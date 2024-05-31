@@ -1,0 +1,59 @@
+﻿namespace UtilityDelta.Api
+{
+    public enum ProjectEventType
+    {
+        AddTask,
+        SetParent,
+        SetTaskSummary,
+        SetTaskStatus,
+        CollapseTask,
+        RemoveTask,
+        SetDueDate,
+        SetAssignedTo,
+        SetEstimate,
+        UnsetTaskStatus,
+        SetLink,
+        SetConfidence,
+        AddPredecessor,
+        AddSuccessor,
+        BeginStandup,
+        RemovePredecessor,
+        RemoveSuccessor,
+        SetProjectOwner,
+        AddProjectMember,
+        AddRole,
+        SetRoleName,
+        SetRoleIsActive,
+        AddTeamMember,
+        SetTeamMemberName,
+        SetTeamMemberHours,
+        AddTeamMemberRoleId,
+        RemoveTeamMemberRoleId,
+        SetTeamMemberIsActive,
+        SetRoleId,
+        SetTeamMemberAuthId,
+        SetDefaultTaskDuration,
+        StandupCompleted,
+        StandupItemTime,
+        AddItemToStandup,
+        StandupNextItem,
+        RetroStart,
+        RetroCancel,
+        RetroEnd,
+        RetroDiscussionItemAdd,
+        RetroDiscussionItemDelete,
+        RetroDiscussionItemGroup,
+        RetroMakeVisible,
+        RemoveProjectMember,
+        AddShareLink,
+        ProvideAccess
+    }
+
+    public enum ProjectAccess
+    {
+        NoAccess,
+        WriteAccess,
+        ReadOnlyAccess,
+        NotExists,
+    }
+}
