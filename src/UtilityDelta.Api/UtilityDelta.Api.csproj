@@ -9,7 +9,14 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Folder Include="containers\" />
+    <Compile Remove="containers\**" />
+    <Content Remove="containers\**" />
+    <EmbeddedResource Remove="containers\**" />
+    <None Remove="containers\**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Nanoid" Version="3.0.0" />
   </ItemGroup>
 
 </Project>

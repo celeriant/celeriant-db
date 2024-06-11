@@ -6,6 +6,6 @@ namespace UtilityDelta.Api.Interfaces
 {
     public interface IReadEvents
     {
-        List<ProjectEventItem> Read(string container, long fromEventId, string currentUser);
+        DtoRead Read(string container, long fromEventId, string currentUser);
     }
 }

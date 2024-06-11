@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Mvc;
+using NanoidDotNet;
 using System.Text.Json.Serialization;
 using UtilityDelta.Api.Interfaces;
 using UtilityDelta.Api.Services;
@@ -6,8 +7,9 @@ using UtilityDelta.Api.Shared;
 
 [JsonSerializable(typeof(ProjectEventItem[]))]
 [JsonSerializable(typeof(List<ProjectEventItem>))]
-[JsonSerializable(typeof(DtoShareProject))]
-[JsonSerializable(typeof(DtoSyncEvents))]
+[JsonSerializable(typeof(DtoRead))]
+[JsonSerializable(typeof(DtoShare))]
+[JsonSerializable(typeof(DtoWrite))]
 public partial class ReadSerializerContext : JsonSerializerContext
 {
 
@@ -15,7 +17,7 @@ public partial class ReadSerializerContext : JsonSerializerContext
 
 public class Program
 {
-    private static List<ProjectEventItem> Read(
+    private static DtoRead Read(
         [FromQuery] string pi,
         [FromQuery] string publicKey,
         [FromQuery] string nonce,
@@ -36,7 +38,7 @@ public class Program
         return readEvents.Read(pi, fromTime, createdBy);
     }
 
-    private static DtoShareProject Share(
+    private static DtoShare Share(
         [FromQuery] string pi,
         [FromQuery] string publicKey,
         [FromQuery] string nonce,
@@ -47,15 +49,12 @@ public class Program
         [FromQuery] long expiresOn,
         [FromQuery] bool readOnly,
         CancellationToken cancellationToken,
-        [FromServices] ICrypto crypto)
+        [FromServices] IAccessLogic accessLogic)
     {
-        crypto.ValidateWithPublicKey(publicKey, nonce, sign);
-        //TODO: Verify access to project
-
-        return new DtoShareProject("jlksdjlksdfjkl");
+        return accessLogic.CreateShareLink(pi, publicKey, nonce, sign, isOwner, singleUse, description, expiresOn, readOnly);
     }
 
-    private static DtoSyncEvents Write(
+    private static DtoWrite Write(
         [FromQuery] string pi,
         [FromQuery] string publicKey,
         [FromQuery] string nonce,
@@ -72,7 +71,8 @@ public class Program
 
         //TODO: Verify access to project
 
-        return new DtoSyncEvents(writeEvents.Write(events, createdBy, pi));
+        var (lastServerId, eventDate) = writeEvents.Write(events, createdBy, pi);
+        return new DtoWrite(lastServerId, eventDate);
     }
 
     private static void Main(string[] args)
@@ -125,6 +125,7 @@ public class Program
         builder.Services.AddSingleton<ICrypto, Crypto>();
         builder.Services.AddSingleton<IReadEvents, ReadEvents>();
         builder.Services.AddSingleton<IWriteEvents, WriteEvents>();
+        builder.Services.AddSingleton<IAccessLogic, AccessLogic>();
 
         var app = builder.Build();
         app.UseCors("CorsDevelopment");

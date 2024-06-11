@@ -46,7 +46,15 @@
         RetroMakeVisible,
         RemoveProjectMember,
         AddShareLink,
+        AddSingleUseShareLink,
         ProvideAccess
+    }
+
+    public enum AccessLevel
+    {
+        Owner,
+        Contributor,
+        Viewer
     }
 
     public enum ProjectAccess

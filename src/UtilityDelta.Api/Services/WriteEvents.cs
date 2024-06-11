@@ -11,7 +11,7 @@ namespace UtilityDelta.Api.Services
     {
         private const uint EVENT_VERSION = 1;
 
-        public long Write(ProjectEventItem[] events, string createdBy, string pi)
+        public (long lastServerId, long eventDate) Write(ProjectEventItem[] events, string createdBy, string pi)
         {
             //This call to get the stream is thread safe
             using var fileHandle = FileHandles.OpenWrite(pi);
@@ -33,7 +33,7 @@ namespace UtilityDelta.Api.Services
 
                 binaryWriter.Flush();
 
-                return latestId;
+                return (latestId, eventDate);
             }
         }
 

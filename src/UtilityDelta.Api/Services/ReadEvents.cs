@@ -9,11 +9,12 @@ namespace UtilityDelta.Api.Services
 {
     public class ReadEvents : IReadEvents
     {
+        private static DtoRead EMPTY = new DtoRead(new List<ProjectEventItem>(), 0);
 
-        public List<ProjectEventItem> Read(string container, long fromEventId, string currentUser)
+        public DtoRead Read(string container, long fromEventId, string currentUser)
         {
             var path = container.ContainerPath();
-            if (!File.Exists(path)) return new List<ProjectEventItem>();
+            if (!File.Exists(path)) return EMPTY;
 
             using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
             using var reader = new BinaryReader(stream, Encoding.UTF8, true);
@@ -40,15 +41,17 @@ namespace UtilityDelta.Api.Services
             }
 
             var events = new List<ProjectEventItem>();
+            long lastServerId = 0;
             while (stream.Position < stream.Length)
             {
                 var eventItem = ReadEvent(reader);
+                lastServerId = eventItem.serverId;
                 if (eventItem.cb == currentUser) continue;
 
                 events.Add(eventItem);
             }
 
-            return events;
+            return new DtoRead(events, lastServerId);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
