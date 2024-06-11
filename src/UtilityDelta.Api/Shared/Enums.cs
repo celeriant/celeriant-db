@@ -1,4 +1,4 @@
-﻿namespace UtilityDelta.Api
+﻿namespace UtilityDelta.Api.Shared
 {
     public enum ProjectEventType
     {
