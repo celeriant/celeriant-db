@@ -4,6 +4,14 @@ namespace UtilityDelta.Api.Interfaces
 {
     public interface IAccessLogic
     {
-        DtoShare CreateShareLink(string pi, string publicKey, string nonce, string sign, bool isOwner, bool singleUse, string? description, long expiresOn, bool readOnly);
+        (ProjectAccess projectAccess, string currentUserHash) IsProjectExistAndHasAccess(
+            string projectId,
+            bool createProjectIfNotExists,
+            string? shareKey,
+            string publicKey,
+            string nonce,
+            string sign);
+
+        DtoShare CreateShareLink(string pi, string currentUserHash, bool isOwner, bool singleUse, string? description, long expiresOn, bool readOnly);
     }
 }

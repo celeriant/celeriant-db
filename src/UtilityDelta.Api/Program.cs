@@ -1,5 +1,7 @@
+using Microsoft.AspNetCore.Http.HttpResults;
 using Microsoft.AspNetCore.Mvc;
 using NanoidDotNet;
+using System.Net;
 using System.Text.Json.Serialization;
 using UtilityDelta.Api.Interfaces;
 using UtilityDelta.Api.Services;
@@ -17,7 +19,7 @@ public partial class ReadSerializerContext : JsonSerializerContext
 
 public class Program
 {
-    private static DtoRead Read(
+    private static IResult Read(
         [FromQuery] string pi,
         [FromQuery] string publicKey,
         [FromQuery] string nonce,
@@ -27,18 +29,25 @@ public class Program
         [FromQuery] string? shareKey,
         CancellationToken cancellationToken,
         [FromServices] IReadEvents readEvents,
-        [FromServices] ICrypto crypto)
+        [FromServices] IAccessLogic accessLogic)
     {
-        crypto.ValidateWithPublicKey(publicKey, nonce, sign);
+        var (accessResult, currentUserHash) = accessLogic.IsProjectExistAndHasAccess(
+            projectId: pi,
+            createProjectIfNotExists: createIfNotExist && fromTime == 0,
+            shareKey: shareKey,
+            publicKey: publicKey, 
+            nonce: nonce, 
+            sign: sign);
 
-        //TODO: Verify access to project
-
-        var createdBy = publicKey.CalculateHash();
-
-        return readEvents.Read(pi, fromTime, createdBy);
+        return accessResult switch
+        {
+            ProjectAccess.NotExists => Results.NotFound(),
+            ProjectAccess.NoAccess => Results.Forbid(),
+            _ => Results.Ok(readEvents.Read(pi, fromTime, currentUserHash))
+        };
     }
 
-    private static DtoShare Share(
+    private static IResult Share(
         [FromQuery] string pi,
         [FromQuery] string publicKey,
         [FromQuery] string nonce,
@@ -51,10 +60,23 @@ public class Program
         CancellationToken cancellationToken,
         [FromServices] IAccessLogic accessLogic)
     {
-        return accessLogic.CreateShareLink(pi, publicKey, nonce, sign, isOwner, singleUse, description, expiresOn, readOnly);
+        var (accessResult, currentUserHash) = accessLogic.IsProjectExistAndHasAccess(
+            projectId: pi,
+            createProjectIfNotExists: false,
+            shareKey: null,
+            publicKey: publicKey,
+            nonce: nonce,
+            sign: sign);
+
+        return accessResult switch
+        {
+            ProjectAccess.NotExists => Results.NotFound(),
+            ProjectAccess.OwnerAccess => Results.Ok(accessLogic.CreateShareLink(pi, currentUserHash, isOwner, singleUse, description, expiresOn, readOnly)),
+            _ => Results.Forbid()
+        };
     }
 
-    private static DtoWrite Write(
+    private static IResult Write(
         [FromQuery] string pi,
         [FromQuery] string publicKey,
         [FromQuery] string nonce,
@@ -63,16 +85,23 @@ public class Program
         [FromBody] ProjectEventItem[] events,
         CancellationToken cancellationToken,
         [FromServices] IWriteEvents writeEvents,
-        [FromServices] ICrypto crypto)
+        [FromServices] IAccessLogic accessLogic)
     {
-        crypto.ValidateWithPublicKey(publicKey, nonce, sign);
+        var (accessResult, currentUserHash) = accessLogic.IsProjectExistAndHasAccess(
+            projectId: pi,
+            createProjectIfNotExists: false,
+            shareKey: null,
+            publicKey: publicKey,
+            nonce: nonce,
+            sign: sign);
 
-        var createdBy = publicKey.CalculateHash();
-
-        //TODO: Verify access to project
-
-        var (lastServerId, eventDate) = writeEvents.Write(events, createdBy, pi);
-        return new DtoWrite(lastServerId, eventDate);
+        return accessResult switch
+        {
+            ProjectAccess.NotExists => Results.NotFound(),
+            ProjectAccess.NoAccess => Results.Forbid(),
+            ProjectAccess.ReadOnlyAccess => Results.Forbid(),
+            _ => Results.Ok(writeEvents.Write(events, currentUserHash, pi))
+        };
     }
 
     private static void Main(string[] args)

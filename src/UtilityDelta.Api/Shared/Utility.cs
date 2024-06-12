@@ -6,6 +6,16 @@ namespace UtilityDelta.Api.Shared
     public static class Utility
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static ProjectAccess ToProjectAccess(this AccessLevel accessLevel) => 
+            accessLevel switch
+            {
+                AccessLevel.Owner => ProjectAccess.OwnerAccess,
+                AccessLevel.Contributor => ProjectAccess.WriteAccess,
+                AccessLevel.Viewer => ProjectAccess.ReadOnlyAccess,
+                _ => throw new NotSupportedException(),
+            };
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static void WriteNullable(this BinaryWriter binaryWriter, double? input)
         {
             if (input == null)

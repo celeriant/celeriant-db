@@ -11,10 +11,17 @@ namespace UtilityDelta.Api.Services
     {
         private static DtoRead EMPTY = new DtoRead(new List<ProjectEventItem>(), 0);
 
-        public DtoRead Read(string container, long fromEventId, string currentUser)
+        public bool Exists(string container)
         {
             var path = container.ContainerPath();
-            if (!File.Exists(path)) return EMPTY;
+            return File.Exists(path);
+        }
+
+        public DtoRead Read(string container, long fromEventId, string currentUserHash)
+        {
+            if (!Exists(container)) return EMPTY;
+
+            var path = container.ContainerPath();
 
             using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
             using var reader = new BinaryReader(stream, Encoding.UTF8, true);
@@ -40,13 +47,14 @@ namespace UtilityDelta.Api.Services
                 stream.Seek(offsetFromEnd * -1, SeekOrigin.End);
             }
 
+            //Step 2 we read all the events from that position to the end of the stream
             var events = new List<ProjectEventItem>();
             long lastServerId = 0;
             while (stream.Position < stream.Length)
             {
                 var eventItem = ReadEvent(reader);
                 lastServerId = eventItem.serverId;
-                if (eventItem.cb == currentUser) continue;
+                if (eventItem.cb == currentUserHash) continue;
 
                 events.Add(eventItem);
             }

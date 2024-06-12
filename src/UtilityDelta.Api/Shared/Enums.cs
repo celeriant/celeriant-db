@@ -63,5 +63,6 @@
         WriteAccess,
         ReadOnlyAccess,
         NotExists,
+        OwnerAccess
     }
 }
