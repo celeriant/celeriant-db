@@ -6,8 +6,8 @@ namespace UtilityDelta.Api.Interfaces
     {
         DtoShare CreateShareLink(string pi, string currentUserHash, bool isOwner, bool singleUse, string? description, long expiresOn, bool readOnly);
 
-        DtoShareKeyData? GetShareKeyDataIfStillValid(string projectId, string? shareKey);
+        DtoShareKeyData? GetShareKeyDataIfStillValid(string projectId, string shareKeyHash);
 
-        void MarkShareKeyAsUsed(string projectId, long shareKeyEventServerId, string currentUserHash);
+        bool MarkShareKeyAsUsed(string projectId, string shareKeyHash);
     }
 }

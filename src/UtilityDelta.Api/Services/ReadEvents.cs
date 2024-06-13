@@ -1,7 +1,5 @@
 ﻿using System;
-using System.IO;
 using System.Linq;
-using System.Runtime.CompilerServices;
 using System.Text;
 using UtilityDelta.Api.Interfaces;
 using UtilityDelta.Api.Shared;
@@ -12,7 +10,7 @@ namespace UtilityDelta.Api.Services
     {
         private static DtoRead EMPTY = new DtoRead(new List<ProjectEventItem>(), 0);
 
-        public DtoRead Read(string container, long fromEventId, string? currentUserHash = null, ProjectEventType? filterEventType = null)
+        public DtoRead Read(string container, long fromEventId, string? currentUserHash = null, ProjectEventType? filterEventType = null, HashSet<ProjectEventType>? multiFilterEventType = null)
         {
             if (!FileHandles.Exists(container)) return EMPTY;
 
@@ -60,8 +58,9 @@ namespace UtilityDelta.Api.Services
                 lastServerId = reader.ReadInt64();
                 reader.ReadInt32(); //totalSize
 
-                //Don't bother creating the object model if we don't want this type of event
+                //Don't bother creating the object model if we don't want this type of event(s)
                 if (filterEventType != null && filterEventType.Value != tp) continue;
+                if (multiFilterEventType != null && !multiFilterEventType.Contains(tp)) continue;
 
                 //Don't bother creating the object model if this is the current user
                 if (currentUserHash != null && cb == currentUserHash) continue;

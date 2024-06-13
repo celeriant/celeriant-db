@@ -7,6 +7,18 @@ namespace UtilityDelta.Api.Shared
     public static class Utility
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static long ToUnixTimeSeconds(this DateTime input)
+        {
+            return new DateTimeOffset(input, TimeSpan.Zero).ToUnixTimeSeconds();
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static DateTime FromUnixTimeSeconds(this long input)
+        {
+            return DateTimeOffset.FromUnixTimeSeconds(input).DateTime;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static bool IncreasesAccessLevel(this AccessLevel currentAccessLevel, AccessLevel? potentialAccessLevel) 
             => potentialAccessLevel.HasValue ? 
                 ((int)currentAccessLevel) > ((int)potentialAccessLevel.Value) : 

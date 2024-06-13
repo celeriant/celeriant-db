@@ -34,13 +34,17 @@ namespace UtilityDelta.Api.Services
             var currentAccessLevel = userAccessCache.GetCurrentAccess(projectId, currentUserHash);
 
             //Get share key data if a key is provided, but only operate on active share keys
-            var shareKeyData = shareKeyCache.GetShareKeyDataIfStillValid(projectId, shareKey);
+            var shareKeyData = shareKey == null ? null : shareKeyCache.GetShareKeyDataIfStillValid(projectId, shareKey);
 
             if (shareKeyData != null && shareKeyData.createdBy != currentUserHash && shareKeyData.isSingleUse)
             {
                 //Users who created the share key can't expire their own key (in case they click it first)
                 //Otherwise if this share key is single use mark it as expired
-                shareKeyCache.MarkShareKeyAsUsed(projectId, shareKeyData.serverId, currentUserHash);
+                if (!shareKeyCache.MarkShareKeyAsUsed(projectId, shareKey!))
+                {
+                    //Could fail due to share key already used (thread contention)
+                    shareKeyData = null;
+                }
             }
 
             if (shareKeyData != null && currentAccessLevel.IncreasesAccessLevel(shareKeyData.accessLevel))

@@ -10,7 +10,7 @@
 
     public record DtoAccessInfo(ProjectAccess ProjectAccess, string CurrentUserHash, ProjectEventItem? AccessEvent);
 
-    public record DtoShareKeyData(long serverId, DateTime? expiresOn, AccessLevel accessLevel, string? description, string hashedCode, bool isSingleUse, string createdBy);
+    public record DtoShareKeyData(DateTime? expiresOn, AccessLevel accessLevel, string? description, string hashedCode, bool isSingleUse, string createdBy);
 
     public record ProjectEventItem(long serverId, string? cb, long ed, string? iv, ProjectEventType tp, 
         string? t1, string? t2, string? t3, double? n1);

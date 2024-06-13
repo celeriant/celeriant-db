@@ -6,7 +6,7 @@ namespace UtilityDelta.Api.Services
 {
     public class UserAccessCache(IWriteEvents writeEvents, IReadEvents readEvents) : IUserAccessCache
     {
-        private ConcurrentDictionary<string, ProjectToUserAccessLevel> _cache = new();
+        private static ConcurrentDictionary<string, ProjectToUserAccessLevel> _cache = new();
 
         public ProjectEventItem? UpdateAccess(string projectId, string? currentUserHash, string forUserId, AccessLevel? potentialAccessLevel, string? description, bool allowDowngrade, string? shareKey)
         {
@@ -55,12 +55,12 @@ namespace UtilityDelta.Api.Services
                     return projectLookup.CurrentAccessLevelForUser(currentUserHash);
                 }
 
-                PopulateUserAccessLevelCache(readEvents, projectId, projectLookup!);
+                PopulateUserAccessLevelCache(projectId, projectLookup!);
                 return projectLookup.CurrentAccessLevelForUser(currentUserHash);
             }
         }
 
-        private static void PopulateUserAccessLevelCache(IReadEvents readEvents, string projectId, ProjectToUserAccessLevel projectLookup)
+        private void PopulateUserAccessLevelCache(string projectId, ProjectToUserAccessLevel projectLookup)
         {
             var relevantEvents = readEvents.Read(projectId, 0, null, ProjectEventType.ProvideAccess);
 
@@ -79,6 +79,8 @@ namespace UtilityDelta.Api.Services
                         break;
                 }
             }
+
+            projectLookup.IsActiveCache = true;
         }
     }
 }

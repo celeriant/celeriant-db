@@ -3,14 +3,11 @@
     public class ProjectToUserAccessLevel
     {
         private readonly Dictionary<string, AccessLevel> _users = [];
-        private DateTime? _lastUpdated = null;
 
-        public bool IsActiveCache => _lastUpdated != null;
+        public bool IsActiveCache { get; set; }
 
         public void UpdateCacheForUser(string currentUserHash, AccessLevel? accessLevel, bool allowOverrideExisting)
         {
-            _lastUpdated = DateTime.UtcNow;
-
             var hasExistingEntry = _users.TryGetValue(currentUserHash, out var userEntry);
 
             //No op - Providing NO access and currently has NO access
