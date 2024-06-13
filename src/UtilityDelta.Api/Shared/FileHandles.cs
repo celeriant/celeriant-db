@@ -16,6 +16,12 @@ namespace UtilityDelta.Api.Shared
 
         public string Container => container;
 
+        public static bool Exists(string container)
+        {
+            var path = container.ContainerPath();
+            return File.Exists(path);
+        }
+
         public static FileHandles OpenWrite(string container)
         {
             //Keep track of how many threads are using the FileStream for this container

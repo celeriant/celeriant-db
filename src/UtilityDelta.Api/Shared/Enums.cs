@@ -47,7 +47,8 @@
         RemoveProjectMember,
         AddShareLink,
         AddSingleUseShareLink,
-        ProvideAccess
+        ProvideAccess,
+        DisableShareLink,
     }
 
     public enum AccessLevel

@@ -11,7 +11,12 @@ namespace UtilityDelta.Api.Services
     {
         private const uint EVENT_VERSION = 1;
 
-        public DtoWrite Write(ProjectEventItem[] events, string createdBy, string pi)
+        public DtoWrite WriteClientEvents(ProjectEventItem[] events, string createdBy, string pi)
+        {
+            return InternalWrite(events.Where(x => !x.tp.IsServerEvent()), createdBy, pi);
+        }
+
+        private DtoWrite InternalWrite(IEnumerable<ProjectEventItem> events, string? createdBy, string pi)
         {
             //This call to get the stream is thread safe
             using var fileHandle = FileHandles.OpenWrite(pi);
@@ -37,8 +42,14 @@ namespace UtilityDelta.Api.Services
             }
         }
 
+        public ProjectEventItem WriteServerEvent(ProjectEventItem eventItem, string pi)
+        {
+            var writeResult = InternalWrite([eventItem], eventItem.cb, pi);
+            return new ProjectEventItem(writeResult.serverId, eventItem.cb, writeResult.eventDate, eventItem.iv, eventItem.tp, eventItem.t1, eventItem.t2, eventItem.t3, eventItem.n1);
+        }
+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static void WriteEvent(BinaryWriter binaryWriter, string cb, string? iv, ushort et, long ed, long id, double? n1, string? t1, string? t2, string? t3)
+        private static void WriteEvent(BinaryWriter binaryWriter, string? cb, string? iv, ushort et, long ed, long id, double? n1, string? t1, string? t2, string? t3)
         {
             var pos1 = binaryWriter.BaseStream.Position;
 

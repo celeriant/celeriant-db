@@ -1,4 +1,5 @@
 ﻿using System;
+using System.IO;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -11,15 +12,9 @@ namespace UtilityDelta.Api.Services
     {
         private static DtoRead EMPTY = new DtoRead(new List<ProjectEventItem>(), 0);
 
-        public bool Exists(string container)
+        public DtoRead Read(string container, long fromEventId, string? currentUserHash = null, ProjectEventType? filterEventType = null)
         {
-            var path = container.ContainerPath();
-            return File.Exists(path);
-        }
-
-        public DtoRead Read(string container, long fromEventId, string currentUserHash)
-        {
-            if (!Exists(container)) return EMPTY;
+            if (!FileHandles.Exists(container)) return EMPTY;
 
             var path = container.ContainerPath();
 
@@ -49,36 +44,32 @@ namespace UtilityDelta.Api.Services
 
             //Step 2 we read all the events from that position to the end of the stream
             var events = new List<ProjectEventItem>();
-            long lastServerId = 0;
+            long lastServerId = fromEventId;
             while (stream.Position < stream.Length)
             {
-                var eventItem = ReadEvent(reader);
-                lastServerId = eventItem.serverId;
-                if (eventItem.cb == currentUserHash) continue;
+                reader.ReadUInt32(); //Version
 
-                events.Add(eventItem);
+                var t1 = reader.ReadStringNullable();
+                var t2 = reader.ReadStringNullable();
+                var t3 = reader.ReadStringNullable();
+                var n1 = reader.ReadDoubleNullable();
+                var iv = reader.ReadStringNullable();
+                var tp = (ProjectEventType)reader.ReadUInt16();
+                var ed = reader.ReadInt64();
+                var cb = reader.ReadStringNullable();
+                lastServerId = reader.ReadInt64();
+                reader.ReadInt32(); //totalSize
+
+                //Don't bother creating the object model if we don't want this type of event
+                if (filterEventType != null && filterEventType.Value != tp) continue;
+
+                //Don't bother creating the object model if this is the current user
+                if (currentUserHash != null && cb == currentUserHash) continue;
+
+                events.Add(new ProjectEventItem(lastServerId, cb, ed, iv, tp, t1, t2, t3, n1));
             }
 
             return new DtoRead(events, lastServerId);
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static ProjectEventItem ReadEvent(BinaryReader binaryReader)
-        {
-            binaryReader.ReadUInt32(); //Version
-
-            var t1 = binaryReader.ReadStringNullable();
-            var t2 = binaryReader.ReadStringNullable();
-            var t3 = binaryReader.ReadStringNullable();
-            var n1 = binaryReader.ReadDoubleNullable();
-            var iv = binaryReader.ReadStringNullable();
-            var tp = (ProjectEventType)binaryReader.ReadUInt16();
-            var ed = binaryReader.ReadInt64();
-            var cb = binaryReader.ReadStringNullable();
-            var serverId = binaryReader.ReadInt64();
-            binaryReader.ReadInt32(); //totalSize
-
-            return new ProjectEventItem(serverId, cb, ed, iv, tp, t1, t2, t3, n1);
         }
     }
 }

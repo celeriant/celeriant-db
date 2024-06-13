@@ -1,4 +1,5 @@
-﻿using System.Runtime.CompilerServices;
+﻿using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 
 namespace UtilityDelta.Api.Shared
@@ -6,8 +7,31 @@ namespace UtilityDelta.Api.Shared
     public static class Utility
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static ProjectAccess ToProjectAccess(this AccessLevel accessLevel) => 
-            accessLevel switch
+        public static bool IncreasesAccessLevel(this AccessLevel currentAccessLevel, AccessLevel? potentialAccessLevel) 
+            => potentialAccessLevel.HasValue ? 
+                ((int)currentAccessLevel) > ((int)potentialAccessLevel.Value) : 
+                false;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IncreasesAccessLevel(this AccessLevel? currentAccessLevel, AccessLevel? potentialAccessLevel) 
+            => currentAccessLevel.HasValue && potentialAccessLevel.HasValue ? 
+                ((int)currentAccessLevel.Value) > ((int)potentialAccessLevel.Value) : 
+                potentialAccessLevel.HasValue;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsServerEvent(this ProjectEventType projectEventType) 
+            => projectEventType switch
+            {
+                ProjectEventType.AddShareLink or 
+                ProjectEventType.AddSingleUseShareLink or 
+                ProjectEventType.ProvideAccess or 
+                ProjectEventType.DisableShareLink => true,
+                _ => false,
+            };
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static ProjectAccess ToProjectAccess(this AccessLevel accessLevel) 
+            => accessLevel switch
             {
                 AccessLevel.Owner => ProjectAccess.OwnerAccess,
                 AccessLevel.Contributor => ProjectAccess.WriteAccess,
@@ -42,16 +66,12 @@ namespace UtilityDelta.Api.Shared
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static string? ReadStringNullable(this BinaryReader reader)
-        {
-            return reader.ReadBoolean() ? reader.ReadString() : null;
-        }
+        public static string? ReadStringNullable(this BinaryReader reader) 
+            => reader.ReadBoolean() ? reader.ReadString() : null;
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static double? ReadDoubleNullable(this BinaryReader reader)
-        {
-            return reader.ReadBoolean() ? reader.ReadDouble() : null;
-        }
+        public static double? ReadDoubleNullable(this BinaryReader reader) 
+            => reader.ReadBoolean() ? reader.ReadDouble() : null;
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static string CalculateHash(this string contents)
@@ -74,6 +94,7 @@ namespace UtilityDelta.Api.Shared
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static string ContainerPath(this string container) => Path.Combine(Constants.SUB_DIR_CONTAINERS, container);
+        public static string ContainerPath(this string container) 
+            => Path.Combine(Constants.SUB_DIR_CONTAINERS, container);
     }
 }
