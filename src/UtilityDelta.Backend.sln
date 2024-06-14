@@ -7,6 +7,10 @@ Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "UtilityDelta.Api", "Utility
 EndProject
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "UtilityDelta.Realtime", "UtilityDelta.Realtime\UtilityDelta.Realtime.csproj", "{27F5F547-93C5-44F3-9FE9-A411EC3509EE}"
 EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "UtilityDelta.Api.Tests", "UtilityDelta.Api.Tests\UtilityDelta.Api.Tests.csproj", "{02D1254E-FC24-49E7-AE0C-8D56A5C0A858}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "UtilityDelta.Api.IntegrationTests", "UtilityDelta.Api.IntegrationTests\UtilityDelta.Api.IntegrationTests.csproj", "{5460F69E-886B-41EF-B64A-D4F0885DED40}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -21,6 +25,14 @@ Global
 		{27F5F547-93C5-44F3-9FE9-A411EC3509EE}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{27F5F547-93C5-44F3-9FE9-A411EC3509EE}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{27F5F547-93C5-44F3-9FE9-A411EC3509EE}.Release|Any CPU.Build.0 = Release|Any CPU
+		{02D1254E-FC24-49E7-AE0C-8D56A5C0A858}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{02D1254E-FC24-49E7-AE0C-8D56A5C0A858}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{02D1254E-FC24-49E7-AE0C-8D56A5C0A858}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{02D1254E-FC24-49E7-AE0C-8D56A5C0A858}.Release|Any CPU.Build.0 = Release|Any CPU
+		{5460F69E-886B-41EF-B64A-D4F0885DED40}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{5460F69E-886B-41EF-B64A-D4F0885DED40}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{5460F69E-886B-41EF-B64A-D4F0885DED40}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{5460F69E-886B-41EF-B64A-D4F0885DED40}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

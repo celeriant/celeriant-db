@@ -5,8 +5,7 @@ using UtilityDelta.Api.Shared;
 
 namespace UtilityDelta.Api.Services
 {
-    public class FileHandlesManager(IOptions<ConfigurationEntry> utilityDeltaConfiguration)
-: IFileHandlesManager
+    public class FileHandlesManager(IOptions<ConfigurationEntry> utilityDeltaConfiguration) : IFileHandlesManager
     {
         //Does not need to be concurrent as we are only using this inside the GetOrAdd lambda
         private readonly Queue<string> _containerQueue = new();
