@@ -33,7 +33,7 @@ namespace UtilityDelta.Api.Services
             }
         }
 
-        private ProjectToUserAccessLevel GetOrBuildCache(string projectId)
+        private ProjectToUserAccessLevel GetOrBuildCache(string projectId, CancellationToken cancellationToken)
         {
             ClearCache();
 
@@ -54,12 +54,12 @@ namespace UtilityDelta.Api.Services
                 }
 
                 _cacheQueue.Enqueue(projectId);
-                PopulateCache(projectId, projectLookup!);
+                PopulateCache(projectId, projectLookup!, cancellationToken);
                 return projectLookup;
             }
         }
 
-        public ProjectEventItem? UpdateAccess(string projectId, string? currentUserHash, string forUserId, AccessLevel? potentialAccessLevel, string? description, bool allowDowngrade, string? shareKey)
+        public ProjectEventItem? UpdateAccess(string projectId, string? currentUserHash, string forUserId, AccessLevel? potentialAccessLevel, string? description, bool allowDowngrade, string? shareKey, CancellationToken cancellationToken)
         {
             //Not allowed to downgrade your own permissions
             if (allowDowngrade && currentUserHash == forUserId)
@@ -67,7 +67,7 @@ namespace UtilityDelta.Api.Services
                 return null;
             }
 
-            var currentAccess = GetCurrentAccess(projectId, forUserId);
+            var currentAccess = GetCurrentAccess(projectId, forUserId, cancellationToken);
 
             //No op as same permission level or lower level and not downgrading
             if (currentAccess == potentialAccessLevel || !allowDowngrade && !currentAccess.IncreasesAccessLevel(potentialAccessLevel)) 
@@ -77,7 +77,7 @@ namespace UtilityDelta.Api.Services
 
             var eventItem = new ProjectEventItem(0, currentUserHash, 0, null, ProjectEventType.ProvideAccess, description, forUserId, shareKey, (double?)potentialAccessLevel);
 
-            var projectCache = GetOrBuildCache(projectId);
+            var projectCache = GetOrBuildCache(projectId, cancellationToken);
             lock (projectCache)
             {
                 if (projectCache.Count > MAX_USERS) return null;
@@ -92,18 +92,18 @@ namespace UtilityDelta.Api.Services
             }
         }
 
-        public AccessLevel? GetCurrentAccess(string projectId, string currentUserHash)
+        public AccessLevel? GetCurrentAccess(string projectId, string currentUserHash, CancellationToken cancellationToken)
         {
-            var projectLookup = GetOrBuildCache(projectId);
+            var projectLookup = GetOrBuildCache(projectId, cancellationToken);
             lock (projectLookup)
             {
                 return projectLookup.CurrentAccessLevelForUser(currentUserHash);
             }
         }
 
-        private void PopulateCache(string projectId, ProjectToUserAccessLevel projectLookup)
+        private void PopulateCache(string projectId, ProjectToUserAccessLevel projectLookup, CancellationToken cancellationToken)
         {
-            var relevantEvents = readEvents.Read(projectId, 0, null, ProjectEventType.ProvideAccess);
+            var relevantEvents = readEvents.Read(projectId, 0, cancellationToken, null, ProjectEventType.ProvideAccess);
 
             foreach (var eventItem in relevantEvents.events)
             {

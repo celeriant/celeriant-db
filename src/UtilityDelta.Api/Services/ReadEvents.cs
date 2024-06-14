@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Linq;
 using System.Text;
+using UtilityDelta.Api.Exceptions;
 using UtilityDelta.Api.Interfaces;
 using UtilityDelta.Api.Shared;
 
@@ -10,9 +11,10 @@ namespace UtilityDelta.Api.Services
     {
         private static DtoRead EMPTY = new DtoRead(new List<ProjectEventItem>(), 0);
 
-        public DtoRead Read(string container, long fromEventId, string? currentUserHash = null, ProjectEventType? filterEventType = null, HashSet<ProjectEventType>? multiFilterEventType = null)
+        public DtoRead Read(string container, long fromEventId, CancellationToken cancellationToken, string? currentUserHash = null, ProjectEventType? filterEventType = null, HashSet<ProjectEventType>? multiFilterEventType = null)
         {
             if (!FileHandles.Exists(container)) return EMPTY;
+            if (cancellationToken.IsCancellationRequested) throw new ExceptionCancelledOperation();
 
             var path = container.ContainerPath();
 
@@ -35,6 +37,8 @@ namespace UtilityDelta.Api.Services
 
                     var dataLengthForEvent = reader.ReadInt32();
                     offsetFromEnd = dataLengthForEvent + Constants.SIZEOF_EVENT_SIZE + offsetFromEnd;
+
+                    if (cancellationToken.IsCancellationRequested) throw new ExceptionCancelledOperation();
                 }
 
                 stream.Seek(offsetFromEnd * -1, SeekOrigin.End);
@@ -66,6 +70,8 @@ namespace UtilityDelta.Api.Services
                 if (currentUserHash != null && cb == currentUserHash) continue;
 
                 events.Add(new ProjectEventItem(lastServerId, cb, ed, iv, tp, t1, t2, t3, n1));
+
+                if (cancellationToken.IsCancellationRequested) throw new ExceptionCancelledOperation();
             }
 
             return new DtoRead(events, lastServerId);

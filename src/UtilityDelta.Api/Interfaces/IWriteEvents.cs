@@ -6,7 +6,7 @@ namespace UtilityDelta.Api.Interfaces
 {
     public interface IWriteEvents
     {
-        DtoWrite WriteClientEvents(ProjectEventItem[] events, string createdBy, string pi);
+        DtoWrite WriteClientEvents(ProjectEventItem[] events, string createdBy, string pi, CancellationToken cancellationToken);
 
         ProjectEventItem WriteServerEvent(ProjectEventItem eventItem, string pi);
     }

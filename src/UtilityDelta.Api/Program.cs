@@ -20,7 +20,7 @@ public partial class ReadSerializerContext : JsonSerializerContext
 
 public class Program
 {
-    private static IResult Read(
+    private static async Task<IResult> Read(
         [FromQuery] string pi,
         [FromQuery] string publicKey,
         [FromQuery] string nonce,
@@ -32,23 +32,27 @@ public class Program
         [FromServices] IReadEvents readEvents,
         [FromServices] IAccessLogic accessLogic)
     {
-        var accessInfo = accessLogic.IsProjectExistAndHasAccess(
+        return await Task.Run(() =>
+        {
+            var accessInfo = accessLogic.IsProjectExistAndHasAccess(
             projectId: pi,
             createProjectIfNotExists: createIfNotExist && fromTime == 0,
             shareKey: shareKey,
-            publicKey: publicKey, 
-            nonce: nonce, 
-            sign: sign);
+            publicKey: publicKey,
+            nonce: nonce,
+            sign: sign,
+            cancellationToken: cancellationToken);
 
-        return accessInfo.ProjectAccess switch
-        {
-            ProjectAccess.NotExists => Results.NotFound(),
-            ProjectAccess.NoAccess => Results.StatusCode(StatusCodes.Status403Forbidden),
-            _ => Results.Ok(readEvents.Read(pi, fromTime, accessInfo.CurrentUserHash))
-        };
+            return accessInfo.ProjectAccess switch
+            {
+                ProjectAccess.NotExists => Results.NotFound(),
+                ProjectAccess.NoAccess => Results.StatusCode(StatusCodes.Status403Forbidden),
+                _ => Results.Ok(readEvents.Read(pi, fromTime, cancellationToken, accessInfo.CurrentUserHash))
+            };
+        });
     }
 
-    private static IResult DisableUser(
+    private static async Task<IResult> DisableUser(
         [FromQuery] string pi,
         [FromQuery] string publicKey,
         [FromQuery] string nonce,
@@ -58,23 +62,27 @@ public class Program
         [FromServices] IUserAccessCache userAccessCache,
         [FromServices] IAccessLogic accessLogic)
     {
-        var accessInfo = accessLogic.IsProjectExistAndHasAccess(
+        return await Task.Run(() =>
+        {
+            var accessInfo = accessLogic.IsProjectExistAndHasAccess(
             projectId: pi,
             createProjectIfNotExists: false,
             shareKey: null,
             publicKey: publicKey,
             nonce: nonce,
-            sign: sign);
+            sign: sign,
+            cancellationToken: cancellationToken);
 
-        return accessInfo.ProjectAccess switch
-        {
-            ProjectAccess.NotExists => Results.NotFound(),
-            ProjectAccess.OwnerAccess => Results.Ok(new DtoDisableAccess(userAccessCache.UpdateAccess(pi, accessInfo.CurrentUserHash, userId, null, null, true, null))),
-            _ => Results.StatusCode(StatusCodes.Status403Forbidden)
-        };
+            return accessInfo.ProjectAccess switch
+            {
+                ProjectAccess.NotExists => Results.NotFound(),
+                ProjectAccess.OwnerAccess => Results.Ok(new DtoDisableAccess(userAccessCache.UpdateAccess(pi, accessInfo.CurrentUserHash, userId, null, null, true, null, cancellationToken))),
+                _ => Results.StatusCode(StatusCodes.Status403Forbidden)
+            };
+        });
     }
 
-    private static IResult Share(
+    private static async Task<IResult> Share(
         [FromQuery] string pi,
         [FromQuery] string publicKey,
         [FromQuery] string nonce,
@@ -88,23 +96,27 @@ public class Program
         [FromServices] IAccessLogic accessLogic,
         [FromServices] IShareKeyCache shareKeyCache)
     {
-        var accessInfo = accessLogic.IsProjectExistAndHasAccess(
+        return await Task.Run(() =>
+        {
+            var accessInfo = accessLogic.IsProjectExistAndHasAccess(
             projectId: pi,
             createProjectIfNotExists: false,
             shareKey: null,
             publicKey: publicKey,
             nonce: nonce,
-            sign: sign);
+            sign: sign,
+            cancellationToken: cancellationToken);
 
-        return accessInfo.ProjectAccess switch
-        {
-            ProjectAccess.NotExists => Results.NotFound(),
-            ProjectAccess.OwnerAccess => Results.Ok(shareKeyCache.CreateShareLink(pi, accessInfo.CurrentUserHash, isOwner, singleUse, description, expiresOn, readOnly)),
-            _ => Results.StatusCode(StatusCodes.Status403Forbidden)
-        };
+            return accessInfo.ProjectAccess switch
+            {
+                ProjectAccess.NotExists => Results.NotFound(),
+                ProjectAccess.OwnerAccess => Results.Ok(shareKeyCache.CreateShareLink(pi, accessInfo.CurrentUserHash, isOwner, singleUse, description, expiresOn, readOnly, cancellationToken)),
+                _ => Results.StatusCode(StatusCodes.Status403Forbidden)
+            };
+        });
     }
 
-    private static IResult Write(
+    private static async Task<IResult> Write(
         [FromQuery] string pi,
         [FromQuery] string publicKey,
         [FromQuery] string nonce,
@@ -115,21 +127,25 @@ public class Program
         [FromServices] IWriteEvents writeEvents,
         [FromServices] IAccessLogic accessLogic)
     {
-        var accessInfo = accessLogic.IsProjectExistAndHasAccess(
-            projectId: pi,
-            createProjectIfNotExists: false,
-            shareKey: null,
-            publicKey: publicKey,
-            nonce: nonce,
-            sign: sign);
-
-        return accessInfo.ProjectAccess switch
+        return await Task.Run(() =>
         {
-            ProjectAccess.NotExists => Results.NotFound(),
-            ProjectAccess.NoAccess => Results.StatusCode(StatusCodes.Status403Forbidden),
-            ProjectAccess.ReadOnlyAccess => Results.StatusCode(StatusCodes.Status403Forbidden),
-            _ => Results.Ok(writeEvents.WriteClientEvents(events, accessInfo.CurrentUserHash, pi))
-        };
+            var accessInfo = accessLogic.IsProjectExistAndHasAccess(
+                projectId: pi,
+                createProjectIfNotExists: false,
+                shareKey: null,
+                publicKey: publicKey,
+                nonce: nonce,
+                sign: sign,
+                cancellationToken: cancellationToken);
+
+            return accessInfo.ProjectAccess switch
+            {
+                ProjectAccess.NotExists => Results.NotFound(),
+                ProjectAccess.NoAccess => Results.StatusCode(StatusCodes.Status403Forbidden),
+                ProjectAccess.ReadOnlyAccess => Results.StatusCode(StatusCodes.Status403Forbidden),
+                _ => Results.Ok(writeEvents.WriteClientEvents(events, accessInfo.CurrentUserHash, pi, cancellationToken))
+            };
+        });
     }
 
     private static void Main(string[] args)

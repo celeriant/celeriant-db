@@ -12,7 +12,8 @@ namespace UtilityDelta.Api.Services
             string? shareKey,
             string publicKey,
             string nonce,
-            string sign)
+            string sign,
+            CancellationToken cancellationToken)
         {
             //Validate the user's public key and get their identity (SHA-256 hash)
             crypto.ValidateWithPublicKey(publicKey, nonce, sign);
@@ -26,21 +27,21 @@ namespace UtilityDelta.Api.Services
                 //No record of this project, either return not exists or auto-create it for the user and give them owner access
                 if (!createProjectIfNotExists) return new DtoAccessInfo(ProjectAccess.NotExists, currentUserHash, null);
 
-                var accessEvent = userAccessCache.UpdateAccess(projectId, null, currentUserHash, AccessLevel.Owner, "Project creator", false, null);
+                var accessEvent = userAccessCache.UpdateAccess(projectId, null, currentUserHash, AccessLevel.Owner, "Project creator", false, null, cancellationToken);
 
                 return new DtoAccessInfo(ProjectAccess.OwnerAccess, currentUserHash, accessEvent);
             }
 
-            var currentAccessLevel = userAccessCache.GetCurrentAccess(projectId, currentUserHash);
+            var currentAccessLevel = userAccessCache.GetCurrentAccess(projectId, currentUserHash, cancellationToken);
 
             //Get share key data if a key is provided, but only operate on active share keys
-            var shareKeyData = shareKey == null ? null : shareKeyCache.GetShareKeyDataIfStillValid(projectId, shareKey);
+            var shareKeyData = shareKey == null ? null : shareKeyCache.GetShareKeyDataIfStillValid(projectId, shareKey, cancellationToken);
 
             if (shareKeyData != null && shareKeyData.createdBy != currentUserHash && shareKeyData.isSingleUse)
             {
                 //Users who created the share key can't expire their own key (in case they click it first)
                 //Otherwise if this share key is single use mark it as expired
-                if (!shareKeyCache.MarkShareKeyAsUsed(projectId, shareKey!))
+                if (!shareKeyCache.MarkShareKeyAsUsed(projectId, shareKey!, cancellationToken))
                 {
                     //Could fail due to share key already used (thread contention)
                     shareKeyData = null;
@@ -50,7 +51,7 @@ namespace UtilityDelta.Api.Services
             if (shareKeyData != null && currentAccessLevel.IncreasesAccessLevel(shareKeyData.accessLevel))
             {
                 //the current user gets an increase in their access level with the given share key
-                var accessEvent = userAccessCache.UpdateAccess(projectId, null, currentUserHash, shareKeyData.accessLevel, shareKeyData.description, false, shareKey);
+                var accessEvent = userAccessCache.UpdateAccess(projectId, null, currentUserHash, shareKeyData.accessLevel, shareKeyData.description, false, shareKey, cancellationToken);
                 return new DtoAccessInfo(shareKeyData.accessLevel.ToProjectAccess(), currentUserHash, accessEvent);
             }
 

@@ -1,6 +1,7 @@
 ﻿using NanoidDotNet;
 using System;
 using System.Collections.Concurrent;
+using System.Threading;
 using UtilityDelta.Api.Interfaces;
 using UtilityDelta.Api.Shared;
 
@@ -42,7 +43,8 @@ namespace UtilityDelta.Api.Services
             bool isSingleUse,
             string? description,
             long expiresOn,
-            bool readOnly)
+            bool readOnly,
+            CancellationToken cancellationToken)
         {
             var code = Nanoid.Generate();
             var hashedCode = code.CalculateHash();
@@ -50,7 +52,7 @@ namespace UtilityDelta.Api.Services
             var accessLevel = isOwner ? AccessLevel.Owner : readOnly ? AccessLevel.Viewer : AccessLevel.Contributor;
             var shareEvent = new ProjectEventItem(0, currentUserHash, 0, null, tp, t1: description, t2: accessLevel.ToString(), t3: hashedCode, n1: expiresOn);
 
-            var projectCache = GetOrBuildCache(projectId);
+            var projectCache = GetOrBuildCache(projectId, cancellationToken);
             lock (projectCache)
             {
                 if (projectCache.Count > MAX_SHARE_LINKS) return new DtoShare(null, null);
@@ -65,7 +67,7 @@ namespace UtilityDelta.Api.Services
             }
         }
 
-        private ProjectToShareKeys GetOrBuildCache(string projectId)
+        private ProjectToShareKeys GetOrBuildCache(string projectId, CancellationToken cancellationToken)
         {
             ClearCache();
 
@@ -86,14 +88,14 @@ namespace UtilityDelta.Api.Services
                 }
 
                 _cacheQueue.Enqueue(projectId);
-                PopulateCache(projectId, projectLookup!);
+                PopulateCache(projectId, projectLookup!, cancellationToken);
                 return projectLookup;
             }
         }
 
-        private void PopulateCache(string projectId, ProjectToShareKeys projectCache)
+        private void PopulateCache(string projectId, ProjectToShareKeys projectCache, CancellationToken cancellationToken)
         {
-            var relevantEvents = readEvents.Read(projectId, 0, null, null, [ProjectEventType.AddShareLink, ProjectEventType.AddSingleUseShareLink, ProjectEventType.DisableShareLink]);
+            var relevantEvents = readEvents.Read(projectId, 0, cancellationToken, null, null, [ProjectEventType.AddShareLink, ProjectEventType.AddSingleUseShareLink, ProjectEventType.DisableShareLink]);
 
             foreach (var eventItem in relevantEvents.events)
             {
@@ -119,9 +121,9 @@ namespace UtilityDelta.Api.Services
             projectCache.IsActiveCache = true;
         }
 
-        public DtoShareKeyData? GetShareKeyDataIfStillValid(string projectId, string shareKeyHash)
+        public DtoShareKeyData? GetShareKeyDataIfStillValid(string projectId, string shareKeyHash, CancellationToken cancellationToken)
         {
-            var projectCache = GetOrBuildCache(projectId);
+            var projectCache = GetOrBuildCache(projectId, cancellationToken);
 
             lock (projectCache)
             {
@@ -137,10 +139,10 @@ namespace UtilityDelta.Api.Services
             }
         }
 
-        public bool MarkShareKeyAsUsed(string projectId, string shareKeyHash)
+        public bool MarkShareKeyAsUsed(string projectId, string shareKeyHash, CancellationToken cancellationToken)
         {
             //Update share link cache - mark as used up
-            var projectCache = GetOrBuildCache(projectId);
+            var projectCache = GetOrBuildCache(projectId, cancellationToken);
 
             lock (projectCache)
             {

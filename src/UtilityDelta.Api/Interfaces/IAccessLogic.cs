@@ -1,4 +1,5 @@
-﻿using UtilityDelta.Api.Shared;
+﻿using System.Threading;
+using UtilityDelta.Api.Shared;
 
 namespace UtilityDelta.Api.Interfaces
 {
@@ -10,6 +11,7 @@ namespace UtilityDelta.Api.Interfaces
             string? shareKey,
             string publicKey,
             string nonce,
-            string sign);
+            string sign,
+            CancellationToken cancellationToken);
     }
 }

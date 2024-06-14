@@ -2,6 +2,7 @@
 using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Text;
+using UtilityDelta.Api.Exceptions;
 using UtilityDelta.Api.Interfaces;
 using UtilityDelta.Api.Shared;
 
@@ -11,13 +12,15 @@ namespace UtilityDelta.Api.Services
     {
         private const uint EVENT_VERSION = 1;
 
-        public DtoWrite WriteClientEvents(ProjectEventItem[] events, string createdBy, string pi)
+        public DtoWrite WriteClientEvents(ProjectEventItem[] events, string createdBy, string pi, CancellationToken cancellationToken)
         {
-            return InternalWrite(events.Where(x => !x.tp.IsServerEvent()), createdBy, pi);
+            return InternalWrite(events.Where(x => !x.tp.IsServerEvent()), createdBy, pi, cancellationToken);
         }
 
-        private DtoWrite InternalWrite(IEnumerable<ProjectEventItem> events, string? createdBy, string pi)
+        private DtoWrite InternalWrite(IEnumerable<ProjectEventItem> events, string? createdBy, string pi, CancellationToken cancellationToken)
         {
+            if (cancellationToken.IsCancellationRequested) throw new ExceptionCancelledOperation();
+
             //This call to get the stream is thread safe
             using var fileHandle = FileHandles.OpenWrite(pi);
 
@@ -32,6 +35,8 @@ namespace UtilityDelta.Api.Services
                 var eventDate = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
                 foreach (var item in events)
                 {
+                    if (cancellationToken.IsCancellationRequested) throw new ExceptionCancelledOperation();
+
                     latestId++;
                     WriteEvent(binaryWriter, createdBy, item.iv, (ushort)item.tp, eventDate, latestId, item.n1, item.t1, item.t2, item.t3);
                 }
@@ -44,7 +49,7 @@ namespace UtilityDelta.Api.Services
 
         public ProjectEventItem WriteServerEvent(ProjectEventItem eventItem, string pi)
         {
-            var writeResult = InternalWrite([eventItem], eventItem.cb, pi);
+            var writeResult = InternalWrite([eventItem], eventItem.cb, pi, CancellationToken.None);
             return new ProjectEventItem(writeResult.serverId, eventItem.cb, writeResult.eventDate, eventItem.iv, eventItem.tp, eventItem.t1, eventItem.t2, eventItem.t3, eventItem.n1);
         }
 
