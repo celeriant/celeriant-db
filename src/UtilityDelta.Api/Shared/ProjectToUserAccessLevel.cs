@@ -6,6 +6,8 @@
 
         public bool IsActiveCache { get; set; }
 
+        public int Count => _users.Count;
+
         public void UpdateCacheForUser(string currentUserHash, AccessLevel? accessLevel, bool allowOverrideExisting)
         {
             var hasExistingEntry = _users.TryGetValue(currentUserHash, out var userEntry);

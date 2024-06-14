@@ -12,6 +12,5 @@
 
     public record DtoShareKeyData(DateTime? expiresOn, AccessLevel accessLevel, string? description, string hashedCode, bool isSingleUse, string createdBy);
 
-    public record ProjectEventItem(long serverId, string? cb, long ed, string? iv, ProjectEventType tp, 
-        string? t1, string? t2, string? t3, double? n1);
+    public record ProjectEventItem(long serverId, string? cb, long ed, string? iv, ProjectEventType tp, string? t1, string? t2, string? t3, double? n1);
 }

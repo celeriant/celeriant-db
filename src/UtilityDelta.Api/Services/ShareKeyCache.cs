@@ -8,7 +8,32 @@ namespace UtilityDelta.Api.Services
 {
     public class ShareKeyCache(IWriteEvents writeEvents, IReadEvents readEvents) : IShareKeyCache
     {
+        private static ConcurrentQueue<string> _cacheQueue = new();
         private static ConcurrentDictionary<string, ProjectToShareKeys> _cache = new();
+        private static DateTime _lastClearedCache = DateTime.UtcNow;
+        private static TimeSpan _cacheCheckTime = TimeSpan.FromHours(1);
+        private const int MAX_CACHE_COUNT = 10000000;
+        private const int MAX_SHARE_LINKS = 100000;
+
+        private static void ClearCache()
+        {
+            if (DateTime.UtcNow.Subtract(_lastClearedCache) < _cacheCheckTime) return;
+
+            if (_cache.Count < MAX_CACHE_COUNT) return;
+
+            lock (_cacheQueue)
+            {
+                if (_cache.Count < MAX_CACHE_COUNT) return;
+
+                _lastClearedCache = DateTime.UtcNow;
+
+                while (_cache.Count > MAX_CACHE_COUNT)
+                {
+                    if (!_cacheQueue.TryDequeue(out var projectId)) break;
+                    _cache.TryRemove(projectId, out _);
+                }
+            }
+        }
 
         public DtoShare CreateShareLink(
             string projectId,
@@ -21,25 +46,29 @@ namespace UtilityDelta.Api.Services
         {
             var code = Nanoid.Generate();
             var hashedCode = code.CalculateHash();
-
             var tp = isSingleUse ? ProjectEventType.AddSingleUseShareLink : ProjectEventType.AddShareLink;
             var accessLevel = isOwner ? AccessLevel.Owner : readOnly ? AccessLevel.Viewer : AccessLevel.Contributor;
-
             var shareEvent = new ProjectEventItem(0, currentUserHash, 0, null, tp, t1: description, t2: accessLevel.ToString(), t3: hashedCode, n1: expiresOn);
-            shareEvent = writeEvents.WriteServerEvent(shareEvent, projectId);
 
-            //Update share cache - note ProjectToShareKeys is not thread-safe
-            var projectLookup = _cache.GetOrAdd(projectId, (x) => new ProjectToShareKeys());
-            lock (projectLookup)
+            var projectCache = GetOrBuildCache(projectId);
+            lock (projectCache)
             {
-                projectLookup.AddShareKey(new DtoShareKeyData(expiresOn == 0 ? null : expiresOn.FromUnixTimeSeconds(), accessLevel, description, hashedCode, isSingleUse, currentUserHash));
-            }
+                if (projectCache.Count > MAX_SHARE_LINKS) return new DtoShare(null, null);
 
-            return new DtoShare(code, shareEvent);
+                //Write the share event to the log
+                shareEvent = writeEvents.WriteServerEvent(shareEvent, projectId);
+
+                //Update share cache - note ProjectToShareKeys is not thread-safe
+                projectCache.AddShareKey(new DtoShareKeyData(expiresOn == 0 ? null : expiresOn.FromUnixTimeSeconds(), accessLevel, description, hashedCode, isSingleUse, currentUserHash));
+
+                return new DtoShare(code, shareEvent);
+            }
         }
 
         private ProjectToShareKeys GetOrBuildCache(string projectId)
         {
+            ClearCache();
+
             //Check cache
             var isInCache = _cache.TryGetValue(projectId, out var projectLookup);
             if (isInCache && projectLookup != null)
@@ -56,6 +85,7 @@ namespace UtilityDelta.Api.Services
                     return projectLookup;
                 }
 
+                _cacheQueue.Enqueue(projectId);
                 PopulateCache(projectId, projectLookup!);
                 return projectLookup;
             }
@@ -111,6 +141,7 @@ namespace UtilityDelta.Api.Services
         {
             //Update share link cache - mark as used up
             var projectCache = GetOrBuildCache(projectId);
+
             lock (projectCache)
             {
                 if (projectCache.DisableShareKey(shareKeyHash))

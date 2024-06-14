@@ -37,5 +37,7 @@
         }
 
         public bool IsActiveCache { get; set; }
+
+        public int Count => _shareKeys.Count;
     }
 }

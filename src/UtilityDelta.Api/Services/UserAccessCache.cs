@@ -6,7 +6,58 @@ namespace UtilityDelta.Api.Services
 {
     public class UserAccessCache(IWriteEvents writeEvents, IReadEvents readEvents) : IUserAccessCache
     {
+        private static ConcurrentQueue<string> _cacheQueue = new();
         private static ConcurrentDictionary<string, ProjectToUserAccessLevel> _cache = new();
+        private static DateTime _lastClearedCache = DateTime.UtcNow;
+        private static TimeSpan _cacheCheckTime = TimeSpan.FromHours(1);
+        private const int MAX_CACHE_COUNT = 10000000;
+        private const int MAX_USERS = 10000;
+
+        private static void ClearCache()
+        {
+            if (DateTime.UtcNow.Subtract(_lastClearedCache) < _cacheCheckTime) return;
+
+            if (_cache.Count < MAX_CACHE_COUNT) return;
+
+            lock (_cacheQueue)
+            {
+                if (_cache.Count < MAX_CACHE_COUNT) return;
+
+                _lastClearedCache = DateTime.UtcNow;
+
+                while (_cache.Count > MAX_CACHE_COUNT)
+                {
+                    if (!_cacheQueue.TryDequeue(out var projectId)) break;
+                    _cache.TryRemove(projectId, out _);
+                }
+            }
+        }
+
+        private ProjectToUserAccessLevel GetOrBuildCache(string projectId)
+        {
+            ClearCache();
+
+            //Check cache
+            var isInCache = _cache.TryGetValue(projectId, out var projectLookup);
+            if (isInCache && projectLookup != null)
+            {
+                return projectLookup;
+            }
+
+            //If not in cache, materialise and then cache project
+            projectLookup = _cache.GetOrAdd(projectId, (x) => new ProjectToUserAccessLevel());
+            lock (projectLookup)
+            {
+                if (projectLookup.IsActiveCache)
+                {
+                    return projectLookup;
+                }
+
+                _cacheQueue.Enqueue(projectId);
+                PopulateCache(projectId, projectLookup!);
+                return projectLookup;
+            }
+        }
 
         public ProjectEventItem? UpdateAccess(string projectId, string? currentUserHash, string forUserId, AccessLevel? potentialAccessLevel, string? description, bool allowDowngrade, string? shareKey)
         {
@@ -25,42 +76,32 @@ namespace UtilityDelta.Api.Services
             }
 
             var eventItem = new ProjectEventItem(0, currentUserHash, 0, null, ProjectEventType.ProvideAccess, description, forUserId, shareKey, (double?)potentialAccessLevel);
-            eventItem = writeEvents.WriteServerEvent(eventItem, projectId);
 
-            //Update access cache
-            var projectLookup = _cache.GetOrAdd(projectId, (x) => new ProjectToUserAccessLevel());
-            lock (projectLookup)
+            var projectCache = GetOrBuildCache(projectId);
+            lock (projectCache)
             {
-                projectLookup.UpdateCacheForUser(forUserId, potentialAccessLevel, allowDowngrade);
-            }
+                if (projectCache.Count > MAX_USERS) return null;
 
-            return eventItem;
+                //Write the user access event to the log
+                eventItem = writeEvents.WriteServerEvent(eventItem, projectId);
+
+                //Update access cache
+                projectCache.UpdateCacheForUser(forUserId, potentialAccessLevel, allowDowngrade);
+
+                return eventItem;
+            }
         }
 
         public AccessLevel? GetCurrentAccess(string projectId, string currentUserHash)
         {
-            //Check cache
-            var isInCache = _cache.TryGetValue(projectId, out var projectLookup);
-            if (isInCache && projectLookup != null)
-            {
-                return projectLookup.CurrentAccessLevelForUser(currentUserHash);
-            }
-
-            //If not in cache, materialise and then cache project
-            projectLookup = _cache.GetOrAdd(projectId, (x) => new ProjectToUserAccessLevel());
+            var projectLookup = GetOrBuildCache(projectId);
             lock (projectLookup)
             {
-                if (projectLookup.IsActiveCache)
-                {
-                    return projectLookup.CurrentAccessLevelForUser(currentUserHash);
-                }
-
-                PopulateUserAccessLevelCache(projectId, projectLookup!);
                 return projectLookup.CurrentAccessLevelForUser(currentUserHash);
             }
         }
 
-        private void PopulateUserAccessLevelCache(string projectId, ProjectToUserAccessLevel projectLookup)
+        private void PopulateCache(string projectId, ProjectToUserAccessLevel projectLookup)
         {
             var relevantEvents = readEvents.Read(projectId, 0, null, ProjectEventType.ProvideAccess);
 
