@@ -106,7 +106,7 @@ namespace UtilityDelta.Api.Shared
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static string ContainerPath(this string container) 
-            => Path.Combine(Constants.SUB_DIR_CONTAINERS, container);
+        public static string ContainerPath(this string container, string folder) 
+            => Path.Combine(folder, container);
     }
 }

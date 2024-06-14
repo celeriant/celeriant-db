@@ -8,10 +8,8 @@ using UtilityDelta.Api.Shared;
 
 namespace UtilityDelta.Api.Services
 {
-    public class WriteEvents : IWriteEvents
+    public class WriteEvents(IFileHandlesManager fileHandlesManager) : IWriteEvents
     {
-        private const uint EVENT_VERSION = 1;
-
         public DtoWrite WriteClientEvents(ProjectEventItem[] events, string createdBy, string pi, CancellationToken cancellationToken)
         {
             return InternalWrite(events.Where(x => !x.tp.IsServerEvent()), createdBy, pi, cancellationToken);
@@ -22,7 +20,7 @@ namespace UtilityDelta.Api.Services
             if (cancellationToken.IsCancellationRequested) throw new ExceptionCancelledOperation();
 
             //This call to get the stream is thread safe
-            using var fileHandle = FileHandles.OpenWrite(pi);
+            using var fileHandle = fileHandlesManager.OpenWrite(pi);
 
             //Must lock while writing to disk - only one writer at a time.
             lock (fileHandle.Stream)
@@ -58,7 +56,7 @@ namespace UtilityDelta.Api.Services
         {
             var pos1 = binaryWriter.BaseStream.Position;
 
-            binaryWriter.Write(EVENT_VERSION);
+            binaryWriter.Write(Constants.EVENT_VERSION);
             binaryWriter.WriteNullable(t1);
             binaryWriter.WriteNullable(t2);
             binaryWriter.WriteNullable(t3);

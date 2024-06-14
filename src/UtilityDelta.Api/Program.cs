@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Http.HttpResults;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Options;
 using NanoidDotNet;
 using System.Globalization;
 using System.Net;
@@ -159,7 +160,8 @@ public class Program
         api.MapPost("/share", Share);
         api.MapPost("/write", Write);
 
-        Directory.CreateDirectory(Constants.SUB_DIR_CONTAINERS);
+        var udConfig = app.Services.GetService<IOptions<ConfigurationEntry>>()!;
+        Directory.CreateDirectory(udConfig.Value.SUB_DIR_CONTAINERS);
 
         app.Run();
     }
@@ -202,6 +204,10 @@ public class Program
         builder.Services.AddSingleton<IAccessLogic, AccessLogic>();
         builder.Services.AddSingleton<IShareKeyCache, ShareKeyCache>();
         builder.Services.AddSingleton<IUserAccessCache, UserAccessCache>();
+        builder.Services.AddSingleton<IFileHandlesManager, FileHandlesManager>();
+
+        var utilityDeltaConfiguration = builder.Configuration.GetSection("UtilityDelta");
+        builder.Services.Configure<ConfigurationEntry>(utilityDeltaConfiguration);
 
         var app = builder.Build();
         app.UseCors("CorsDevelopment");

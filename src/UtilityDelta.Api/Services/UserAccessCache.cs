@@ -1,31 +1,30 @@
-﻿using System.Collections.Concurrent;
+﻿using Microsoft.Extensions.Options;
+using System.Collections.Concurrent;
 using UtilityDelta.Api.Interfaces;
 using UtilityDelta.Api.Shared;
 
 namespace UtilityDelta.Api.Services
 {
-    public class UserAccessCache(IWriteEvents writeEvents, IReadEvents readEvents) : IUserAccessCache
+    public class UserAccessCache(IWriteEvents writeEvents, IReadEvents readEvents, IOptions<ConfigurationEntry> utilityDeltaConfiguration) : IUserAccessCache
     {
-        private static ConcurrentQueue<string> _cacheQueue = new();
-        private static ConcurrentDictionary<string, ProjectToUserAccessLevel> _cache = new();
-        private static DateTime _lastClearedCache = DateTime.UtcNow;
-        private static TimeSpan _cacheCheckTime = TimeSpan.FromHours(1);
-        private const int MAX_CACHE_COUNT = 10000000;
-        private const int MAX_USERS = 10000;
+        private ConcurrentQueue<string> _cacheQueue = new();
+        private ConcurrentDictionary<string, ProjectToUserAccessLevel> _cache = new();
+        private DateTime _lastClearedCache = DateTime.UtcNow;
+        private TimeSpan _cacheCheckTime = TimeSpan.FromHours(utilityDeltaConfiguration.Value.CACHE_CHECK_TIME_HOURS);
 
-        private static void ClearCache()
+        private void ClearCache()
         {
             if (DateTime.UtcNow.Subtract(_lastClearedCache) < _cacheCheckTime) return;
 
-            if (_cache.Count < MAX_CACHE_COUNT) return;
+            if (_cache.Count < utilityDeltaConfiguration.Value.CACHE_MAX_PROJECT_COUNT) return;
 
             lock (_cacheQueue)
             {
-                if (_cache.Count < MAX_CACHE_COUNT) return;
+                if (_cache.Count < utilityDeltaConfiguration.Value.CACHE_MAX_PROJECT_COUNT) return;
 
                 _lastClearedCache = DateTime.UtcNow;
 
-                while (_cache.Count > MAX_CACHE_COUNT)
+                while (_cache.Count > utilityDeltaConfiguration.Value.CACHE_MAX_PROJECT_COUNT)
                 {
                     if (!_cacheQueue.TryDequeue(out var projectId)) break;
                     _cache.TryRemove(projectId, out _);
@@ -80,7 +79,7 @@ namespace UtilityDelta.Api.Services
             var projectCache = GetOrBuildCache(projectId, cancellationToken);
             lock (projectCache)
             {
-                if (projectCache.Count > MAX_USERS) return null;
+                if (projectCache.Count > utilityDeltaConfiguration.Value.CACHE_MAX_USERS_PER_PROJECT) return null;
 
                 //Write the user access event to the log
                 eventItem = writeEvents.WriteServerEvent(eventItem, projectId);

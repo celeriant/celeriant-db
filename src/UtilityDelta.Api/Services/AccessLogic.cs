@@ -4,7 +4,7 @@ using UtilityDelta.Api.Shared;
 
 namespace UtilityDelta.Api.Services
 {
-    public class AccessLogic(ICrypto crypto, IUserAccessCache userAccessCache, IShareKeyCache shareKeyCache) : IAccessLogic
+    public class AccessLogic(IFileHandlesManager fileHandlesManager, ICrypto crypto, IUserAccessCache userAccessCache, IShareKeyCache shareKeyCache) : IAccessLogic
     {
         public DtoAccessInfo IsProjectExistAndHasAccess(
             string projectId,
@@ -22,7 +22,7 @@ namespace UtilityDelta.Api.Services
             //The orignal sharekey is not store in event stream, only its hash
             shareKey = shareKey?.CalculateHash();
 
-            if (!FileHandles.Exists(projectId))
+            if (!fileHandlesManager.Exists(projectId))
             {
                 //No record of this project, either return not exists or auto-create it for the user and give them owner access
                 if (!createProjectIfNotExists) return new DtoAccessInfo(ProjectAccess.NotExists, currentUserHash, null);

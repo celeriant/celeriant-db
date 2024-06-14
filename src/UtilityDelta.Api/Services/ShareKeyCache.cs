@@ -1,4 +1,5 @@
-﻿using NanoidDotNet;
+﻿using Microsoft.Extensions.Options;
+using NanoidDotNet;
 using System;
 using System.Collections.Concurrent;
 using System.Threading;
@@ -7,28 +8,26 @@ using UtilityDelta.Api.Shared;
 
 namespace UtilityDelta.Api.Services
 {
-    public class ShareKeyCache(IWriteEvents writeEvents, IReadEvents readEvents) : IShareKeyCache
+    public class ShareKeyCache(IWriteEvents writeEvents, IReadEvents readEvents, IOptions<ConfigurationEntry> utilityDeltaConfiguration) : IShareKeyCache
     {
-        private static ConcurrentQueue<string> _cacheQueue = new();
-        private static ConcurrentDictionary<string, ProjectToShareKeys> _cache = new();
-        private static DateTime _lastClearedCache = DateTime.UtcNow;
-        private static TimeSpan _cacheCheckTime = TimeSpan.FromHours(1);
-        private const int MAX_CACHE_COUNT = 10000000;
-        private const int MAX_SHARE_LINKS = 100000;
+        private ConcurrentQueue<string> _cacheQueue = new();
+        private ConcurrentDictionary<string, ProjectToShareKeys> _cache = new();
+        private DateTime _lastClearedCache = DateTime.UtcNow;
+        private TimeSpan _cacheCheckTime = TimeSpan.FromHours(utilityDeltaConfiguration.Value.CACHE_CHECK_TIME_HOURS);
 
-        private static void ClearCache()
+        private void ClearCache()
         {
             if (DateTime.UtcNow.Subtract(_lastClearedCache) < _cacheCheckTime) return;
 
-            if (_cache.Count < MAX_CACHE_COUNT) return;
+            if (_cache.Count < utilityDeltaConfiguration.Value.CACHE_MAX_PROJECT_COUNT) return;
 
             lock (_cacheQueue)
             {
-                if (_cache.Count < MAX_CACHE_COUNT) return;
+                if (_cache.Count < utilityDeltaConfiguration.Value.CACHE_MAX_PROJECT_COUNT) return;
 
                 _lastClearedCache = DateTime.UtcNow;
 
-                while (_cache.Count > MAX_CACHE_COUNT)
+                while (_cache.Count > utilityDeltaConfiguration.Value.CACHE_MAX_PROJECT_COUNT)
                 {
                     if (!_cacheQueue.TryDequeue(out var projectId)) break;
                     _cache.TryRemove(projectId, out _);
@@ -55,7 +54,7 @@ namespace UtilityDelta.Api.Services
             var projectCache = GetOrBuildCache(projectId, cancellationToken);
             lock (projectCache)
             {
-                if (projectCache.Count > MAX_SHARE_LINKS) return new DtoShare(null, null);
+                if (projectCache.Count > utilityDeltaConfiguration.Value.CACHE_MAX_SHARE_LINKS_PER_PROJECT) return new DtoShare(null, null);
 
                 //Write the share event to the log
                 shareEvent = writeEvents.WriteServerEvent(shareEvent, projectId);

@@ -1,4 +1,5 @@
-﻿using System;
+﻿using Microsoft.Extensions.Options;
+using System;
 using System.Linq;
 using System.Text;
 using UtilityDelta.Api.Exceptions;
@@ -7,16 +8,16 @@ using UtilityDelta.Api.Shared;
 
 namespace UtilityDelta.Api.Services
 {
-    public class ReadEvents : IReadEvents
+    public class ReadEvents(IOptions<ConfigurationEntry> utilityDeltaConfiguration, IFileHandlesManager fileHandlesManager) : IReadEvents
     {
         private static DtoRead EMPTY = new DtoRead(new List<ProjectEventItem>(), 0);
 
         public DtoRead Read(string container, long fromEventId, CancellationToken cancellationToken, string? currentUserHash = null, ProjectEventType? filterEventType = null, HashSet<ProjectEventType>? multiFilterEventType = null)
         {
-            if (!FileHandles.Exists(container)) return EMPTY;
+            if (!fileHandlesManager.Exists(container)) return EMPTY;
             if (cancellationToken.IsCancellationRequested) throw new ExceptionCancelledOperation();
 
-            var path = container.ContainerPath();
+            var path = container.ContainerPath(utilityDeltaConfiguration.Value.SUB_DIR_CONTAINERS);
 
             using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
             using var reader = new BinaryReader(stream, Encoding.UTF8, true);
