@@ -5,6 +5,7 @@ using NanoidDotNet;
 using System.Globalization;
 using System.Net;
 using System.Text.Json.Serialization;
+using System.Threading.RateLimiting;
 using UtilityDelta.Api.Interfaces;
 using UtilityDelta.Api.Services;
 using UtilityDelta.Api.Shared;
@@ -166,6 +167,20 @@ public class Program
         app.Run();
     }
 
+    public class MyRateLimitOptions
+    {
+        public const string MyRateLimit = "MyRateLimit";
+        public int PermitLimit { get; set; } = 100;
+        public int Window { get; set; } = 10;
+        public int ReplenishmentPeriod { get; set; } = 2;
+        public int QueueLimit { get; set; } = 2;
+        public int SegmentsPerWindow { get; set; } = 8;
+        public int TokenLimit { get; set; } = 10;
+        public int TokenLimit2 { get; set; } = 20;
+        public int TokensPerPeriod { get; set; } = 4;
+        public bool AutoReplenishment { get; set; } = false;
+    }
+
     private static WebApplication SetupApplication(string[] args)
     {
         var builder = WebApplication.CreateSlimBuilder(args);
@@ -175,27 +190,61 @@ public class Program
             options.SerializerOptions.TypeInfoResolverChain.Insert(0, ReadSerializerContext.Default);
         });
 
+        var isDevelopment = builder.Environment.IsDevelopment();
+
+        if (!isDevelopment)
+        {
+            builder.Services.AddRateLimiter((limiterOptions) =>
+            {
+                limiterOptions.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, IPAddress>(context =>
+                {
+                    var myOptions = new MyRateLimitOptions();
+                    IPAddress? remoteIpAddress = context.Connection.RemoteIpAddress;
+
+                    if (!IPAddress.IsLoopback(remoteIpAddress!))
+                    {
+                        return RateLimitPartition.GetTokenBucketLimiter
+                        (remoteIpAddress!, _ =>
+                            new TokenBucketRateLimiterOptions
+                            {
+                                TokenLimit = myOptions.TokenLimit2,
+                                QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+                                QueueLimit = myOptions.QueueLimit,
+                                ReplenishmentPeriod = TimeSpan.FromSeconds(myOptions.ReplenishmentPeriod),
+                                TokensPerPeriod = myOptions.TokensPerPeriod,
+                                AutoReplenishment = myOptions.AutoReplenishment
+                            });
+                    }
+
+                    return RateLimitPartition.GetNoLimiter(IPAddress.Loopback);
+                });
+            });
+        }
+
         builder.Services.AddCors(
             (options) => options.AddPolicy("CorsDevelopment",
                     builder =>
                     {
-                        builder
-                        .WithOrigins("http://localhost:5173")
-                        .AllowAnyMethod()
-                        .AllowAnyHeader()
-                        .AllowCredentials();
+                        if (isDevelopment)
+                        {
+                            builder
+                                .WithOrigins("http://localhost:5173")
+                                .AllowAnyMethod()
+                                .AllowAnyHeader()
+                                .AllowCredentials();
+                        }
 
                         builder
-                        .WithOrigins("https://app.utilitydelta.io")
-                        .AllowAnyMethod()
-                        .AllowAnyHeader()
-                        .AllowCredentials();
+                            .WithOrigins("https://app.utilitydelta.io")
+                            .AllowAnyMethod()
+                            .AllowAnyHeader()
+                            .AllowCredentials();
 
                         builder
-                        .WithOrigins("https://test.utilitydelta.io")
-                        .AllowAnyMethod()
-                        .AllowAnyHeader()
-                        .AllowCredentials();
+                            .WithOrigins("https://test.utilitydelta.io")
+                            .AllowAnyMethod()
+                            .AllowAnyHeader()
+                            .AllowCredentials();
                     }));
 
         builder.Services.AddSingleton<ICrypto, Crypto>();
