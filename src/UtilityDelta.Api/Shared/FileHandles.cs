@@ -7,7 +7,7 @@ namespace UtilityDelta.Api.Shared
         string container, 
         ConcurrentDictionary<string, FileStream> _containerFileStreams, 
         ConcurrentDictionary<string, int> _isInUse, 
-        Action<string, FileStream?> _disposeIfStreamNotInUse) : IDisposable
+        Func<string, FileStream?, bool> _disposeIfStreamNotInUse) : IDisposable
     {
         public FileStream Stream => stream;
 
