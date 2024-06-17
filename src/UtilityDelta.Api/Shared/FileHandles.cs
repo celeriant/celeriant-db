@@ -11,8 +11,6 @@ namespace UtilityDelta.Api.Shared
     {
         public FileStream Stream => stream;
 
-        public string Container => container;
-
         public void Dispose()
         {
             //Here we DO NOT dispose of the stream, instead keeping it in memory ready for the next write operation

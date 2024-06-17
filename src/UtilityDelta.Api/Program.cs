@@ -260,6 +260,11 @@ public class Program
 
         var app = builder.Build();
         app.UseCors("CorsDevelopment");
+
+        if (!isDevelopment)
+        {
+            app.UseRateLimiter();
+        }
         return app;
     }
 }

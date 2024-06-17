@@ -8,6 +8,5 @@
         public int CACHE_MAX_SHARE_LINKS_PER_PROJECT { get; set; }
         public int CACHE_MAX_PROJECT_COUNT { get; set; }
         public double CACHE_CHECK_TIME_HOURS { get; set; }
-        public string[] CORS_SITES { get; set; } = [];
     }
 }

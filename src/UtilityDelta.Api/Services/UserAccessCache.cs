@@ -110,10 +110,6 @@ namespace UtilityDelta.Api.Services
 
                 switch (eventItem.tp)
                 {
-                    case ProjectEventType.RemoveProjectMember:
-                        projectLookup.UpdateCacheForUser(eventItem.t2!, null, true);
-                        break;
-
                     case ProjectEventType.ProvideAccess:
                         projectLookup.UpdateCacheForUser(eventItem.t2!, (AccessLevel?)eventItem.n1, true);
                         break;

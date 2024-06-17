@@ -49,7 +49,7 @@ namespace UtilityDelta.Api.Services
             var hashedCode = code.CalculateHash();
             var tp = isSingleUse ? ProjectEventType.AddSingleUseShareLink : ProjectEventType.AddShareLink;
             var accessLevel = isOwner ? AccessLevel.Owner : readOnly ? AccessLevel.Viewer : AccessLevel.Contributor;
-            var shareEvent = new ProjectEventItem(0, currentUserHash, 0, null, tp, t1: description, t2: accessLevel.ToString(), t3: hashedCode, n1: expiresOn);
+            var shareEvent = new ProjectEventItem(0, currentUserHash, 0, null, tp, t1: description, t2: accessLevel.ToString(), t3: hashedCode, n1: expiresOn > 0 ? expiresOn : null);
 
             var projectCache = GetOrBuildCache(projectId, cancellationToken);
             lock (projectCache)
@@ -149,7 +149,7 @@ namespace UtilityDelta.Api.Services
                 {
                     //Write used up event to log
                     var eventItem = new ProjectEventItem(0, null, 0, null, ProjectEventType.DisableShareLink, shareKeyHash, null, null, null);
-                    eventItem = writeEvents.WriteServerEvent(eventItem, projectId);
+                    _ = writeEvents.WriteServerEvent(eventItem, projectId);
 
                     return true;
                 }
