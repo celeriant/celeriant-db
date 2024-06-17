@@ -15,6 +15,7 @@ using UtilityDelta.Api.Shared;
 [JsonSerializable(typeof(DtoRead))]
 [JsonSerializable(typeof(DtoShare))]
 [JsonSerializable(typeof(DtoWrite))]
+[JsonSerializable(typeof(DtoDisableAccess))]
 public partial class ReadSerializerContext : JsonSerializerContext
 {
 
