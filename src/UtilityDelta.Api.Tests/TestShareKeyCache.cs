@@ -111,14 +111,14 @@ namespace UtilityDelta.Api.Tests
         {
 
             //Now we can check if the key is in the cache by requesting it
-            var keyData = service.GetShareKeyDataIfStillValid(pi, result.shareKey.CalculateHash(), CancellationToken.None);
+            var keyData = service.GetShareKeyDataIfStillValid(pi, result.shareKey!.CalculateHash(), CancellationToken.None);
             Assert.IsNotNull(keyData);
 
             var expiresOnDateTime = expiresOnLong > 0 ? (DateTime?)expiresOnLong.FromUnixTimeSeconds() : null;
             Assert.AreEqual(expiresOnDateTime, keyData.expiresOn);
             Assert.AreEqual(accessLevel, keyData.accessLevel);
             Assert.AreEqual(description, keyData.description);
-            Assert.AreEqual(result.shareKey.CalculateHash(), keyData.hashedCode);
+            Assert.AreEqual(result.shareKey!.CalculateHash(), keyData.hashedCode);
             Assert.AreEqual(isSingleUse, keyData.isSingleUse);
             Assert.AreEqual("tyson", keyData.createdBy);
 

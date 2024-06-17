@@ -8,7 +8,7 @@
 
     public record DtoDisableAccess(ProjectEventItem? disableAccessEvent);
 
-    public record DtoAccessInfo(ProjectAccess ProjectAccess, string CurrentUserHash, ProjectEventItem? AccessEvent);
+    public record DtoAccessInfo(ProjectAccess ProjectAccess, string CurrentUserHash);
 
     public record DtoShareKeyData(DateTime? expiresOn, AccessLevel accessLevel, string? description, string hashedCode, bool isSingleUse, string createdBy);
 

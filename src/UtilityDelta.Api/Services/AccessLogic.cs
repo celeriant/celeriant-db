@@ -25,11 +25,11 @@ namespace UtilityDelta.Api.Services
             if (!fileHandlesManager.Exists(projectId))
             {
                 //No record of this project, either return not exists or auto-create it for the user and give them owner access
-                if (!createProjectIfNotExists) return new DtoAccessInfo(ProjectAccess.NotExists, currentUserHash, null);
+                if (!createProjectIfNotExists) return new DtoAccessInfo(ProjectAccess.NotExists, currentUserHash);
 
-                var accessEvent = userAccessCache.UpdateAccess(projectId, null, currentUserHash, AccessLevel.Owner, "Project creator", false, null, cancellationToken);
+                userAccessCache.UpdateAccess(projectId, null, currentUserHash, AccessLevel.Owner, "Project creator", false, null, cancellationToken);
 
-                return new DtoAccessInfo(ProjectAccess.OwnerAccess, currentUserHash, accessEvent);
+                return new DtoAccessInfo(ProjectAccess.OwnerAccess, currentUserHash);
             }
 
             var currentAccessLevel = userAccessCache.GetCurrentAccess(projectId, currentUserHash, cancellationToken);
@@ -51,17 +51,17 @@ namespace UtilityDelta.Api.Services
             if (shareKeyData != null && currentAccessLevel.IncreasesAccessLevel(shareKeyData.accessLevel))
             {
                 //the current user gets an increase in their access level with the given share key
-                var accessEvent = userAccessCache.UpdateAccess(projectId, null, currentUserHash, shareKeyData.accessLevel, shareKeyData.description, false, shareKey, cancellationToken);
-                return new DtoAccessInfo(shareKeyData.accessLevel.ToProjectAccess(), currentUserHash, accessEvent);
+                userAccessCache.UpdateAccess(projectId, null, currentUserHash, shareKeyData.accessLevel, shareKeyData.description, false, shareKey, cancellationToken);
+                return new DtoAccessInfo(shareKeyData.accessLevel.ToProjectAccess(), currentUserHash);
             }
 
             //No current access and no current sharekey
             if (!currentAccessLevel.HasValue)
             {
-                return new DtoAccessInfo(ProjectAccess.NoAccess, currentUserHash, null);
+                return new DtoAccessInfo(ProjectAccess.NoAccess, currentUserHash);
             }
 
-            return new DtoAccessInfo(currentAccessLevel.Value.ToProjectAccess(), currentUserHash, null);
+            return new DtoAccessInfo(currentAccessLevel.Value.ToProjectAccess(), currentUserHash);
         }
     }
 }
