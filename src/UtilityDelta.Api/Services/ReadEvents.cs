@@ -23,6 +23,7 @@ namespace UtilityDelta.Api.Services
             using var reader = new BinaryReader(stream, Encoding.UTF8, true);
 
             //Step 1 is to find the start of the events we want to read
+
             if (fromEventId > 0)
             {
                 long offsetFromEnd = 0;
@@ -47,7 +48,6 @@ namespace UtilityDelta.Api.Services
 
             //Step 2 we read all the events from that position to the end of the stream
             var events = new List<ProjectEventItem>();
-            long lastServerId = fromEventId;
             while (stream.Position < stream.Length)
             {
                 reader.ReadUInt32(); //Version
@@ -60,7 +60,7 @@ namespace UtilityDelta.Api.Services
                 var tp = (ProjectEventType)reader.ReadUInt16();
                 var ed = reader.ReadInt64();
                 var cb = reader.ReadStringNullable();
-                lastServerId = reader.ReadInt64();
+                var serverId = reader.ReadInt64();
                 reader.ReadInt32(); //totalSize
 
                 //Don't bother creating the object model if we don't want this type of event(s)
@@ -70,10 +70,14 @@ namespace UtilityDelta.Api.Services
                 //Don't bother creating the object model if this is the current user
                 if (currentUserHash != null && cb == currentUserHash) continue;
 
-                events.Add(new ProjectEventItem(lastServerId, cb, ed, iv, tp, t1, t2, t3, n1));
+                events.Add(new ProjectEventItem(serverId, cb, ed, iv, tp, t1, t2, t3, n1));
 
                 if (cancellationToken.IsCancellationRequested) throw new ExceptionCancelledOperation();
             }
+
+            //Finally always return the last id in the event log
+            stream.Seek(Constants.OFFSET_BYTES_FOR_GETTING_EVENTID * -1, SeekOrigin.End);
+            var lastServerId = reader.ReadInt64();
 
             return new DtoRead(events, lastServerId);
         }

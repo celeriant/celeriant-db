@@ -12,10 +12,15 @@ namespace UtilityDelta.Api.Services
     {
         public DtoWrite WriteClientEvents(ProjectEventItem[] events, string createdBy, string pi, CancellationToken cancellationToken)
         {
-            return InternalWrite(events.Where(x => !x.tp.IsServerEvent()), createdBy, pi, cancellationToken);
+            return InternalWrite(events.Where(x => !x.tp.IsServerEvent()), createdBy, pi, DateTimeOffset.UtcNow.ToUnixTimeSeconds(), cancellationToken);
         }
 
-        private DtoWrite InternalWrite(IEnumerable<ProjectEventItem> events, string? createdBy, string pi, CancellationToken cancellationToken)
+        public DtoWrite CustomWriteEvents(ProjectEventItem[] events, string pi, CancellationToken cancellationToken)
+        {
+            return InternalWrite(events, null, pi, null, cancellationToken);
+        }
+
+        private DtoWrite InternalWrite(IEnumerable<ProjectEventItem> events, string? createdBy, string pi, long? eventDate, CancellationToken cancellationToken)
         {
             if (cancellationToken.IsCancellationRequested) throw new ExceptionCancelledOperation();
 
@@ -30,24 +35,23 @@ namespace UtilityDelta.Api.Services
 
                 using var binaryWriter = new BinaryWriter(fileHandle.Stream, Encoding.UTF8, true);
 
-                var eventDate = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
                 foreach (var item in events)
                 {
                     if (cancellationToken.IsCancellationRequested) throw new ExceptionCancelledOperation();
 
                     latestId++;
-                    WriteEvent(binaryWriter, createdBy, item.iv, (ushort)item.tp, eventDate, latestId, item.n1, item.t1, item.t2, item.t3);
+                    WriteEvent(binaryWriter, createdBy ?? item.cb, item.iv, (ushort)item.tp, eventDate ?? item.ed, latestId, item.n1, item.t1, item.t2, item.t3);
                 }
 
                 binaryWriter.Flush();
 
-                return new DtoWrite(latestId, eventDate);
+                return new DtoWrite(latestId, eventDate ?? 0);
             }
         }
 
         public ProjectEventItem WriteServerEvent(ProjectEventItem eventItem, string pi)
         {
-            var writeResult = InternalWrite([eventItem], eventItem.cb, pi, CancellationToken.None);
+            var writeResult = InternalWrite([eventItem], eventItem.cb, pi, DateTimeOffset.UtcNow.ToUnixTimeSeconds(), CancellationToken.None);
             return new ProjectEventItem(writeResult.serverId, eventItem.cb, writeResult.eventDate, eventItem.iv, eventItem.tp, eventItem.t1, eventItem.t2, eventItem.t3, eventItem.n1);
         }
 

@@ -9,7 +9,9 @@ Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "UtilityDelta.Realtime", "Ut
 EndProject
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "UtilityDelta.Api.Tests", "UtilityDelta.Api.Tests\UtilityDelta.Api.Tests.csproj", "{02D1254E-FC24-49E7-AE0C-8D56A5C0A858}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "UtilityDelta.Api.IntegrationTests", "UtilityDelta.Api.IntegrationTests\UtilityDelta.Api.IntegrationTests.csproj", "{5460F69E-886B-41EF-B64A-D4F0885DED40}"
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "UtilityDelta.Api.IntegrationTests", "UtilityDelta.Api.IntegrationTests\UtilityDelta.Api.IntegrationTests.csproj", "{5460F69E-886B-41EF-B64A-D4F0885DED40}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "UtilityDelta.Api.CosmosToOwnDb", "UtilityDelta.Api.CosmosToOwnDb\UtilityDelta.Api.CosmosToOwnDb.csproj", "{84FCA068-F826-4AFC-A51C-F8A979018666}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -33,6 +35,10 @@ Global
 		{5460F69E-886B-41EF-B64A-D4F0885DED40}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{5460F69E-886B-41EF-B64A-D4F0885DED40}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{5460F69E-886B-41EF-B64A-D4F0885DED40}.Release|Any CPU.Build.0 = Release|Any CPU
+		{84FCA068-F826-4AFC-A51C-F8A979018666}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{84FCA068-F826-4AFC-A51C-F8A979018666}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{84FCA068-F826-4AFC-A51C-F8A979018666}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{84FCA068-F826-4AFC-A51C-F8A979018666}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
