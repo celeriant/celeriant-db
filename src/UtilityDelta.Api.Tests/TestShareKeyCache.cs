@@ -74,8 +74,8 @@ namespace UtilityDelta.Api.Tests
             GetKeyDataAndAssert(isSingleUse, description, readEvents, service, pi, expiresOnLong, accessLevel, result);
 
             //Disable logic - try to disable but wrong key
-            var resultDisable1 = service.MarkShareKeyAsUsed(pi, "some other key", CancellationToken.None);
-            Assert.IsFalse(resultDisable1);
+            var resultDisable1 = service.MarkShareKeyAsUsed(pi, null, "some other key", CancellationToken.None);
+            Assert.IsFalse(resultDisable1 != null);
 
             //Assert we did not write an event
             writeEvents.Verify(x => x.WriteServerEvent(It.Is<ProjectEventItem>(y => y.tp == ProjectEventType.DisableShareLink), pi), Times.Never);
@@ -87,19 +87,22 @@ namespace UtilityDelta.Api.Tests
                 "some other project", 0, CancellationToken.None, null, null,
                 It.Is<HashSet<ProjectEventType>>(y => y.Count == 3 && y.Contains(ProjectEventType.AddShareLink) && y.Contains(ProjectEventType.AddSingleUseShareLink) && y.Contains(ProjectEventType.DisableShareLink))))
                 .Returns(new DtoRead([], 6));
-            _ = service.MarkShareKeyAsUsed("some other project", result.shareKey.CalculateHash(), CancellationToken.None);
+            _ = service.MarkShareKeyAsUsed("some other project", null, result.shareKey.CalculateHash(), CancellationToken.None);
+
+            writeEvents.Setup(x => x.WriteServerEvent(It.Is<ProjectEventItem>(y => y.tp == ProjectEventType.DisableShareLink && y.t1 == result.shareKey.CalculateHash()), pi))
+                .Returns(new ProjectEventItem(0, null, 0, null, ProjectEventType.AddItemToStandup, null, null, null, null));
 
             //Disable the link - should disable in the cache and write an event
-            var resultDisable2 = service.MarkShareKeyAsUsed(pi, result.shareKey.CalculateHash(), CancellationToken.None);
+            var resultDisable2 = service.MarkShareKeyAsUsed(pi, null, result.shareKey.CalculateHash(), CancellationToken.None);
 
             if (CACHE_MAX_PROJECT_COUNT == 1)
             {
                 //Triggers a cache reload, and our mock returns no share events, so disable returns failure
-                Assert.IsFalse(resultDisable2);
+                Assert.IsFalse(resultDisable2 != null);
                 return;
             }
 
-            Assert.IsTrue(resultDisable2);
+            Assert.IsTrue(resultDisable2 != null);
             writeEvents.Verify(x => x.WriteServerEvent(It.Is<ProjectEventItem>(y => y.tp == ProjectEventType.DisableShareLink && y.t1 == result.shareKey.CalculateHash()), pi), Times.Once);
 
             var keyDataNone = service.GetShareKeyDataIfStillValid(pi, result.shareKey.CalculateHash(), CancellationToken.None);
@@ -159,12 +162,15 @@ namespace UtilityDelta.Api.Tests
                 }, 17));
 
 
-            var resultDisable1 = service.MarkShareKeyAsUsed(pi, "hashedcode2", CancellationToken.None);
-            Assert.IsFalse(resultDisable1);
+            var resultDisable1 = service.MarkShareKeyAsUsed(pi, null, "hashedcode2", CancellationToken.None);
+            Assert.IsFalse(resultDisable1 != null);
             writeEvents.Verify(x => x.WriteServerEvent(It.Is<ProjectEventItem>(y => y.tp == ProjectEventType.DisableShareLink), pi), Times.Never);
 
-            var resultDisable2 = service.MarkShareKeyAsUsed(pi, "hashedcode1", CancellationToken.None);
-            Assert.IsTrue(resultDisable2);
+            writeEvents.Setup(x => x.WriteServerEvent(It.Is<ProjectEventItem>(y => y.tp == ProjectEventType.DisableShareLink && y.t1 == "hashedcode1"), pi))
+                .Returns(new ProjectEventItem(0,null,0,null,ProjectEventType.AddItemToStandup,null,null,null,null));
+
+            var resultDisable2 = service.MarkShareKeyAsUsed(pi, null, "hashedcode1", CancellationToken.None);
+            Assert.IsTrue(resultDisable2 != null);
             writeEvents.Verify(x => x.WriteServerEvent(It.Is<ProjectEventItem>(y => y.tp == ProjectEventType.DisableShareLink && y.t1 == "hashedcode1"), pi), Times.Once);
 
             //Hit the cache, don't read a second time

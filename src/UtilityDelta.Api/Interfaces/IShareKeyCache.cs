@@ -17,6 +17,6 @@ namespace UtilityDelta.Api.Interfaces
         /// <summary>
         /// Disables the share key - could be a single use key or a user is manually de-activating the share key
         /// </summary>
-        bool MarkShareKeyAsUsed(string projectId, string shareKeyHash, CancellationToken cancellationToken);
+        ProjectEventItem? MarkShareKeyAsUsed(string projectId, string? currentUserHash, string shareKeyHash, CancellationToken cancellationToken);
     }
 }

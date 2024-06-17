@@ -37,8 +37,8 @@ namespace UtilityDelta.Api.Tests
             {
                 shareKeyCache.Setup(x => x.GetShareKeyDataIfStillValid(pi, "wrongsharekey".CalculateHash(), CancellationToken.None))
                     .Returns(new DtoShareKeyData(null, AccessLevel.Owner, null, "kljsdfj", true, "kjlf"));
-                shareKeyCache.Setup(x => x.MarkShareKeyAsUsed(pi, "wrongsharekey".CalculateHash(), CancellationToken.None))
-                    .Returns(false);
+                shareKeyCache.Setup(x => x.MarkShareKeyAsUsed(pi, null, "wrongsharekey".CalculateHash(), CancellationToken.None))
+                    .Returns((ProjectEventItem?)null);
             }
 
             var service = new AccessLogic(fileHandlesManager.Object, crypto.Object, userAccessCache.Object, shareKeyCache.Object);
@@ -54,7 +54,7 @@ namespace UtilityDelta.Api.Tests
             }
             if (sharekeyClaimFailed)
             {
-                shareKeyCache.Verify(x => x.MarkShareKeyAsUsed(pi, "wrongsharekey".CalculateHash(), CancellationToken.None), Times.Once);
+                shareKeyCache.Verify(x => x.MarkShareKeyAsUsed(pi, null, "wrongsharekey".CalculateHash(), CancellationToken.None), Times.Once);
             }
             crypto.Verify(x => x.ValidateWithPublicKey("publicKey", "nonce", "sign"), Times.Once);
             userAccessCache.Verify(x => x.UpdateAccess(pi, null, result.CurrentUserHash, AccessLevel.Owner, "Project creator", false, null, CancellationToken.None), Times.Never);
@@ -110,7 +110,7 @@ namespace UtilityDelta.Api.Tests
             Assert.AreEqual(cb, result.CurrentUserHash);
 
             shareKeyCache.Verify(x => x.GetShareKeyDataIfStillValid(pi, shareKeyHash, CancellationToken.None), Times.Once());
-            shareKeyCache.Verify(x => x.MarkShareKeyAsUsed(pi, shareKeyHash, CancellationToken.None), Times.Never);
+            shareKeyCache.Verify(x => x.MarkShareKeyAsUsed(pi, null, shareKeyHash, CancellationToken.None), Times.Never);
 
             crypto.Verify(x => x.ValidateWithPublicKey("publicKey", "nonce", "sign"), Times.Once);
             userAccessCache.Verify(x => x.UpdateAccess(
@@ -152,7 +152,7 @@ namespace UtilityDelta.Api.Tests
                 shareKeyCache.Verify(x => x.GetShareKeyDataIfStillValid(pi, shareKeyHash, CancellationToken.None), Times.Once());
 
                 //As its not own share key we must expire it even though it provides no extra access
-                shareKeyCache.Verify(x => x.MarkShareKeyAsUsed(pi, shareKeyHash, CancellationToken.None), Times.Once());
+                shareKeyCache.Verify(x => x.MarkShareKeyAsUsed(pi, null, shareKeyHash, CancellationToken.None), Times.Once());
             }
 
             crypto.Verify(x => x.ValidateWithPublicKey("publicKey", "nonce", "sign"), Times.Once);

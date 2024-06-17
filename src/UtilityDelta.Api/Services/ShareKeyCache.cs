@@ -138,7 +138,7 @@ namespace UtilityDelta.Api.Services
             }
         }
 
-        public bool MarkShareKeyAsUsed(string projectId, string shareKeyHash, CancellationToken cancellationToken)
+        public ProjectEventItem? MarkShareKeyAsUsed(string projectId, string? currentUserHash, string shareKeyHash, CancellationToken cancellationToken)
         {
             //Update share link cache - mark as used up
             var projectCache = GetOrBuildCache(projectId, cancellationToken);
@@ -148,14 +148,14 @@ namespace UtilityDelta.Api.Services
                 if (projectCache.DisableShareKey(shareKeyHash))
                 {
                     //Write used up event to log
-                    var eventItem = new ProjectEventItem(0, null, 0, null, ProjectEventType.DisableShareLink, shareKeyHash, null, null, null);
-                    _ = writeEvents.WriteServerEvent(eventItem, projectId);
+                    var eventItem = new ProjectEventItem(0, currentUserHash, 0, null, ProjectEventType.DisableShareLink, shareKeyHash, null, null, null);
+                    eventItem = writeEvents.WriteServerEvent(eventItem, projectId);
 
-                    return true;
+                    return eventItem;
                 }
             }
 
-            return false;
+            return null;
         }
     }
 }

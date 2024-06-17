@@ -41,7 +41,7 @@ namespace UtilityDelta.Api.Services
             {
                 //Users who created the share key can't expire their own key (in case they click it first)
                 //Otherwise if this share key is single use mark it as expired
-                if (!shareKeyCache.MarkShareKeyAsUsed(projectId, shareKey!, cancellationToken))
+                if (shareKeyCache.MarkShareKeyAsUsed(projectId, null, shareKey!, cancellationToken) == null)
                 {
                     //Could fail due to share key already used (thread contention)
                     shareKeyData = null;

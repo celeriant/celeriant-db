@@ -54,6 +54,36 @@ public class Program
         });
     }
 
+    private static async Task<IResult> DisableShare(
+        [FromQuery] string pi,
+        [FromQuery] string publicKey,
+        [FromQuery] string nonce,
+        [FromQuery] string sign,
+        [FromQuery] string shareKeyHash,
+        CancellationToken cancellationToken,
+        [FromServices] IShareKeyCache shareKeyCache,
+        [FromServices] IAccessLogic accessLogic)
+    {
+        return await Task.Run(() =>
+        {
+            var accessInfo = accessLogic.IsProjectExistAndHasAccess(
+                projectId: pi,
+                createProjectIfNotExists: false,
+                shareKey: null,
+                publicKey: publicKey,
+                nonce: nonce,
+                sign: sign,
+                cancellationToken: cancellationToken);
+
+            return accessInfo.ProjectAccess switch
+            {
+                ProjectAccess.NotExists => Results.NotFound(),
+                ProjectAccess.OwnerAccess => Results.Ok(new DtoDisableAccess(shareKeyCache.MarkShareKeyAsUsed(pi, accessInfo.CurrentUserHash, shareKeyHash, cancellationToken))),
+                _ => Results.StatusCode(StatusCodes.Status403Forbidden)
+            };
+        });
+    }
+
     private static async Task<IResult> DisableUser(
         [FromQuery] string pi,
         [FromQuery] string publicKey,
@@ -158,6 +188,7 @@ public class Program
         
         api.MapGet("/read", Read);
         api.MapPost("/disableuser", DisableUser);
+        api.MapPost("/disableshare", DisableShare);
         api.MapPost("/share", Share);
         api.MapPost("/write", Write);
 
