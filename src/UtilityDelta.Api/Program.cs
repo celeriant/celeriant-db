@@ -27,12 +27,14 @@ public class Program
         var app = SetupApplication(args);
 
         var api = app.MapGroup("/api");
-        
-        api.MapGet("/read", Read);
-        api.MapPost("/disableuser", DisableUser);
-        api.MapPost("/disableshare", DisableShare);
-        api.MapPost("/share", Share);
-        api.MapPost("/write", Write);
+
+        var endpoints = app.Services.GetService<IEndpoints>()!;
+
+        api.MapGet("/read", endpoints.Read);
+        api.MapPost("/disableuser", endpoints.DisableUser);
+        api.MapPost("/disableshare", endpoints.DisableShare);
+        api.MapPost("/share", endpoints.Share);
+        api.MapPost("/write", endpoints.Write);
 
         var udConfig = app.Services.GetService<IOptions<ConfigurationEntry>>()!;
         Directory.CreateDirectory(udConfig.Value.SUB_DIR_CONTAINERS);
@@ -127,6 +129,7 @@ public class Program
         builder.Services.AddSingleton<IShareKeyCache, ShareKeyCache>();
         builder.Services.AddSingleton<IUserAccessCache, UserAccessCache>();
         builder.Services.AddSingleton<IFileHandlesManager, FileHandlesManager>();
+        builder.Services.AddSingleton<IEndpoints, Endpoints>();
 
         var utilityDeltaConfiguration = builder.Configuration.GetSection("UtilityDelta");
         builder.Services.Configure<ConfigurationEntry>(utilityDeltaConfiguration);

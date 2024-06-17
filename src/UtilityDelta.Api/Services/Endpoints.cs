@@ -4,9 +4,9 @@ using UtilityDelta.Api.Shared;
 
 namespace UtilityDelta.Api.Services
 {
-    public class Endpoints(IAccessLogic accessLogic, IReadEvents readEvents, IWriteEvents writeEvents, IShareKeyCache shareKeyCache, IUserAccessCache userAccessCache)
+    public class Endpoints(IAccessLogic accessLogic, IReadEvents readEvents, IWriteEvents writeEvents, IShareKeyCache shareKeyCache, IUserAccessCache userAccessCache) : IEndpoints
     {
-        private async Task<IResult> Read(
+        public async Task<IResult> Read(
             [FromQuery] string pi,
             [FromQuery] string publicKey,
             [FromQuery] string nonce,
@@ -19,13 +19,13 @@ namespace UtilityDelta.Api.Services
             return await Task.Run(() =>
             {
                 var accessInfo = accessLogic.IsProjectExistAndHasAccess(
-                projectId: pi,
-                createProjectIfNotExists: createIfNotExist && fromTime == 0,
-                shareKey: shareKey,
-                publicKey: publicKey,
-                nonce: nonce,
-                sign: sign,
-                cancellationToken: cancellationToken);
+                    projectId: pi,
+                    createProjectIfNotExists: createIfNotExist && fromTime == 0,
+                    shareKey: shareKey,
+                    publicKey: publicKey,
+                    nonce: nonce,
+                    sign: sign,
+                    cancellationToken: cancellationToken);
 
                 return accessInfo.ProjectAccess switch
                 {
@@ -36,7 +36,7 @@ namespace UtilityDelta.Api.Services
             });
         }
 
-        private async Task<IResult> DisableShare(
+        public async Task<IResult> DisableShare(
             [FromQuery] string pi,
             [FromQuery] string publicKey,
             [FromQuery] string nonce,
@@ -64,7 +64,7 @@ namespace UtilityDelta.Api.Services
             });
         }
 
-        private async Task<IResult> DisableUser(
+        public async Task<IResult> DisableUser(
             [FromQuery] string pi,
             [FromQuery] string publicKey,
             [FromQuery] string nonce,
@@ -75,13 +75,13 @@ namespace UtilityDelta.Api.Services
             return await Task.Run(() =>
             {
                 var accessInfo = accessLogic.IsProjectExistAndHasAccess(
-                projectId: pi,
-                createProjectIfNotExists: false,
-                shareKey: null,
-                publicKey: publicKey,
-                nonce: nonce,
-                sign: sign,
-                cancellationToken: cancellationToken);
+                    projectId: pi,
+                    createProjectIfNotExists: false,
+                    shareKey: null,
+                    publicKey: publicKey,
+                    nonce: nonce,
+                    sign: sign,
+                    cancellationToken: cancellationToken);
 
                 return accessInfo.ProjectAccess switch
                 {
@@ -92,7 +92,7 @@ namespace UtilityDelta.Api.Services
             });
         }
 
-        private async Task<IResult> Share(
+        public async Task<IResult> Share(
             [FromQuery] string pi,
             [FromQuery] string publicKey,
             [FromQuery] string nonce,
@@ -107,13 +107,13 @@ namespace UtilityDelta.Api.Services
             return await Task.Run(() =>
             {
                 var accessInfo = accessLogic.IsProjectExistAndHasAccess(
-                projectId: pi,
-                createProjectIfNotExists: false,
-                shareKey: null,
-                publicKey: publicKey,
-                nonce: nonce,
-                sign: sign,
-                cancellationToken: cancellationToken);
+                    projectId: pi,
+                    createProjectIfNotExists: false,
+                    shareKey: null,
+                    publicKey: publicKey,
+                    nonce: nonce,
+                    sign: sign,
+                    cancellationToken: cancellationToken);
 
                 return accessInfo.ProjectAccess switch
                 {
@@ -124,7 +124,7 @@ namespace UtilityDelta.Api.Services
             });
         }
 
-        private async Task<IResult> Write(
+        public async Task<IResult> Write(
             [FromQuery] string pi,
             [FromQuery] string publicKey,
             [FromQuery] string nonce,
@@ -137,7 +137,7 @@ namespace UtilityDelta.Api.Services
             {
                 var accessInfo = accessLogic.IsProjectExistAndHasAccess(
                     projectId: pi,
-                    createProjectIfNotExists: false,
+                    createProjectIfNotExists: createIfNotExist,
                     shareKey: null,
                     publicKey: publicKey,
                     nonce: nonce,

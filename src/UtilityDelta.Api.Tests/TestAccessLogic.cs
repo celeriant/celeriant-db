@@ -162,5 +162,44 @@ namespace UtilityDelta.Api.Tests
 
         }
 
+        //Project exists, user has access, Attempt to use share key, but current user already has that access level. No event created (ignore share key)
+        [TestMethod]
+        public void ShareKeyRequired()
+        {
+            var pi = "myproject1";
+            var cb = "publicKey".CalculateHash();
+            var shareKey = "mysharekey";
+            var shareKeyHash = shareKey.CalculateHash();
+
+            var fileHandlesManager = new Mock<IFileHandlesManager>();
+            var crypto = new Mock<ICrypto>();
+            var userAccessCache = new Mock<IUserAccessCache>();
+            var shareKeyCache = new Mock<IShareKeyCache>();
+
+            userAccessCache.Setup(x => x.GetCurrentAccess(pi, cb, CancellationToken.None)).Returns((AccessLevel?)null);
+            fileHandlesManager.Setup(x => x.Exists(pi)).Returns(true);
+            shareKeyCache.Setup(x => x.GetShareKeyDataIfStillValid(pi, shareKeyHash, CancellationToken.None))
+                .Returns(new DtoShareKeyData(null, AccessLevel.Viewer, null, shareKeyHash, true, "anotheruserhash"));
+            shareKeyCache.Setup(x => x.MarkShareKeyAsUsed(pi, null, shareKeyHash, CancellationToken.None)).Returns(new ProjectEventItem(0,null,0,null, ProjectEventType.AddTask, null, null, null, null));
+
+            var service = new AccessLogic(fileHandlesManager.Object, crypto.Object, userAccessCache.Object, shareKeyCache.Object);
+
+            var result = service.IsProjectExistAndHasAccess(pi, false, shareKey, "publicKey", "nonce", "sign", CancellationToken.None);
+
+            Assert.AreEqual(ProjectAccess.ReadOnlyAccess, result.ProjectAccess);
+            Assert.AreEqual(cb, result.CurrentUserHash);
+
+            shareKeyCache.Verify(x => x.GetShareKeyDataIfStillValid(pi, shareKeyHash, CancellationToken.None), Times.Once());
+
+            //As its not own share key we must expire it even though it provides no extra access
+            shareKeyCache.Verify(x => x.MarkShareKeyAsUsed(pi, null, shareKeyHash, CancellationToken.None), Times.Once());
+
+            crypto.Verify(x => x.ValidateWithPublicKey("publicKey", "nonce", "sign"), Times.Once);
+
+            userAccessCache.Verify(x => x.UpdateAccess(
+                pi, null, cb, AccessLevel.Viewer, null, false, shareKeyHash, CancellationToken.None), Times.Once);
+
+        }
+
     }
 }
