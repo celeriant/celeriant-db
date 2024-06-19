@@ -82,7 +82,7 @@ namespace UtilityDelta.Api.CosmosToOwnDb
             //    Console.WriteLine($"\rud1: {counter["ud1"]/(double)total}% | ud2: {counter["ud2"] / (double)total}%");
             //}
 
-            var loadFor = args[0];
+            var loadFor = Environment.MachineName;
 
             var cosmosContainers = new CosmosContainers(COSMOS_ENDPOINT, COSMOS_KEY);
             await cosmosContainers.Initialise();
@@ -97,6 +97,20 @@ namespace UtilityDelta.Api.CosmosToOwnDb
             foreach (var project in projects)
             {
                 var allEvents = await serviceQueries.GetEventsAll(project);
+                if (allEvents.Count == 0) continue;
+
+                //Fix up the ed
+                long currentED = allEvents[0].ed - 1;
+                foreach (var eventItem in allEvents)
+                {
+                    if (eventItem.ed <= currentED)
+                    {
+                        eventItem.ed = currentED + 1;
+                    }
+
+                    currentED = eventItem.ed;
+                }
+
                 var allProjectAccess = await serviceQueries.GetAllProjectAccess(project);
                 var allShareLinks = await serviceQueries.GetAllShareLinks(project);
                 var bucket = new ProjectBucket(project, allEvents, allProjectAccess, allShareLinks);
