@@ -152,7 +152,7 @@ namespace UtilityDelta.Api.CosmosToOwnDb
             utilityDeltaConfiguration.Setup(x => x.Value).Returns(new ConfigurationEntry()
             {
                 FILE_HANDLE_OPEN_LIMIT = 1000,
-                SUB_DIR_CONTAINERS = "C:\\containers",
+                SUB_DIR_CONTAINERS = "/mnt/nvme0n1p1/containers",
                 CACHE_CHECK_TIME_HOURS = 1,
                 CACHE_MAX_PROJECT_COUNT = 1000,
                 CACHE_MAX_SHARE_LINKS_PER_PROJECT = 1000,
