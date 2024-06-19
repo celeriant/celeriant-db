@@ -13,10 +13,9 @@ namespace UtilityDelta.Api.IntegrationTests
         private static string endpoint = "/api/write";
         private static string endpointRead = "/api/read";
 
+
         static async Task Main(string[] args)
         {
-            Console.WriteLine("Hello, World!");
-
             var assymetric = RSA.Create();
             var publicKeyPEM = assymetric.ExportRSAPublicKeyPem();
             var createdBy = MD5.HashData(Encoding.UTF8.GetBytes(publicKeyPEM));

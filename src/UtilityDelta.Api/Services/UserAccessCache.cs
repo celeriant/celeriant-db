@@ -5,7 +5,7 @@ using UtilityDelta.Api.Shared;
 
 namespace UtilityDelta.Api.Services
 {
-    public class UserAccessCache(IWriteEvents writeEvents, IReadEvents readEvents, IOptions<ConfigurationEntry> utilityDeltaConfiguration) : IUserAccessCache
+    public class UserAccessCache(IWriteAndBackup writeAndBackup, IReadEvents readEvents, IOptions<ConfigurationEntry> utilityDeltaConfiguration) : IUserAccessCache
     {
         private ConcurrentQueue<string> _cacheQueue = new();
         private ConcurrentDictionary<string, ProjectToUserAccessLevel> _cache = new();
@@ -82,7 +82,7 @@ namespace UtilityDelta.Api.Services
                 if (projectCache.Count > utilityDeltaConfiguration.Value.CACHE_MAX_USERS_PER_PROJECT) return null;
 
                 //Write the user access event to the log
-                eventItem = writeEvents.WriteServerEvent(eventItem, projectId);
+                eventItem = writeAndBackup.WriteServerEvent(eventItem, projectId);
 
                 //Update access cache
                 projectCache.UpdateCacheForUser(forUserId, potentialAccessLevel, allowDowngrade);

@@ -8,7 +8,7 @@ using UtilityDelta.Api.Shared;
 
 namespace UtilityDelta.Api.Services
 {
-    public class ShareKeyCache(IWriteEvents writeEvents, IReadEvents readEvents, IOptions<ConfigurationEntry> utilityDeltaConfiguration) : IShareKeyCache
+    public class ShareKeyCache(IWriteAndBackup writeAndBackup, IReadEvents readEvents, IOptions<ConfigurationEntry> utilityDeltaConfiguration) : IShareKeyCache
     {
         private ConcurrentQueue<string> _cacheQueue = new();
         private ConcurrentDictionary<string, ProjectToShareKeys> _cache = new();
@@ -57,7 +57,7 @@ namespace UtilityDelta.Api.Services
                 if (projectCache.Count > utilityDeltaConfiguration.Value.CACHE_MAX_SHARE_LINKS_PER_PROJECT) return new DtoShare(null, null);
 
                 //Write the share event to the log
-                shareEvent = writeEvents.WriteServerEvent(shareEvent, projectId);
+                shareEvent = writeAndBackup.WriteServerEvent(shareEvent, projectId);
 
                 //Update share cache - note ProjectToShareKeys is not thread-safe
                 projectCache.AddShareKey(new DtoShareKeyData(expiresOn == 0 ? null : expiresOn.FromUnixTimeSeconds(), accessLevel, description, hashedCode, isSingleUse, currentUserHash));
@@ -149,7 +149,7 @@ namespace UtilityDelta.Api.Services
                 {
                     //Write used up event to log
                     var eventItem = new ProjectEventItem(0, currentUserHash, 0, null, ProjectEventType.DisableShareLink, shareKeyHash, null, null, null);
-                    eventItem = writeEvents.WriteServerEvent(eventItem, projectId);
+                    eventItem = writeAndBackup.WriteServerEvent(eventItem, projectId);
 
                     return eventItem;
                 }

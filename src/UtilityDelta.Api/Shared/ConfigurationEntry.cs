@@ -8,5 +8,9 @@
         public int CACHE_MAX_SHARE_LINKS_PER_PROJECT { get; set; }
         public int CACHE_MAX_PROJECT_COUNT { get; set; }
         public double CACHE_CHECK_TIME_HOURS { get; set; }
+        public int CLOUD_UPLOAD_FREQUENCY { get; set; }
+        public string CLOUD_STORAGE_CONNECTION { get; set; } = string.Empty;
+        public int APPEND_BLOB_MAX_COMMITS { get; set; }
+        public int APPEND_BLOB_MAX_CHUNK_SIZE { get; set; }
     }
 }

@@ -2,6 +2,8 @@
 using Moq;
 using System.Globalization;
 using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
 using UtilityDelta.Api.Services;
 using UtilityDelta.Api.Shared;
 using UtilityDelta.WebAPI.Services;
@@ -47,8 +49,41 @@ namespace UtilityDelta.Api.CosmosToOwnDb
         private const string COSMOS_ENDPOINT = "https://au-utilitydelta.documents.azure.com:443";
         private const string COSMOS_KEY = "AZURE_COSMOS_KEY_REDACTED_PRE_PUBLICATION_SEE_PROVENANCE_MD";
 
+        static byte HashProjectId(string projectId)
+        {
+            using (SHA256 sha256 = SHA256.Create())
+            {
+                byte[] bytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(projectId));
+                return bytes[0];
+            }
+        }
+
+        static string GetServer(string projectId)
+        {
+            int hash = HashProjectId(projectId);
+            // Using bitwise AND with 1 to check if the hash is even or odd
+            return (hash % 2) == 0 ? "ud1" : "ud2";
+        }
+
         static async Task Main(string[] args)
         {
+            //var counter = new Dictionary<string, int>();
+            //counter.Add("ud1", 0);
+            //counter.Add("ud2", 0);
+            //int total = 0;
+            //while (true)
+            //{
+            //    var sample = NanoidDotNet.Nanoid.Generate();
+            //    var server = GetServer(sample);
+            //    counter[server] = counter[server]+1;
+
+            //    total++;
+
+            //    Console.WriteLine($"\rud1: {counter["ud1"]/(double)total}% | ud2: {counter["ud2"] / (double)total}%");
+            //}
+
+            var loadFor = args[0];
+
             var cosmosContainers = new CosmosContainers(COSMOS_ENDPOINT, COSMOS_KEY);
             await cosmosContainers.Initialise();
 
@@ -65,7 +100,10 @@ namespace UtilityDelta.Api.CosmosToOwnDb
                 var allProjectAccess = await serviceQueries.GetAllProjectAccess(project);
                 var allShareLinks = await serviceQueries.GetAllShareLinks(project);
                 var bucket = new ProjectBucket(project, allEvents, allProjectAccess, allShareLinks);
-                buckets.Add(bucket);
+                if (GetServer(project) == loadFor)
+                {
+                    buckets.Add(bucket);
+                }
 
                 //if (MY_PROJECTS.ContainsKey(project))
                 //{

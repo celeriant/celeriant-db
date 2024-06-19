@@ -4,7 +4,7 @@ using UtilityDelta.Api.Shared;
 
 namespace UtilityDelta.Api.Services
 {
-    public class Endpoints(IAccessLogic accessLogic, IReadEvents readEvents, IWriteEvents writeEvents, IShareKeyCache shareKeyCache, IUserAccessCache userAccessCache) : IEndpoints
+    public class Endpoints(IAccessLogic accessLogic, IReadEvents readEvents, IWriteAndBackup writeAndBackup, IShareKeyCache shareKeyCache, IUserAccessCache userAccessCache) : IEndpoints
     {
         public async Task<IResult> Read(
             [FromQuery] string pi,
@@ -149,7 +149,7 @@ namespace UtilityDelta.Api.Services
                     ProjectAccess.NotExists => Results.NotFound(),
                     ProjectAccess.NoAccess => Results.StatusCode(StatusCodes.Status403Forbidden),
                     ProjectAccess.ReadOnlyAccess => Results.StatusCode(StatusCodes.Status403Forbidden),
-                    _ => Results.Ok(writeEvents.WriteClientEvents(events, accessInfo.CurrentUserHash, pi, cancellationToken))
+                    _ => Results.Ok(writeAndBackup.WriteClientEvents(events, accessInfo.CurrentUserHash, pi, cancellationToken))
                 };
             });
         }

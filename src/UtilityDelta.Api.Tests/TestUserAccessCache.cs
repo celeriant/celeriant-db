@@ -32,7 +32,7 @@ namespace UtilityDelta.Api.Tests
                 CACHE_MAX_USERS_PER_PROJECT = 3
             });
 
-            var writeEvents = new Mock<IWriteEvents>();
+            var writeEvents = new Mock<IWriteAndBackup>();
             var readEvents = new Mock<IReadEvents>();
             readEvents.Setup(x => x.Read(pi1, 0, CancellationToken.None, null, ProjectEventType.ProvideAccess, null)).Returns(new DtoRead([], 0));
 

@@ -40,6 +40,9 @@ public class Program
         var udConfig = app.Services.GetService<IOptions<ConfigurationEntry>>()!;
         Directory.CreateDirectory(udConfig.Value.SUB_DIR_CONTAINERS);
 
+        var writeAndBackup = app.Services.GetService<IWriteAndBackup>()!;
+        _ = Task.Run(writeAndBackup.ProcessQueue);
+
         app.Run();
     }
 
@@ -126,6 +129,7 @@ public class Program
         builder.Services.AddSingleton<ICrypto, Crypto>();
         builder.Services.AddSingleton<IReadEvents, ReadEvents>();
         builder.Services.AddSingleton<IWriteEvents, WriteEvents>();
+        builder.Services.AddSingleton<IWriteAndBackup, WriteAndBackup>();
         builder.Services.AddSingleton<IAccessLogic, AccessLogic>();
         builder.Services.AddSingleton<IShareKeyCache, ShareKeyCache>();
         builder.Services.AddSingleton<IUserAccessCache, UserAccessCache>();

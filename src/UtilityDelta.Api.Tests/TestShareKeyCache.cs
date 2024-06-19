@@ -38,7 +38,7 @@ namespace UtilityDelta.Api.Tests
                 CACHE_MAX_USERS_PER_PROJECT = 3
             });
 
-            var writeEvents = new Mock<IWriteEvents>();
+            var writeEvents = new Mock<IWriteAndBackup>();
             var readEvents = new Mock<IReadEvents>();
             var service = new ShareKeyCache(writeEvents.Object, readEvents.Object, utilityDeltaConfiguration.Object);
 
@@ -144,7 +144,7 @@ namespace UtilityDelta.Api.Tests
                 CACHE_MAX_USERS_PER_PROJECT = 3
             });
 
-            var writeEvents = new Mock<IWriteEvents>();
+            var writeEvents = new Mock<IWriteAndBackup>();
             var readEvents = new Mock<IReadEvents>();
             var service = new ShareKeyCache(writeEvents.Object, readEvents.Object, utilityDeltaConfiguration.Object);
 

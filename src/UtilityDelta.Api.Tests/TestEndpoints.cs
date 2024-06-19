@@ -27,7 +27,7 @@ namespace UtilityDelta.Api.Tests
         {
             var accessLogic = new Mock<IAccessLogic>();
             var readEvents = new Mock<IReadEvents>();
-            var writeEvents = new Mock<IWriteEvents>();
+            var writeEvents = new Mock<IWriteAndBackup>();
             var shareKeyCache = new Mock<IShareKeyCache>();
             var userAccessCache = new Mock<IUserAccessCache>();
 
@@ -89,7 +89,7 @@ namespace UtilityDelta.Api.Tests
         {
             var accessLogic = new Mock<IAccessLogic>();
             var readEvents = new Mock<IReadEvents>();
-            var writeEvents = new Mock<IWriteEvents>();
+            var writeEvents = new Mock<IWriteAndBackup>();
             var shareKeyCache = new Mock<IShareKeyCache>();
             var userAccessCache = new Mock<IUserAccessCache>();
 
@@ -152,7 +152,7 @@ namespace UtilityDelta.Api.Tests
         {
             var accessLogic = new Mock<IAccessLogic>();
             var readEvents = new Mock<IReadEvents>();
-            var writeEvents = new Mock<IWriteEvents>();
+            var writeEvents = new Mock<IWriteAndBackup>();
             var shareKeyCache = new Mock<IShareKeyCache>();
             var userAccessCache = new Mock<IUserAccessCache>();
 
@@ -189,7 +189,7 @@ namespace UtilityDelta.Api.Tests
         {
             var accessLogic = new Mock<IAccessLogic>();
             var readEvents = new Mock<IReadEvents>();
-            var writeEvents = new Mock<IWriteEvents>();
+            var writeEvents = new Mock<IWriteAndBackup>();
             var shareKeyCache = new Mock<IShareKeyCache>();
             var userAccessCache = new Mock<IUserAccessCache>();
 
@@ -228,7 +228,7 @@ namespace UtilityDelta.Api.Tests
         {
             var accessLogic = new Mock<IAccessLogic>();
             var readEvents = new Mock<IReadEvents>();
-            var writeEvents = new Mock<IWriteEvents>();
+            var writeEvents = new Mock<IWriteAndBackup>();
             var shareKeyCache = new Mock<IShareKeyCache>();
             var userAccessCache = new Mock<IUserAccessCache>();
 
