@@ -7,7 +7,7 @@ namespace UtilityDelta.Api.Interfaces
         /// <summary>
         /// Create a new share key, log it to the event stream and add it to the active cache.
         /// </summary>
-        DtoShare CreateShareLink(string pi, string currentUserHash, bool isOwner, bool singleUse, string? description, long expiresOn, bool readOnly, CancellationToken cancellationToken);
+        DtoShare CreateShareLink(string pi, string currentUserHash, bool isOwner, bool singleUse, string? iv, string? description, long expiresOn, bool readOnly, CancellationToken cancellationToken);
 
         /// <summary>
         /// If the request presents with a sharekey, check if there is a match for that project in the event log. The request is cached.

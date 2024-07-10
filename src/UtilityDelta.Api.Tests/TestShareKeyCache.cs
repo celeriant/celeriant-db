@@ -26,6 +26,7 @@ namespace UtilityDelta.Api.Tests
             int CACHE_MAX_PROJECT_COUNT)
         {
             string? description = "test description";
+            string? iv = "test iv";
 
             var utilityDeltaConfiguration = new Mock<IOptions<ConfigurationEntry>>();
             utilityDeltaConfiguration.Setup(x => x.Value).Returns(new ConfigurationEntry()
@@ -54,7 +55,7 @@ namespace UtilityDelta.Api.Tests
 
             var tp = isSingleUse ? ProjectEventType.AddSingleUseShareLink : ProjectEventType.AddShareLink;
             var accessLevel = isOwner ? AccessLevel.Owner : readOnly ? AccessLevel.Viewer : AccessLevel.Contributor;
-            var shareEvent = new ProjectEventItem(0, "tyson", 0, null, tp, t1: description, t2: accessLevel.ToString(), t3: "hashedCode", n1: expiresOnLong > 0 ? expiresOnLong : null);
+            var shareEvent = new ProjectEventItem(0, "tyson", 0, iv, tp, t1: description, t2: accessLevel.ToString(), t3: "hashedCode", n1: expiresOnLong > 0 ? expiresOnLong : null);
 
             //The event is written to the stream
             writeEvents!.Setup(x => x.WriteServerEvent(It.Is<ProjectEventItem>(y =>
@@ -66,7 +67,7 @@ namespace UtilityDelta.Api.Tests
                 y.t3 != null
                 ), pi)).Returns(shareEvent);
 
-            var result = service!.CreateShareLink(pi, "tyson", isOwner, isSingleUse, description, expiresOnLong, readOnly, CancellationToken.None);
+            var result = service!.CreateShareLink(pi, "tyson", isOwner, isSingleUse, iv, description, expiresOnLong, readOnly, CancellationToken.None);
 
             Assert.AreEqual(shareEvent, result.shareEvent);
             Assert.IsNotNull(result.shareKey);

@@ -40,6 +40,7 @@ namespace UtilityDelta.Api.Services
             string currentUserHash,
             bool isOwner,
             bool isSingleUse,
+            string? iv,
             string? description,
             long expiresOn,
             bool readOnly,
@@ -49,7 +50,7 @@ namespace UtilityDelta.Api.Services
             var hashedCode = code.CalculateHash();
             var tp = isSingleUse ? ProjectEventType.AddSingleUseShareLink : ProjectEventType.AddShareLink;
             var accessLevel = isOwner ? AccessLevel.Owner : readOnly ? AccessLevel.Viewer : AccessLevel.Contributor;
-            var shareEvent = new ProjectEventItem(0, currentUserHash, 0, null, tp, t1: description, t2: accessLevel.ToString(), t3: hashedCode, n1: expiresOn > 0 ? expiresOn : null);
+            var shareEvent = new ProjectEventItem(0, currentUserHash, 0, iv, tp, t1: description, t2: accessLevel.ToString(), t3: hashedCode, n1: expiresOn > 0 ? expiresOn : null);
 
             var projectCache = GetOrBuildCache(projectId, cancellationToken);
             lock (projectCache)
@@ -60,7 +61,7 @@ namespace UtilityDelta.Api.Services
                 shareEvent = writeAndBackup.WriteServerEvent(shareEvent, projectId);
 
                 //Update share cache - note ProjectToShareKeys is not thread-safe
-                projectCache.AddShareKey(new DtoShareKeyData(expiresOn == 0 ? null : expiresOn.FromUnixTimeSeconds(), accessLevel, description, hashedCode, isSingleUse, currentUserHash));
+                projectCache.AddShareKey(new DtoShareKeyData(expiresOn == 0 ? null : expiresOn.FromUnixTimeSeconds(), accessLevel, iv, description, hashedCode, isSingleUse, currentUserHash));
 
                 return new DtoShare(code, shareEvent);
             }
@@ -105,6 +106,7 @@ namespace UtilityDelta.Api.Services
                         projectCache.AddShareKey(new DtoShareKeyData(
                             expiresOn: eventItem.n1 == null ? null : ((long)eventItem.n1.Value).FromUnixTimeSeconds(),
                             accessLevel: Enum.Parse<AccessLevel>(eventItem.t2!),
+                            iv: eventItem.iv,
                             description: eventItem.t1,
                             hashedCode: eventItem.t3!,
                             isSingleUse: eventItem.tp == ProjectEventType.AddSingleUseShareLink,

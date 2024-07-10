@@ -86,7 +86,7 @@ namespace UtilityDelta.Api.Services
                 return accessInfo.ProjectAccess switch
                 {
                     ProjectAccess.NotExists => Results.NotFound(),
-                    ProjectAccess.OwnerAccess => Results.Ok(new DtoDisableAccess(userAccessCache.UpdateAccess(pi, accessInfo.CurrentUserHash, userId, null, null, true, null, cancellationToken))),
+                    ProjectAccess.OwnerAccess => Results.Ok(new DtoDisableAccess(userAccessCache.UpdateAccess(pi, accessInfo.CurrentUserHash, userId, null, null, null, true, null, cancellationToken))),
                     _ => Results.StatusCode(StatusCodes.Status403Forbidden)
                 };
             });
@@ -99,6 +99,7 @@ namespace UtilityDelta.Api.Services
             [FromQuery] string sign,
             [FromQuery] bool isOwner,
             [FromQuery] bool singleUse,
+            [FromQuery] string? iv,
             [FromQuery] string? description,
             [FromQuery] long expiresOn,
             [FromQuery] bool readOnly,
@@ -118,7 +119,7 @@ namespace UtilityDelta.Api.Services
                 return accessInfo.ProjectAccess switch
                 {
                     ProjectAccess.NotExists => Results.NotFound(),
-                    ProjectAccess.OwnerAccess => Results.Ok(shareKeyCache.CreateShareLink(pi, accessInfo.CurrentUserHash, isOwner, singleUse, description, expiresOn, readOnly, cancellationToken)),
+                    ProjectAccess.OwnerAccess => Results.Ok(shareKeyCache.CreateShareLink(pi, accessInfo.CurrentUserHash, isOwner, singleUse, iv, description, expiresOn, readOnly, cancellationToken)),
                     _ => Results.StatusCode(StatusCodes.Status403Forbidden)
                 };
             });

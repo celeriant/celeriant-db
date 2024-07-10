@@ -20,6 +20,7 @@ namespace UtilityDelta.Api.Tests
         {
             var pi1 = "p1";
             var cu1 = "c1";
+            var iv = "test iv";
 
             var utilityDeltaConfiguration = new Mock<IOptions<ConfigurationEntry>>();
             utilityDeltaConfiguration.Setup(x => x.Value).Returns(new ConfigurationEntry()
@@ -54,7 +55,7 @@ namespace UtilityDelta.Api.Tests
             Assert.AreEqual(AccessLevel.Viewer, accessLevel);
 
             //Try to lower own access - error
-            var eventResult = service.UpdateAccess(pi1, "foruser1", "foruser1", null, "desc here", allowDowngrade: true, shareKey: null, CancellationToken.None);
+            var eventResult = service.UpdateAccess(pi1, "foruser1", "foruser1", null, iv, "desc here", allowDowngrade: true, shareKey: null, CancellationToken.None);
             Assert.IsNull(eventResult);
 
             writeEvents.Setup(x => x.WriteServerEvent(It.Is<ProjectEventItem>(y => 
@@ -69,14 +70,14 @@ namespace UtilityDelta.Api.Tests
                 ), pi1))
                 .Returns(new ProjectEventItem(2, cu1, 999, null, ProjectEventType.ProvideAccess, "desc here", "foruser1", "sharekey1", (double?)AccessLevel.Contributor));
 
-            eventResult = service.UpdateAccess(pi1, cu1, "foruser1", AccessLevel.Contributor, "desc here", allowDowngrade: true, shareKey: "sharekey1", CancellationToken.None);
+            eventResult = service.UpdateAccess(pi1, cu1, "foruser1", AccessLevel.Contributor, iv, "desc here", allowDowngrade: true, shareKey: "sharekey1", CancellationToken.None);
             Assert.IsNotNull(eventResult);
 
             accessLevel = service.GetCurrentAccess(pi1, "foruser1", CancellationToken.None);
             Assert.AreEqual(AccessLevel.Contributor, accessLevel);
 
             //Try downgrade without flag set
-            eventResult = service.UpdateAccess(pi1, cu1, "foruser1", AccessLevel.Viewer, "desc here", allowDowngrade: false, shareKey: "sharekey1", CancellationToken.None);
+            eventResult = service.UpdateAccess(pi1, cu1, "foruser1", AccessLevel.Viewer, iv, "desc here", allowDowngrade: false, shareKey: "sharekey1", CancellationToken.None);
             Assert.IsNull(eventResult);
         }
     }

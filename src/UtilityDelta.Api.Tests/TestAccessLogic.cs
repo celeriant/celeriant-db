@@ -36,7 +36,7 @@ namespace UtilityDelta.Api.Tests
             if (sharekeyClaimFailed)
             {
                 shareKeyCache.Setup(x => x.GetShareKeyDataIfStillValid(pi, "wrongsharekey".CalculateHash(), CancellationToken.None))
-                    .Returns(new DtoShareKeyData(null, AccessLevel.Owner, null, "kljsdfj", true, "kjlf"));
+                    .Returns(new DtoShareKeyData(null, AccessLevel.Owner, null, null, "kljsdfj", true, "kjlf"));
                 shareKeyCache.Setup(x => x.MarkShareKeyAsUsed(pi, null, "wrongsharekey".CalculateHash(), CancellationToken.None))
                     .Returns((ProjectEventItem?)null);
             }
@@ -57,7 +57,7 @@ namespace UtilityDelta.Api.Tests
                 shareKeyCache.Verify(x => x.MarkShareKeyAsUsed(pi, null, "wrongsharekey".CalculateHash(), CancellationToken.None), Times.Once);
             }
             crypto.Verify(x => x.ValidateWithPublicKey("publicKey", "nonce", "sign"), Times.Once);
-            userAccessCache.Verify(x => x.UpdateAccess(pi, null, result.CurrentUserHash, AccessLevel.Owner, "Project creator", false, null, CancellationToken.None), Times.Never);
+            userAccessCache.Verify(x => x.UpdateAccess(pi, null, result.CurrentUserHash, AccessLevel.Owner, null, "Project creator", false, null, CancellationToken.None), Times.Never);
 
         }
 
@@ -80,7 +80,7 @@ namespace UtilityDelta.Api.Tests
 
             //Ensure this is a system created event (cb is null)
             crypto.Verify(x => x.ValidateWithPublicKey("publicKey", "nonce", "sign"), Times.Once);
-            userAccessCache.Verify(x => x.UpdateAccess(pi, null, result.CurrentUserHash, AccessLevel.Owner, "Project creator", false, null, CancellationToken.None), Times.Once);
+            userAccessCache.Verify(x => x.UpdateAccess(pi, null, result.CurrentUserHash, AccessLevel.Owner, null, "Project creator", false, null, CancellationToken.None), Times.Once);
         }
 
         //Single use share key, attempted to be used by creator, ignore, share key still valid
@@ -100,7 +100,7 @@ namespace UtilityDelta.Api.Tests
             userAccessCache.Setup(x => x.GetCurrentAccess(pi, cb, CancellationToken.None)).Returns(AccessLevel.Owner);
             fileHandlesManager.Setup(x => x.Exists(pi)).Returns(true);
             shareKeyCache.Setup(x => x.GetShareKeyDataIfStillValid(pi, shareKeyHash, CancellationToken.None))
-                .Returns(new DtoShareKeyData(null, AccessLevel.Owner, null, shareKeyHash, true, cb));
+                .Returns(new DtoShareKeyData(null, AccessLevel.Owner, null, null, shareKeyHash, true, cb));
 
             var service = new AccessLogic(fileHandlesManager.Object, crypto.Object, userAccessCache.Object, shareKeyCache.Object);
 
@@ -115,7 +115,7 @@ namespace UtilityDelta.Api.Tests
             crypto.Verify(x => x.ValidateWithPublicKey("publicKey", "nonce", "sign"), Times.Once);
             userAccessCache.Verify(x => x.UpdateAccess(
                 pi, It.IsAny<string?>(), It.IsAny<string>(), It.IsAny<AccessLevel>(), 
-                It.IsAny<string?>(), It.IsAny<bool>(), It.IsAny<string?>(), CancellationToken.None), Times.Never);
+                null, It.IsAny<string?>(), It.IsAny<bool>(), It.IsAny<string?>(), CancellationToken.None), Times.Never);
 
         }
 
@@ -138,7 +138,7 @@ namespace UtilityDelta.Api.Tests
             userAccessCache.Setup(x => x.GetCurrentAccess(pi, cb, CancellationToken.None)).Returns(AccessLevel.Contributor);
             fileHandlesManager.Setup(x => x.Exists(pi)).Returns(true);
             shareKeyCache.Setup(x => x.GetShareKeyDataIfStillValid(pi, shareKeyHash, CancellationToken.None))
-                .Returns(new DtoShareKeyData(null, AccessLevel.Viewer, null, shareKeyHash, true, "anotheruserhash"));
+                .Returns(new DtoShareKeyData(null, AccessLevel.Viewer, null, null, shareKeyHash, true, "anotheruserhash"));
 
             var service = new AccessLogic(fileHandlesManager.Object, crypto.Object, userAccessCache.Object, shareKeyCache.Object);
 
@@ -158,7 +158,7 @@ namespace UtilityDelta.Api.Tests
             crypto.Verify(x => x.ValidateWithPublicKey("publicKey", "nonce", "sign"), Times.Once);
             userAccessCache.Verify(x => x.UpdateAccess(
                 pi, It.IsAny<string?>(), It.IsAny<string>(), It.IsAny<AccessLevel>(),
-                It.IsAny<string?>(), It.IsAny<bool>(), It.IsAny<string?>(), CancellationToken.None), Times.Never);
+                 null, It.IsAny<string?>(), It.IsAny<bool>(), It.IsAny<string?>(), CancellationToken.None), Times.Never);
 
         }
 
@@ -179,7 +179,7 @@ namespace UtilityDelta.Api.Tests
             userAccessCache.Setup(x => x.GetCurrentAccess(pi, cb, CancellationToken.None)).Returns((AccessLevel?)null);
             fileHandlesManager.Setup(x => x.Exists(pi)).Returns(true);
             shareKeyCache.Setup(x => x.GetShareKeyDataIfStillValid(pi, shareKeyHash, CancellationToken.None))
-                .Returns(new DtoShareKeyData(null, AccessLevel.Viewer, null, shareKeyHash, true, "anotheruserhash"));
+                .Returns(new DtoShareKeyData(null, AccessLevel.Viewer, null, null, shareKeyHash, true, "anotheruserhash"));
             shareKeyCache.Setup(x => x.MarkShareKeyAsUsed(pi, null, shareKeyHash, CancellationToken.None)).Returns(new ProjectEventItem(0,null,0,null, ProjectEventType.AddTask, null, null, null, null));
 
             var service = new AccessLogic(fileHandlesManager.Object, crypto.Object, userAccessCache.Object, shareKeyCache.Object);
@@ -197,7 +197,7 @@ namespace UtilityDelta.Api.Tests
             crypto.Verify(x => x.ValidateWithPublicKey("publicKey", "nonce", "sign"), Times.Once);
 
             userAccessCache.Verify(x => x.UpdateAccess(
-                pi, null, cb, AccessLevel.Viewer, null, false, shareKeyHash, CancellationToken.None), Times.Once);
+                pi, null, cb, AccessLevel.Viewer, null, null, false, shareKeyHash, CancellationToken.None), Times.Once);
 
         }
 

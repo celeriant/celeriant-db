@@ -162,20 +162,21 @@ namespace UtilityDelta.Api.Tests
             var publicKey = "mykeypub";
             var nonce = "mynonce";
             var sign = "signednonce";
+            var iv = "test iv";
 
             accessLogic.Setup(x => x.IsProjectExistAndHasAccess(pi, false, null, publicKey, nonce, sign, CancellationToken.None))
                 .Returns(new DtoAccessInfo(projectAccess, publicKey.CalculateHash()));
 
-            var result = await service.Share(pi, publicKey, nonce, sign, isOwner, singleUse, "my desc", expiresOn, readOnly, CancellationToken.None);
+            var result = await service.Share(pi, publicKey, nonce, sign, isOwner, singleUse, iv, "my desc", expiresOn, readOnly, CancellationToken.None);
 
             if (projectAccess != ProjectAccess.OwnerAccess)
             {
-                shareKeyCache.Verify(x => x.CreateShareLink(pi, It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<string?>(), It.IsAny<long>(), It.IsAny<bool>(), CancellationToken.None), Times.Never);
+                shareKeyCache.Verify(x => x.CreateShareLink(pi, It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<string?>(), It.IsAny<string?>(), It.IsAny<long>(), It.IsAny<bool>(), CancellationToken.None), Times.Never);
 
                 Assert.AreEqual(403, ((Microsoft.AspNetCore.Http.HttpResults.StatusCodeHttpResult)result).StatusCode);
             } else
             {
-                shareKeyCache.Verify(x => x.CreateShareLink(pi, publicKey.CalculateHash(), isOwner, singleUse, "my desc", expiresOn, readOnly, CancellationToken.None), Times.Once);
+                shareKeyCache.Verify(x => x.CreateShareLink(pi, publicKey.CalculateHash(), isOwner, singleUse, iv, "my desc", expiresOn, readOnly, CancellationToken.None), Times.Once);
                 Assert.AreEqual(200, ((Microsoft.AspNetCore.Http.HttpResults.Ok)result).StatusCode);
             }
         }
@@ -207,13 +208,13 @@ namespace UtilityDelta.Api.Tests
 
             if (projectAccess != ProjectAccess.OwnerAccess)
             {
-                userAccessCache.Verify(x => x.UpdateAccess(pi, It.IsAny<string?>(), It.IsAny<string>(), It.IsAny<AccessLevel>(), It.IsAny<string?>(), It.IsAny<bool>(), It.IsAny<string?>(), CancellationToken.None), Times.Never);
+                userAccessCache.Verify(x => x.UpdateAccess(pi, It.IsAny<string?>(), It.IsAny<string>(), It.IsAny<AccessLevel>(), It.IsAny<string?>(), It.IsAny<string?>(), It.IsAny<bool>(), It.IsAny<string?>(), CancellationToken.None), Times.Never);
 
                 Assert.AreEqual(403, ((Microsoft.AspNetCore.Http.HttpResults.StatusCodeHttpResult)result).StatusCode);
             }
             else
             {
-                userAccessCache.Verify(x => x.UpdateAccess(pi, publicKey.CalculateHash(), "useridtodisableHashed", null, null, true, null, CancellationToken.None), Times.Once);
+                userAccessCache.Verify(x => x.UpdateAccess(pi, publicKey.CalculateHash(), "useridtodisableHashed", null, null, null, true, null, CancellationToken.None), Times.Once);
 
                 Assert.AreEqual(200, ((Microsoft.AspNetCore.Http.HttpResults.Ok<DtoDisableAccess>)result).StatusCode);
             }

@@ -27,7 +27,7 @@ namespace UtilityDelta.Api.Services
                 //No record of this project, either return not exists or auto-create it for the user and give them owner access
                 if (!createProjectIfNotExists) return new DtoAccessInfo(ProjectAccess.NotExists, currentUserHash);
 
-                userAccessCache.UpdateAccess(projectId, null, currentUserHash, AccessLevel.Owner, "Project creator", false, null, cancellationToken);
+                userAccessCache.UpdateAccess(projectId, null, currentUserHash, AccessLevel.Owner, null, "Project creator", false, null, cancellationToken);
 
                 return new DtoAccessInfo(ProjectAccess.OwnerAccess, currentUserHash);
             }
@@ -51,7 +51,7 @@ namespace UtilityDelta.Api.Services
             if (shareKeyData != null && currentAccessLevel.IncreasesAccessLevel(shareKeyData.accessLevel))
             {
                 //the current user gets an increase in their access level with the given share key
-                userAccessCache.UpdateAccess(projectId, null, currentUserHash, shareKeyData.accessLevel, shareKeyData.description, false, shareKey, cancellationToken);
+                userAccessCache.UpdateAccess(projectId, null, currentUserHash, shareKeyData.accessLevel, shareKeyData.iv, shareKeyData.description, false, shareKey, cancellationToken);
                 return new DtoAccessInfo(shareKeyData.accessLevel.ToProjectAccess(), currentUserHash);
             }
 

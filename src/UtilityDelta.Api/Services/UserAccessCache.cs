@@ -58,7 +58,7 @@ namespace UtilityDelta.Api.Services
             }
         }
 
-        public ProjectEventItem? UpdateAccess(string projectId, string? currentUserHash, string forUserId, AccessLevel? potentialAccessLevel, string? description, bool allowDowngrade, string? shareKey, CancellationToken cancellationToken)
+        public ProjectEventItem? UpdateAccess(string projectId, string? currentUserHash, string forUserId, AccessLevel? potentialAccessLevel, string? iv, string? description, bool allowDowngrade, string? shareKey, CancellationToken cancellationToken)
         {
             //Not allowed to downgrade your own permissions
             if (allowDowngrade && currentUserHash == forUserId)
@@ -74,7 +74,7 @@ namespace UtilityDelta.Api.Services
                 return null;
             }
 
-            var eventItem = new ProjectEventItem(0, currentUserHash, 0, null, ProjectEventType.ProvideAccess, description, forUserId, shareKey, (double?)potentialAccessLevel);
+            var eventItem = new ProjectEventItem(0, currentUserHash, 0, iv, ProjectEventType.ProvideAccess, description, forUserId, shareKey, (double?)potentialAccessLevel);
 
             var projectCache = GetOrBuildCache(projectId, cancellationToken);
             lock (projectCache)
