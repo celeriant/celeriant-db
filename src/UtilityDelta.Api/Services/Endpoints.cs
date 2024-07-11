@@ -1,10 +1,11 @@
 ﻿using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Logging;
 using UtilityDelta.Api.Interfaces;
 using UtilityDelta.Api.Shared;
 
 namespace UtilityDelta.Api.Services
 {
-    public class Endpoints(IAccessLogic accessLogic, IReadEvents readEvents, IWriteAndBackup writeAndBackup, IShareKeyCache shareKeyCache, IUserAccessCache userAccessCache) : IEndpoints
+    public class Endpoints(IAccessLogic accessLogic, IReadEvents readEvents, IWriteAndBackup writeAndBackup, IShareKeyCache shareKeyCache, IUserAccessCache userAccessCache, ILlmBreakdown llmBreakdown) : IEndpoints
     {
         public async Task<IResult> Read(
             [FromQuery] string pi,
@@ -151,6 +152,29 @@ namespace UtilityDelta.Api.Services
                     ProjectAccess.NoAccess => Results.StatusCode(StatusCodes.Status403Forbidden),
                     ProjectAccess.ReadOnlyAccess => Results.StatusCode(StatusCodes.Status403Forbidden),
                     _ => Results.Ok(writeAndBackup.WriteClientEvents(events, accessInfo.CurrentUserHash, pi, cancellationToken))
+                };
+            });
+        }
+
+        public async Task<IResult> Breakdown([FromQuery] string pi, [FromQuery] string publicKey, [FromQuery] string nonce, [FromQuery] string sign, [FromBody] DtoBreakdownInputs dtoBreakdownInputs, CancellationToken cancellationToken)
+        {
+            return await Task.Run(async () =>
+            {
+                var accessInfo = accessLogic.IsProjectExistAndHasAccess(
+                    projectId: pi,
+                    createProjectIfNotExists: false,
+                    shareKey: null,
+                    publicKey: publicKey,
+                    nonce: nonce,
+                    sign: sign,
+                    cancellationToken: cancellationToken);
+
+                return accessInfo.ProjectAccess switch
+                {
+                    ProjectAccess.NotExists => Results.NotFound(),
+                    ProjectAccess.NoAccess => Results.StatusCode(StatusCodes.Status403Forbidden),
+                    ProjectAccess.ReadOnlyAccess => Results.StatusCode(StatusCodes.Status403Forbidden),
+                    _ => Results.Ok(await llmBreakdown.BreakdownTask(dtoBreakdownInputs, accessInfo.CurrentUserHash, pi, cancellationToken))
                 };
             });
         }

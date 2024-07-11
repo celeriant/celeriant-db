@@ -12,5 +12,6 @@
         public string CLOUD_STORAGE_CONNECTION { get; set; } = string.Empty;
         public int APPEND_BLOB_MAX_COMMITS { get; set; }
         public int APPEND_BLOB_MAX_CHUNK_SIZE { get; set; }
+        public string LLM_SERVER { get; set; } = string.Empty;
     }
 }

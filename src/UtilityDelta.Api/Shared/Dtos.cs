@@ -14,4 +14,18 @@
 
     public record ProjectEventItem(long serverId, string? cb, long ed, string? iv, ProjectEventType tp, string? t1, string? t2, string? t3, double? n1);
 
+    public class DtoBreakdownInputs
+    {
+        public string task { get; set; }
+        public string[] parents { get; set; }
+        public string[] siblings { get; set; }
+        public int minDuration { get; set; }
+    }
+
+    public class DtoBreakdownOutputs
+    {
+        public string[] subTasks { get; set; }
+        public string[] predecessors { get; set; }
+        public string[] successors { get; set; }
+    }
 }

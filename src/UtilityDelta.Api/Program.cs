@@ -12,6 +12,10 @@ using UtilityDelta.Api.Shared;
 
 [JsonSerializable(typeof(ProjectEventItem[]))]
 [JsonSerializable(typeof(List<ProjectEventItem>))]
+[JsonSerializable(typeof(LlmResult))]
+[JsonSerializable(typeof(LlmInput))]
+[JsonSerializable(typeof(DtoBreakdownInputs))]
+[JsonSerializable(typeof(DtoBreakdownOutputs))]
 [JsonSerializable(typeof(DtoRead))]
 [JsonSerializable(typeof(DtoShare))]
 [JsonSerializable(typeof(DtoWrite))]
@@ -36,6 +40,7 @@ public class Program
         api.MapPost("/disableshare", endpoints.DisableShare);
         api.MapPost("/share", endpoints.Share);
         api.MapPost("/write", endpoints.Write);
+        api.MapPost("/breakdown", endpoints.Breakdown);
 
         var udConfig = app.Services.GetService<IOptions<ConfigurationEntry>>()!;
         Directory.CreateDirectory(udConfig.Value.SUB_DIR_CONTAINERS);
@@ -134,6 +139,7 @@ public class Program
         builder.Services.AddSingleton<IShareKeyCache, ShareKeyCache>();
         builder.Services.AddSingleton<IUserAccessCache, UserAccessCache>();
         builder.Services.AddSingleton<IFileHandlesManager, FileHandlesManager>();
+        builder.Services.AddSingleton<ILlmBreakdown, LlmBreakdown>();
         builder.Services.AddSingleton<IEndpoints, Endpoints>();
 
         var utilityDeltaConfiguration = builder.Configuration.GetSection("UtilityDelta");
