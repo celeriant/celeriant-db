@@ -1,4 +1,5 @@
-﻿using Microsoft.Extensions.Options;
+﻿using Microsoft.AspNetCore.DataProtection.KeyManagement;
+using Microsoft.Extensions.Options;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -12,6 +13,85 @@ namespace UtilityDelta.Api.Services
     {
         public async Task<DtoBreakdownOutputs> BreakdownTask(DtoBreakdownInputs dtoBreakdownInputs, string currentUserHash, string pi, CancellationToken cancellationToken)
         {
+            var prompt = InitialPrompt(dtoBreakdownInputs);
+
+            //prompt.Append(" After listing all the tasks, also list any dependencies between the tasks, one line at a time, in a similar format, using '->'.");
+
+            var requestData = new LlmInput
+            {
+                model = "llama3",
+                prompt = prompt,
+                stream = false
+            };
+
+            var conversationHistory = new List<string>();
+            conversationHistory.Add($"User: {requestData.prompt}");
+
+            string jsonData = JsonSerializer.Serialize(requestData, ReadSerializerContext.Default.LlmInput);
+
+            string response = await StreamResponse($"http://{utilityDeltaConfiguration.Value.LLM_SERVER}/api/generate", jsonData);
+            conversationHistory.Add($"LLM: {response}");
+            var llmResult1 = JsonSerializer.Deserialize<LlmResult>(response, ReadSerializerContext.Default.LlmResult);
+            var r1 = llmResult1.response;
+
+            conversationHistory.Add($"User: List any dependencies between the tasks, one line at a time, in a similar format, using '->'");
+
+            requestData = new LlmInput
+            {
+                model = "llama3",
+                prompt = string.Join("\n", conversationHistory),
+                stream = false
+            };
+            jsonData = JsonSerializer.Serialize(requestData, ReadSerializerContext.Default.LlmInput);
+            response = await StreamResponse($"http://{utilityDeltaConfiguration.Value.LLM_SERVER}/api/generate", jsonData);
+            var llmResult2 = JsonSerializer.Deserialize<LlmResult>(response, ReadSerializerContext.Default.LlmResult);
+            var r2 = llmResult2.response;
+            DtoBreakdownOutputs result = BuildResult(dtoBreakdownInputs, r1, r2);
+
+            return result;
+        }
+
+        public static DtoBreakdownOutputs BuildResult(DtoBreakdownInputs dtoBreakdownInputs, string r1, string r2)
+        {
+            var result = new DtoBreakdownOutputs();
+            var subtasks = new List<string>();
+
+            var dependencyMode = false;
+            foreach (var output in r1.Split('\n'))
+            {
+                if (output.ToLowerInvariant() == dtoBreakdownInputs.task.ToLowerInvariant() || string.IsNullOrWhiteSpace(output)) continue;
+
+                subtasks.Add(output);
+            }
+            var predecessors = new List<string>();
+            var successors = new List<string>();
+
+            foreach (var output in r2.Split('\n'))
+            {
+                var depOutput = output;
+                if (output.StartsWith("->"))
+                {
+                    depOutput = output.Substring(2).Trim();
+                }
+                if (output.StartsWith(">"))
+                {
+                    depOutput = output.Substring(1).Trim();
+                }
+                var depSplit = depOutput.Split("->");
+                if (depSplit.Length != 2) continue;
+
+                predecessors.Add(depSplit[0].Trim());
+                successors.Add(depSplit[1].Trim());
+            }
+
+            result.subTasks = subtasks.ToArray();
+            result.predecessors = predecessors.ToArray();
+            result.successors = successors.ToArray();
+            return result;
+        }
+
+        public static string InitialPrompt(DtoBreakdownInputs dtoBreakdownInputs)
+        {
             var prompt = new StringBuilder();
             prompt.Append($"Breakdown the task \"{dtoBreakdownInputs.task}\" into sub-tasks for my project. Only output one level of breakdown, from 2 to a maximum 10 sub-tasks. Don't include sub-tasks that take less than {dtoBreakdownInputs.minDuration} hours to complete. Do not include the input task or any other content other than the title of each task. Do not include numbering or any special characters or any intro sentence.");
 
@@ -19,13 +99,13 @@ namespace UtilityDelta.Api.Services
             {
                 prompt.Append(" For context, the parents of this task is ");
                 var isFirst = true;
-                foreach (var parent in dtoBreakdownInputs.parents) 
-                { 
+                foreach (var parent in dtoBreakdownInputs.parents)
+                {
                     if (!isFirst)
                     {
                         prompt.Append(" and then ");
                     }
-                    prompt.Append($"\"{parent}\""); 
+                    prompt.Append($"\"{parent}\"");
                     isFirst = false;
                 }
                 prompt.Append(".");
@@ -47,78 +127,7 @@ namespace UtilityDelta.Api.Services
                 prompt.Append(".");
             }
 
-            //prompt.Append(" After listing all the tasks, also list any dependencies between the tasks, one line at a time, in a similar format, using '->'.");
-
-            var requestData = new LlmInput
-            {
-                model = "llama3",
-                prompt = prompt.ToString(),
-                stream = false
-            };
-
-            var conversationHistory = new List<string>();
-            conversationHistory.Add($"User: {requestData.prompt}");
-
-            string jsonData = JsonSerializer.Serialize(requestData, ReadSerializerContext.Default.LlmInput);
-
-            string response = await StreamResponse($"http://{utilityDeltaConfiguration.Value.LLM_SERVER}/api/generate", jsonData);
-            conversationHistory.Add($"LLM: {response}");
-            var llmResult = JsonSerializer.Deserialize<LlmResult>(response, ReadSerializerContext.Default.LlmResult);
-
-            var result = new DtoBreakdownOutputs();
-            var subtasks = new List<string>();
-
-            var dependencyMode = false;
-            foreach (var output in llmResult!.response.Split('\n'))
-            {
-                if (output.ToLowerInvariant() == dtoBreakdownInputs.task.ToLowerInvariant() || string.IsNullOrWhiteSpace(output)) continue;
-
-                subtasks.Add(output);
-            }
-
-            if (subtasks.Count == 0)
-            {
-
-            }
-
-            conversationHistory.Add($"User: List any dependencies between the tasks, one line at a time, in a similar format, using '->'");
-
-            requestData = new LlmInput
-            {
-                model = "llama3",
-                prompt = string.Join("\n", conversationHistory),
-                stream = false
-            };
-            jsonData = JsonSerializer.Serialize(requestData, ReadSerializerContext.Default.LlmInput);
-            response = await StreamResponse($"http://{utilityDeltaConfiguration.Value.LLM_SERVER}/api/generate", jsonData);
-            llmResult = JsonSerializer.Deserialize<LlmResult>(response, ReadSerializerContext.Default.LlmResult);
-
-            var predecessors = new List<string>();
-            var successors = new List<string>();
-
-            foreach (var output in llmResult!.response.Split('\n'))
-            {
-                var depOutput = output;
-                if (output.StartsWith("->"))
-                {
-                    depOutput = output.Substring(2).Trim();
-                }
-                if (output.StartsWith(">"))
-                {
-                    depOutput = output.Substring(1).Trim();
-                }
-                var depSplit = depOutput.Split("->");
-                if (depSplit.Length != 2) continue;
-
-                predecessors.Add(depSplit[0].Trim());
-                successors.Add(depSplit[1].Trim());
-            }
-
-            result.subTasks = subtasks.ToArray();
-            result.predecessors = predecessors.ToArray();
-            result.successors = successors.ToArray();
-
-            return result;
+            return prompt.ToString();
         }
 
         public static async Task<string> StreamResponse(string url, string jsonData)

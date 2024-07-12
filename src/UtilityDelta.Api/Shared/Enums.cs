@@ -49,6 +49,7 @@
         AddSingleUseShareLink,
         ProvideAccess,
         DisableShareLink,
+        SetProjectDescription
     }
 
     public enum AccessLevel

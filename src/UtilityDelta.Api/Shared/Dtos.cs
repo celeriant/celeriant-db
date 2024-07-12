@@ -16,6 +16,7 @@
 
     public class DtoBreakdownInputs
     {
+        public string? system {  get; set; }
         public string task { get; set; }
         public string[] parents { get; set; }
         public string[] siblings { get; set; }

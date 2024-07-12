@@ -139,7 +139,7 @@ public class Program
         builder.Services.AddSingleton<IShareKeyCache, ShareKeyCache>();
         builder.Services.AddSingleton<IUserAccessCache, UserAccessCache>();
         builder.Services.AddSingleton<IFileHandlesManager, FileHandlesManager>();
-        builder.Services.AddSingleton<ILlmBreakdown, LlmBreakdown>();
+        builder.Services.AddSingleton<ILlmBreakdown, ChatGPTBreakdown>();
         builder.Services.AddSingleton<IEndpoints, Endpoints>();
 
         var utilityDeltaConfiguration = builder.Configuration.GetSection("UtilityDelta");
