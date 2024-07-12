@@ -71,33 +71,14 @@ namespace UtilityDelta.Api.Services
             var dependencyMode = false;
             foreach (var output in llmResult!.response.Split('\n'))
             {
-                if (output.ToLowerInvariant() == dtoBreakdownInputs.task.ToLowerInvariant()) continue;
+                if (output.ToLowerInvariant() == dtoBreakdownInputs.task.ToLowerInvariant() || string.IsNullOrWhiteSpace(output)) continue;
 
-                if (string.IsNullOrWhiteSpace(output) || output.ToLowerInvariant().StartsWith("dependencies"))
-                {
-                    dependencyMode = true;
-                    continue;
-                }
-                if (!dependencyMode)
-                {
-                    subtasks.Add(output);
-                } else
-                {
-                    //var depOutput = output;
-                    //if (output.StartsWith("->"))
-                    //{
-                    //    depOutput = output.Substring(2).Trim();
-                    //}
-                    //if (output.StartsWith(">"))
-                    //{
-                    //    depOutput = output.Substring(1).Trim();
-                    //}
-                    //var depSplit = depOutput.Split("->");
-                    //if (depSplit.Length != 2) continue;
+                subtasks.Add(output);
+            }
 
-                    //predecessors.Add(depSplit[0].Trim());
-                    //successors.Add(depSplit[1].Trim());
-                }
+            if (subtasks.Count == 0)
+            {
+
             }
 
             conversationHistory.Add($"User: List any dependencies between the tasks, one line at a time, in a similar format, using '->'");
