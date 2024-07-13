@@ -13,6 +13,8 @@ Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "UtilityDelta.Api.Integratio
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "UtilityDelta.Api.CosmosToOwnDb", "UtilityDelta.Api.CosmosToOwnDb\UtilityDelta.Api.CosmosToOwnDb.csproj", "{84FCA068-F826-4AFC-A51C-F8A979018666}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "UtilityDelta.ChatGpt", "UtilityDelta.ChatGpt\UtilityDelta.ChatGpt.csproj", "{0AC3F00C-0FA8-4A7B-96EE-37EF8F75D737}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -39,6 +41,10 @@ Global
 		{84FCA068-F826-4AFC-A51C-F8A979018666}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{84FCA068-F826-4AFC-A51C-F8A979018666}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{84FCA068-F826-4AFC-A51C-F8A979018666}.Release|Any CPU.Build.0 = Release|Any CPU
+		{0AC3F00C-0FA8-4A7B-96EE-37EF8F75D737}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{0AC3F00C-0FA8-4A7B-96EE-37EF8F75D737}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{0AC3F00C-0FA8-4A7B-96EE-37EF8F75D737}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{0AC3F00C-0FA8-4A7B-96EE-37EF8F75D737}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
