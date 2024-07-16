@@ -171,7 +171,7 @@ namespace UtilityDelta.Api.Services
 
                 return accessInfo.ProjectAccess switch
                 {
-                    ProjectAccess.NotExists => Results.NotFound(),
+                    ProjectAccess.NotExists => Results.Ok(await llmBreakdown.BreakdownTask(dtoBreakdownInputs, accessInfo.CurrentUserHash, pi, cancellationToken)),
                     ProjectAccess.NoAccess => Results.StatusCode(StatusCodes.Status403Forbidden),
                     ProjectAccess.ReadOnlyAccess => Results.StatusCode(StatusCodes.Status403Forbidden),
                     _ => Results.Ok(await llmBreakdown.BreakdownTask(dtoBreakdownInputs, accessInfo.CurrentUserHash, pi, cancellationToken))
