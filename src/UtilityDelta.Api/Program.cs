@@ -16,6 +16,7 @@ using UtilityDelta.Api.Shared;
 [JsonSerializable(typeof(LlmInput))]
 [JsonSerializable(typeof(DtoBreakdownInputs))]
 [JsonSerializable(typeof(DtoBreakdownOutputs))]
+[JsonSerializable(typeof(DtoUnknownOutputs))]
 [JsonSerializable(typeof(DtoRead))]
 [JsonSerializable(typeof(DtoShare))]
 [JsonSerializable(typeof(DtoWrite))]
@@ -41,6 +42,7 @@ public class Program
         api.MapPost("/share", endpoints.Share);
         api.MapPost("/write", endpoints.Write);
         api.MapPost("/breakdown", endpoints.Breakdown);
+        api.MapPost("/unknowns", endpoints.Unknowns);
 
         var udConfig = app.Services.GetService<IOptions<ConfigurationEntry>>()!;
         Directory.CreateDirectory(udConfig.Value.SUB_DIR_CONTAINERS);

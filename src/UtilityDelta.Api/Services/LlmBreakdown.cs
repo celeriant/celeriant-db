@@ -51,6 +51,22 @@ namespace UtilityDelta.Api.Services
             return result;
         }
 
+        public static DtoUnknownOutputs BuildUnknownResult(DtoBreakdownInputs dtoBreakdownInputs, string r1)
+        {
+            var result = new DtoUnknownOutputs();
+            var subtasks = new List<string>();
+
+            var numbers = new List<int>();
+            foreach (var output in r1.Split('\n'))
+            {
+                if (string.IsNullOrWhiteSpace(output) || !int.TryParse(output, out var taskNumber)) continue;
+
+                numbers.Add(taskNumber);
+            }
+            result.unkownTasks = numbers.ToArray();
+            return result;
+        }
+
         public static DtoBreakdownOutputs BuildResult(DtoBreakdownInputs dtoBreakdownInputs, string r1, string r2)
         {
             var result = new DtoBreakdownOutputs();
@@ -88,6 +104,31 @@ namespace UtilityDelta.Api.Services
             result.predecessors = predecessors.ToArray();
             result.successors = successors.ToArray();
             return result;
+        }
+
+        public static string DiscoverUnknownsPrompt(DtoBreakdownInputs dtoBreakdownInputs)
+        {
+            var prompt = new StringBuilder();
+            prompt.AppendLine($"Identify tasks in this list that could take longer than {dtoBreakdownInputs.minDuration} hours to complete. Only return the task number, one line for each task number. Do not return any other text.");
+
+            prompt.Append($" For context, the parents of these tasks are: \"{dtoBreakdownInputs.task}\"");
+            if (dtoBreakdownInputs.parents != null && dtoBreakdownInputs.parents.Length > 0)
+            {
+                foreach (var parent in dtoBreakdownInputs.parents)
+                {
+                    prompt.Append(" and then ");
+                    prompt.Append($"\"{parent}\"");
+                }
+            }
+            prompt.AppendLine(".");
+
+            prompt.AppendLine(" Here are the tasks: ");
+            for (var i = 0; i < dtoBreakdownInputs.siblings.Length; i++)
+            {
+                prompt.AppendLine($"{i} - {dtoBreakdownInputs.siblings[i]}");
+            }
+
+            return prompt.ToString();
         }
 
         public static string InitialPrompt(DtoBreakdownInputs dtoBreakdownInputs)
@@ -150,6 +191,11 @@ namespace UtilityDelta.Api.Services
                     return result.Trim();
                 }
             }
+        }
+
+        public Task<DtoUnknownOutputs> IdentifyUnknowns(DtoBreakdownInputs dtoBreakdownInputs, CancellationToken cancellationToken)
+        {
+            throw new NotImplementedException();
         }
     }
 }

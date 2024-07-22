@@ -20,7 +20,7 @@
         public string task { get; set; }
         public string[] parents { get; set; }
         public string[] siblings { get; set; }
-        public int minDuration { get; set; }
+        public double minDuration { get; set; }
     }
 
     public class DtoBreakdownOutputs
@@ -28,5 +28,10 @@
         public string[] subTasks { get; set; }
         public string[] predecessors { get; set; }
         public string[] successors { get; set; }
+    }
+
+    public class DtoUnknownOutputs
+    {
+        public int[] unkownTasks { get; set; }
     }
 }

@@ -11,5 +11,6 @@ namespace UtilityDelta.Api.Interfaces
         Task<IResult> Share([FromQuery] string pi, [FromQuery] string publicKey, [FromQuery] string nonce, [FromQuery] string sign, [FromQuery] bool isOwner, [FromQuery] bool singleUse, [FromQuery] string? iv, [FromQuery] string? description, [FromQuery] long expiresOn, [FromQuery] bool readOnly, CancellationToken cancellationToken);
         Task<IResult> Write([FromQuery] string pi, [FromQuery] string publicKey, [FromQuery] string nonce, [FromQuery] string sign, [FromQuery] bool createIfNotExist, [FromBody] ProjectEventItem[] events, CancellationToken cancellationToken);
         Task<IResult> Breakdown([FromQuery] string pi, [FromQuery] string publicKey, [FromQuery] string nonce, [FromQuery] string sign, [FromBody] DtoBreakdownInputs dtoBreakdownInputs, CancellationToken cancellationToken);
+        Task<IResult> Unknowns([FromQuery] string pi, [FromQuery] string publicKey, [FromQuery] string nonce, [FromQuery] string sign, [FromBody] DtoBreakdownInputs dtoBreakdownInputs, CancellationToken cancellationToken);
     }
 }
