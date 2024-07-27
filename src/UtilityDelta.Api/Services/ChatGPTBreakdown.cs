@@ -19,7 +19,7 @@ namespace UtilityDelta.Api.Services
             {
                 chat.AppendSystemMessage(dtoBreakdownInputs.system);
             }
-            chat.Model = Model.GPT4_Turbo;
+            chat.Model = Model.GPT4o;
             chat.AppendUserInput(prompt);
 
             string r1 = await chat.GetResponseFromChatbotAsync();
@@ -42,7 +42,7 @@ namespace UtilityDelta.Api.Services
             {
                 chat.AppendSystemMessage(dtoBreakdownInputs.system);
             }
-            chat.Model = Model.GPT4_Turbo;
+            chat.Model = Model.GPT4o;
             chat.AppendUserInput(prompt);
 
             string r1 = await chat.GetResponseFromChatbotAsync();
