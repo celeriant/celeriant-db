@@ -23,6 +23,20 @@
         public double minDuration { get; set; }
     }
 
+    public class DtoAssignRolesInputs
+    {
+        public string? system { get; set; }
+        public string[] parents { get; set; }
+        public string[] tasks { get; set; }
+        public string[] roles { get; set; }
+    }
+
+    public class DtoRolesInputs
+    {
+        public string? system { get; set; }
+        public string[] tasks { get; set; }
+    }
+
     public class DtoBreakdownOutputs
     {
         public string[] subTasks { get; set; }
@@ -33,5 +47,16 @@
     public class DtoUnknownOutputs
     {
         public int[] unkownTasks { get; set; }
+    }
+
+    public class DtoAssignRolesOutputs
+    {
+        public int[] taskNumbers { get; set; }
+        public string[] roles { get; set; }
+    }
+
+    public class DtoRolesOutputs
+    {
+        public string[] roles { get; set; }
     }
 }

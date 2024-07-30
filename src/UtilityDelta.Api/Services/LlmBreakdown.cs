@@ -1,5 +1,6 @@
 ﻿using Microsoft.AspNetCore.DataProtection.KeyManagement;
 using Microsoft.Extensions.Options;
+using Microsoft.Extensions.Primitives;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -67,6 +68,22 @@ namespace UtilityDelta.Api.Services
             return result;
         }
 
+        public static DtoRolesOutputs BuildRolesResult(string r1)
+        {
+            var output = new List<string>();
+            foreach (var text in r1.Split('\n'))
+            {
+                var clean = text.Trim();
+                if (text.StartsWith('-'))
+                {
+                    clean = clean.Substring(1);
+                }
+                output.Add(clean.Trim());
+            }
+
+            return new DtoRolesOutputs() { roles = output.ToArray() };
+        }
+
         public static DtoBreakdownOutputs BuildResult(DtoBreakdownInputs dtoBreakdownInputs, string r1, string r2)
         {
             var result = new DtoBreakdownOutputs();
@@ -126,6 +143,19 @@ namespace UtilityDelta.Api.Services
             for (var i = 0; i < dtoBreakdownInputs.siblings.Length; i++)
             {
                 prompt.AppendLine($"{i} - {dtoBreakdownInputs.siblings[i]}");
+            }
+
+            return prompt.ToString();
+        }
+
+        public static string DetermineRolesPrompt(DtoRolesInputs dtoRolesInputs)
+        {
+            var prompt = new StringBuilder();
+            prompt.AppendLine($"Here is a rough breakdown of my project - tasks and sub-tasks. I need to hire staff to complete this project. Tell me what roles I need to hire for. Only stick to popular roles that I can hire for on the market. Only return the role title, one line for each role. Do not return any numbering, formatting, special characters or any other text.");
+
+            foreach (var task in dtoRolesInputs.tasks)
+            {
+                prompt.AppendLine(task);
             }
 
             return prompt.ToString();
@@ -194,6 +224,72 @@ namespace UtilityDelta.Api.Services
         }
 
         public Task<DtoUnknownOutputs> IdentifyUnknowns(DtoBreakdownInputs dtoBreakdownInputs, CancellationToken cancellationToken)
+        {
+            throw new NotImplementedException();
+        }
+
+        public Task<DtoRolesOutputs> DetermineRoles(DtoRolesInputs dtoRolesInputs, CancellationToken cancellationToken)
+        {
+            throw new NotImplementedException();
+        }
+
+        public static string AssignRolesPrompt(DtoAssignRolesInputs dtoRolesInputs)
+        {
+            var prompt = new StringBuilder();
+
+            prompt.AppendLine("Our project has the following defined roles that can action tasks:");
+            foreach (var roleText in dtoRolesInputs.roles)
+            {
+                prompt.AppendLine(roleText);
+            }
+            prompt.AppendLine();
+
+            prompt.AppendLine(" Here are the tasks: ");
+
+            for (var i = 0; i < dtoRolesInputs.tasks.Length; i++)
+            {
+                prompt.AppendLine($"{i} - {dtoRolesInputs.tasks[i]}");
+            }
+            prompt.AppendLine();
+
+            prompt.AppendLine($"Determine the primary role to assign to each task. If not sure, or the task requires multiple roles, skip that task. Only return the task number and then role, using '->' to separate, one line for each. Do not return any other text.");
+
+            return prompt.ToString();
+        }
+
+        public static DtoAssignRolesOutputs AssignRolesResult(DtoAssignRolesInputs dtoRolesInputs, string r1)
+        {
+            var taskIds = new List<int>();
+            var roles = new List<string>();
+
+            var entries = r1.Split('\n');
+            foreach (var output in entries)
+            {
+                var depOutput = output;
+                if (output.StartsWith("->"))
+                {
+                    depOutput = output.Substring(2).Trim();
+                }
+                if (output.StartsWith(">"))
+                {
+                    depOutput = output.Substring(1).Trim();
+                }
+                var depSplit = depOutput.Split("->");
+                if (depSplit.Length != 2) continue;
+
+                var taskIdStr = depSplit[0].Trim();
+                var roleText = depSplit[1].Trim();
+
+                if (!int.TryParse(taskIdStr, out var taskId)) continue;
+
+                taskIds.Add(taskId);
+                roles.Add(roleText);
+            }
+
+            return new DtoAssignRolesOutputs() { roles = roles.ToArray(), taskNumbers = taskIds.ToArray() };
+        }
+
+        public Task<DtoAssignRolesOutputs> AssignRoles(DtoAssignRolesInputs dtoRolesInputs, CancellationToken cancellationToken)
         {
             throw new NotImplementedException();
         }

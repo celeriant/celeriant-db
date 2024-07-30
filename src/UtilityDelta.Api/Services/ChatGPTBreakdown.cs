@@ -49,5 +49,43 @@ namespace UtilityDelta.Api.Services
 
             return LlmBreakdown.BuildUnknownResult(dtoBreakdownInputs, r1);
         }
+
+        public async Task<DtoAssignRolesOutputs> AssignRoles(DtoAssignRolesInputs dtoRolesInputs, CancellationToken cancellationToken)
+        {
+            var prompt = LlmBreakdown.AssignRolesPrompt(dtoRolesInputs);
+
+            var api = new OpenAI_API.OpenAIAPI(KEY);
+
+            var chat = api.Chat.CreateConversation();
+            if (!string.IsNullOrEmpty(dtoRolesInputs.system))
+            {
+                chat.AppendSystemMessage(dtoRolesInputs.system);
+            }
+            chat.Model = Model.GPT4o;
+            chat.AppendUserInput(prompt);
+
+            string r1 = await chat.GetResponseFromChatbotAsync();
+
+            return LlmBreakdown.AssignRolesResult(dtoRolesInputs, r1);
+        }
+
+        public async Task<DtoRolesOutputs> DetermineRoles(DtoRolesInputs dtoRolesInputs, CancellationToken cancellationToken)
+        {
+            var prompt = LlmBreakdown.DetermineRolesPrompt(dtoRolesInputs);
+
+            var api = new OpenAI_API.OpenAIAPI(KEY);
+
+            var chat = api.Chat.CreateConversation();
+            if (!string.IsNullOrEmpty(dtoRolesInputs.system))
+            {
+                chat.AppendSystemMessage(dtoRolesInputs.system);
+            }
+            chat.Model = Model.GPT4o;
+            chat.AppendUserInput(prompt);
+
+            string r1 = await chat.GetResponseFromChatbotAsync();
+
+            return LlmBreakdown.BuildRolesResult(r1);
+        }
     }
 }

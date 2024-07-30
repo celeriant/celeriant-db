@@ -150,13 +150,15 @@ namespace OpenAI_API.Models
 		///	The latest GPT-4 model with improved instruction following, JSON mode, reproducible outputs, parallel function calling, and more. Returns a maximum of 4,096 output tokens. This preview model is not yet suited for production traffic. 
 		/// </summary>
 		public static Model GPT4_Turbo => new Model("gpt-4-turbo-preview") { OwnedBy = "openai" };
-		#endregion
 
-		#region GPT-3.5
-		/// <summary>
-		/// GPT-3.5 Turbo model which regularly updates with the latest model iteration.
-		/// </summary>
-		public static Model ChatGPTTurbo => new Model("gpt-3.5-turbo") { OwnedBy = "openai" };
+        public static Model GPT4o => new Model("gpt-4o") { OwnedBy = "openai" };
+        #endregion
+
+        #region GPT-3.5
+        /// <summary>
+        /// GPT-3.5 Turbo model which regularly updates with the latest model iteration.
+        /// </summary>
+        public static Model ChatGPTTurbo => new Model("gpt-3.5-turbo") { OwnedBy = "openai" };
 
 		/// <summary>
 		/// The latest GPT-3.5 Turbo model with improved instruction following, JSON mode, reproducible outputs, parallel function calling, and more. Returns a maximum of 4,096 output tokens.
