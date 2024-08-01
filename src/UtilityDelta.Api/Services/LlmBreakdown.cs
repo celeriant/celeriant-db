@@ -164,11 +164,11 @@ namespace UtilityDelta.Api.Services
         public static string InitialPrompt(DtoBreakdownInputs dtoBreakdownInputs)
         {
             var prompt = new StringBuilder();
-            prompt.Append($"Breakdown the task \"{dtoBreakdownInputs.task}\" into sub-tasks for my project. Only output one level of breakdown, from 2 to a maximum 10 sub-tasks. Don't include sub-tasks that take less than {dtoBreakdownInputs.minDuration} hours to complete. Do not include the input task or any other content other than the title of each task. Do not include numbering or any special characters or any intro sentence.");
+            prompt.AppendLine($"Breakdown the task \"{dtoBreakdownInputs.task}\" into sub-tasks for my project.");
 
             if (dtoBreakdownInputs.parents != null && dtoBreakdownInputs.parents.Length > 0)
             {
-                prompt.Append(" For context, the parents of this task is ");
+                prompt.Append("For context, the parents of this task is ");
                 var isFirst = true;
                 foreach (var parent in dtoBreakdownInputs.parents)
                 {
@@ -179,24 +179,20 @@ namespace UtilityDelta.Api.Services
                     prompt.Append($"\"{parent}\"");
                     isFirst = false;
                 }
-                prompt.Append(".");
+                prompt.AppendLine(".");
             }
 
             if (dtoBreakdownInputs.siblings != null && dtoBreakdownInputs.siblings.Length > 0)
             {
-                prompt.Append(" Don't include these tasks as we already have them in the project: ");
-                var isFirst = true;
+                prompt.AppendLine("Don't include the following tasks as we already have them in the project: ");
                 foreach (var sibling in dtoBreakdownInputs.siblings)
                 {
-                    if (!isFirst)
-                    {
-                        prompt.Append(" and ");
-                    }
-                    prompt.Append($"\"{sibling}\"");
-                    isFirst = false;
+                    prompt.AppendLine($" - {sibling}");
                 }
-                prompt.Append(".");
             }
+
+            prompt.AppendLine($"Only output one level of breakdown, from 2 to a maximum 10 sub-tasks. Don't include sub-tasks that take less than {dtoBreakdownInputs.minDuration} hours to complete. Do not include the input task or any other content other than the title of each task. Do not include numbering or any special characters or any intro sentence. Tasks should be specific and actionable. Do not add fluffy irrelevant tasks.");
+
 
             return prompt.ToString();
         }
