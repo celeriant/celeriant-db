@@ -87,5 +87,24 @@ namespace UtilityDelta.Api.Services
 
             return LlmBreakdown.BuildRolesResult(r1);
         }
+
+        public async Task<DtoOrganiseOutputs> GroupTasks(DtoOrganiseInputs dtoOrganiseInputs, CancellationToken cancellationToken)
+        {
+            var prompt = LlmBreakdown.GroupTasksPrompt(dtoOrganiseInputs);
+
+            var api = new OpenAI_API.OpenAIAPI(KEY);
+
+            var chat = api.Chat.CreateConversation();
+            if (!string.IsNullOrEmpty(dtoOrganiseInputs.system))
+            {
+                chat.AppendSystemMessage(dtoOrganiseInputs.system);
+            }
+            chat.Model = Model.GPT4o;
+            chat.AppendUserInput(prompt);
+
+            string r1 = await chat.GetResponseFromChatbotAsync();
+
+            return LlmBreakdown.GroupTasksResult(dtoOrganiseInputs, r1);
+        }
     }
 }

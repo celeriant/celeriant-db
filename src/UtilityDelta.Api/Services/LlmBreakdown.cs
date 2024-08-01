@@ -253,6 +253,54 @@ namespace UtilityDelta.Api.Services
             return prompt.ToString();
         }
 
+        public static string GroupTasksPrompt(DtoOrganiseInputs dtoRolesInputs)
+        {
+            var prompt = new StringBuilder();
+
+            prompt.AppendLine("Group related tasks. Only create groups when there are 2 or more related tasks for that group. Here are the tasks:");
+            for (var i = 0; i < dtoRolesInputs.tasks.Length; i++)
+            {
+                prompt.AppendLine($"{i} - {dtoRolesInputs.tasks[i]}");
+            }
+            prompt.AppendLine();
+
+            prompt.AppendLine($"Only return the task number and then the group, using '->' to separate, one line for each. Do not return any other text. Skip tasks that don't belong to any group.");
+
+            return prompt.ToString();
+        }
+
+        public static DtoOrganiseOutputs GroupTasksResult(DtoOrganiseInputs dtoOrganiseInputs, string r1)
+        {
+            var taskIds = new List<int>();
+            var taskGroups = new List<string>();
+
+            var entries = r1.Split('\n');
+            foreach (var output in entries)
+            {
+                var depOutput = output;
+                if (output.StartsWith("->"))
+                {
+                    depOutput = output.Substring(2).Trim();
+                }
+                if (output.StartsWith(">"))
+                {
+                    depOutput = output.Substring(1).Trim();
+                }
+                var depSplit = depOutput.Split("->");
+                if (depSplit.Length != 2) continue;
+
+                var taskIdStr = depSplit[0].Trim();
+                var roleText = depSplit[1].Trim();
+
+                if (!int.TryParse(taskIdStr, out var taskId)) continue;
+
+                taskIds.Add(taskId);
+                taskGroups.Add(roleText);
+            }
+
+            return new DtoOrganiseOutputs() { taskGroups = taskGroups.ToArray(), taskNumbers = taskIds.ToArray() };
+        }
+
         public static DtoAssignRolesOutputs AssignRolesResult(DtoAssignRolesInputs dtoRolesInputs, string r1)
         {
             var taskIds = new List<int>();
@@ -286,6 +334,11 @@ namespace UtilityDelta.Api.Services
         }
 
         public Task<DtoAssignRolesOutputs> AssignRoles(DtoAssignRolesInputs dtoRolesInputs, CancellationToken cancellationToken)
+        {
+            throw new NotImplementedException();
+        }
+
+        public Task<DtoOrganiseOutputs> GroupTasks(DtoOrganiseInputs dtoOrganiseInputs, CancellationToken cancellationToken)
         {
             throw new NotImplementedException();
         }

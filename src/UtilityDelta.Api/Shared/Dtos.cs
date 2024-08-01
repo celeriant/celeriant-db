@@ -31,6 +31,13 @@
         public string[] roles { get; set; }
     }
 
+    public class DtoOrganiseInputs
+    {
+        public string? system { get; set; }
+        public string[] parents { get; set; }
+        public string[] tasks { get; set; }
+    }
+
     public class DtoRolesInputs
     {
         public string? system { get; set; }
@@ -53,6 +60,12 @@
     {
         public int[] taskNumbers { get; set; }
         public string[] roles { get; set; }
+    }
+
+    public class DtoOrganiseOutputs
+    {
+        public int[] taskNumbers { get; set; }
+        public string[] taskGroups { get; set; }
     }
 
     public class DtoRolesOutputs
