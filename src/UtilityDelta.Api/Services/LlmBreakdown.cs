@@ -257,14 +257,14 @@ namespace UtilityDelta.Api.Services
         {
             var prompt = new StringBuilder();
 
-            prompt.AppendLine("Group related tasks. Only create groups when there are 2 or more related tasks for that group. Here are the tasks:");
+            prompt.AppendLine("Group related tasks. Here are the tasks:");
             for (var i = 0; i < dtoRolesInputs.tasks.Length; i++)
             {
                 prompt.AppendLine($"{i} - {dtoRolesInputs.tasks[i]}");
             }
             prompt.AppendLine();
 
-            prompt.AppendLine($"Only return the task number and then the group, using '->' to separate, one line for each. Do not return any other text. Skip tasks that don't belong to any group.");
+            prompt.AppendLine($"Return the group name and the task numbers for that group, one line for each. Do not return any other text. Skip tasks that don't belong to any group.");
 
             return prompt.ToString();
         }
@@ -277,25 +277,20 @@ namespace UtilityDelta.Api.Services
             var entries = r1.Split('\n');
             foreach (var output in entries)
             {
-                var depOutput = output;
-                if (output.StartsWith("->"))
+                var groupAndTasks = output.Split(":");
+                if (groupAndTasks.Length < 2) continue;
+
+                var groupName = groupAndTasks[0];
+
+                var taskIdsStr = groupAndTasks[1].Split(",").Select(x => x.Trim());
+                foreach (var taskIdStr in taskIdsStr)
                 {
-                    depOutput = output.Substring(2).Trim();
+                    if (int.TryParse(taskIdStr, out var id) && id < dtoOrganiseInputs.tasks.Length) 
+                    {
+                        taskGroups.Add(groupName);
+                        taskIds.Add(id);
+                    }
                 }
-                if (output.StartsWith(">"))
-                {
-                    depOutput = output.Substring(1).Trim();
-                }
-                var depSplit = depOutput.Split("->");
-                if (depSplit.Length != 2) continue;
-
-                var taskIdStr = depSplit[0].Trim();
-                var roleText = depSplit[1].Trim();
-
-                if (!int.TryParse(taskIdStr, out var taskId)) continue;
-
-                taskIds.Add(taskId);
-                taskGroups.Add(roleText);
             }
 
             return new DtoOrganiseOutputs() { taskGroups = taskGroups.ToArray(), taskNumbers = taskIds.ToArray() };
