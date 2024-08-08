@@ -1,39 +1,27 @@
-using Microsoft.AspNetCore.Http.HttpResults;
-using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Options;
-using NanoidDotNet;
-using System.Globalization;
 using System.Net;
 using System.Text.Json.Serialization;
 using System.Threading.RateLimiting;
 using UtilityDelta.Api.Interfaces;
 using UtilityDelta.Api.Services;
-using UtilityDelta.Api.Shared;
+using UtilityDelta.Projects.Interfaces;
+using UtilityDelta.Projects.Services;
+using UtilityDelta.Projects.Shared;
+
 
 [JsonSerializable(typeof(ProjectEventItem[]))]
 [JsonSerializable(typeof(List<ProjectEventItem>))]
-[JsonSerializable(typeof(LlmResult))]
-[JsonSerializable(typeof(LlmInput))]
-[JsonSerializable(typeof(DtoBreakdownInputs))]
-[JsonSerializable(typeof(DtoBreakdownOutputs))]
-[JsonSerializable(typeof(DtoUnknownOutputs))]
-[JsonSerializable(typeof(DtoRolesOutputs))]
-[JsonSerializable(typeof(DtoRolesInputs))]
-[JsonSerializable(typeof(DtoAssignRolesOutputs))]
-[JsonSerializable(typeof(DtoAssignRolesInputs))]
-[JsonSerializable(typeof(DtoOrganiseOutputs))]
-[JsonSerializable(typeof(DtoOrganiseInputs))]
 [JsonSerializable(typeof(DtoRead))]
 [JsonSerializable(typeof(DtoShare))]
 [JsonSerializable(typeof(DtoWrite))]
 [JsonSerializable(typeof(DtoDisableAccess))]
 public partial class ReadSerializerContext : JsonSerializerContext
 {
-
 }
 
 public class Program
 {
+
     private static void Main(string[] args)
     {
         var app = SetupApplication(args);
@@ -47,13 +35,8 @@ public class Program
         api.MapPost("/disableshare", endpoints.DisableShare);
         api.MapPost("/share", endpoints.Share);
         api.MapPost("/write", endpoints.Write);
-        api.MapPost("/breakdown", endpoints.Breakdown);
-        api.MapPost("/unknowns", endpoints.Unknowns);
-        api.MapPost("/roles", endpoints.Roles);
-        api.MapPost("/assignroles", endpoints.AssignRoles);
-        api.MapPost("/grouptasks", endpoints.GroupTasks);
 
-        var udConfig = app.Services.GetService<IOptions<ConfigurationEntry>>()!;
+        var udConfig = app.Services.GetService<IOptions<SystemSettings>>()!;
         Directory.CreateDirectory(udConfig.Value.SUB_DIR_CONTAINERS);
 
         var writeAndBackup = app.Services.GetService<IWriteAndBackup>()!;
@@ -150,11 +133,10 @@ public class Program
         builder.Services.AddSingleton<IShareKeyCache, ShareKeyCache>();
         builder.Services.AddSingleton<IUserAccessCache, UserAccessCache>();
         builder.Services.AddSingleton<IFileHandlesManager, FileHandlesManager>();
-        builder.Services.AddSingleton<ILlmBreakdown, ChatGPTBreakdown>();
         builder.Services.AddSingleton<IEndpoints, Endpoints>();
 
         var utilityDeltaConfiguration = builder.Configuration.GetSection("UtilityDelta");
-        builder.Services.Configure<ConfigurationEntry>(utilityDeltaConfiguration);
+        builder.Services.Configure<SystemSettings>(utilityDeltaConfiguration);
 
         var app = builder.Build();
         app.UseCors("CorsDevelopment");

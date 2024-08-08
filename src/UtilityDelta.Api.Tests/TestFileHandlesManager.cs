@@ -6,10 +6,10 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
-using UtilityDelta.Api.Services;
-using UtilityDelta.Api.Shared;
+using UtilityDelta.Projects.Services;
+using UtilityDelta.Projects.Shared;
 
-namespace UtilityDelta.Api.Tests
+namespace UtilityDelta.Projects.Tests
 {
     [TestClass]
     public class TestFileHandlesManager
@@ -19,8 +19,8 @@ namespace UtilityDelta.Api.Tests
         {
             if (Directory.Exists("testfolder")) Directory.Delete("testfolder", true);
 
-            var utilityDeltaConfiguration = new Mock<IOptions<ConfigurationEntry>>();
-            utilityDeltaConfiguration.Setup(x => x.Value).Returns(new ConfigurationEntry()
+            var utilityDeltaConfiguration = new Mock<IOptions<SystemSettings>>();
+            utilityDeltaConfiguration.Setup(x => x.Value).Returns(new SystemSettings()
             {
                 FILE_HANDLE_OPEN_LIMIT = 1,
                 SUB_DIR_CONTAINERS = "testfolder"
@@ -140,8 +140,8 @@ namespace UtilityDelta.Api.Tests
             var folder = "OpenStreamsTest" + FILE_HANDLE_OPEN_LIMIT;
             if (Directory.Exists(folder)) Directory.Delete(folder, true);
 
-            var utilityDeltaConfiguration = new Mock<IOptions<ConfigurationEntry>>();
-            utilityDeltaConfiguration.Setup(x => x.Value).Returns(new ConfigurationEntry()
+            var utilityDeltaConfiguration = new Mock<IOptions<SystemSettings>>();
+            utilityDeltaConfiguration.Setup(x => x.Value).Returns(new SystemSettings()
             {
                 FILE_HANDLE_OPEN_LIMIT = FILE_HANDLE_OPEN_LIMIT,
                 SUB_DIR_CONTAINERS = folder

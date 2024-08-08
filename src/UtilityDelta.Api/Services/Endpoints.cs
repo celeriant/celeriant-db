@@ -1,11 +1,12 @@
 ﻿using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
 using UtilityDelta.Api.Interfaces;
-using UtilityDelta.Api.Shared;
+using UtilityDelta.Projects.Interfaces;
+using UtilityDelta.Projects.Shared;
 
 namespace UtilityDelta.Api.Services
 {
-    public class Endpoints(IAccessLogic accessLogic, IReadEvents readEvents, IWriteAndBackup writeAndBackup, IShareKeyCache shareKeyCache, IUserAccessCache userAccessCache, ILlmBreakdown llmBreakdown) : IEndpoints
+    public class Endpoints(IAccessLogic accessLogic, IReadEvents readEvents, IWriteAndBackup writeAndBackup, IShareKeyCache shareKeyCache, IUserAccessCache userAccessCache) : IEndpoints
     {
         public async Task<IResult> Read(
             [FromQuery] string pi,
@@ -156,119 +157,5 @@ namespace UtilityDelta.Api.Services
             });
         }
 
-        public async Task<IResult> Breakdown([FromQuery] string pi, [FromQuery] string publicKey, [FromQuery] string nonce, [FromQuery] string sign, [FromBody] DtoBreakdownInputs dtoBreakdownInputs, CancellationToken cancellationToken)
-        {
-            return await Task.Run(async () =>
-            {
-                var accessInfo = accessLogic.IsProjectExistAndHasAccess(
-                    projectId: pi,
-                    createProjectIfNotExists: false,
-                    shareKey: null,
-                    publicKey: publicKey,
-                    nonce: nonce,
-                    sign: sign,
-                    cancellationToken: cancellationToken);
-
-                return accessInfo.ProjectAccess switch
-                {
-                    ProjectAccess.NotExists => Results.Ok(await llmBreakdown.BreakdownTask(dtoBreakdownInputs, accessInfo.CurrentUserHash, pi, cancellationToken)),
-                    ProjectAccess.NoAccess => Results.StatusCode(StatusCodes.Status403Forbidden),
-                    ProjectAccess.ReadOnlyAccess => Results.StatusCode(StatusCodes.Status403Forbidden),
-                    _ => Results.Ok(await llmBreakdown.BreakdownTask(dtoBreakdownInputs, accessInfo.CurrentUserHash, pi, cancellationToken))
-                };
-            });
-        }
-
-        public async Task<IResult> Unknowns([FromQuery] string pi, [FromQuery] string publicKey, [FromQuery] string nonce, [FromQuery] string sign, [FromBody] DtoBreakdownInputs dtoBreakdownInputs, CancellationToken cancellationToken)
-        {
-            return await Task.Run(async () =>
-            {
-                var accessInfo = accessLogic.IsProjectExistAndHasAccess(
-                    projectId: pi,
-                    createProjectIfNotExists: false,
-                    shareKey: null,
-                    publicKey: publicKey,
-                    nonce: nonce,
-                    sign: sign,
-                    cancellationToken: cancellationToken);
-
-                return accessInfo.ProjectAccess switch
-                {
-                    ProjectAccess.NotExists => Results.Ok(await llmBreakdown.IdentifyUnknowns(dtoBreakdownInputs, cancellationToken)),
-                    ProjectAccess.NoAccess => Results.StatusCode(StatusCodes.Status403Forbidden),
-                    ProjectAccess.ReadOnlyAccess => Results.StatusCode(StatusCodes.Status403Forbidden),
-                    _ => Results.Ok(await llmBreakdown.IdentifyUnknowns(dtoBreakdownInputs, cancellationToken))
-                };
-            });
-        }
-
-        public async Task<IResult> Roles([FromQuery] string pi, [FromQuery] string publicKey, [FromQuery] string nonce, [FromQuery] string sign, [FromBody] DtoRolesInputs dtoRolesInputs, CancellationToken cancellationToken)
-        {
-            return await Task.Run(async () =>
-            {
-                var accessInfo = accessLogic.IsProjectExistAndHasAccess(
-                    projectId: pi,
-                    createProjectIfNotExists: false,
-                    shareKey: null,
-                    publicKey: publicKey,
-                    nonce: nonce,
-                    sign: sign,
-                    cancellationToken: cancellationToken);
-
-                return accessInfo.ProjectAccess switch
-                {
-                    ProjectAccess.NotExists => Results.Ok(await llmBreakdown.DetermineRoles(dtoRolesInputs, cancellationToken)),
-                    ProjectAccess.NoAccess => Results.StatusCode(StatusCodes.Status403Forbidden),
-                    ProjectAccess.ReadOnlyAccess => Results.StatusCode(StatusCodes.Status403Forbidden),
-                    _ => Results.Ok(await llmBreakdown.DetermineRoles(dtoRolesInputs, cancellationToken))
-                };
-            });
-        }
-
-        public async Task<IResult> AssignRoles([FromQuery] string pi, [FromQuery] string publicKey, [FromQuery] string nonce, [FromQuery] string sign, [FromBody] DtoAssignRolesInputs dtoAssignRolesInputs, CancellationToken cancellationToken)
-        {
-            return await Task.Run(async () =>
-            {
-                var accessInfo = accessLogic.IsProjectExistAndHasAccess(
-                    projectId: pi,
-                    createProjectIfNotExists: false,
-                    shareKey: null,
-                    publicKey: publicKey,
-                    nonce: nonce,
-                    sign: sign,
-                    cancellationToken: cancellationToken);
-
-                return accessInfo.ProjectAccess switch
-                {
-                    ProjectAccess.NotExists => Results.Ok(await llmBreakdown.AssignRoles(dtoAssignRolesInputs, cancellationToken)),
-                    ProjectAccess.NoAccess => Results.StatusCode(StatusCodes.Status403Forbidden),
-                    ProjectAccess.ReadOnlyAccess => Results.StatusCode(StatusCodes.Status403Forbidden),
-                    _ => Results.Ok(await llmBreakdown.AssignRoles(dtoAssignRolesInputs, cancellationToken))
-                };
-            });
-        }
-
-        public async Task<IResult> GroupTasks([FromQuery] string pi, [FromQuery] string publicKey, [FromQuery] string nonce, [FromQuery] string sign, [FromBody] DtoOrganiseInputs dtoOrganiseInputs, CancellationToken cancellationToken)
-        {
-            return await Task.Run(async () =>
-            {
-                var accessInfo = accessLogic.IsProjectExistAndHasAccess(
-                    projectId: pi,
-                    createProjectIfNotExists: false,
-                    shareKey: null,
-                    publicKey: publicKey,
-                    nonce: nonce,
-                    sign: sign,
-                    cancellationToken: cancellationToken);
-
-                return accessInfo.ProjectAccess switch
-                {
-                    ProjectAccess.NotExists => Results.Ok(await llmBreakdown.GroupTasks(dtoOrganiseInputs, cancellationToken)),
-                    ProjectAccess.NoAccess => Results.StatusCode(StatusCodes.Status403Forbidden),
-                    ProjectAccess.ReadOnlyAccess => Results.StatusCode(StatusCodes.Status403Forbidden),
-                    _ => Results.Ok(await llmBreakdown.GroupTasks(dtoOrganiseInputs, cancellationToken))
-                };
-            });
-        }
     }
 }

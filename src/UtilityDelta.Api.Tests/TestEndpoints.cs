@@ -2,11 +2,13 @@
 using System;
 using System.Globalization;
 using System.Linq;
+using UtilityDelta.Projects.Interfaces;
 using UtilityDelta.Api.Interfaces;
+using UtilityDelta.Projects.Services;
+using UtilityDelta.Projects.Shared;
 using UtilityDelta.Api.Services;
-using UtilityDelta.Api.Shared;
 
-namespace UtilityDelta.Api.Tests
+namespace UtilityDelta.Projects.Tests
 {
     [TestClass]
     public class TestEndpoints
@@ -30,9 +32,8 @@ namespace UtilityDelta.Api.Tests
             var writeEvents = new Mock<IWriteAndBackup>();
             var shareKeyCache = new Mock<IShareKeyCache>();
             var userAccessCache = new Mock<IUserAccessCache>();
-            var llmBreakdown = new Mock<ILlmBreakdown>();
 
-            var service = new Endpoints(accessLogic.Object, readEvents.Object, writeEvents.Object, shareKeyCache.Object, userAccessCache.Object, llmBreakdown.Object);
+            var service = new Endpoints(accessLogic.Object, readEvents.Object, writeEvents.Object, shareKeyCache.Object, userAccessCache.Object);
 
             var pi = "kjlasfd";
             var publicKey = "mykeypub";
@@ -93,9 +94,8 @@ namespace UtilityDelta.Api.Tests
             var writeEvents = new Mock<IWriteAndBackup>();
             var shareKeyCache = new Mock<IShareKeyCache>();
             var userAccessCache = new Mock<IUserAccessCache>();
-            var llmBreakdown = new Mock<ILlmBreakdown>();
 
-            var service = new Endpoints(accessLogic.Object, readEvents.Object, writeEvents.Object, shareKeyCache.Object, userAccessCache.Object, llmBreakdown.Object);
+            var service = new Endpoints(accessLogic.Object, readEvents.Object, writeEvents.Object, shareKeyCache.Object, userAccessCache.Object);
 
             var pi = "kjlasfd";
             var publicKey = "mykeypub";
@@ -157,9 +157,8 @@ namespace UtilityDelta.Api.Tests
             var writeEvents = new Mock<IWriteAndBackup>();
             var shareKeyCache = new Mock<IShareKeyCache>();
             var userAccessCache = new Mock<IUserAccessCache>();
-            var llmBreakdown = new Mock<ILlmBreakdown>();
 
-            var service = new Endpoints(accessLogic.Object, readEvents.Object, writeEvents.Object, shareKeyCache.Object, userAccessCache.Object, llmBreakdown.Object);
+            var service = new Endpoints(accessLogic.Object, readEvents.Object, writeEvents.Object, shareKeyCache.Object, userAccessCache.Object);
 
             var pi = "kjlasfd";
             var publicKey = "mykeypub";
@@ -196,9 +195,8 @@ namespace UtilityDelta.Api.Tests
             var writeEvents = new Mock<IWriteAndBackup>();
             var shareKeyCache = new Mock<IShareKeyCache>();
             var userAccessCache = new Mock<IUserAccessCache>();
-            var llmBreakdown = new Mock<ILlmBreakdown>();
 
-            var service = new Endpoints(accessLogic.Object, readEvents.Object, writeEvents.Object, shareKeyCache.Object, userAccessCache.Object, llmBreakdown.Object);
+            var service = new Endpoints(accessLogic.Object, readEvents.Object, writeEvents.Object, shareKeyCache.Object, userAccessCache.Object);
 
             var pi = "kjlasfd";
             var publicKey = "mykeypub";
@@ -236,9 +234,8 @@ namespace UtilityDelta.Api.Tests
             var writeEvents = new Mock<IWriteAndBackup>();
             var shareKeyCache = new Mock<IShareKeyCache>();
             var userAccessCache = new Mock<IUserAccessCache>();
-            var llmBreakdown = new Mock<ILlmBreakdown>();
 
-            var service = new Endpoints(accessLogic.Object, readEvents.Object, writeEvents.Object, shareKeyCache.Object, userAccessCache.Object, llmBreakdown.Object);
+            var service = new Endpoints(accessLogic.Object, readEvents.Object, writeEvents.Object, shareKeyCache.Object, userAccessCache.Object);
 
             var pi = "kjlasfd";
             var publicKey = "mykeypub";

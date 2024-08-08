@@ -16,12 +16,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Azure.Storage.Blobs" Version="12.20.0" />
-    <PackageReference Include="Nanoid" Version="3.0.0" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <ProjectReference Include="..\UtilityDelta.ChatGpt\UtilityDelta.ChatGpt.csproj" />
+    <ProjectReference Include="..\UtilityDelta.Projects\UtilityDelta.Projects.csproj" />
   </ItemGroup>
 
   <ItemGroup>

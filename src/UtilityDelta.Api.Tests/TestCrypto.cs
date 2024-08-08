@@ -1,9 +1,9 @@
 using System.Security.Cryptography;
 using System.Text;
-using UtilityDelta.Api.Exceptions;
-using UtilityDelta.Api.Services;
+using UtilityDelta.Projects.Exceptions;
+using UtilityDelta.Projects.Services;
 
-namespace UtilityDelta.Api.Tests
+namespace UtilityDelta.Projects.Tests
 {
     [TestClass]
     public class TestCrypto

@@ -6,11 +6,11 @@ using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using UtilityDelta.Api.Interfaces;
-using UtilityDelta.Api.Services;
-using UtilityDelta.Api.Shared;
+using UtilityDelta.Projects.Interfaces;
+using UtilityDelta.Projects.Services;
+using UtilityDelta.Projects.Shared;
 
-namespace UtilityDelta.Api.Tests
+namespace UtilityDelta.Projects.Tests
 {
     [TestClass]
     public class TestUserAccessCache
@@ -22,8 +22,8 @@ namespace UtilityDelta.Api.Tests
             var cu1 = "c1";
             var iv = "test iv";
 
-            var utilityDeltaConfiguration = new Mock<IOptions<ConfigurationEntry>>();
-            utilityDeltaConfiguration.Setup(x => x.Value).Returns(new ConfigurationEntry()
+            var utilityDeltaConfiguration = new Mock<IOptions<SystemSettings>>();
+            utilityDeltaConfiguration.Setup(x => x.Value).Returns(new SystemSettings()
             {
                 FILE_HANDLE_OPEN_LIMIT = 10,
                 SUB_DIR_CONTAINERS = string.Empty,

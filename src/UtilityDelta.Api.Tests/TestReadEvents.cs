@@ -5,10 +5,10 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
-using UtilityDelta.Api.Services;
-using UtilityDelta.Api.Shared;
+using UtilityDelta.Projects.Services;
+using UtilityDelta.Projects.Shared;
 
-namespace UtilityDelta.Api.Tests
+namespace UtilityDelta.Projects.Tests
 {
     [TestClass]
     public class TestReadEvents
@@ -16,8 +16,8 @@ namespace UtilityDelta.Api.Tests
         [TestMethod]
         public void TestV1()
         {
-            var utilityDeltaConfiguration = new Mock<IOptions<ConfigurationEntry>>();
-            utilityDeltaConfiguration.Setup(x => x.Value).Returns(new ConfigurationEntry()
+            var utilityDeltaConfiguration = new Mock<IOptions<SystemSettings>>();
+            utilityDeltaConfiguration.Setup(x => x.Value).Returns(new SystemSettings()
             {
                 FILE_HANDLE_OPEN_LIMIT = 10,
                 SUB_DIR_CONTAINERS = string.Empty
@@ -34,8 +34,8 @@ namespace UtilityDelta.Api.Tests
         [TestMethod]
         public void TestFilterSelfEvents()
         {
-            var utilityDeltaConfiguration = new Mock<IOptions<ConfigurationEntry>>();
-            utilityDeltaConfiguration.Setup(x => x.Value).Returns(new ConfigurationEntry()
+            var utilityDeltaConfiguration = new Mock<IOptions<SystemSettings>>();
+            utilityDeltaConfiguration.Setup(x => x.Value).Returns(new SystemSettings()
             {
                 FILE_HANDLE_OPEN_LIMIT = 10,
                 SUB_DIR_CONTAINERS = string.Empty
@@ -57,8 +57,8 @@ namespace UtilityDelta.Api.Tests
         [TestMethod]
         public void TestLimitToServerId()
         {
-            var utilityDeltaConfiguration = new Mock<IOptions<ConfigurationEntry>>();
-            utilityDeltaConfiguration.Setup(x => x.Value).Returns(new ConfigurationEntry()
+            var utilityDeltaConfiguration = new Mock<IOptions<SystemSettings>>();
+            utilityDeltaConfiguration.Setup(x => x.Value).Returns(new SystemSettings()
             {
                 FILE_HANDLE_OPEN_LIMIT = 10,
                 SUB_DIR_CONTAINERS = string.Empty
@@ -75,8 +75,8 @@ namespace UtilityDelta.Api.Tests
         [TestMethod]
         public void TestLimitToEventType()
         {
-            var utilityDeltaConfiguration = new Mock<IOptions<ConfigurationEntry>>();
-            utilityDeltaConfiguration.Setup(x => x.Value).Returns(new ConfigurationEntry()
+            var utilityDeltaConfiguration = new Mock<IOptions<SystemSettings>>();
+            utilityDeltaConfiguration.Setup(x => x.Value).Returns(new SystemSettings()
             {
                 FILE_HANDLE_OPEN_LIMIT = 10,
                 SUB_DIR_CONTAINERS = string.Empty
@@ -93,8 +93,8 @@ namespace UtilityDelta.Api.Tests
         [TestMethod]
         public void TestLimitToEventTypes()
         {
-            var utilityDeltaConfiguration = new Mock<IOptions<ConfigurationEntry>>();
-            utilityDeltaConfiguration.Setup(x => x.Value).Returns(new ConfigurationEntry()
+            var utilityDeltaConfiguration = new Mock<IOptions<SystemSettings>>();
+            utilityDeltaConfiguration.Setup(x => x.Value).Returns(new SystemSettings()
             {
                 FILE_HANDLE_OPEN_LIMIT = 10,
                 SUB_DIR_CONTAINERS = string.Empty
@@ -111,8 +111,8 @@ namespace UtilityDelta.Api.Tests
         [TestMethod]
         public void TestNotFound()
         {
-            var utilityDeltaConfiguration = new Mock<IOptions<ConfigurationEntry>>();
-            utilityDeltaConfiguration.Setup(x => x.Value).Returns(new ConfigurationEntry()
+            var utilityDeltaConfiguration = new Mock<IOptions<SystemSettings>>();
+            utilityDeltaConfiguration.Setup(x => x.Value).Returns(new SystemSettings()
             {
                 FILE_HANDLE_OPEN_LIMIT = 10,
                 SUB_DIR_CONTAINERS = string.Empty

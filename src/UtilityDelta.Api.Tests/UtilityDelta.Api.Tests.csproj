@@ -29,6 +29,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\UtilityDelta.Api\UtilityDelta.Api.csproj" />
+    <ProjectReference Include="..\UtilityDelta.Projects\UtilityDelta.Projects.csproj" />
   </ItemGroup>
 
   <ItemGroup>

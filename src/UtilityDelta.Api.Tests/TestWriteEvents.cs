@@ -5,11 +5,11 @@ using System.Collections.Concurrent;
 using System.IO;
 using System.Linq;
 using System.Text;
-using UtilityDelta.Api.Interfaces;
-using UtilityDelta.Api.Services;
-using UtilityDelta.Api.Shared;
+using UtilityDelta.Projects.Interfaces;
+using UtilityDelta.Projects.Services;
+using UtilityDelta.Projects.Shared;
 
-namespace UtilityDelta.Api.Tests
+namespace UtilityDelta.Projects.Tests
 {
     [TestClass]
     public class TestWriteEvents
@@ -81,8 +81,8 @@ namespace UtilityDelta.Api.Tests
         {
             if (Directory.Exists(nameof(TestCurrentVersion))) Directory.Delete(nameof(TestCurrentVersion), true);
 
-            var utilityDeltaConfiguration = new Mock<IOptions<ConfigurationEntry>>();
-            utilityDeltaConfiguration.Setup(x => x.Value).Returns(new ConfigurationEntry()
+            var utilityDeltaConfiguration = new Mock<IOptions<SystemSettings>>();
+            utilityDeltaConfiguration.Setup(x => x.Value).Returns(new SystemSettings()
             {
                 FILE_HANDLE_OPEN_LIMIT = 10,
                 SUB_DIR_CONTAINERS = nameof(TestCurrentVersion)

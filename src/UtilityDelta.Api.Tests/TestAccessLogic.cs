@@ -5,11 +5,11 @@ using System.Linq;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Threading.Tasks;
-using UtilityDelta.Api.Interfaces;
-using UtilityDelta.Api.Services;
-using UtilityDelta.Api.Shared;
+using UtilityDelta.Projects.Interfaces;
+using UtilityDelta.Projects.Services;
+using UtilityDelta.Projects.Shared;
 
-namespace UtilityDelta.Api.Tests
+namespace UtilityDelta.Projects.Tests
 {
     [TestClass]
     public class TestAccessLogic
