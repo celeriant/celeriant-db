@@ -12,7 +12,7 @@ namespace UtilityDelta.Projects.Services
     {
         public DtoWrite WriteClientEvents(ProjectEventItem[] events, string createdBy, string pi, CancellationToken cancellationToken)
         {
-            return InternalWrite(events.Where(x => !x.tp.IsServerEvent()), createdBy, pi, DateTimeOffset.UtcNow.ToUnixTimeSeconds(), cancellationToken);
+            return InternalWrite(events.Where(x => !x.tp.IsServerEvent()), createdBy, pi, null, cancellationToken);
         }
 
         public DtoWrite CustomWriteEvents(ProjectEventItem[] events, string pi, CancellationToken cancellationToken)
