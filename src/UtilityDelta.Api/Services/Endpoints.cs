@@ -1,5 +1,6 @@
 ﻿using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
+using System.Collections.Concurrent;
 using UtilityDelta.Api.Interfaces;
 using UtilityDelta.Projects.Interfaces;
 using UtilityDelta.Projects.Shared;
@@ -36,6 +37,48 @@ namespace UtilityDelta.Api.Services
                     _ => Results.Ok(readEvents.Read(pi, fromTime, cancellationToken, accessInfo.CurrentUserHash))
                 };
             });
+        }
+
+        private static ConcurrentDictionary<string, int> _pingCount = new ConcurrentDictionary<string, int>();
+        private static ConcurrentDictionary<string, DateTime> _pingLastAccess = new ConcurrentDictionary<string, DateTime>();
+
+        public IResult Ping(
+            [FromQuery] string pi)
+        {
+            _pingCount.AddOrUpdate(pi, 1, (pi, v) => v + 1);
+            _pingLastAccess.AddOrUpdate(pi, DateTime.UtcNow, (pi, v) => DateTime.UtcNow);
+
+            return Results.Ok();
+        }
+
+        public class DtoPingResult()
+        {
+            public string pi { get; set; }
+            public int count { get; set; }
+            public DateTime lastAccess { get; set; }
+        }
+
+        public IResult PingResults(string secret)
+        {
+            if (secret != "LKJSDFLKJASDFLKJA") return Results.StatusCode(StatusCodes.Status403Forbidden);
+
+            var keys = _pingCount.Keys;
+            var result = new List<DtoPingResult>(keys.Count);
+
+            foreach (var key in keys)
+            {
+                try
+                {
+                    var count = _pingCount[key];
+                    var lastAccess = _pingLastAccess[key];
+                    result.Add(new DtoPingResult { pi = key, count = count, lastAccess = lastAccess });
+                }
+                catch
+                {
+                }
+            }
+
+            return Results.Ok(result);
         }
 
         public async Task<IResult> DisableShare(

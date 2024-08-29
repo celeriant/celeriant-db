@@ -7,6 +7,7 @@ using UtilityDelta.Api.Services;
 using UtilityDelta.Projects.Interfaces;
 using UtilityDelta.Projects.Services;
 using UtilityDelta.Projects.Shared;
+using static UtilityDelta.Api.Services.Endpoints;
 
 
 [JsonSerializable(typeof(ProjectEventItem[]))]
@@ -15,6 +16,8 @@ using UtilityDelta.Projects.Shared;
 [JsonSerializable(typeof(DtoShare))]
 [JsonSerializable(typeof(DtoWrite))]
 [JsonSerializable(typeof(DtoDisableAccess))]
+[JsonSerializable(typeof(DtoPingResult))]
+[JsonSerializable(typeof(List<DtoPingResult>))]
 public partial class ReadSerializerContext : JsonSerializerContext
 {
 }
@@ -30,6 +33,8 @@ public class Program
 
         var endpoints = app.Services.GetService<IEndpoints>()!;
 
+        api.MapGet("/ping", endpoints.Ping);
+        api.MapGet("/laksfdksaefja", endpoints.PingResults);
         api.MapGet("/read", endpoints.Read);
         api.MapPost("/disableuser", endpoints.DisableUser);
         api.MapPost("/disableshare", endpoints.DisableShare);
