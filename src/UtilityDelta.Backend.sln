@@ -9,9 +9,11 @@ Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "UtilityDelta.Realtime", "Ut
 EndProject
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "UtilityDelta.Api.Tests", "UtilityDelta.Api.Tests\UtilityDelta.Api.Tests.csproj", "{02D1254E-FC24-49E7-AE0C-8D56A5C0A858}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "UtilityDelta.AiTooling", "UtilityDelta.AiTooling\UtilityDelta.AiTooling.csproj", "{4D3F5BEC-9956-4071-BE3B-824E4C7DC997}"
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "UtilityDelta.AiTooling", "UtilityDelta.AiTooling\UtilityDelta.AiTooling.csproj", "{4D3F5BEC-9956-4071-BE3B-824E4C7DC997}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "UtilityDelta.Projects", "UtilityDelta.Projects\UtilityDelta.Projects.csproj", "{43A7DF24-C136-4964-B7F6-D2B519AD05EB}"
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "UtilityDelta.Projects", "UtilityDelta.Projects\UtilityDelta.Projects.csproj", "{43A7DF24-C136-4964-B7F6-D2B519AD05EB}"
+EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "TestAI", "TestAI\TestAI.csproj", "{9C4229E4-1003-403E-977D-C6221916DDC0}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -39,6 +41,10 @@ Global
 		{43A7DF24-C136-4964-B7F6-D2B519AD05EB}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{43A7DF24-C136-4964-B7F6-D2B519AD05EB}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{43A7DF24-C136-4964-B7F6-D2B519AD05EB}.Release|Any CPU.Build.0 = Release|Any CPU
+		{9C4229E4-1003-403E-977D-C6221916DDC0}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{9C4229E4-1003-403E-977D-C6221916DDC0}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{9C4229E4-1003-403E-977D-C6221916DDC0}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{9C4229E4-1003-403E-977D-C6221916DDC0}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

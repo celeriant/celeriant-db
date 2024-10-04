@@ -26,17 +26,32 @@ namespace UtilityDelta.AiTooling.Services
             return new ChatClient(model: config.Value.LLM_MODEL, config.Value.OPENAI_API_KEY);
         }
 
+        public async Task<DtoBreakdownQuestionsOutputs> BreakdownQuestions(DtoBreakdownInputs dtoBreakdownInputs, CancellationToken cancellationToken)
+        {
+            var chat = NewChat();
+
+            var u1 = ChatMessage.CreateUserMessage(dtoBreakdownInputs.AutoBreakdownInitialQuestionsPrompt());
+
+            var r1 = await chat.CompleteChatAsync([u1], cancellationToken: cancellationToken);
+            var a1 = ChatMessage.CreateAssistantMessage(r1);
+
+            return dtoBreakdownInputs.AutoBreakdownInitialQuestionsResult(r1.Value.Content[0].Text);
+        }
+
         public async Task<DtoBreakdownOutputs> BreakdownTask(DtoBreakdownInputs dtoBreakdownInputs, CancellationToken cancellationToken)
         {
             var chat = NewChat();
 
             var u1 = ChatMessage.CreateUserMessage(dtoBreakdownInputs.AutoBreakdownInitialPrompt());
-
             var r1 = await chat.CompleteChatAsync([u1], cancellationToken: cancellationToken);
             var a1 = ChatMessage.CreateAssistantMessage(r1);
 
-            var u2 = ChatMessage.CreateUserMessage(PromptEngineering.LinkDependenciesPrompt());
+            if (dtoBreakdownInputs.skipDependencies)
+            {
+                return dtoBreakdownInputs.AutoBreakdownResult(r1.Value.Content[0].Text, string.Empty);
+            }
 
+            var u2 = ChatMessage.CreateUserMessage(PromptEngineering.LinkDependenciesPrompt());
             var r2 = await chat.CompleteChatAsync([u1, a1, u2], cancellationToken: cancellationToken);
 
             return dtoBreakdownInputs.AutoBreakdownResult(r1.Value.Content[0].Text, r2.Value.Content[0].Text);

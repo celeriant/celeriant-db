@@ -5,6 +5,7 @@ namespace UtilityDelta.AiTooling.Interfaces
     public interface ILlmProcessing
     {
         Task<DtoBreakdownOutputs> BreakdownTask(DtoBreakdownInputs dtoBreakdownInputs, CancellationToken cancellationToken);
+        Task<DtoBreakdownQuestionsOutputs> BreakdownQuestions(DtoBreakdownInputs dtoBreakdownInputs, CancellationToken cancellationToken);
         Task<DtoUnknownOutputs> IdentifyUnknowns(DtoBreakdownInputs dtoBreakdownInputs, CancellationToken cancellationToken);
         Task<DtoRolesOutputs> DetermineRoles(DtoRolesInputs dtoRolesInputs, CancellationToken cancellationToken);
         Task<DtoAssignRolesOutputs> AssignRoles(DtoAssignRolesInputs dtoRolesInputs, CancellationToken cancellationToken);

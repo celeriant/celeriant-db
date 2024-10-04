@@ -1,3 +1,7 @@
+using Microsoft.AspNetCore.Mvc;
+using System.Security.Cryptography.X509Certificates;
+using System.Text;
+using UtilityDelta.AiTooling.Dtos;
 using UtilityDelta.AiTooling.Interfaces;
 using UtilityDelta.AiTooling.Services;
 using UtilityDelta.Projects.Interfaces;
@@ -16,10 +20,33 @@ namespace UtilityDelta.AiTooling
             var endpoints = app.Services.GetService<IEndpoints>()!;
 
             api.MapPost("/breakdown", endpoints.Breakdown);
+            api.MapPost("/breakdownquestions", endpoints.BreakdownQuestions);
             api.MapPost("/unknowns", endpoints.Unknowns);
             api.MapPost("/roles", endpoints.Roles);
             api.MapPost("/assignroles", endpoints.AssignRoles);
             api.MapPost("/grouptasks", endpoints.GroupTasks);
+
+            api.MapPost("/assistant", async ([FromBody] DtoQuestion question, [FromQuery] string pi, [FromQuery] string publicKey, [FromQuery] string nonce, [FromQuery] string sign, HttpContext context, [FromServices] IUtilityDeltaAssistant utilityDeltaAssistant, [FromServices] IAccessLogic accessLogic, CancellationToken cancellationToken) =>
+            {
+                var accessInfo = accessLogic.IsProjectExistAndHasAccess(
+                    projectId: pi,
+                    createProjectIfNotExists: false,
+                    shareKey: null,
+                    publicKey: publicKey,
+                    nonce: nonce,
+                    sign: sign,
+                    cancellationToken: cancellationToken);
+
+                context.Response.ContentType = "text/plain";
+
+                // Use the input text to generate a stream response
+                await foreach (var item in utilityDeltaAssistant.AskAssistant(accessInfo.CurrentUserHash, question.question, cancellationToken))
+                {
+                    Console.WriteLine(item);
+                    await context.Response.WriteAsync(item);
+                    await context.Response.Body.FlushAsync(); // Flush the stream to ensure data is sent immediately
+                }
+            });
 
             app.Run();
         }
@@ -66,6 +93,8 @@ namespace UtilityDelta.AiTooling
             builder.Services.AddSingleton<IFileHandlesManager, FileHandlesManager>();
             builder.Services.AddSingleton<ILlmProcessing, LlmProcessing>();
             builder.Services.AddSingleton<IEndpoints, Endpoints>();
+            builder.Services.AddSingleton<IUtilityDeltaAssistant, UtilityDeltaAssistant>();
+
 
             var utilityDeltaConfiguration = builder.Configuration.GetSection("UtilityDelta");
             builder.Services.Configure<ConfigurationEntry>(utilityDeltaConfiguration);

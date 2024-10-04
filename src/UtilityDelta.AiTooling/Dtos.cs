@@ -6,7 +6,18 @@
         public string? task { get; set; }
         public string[] parents { get; set; } = [];
         public string[] siblings { get; set; } = [];
+        public string[] yesQuestions { get; set; } = [];
+        public string[] noQuestions { get; set; } = [];
+        public string[] unsureQuestions { get; set; } = [];
+        public string[] unansweredQuestions { get; set; } = [];
+        public string? userNotes { get; set; }
         public double minDuration { get; set; }
+        public bool skipDependencies { get; set; }
+    }
+
+    public class DtoQuestion
+    {
+        public string question { get; set; } = string.Empty;
     }
 
     public class DtoAssignRolesInputs
@@ -35,6 +46,11 @@
         public string[] subTasks { get; set; } = [];
         public string[] predecessors { get; set; } = [];
         public string[] successors { get; set; } = [];
+    }
+
+    public class DtoBreakdownQuestionsOutputs
+    {
+        public string[] questions { get; set; } = [];
     }
 
     public class DtoUnknownOutputs

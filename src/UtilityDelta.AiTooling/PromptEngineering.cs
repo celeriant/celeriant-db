@@ -37,6 +37,27 @@ namespace UtilityDelta.AiTooling
             return new DtoRolesOutputs() { roles = output.ToArray() };
         }
 
+        public static DtoBreakdownQuestionsOutputs AutoBreakdownInitialQuestionsResult(this DtoBreakdownInputs dtoBreakdownInputs, string r1)
+        {
+            var result = new DtoBreakdownQuestionsOutputs();
+            var subtasks = new List<string>();
+
+            foreach (var output in r1.Split('\n'))
+            {
+                var taskOutput = output.Trim();
+                if (taskOutput.StartsWith('-'))
+                {
+                    taskOutput = taskOutput.Substring(1).Trim();
+                }
+                if (taskOutput.ToLowerInvariant() == dtoBreakdownInputs.task!.ToLowerInvariant() || string.IsNullOrWhiteSpace(taskOutput)) continue;
+
+                subtasks.Add(taskOutput);
+            }
+
+            result.questions = subtasks.ToArray();
+            return result;
+        }
+
         public static DtoBreakdownOutputs AutoBreakdownResult(this DtoBreakdownInputs dtoBreakdownInputs, string r1, string r2)
         {
             var result = new DtoBreakdownOutputs();
@@ -83,7 +104,7 @@ namespace UtilityDelta.AiTooling
         public static string DiscoverUnknownsPrompt(this DtoBreakdownInputs dtoBreakdownInputs)
         {
             var prompt = new StringBuilder();
-            prompt.AppendLine($"Identify tasks in this list that could take longer than {dtoBreakdownInputs.minDuration} hours to complete. Only return the task number, one line for each task number. Do not return any other text.");
+            prompt.AppendLine($"Identify tasks in this list that could take longer than 15 story points to complete. Only return the task number, one line for each task number. Do not return any other text.");
 
             prompt.Append($" For context, the parents of these tasks are: \"{dtoBreakdownInputs.task}\"");
             if (dtoBreakdownInputs.parents != null && dtoBreakdownInputs.parents.Length > 0)
@@ -118,10 +139,12 @@ namespace UtilityDelta.AiTooling
             return prompt.ToString();
         }
 
-        public static string AutoBreakdownInitialPrompt(this DtoBreakdownInputs dtoBreakdownInputs)
+        public static string AutoBreakdownInitialQuestionsPrompt(this  DtoBreakdownInputs dtoBreakdownInputs)
         {
             var prompt = new StringBuilder();
-            prompt.AppendLine($"Breakdown the task \"{dtoBreakdownInputs.task}\" into sub-tasks for my project.");
+            prompt.AppendLine("To better prepare for task breakdown, ask the user some clarifying questions. Each question should be short and able to be answered with a yes or a no by the user. Do not give \"[this] or [that]\" style questions as the user can only answer yes or no. Do not number the questions or add any bullet points.");
+            prompt.AppendLine($"The task is \"{dtoBreakdownInputs.task}\".");
+            prompt.AppendLine();
 
             if (dtoBreakdownInputs.parents != null && dtoBreakdownInputs.parents.Length > 0)
             {
@@ -137,6 +160,90 @@ namespace UtilityDelta.AiTooling
                     isFirst = false;
                 }
                 prompt.AppendLine(".");
+                prompt.AppendLine();
+            }
+
+            if (dtoBreakdownInputs.siblings != null && dtoBreakdownInputs.siblings.Length > 0)
+            {
+                prompt.AppendLine("The task has already been broken down previously, here are the sub-tasks: ");
+                foreach (var sibling in dtoBreakdownInputs.siblings)
+                {
+                    prompt.AppendLine($" - {sibling}");
+                }
+                prompt.AppendLine();
+            }
+
+            if (dtoBreakdownInputs.yesQuestions != null && dtoBreakdownInputs.yesQuestions.Length > 0)
+            {
+                prompt.AppendLine("The user has already indicated 'YES' for the following questions: ");
+                foreach (var question in dtoBreakdownInputs.yesQuestions)
+                {
+                    prompt.AppendLine($" - {question}");
+                }
+                prompt.AppendLine();
+            }
+
+            if (dtoBreakdownInputs.noQuestions != null && dtoBreakdownInputs.noQuestions.Length > 0)
+            {
+                prompt.AppendLine("The user has already indicated 'NO' for the following questions: ");
+                foreach (var question in dtoBreakdownInputs.noQuestions)
+                {
+                    prompt.AppendLine($" - {question}");
+                }
+                prompt.AppendLine();
+            }
+
+            if (dtoBreakdownInputs.unsureQuestions != null && dtoBreakdownInputs.unsureQuestions.Length > 0)
+            {
+                prompt.AppendLine("The user is 'UNSURE' about these questions. Possibly rephrase them, add more detail or just leave them out: ");
+                foreach (var question in dtoBreakdownInputs.unsureQuestions)
+                {
+                    prompt.AppendLine($" - {question}");
+                }
+                prompt.AppendLine();
+            }
+
+            if (dtoBreakdownInputs.unansweredQuestions != null && dtoBreakdownInputs.unansweredQuestions.Length > 0)
+            {
+                prompt.AppendLine("The user has skipped these questions. Just leave them out from future responses: ");
+                foreach (var question in dtoBreakdownInputs.unansweredQuestions)
+                {
+                    prompt.AppendLine($" - {question}");
+                }
+                prompt.AppendLine();
+            }
+
+            if (!string.IsNullOrWhiteSpace(dtoBreakdownInputs.userNotes))
+            {
+                prompt.AppendLine("The user has provided some extra details for context: ");
+                prompt.AppendLine(dtoBreakdownInputs.userNotes);
+                prompt.AppendLine();
+            }
+
+            return prompt.ToString();
+        }
+
+        public static string AutoBreakdownInitialPrompt(this DtoBreakdownInputs dtoBreakdownInputs)
+        {
+            var prompt = new StringBuilder();
+            prompt.AppendLine($"Breakdown the task \"{dtoBreakdownInputs.task}\" into sub-tasks for my project.");
+            prompt.AppendLine();
+
+            if (dtoBreakdownInputs.parents != null && dtoBreakdownInputs.parents.Length > 0)
+            {
+                prompt.Append("For context, the parents of this task is ");
+                var isFirst = true;
+                foreach (var parent in dtoBreakdownInputs.parents)
+                {
+                    if (!isFirst)
+                    {
+                        prompt.Append(" and then ");
+                    }
+                    prompt.Append($"\"{parent}\"");
+                    isFirst = false;
+                }
+                prompt.AppendLine(".");
+                prompt.AppendLine();
             }
 
             if (dtoBreakdownInputs.siblings != null && dtoBreakdownInputs.siblings.Length > 0)
@@ -146,10 +253,38 @@ namespace UtilityDelta.AiTooling
                 {
                     prompt.AppendLine($" - {sibling}");
                 }
+                prompt.AppendLine();
             }
 
-            prompt.AppendLine($"Only output one level of breakdown, from 2 to a maximum 10 sub-tasks. Don't include sub-tasks that take less than {dtoBreakdownInputs.minDuration} hours to complete. Do not include the input task or any other content other than the title of each task. Do not include numbering or any special characters or any intro sentence. Tasks should be specific and actionable. Do not add fluffy irrelevant tasks.");
+            if (dtoBreakdownInputs.yesQuestions != null && dtoBreakdownInputs.yesQuestions.Length > 0)
+            {
+                prompt.AppendLine("The user has answered 'YES' to the following clarification questions: ");
+                foreach (var question in dtoBreakdownInputs.yesQuestions)
+                {
+                    prompt.AppendLine($" - {question}");
+                }
+                prompt.AppendLine();
+            }
 
+            if (dtoBreakdownInputs.noQuestions != null && dtoBreakdownInputs.noQuestions.Length > 0)
+            {
+                prompt.AppendLine("The user has answered 'NO' to the following clarification questions: ");
+                foreach (var question in dtoBreakdownInputs.noQuestions)
+                {
+                    prompt.AppendLine($" - {question}");
+                }
+                prompt.AppendLine();
+            }
+
+            if (!string.IsNullOrWhiteSpace(dtoBreakdownInputs.userNotes))
+            {
+                prompt.AppendLine("The user has provided some extra details for context: ");
+                prompt.AppendLine(dtoBreakdownInputs.userNotes);
+                prompt.AppendLine();
+            }
+
+            prompt.AppendLine($"Give an actionable, single sentence per task, without any full stops at the end. Only output one level of breakdown. Don't include sub-tasks that take less than {dtoBreakdownInputs.minDuration} hours to complete. Do not include the input task or any other content other than the title of each task. Do not include numbering or any special characters or any intro sentence. Tasks should be specific and actionable. Do not add fluffy irrelevant tasks.");
+            prompt.AppendLine();
 
             return prompt.ToString();
         }

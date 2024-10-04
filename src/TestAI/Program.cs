@@ -29,20 +29,7 @@ namespace TestAI
         static async Task Main(string[] args)
         {
             var key = Environment.GetEnvironmentVariable("OPENAI_API_KEY")!;
-            var documentationAssistantId = Environment.GetEnvironmentVariable("OPENAI_DOCS_ASSISTANT_ID")!;
-
-            //ChatClient client = new(model: "gpt-4o", key);
-
-            //var input = Console.ReadLine();
-            //var completion = client.CompleteChatStreamingAsync(input);
-
-            //await foreach (var update in completion)
-            //{
-            //    foreach (ChatMessageContentPart updatePart in update.ContentUpdate)
-            //    {
-            //        Console.Write(updatePart);
-            //    }
-            //}
+            var documentationAssistantId = "OPENAI_ASSISTANT_ID_REDACTED_PRE_PUBLICATION_SEE_PROVENANCE_MD";
 
             // Assistants is a beta API and subject to change; acknowledge its experimental status by suppressing the matching warning.
 #pragma warning disable OPENAI001
@@ -52,35 +39,26 @@ namespace TestAI
             await StreamedThread(documentationAssistantId, assistantClient, CancellationToken.None);
         }
 
-        //public static string? RemovePatterns(string? input)
-        //{
-        //    if (input == null) return null;
-
-        //    // Define the regular expression pattern
-        //    string pattern = @"\?\d+:\d+\+source\?";
-
-        //    // Replace the matched patterns with an empty string
-        //    string result = Regex.Replace(input, pattern, string.Empty);
-
-        //    return result;
-        //}
-
         private static async Task StreamedThread(string assistantId, AssistantClient client, CancellationToken cancellationToken)
         {
             var assistant = await client.GetAssistantAsync(assistantId, cancellationToken);
-            
+
             //Here we lookup the existing threadId for the requesting user
             AssistantThread? thread = null;
+            //AssistantThread? thread = await client.GetThreadAsync("thread_ppN1QNzjhHsgPs483q4uSYKO");
 
             try
             {
                 while (true)
                 {
-                    Console.WriteLine("Ask a question!");
+                    Console.WriteLine();
+                    Console.WriteLine("ENTER PROMPT:");
+                    Console.WriteLine();
                     var userQuestion = Console.ReadLine();
                     if (string.IsNullOrWhiteSpace(userQuestion) || userQuestion.Trim().ToLower() == "quit") break;
 
                     if (thread == null) thread = await client.CreateThreadAsync();
+                    Console.WriteLine(thread.Id);
 
                     var message = await client.CreateMessageAsync(thread, MessageRole.User, [userQuestion]);
 
@@ -97,11 +75,13 @@ namespace TestAI
                             }
                             else if (update is MessageContentUpdate contentUpdate && !string.IsNullOrWhiteSpace(contentUpdate.Text))
                             {
-                                Console.Write(contentUpdate.Text);
+                                Console.Write(contentUpdate.Text.Replace("\n", Environment.NewLine));
                             }
                         }
                     }
                     while (currentRun?.Status.IsTerminal == false);
+                    Console.WriteLine();
+                    Console.WriteLine();
                 }
             }
             finally
