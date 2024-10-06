@@ -1,4 +1,6 @@
-﻿namespace UtilityDelta.AiTooling.Dtos
+﻿using UtilityDelta.Projects.Shared;
+
+namespace UtilityDelta.AiTooling.Dtos
 {
     public class DtoBreakdownInputs
     {
@@ -14,6 +16,8 @@
         public double minDuration { get; set; }
         public bool skipDependencies { get; set; }
     }
+
+    public record DtoAssistantChanges(List<ProjectEventItem> events);
 
     public class DtoQuestion
     {

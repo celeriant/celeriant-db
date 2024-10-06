@@ -1,9 +1,13 @@
 ﻿using Microsoft.Extensions.Options;
 using OpenAI;
 using OpenAI.Assistants;
+using OpenAI.Files;
+using System.ClientModel;
 using System.ClientModel.Primitives;
 using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
+using System.Text;
+using System.Text.RegularExpressions;
 using UtilityDelta.AiTooling.Interfaces;
 
 #pragma warning disable OPENAI001
@@ -14,61 +18,120 @@ namespace UtilityDelta.AiTooling.Services
     {
         private ConcurrentDictionary<string, string> _userToThreadIds = new ConcurrentDictionary<string, string>();
 
-        public async IAsyncEnumerable<string> AskAssistant(string currentUserHash, string userQuestion, [EnumeratorCancellation] CancellationToken cancellationToken)
+        public async Task<(string response, string? threadId)> AskAssistantNoStreaming(string assistantId, string? threadId, bool deleteThread, string currentUserHash, string userQuestion, CancellationToken cancellationToken)
+        {
+            var (assistantClient, assistant) = await GetAssistantClient(assistantId);
+
+            ThreadRun threadRun;
+            if (threadId != null)
+            {
+                var threadGet = await assistantClient.GetThreadAsync(threadId, cancellationToken);
+                var runCreationOptions = new RunCreationOptions();
+                runCreationOptions.AdditionalMessages.Add(new ThreadInitializationMessage(MessageRole.User, [userQuestion]));
+                threadRun = await assistantClient.CreateRunAsync(threadId, assistantId, runCreationOptions, cancellationToken);
+            } else
+            {
+                ThreadCreationOptions threadOptions = new()
+                {
+                    InitialMessages = { userQuestion }
+                };
+
+                threadRun = await assistantClient.CreateThreadAndRunAsync(assistant.Id, threadOptions);
+            }
+
+            do
+            {
+                await Task.Delay(1000);
+                threadRun = assistantClient.GetRun(threadRun.ThreadId, threadRun.Id);
+            } while (!threadRun.Status.IsTerminal);
+
+            CollectionResult<ThreadMessage> messages = assistantClient.GetMessages(threadRun.ThreadId, new MessageCollectionOptions() { Order = MessageCollectionOrder.Ascending }, cancellationToken);
+
+            var result = new StringBuilder();
+            foreach (var message in messages)
+            {
+                if (message.Role != MessageRole.Assistant) continue;
+
+                foreach (MessageContent contentItem in message.Content)
+                {
+                    if (string.IsNullOrEmpty(contentItem.Text)) continue;
+
+                    // Regular expression to match and remove citation patterns like  
+                    string pattern = @"【.*?】";
+
+                    // Replace the citation pattern with an empty string
+                    var removedCitations = Regex.Replace(contentItem.Text, pattern, string.Empty);
+
+                    result.AppendLine(removedCitations);
+                }
+            }
+
+            if (deleteThread)
+            {
+                await CloseThread(currentUserHash, assistantId);
+            }
+
+            return (response: result.ToString(), threadId: (deleteThread ? null : threadRun.ThreadId));
+        }
+
+        public async IAsyncEnumerable<string> AskAssistant(string? assistantId, bool closeThread, string currentUserHash, string userQuestion, [EnumeratorCancellation] CancellationToken cancellationToken)
         {
             if (string.IsNullOrWhiteSpace(userQuestion)) yield break;
 
-            var (client, assistant) = await GetAssistantClient();
+            var (client, assistant) = await GetAssistantClient(assistantId);
+
+            var hashCheck = assistant.Id + currentUserHash;
 
             //Here we lookup the existing threadId for the requesting user
             AssistantThread thread;
-            if (!_userToThreadIds.TryGetValue(currentUserHash, out var threadId))
+            if (!_userToThreadIds.TryGetValue(hashCheck, out var threadId))
             {
                 thread = await client.CreateThreadAsync(cancellationToken: cancellationToken);
-                _userToThreadIds.AddOrUpdate(currentUserHash, thread.Id, (_, threadId) => thread.Id);
+                _userToThreadIds.AddOrUpdate(hashCheck, thread.Id, (_, threadId) => thread.Id);
             } else
             {
                 thread = await client.GetThreadAsync(threadId, cancellationToken);
             }
 
-            var message = await client.CreateMessageAsync(thread, MessageRole.User, [userQuestion]);
-
-            var asyncUpdates = client.CreateRunStreamingAsync(thread, assistant);
-            ThreadRun? currentRun = null;
-            do
-            {
-                currentRun = null;
-                await foreach (StreamingUpdate update in asyncUpdates)
+            var streamingUpdates = client.CreateRunStreamingAsync(
+                thread.Id,
+                assistant.Id,
+                new RunCreationOptions()
                 {
-                    if (update is RunUpdate runUpdate)
-                    {
-                        currentRun = runUpdate;
-                    }
-                    else if (update is MessageContentUpdate contentUpdate && !string.IsNullOrWhiteSpace(contentUpdate.Text))
-                    {
-                        yield return contentUpdate.Text;
-                    }
+                    AdditionalInstructions = userQuestion,
+                }, cancellationToken);
+
+            await foreach (StreamingUpdate streamingUpdate in streamingUpdates)
+            {
+                if (streamingUpdate is MessageContentUpdate contentUpdate)
+                {
+                    yield return contentUpdate.Text;
                 }
             }
-            while (currentRun?.Status.IsTerminal == false);
+
+            if (closeThread)
+            {
+                await CloseThread(currentUserHash, assistant.Id);
+            }
         }
 
-        public async Task CloseThread(string currentUserHash)
+        public async Task CloseThread(string currentUserHash, string assistantId)
         {
-            if (_userToThreadIds.TryRemove(currentUserHash, out var threadId))
+            var hashCheck = assistantId + currentUserHash;
+            if (_userToThreadIds.TryRemove(hashCheck, out var threadId))
             {
-                var (client, _) = await GetAssistantClient();
+                var (client, _) = await GetAssistantClient(assistantId);
 
                 RequestOptions noThrowOptions = new() { ErrorOptions = ClientErrorBehaviors.NoThrow };
                 _ = await client.DeleteThreadAsync(threadId, noThrowOptions);
             }
         }
 
-        private async Task<(AssistantClient, Assistant)> GetAssistantClient()
+        private async Task<(AssistantClient, Assistant)> GetAssistantClient(string? assistantId)
         {
             OpenAIClient openAIClient = new(options.Value.OPENAI_API_KEY);
             var client = openAIClient.GetAssistantClient();
-            var assistant = await client.GetAssistantAsync(options.Value.UD_ASSISTANT_ID);
+            var assistant = await client.GetAssistantAsync(assistantId ?? options.Value.UD_ASSISTANT_ID);
             return (client, assistant);
         }
     }

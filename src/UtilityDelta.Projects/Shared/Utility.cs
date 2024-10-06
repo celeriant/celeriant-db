@@ -37,7 +37,11 @@ namespace UtilityDelta.Projects.Shared
                 ProjectEventType.AddShareLink or 
                 ProjectEventType.AddSingleUseShareLink or 
                 ProjectEventType.ProvideAccess or 
-                ProjectEventType.DisableShareLink => true,
+                ProjectEventType.DisableShareLink or
+                ProjectEventType.CreateAssistant or
+                ProjectEventType.DeleteAssistant or
+                ProjectEventType.AddAssistantFile or
+                ProjectEventType.DeleteAssistantFile => true,
                 _ => false,
             };
 

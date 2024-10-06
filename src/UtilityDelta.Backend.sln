@@ -3,8 +3,6 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.10.34916.146
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "UtilityDelta.Api", "UtilityDelta.Api\UtilityDelta.Api.csproj", "{8BDE82FF-DC56-468C-9E26-4377D2E2722C}"
-EndProject
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "UtilityDelta.Realtime", "UtilityDelta.Realtime\UtilityDelta.Realtime.csproj", "{27F5F547-93C5-44F3-9FE9-A411EC3509EE}"
 EndProject
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "UtilityDelta.Api.Tests", "UtilityDelta.Api.Tests\UtilityDelta.Api.Tests.csproj", "{02D1254E-FC24-49E7-AE0C-8D56A5C0A858}"
@@ -21,10 +19,6 @@ Global
 		Release|Any CPU = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(ProjectConfigurationPlatforms) = postSolution
-		{8BDE82FF-DC56-468C-9E26-4377D2E2722C}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{8BDE82FF-DC56-468C-9E26-4377D2E2722C}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{8BDE82FF-DC56-468C-9E26-4377D2E2722C}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{8BDE82FF-DC56-468C-9E26-4377D2E2722C}.Release|Any CPU.Build.0 = Release|Any CPU
 		{27F5F547-93C5-44F3-9FE9-A411EC3509EE}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
 		{27F5F547-93C5-44F3-9FE9-A411EC3509EE}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{27F5F547-93C5-44F3-9FE9-A411EC3509EE}.Release|Any CPU.ActiveCfg = Release|Any CPU

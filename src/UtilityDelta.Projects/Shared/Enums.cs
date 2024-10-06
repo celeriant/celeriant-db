@@ -49,7 +49,12 @@
         AddSingleUseShareLink,
         ProvideAccess,
         DisableShareLink,
-        SetProjectDescription
+        SetProjectDescription,
+        SaveNodePositions,
+        CreateAssistant,
+        DeleteAssistant,
+        AddAssistantFile,
+        DeleteAssistantFile
     }
 
     public enum AccessLevel
