@@ -106,14 +106,8 @@ namespace UtilityDelta.AiTooling
 
             foreach (var output in r1.Split('\n'))
             {
-                var taskOutput = output.Trim();
-                if (taskOutput.StartsWith('-'))
-                {
-                    taskOutput = taskOutput.Substring(1).Trim();
-                }
-                if (taskOutput.ToLowerInvariant() == dtoBreakdownInputs.task!.ToLowerInvariant() || string.IsNullOrWhiteSpace(taskOutput)) continue;
-
-                subtasks.Add(taskOutput);
+                if (output.TrimStart().StartsWith("#")) continue;
+                subtasks.Add(output);
             }
             var predecessors = new List<string>();
             var successors = new List<string>();
@@ -132,6 +126,11 @@ namespace UtilityDelta.AiTooling
                 var depSplit = depOutput.Split("->");
                 if (depSplit.Length != 2) continue;
 
+                depSplit[0] = depSplit[0].Trim();
+                if (depSplit[0].StartsWith('-'))
+                {
+                    depSplit[0] = depSplit[0].Substring(1);
+                }
                 predecessors.Add(depSplit[0].Trim());
                 successors.Add(depSplit[1].Trim());
             }
@@ -271,13 +270,31 @@ namespace UtilityDelta.AiTooling
         public static string ImageBreakdownPrompt(this DtoImageBreakdownInputs dtoImageBreakdownInputs)
         {
             var prompt = new StringBuilder();
-            prompt.AppendLine($"Utilise the provided image to generate sub-tasks for the task \"{dtoImageBreakdownInputs.task}\".");
-            prompt.AppendLine($"If the image is a whiteboard diagram, try to infer the hierarchy of tasks out output tasks and sub-tasks (sub-tasks are indented by one space). Otherwise, interpret the context of the image, derive some tasks and determine any dependencies (as described below).");
-            prompt.AppendLine($"Don't just write out the text from the image, instead turn the text from each task into a coherent sentence.");
-            prompt.AppendLine($"If you see a dashed line with an arrow between two tasks, this is a dependency. List both tasks together in the direction of the arrow, one line at a time, at the end of the prompt response, with '->'. For example:");
-            prompt.AppendLine($"My First Task -> My Second Task");
+
+            prompt.AppendLine("Scenario 1: If the provided image is a 'Task Tree Diagram', output a hierarchy of tasks in bullet point markdown format. This diagram can have any arbitary depth, follow the structure top-down. Be careful to trace the lines between nodes to establish the correct hierarchy.");
+            prompt.AppendLine($"While still maintaining the original hierarchy, update the task description turning it into a coherent sentence.");
+
+            //prompt.AppendLine("Ignore any dashed lines connecting tasks.");
+
+            //prompt.AppendLine("If you see a 'dashed line with an arrow' between two tasks, this is not pointing to a child task, it is a dependency. List both tasks together in the direction of the arrow, one line at a time, at the end of the prompt response, with '->'. For example:");
+            //prompt.AppendLine($"My First Task -> My Second Task");
+
+            prompt.AppendLine("");
+
+            prompt.AppendLine("Scenario 2: If the image is not a diagram, analyse the situation in the image and derive a set of tasks based on what you see.");
             prompt.AppendLine($"Only output the tasks, one per line, no other text. Each task must start with '-' (markdown format)");
-            prompt.AppendLine();
+            prompt.AppendLine("");
+            //prompt.AppendLine("");
+            //prompt.AppendLine("");
+            //prompt.AppendLine("");
+
+            //prompt.AppendLine($"Utilise the provided image to generate sub-tasks for the task \"{dtoImageBreakdownInputs.task}\".");
+            //prompt.AppendLine($"If the image is a whiteboard diagram, try to infer the hierarchy of tasks out output tasks and sub-tasks (sub-tasks are indented by one space). Otherwise, interpret the context of the image, derive some tasks and determine any dependencies (as described below).");
+            //prompt.AppendLine($"Don't just write out the text from the image, instead turn the text from each task into a coherent sentence.");
+            //prompt.AppendLine($"If you see a dashed line with an arrow between two tasks, this is a dependency. List both tasks together in the direction of the arrow, one line at a time, at the end of the prompt response, with '->'. For example:");
+            //prompt.AppendLine($"My First Task -> My Second Task");
+            //prompt.AppendLine($"Only output the tasks, one per line, no other text. Each task must start with '-' (markdown format)");
+            //prompt.AppendLine();
 
             if (dtoImageBreakdownInputs.parents != null && dtoImageBreakdownInputs.parents.Length > 0)
             {
@@ -301,12 +318,10 @@ namespace UtilityDelta.AiTooling
         public static string AutoBreakdownInitialPrompt(this DtoBreakdownInputs dtoBreakdownInputs, bool utiliseFiles)
         {
             var prompt = new StringBuilder();
-            prompt.AppendLine($"Breakdown the task \"{dtoBreakdownInputs.task}\" into sub-tasks for my project.");
-            if (utiliseFiles)
-            {
-                prompt.AppendLine($"For context, utilise the provided files when breaking down the task.");
-            }
-            prompt.AppendLine();
+            prompt.AppendLine($"Perform a Hierarchical Task Analysis on the following task:");
+            prompt.AppendLine(dtoBreakdownInputs.task);
+            prompt.AppendLine("Remember, in Hierarchical Task Analysis, you start with a goal for what the task is trying to accomplish overall (the task above), and break this down into top level sub-goals, and keep decomposing these sub-goals into more detail to create a tree-like structure.");
+            prompt.AppendLine("Try to generate between 3 to 8 sub-tasks per task. Use your judgement to decide, based on the complexity of the parent task. Do not generate a root task as we already have included it for the user.");
 
             if (dtoBreakdownInputs.parents != null && dtoBreakdownInputs.parents.Length > 0)
             {
@@ -324,13 +339,18 @@ namespace UtilityDelta.AiTooling
                 prompt.AppendLine(".");
                 prompt.AppendLine();
             }
+            if (utiliseFiles)
+            {
+                prompt.AppendLine($"For context, utilise the provided files when breaking down the task.");
+            }
+            prompt.AppendLine();
 
             if (dtoBreakdownInputs.siblings != null && dtoBreakdownInputs.siblings.Length > 0)
             {
                 prompt.AppendLine("Don't include the following tasks as we already have them in the project: ");
                 foreach (var sibling in dtoBreakdownInputs.siblings)
                 {
-                    prompt.AppendLine($" - {sibling}");
+                    prompt.AppendLine($"- {sibling}");
                 }
                 prompt.AppendLine();
             }
@@ -340,7 +360,7 @@ namespace UtilityDelta.AiTooling
                 prompt.AppendLine("The user has answered 'YES' to the following clarification questions: ");
                 foreach (var question in dtoBreakdownInputs.yesQuestions)
                 {
-                    prompt.AppendLine($" - {question}");
+                    prompt.AppendLine($"- {question}");
                 }
                 prompt.AppendLine();
             }
@@ -350,7 +370,7 @@ namespace UtilityDelta.AiTooling
                 prompt.AppendLine("The user has answered 'NO' to the following clarification questions: ");
                 foreach (var question in dtoBreakdownInputs.noQuestions)
                 {
-                    prompt.AppendLine($" - {question}");
+                    prompt.AppendLine($"- {question}");
                 }
                 prompt.AppendLine();
             }
@@ -362,7 +382,7 @@ namespace UtilityDelta.AiTooling
                 prompt.AppendLine();
             }
 
-            prompt.AppendLine($"Give an actionable, single sentence per task, without any full stops at the end. Only output one level of breakdown. Don't include sub-tasks that take less than {dtoBreakdownInputs.minDuration} hours to complete. Do not include the input task or any other content other than the title of each task. Do not include numbering or any special characters or any intro sentence. Tasks should be specific and actionable. Do not add fluffy irrelevant tasks.");
+            prompt.AppendLine($"Give an actionable, single sentence per task, without any full stops at the end. Use '-' for listing tasks (markdown bullet points). Do not number tasks or use '#', just use '-' for all levels with a space in front for sub-tasks. Multiple levels of tasks can be included, indicate the next level with a space before '-'. Do not include the input task or any other content other than the title of each task. Do not include any intro sentence.");
             prompt.AppendLine();
 
             return prompt.ToString();
@@ -470,7 +490,19 @@ namespace UtilityDelta.AiTooling
 
         public static string LinkDependenciesPrompt()
         {
-            return "List any dependencies between the tasks (including the existing tasks), one line at a time, in a similar format, using '->'";
+            var sb = new StringBuilder();
+            sb.AppendLine("List any dependencies between tasks. Use the following format:");
+            sb.AppendLine("task one -> task two");
+            sb.AppendLine("Where task two cannot be started until task one is complete.");
+
+            sb.AppendLine("There are two main steps for discovering dependencies from the previous output:");
+            sb.AppendLine("1. Discover dependencies for high level task groupings");
+            sb.AppendLine("2. Look inside each task grouping and determine any dependencies of tasks inside the group");
+            sb.AppendLine("Apply the same output format for both step 1 and step 2:");
+            sb.AppendLine("sub task one -> sub task two");
+            sb.AppendLine("Where task two cannot be started until task one is complete.");
+
+            return sb.ToString();
         }
     }
 }
