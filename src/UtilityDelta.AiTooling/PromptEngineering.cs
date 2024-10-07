@@ -37,6 +37,47 @@ namespace UtilityDelta.AiTooling
             return new DtoRolesOutputs() { roles = output.ToArray() };
         }
 
+        public static DtoBreakdownOutputs ImageBreakdownResult(this DtoImageBreakdownInputs dtoImageBreakdownInputs, string r1)
+        {
+            var result = new DtoBreakdownOutputs();
+            var subtasks = new List<string>();
+            var predecessors = new List<string>();
+            var successors = new List<string>();
+
+            foreach (var output in r1.Split('\n'))
+            {
+                var taskOutput = output;
+                if (output.StartsWith("->"))
+                {
+                    taskOutput = output.Substring(2).Trim();
+                }
+                if (output.StartsWith(">"))
+                {
+                    taskOutput = output.Substring(1).Trim();
+                }
+                if (taskOutput.ToLowerInvariant() == dtoImageBreakdownInputs.task!.ToLowerInvariant() || string.IsNullOrWhiteSpace(taskOutput)) continue;
+
+                var depSplit = taskOutput.Split("->");
+                if (depSplit.Length != 2)
+                {
+                    subtasks.Add(taskOutput);
+                } else
+                {
+                    if (depSplit[0].StartsWith('-'))
+                    {
+                        depSplit[0] = depSplit[0].Substring(1);
+                    }
+                    predecessors.Add(depSplit[0].Trim());
+                    successors.Add(depSplit[1].Trim());
+                }
+            }
+
+            result.subTasks = subtasks.ToArray();
+            result.predecessors = predecessors.ToArray();
+            result.successors = successors.ToArray();
+            return result;
+        }
+
         public static DtoBreakdownQuestionsOutputs AutoBreakdownInitialQuestionsResult(this DtoBreakdownInputs dtoBreakdownInputs, string r1)
         {
             var result = new DtoBreakdownQuestionsOutputs();
@@ -139,11 +180,15 @@ namespace UtilityDelta.AiTooling
             return prompt.ToString();
         }
 
-        public static string AutoBreakdownInitialQuestionsPrompt(this  DtoBreakdownInputs dtoBreakdownInputs)
+        public static string AutoBreakdownInitialQuestionsPrompt(this  DtoBreakdownInputs dtoBreakdownInputs, bool utiliseFiles)
         {
             var prompt = new StringBuilder();
             prompt.AppendLine("To better prepare for task breakdown, ask the user some clarifying questions. Each question should be short and able to be answered with a yes or a no by the user. Do not give \"[this] or [that]\" style questions as the user can only answer yes or no. Do not number the questions or add any bullet points.");
             prompt.AppendLine($"The task is \"{dtoBreakdownInputs.task}\".");
+            if (utiliseFiles)
+            {
+                prompt.AppendLine($"For context, utilise the provided files when breaking down the task.");
+            }
             prompt.AppendLine();
 
             if (dtoBreakdownInputs.parents != null && dtoBreakdownInputs.parents.Length > 0)
@@ -223,15 +268,49 @@ namespace UtilityDelta.AiTooling
             return prompt.ToString();
         }
 
-        public static string AutoBreakdownInitialPrompt(this DtoBreakdownInputs dtoBreakdownInputs)
+        public static string ImageBreakdownPrompt(this DtoImageBreakdownInputs dtoImageBreakdownInputs)
+        {
+            var prompt = new StringBuilder();
+            prompt.AppendLine($"Utilise the provided image to generate sub-tasks for the task \"{dtoImageBreakdownInputs.task}\".");
+            prompt.AppendLine($"If the image is a whiteboard diagram, try to infer the hierarchy of tasks out output tasks and sub-tasks (sub-tasks are indented by one space). Otherwise, interpret the context of the image, derive some tasks and determine any dependencies (as described below).");
+            prompt.AppendLine($"Don't just write out the text from the image, instead turn the text from each task into a coherent sentence.");
+            prompt.AppendLine($"If you see a dashed line with an arrow between two tasks, this is a dependency. List both tasks together in the direction of the arrow, one line at a time, at the end of the prompt response, with '->'. For example:");
+            prompt.AppendLine($"My First Task -> My Second Task");
+            prompt.AppendLine($"Only output the tasks, one per line, no other text. Each task must start with '-' (markdown format)");
+            prompt.AppendLine();
+
+            if (dtoImageBreakdownInputs.parents != null && dtoImageBreakdownInputs.parents.Length > 0)
+            {
+                prompt.Append("For context, the parents of this task is ");
+                var isFirst = true;
+                foreach (var parent in dtoImageBreakdownInputs.parents)
+                {
+                    if (!isFirst)
+                    {
+                        prompt.Append(" and then ");
+                    }
+                    prompt.Append($"\"{parent}\"");
+                    isFirst = false;
+                }
+                prompt.AppendLine(".");
+                prompt.AppendLine();
+            }
+            return prompt.ToString();
+        }
+
+        public static string AutoBreakdownInitialPrompt(this DtoBreakdownInputs dtoBreakdownInputs, bool utiliseFiles)
         {
             var prompt = new StringBuilder();
             prompt.AppendLine($"Breakdown the task \"{dtoBreakdownInputs.task}\" into sub-tasks for my project.");
+            if (utiliseFiles)
+            {
+                prompt.AppendLine($"For context, utilise the provided files when breaking down the task.");
+            }
             prompt.AppendLine();
 
             if (dtoBreakdownInputs.parents != null && dtoBreakdownInputs.parents.Length > 0)
             {
-                prompt.Append("For context, the parents of this task is ");
+                prompt.Append("The parents of this task is ");
                 var isFirst = true;
                 foreach (var parent in dtoBreakdownInputs.parents)
                 {

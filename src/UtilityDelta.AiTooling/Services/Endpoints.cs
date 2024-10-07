@@ -1,6 +1,7 @@
 ﻿using Microsoft.AspNetCore.Mvc;
 using System.Collections.Concurrent;
 using System.Reflection.Metadata;
+using System.Xml.Linq;
 using UtilityDelta.AiTooling.Dtos;
 using UtilityDelta.AiTooling.Interfaces;
 using UtilityDelta.Projects.Interfaces;
@@ -329,6 +330,45 @@ namespace UtilityDelta.AiTooling.Services
                     ProjectAccess.NoAccess => Results.StatusCode(StatusCodes.Status403Forbidden),
                     ProjectAccess.ReadOnlyAccess => Results.StatusCode(StatusCodes.Status403Forbidden),
                     _ => Results.Ok(await llmProcessing.BreakdownTask(pi, accessInfo.CurrentUserHash, dtoBreakdownInputs, cancellationToken))
+                };
+            });
+        }
+
+        public async Task<IResult> ImageBreakdown(
+            [FromQuery] string pi, 
+            [FromQuery] string publicKey, 
+            [FromQuery] string nonce, 
+            [FromQuery] string sign, 
+            [FromQuery] string system, 
+            [FromQuery] string task,
+            [FromQuery] string fileName,
+            IFormFile image,
+            CancellationToken cancellationToken)
+        {
+            return await Task.Run(async () =>
+            {
+                var dtoImageBreakdownInputs = new DtoImageBreakdownInputs()
+                {
+                    system = system,
+                    task = task
+                };
+                using var documentStream = image.OpenReadStream();
+
+                var accessInfo = accessLogic.IsProjectExistAndHasAccess(
+                    projectId: pi,
+                    createProjectIfNotExists: false,
+                    shareKey: null,
+                    publicKey: publicKey,
+                    nonce: nonce,
+                    sign: sign,
+                    cancellationToken: cancellationToken);
+
+                return accessInfo.ProjectAccess switch
+                {
+                    ProjectAccess.NotExists => Results.Ok(await llmProcessing.ImageBreakdownTask(pi, accessInfo.CurrentUserHash, fileName, documentStream, dtoImageBreakdownInputs, cancellationToken)),
+                    ProjectAccess.NoAccess => Results.StatusCode(StatusCodes.Status403Forbidden),
+                    ProjectAccess.ReadOnlyAccess => Results.StatusCode(StatusCodes.Status403Forbidden),
+                    _ => Results.Ok(await llmProcessing.ImageBreakdownTask(pi, accessInfo.CurrentUserHash, fileName, documentStream, dtoImageBreakdownInputs, cancellationToken))
                 };
             });
         }

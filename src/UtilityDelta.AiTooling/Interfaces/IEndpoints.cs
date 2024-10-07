@@ -6,6 +6,16 @@ namespace UtilityDelta.AiTooling.Interfaces
 {
     public interface IEndpoints
     {
+        Task<IResult> ImageBreakdown(
+            [FromQuery] string pi,
+            [FromQuery] string publicKey,
+            [FromQuery] string nonce,
+            [FromQuery] string sign,
+            [FromQuery] string system,
+            [FromQuery] string task,
+            [FromQuery] string fileName,
+            IFormFile image,
+            CancellationToken cancellationToken);
         Task<IResult> UploadFile([FromQuery] string pi, [FromQuery] string publicKey, [FromQuery] string nonce, [FromQuery] string sign, [FromQuery] string system, [FromQuery] string iv, [FromQuery]string encrypted_fileName, IFormFile document, CancellationToken cancellationToken);
         Task<IResult> DeleteFile(string pi, string publicKey, string nonce, string sign, string fileId, CancellationToken cancellationToken);
         Task<IResult> DeleteAllFiles(string pi, string publicKey, string nonce, string sign, CancellationToken cancellationToken);

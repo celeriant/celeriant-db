@@ -23,6 +23,7 @@ namespace UtilityDelta.AiTooling
             var endpoints = app.Services.GetService<IEndpoints>()!;
 
             api.MapPost("/breakdown", endpoints.Breakdown);
+            api.MapPost("/ImageBreakdown", endpoints.ImageBreakdown).DisableAntiforgery();
             api.MapPost("/breakdownquestions", endpoints.BreakdownQuestions);
             api.MapPost("/unknowns", endpoints.Unknowns);
             api.MapPost("/roles", endpoints.Roles);

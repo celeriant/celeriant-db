@@ -18,26 +18,19 @@ namespace UtilityDelta.AiTooling.Services
     {
         private ConcurrentDictionary<string, string> _userToThreadIds = new ConcurrentDictionary<string, string>();
 
-        public async Task<(string response, string? threadId)> AskAssistantNoStreaming(string assistantId, string? threadId, bool deleteThread, string currentUserHash, string userQuestion, CancellationToken cancellationToken)
+        public async Task<(string response, string? threadId)> AskAssistantNoStreaming(string? assistantId, string? threadId, bool deleteThread, string currentUserHash, List<MessageContent> userQuestion, CancellationToken cancellationToken)
         {
             var (assistantClient, assistant) = await GetAssistantClient(assistantId);
 
-            ThreadRun threadRun;
-            if (threadId != null)
+            if (threadId == null)
             {
-                var threadGet = await assistantClient.GetThreadAsync(threadId, cancellationToken);
-                var runCreationOptions = new RunCreationOptions();
-                runCreationOptions.AdditionalMessages.Add(new ThreadInitializationMessage(MessageRole.User, [userQuestion]));
-                threadRun = await assistantClient.CreateRunAsync(threadId, assistantId, runCreationOptions, cancellationToken);
-            } else
-            {
-                ThreadCreationOptions threadOptions = new()
-                {
-                    InitialMessages = { userQuestion }
-                };
-
-                threadRun = await assistantClient.CreateThreadAndRunAsync(assistant.Id, threadOptions);
+                threadId = (await assistantClient.CreateThreadAsync(new ThreadCreationOptions(), cancellationToken)).Value.Id;
             }
+
+            var threadGet = await assistantClient.GetThreadAsync(threadId, cancellationToken);
+            var runCreationOptions = new RunCreationOptions();
+            runCreationOptions.AdditionalMessages.Add(new ThreadInitializationMessage(MessageRole.User, userQuestion));
+            var threadRun = (await assistantClient.CreateRunAsync(threadId, assistantId, runCreationOptions, cancellationToken)).Value;
 
             do
             {

@@ -104,6 +104,36 @@ namespace UtilityDelta.AiTooling.Services
             return count;
         }
 
+        public async Task RemoveFileIndependant(string fileId)
+        {
+            OpenAIClient openAIClient = new(options.Value.OPENAI_API_KEY);
+            var fileClient = openAIClient.GetOpenAIFileClient();
+
+            try
+            {
+                await fileClient.DeleteFileAsync(fileId);
+            }
+            catch
+            {
+            }
+        }
+
+        public async Task<string> UploadFileIndependant(string fileName, Stream document, CancellationToken cancellationToken)
+        {
+            OpenAIClient openAIClient = new(options.Value.OPENAI_API_KEY);
+            var fileClient = openAIClient.GetOpenAIFileClient();
+
+            var uploadedFile = await fileClient.UploadFileAsync(
+                document,
+                fileName,
+                FileUploadPurpose.Assistants,
+                cancellationToken);
+
+            var fileId = uploadedFile.Value.Id;
+
+            return fileId;
+        }
+
         public async Task<string> UploadFile(string fileName, Stream document, string assistantId, CancellationToken cancellationToken)
         {
             OpenAIClient openAIClient = new(options.Value.OPENAI_API_KEY);
@@ -114,7 +144,7 @@ namespace UtilityDelta.AiTooling.Services
 
             var assistant = await assistantClient.GetAssistantAsync(assistantId, cancellationToken);
 
-            var uploadedFile = fileClient.UploadFile(
+            var uploadedFile = await fileClient.UploadFileAsync(
                 document,
                 fileName,
                 FileUploadPurpose.Assistants,

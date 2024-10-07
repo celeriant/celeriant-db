@@ -4,6 +4,7 @@ namespace UtilityDelta.AiTooling.Interfaces
 {
     public interface ISelectLLMProvider
     {
+        Task<DtoBreakdownOutputs> ImageBreakdownTask(string projectId, string currentUserHash, string fileName, Stream image, DtoImageBreakdownInputs dtoImageBreakdownInputs, CancellationToken cancellationToken);
         Task<DtoBreakdownOutputs> BreakdownTask(string projectId, string currentUserHash, DtoBreakdownInputs dtoBreakdownInputs, CancellationToken cancellationToken);
         Task<DtoBreakdownQuestionsOutputs> BreakdownQuestions(string projectId, string currentUserHash, DtoBreakdownInputs dtoBreakdownInputs, CancellationToken cancellationToken);
         Task<DtoUnknownOutputs> IdentifyUnknowns(string projectId, string currentUserHash, DtoBreakdownInputs dtoBreakdownInputs, CancellationToken cancellationToken);

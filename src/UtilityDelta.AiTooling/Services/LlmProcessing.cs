@@ -1,4 +1,5 @@
 ﻿using Microsoft.Extensions.Options;
+using OpenAI.Assistants;
 using OpenAI.Chat;
 using UtilityDelta.AiTooling.Dtos;
 using UtilityDelta.AiTooling.Interfaces;
@@ -30,7 +31,7 @@ namespace UtilityDelta.AiTooling.Services
         {
             var chat = NewChat();
 
-            var u1 = ChatMessage.CreateUserMessage(dtoBreakdownInputs.AutoBreakdownInitialQuestionsPrompt());
+            var u1 = ChatMessage.CreateUserMessage(dtoBreakdownInputs.AutoBreakdownInitialQuestionsPrompt(false));
 
             var r1 = await chat.CompleteChatAsync([u1], cancellationToken: cancellationToken);
             var a1 = ChatMessage.CreateAssistantMessage(r1);
@@ -42,7 +43,7 @@ namespace UtilityDelta.AiTooling.Services
         {
             var chat = NewChat();
 
-            var u1 = ChatMessage.CreateUserMessage(dtoBreakdownInputs.AutoBreakdownInitialPrompt());
+            var u1 = ChatMessage.CreateUserMessage(dtoBreakdownInputs.AutoBreakdownInitialPrompt(false));
             var r1 = await chat.CompleteChatAsync([u1], cancellationToken: cancellationToken);
             var a1 = ChatMessage.CreateAssistantMessage(r1);
 

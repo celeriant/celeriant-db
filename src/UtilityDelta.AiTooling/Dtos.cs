@@ -17,6 +17,14 @@ namespace UtilityDelta.AiTooling.Dtos
         public bool skipDependencies { get; set; }
     }
 
+    public class DtoImageBreakdownInputs
+    {
+        public string? system { get; set; }
+        public string? task { get; set; }
+        public string[] parents { get; set; } = [];
+        public string? fileId { get; set; }
+    }
+
     public record DtoAssistantChanges(List<ProjectEventItem> events);
 
     public class DtoQuestion
