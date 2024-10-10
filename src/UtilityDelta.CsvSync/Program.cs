@@ -6,9 +6,11 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
+using UtilityDelta.Projects.Services;
 using UtilityDelta.Projects.Shared;
 using static System.Net.Mime.MediaTypeNames;
 using static System.Runtime.InteropServices.JavaScript.JSType;
@@ -17,10 +19,30 @@ namespace UtilityDelta.CsvSync
 {
     internal class Program
     {
-        private static string baseUrl = "http://localhost:5198";
+
+        public static int HashProjectId(string projectId)
+        {
+            using (SHA256 sha256 = SHA256.Create())
+            {
+                byte[] data = Encoding.UTF8.GetBytes(projectId);
+                byte[] hashBytes = sha256.ComputeHash(data);
+                return hashBytes[0];
+            }
+        }
+
+        private static string baseUrl()
+    {
+#if !DEBUG
+        int hash = HashProjectId(projectId);
+        // Using bitwise AND with 1 to check if the hash is even or odd
+        return (hash % 2) == 0 ? "https://api2.utilitydelta.io:1001" : "https://api2.utilitydelta.io:1000";
+#endif
+        return "http://localhost:5198";
+    }
+
         private static string projectId = Nanoid.Generate();
-        private static string linkBase = "https://saludamedical.atlassian.net/browse/";
-        private static string TLTTitle = "Saluda";
+        private static string linkBase = "https://megt.atlassian.net/browse/";
+        private static string TLTTitle = "MEGT";
 
         private static string endpoint = "/api/write";
         private static string endpointRead = "/api/read";
@@ -292,7 +314,7 @@ namespace UtilityDelta.CsvSync
             var assymetricRSA = CreateRsaFromPrivateKey(privateKey);
             NonceAndSignIt(assymetricRSA, out var nonce, out var nonceSigned);
 
-            var uriBuilder2 = new UriBuilder(baseUrl + endpointRead);
+            var uriBuilder2 = new UriBuilder(baseUrl() + endpointRead);
 
             var query2 = System.Web.HttpUtility.ParseQueryString(uriBuilder2.Query);
             query2["pi"] = projectId;
@@ -535,7 +557,7 @@ namespace UtilityDelta.CsvSync
 
         private static async Task SendViaWebClient(HttpClient client, string nonce, string sign, List<ProjectEventItem> events)
         {
-            var uriBuilder = new UriBuilder(baseUrl + endpoint);
+            var uriBuilder = new UriBuilder(baseUrl() + endpoint);
             var query = System.Web.HttpUtility.ParseQueryString(uriBuilder.Query);
             query["pi"] = projectId;
             query["publicKey"] = publicKey;
@@ -588,7 +610,7 @@ namespace UtilityDelta.CsvSync
             var assymetricRSA = CreateRsaFromPrivateKey(privateKey);
             NonceAndSignIt(assymetricRSA, out var nonce, out var nonceSigned);
 
-            var uriBuilder = new UriBuilder(baseUrl + "/api/share");
+            var uriBuilder = new UriBuilder(baseUrl() + "/api/share");
             var query = System.Web.HttpUtility.ParseQueryString(uriBuilder.Query);
             query["pi"] = projectId;
             query["publicKey"] = publicKey;
@@ -614,7 +636,7 @@ namespace UtilityDelta.CsvSync
 
             // Path to the CSV file
             string csvFilePathCurrent = "jira_tasks.csv";
-            string csvFilePathPrevious = "jira_tasks_previous.csv";
+            string csvFilePathPrevious = $"jira_tasks_previous{TLTTitle}.csv";
             string jsonTeamMembers = "teamMembers.json";
 
             bool cleanRun = true;
@@ -648,7 +670,11 @@ namespace UtilityDelta.CsvSync
             if (cleanRun)
             {
                 var shareLink = await CreateShareLink();
+#if DEBUG
                 Console.WriteLine($"http://localhost:5173/project/{projectId}?shareKey={shareLink.shareKey}#sk={symmetricKey}");
+#else
+                Console.WriteLine($"https://app.utilitydelta.io/project/{projectId}?shareKey={shareLink.shareKey}#sk={symmetricKey}");
+#endif
                 Console.ReadLine();
             }
             
