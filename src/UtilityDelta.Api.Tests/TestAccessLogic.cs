@@ -57,7 +57,7 @@ namespace UtilityDelta.Projects.Tests
                 shareKeyCache.Verify(x => x.MarkShareKeyAsUsed(pi, null, "wrongsharekey".CalculateHash(), CancellationToken.None), Times.Once);
             }
             crypto.Verify(x => x.ValidateWithPublicKey("publicKey", "nonce", "sign"), Times.Once);
-            userAccessCache.Verify(x => x.UpdateAccess(pi, null, result.CurrentUserHash, AccessLevel.Owner, null, "Project creator", false, null, CancellationToken.None), Times.Never);
+            userAccessCache.Verify(x => x.UpdateAccess(pi, null, result.CurrentUserHash, AccessLevel.Owner, null, "Project creator", false, null, null, CancellationToken.None), Times.Never);
 
         }
 
@@ -80,7 +80,7 @@ namespace UtilityDelta.Projects.Tests
 
             //Ensure this is a system created event (cb is null)
             crypto.Verify(x => x.ValidateWithPublicKey("publicKey", "nonce", "sign"), Times.Once);
-            userAccessCache.Verify(x => x.UpdateAccess(pi, null, result.CurrentUserHash, AccessLevel.Owner, null, "Project creator", false, null, CancellationToken.None), Times.Once);
+            userAccessCache.Verify(x => x.UpdateAccess(pi, null, result.CurrentUserHash, AccessLevel.Owner, null, "Project creator", false, null, null, CancellationToken.None), Times.Once);
         }
 
         //Single use share key, attempted to be used by creator, ignore, share key still valid
@@ -115,7 +115,7 @@ namespace UtilityDelta.Projects.Tests
             crypto.Verify(x => x.ValidateWithPublicKey("publicKey", "nonce", "sign"), Times.Once);
             userAccessCache.Verify(x => x.UpdateAccess(
                 pi, It.IsAny<string?>(), It.IsAny<string>(), It.IsAny<AccessLevel>(), 
-                null, It.IsAny<string?>(), It.IsAny<bool>(), It.IsAny<string?>(), CancellationToken.None), Times.Never);
+                null, It.IsAny<string?>(), It.IsAny<bool>(), It.IsAny<string?>(), null, CancellationToken.None), Times.Never);
 
         }
 
@@ -158,7 +158,7 @@ namespace UtilityDelta.Projects.Tests
             crypto.Verify(x => x.ValidateWithPublicKey("publicKey", "nonce", "sign"), Times.Once);
             userAccessCache.Verify(x => x.UpdateAccess(
                 pi, It.IsAny<string?>(), It.IsAny<string>(), It.IsAny<AccessLevel>(),
-                 null, It.IsAny<string?>(), It.IsAny<bool>(), It.IsAny<string?>(), CancellationToken.None), Times.Never);
+                 null, It.IsAny<string?>(), It.IsAny<bool>(), It.IsAny<string?>(), null, CancellationToken.None), Times.Never);
 
         }
 
@@ -197,7 +197,7 @@ namespace UtilityDelta.Projects.Tests
             crypto.Verify(x => x.ValidateWithPublicKey("publicKey", "nonce", "sign"), Times.Once);
 
             userAccessCache.Verify(x => x.UpdateAccess(
-                pi, null, cb, AccessLevel.Viewer, null, null, false, shareKeyHash, CancellationToken.None), Times.Once);
+                pi, null, cb, AccessLevel.Viewer, null, null, false, shareKeyHash, null, CancellationToken.None), Times.Once);
 
         }
 

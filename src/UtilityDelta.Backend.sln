@@ -13,6 +13,8 @@ Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "UtilityDelta.Projects", "Ut
 EndProject
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "TestAI", "TestAI\TestAI.csproj", "{9C4229E4-1003-403E-977D-C6221916DDC0}"
 EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "UtilityDelta.CsvSync", "UtilityDelta.CsvSync\UtilityDelta.CsvSync.csproj", "{DCFE8CBB-457D-4A64-9519-4DC144C66EDC}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -39,6 +41,10 @@ Global
 		{9C4229E4-1003-403E-977D-C6221916DDC0}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{9C4229E4-1003-403E-977D-C6221916DDC0}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{9C4229E4-1003-403E-977D-C6221916DDC0}.Release|Any CPU.Build.0 = Release|Any CPU
+		{DCFE8CBB-457D-4A64-9519-4DC144C66EDC}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{DCFE8CBB-457D-4A64-9519-4DC144C66EDC}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{DCFE8CBB-457D-4A64-9519-4DC144C66EDC}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{DCFE8CBB-457D-4A64-9519-4DC144C66EDC}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

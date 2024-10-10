@@ -45,7 +45,7 @@ namespace UtilityDelta.Projects.Tests
                 new ProjectEventItem(0, null, 0, "iv1", ProjectEventType.AddTask, "kljsfddsf", "kjsdfkljd",null, 344)
             }.ToArray();
 
-            accessLogic.Setup(x => x.IsProjectExistAndHasAccess(pi, createIfNotExist, null, publicKey, nonce, sign, CancellationToken.None))
+            accessLogic.Setup(x => x.IsProjectExistAndHasAccess(pi, createIfNotExist, null, publicKey, nonce, sign, CancellationToken.None, null))
                 .Returns(new DtoAccessInfo(projectAccess, publicKey.CalculateHash()));
 
             var result = await service.Write(pi, publicKey, nonce, sign, createIfNotExist, events, CancellationToken.None);
@@ -104,10 +104,10 @@ namespace UtilityDelta.Projects.Tests
             var shareKey = "mysharekey";
             var fromTime = createIfNotExist ? 0 : 83432;
 
-            accessLogic.Setup(x => x.IsProjectExistAndHasAccess(pi, createIfNotExist, shareKey, publicKey, nonce, sign, CancellationToken.None))
+            accessLogic.Setup(x => x.IsProjectExistAndHasAccess(pi, createIfNotExist, shareKey, publicKey, nonce, sign, CancellationToken.None, null))
                 .Returns(new DtoAccessInfo(projectAccess, publicKey.CalculateHash()));
 
-            var result = await service.Read(pi, publicKey, nonce, sign, fromTime, createIfNotExist, shareKey, CancellationToken.None);
+            var result = await service.Read(pi, publicKey, nonce, sign, fromTime, false, createIfNotExist, shareKey, CancellationToken.None);
 
             switch (projectAccess)
             {
@@ -166,7 +166,7 @@ namespace UtilityDelta.Projects.Tests
             var sign = "signednonce";
             var iv = "test iv";
 
-            accessLogic.Setup(x => x.IsProjectExistAndHasAccess(pi, false, null, publicKey, nonce, sign, CancellationToken.None))
+            accessLogic.Setup(x => x.IsProjectExistAndHasAccess(pi, false, null, publicKey, nonce, sign, CancellationToken.None, null))
                 .Returns(new DtoAccessInfo(projectAccess, publicKey.CalculateHash()));
 
             var result = await service.Share(pi, publicKey, nonce, sign, isOwner, singleUse, iv, "my desc", expiresOn, readOnly, CancellationToken.None);
@@ -203,20 +203,20 @@ namespace UtilityDelta.Projects.Tests
             var nonce = "mynonce";
             var sign = "signednonce";
 
-            accessLogic.Setup(x => x.IsProjectExistAndHasAccess(pi, false, null, publicKey, nonce, sign, CancellationToken.None))
+            accessLogic.Setup(x => x.IsProjectExistAndHasAccess(pi, false, null, publicKey, nonce, sign, CancellationToken.None, null))
                 .Returns(new DtoAccessInfo(projectAccess, publicKey.CalculateHash()));
 
             var result = await service.DisableUser(pi, publicKey, nonce, sign, "useridtodisableHashed", CancellationToken.None);
 
             if (projectAccess != ProjectAccess.OwnerAccess)
             {
-                userAccessCache.Verify(x => x.UpdateAccess(pi, It.IsAny<string?>(), It.IsAny<string>(), It.IsAny<AccessLevel>(), It.IsAny<string?>(), It.IsAny<string?>(), It.IsAny<bool>(), It.IsAny<string?>(), CancellationToken.None), Times.Never);
+                userAccessCache.Verify(x => x.UpdateAccess(pi, It.IsAny<string?>(), It.IsAny<string>(), It.IsAny<AccessLevel>(), It.IsAny<string?>(), It.IsAny<string?>(), It.IsAny<bool>(), It.IsAny<string?>(), null, CancellationToken.None), Times.Never);
 
                 Assert.AreEqual(403, ((Microsoft.AspNetCore.Http.HttpResults.StatusCodeHttpResult)result).StatusCode);
             }
             else
             {
-                userAccessCache.Verify(x => x.UpdateAccess(pi, publicKey.CalculateHash(), "useridtodisableHashed", null, null, null, true, null, CancellationToken.None), Times.Once);
+                userAccessCache.Verify(x => x.UpdateAccess(pi, publicKey.CalculateHash(), "useridtodisableHashed", null, null, null, true, null, null, CancellationToken.None), Times.Once);
 
                 Assert.AreEqual(200, ((Microsoft.AspNetCore.Http.HttpResults.Ok<DtoDisableAccess>)result).StatusCode);
             }
@@ -242,7 +242,7 @@ namespace UtilityDelta.Projects.Tests
             var nonce = "mynonce";
             var sign = "signednonce";
 
-            accessLogic.Setup(x => x.IsProjectExistAndHasAccess(pi, false, null, publicKey, nonce, sign, CancellationToken.None))
+            accessLogic.Setup(x => x.IsProjectExistAndHasAccess(pi, false, null, publicKey, nonce, sign, CancellationToken.None, null))
                 .Returns(new DtoAccessInfo(projectAccess, publicKey.CalculateHash()));
 
             var result = await service.DisableShare(pi, publicKey, nonce, sign, "sharekeyHashed", CancellationToken.None);

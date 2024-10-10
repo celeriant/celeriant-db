@@ -1,5 +1,13 @@
 ﻿namespace UtilityDelta.Projects.Shared
 {
+    public enum TaskStatus
+    {
+        Completed,
+        Blocked,
+        InProgress,
+        Pending,
+    }
+
     public enum ProjectEventType
     {
         AddTask,

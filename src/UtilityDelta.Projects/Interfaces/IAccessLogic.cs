@@ -12,6 +12,7 @@ namespace UtilityDelta.Projects.Interfaces
             string publicKey,
             string nonce,
             string sign,
-            CancellationToken cancellationToken);
+            CancellationToken cancellationToken,
+            long? edOverride = null);
     }
 }

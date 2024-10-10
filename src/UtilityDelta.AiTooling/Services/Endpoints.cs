@@ -134,7 +134,7 @@ namespace UtilityDelta.AiTooling.Services
                 return accessInfo.ProjectAccess switch
                 {
                     ProjectAccess.NotExists => Results.NotFound(),
-                    ProjectAccess.OwnerAccess => Results.Ok(new DtoDisableAccess(userAccessCache.UpdateAccess(pi, accessInfo.CurrentUserHash, userId, null, null, null, true, null, cancellationToken))),
+                    ProjectAccess.OwnerAccess => Results.Ok(new DtoDisableAccess(userAccessCache.UpdateAccess(pi, accessInfo.CurrentUserHash, userId, null, null, null, true, null, null, cancellationToken))),
                     _ => Results.StatusCode(StatusCodes.Status403Forbidden)
                 };
             });
@@ -269,6 +269,8 @@ namespace UtilityDelta.AiTooling.Services
         {
             return await Task.Run(() =>
             {
+                var creatorEventDate = events.Min(x => x.ed) - 1;
+
                 var accessInfo = accessLogic.IsProjectExistAndHasAccess(
                     projectId: pi,
                     createProjectIfNotExists: createIfNotExist,
@@ -276,6 +278,7 @@ namespace UtilityDelta.AiTooling.Services
                     publicKey: publicKey,
                     nonce: nonce,
                     sign: sign,
+                    edOverride: creatorEventDate,
                     cancellationToken: cancellationToken);
 
                 return accessInfo.ProjectAccess switch

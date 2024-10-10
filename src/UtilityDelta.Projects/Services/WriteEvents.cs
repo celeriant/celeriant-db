@@ -51,7 +51,7 @@ namespace UtilityDelta.Projects.Services
 
         public ProjectEventItem WriteServerEvent(ProjectEventItem eventItem, string pi)
         {
-            var writeResult = InternalWrite([eventItem], eventItem.cb, pi, DateTimeOffset.UtcNow.ToUnixTimeSeconds(), CancellationToken.None);
+            var writeResult = InternalWrite([eventItem], eventItem.cb, pi, eventItem.ed == 0 ? DateTimeOffset.UtcNow.ToUnixTimeSeconds() : eventItem.ed, CancellationToken.None);
             return new ProjectEventItem(writeResult.serverId, eventItem.cb, writeResult.eventDate, eventItem.iv, eventItem.tp, eventItem.t1, eventItem.t2, eventItem.t3, eventItem.n1);
         }
 

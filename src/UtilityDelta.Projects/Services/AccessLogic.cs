@@ -13,7 +13,8 @@ namespace UtilityDelta.Projects.Services
             string publicKey,
             string nonce,
             string sign,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            long? edOverride = null)
         {
             //Validate the user's public key and get their identity (SHA-256 hash)
             crypto.ValidateWithPublicKey(publicKey, nonce, sign);
@@ -27,7 +28,7 @@ namespace UtilityDelta.Projects.Services
                 //No record of this project, either return not exists or auto-create it for the user and give them owner access
                 if (!createProjectIfNotExists) return new DtoAccessInfo(ProjectAccess.NotExists, currentUserHash);
 
-                userAccessCache.UpdateAccess(projectId, null, currentUserHash, AccessLevel.Owner, null, "Project creator", false, null, cancellationToken);
+                userAccessCache.UpdateAccess(projectId, null, currentUserHash, AccessLevel.Owner, null, "Project creator", false, null, edOverride, cancellationToken);
 
                 return new DtoAccessInfo(ProjectAccess.OwnerAccess, currentUserHash);
             }
@@ -51,7 +52,7 @@ namespace UtilityDelta.Projects.Services
             if (shareKeyData != null && currentAccessLevel.IncreasesAccessLevel(shareKeyData.accessLevel))
             {
                 //the current user gets an increase in their access level with the given share key
-                userAccessCache.UpdateAccess(projectId, null, currentUserHash, shareKeyData.accessLevel, shareKeyData.iv, shareKeyData.description, false, shareKey, cancellationToken);
+                userAccessCache.UpdateAccess(projectId, null, currentUserHash, shareKeyData.accessLevel, shareKeyData.iv, shareKeyData.description, false, shareKey, null, cancellationToken);
                 return new DtoAccessInfo(shareKeyData.accessLevel.ToProjectAccess(), currentUserHash);
             }
 
