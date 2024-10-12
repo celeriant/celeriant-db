@@ -32,7 +32,7 @@ namespace UtilityDelta.CsvSync
 
         private static string baseUrl()
     {
-#if !DEBUG
+#if DEBUG
         int hash = HashProjectId(projectId);
         // Using bitwise AND with 1 to check if the hash is even or odd
         return (hash % 2) == 0 ? "https://api2.utilitydelta.io:1001" : "https://api2.utilitydelta.io:1000";
@@ -40,7 +40,11 @@ namespace UtilityDelta.CsvSync
         return "http://localhost:5198";
     }
 
-        private static string projectId = Nanoid.Generate();
+        //private static string projectId = "u8e6DG1NRkjJUZkHzLILr";
+        //private static string linkBase = "https://saludamedical.atlassian.net/browse/";
+        //private static string TLTTitle = "Saluda2";
+
+        private static string projectId = "SB3ldQsj334dDsM19t6ml";
         private static string linkBase = "https://megt.atlassian.net/browse/";
         private static string TLTTitle = "MEGT";
 
@@ -433,7 +437,7 @@ namespace UtilityDelta.CsvSync
                         sourceTask.DateCreated.ToUniversalTime().ToUnixTimeSeconds(), null, 
                         ProjectEventType.AddTask,
                         t1: sourceTask.TaskId,
-                        t2: sourceTask.ParentTask == "No parent" ? projectId : sourceTask.ParentTask,
+                        t2: projectId, //Always add new tasks directly under the projectid TLT, changing the parent later
                         t3: sourceTask.Summary, 
                         n1: null));
 
@@ -497,7 +501,17 @@ namespace UtilityDelta.CsvSync
                 destinationLookup.TryGetValue(sourceTask.TaskId, out var destinationTask);
                 if (destinationTask == null) destinationTask = new JiraTask() { ParentTask = "", Dependencies = "" };
 
-                if (destinationTask.ParentTask != "" && sourceTask.ParentTask != destinationTask.ParentTask)
+                if (destinationTask.ParentTask == "" && sourceTask.ParentTask != "No parent")
+                {
+                    projectEvents.Add(new ProjectEventItem(0, null,
+                        sourceTask.DateLastModified.ToUniversalTime().ToUnixTimeSeconds() + 5, null,
+                        ProjectEventType.SetParent,
+                        t1: sourceTask.TaskId,
+                        t2: sourceTask.ParentTask,
+                        t3: null,
+                        n1: null));
+                }
+                else if (destinationTask.ParentTask != "" && sourceTask.ParentTask != destinationTask.ParentTask)
                 {
                     projectEvents.Add(new ProjectEventItem(0, null,
                         sourceTask.DateLastModified.ToUniversalTime().ToUnixTimeSeconds() + 5, null,
@@ -639,16 +653,17 @@ namespace UtilityDelta.CsvSync
             string csvFilePathPrevious = $"jira_tasks_previous{TLTTitle}.csv";
             string jsonTeamMembers = "teamMembers.json";
 
-            bool cleanRun = true;
+            bool cleanRun = false;
 
             var currentTasks = GetJiraTasks(csvFilePathCurrent);
-            //var las40 = currentTasks.Where(x => x.Dependencies != "No dependencies");
+            //var task = currentTasks.FirstOrDefault(x => x.TaskId == "LAS-164");
 
             var currentState = !cleanRun && File.Exists(csvFilePathPrevious) ? GetJiraTasks(csvFilePathPrevious).ToDictionary(x => x.TaskId, x => x) : new Dictionary<string, JiraTask>();
+            //var hasTaskCurrent = currentState.ContainsKey(task.TaskId);
 
             //Reading from UD in case we want to sync state from there instead of rpevious csv
             //var read = await DoRead();
-            //var currentState = GetCurrentState(read.events);
+            //var currentStateUD = GetCurrentState(read.events);
 
             var currentUsers = !cleanRun && File.Exists(jsonTeamMembers) ? 
                 JsonSerializer.Deserialize<List<UDTeamMember>>(File.ReadAllText(jsonTeamMembers)) : 
