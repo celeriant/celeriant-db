@@ -9,6 +9,7 @@ using UtilityDelta.AiTooling.Services;
 using UtilityDelta.Projects.Interfaces;
 using UtilityDelta.Projects.Services;
 using UtilityDelta.Projects.Shared;
+using UtilityDelta.Realtime;
 
 namespace UtilityDelta.AiTooling
 {
@@ -131,9 +132,12 @@ namespace UtilityDelta.AiTooling
             builder.Services.Configure<ConfigurationEntry>(utilityDeltaConfiguration);
             builder.Services.Configure<SystemSettings>(utilityDeltaConfiguration);
 
+            builder.Services.AddSignalR();
+
             var app = builder.Build();
 
             app.UseCors("CorsDevelopment");
+            app.MapHub<UtilityDeltaHub>("/realtime");
             return app;
         }
     }

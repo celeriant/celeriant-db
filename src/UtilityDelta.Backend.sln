@@ -3,17 +3,11 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.10.34916.146
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "UtilityDelta.Realtime", "UtilityDelta.Realtime\UtilityDelta.Realtime.csproj", "{27F5F547-93C5-44F3-9FE9-A411EC3509EE}"
-EndProject
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "UtilityDelta.Api.Tests", "UtilityDelta.Api.Tests\UtilityDelta.Api.Tests.csproj", "{02D1254E-FC24-49E7-AE0C-8D56A5C0A858}"
 EndProject
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "UtilityDelta.AiTooling", "UtilityDelta.AiTooling\UtilityDelta.AiTooling.csproj", "{4D3F5BEC-9956-4071-BE3B-824E4C7DC997}"
 EndProject
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "UtilityDelta.Projects", "UtilityDelta.Projects\UtilityDelta.Projects.csproj", "{43A7DF24-C136-4964-B7F6-D2B519AD05EB}"
-EndProject
-Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "TestAI", "TestAI\TestAI.csproj", "{9C4229E4-1003-403E-977D-C6221916DDC0}"
-EndProject
-Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "UtilityDelta.CsvSync", "UtilityDelta.CsvSync\UtilityDelta.CsvSync.csproj", "{DCFE8CBB-457D-4A64-9519-4DC144C66EDC}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -21,10 +15,6 @@ Global
 		Release|Any CPU = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(ProjectConfigurationPlatforms) = postSolution
-		{27F5F547-93C5-44F3-9FE9-A411EC3509EE}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{27F5F547-93C5-44F3-9FE9-A411EC3509EE}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{27F5F547-93C5-44F3-9FE9-A411EC3509EE}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{27F5F547-93C5-44F3-9FE9-A411EC3509EE}.Release|Any CPU.Build.0 = Release|Any CPU
 		{02D1254E-FC24-49E7-AE0C-8D56A5C0A858}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
 		{02D1254E-FC24-49E7-AE0C-8D56A5C0A858}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{02D1254E-FC24-49E7-AE0C-8D56A5C0A858}.Release|Any CPU.ActiveCfg = Release|Any CPU
@@ -37,14 +27,6 @@ Global
 		{43A7DF24-C136-4964-B7F6-D2B519AD05EB}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{43A7DF24-C136-4964-B7F6-D2B519AD05EB}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{43A7DF24-C136-4964-B7F6-D2B519AD05EB}.Release|Any CPU.Build.0 = Release|Any CPU
-		{9C4229E4-1003-403E-977D-C6221916DDC0}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{9C4229E4-1003-403E-977D-C6221916DDC0}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{9C4229E4-1003-403E-977D-C6221916DDC0}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{9C4229E4-1003-403E-977D-C6221916DDC0}.Release|Any CPU.Build.0 = Release|Any CPU
-		{DCFE8CBB-457D-4A64-9519-4DC144C66EDC}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{DCFE8CBB-457D-4A64-9519-4DC144C66EDC}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{DCFE8CBB-457D-4A64-9519-4DC144C66EDC}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{DCFE8CBB-457D-4A64-9519-4DC144C66EDC}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

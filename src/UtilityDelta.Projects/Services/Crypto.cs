@@ -22,10 +22,15 @@ namespace UtilityDelta.Projects.Services
         {
             try
             {
+                //Create our public key object
                 var rsaPublicKey = RSA.Create();
                 rsaPublicKey.ImportFromPem(publicKey);
+
+                //Prepare our byte array for decryption
                 var nonceData = nonce.ToByteArray();
                 var signData = Convert.FromBase64String(sign);
+
+                //Decrypt and verify success
                 var result = rsaPublicKey.VerifyData(nonceData, signData, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
                 if (!result) throw new ExceptionInvalidSignature();
             }
