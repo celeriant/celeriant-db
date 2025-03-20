@@ -9,18 +9,10 @@ namespace UtilityDelta.Realtime
 {
     public class UtilityDeltaHub(IAccessLogic accessLogic) : Hub
     {
-        private static ConcurrentDictionary<string, string> UserToProject { get; set; } = new ConcurrentDictionary<string, string>();
-
-        public override Task OnDisconnectedAsync(Exception? exception)
-        {
-            UserToProject.TryRemove(Context.ConnectionId, out _);
-            return base.OnDisconnectedAsync(exception);
-        }
-
-        public async Task JoinProject(string pi, string publicKey, string nonce, string sign)
+        public async Task JoinProject(string projectId, string publicKey, string nonce, string sign)
         {
             var accessInfo = accessLogic.IsProjectExistAndHasAccess(
-                projectId: pi,
+                projectId: projectId,
                 createProjectIfNotExists: false,
                 shareKey: null,
                 publicKey: publicKey,
@@ -30,26 +22,28 @@ namespace UtilityDelta.Realtime
 
             if (accessInfo.ProjectAccess == Projects.Shared.ProjectAccess.NoAccess || accessInfo.ProjectAccess == Projects.Shared.ProjectAccess.NotExists) return;
 
-            UserToProject.TryRemove(Context.ConnectionId, out _);
-            UserToProject.TryAdd(Context.ConnectionId, pi);
-            await Groups.AddToGroupAsync(Context.ConnectionId, pi);
+            await Groups.AddToGroupAsync(Context.ConnectionId, projectId);
         }
 
-        public async Task LeaveProject()
+        public async Task LeaveProject(string projectId)
         {
-            UserToProject.TryRemove(Context.ConnectionId, out var pi);
-            if (pi != null)
-            {
-                await Groups.RemoveFromGroupAsync(Context.ConnectionId, pi);
-            }
+            await Groups.RemoveFromGroupAsync(Context.ConnectionId, projectId);
         }
 
-        public async Task AddedEvents()
+        public async Task AddedEvents(string projectId, string publicKey, string nonce, string sign)
         {
-            if (UserToProject.TryGetValue(Context.ConnectionId, out var pi))
-            {
-                await Clients.OthersInGroup(pi).SendAsync("NewEvents");
-            }
+            var accessInfo = accessLogic.IsProjectExistAndHasAccess(
+                projectId: projectId,
+                createProjectIfNotExists: false,
+                shareKey: null,
+                publicKey: publicKey,
+                nonce: nonce,
+                sign: sign,
+                cancellationToken: CancellationToken.None);
+
+            if (accessInfo.ProjectAccess == Projects.Shared.ProjectAccess.NoAccess || accessInfo.ProjectAccess == Projects.Shared.ProjectAccess.NotExists) return;
+
+            await Clients.OthersInGroup(projectId).SendAsync("NewEvents");
         }
     }
 }

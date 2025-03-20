@@ -74,7 +74,16 @@ namespace UtilityDelta.Projects.Services
                 return null;
             }
 
-            var eventItem = new ProjectEventItem(0, currentUserHash, edOverride ?? 0, iv, ProjectEventType.ProvideAccess, description, forUserId, shareKey, (double?)potentialAccessLevel);
+            var eventItem = new ProjectEventItem(
+                serverId: 0, 
+                cb: currentUserHash, 
+                ed: edOverride ?? 0, 
+                iv: iv, 
+                tp: ProjectEventType.ProvideAccess, 
+                t1: description, 
+                t2: forUserId, 
+                t3: shareKey, 
+                n1: (double?)potentialAccessLevel);
 
             var projectCache = GetOrBuildCache(projectId, cancellationToken);
             lock (projectCache)
