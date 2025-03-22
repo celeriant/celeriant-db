@@ -5,6 +5,7 @@ namespace UtilityDelta.Projects.Interfaces
 {
     public interface IAccessLogic
     {
+        Task<bool> PullFromCloudIfNotPresentLocally(string projectId);
         DtoAccessInfo IsProjectExistAndHasAccess(
             string projectId,
             bool createProjectIfNotExists,
