@@ -60,6 +60,97 @@ namespace UtilityDelta.Projects.Services
             }
         }
 
+        public async Task<bool> ReadFromCloud(string pi)
+        {
+            logger.LogInformation("Reading project from cloud storage: {pi}", pi);
+
+            try
+            {
+                var blobServiceClient = new BlobServiceClient(utilityDeltaConfiguration.Value.CLOUD_STORAGE_CONNECTION);
+
+                // Current machine container name
+                string currentMachineContainer = Environment.MachineName.Replace("-", "").ToLowerInvariant();
+
+                // List of containers to check
+                var containersToCheck = new List<string> { currentMachineContainer };
+
+                // Add additional containers from config if they're not already the current machine container
+                if (utilityDeltaConfiguration.Value.BLOB_CONTAINERS != null)
+                {
+                    foreach (var container in utilityDeltaConfiguration.Value.BLOB_CONTAINERS)
+                    {
+                        string containerName = container.Replace("-", "").ToLowerInvariant();
+                        if (!containersToCheck.Contains(containerName))
+                        {
+                            containersToCheck.Add(containerName);
+                        }
+                    }
+                }
+
+                // Try each container in sequence
+                foreach (var containerName in containersToCheck)
+                {
+                    var blobContainerClient = blobServiceClient.GetBlobContainerClient(containerName);
+
+                    if (!blobContainerClient.Exists())
+                    {
+                        logger.LogWarning("Container does not exist in cloud storage: {containerName}", containerName);
+                        continue; // Try next container
+                    }
+
+                    var appendBlobClient = blobContainerClient.GetAppendBlobClient(pi);
+
+                    if (!appendBlobClient.Exists())
+                    {
+                        logger.LogWarning("Project not found in container {containerName}: {pi}", containerName, pi);
+                        continue; // Try next container
+                    }
+
+                    // Found the project, download it
+                    logger.LogInformation("Found project in container {containerName}: {pi}", containerName, pi);
+
+                    // Create a temporary file path
+                    string tempFilePath = Path.Combine(
+                        Path.GetTempPath(),
+                        $"{pi}_{Guid.NewGuid()}.tmp");
+
+                    // Download blob content to a temporary file
+                    await appendBlobClient.DownloadToAsync(tempFilePath);
+
+                    // Use the file manager to handle writing the file content to the actual project file
+                    using (var fileHandle = fileHandlesManager.OpenWrite(pi))
+                    {
+                        using (var tempFileStream = new FileStream(tempFilePath, FileMode.Open, FileAccess.Read))
+                        {
+                            lock (fileHandle.Stream)
+                            {
+                                fileHandle.Stream.SetLength(0); // Clear existing content
+                                tempFileStream.CopyTo(fileHandle.Stream);
+                            }
+                        }
+                    }
+
+                    // Clean up the temporary file
+                    if (File.Exists(tempFilePath))
+                    {
+                        File.Delete(tempFilePath);
+                    }
+
+                    logger.LogInformation("Successfully restored project from cloud storage container {containerName}: {pi}", containerName, pi);
+                    return true;
+                }
+
+                // If we get here, the project wasn't found in any container
+                logger.LogWarning("Project not found in any available cloud storage containers: {pi}", pi);
+                return false;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Failed to read project from cloud storage: {pi} due to {message}", pi, ex.Message);
+                return false;
+            }
+        }
+
         private async Task WriteToCloud(string pi)
         {
             logger.LogInformation("Writing project to cloud storage: {pi}", pi);

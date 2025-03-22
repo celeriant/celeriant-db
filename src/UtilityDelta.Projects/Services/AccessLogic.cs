@@ -4,8 +4,24 @@ using UtilityDelta.Projects.Shared;
 
 namespace UtilityDelta.Projects.Services
 {
-    public class AccessLogic(IFileHandlesManager fileHandlesManager, ICrypto crypto, IUserAccessCache userAccessCache, IShareKeyCache shareKeyCache) : IAccessLogic
+    public class AccessLogic(IFileHandlesManager fileHandlesManager, ICrypto crypto, IUserAccessCache userAccessCache, IShareKeyCache shareKeyCache, IWriteAndBackup writeAndBackup) : IAccessLogic
     {
+        public async Task<bool> PullFromCloudIfNotPresentLocally(string projectId)
+        {
+            // Check if project exists locally
+            if (fileHandlesManager.Exists(projectId))
+            {
+                // Project already exists locally, no need to pull from cloud
+                return true;
+            }
+
+            // Attempt to read the project from cloud storage
+            bool success = await writeAndBackup.ReadFromCloud(projectId);
+
+            // Return whether the operation was successful
+            return success && fileHandlesManager.Exists(projectId);
+        }
+
         public DtoAccessInfo IsProjectExistAndHasAccess(
             string projectId,
             bool createProjectIfNotExists,

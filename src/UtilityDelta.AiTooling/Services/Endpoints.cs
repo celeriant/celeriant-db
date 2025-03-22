@@ -22,8 +22,10 @@ namespace UtilityDelta.AiTooling.Services
             [FromQuery] string? shareKey,
             CancellationToken cancellationToken)
         {
-            return await Task.Run(() =>
+            return await Task.Run(async () =>
             {
+                await accessLogic.PullFromCloudIfNotPresentLocally(pi);
+
                 var accessInfo = accessLogic.IsProjectExistAndHasAccess(
                     projectId: pi,
                     createProjectIfNotExists: createIfNotExist && fromTime == 0,
