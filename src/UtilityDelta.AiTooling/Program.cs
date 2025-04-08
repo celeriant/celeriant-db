@@ -91,6 +91,11 @@ namespace UtilityDelta.AiTooling
                                     .AllowAnyMethod()
                                     .AllowAnyHeader()
                                     .AllowCredentials();
+                                builder
+                                    .WithOrigins("http://localhost:5174")
+                                    .AllowAnyMethod()
+                                    .AllowAnyHeader()
+                                    .AllowCredentials();
                             }
 
                             builder
@@ -101,6 +106,12 @@ namespace UtilityDelta.AiTooling
 
                             builder
                                 .WithOrigins("https://test.utilitydelta.io")
+                                .AllowAnyMethod()
+                                .AllowAnyHeader()
+                                .AllowCredentials();
+
+                            builder
+                                .WithOrigins("https://colorsquare.utilitydelta.io")
                                 .AllowAnyMethod()
                                 .AllowAnyHeader()
                                 .AllowCredentials();

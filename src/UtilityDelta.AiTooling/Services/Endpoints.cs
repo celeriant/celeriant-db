@@ -244,7 +244,7 @@ namespace UtilityDelta.AiTooling.Services
             {
                 var accessInfo = accessLogic.IsProjectExistAndHasAccess(
                     projectId: pi,
-                    createProjectIfNotExists: false,
+                    createProjectIfNotExists: true,
                     shareKey: null,
                     publicKey: publicKey,
                     nonce: nonce,
