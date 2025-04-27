@@ -115,6 +115,12 @@ namespace UtilityDelta.AiTooling
                                 .AllowAnyMethod()
                                 .AllowAnyHeader()
                                 .AllowCredentials();
+
+                            builder
+                                .WithOrigins("https://colorsquare.org")
+                                .AllowAnyMethod()
+                                .AllowAnyHeader()
+                                .AllowCredentials();
                         }));
 
             builder.Services.AddSingleton<ICrypto, Crypto>();

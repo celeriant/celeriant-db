@@ -3,6 +3,7 @@ using Azure.Storage.Blobs.Specialized;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using System.Collections.Concurrent;
+using System.ComponentModel;
 using UtilityDelta.Projects.Interfaces;
 using UtilityDelta.Projects.Shared;
 
@@ -69,7 +70,7 @@ namespace UtilityDelta.Projects.Services
                 var blobServiceClient = new BlobServiceClient(utilityDeltaConfiguration.Value.CLOUD_STORAGE_CONNECTION);
 
                 // Current machine container name
-                string currentMachineContainer = Environment.MachineName.Replace("-", "").ToLowerInvariant();
+                string currentMachineContainer = "_" + Environment.MachineName.Replace("-", "").ToLowerInvariant();
 
                 // List of containers to check
                 var containersToCheck = new List<string> { currentMachineContainer };
@@ -126,6 +127,7 @@ namespace UtilityDelta.Projects.Services
                             {
                                 fileHandle.Stream.SetLength(0); // Clear existing content
                                 tempFileStream.CopyTo(fileHandle.Stream);
+                                fileHandle.Stream.Flush();
                             }
                         }
                     }
@@ -158,7 +160,7 @@ namespace UtilityDelta.Projects.Services
             await Task.Run(() =>
             {
                 var blobServiceClient = new BlobServiceClient(utilityDeltaConfiguration.Value.CLOUD_STORAGE_CONNECTION);
-                var blobContainerClient = blobServiceClient.GetBlobContainerClient(Environment.MachineName.Replace("-", "").ToLowerInvariant());
+                var blobContainerClient = blobServiceClient.GetBlobContainerClient("_"+Environment.MachineName.Replace("-", "").ToLowerInvariant());
                 blobContainerClient.CreateIfNotExists();
 
                 var appendBlobClient = blobContainerClient.GetAppendBlobClient(pi);
