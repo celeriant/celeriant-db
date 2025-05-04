@@ -75,7 +75,7 @@ namespace UtilityDelta.Projects.Services
             }
 
             var eventItem = new ProjectEventItem(
-                serverId: 0, 
+                si: 0, 
                 cb: currentUserHash, 
                 ed: edOverride ?? 0, 
                 iv: iv, 

@@ -28,7 +28,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\UtilityDelta.Api\UtilityDelta.Api.csproj" />
+    <ProjectReference Include="..\UtilityDelta.AiTooling\UtilityDelta.AiTooling.csproj" />
     <ProjectReference Include="..\UtilityDelta.Projects\UtilityDelta.Projects.csproj" />
   </ItemGroup>
 

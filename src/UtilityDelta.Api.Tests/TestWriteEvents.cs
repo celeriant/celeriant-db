@@ -102,7 +102,7 @@ namespace UtilityDelta.Projects.Tests
             //Assert.IsTrue(DateTimeOffset.UtcNow.ToUnixTimeSeconds() - r1.eventDate == 0);
 
             var r2 = writeEvents.WriteServerEvent(new ProjectEventItem(0, null, 0, null, ProjectEventType.AddShareLink, "sdf", "sharelink", null, 123.12), pi1);
-            Assert.AreEqual(3, r2.serverId);
+            Assert.AreEqual(3, r2.si);
             //Assert.IsTrue(DateTimeOffset.UtcNow.ToUnixTimeSeconds() - r2.ed < 2);
 
             var cb2 = "frank";
@@ -143,10 +143,10 @@ namespace UtilityDelta.Projects.Tests
             if (skip <= 2) Assert.AreEqual(123.12, r4.events[2 - skip].n1);
             Assert.AreEqual(111, r4.events[3 - skip].n1);
 
-            if (skip <= 0) Assert.AreEqual(1, r4.events[0 - skip].serverId);
-            if (skip <= 1) Assert.AreEqual(2, r4.events[1 - skip].serverId);
-            if (skip <= 2) Assert.AreEqual(3, r4.events[2 - skip].serverId);
-            Assert.AreEqual(4, r4.events[3 - skip].serverId);
+            if (skip <= 0) Assert.AreEqual(1, r4.events[0 - skip].si);
+            if (skip <= 1) Assert.AreEqual(2, r4.events[1 - skip].si);
+            if (skip <= 2) Assert.AreEqual(3, r4.events[2 - skip].si);
+            Assert.AreEqual(4, r4.events[3 - skip].si);
 
             if (skip <= 0) Assert.AreEqual(cb, r4.events[0 - skip].cb);
             if (skip <= 1) Assert.AreEqual(cb, r4.events[1 - skip].cb);

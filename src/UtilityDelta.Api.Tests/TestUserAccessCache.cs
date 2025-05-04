@@ -61,7 +61,7 @@ namespace UtilityDelta.Projects.Tests
             writeEvents.Setup(x => x.WriteServerEvent(It.Is<ProjectEventItem>(y => 
                 y.cb == cu1 &&
                 y.ed == 0 &&
-                y.serverId == 0 &&
+                y.si == 0 &&
                 y.tp == ProjectEventType.ProvideAccess &&
                 y.t1 == "desc here" &&
                 y.t2 == "foruser1" &&

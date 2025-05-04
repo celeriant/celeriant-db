@@ -70,7 +70,7 @@ namespace UtilityDelta.Projects.Services
                 var blobServiceClient = new BlobServiceClient(utilityDeltaConfiguration.Value.CLOUD_STORAGE_CONNECTION);
 
                 // Current machine container name
-                string currentMachineContainer = "_" + Environment.MachineName.Replace("-", "").ToLowerInvariant();
+                string currentMachineContainer = "server-" + Environment.MachineName.Replace("-", "").ToLowerInvariant();
 
                 // List of containers to check
                 var containersToCheck = new List<string> { currentMachineContainer };
@@ -160,7 +160,7 @@ namespace UtilityDelta.Projects.Services
             await Task.Run(() =>
             {
                 var blobServiceClient = new BlobServiceClient(utilityDeltaConfiguration.Value.CLOUD_STORAGE_CONNECTION);
-                var blobContainerClient = blobServiceClient.GetBlobContainerClient("_"+Environment.MachineName.Replace("-", "").ToLowerInvariant());
+                var blobContainerClient = blobServiceClient.GetBlobContainerClient("server-" + Environment.MachineName.Replace("-", "").ToLowerInvariant());
                 blobContainerClient.CreateIfNotExists();
 
                 var appendBlobClient = blobContainerClient.GetAppendBlobClient(pi);
