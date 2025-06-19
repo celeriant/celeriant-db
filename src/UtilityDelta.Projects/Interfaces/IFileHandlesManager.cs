@@ -6,5 +6,6 @@ namespace UtilityDelta.Projects.Interfaces
     {
         bool Exists(string container);
         FileHandles OpenWrite(string container);
+        void Delete(string container);
     }
 }

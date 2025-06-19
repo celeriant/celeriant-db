@@ -60,6 +60,7 @@ namespace UtilityDelta.AiTooling
             api.MapGet("/ping", endpoints.Ping);
             api.MapGet("/laksfdksaefja", endpoints.PingResults);
             api.MapGet("/read", endpoints.Read);
+            api.MapPost("/deleteproject", endpoints.DeleteProject);
             api.MapPost("/disableuser", endpoints.DisableUser);
             api.MapPost("/disableshare", endpoints.DisableShare);
             api.MapPost("/share", endpoints.Share);

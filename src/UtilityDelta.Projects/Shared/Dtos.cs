@@ -8,6 +8,8 @@
 
     public record DtoDisableAccess(ProjectEventItem? disableAccessEvent);
 
+    public record DtoDeleteProject(bool success);
+
     public record DtoAccessInfo(ProjectAccess ProjectAccess, string CurrentUserHash);
 
     public record DtoShareKeyData(DateTime? expiresOn, AccessLevel accessLevel, string? iv, string? description, string hashedCode, bool isSingleUse, string createdBy);

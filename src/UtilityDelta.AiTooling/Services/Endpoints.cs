@@ -114,6 +114,34 @@ namespace UtilityDelta.AiTooling.Services
             });
         }
 
+        public async Task<IResult> DeleteProject(
+            [FromQuery] string pi,
+            [FromQuery] string publicKey,
+            [FromQuery] string nonce,
+            [FromQuery] string sign,
+            CancellationToken cancellationToken)
+        {
+            return await Task.Run(() =>
+            {
+                var accessInfo = accessLogic.IsProjectExistAndHasAccess(
+                    projectId: pi,
+                    createProjectIfNotExists: false,
+                    shareKey: null,
+                    publicKey: publicKey,
+                    nonce: nonce,
+                    sign: sign,
+                    cancellationToken: cancellationToken);
+
+                return accessInfo.ProjectAccess switch
+                {
+                    ProjectAccess.NotExists => Results.NotFound(),
+                    ProjectAccess.OwnerAccess => Results.Ok(
+                        new DtoDeleteProject(writeAndBackup.DeleteProject(pi, accessInfo.CurrentUserHash))),
+                    _ => Results.StatusCode(StatusCodes.Status403Forbidden)
+                };
+            });
+        }
+
         public async Task<IResult> DisableUser(
             [FromQuery] string pi,
             [FromQuery] string publicKey,
@@ -269,7 +297,7 @@ namespace UtilityDelta.AiTooling.Services
             [FromBody] ProjectEventItem[] events,
             CancellationToken cancellationToken)
         {
-            return await Task.Run(() =>
+            return await Task.Run(async () =>
             {
                 var creatorEventDate = events.Min(x => x.ed) - 1;
 

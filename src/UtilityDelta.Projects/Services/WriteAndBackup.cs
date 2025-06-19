@@ -80,10 +80,9 @@ namespace UtilityDelta.Projects.Services
                 {
                     foreach (var container in utilityDeltaConfiguration.Value.BLOB_CONTAINERS)
                     {
-                        string containerName = container.Replace("-", "").ToLowerInvariant();
-                        if (!containersToCheck.Contains(containerName))
+                        if (!containersToCheck.Contains(container))
                         {
-                            containersToCheck.Add(containerName);
+                            containersToCheck.Add(container);
                         }
                     }
                 }
@@ -229,6 +228,31 @@ namespace UtilityDelta.Projects.Services
             TryQueueBackupForProject(pi);
 
             return writeResult;
+        }
+
+        public bool DeleteProject(string pi, string currentUserHash)
+        {
+            var blobServiceClient = new BlobServiceClient(utilityDeltaConfiguration.Value.CLOUD_STORAGE_CONNECTION);
+
+            // Current machine container name
+            string containerName = "server-" + Environment.MachineName.Replace("-", "").ToLowerInvariant();
+            var blobContainerClient = blobServiceClient.GetBlobContainerClient(containerName);
+
+            if (blobContainerClient.Exists())
+            {
+                var appendBlobClient = blobContainerClient.GetAppendBlobClient(pi);
+                if (appendBlobClient.Exists())
+                {
+                    appendBlobClient.Delete();
+                }
+            }
+
+            if (fileHandlesManager.Exists(pi))
+            {
+                fileHandlesManager.Delete(pi);
+            }
+
+            return true;
         }
     }
 }

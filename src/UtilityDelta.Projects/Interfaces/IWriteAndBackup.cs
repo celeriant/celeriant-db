@@ -8,5 +8,6 @@ namespace UtilityDelta.Projects.Interfaces
         Task ProcessQueue();
         DtoWrite WriteClientEvents(ProjectEventItem[] events, string createdBy, string pi, CancellationToken cancellationToken);
         ProjectEventItem WriteServerEvent(ProjectEventItem eventItem, string pi);
+        bool DeleteProject(string pi, string currentUserHash);
     }
 }

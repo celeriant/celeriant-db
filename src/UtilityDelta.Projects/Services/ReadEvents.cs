@@ -68,7 +68,8 @@ namespace UtilityDelta.Projects.Services
                 if (multiFilterEventType != null && !multiFilterEventType.Contains(tp)) continue;
 
                 //Don't bother creating the object model if this is the current user
-                if (currentUserHash != null && cb == currentUserHash) continue;
+                //The only exception to this is if the user is asking for the complete event history
+                if (fromEventId > 0 && currentUserHash != null && cb == currentUserHash) continue;
 
                 events.Add(new ProjectEventItem(serverId, cb, ed, iv, tp, t1, t2, t3, n1));
 

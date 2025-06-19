@@ -1,5 +1,7 @@
 ﻿using Microsoft.Extensions.Options;
 using System.Collections.Concurrent;
+using System.ComponentModel;
+using System.Xml.Linq;
 using UtilityDelta.Projects.Interfaces;
 using UtilityDelta.Projects.Shared;
 
@@ -101,6 +103,21 @@ namespace UtilityDelta.Projects.Services
             _isInUse.TryRemove(contaner, out var _);
 
             return true;
+        }
+
+        public void Delete(string container)
+        {
+            var hasValue = _containerFileStreams.TryGetValue(container, out var stream);
+            if (hasValue && stream != null)
+            {
+                stream.Dispose();
+            }
+
+            var filePath = container.ContainerPath(utilityDeltaConfiguration.Value.SUB_DIR_CONTAINERS);
+            File.Delete(filePath);
+
+            _isInUse.TryRemove(container, out var _);
+            _containerFileStreams.TryRemove(container, out var _);
         }
     }
 }

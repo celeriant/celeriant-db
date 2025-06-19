@@ -20,6 +20,7 @@ namespace UtilityDelta.AiTooling.Interfaces
         Task<IResult> DeleteFile(string pi, string publicKey, string nonce, string sign, string fileId, CancellationToken cancellationToken);
         Task<IResult> DeleteAllFiles(string pi, string publicKey, string nonce, string sign, CancellationToken cancellationToken);
         Task<IResult> DisableShare([FromQuery] string pi, [FromQuery] string publicKey, [FromQuery] string nonce, [FromQuery] string sign, [FromQuery] string shareKeyHash, CancellationToken cancellationToken);
+        Task<IResult> DeleteProject([FromQuery] string pi, [FromQuery] string publicKey, [FromQuery] string nonce, [FromQuery] string sign, CancellationToken cancellationToken);
         Task<IResult> DisableUser([FromQuery] string pi, [FromQuery] string publicKey, [FromQuery] string nonce, [FromQuery] string sign, [FromQuery] string userId, CancellationToken cancellationToken);
         Task<IResult> Read([FromQuery] string pi, [FromQuery] string publicKey, [FromQuery] string nonce, [FromQuery] string sign, [FromQuery] long fromTime, [FromQuery] bool createIfNotExist, [FromQuery] string? shareKey, CancellationToken cancellationToken);
         IResult Ping([FromQuery] string pi);
