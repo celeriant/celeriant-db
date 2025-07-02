@@ -1,0 +1,34 @@
+[package]
+name = "event_storage"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bincode.workspace = true
+postcard.workspace = true
+serde.workspace = true
+simd-json.workspace = true
+zstd.workspace = true
+tikv-jemallocator = { workspace = true, optional = true }
+
+[dev-dependencies]
+stl_io.workspace = true
+image.workspace = true
+rand.workspace = true
+nanoid.workspace = true
+tempfile.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "bench_event_item"
+harness = false
+
+[[bench]]
+name = "bench_event_storage"
+harness = false
+
+[[bench]]
+name = "bench_storage_cache"
+harness = false
