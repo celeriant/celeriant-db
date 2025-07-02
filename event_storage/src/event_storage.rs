@@ -95,6 +95,40 @@ fn read_batch_at_position(reader: &mut BufReader<File>, current_pos: u64, batch_
     Ok(event_batch_item)
 }
 
+pub fn find_last_valid_event_batch(mut reader: &mut BufReader<File>) -> io::Result<u64> {
+    let file_size = reader.get_ref().metadata()?.len();
+    
+    if file_size < BATCH_START_SIZE + BATCH_METADATA_SIZE {
+        return Ok(0); // File too small to contain any valid batch
+    }
+    
+    let mut current_pos = 0u64;
+    let mut last_valid_pos = 0u64;
+    
+    while current_pos + BATCH_START_SIZE + BATCH_METADATA_SIZE <= file_size {
+        // Read the compressed data size from the beginning of the batch
+        let compressed_size = read_u64_at_offset(&mut reader, current_pos, 0)?;
+        
+        // Calculate where this batch should end
+        let batch_end_pos = current_pos + BATCH_START_SIZE + compressed_size + BATCH_METADATA_SIZE;
+        
+        // Check if the batch would extend beyond the file
+        if batch_end_pos > file_size {
+            break;
+        }
+        
+        // Check if the magic number is correct at the expected end position
+        if !is_batch_corrupt(&mut reader, batch_end_pos) {
+            last_valid_pos = batch_end_pos;
+            current_pos = batch_end_pos;
+        } else {
+            break; // Found corruption, stop here
+        }
+    }
+    
+    Ok(last_valid_pos)
+}
+
 pub fn find_last_si(mut reader: &mut BufReader<File>) -> io::Result<Option<u64>> {
     let file_size = reader.get_ref().metadata()?.len();
 
@@ -463,4 +497,94 @@ pub mod tests {
         assert_eq!(events_batch_2.si, read_result.event_batches[0].si);
         assert_eq!(events_batch_3.si, read_result.event_batches[1].si);
     }
+
+    #[test]
+    fn test_find_last_valid_event_batch_corrupted_file() {
+        let events_batch_1 = create_event_batch_item(0, None, 123, vec![
+            create_test_event_item(),
+            create_minimal_event_item(),
+        ]);
+        let events_batch_2 = create_event_batch_item(1, None, 456, vec![
+            create_test_event_item(),
+        ]);
+        let events_batch_3 = create_event_batch_item(2, None, 789, vec![
+            create_minimal_event_item(),
+        ]);
+
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let temp_path = temp_dir.path();
+        let events_bin = temp_path.join("events.bin");
+
+        let mut writer = create_append_writer(events_bin.to_str().unwrap()).unwrap();
+        
+        append_event_batch(&mut writer, &events_batch_1).unwrap();
+        append_event_batch(&mut writer, &events_batch_2).unwrap();
+
+        // Get the position after the first two valid batches
+        let reader = create_reader(events_bin.to_str().unwrap()).unwrap();
+        let valid_end_pos = reader.get_ref().metadata().unwrap().len();
+
+        // Add a third batch
+        append_event_batch(&mut writer, &events_batch_3).unwrap();
+
+        // Corrupt the file by truncating it in the middle of the third batch
+        let file = OpenOptions::new()
+            .write(true)
+            .open(events_bin.to_str().unwrap())
+            .unwrap();
+        file.set_len(valid_end_pos + 50).unwrap(); // Truncate partway through third batch
+
+        // Test that find_last_valid_event_batch returns position after second batch
+        let mut reader = create_reader(events_bin.to_str().unwrap()).unwrap();
+        let last_valid_pos = find_last_valid_event_batch(&mut reader).unwrap();
+        
+        assert_eq!(last_valid_pos, valid_end_pos);
+    }
+
+    #[test]
+    fn test_find_last_valid_event_batch_uncorrupted_file() {
+        let events_batch_1 = create_event_batch_item(0, None, 123, vec![
+            create_test_event_item(),
+            create_minimal_event_item(),
+        ]);
+        let events_batch_2 = create_event_batch_item(1, None, 456, vec![
+            create_test_event_item(),
+        ]);
+
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let temp_path = temp_dir.path();
+        let events_bin = temp_path.join("events.bin");
+
+        let mut writer = create_append_writer(events_bin.to_str().unwrap()).unwrap();
+        
+        append_event_batch(&mut writer, &events_batch_1).unwrap();
+        append_event_batch(&mut writer, &events_batch_2).unwrap();
+
+        let mut reader = create_reader(events_bin.to_str().unwrap()).unwrap();
+        let file_size = reader.get_ref().metadata().unwrap().len();
+        
+        let last_valid_pos = find_last_valid_event_batch(&mut reader).unwrap();
+        
+        // Should return the exact end of file position since no corruption
+        assert_eq!(last_valid_pos, file_size);
+    }
+
+    #[test]
+    fn test_find_last_valid_event_batch_completely_corrupt_file() {
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let temp_path = temp_dir.path();
+        let events_bin = temp_path.join("events.bin");
+
+        // Create a file with random garbage data
+        let mut file = File::create(events_bin.to_str().unwrap()).unwrap();
+        let garbage_data = vec![0x42u8; 1000]; // 1000 bytes of garbage
+        file.write_all(&garbage_data).unwrap();
+
+        let mut reader = create_reader(events_bin.to_str().unwrap()).unwrap();
+        let last_valid_pos = find_last_valid_event_batch(&mut reader).unwrap();
+        
+        // Should return 0 since no valid batches found
+        assert_eq!(last_valid_pos, 0);
+    }
+
 }

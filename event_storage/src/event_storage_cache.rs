@@ -1,6 +1,6 @@
-use std::{fs::{metadata, File}, io::{self, Read, Seek, SeekFrom, Write}, sync::Arc};
+use std::{fs::{metadata, File}, io::{self, BufReader, Read, Seek, SeekFrom, Write}, sync::Arc};
 
-use crate::{catchup_result::{CatchupResult}, event_batch_item::EventBatchItem, event_storage::{append_event_batch, find_last_si, read_from_si}, file_cache::FileCache, last_si_cache::LastSiCache, memory_cache::MemoryCache};
+use crate::{catchup_result::CatchupResult, event_batch_item::EventBatchItem, event_storage::{append_event_batch, find_last_si, find_last_valid_event_batch, read_from_si}, file_cache::FileCache, last_si_cache::LastSiCache, memory_cache::MemoryCache};
 
 pub struct EventStorageCache {
     file_cache: FileCache,
@@ -83,24 +83,43 @@ impl EventStorageCache {
     fn recover_from_transaction_file(&mut self, file_path: &str) {
         // Check for existing transaction and recover if needed
         if let Ok(Some(original_file_length)) = self.has_transaction(file_path) {
-            // Truncate file to original length to recover from crash
-            if let Ok(file) = std::fs::OpenOptions::new()
-                .write(true)
-                .open(file_path)
-            {
-                let _ = file.set_len(original_file_length);
-            }
-            
-            // Clear the caches for this file
-            self.file_cache.remove(file_path);
-            self.last_si_cache.remove(file_path);
+            // Truncate file to original length to recover from crash. Ignore failure
+            let _ = self.truncate_file_and_invalidate_cache(file_path, original_file_length);
         }
     }
 
-    fn recover_file_using_magic_number(&mut self, reader: &mut std::cell::RefMut<'_, io::BufReader<File>>, file_path: &str) -> bool {
-        todo!()
+    fn truncate_file_and_invalidate_cache(&mut self, file_path: &str, truncate_to: u64) -> io::Result<()> {
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .write(true)
+            .open(file_path)
+        {
+            file.set_len(truncate_to)?;
+        }
+        
+        // Clear the caches for this file
+        self.file_cache.remove(file_path);
+        self.last_si_cache.remove(file_path);
+
+        Ok(())
     }
 
+    fn recover_file_using_magic_number(&mut self, file_path: &str, mut reader: &mut BufReader<File>) -> io::Result<()> {
+        let file_size = reader.get_ref().metadata()?.len();
+        let last_valid_pos: u64 = find_last_valid_event_batch(&mut reader)?;
+
+        if last_valid_pos < file_size {
+            self.truncate_file_and_invalidate_cache(file_path, last_valid_pos)?;
+            return Ok(());
+        }
+
+        if last_valid_pos == 0 {
+            return Err(io::Error::new(io::ErrorKind::Other, "File is corrupted and cannot be recovered"));
+        }
+
+        Ok(())
+    }
+
+    
     pub fn get_last_si(&mut self, file_path: &str) -> io::Result<Option<u64>> {
         self.recover_from_transaction_file(file_path);
         self.get_last_si_internal(file_path, true)
@@ -124,15 +143,13 @@ impl EventStorageCache {
                         Ok(si) => last_si = si,
                         Err(_) => {
                             //File is corrupted, try to recover it
-                            if self.recover_file_using_magic_number(&mut reader, file_path) {
-                                match find_last_si(&mut reader) {
-                                    Ok(si) => last_si = si,
-                                    Err(_) => {
-                                        return Err(io::Error::new(io::ErrorKind::Other, "File is corrupted and cannot be recovered"));
-                                    },
-                                }
-                            } else {
-                                return Err(io::Error::new(io::ErrorKind::Other, "File is corrupted and cannot be recovered"));
+                            self.recover_file_using_magic_number(file_path, &mut reader)?;
+
+                            match find_last_si(&mut reader) {
+                                Ok(si) => last_si = si,
+                                Err(_) => {
+                                    return Err(io::Error::new(io::ErrorKind::Other, "File is corrupted and cannot be recovered"));
+                                },
                             }
                         }
                     }
@@ -223,15 +240,13 @@ impl EventStorageCache {
                     Ok(catchup_result) => return Ok(catchup_result),
                     Err(_) => {
                         //File is corrupted, try to recover it
-                        if self.recover_file_using_magic_number(&mut reader, file_path) {
-                            match read_from_si(&mut reader, from_si, max_bytes) {
-                                Ok(catchup_result) => return Ok(catchup_result),
-                                Err(_) => {
-                                    return Err(io::Error::new(io::ErrorKind::Other, "File is corrupted and cannot be recovered"));
-                                },
-                            }
-                        } else {
-                            return Err(io::Error::new(io::ErrorKind::Other, "File is corrupted and cannot be recovered"));
+                        self.recover_file_using_magic_number(file_path, &mut reader)?;
+                        
+                        match read_from_si(&mut reader, from_si, max_bytes) {
+                            Ok(catchup_result) => return Ok(catchup_result),
+                            Err(_) => {
+                                return Err(io::Error::new(io::ErrorKind::Other, "File is corrupted and cannot be recovered"));
+                            },
                         }
                     }
                 }
@@ -522,5 +537,102 @@ mod tests {
         let partial_events = storage.read(&events_bin.to_str().unwrap(), 1, 1).unwrap();
         assert_eq!(partial_events.next_si, None); // Should continue from SI 1 after reaching the limit
         assert_eq!(partial_events.flatten_events().len(), 1);
+    }
+
+    #[test]
+    fn test_file_recovery_using_magic_number() {
+        // Turn off memory cache to ensure we read from disk
+        let mut storage = EventStorageCache::new(0, 1000000, 10000);
+
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let temp_path = temp_dir.path();
+        let events_bin = temp_path.join("events.bin");
+        let file_path = events_bin.to_str().unwrap();
+
+        let events_batch_1 = vec![create_test_event_item(), create_minimal_event_item()];
+        let events_batch_2 = vec![create_test_event_item()];
+        let events_batch_3 = vec![create_minimal_event_item()];
+        
+        let event_batch_item_1 = create_event_batch_item(0, None, 123, events_batch_1);
+        let event_batch_item_2 = create_event_batch_item(0, None, 456, events_batch_2);
+        let event_batch_item_3 = create_event_batch_item(0, None, 789, events_batch_3);
+
+        // Write first two batches
+        let last_si = storage.write(file_path, true, event_batch_item_1).unwrap();
+        assert_eq!(last_si, 0);
+        let last_si = storage.write(file_path, true, event_batch_item_2).unwrap();
+        assert_eq!(last_si, 1);
+
+        // Get file length after valid batches
+        let valid_file_length = fs::metadata(&events_bin).unwrap().len();
+
+        // Write third batch
+        let last_si = storage.write(file_path, true, event_batch_item_3).unwrap();
+        assert_eq!(last_si, 2);
+
+        // Corrupt the file by truncating it in the middle of the third batch
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(file_path)
+            .unwrap();
+        file.set_len(valid_file_length + 50).unwrap(); // Truncate partway through third batch
+
+        // Clear all caches to force re-reading from disk
+        storage.file_cache.remove(file_path);
+        storage.last_si_cache.remove(file_path);
+        storage.memory_cache.invalidate_file(file_path);
+
+        // Test 1: get_last_si should recover and return SI 1 (last valid batch)
+        let last_si = storage.get_last_si(file_path).unwrap();
+        assert_eq!(last_si, Some(1));
+
+        // Verify file was truncated to valid length
+        let recovered_file_length = fs::metadata(&events_bin).unwrap().len();
+        assert_eq!(recovered_file_length, valid_file_length);
+
+        // Re-corrupt the file for next test
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(file_path)
+            .unwrap();
+        file.set_len(valid_file_length + 50).unwrap();
+        storage.file_cache.remove(file_path);
+        storage.last_si_cache.remove(file_path);
+
+        // Test 2: read should recover and return only valid batches
+        let events = storage.read(file_path, 0, 1000000).unwrap();
+        assert_eq!(events.flatten_events().len(), 3); // Only first two batches
+        assert_eq!(events.event_batches.len(), 2);
+        assert_eq!(events.event_batches[0].si, 0);
+        assert_eq!(events.event_batches[1].si, 1);
+        assert_eq!(events.next_si, None);
+
+        // Verify file was truncated again
+        let recovered_file_length = fs::metadata(&events_bin).unwrap().len();
+        assert_eq!(recovered_file_length, valid_file_length);
+
+        // Re-corrupt the file for final test
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(file_path)
+            .unwrap();
+        file.set_len(valid_file_length + 50).unwrap();
+        storage.file_cache.remove(file_path);
+        storage.last_si_cache.remove(file_path);
+
+        // Test 3: write should recover and then successfully write new batch
+        let new_event_batch = create_event_batch_item(0, None, 999, vec![create_test_event_item()]);
+        let last_si = storage.write(file_path, true, new_event_batch).unwrap();
+        assert_eq!(last_si, 2); // Should be SI 2 after recovery
+
+        // Verify we can read all three batches (original 2 + new 1)
+        storage.memory_cache.invalidate_file(file_path); // Clear cache to read from disk
+        let final_events = storage.read(file_path, 0, 1000000).unwrap();
+        assert_eq!(final_events.flatten_events().len(), 4); // 2 + 1 + 1 events
+        assert_eq!(final_events.event_batches.len(), 3);
+        assert_eq!(final_events.event_batches[0].si, 0);
+        assert_eq!(final_events.event_batches[1].si, 1);
+        assert_eq!(final_events.event_batches[2].si, 2);
+        assert_eq!(final_events.event_batches[2].sd, 999); // New batch
     }
 }
