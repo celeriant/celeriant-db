@@ -10,6 +10,7 @@ core_affinity.workspace = true
 crossbeam.workspace = true
 ahash.workspace = true
 tokio.workspace = true
+nanoid.workspace = true
 
 [dev-dependencies]
 rand.workspace = true

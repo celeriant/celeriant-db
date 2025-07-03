@@ -1,87 +1,91 @@
-use std::collections::HashMap;
-use std::sync::{Arc};
-use std::thread;
-use core_affinity;
-use crossbeam::channel::{Sender, Receiver, unbounded};
-use tokio::sync::oneshot;
-use ahash::AHasher;
 use std::hash::{Hash, Hasher};
+use std::thread;
 
-// A job that optionally returns a result
+use ahash::AHasher;
+use core_affinity;
+use crossbeam::channel::{unbounded, Receiver, Sender};
+use nanoid::nanoid;
+use tokio::sync::oneshot;
+
 enum Job {
     NoResult(String),
     WithResult(String, oneshot::Sender<String>),
 }
 
-// Create a thread pool where each thread is pinned to a core
-fn create_thread_pool(n: usize) -> (Vec<Sender<Job>>, Vec<thread::JoinHandle<()>>) {
+fn create_thread_pool(n: usize) -> Vec<Sender<Job>> {
     let cores = core_affinity::get_core_ids().unwrap();
-    let mut senders = Vec::new();
-    let mut handles = Vec::new();
+    let num_available_cores = cores.len(); // Get the total number of cores
+    let num_threads_to_use = std::cmp::min(n, num_available_cores); // Use min to not exceed available cores
 
-    for i in 0..n {
+    let mut senders = Vec::new();
+
+    for i in 0..num_threads_to_use {
         let (tx, rx): (Sender<Job>, Receiver<Job>) = unbounded();
         let core_id = cores[i];
-        let handle = thread::spawn(move || {
-            // Pin thread to CPU core
+
+        // Spawn pinned thread
+        thread::spawn(move || {
             core_affinity::set_for_current(core_id);
 
-            // Worker loop
             for job in rx.iter() {
                 match job {
                     Job::NoResult(data) => {
-                        println!("[Core {}] Processed (fire-and-forget): {}", core_id.id, data);
+                        println!("[Core {}] Fire-and-forget: {}", core_id.id, data);
                     }
                     Job::WithResult(data, tx) => {
                         let result = format!("Processed: {}", data);
-                        let _ = tx.send(result); // ignore if receiver dropped
+                        let _ = tx.send(result);
                     }
                 }
             }
         });
 
         senders.push(tx);
-        handles.push(handle);
     }
 
-    (senders, handles)
+    senders
 }
 
-// Consistent hashing to select worker
 fn hash_string_to_index(id: &str, num_threads: usize) -> usize {
     let mut hasher = AHasher::default();
     id.hash(&mut hasher);
     (hasher.finish() as usize) % num_threads
 }
 
-// Submit a job and optionally wait for a result
-fn submit_job(
+async fn submit_job(
     workers: &[Sender<Job>],
     id: &str,
     wait_for_result: bool,
 ) -> Option<String> {
     let index = hash_string_to_index(id, workers.len());
+
     if wait_for_result {
         let (tx, rx) = oneshot::channel();
-        workers[index].send(Job::WithResult(id.to_string(), tx)).unwrap();
-        Some(rx.blocking_recv().unwrap())
+        workers[index]
+            .send(Job::WithResult(id.to_string(), tx))
+            .unwrap();
+        Some(rx.await.expect("Worker dropped response"))
     } else {
-        workers[index].send(Job::NoResult(id.to_string())).unwrap();
+        workers[index]
+            .send(Job::NoResult(id.to_string()))
+            .unwrap();
         None
     }
 }
 
-fn main() {
-    let num_threads = 4;
-    let (workers, handles) = create_thread_pool(num_threads);
+#[tokio::main]
+async fn main() {
+    let cores = core_affinity::get_core_ids().unwrap();
+    let workers = create_thread_pool(cores.len());
 
-    // Submit jobs
-    submit_job(&workers, "user_123", false);
-    submit_job(&workers, "user_456", false);
+    // Fire-and-forget job
+    for _ in 0..1000 {
+        submit_job(&workers, nanoid!().as_str(), false).await;
+        if let Some(result) = submit_job(&workers, nanoid!().as_str(), true).await {
+            println!("Got result: {}", result);
+        }
+    }
 
-    let result = submit_job(&workers, "user_789", true);
-    println!("Got result: {:?}", result);
-
-    // Let threads run a bit (in real app, you'd handle shutdown properly)
-    std::thread::sleep(std::time::Duration::from_secs(1));
+    // Let threads finish processing
+    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
 }
