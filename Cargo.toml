@@ -35,3 +35,4 @@ tokio = { version = "1.46.0", features = ["full"] }
 futures = "0.3.31"
 axum = "0.8.4"
 chrono = "0.4.41"
+tower-http = { version = "0.6.6", features = ["cors"] }

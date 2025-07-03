@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, Query},
-    http::StatusCode,
+    http::{HeaderValue, Method, StatusCode},
     response::Json,
     routing::{get, post},
     Router,
@@ -10,7 +10,8 @@ use event_storage::event_batch_item::EventBatchItem;
 use event_storage_threads::{create_thread_pool, read_async, write_async, Job};
 use crossbeam::channel::Sender;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use tower_http::cors::{Any, CorsLayer};
+use std::{collections::HashMap, time::Duration};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use core_affinity;
@@ -22,20 +23,72 @@ struct WriteRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct WriteResponse {
-    si: u64,
-    events_written: usize,
+    #[serde(rename = "serverId")]
+    server_id: u64,
+    #[serde(rename = "eventDate")]
+    event_date: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ReadResponse {
     events: Vec<EventItem>,
-    total_events: usize,
+    server_id: u64,
+}
+
+
+#[derive(Debug, Deserialize)]
+struct ShareQuery {
+    pi: String,
+    #[serde(rename = "publicKey")]
+    public_key: String,
+    nonce: String,
+    sign: String,
+    #[serde(rename = "isOwner")]
+    is_owner: bool,
+    #[serde(rename = "singleUse")]
+    single_use: bool,
+    iv: Option<String>,
+    description: Option<String>,
+    #[serde(rename = "expiresOn")]
+    expires_on: i64,
+    #[serde(rename = "readOnly")]
+    read_only: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ShareResponse {
+    #[serde(rename = "shareKey")]
+    share_key: String,
+    #[serde(rename = "shareEvent")]
+    share_event: EventItem,
 }
 
 #[derive(Debug, Deserialize)]
 struct ReadQuery {
-    from_si: Option<u64>,
+    pi: String,
+    #[serde(rename = "publicKey")]
+    public_key: String,
+    nonce: String,
+    sign: String,
+    #[serde(rename = "fromTime")]
+    from_time: i64,
+    #[serde(rename = "createIfNotExist")]
+    create_if_not_exist: bool,
+    #[serde(rename = "shareKey")]
+    share_key: Option<String>,
     max_bytes: Option<usize>,
+}
+
+
+#[derive(Debug, Deserialize)]
+struct WriteQuery {
+    pi: String,
+    #[serde(rename = "publicKey")]
+    public_key: String,
+    nonce: String,
+    sign: String,
+    #[serde(rename = "createIfNotExist")]
+    create_if_not_exist: bool,
 }
 
 #[derive(Clone)]
@@ -62,35 +115,43 @@ impl AppState {
     }
 }
 
-// POST /events/{file_id} - Write events to a file
+// POST /write - Write events with query parameters
 async fn write_events(
-    Path(file_id): Path<String>,
+    Query(params): Query<WriteQuery>,
     axum::extract::State(state): axum::extract::State<AppState>,
-    Json(request): Json<WriteRequest>,
+    Json(events): Json<Vec<EventItem>>,
 ) -> Result<Json<WriteResponse>, (StatusCode, String)> {
-    if request.events.is_empty() {
+    if events.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "No events provided".to_string()));
     }
 
-    let file_path = state.get_file_path(&file_id);
+    // TODO: Implement authentication logic using:
+    // - params.pi (project identifier)
+    // - params.public_key
+    // - params.nonce
+    // - params.sign
+    // - params.create_if_not_exist
+
+    let file_path = state.get_file_path(&params.pi);
+    let event_date = chrono::Utc::now().timestamp_millis();
     
     // Create an EventBatchItem from the events
     let event_batch = EventBatchItem {
         si: 0, // Will be assigned by the storage system
         cb: None,
-        sd: chrono::Utc::now().timestamp_millis() as u64,
-        events: request.events.clone(),
+        sd: event_date as u64,
+        events: events.clone(),
     };
 
-    match write_async(&state.workers, file_path, true, event_batch).await {
+    match write_async(&state.workers, file_path, params.create_if_not_exist, event_batch).await {
         Ok(si) => {
             // Update file paths registry
             let mut paths = state.file_paths.write().await;
-            paths.insert(file_id.clone(), state.get_file_path(&file_id));
+            paths.insert(params.pi.clone(), state.get_file_path(&params.pi));
             
             Ok(Json(WriteResponse {
-                si,
-                events_written: request.events.len(),
+                server_id: 12345, // TODO: Implement proper server ID logic
+                event_date,
             }))
         }
         Err(e) => Err((
@@ -100,15 +161,59 @@ async fn write_events(
     }
 }
 
+
+// POST /share - Create a share link
+async fn share(
+    Query(params): Query<ShareQuery>,
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> Result<Json<ShareResponse>, (StatusCode, String)> {
+    // TODO: Implement authentication logic using:
+    // - params.pi (project identifier)
+    // - params.public_key
+    // - params.nonce
+    // - params.sign
+    // - params.is_owner
+    
+    let share_key = nanoid::nanoid!();
+    
+    // Create EventItem with tp == 43 (share event type)
+    let share_event = EventItem {
+        tp: 43,
+        ed: chrono::Utc::now().timestamp_millis() as u64,
+        iv: None,
+        int_values: None,
+        uint_values: None,
+        f32_values: None,
+        f64_values: None,
+        bool_values: None,
+        string_values: None,
+        byte_arrays: None,
+    };
+
+    Ok(Json(ShareResponse {
+        share_key: share_key.clone(),
+        share_event,
+    }))
+}
+
 // GET /events/{file_id} - Read events from a file
 async fn read_events(
-    Path(file_id): Path<String>,
     Query(params): Query<ReadQuery>,
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> Result<Json<ReadResponse>, (StatusCode, String)> {
-    let file_path = state.get_file_path(&file_id);
-    let from_si = params.from_si.unwrap_or(0);
-    let max_bytes = params.max_bytes.unwrap_or(usize::MAX);
+    // TODO: Implement authentication logic using:
+    // - params.pi (project identifier)
+    // - params.public_key
+    // - params.nonce
+    // - params.sign
+    // - params.share_key (optional)
+    
+    // Use pi as the file_id
+    let file_path = state.get_file_path(&params.pi);
+    let from_si = params.from_time.max(0) as u64; // Convert fromTime to from_si
+    let max_bytes = usize::MAX; // Default max bytes
+    
+    // TODO: Handle params.create_if_not_exist logic
 
     match read_async(&state.workers, file_path, from_si, max_bytes).await {
         Ok(result) => {
@@ -116,8 +221,8 @@ async fn read_events(
             let all_events: Vec<EventItem> = result.event_batches.iter().flat_map(|batch| batch.events.iter().cloned()).collect();
 
             Ok(Json(ReadResponse {
-                total_events: all_events.len(),
                 events: all_events,
+                server_id: 12345, // TODO: Implement proper server ID logic
             }))
         }
         Err(e) => Err((
@@ -127,123 +232,23 @@ async fn read_events(
     }
 }
 
-// GET /files - List all available files
-async fn list_files(
-    axum::extract::State(state): axum::extract::State<AppState>,
-) -> Result<Json<Vec<String>>, (StatusCode, String)> {
-    let paths = state.file_paths.read().await;
-    let file_ids: Vec<String> = paths.keys().cloned().collect();
-    Ok(Json(file_ids))
-}
-
-// Health check endpoint
-async fn health_check() -> &'static str {
-    "OK"
-}
-
 pub fn create_router(state: AppState) -> Router {
+    let cors = CorsLayer::new()
+        .allow_origin([
+            "http://localhost:5174".parse::<HeaderValue>().unwrap(),
+            "https://colorsquare.org".parse::<HeaderValue>().unwrap(),
+        ])
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers(Any)
+        .max_age(Duration::from_secs(86400)); // 24 hours
+
+    let api = Router::new()
+        .route("/read", get(read_events))
+        .route("/write", post(write_events))
+        .route("/share", post(share));
+
     Router::new()
-        .route("/health", get(health_check))
-        .route("/events/{file_id}", post(write_events))
-        .route("/events/{file_id}", get(read_events))
-        .route("/files", get(list_files))
+        .nest("/api", api)
+        .layer(cors)
         .with_state(state)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::http::StatusCode;
-    use axum_test::TestServer;
-    use tempfile::TempDir;
-    use event_storage::event_item::EventItem;
-
-    fn create_test_event() -> EventItem {
-        let mut event = EventItem::new();
-        event.ed = 12345;
-        event.iv = Some("test_event".to_string());
-        event.tp = 100;
-        event.int_values = Some(vec![1, 2, 3, 4, 5]);
-        event.string_values = Some(vec![Some("test".to_string()), None, Some("data".to_string())]);
-        event
-    }
-
-    #[tokio::test]
-    async fn test_write_and_read_events() {
-        let temp_dir = TempDir::new().unwrap();
-        let app_state = AppState::new(temp_dir.path().to_string_lossy().to_string());
-        let app = create_router(app_state);
-        let server = TestServer::new(app).unwrap();
-
-        // Test write
-        let write_request = WriteRequest {
-            events: vec![create_test_event(), create_test_event()],
-        };
-
-        let response = server
-            .post("/events/test_file")
-            .json(&write_request)
-            .await;
-
-        assert_eq!(response.status_code(), StatusCode::OK);
-        
-        let write_response: WriteResponse = response.json();
-        assert_eq!(write_response.events_written, 2);
-        assert!(write_response.si > 0);
-
-        // Test read
-        let response = server
-            .get("/events/test_file")
-            .await;
-
-        assert_eq!(response.status_code(), StatusCode::OK);
-        
-        let read_response: ReadResponse = response.json();
-        assert_eq!(read_response.total_events, 2);
-        assert_eq!(read_response.events.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_list_files() {
-        let temp_dir = TempDir::new().unwrap();
-        let app_state = AppState::new(temp_dir.path().to_string_lossy().to_string());
-        let app = create_router(app_state);
-        let server = TestServer::new(app).unwrap();
-
-        // Write to a file first
-        let write_request = WriteRequest {
-            events: vec![create_test_event()],
-        };
-
-        let _response = server
-            .post("/events/test_file")
-            .json(&write_request)
-            .await;
-
-        // Test list files
-        let response = server.get("/files").await;
-        assert_eq!(response.status_code(), StatusCode::OK);
-        
-        let files: Vec<String> = response.json();
-        assert!(files.contains(&"test_file".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_empty_events_error() {
-        let temp_dir = TempDir::new().unwrap();
-        let app_state = AppState::new(temp_dir.path().to_string_lossy().to_string());
-        let app = create_router(app_state);
-        let server = TestServer::new(app).unwrap();
-
-        let write_request = WriteRequest {
-            events: vec![],
-        };
-
-        let response = server
-            .post("/events/test_file")
-            .json(&write_request)
-            .await;
-
-        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
-    }
 }

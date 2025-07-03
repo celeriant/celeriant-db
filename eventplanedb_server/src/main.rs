@@ -16,7 +16,7 @@ async fn main() {
     let app = create_router(app_state);
     
     // Get port from environment or use default
-    let port = env::var("PORT").unwrap_or_else(|_| "3000".to_string());
+    let port = env::var("PORT").unwrap_or_else(|_| "5198".to_string());
     let addr = format!("0.0.0.0:{}", port);
     
     println!("Starting EventPlaneDB server on {}", addr);

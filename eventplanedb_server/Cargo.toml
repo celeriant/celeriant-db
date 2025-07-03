@@ -24,6 +24,7 @@ axum.workspace = true
 serde.workspace = true
 chrono.workspace = true
 tikv-jemallocator = { workspace = true, optional = true }
+tower-http.workspace = true
 
 [dev-dependencies]
 rand.workspace = true
