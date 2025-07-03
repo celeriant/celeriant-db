@@ -1,7 +1,8 @@
 [workspace]
 # In alphabetical order
 members = [
-    "event_storage"
+    "event_storage",
+    "event_storage_threads",
 ]
 default-members = ["event_storage"]
 
@@ -26,3 +27,7 @@ zstd = "0.13.3"
 criterion = "0.6.0"
 postcard = { version = "1.1.2", features = ["alloc"] }
 tikv-jemallocator = { version = "0.5", features = ["unprefixed_malloc_on_supported_platforms"] }
+core_affinity = "0.8.3"
+crossbeam = "0.8.4"
+ahash = "0.8.12"
+tokio = { version = "1.46.0", features = ["sync", "rt", "macros"] }

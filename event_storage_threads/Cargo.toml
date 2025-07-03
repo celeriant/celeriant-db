@@ -1,0 +1,18 @@
+[package]
+name = "event_storage_threads"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+core_affinity.workspace = true
+crossbeam.workspace = true
+ahash.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
+nanoid.workspace = true
+tempfile.workspace = true
+criterion.workspace = true
