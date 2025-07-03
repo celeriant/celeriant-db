@@ -3,8 +3,9 @@
 members = [
     "event_storage",
     "event_storage_threads",
+    "eventplanedb_server"
 ]
-default-members = ["event_storage"]
+default-members = ["eventplanedb_server"]
 
 resolver = "2"
 
@@ -31,3 +32,4 @@ core_affinity = "0.8.3"
 crossbeam = "0.8.4"
 ahash = "0.8.12"
 tokio = { version = "1.46.0", features = ["full"] }
+futures = "0.3.31"
