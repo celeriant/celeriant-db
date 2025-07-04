@@ -122,7 +122,7 @@ mod tests {
     fn test_validate_signature_valid() {
         // Generate a new RSA key pair for testing
         let mut rng = rand::thread_rng();
-        let bits = 2048;
+        let bits = 1024;
         let private_key = RsaPrivateKey::new(&mut rng, bits).expect("Failed to generate private key");
         let public_key = private_key.to_public_key();
 
@@ -144,7 +144,7 @@ mod tests {
     fn test_validate_signature_invalid() {
         // Generate a new RSA key pair for testing
         let mut rng = rand::thread_rng();
-        let bits = 2048;
+        let bits = 1024;
         let private_key = RsaPrivateKey::new(&mut rng, bits).expect("Failed to generate private key");
         let public_key = private_key.to_public_key();
 

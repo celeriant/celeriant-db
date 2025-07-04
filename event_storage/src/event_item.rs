@@ -4,15 +4,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct EventItem {
     pub ed: u64,
-    pub iv: Option<String>,
     pub tp: u64,
-
+    
     pub int_values: Option<Vec<i64>>,
     pub uint_values: Option<Vec<u64>>,
     pub f32_values: Option<Vec<f32>>,
     pub f64_values: Option<Vec<f64>>,
     pub bool_values: Option<Vec<bool>>,
     pub string_values: Option<Vec<Option<String>>>,
+    pub iv_arrays: Option<Vec<Option<Vec<u8>>>>,
     pub byte_arrays: Option<Vec<Option<Vec<u8>>>>,
 }
 
@@ -20,7 +20,6 @@ impl EventItem {
     pub fn new() -> Self {
         EventItem {
             ed: 0,
-            iv: None,
             tp: 0,
             int_values: None,
             uint_values: None,
@@ -28,6 +27,7 @@ impl EventItem {
             f64_values: None,
             bool_values: None,
             string_values: None,
+            iv_arrays: None,
             byte_arrays: None,
         }
     }

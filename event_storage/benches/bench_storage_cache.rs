@@ -14,7 +14,6 @@ fn random_event_item(array_size: i32) -> EventItem {
     let mut rng = rand::thread_rng();
 
     dummy_storage.ed = rng.r#gen::<u64>();
-    dummy_storage.iv = Some("kjldsfsdfasdfasdfasfawserfwfdsafdasdfas".to_string());
     dummy_storage.tp = rng.r#gen::<u16>() as u64;
 
     dummy_storage.int_values = Some((0..array_size).map(|_| rng.r#gen::<i64>()).collect());

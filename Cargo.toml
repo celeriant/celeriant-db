@@ -6,7 +6,6 @@ members = [
     "eventplanedb_server",
     "eventplanedb_access",
 ]
-default-members = ["eventplanedb_server"]
 
 resolver = "2"
 
