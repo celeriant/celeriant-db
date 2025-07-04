@@ -25,7 +25,7 @@ pub fn create_thread_pool(required_thread_count: usize) -> Vec<Sender<Job>> {
 
             let mut event_storage_cache = EventStorageCache::new(30, 1000000, 10000);
             let mut share_links_cache = ShareLinksCache::new();
-            let mut user_access_cache = UserAccessCache::new(1, 10000);
+            let mut user_access_cache = UserAccessCache::new(10000);
 
             for job in rx.iter() {
                 match job {

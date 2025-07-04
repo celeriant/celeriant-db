@@ -4,14 +4,12 @@ use crate::access_level::AccessLevel;
 
 pub struct ProjectToUserAccessLevel {
     users: HashMap<String, AccessLevel>,
-    is_active_cache: bool,
 }
 
 impl ProjectToUserAccessLevel {
     pub fn new() -> Self {
         Self {
-            users: HashMap::new(),
-            is_active_cache: false,
+            users: HashMap::new()
         }
     }
 
@@ -62,7 +60,6 @@ mod tests {
     fn test_new_creates_empty_cache() {
         let cache = ProjectToUserAccessLevel::new();
         assert_eq!(cache.count(), 0);
-        assert!(!cache.is_active_cache);
     }
 
     #[test]
