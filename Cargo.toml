@@ -3,7 +3,8 @@
 members = [
     "event_storage",
     "event_storage_threads",
-    "eventplanedb_server"
+    "eventplanedb_server",
+    "eventplanedb_access",
 ]
 default-members = ["eventplanedb_server"]
 
@@ -17,11 +18,11 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 bincode = "2.0.1"
-serde = "1.0.219"
+serde = { version = "1.0.219", features = ["derive", "rc"] }
 simd-json = "0.15.1"
 stl_io = "0.8.5"
 image = "0.25.6"
-rand = "0.9.1"
+rand = "0.8.0"
 nanoid = "0.4.0"
 tempfile = "3.20.0"
 zstd = "0.13.3"
@@ -36,3 +37,7 @@ futures = "0.3.31"
 axum = "0.8.4"
 chrono = "0.4.41"
 tower-http = { version = "0.6.6", features = ["cors"] }
+rsa = { version = "0.9.8", features = ["sha2"] }
+sha2 = "0.10.9"
+base64 = "0.22.1"
+thiserror = "2.0.12"

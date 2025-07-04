@@ -6,6 +6,7 @@ use event_storage::event_item::EventItem;
 use event_storage::event_storage::{append_event_batch, read_from_si};
 use event_storage::file_cache::{create_append_writer, create_reader};
 use tempfile::TempDir;
+use rand::prelude::*;
 
 fn create_event_batch_item(
     si: u64,
@@ -23,29 +24,28 @@ fn create_event_batch_item(
 
 // Include the random_event_item function from the other benchmark file
 fn random_event_item(array_size: i32) -> EventItem {
-    use rand::Rng;
 
     // Create dummy storage data with configurable array sizes
     let mut dummy_storage = EventItem::new();
-    let mut rng = rand::rng();
+    let mut rng = rand::thread_rng();
 
-    dummy_storage.ed = rng.random::<u64>();
+    dummy_storage.ed = rng.r#gen::<u64>();
     dummy_storage.iv = Some("kjldsfsdfasdfasdfasfawserfwfdsafdasdfas".to_string());
-    dummy_storage.tp = rng.random::<u16>() as u64;
+    dummy_storage.tp = rng.r#gen::<u16>() as u64;
 
-    dummy_storage.int_values = Some((0..array_size).map(|_| rng.random::<i64>()).collect());
+    dummy_storage.int_values = Some((0..array_size).map(|_| rng.r#gen::<i64>()).collect());
 
-    dummy_storage.f32_values = Some((0..array_size).map(|_| rng.random::<f32>()).collect());
+    dummy_storage.f32_values = Some((0..array_size).map(|_| rng.r#gen::<f32>()).collect());
 
-    dummy_storage.f64_values = Some((0..array_size).map(|_| rng.random::<f64>()).collect());
+    dummy_storage.f64_values = Some((0..array_size).map(|_| rng.r#gen::<f64>()).collect());
 
     dummy_storage.bool_values = Some(
         (0..array_size)
-            .map(|_| rng.random::<bool>())
+            .map(|_| rng.r#gen::<bool>())
             .collect(),
     );
 
-    dummy_storage.uint_values = Some((0..array_size).map(|_| rng.random::<u64>()).collect());
+    dummy_storage.uint_values = Some((0..array_size).map(|_| rng.r#gen::<u64>()).collect());
     
     // Generate random strings using nanoid
     dummy_storage.string_values = Some((0..array_size).map(|_| Some(nanoid::nanoid!())).collect());
@@ -66,8 +66,8 @@ fn random_event_item(array_size: i32) -> EventItem {
     dummy_storage.byte_arrays = Some(
         (0..array_size)
             .map(|_| {
-                let size = rng.random_range(1..=320);
-                Some((0..size).map(|_| rng.random::<u8>()).collect())
+                let size = rng.gen_range(1..=320);
+                Some((0..size).map(|_| rng.r#gen::<u8>()).collect())
             })
             .collect(),
     );

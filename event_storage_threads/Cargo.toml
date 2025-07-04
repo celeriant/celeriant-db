@@ -13,6 +13,7 @@ tokio.workspace = true
 nanoid.workspace = true
 tempfile.workspace = true
 event_storage = { path = "../event_storage" }
+eventplanedb_access = { path = "../eventplanedb_access" }
 rand.workspace = true
 futures.workspace = true
 

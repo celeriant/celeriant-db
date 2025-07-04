@@ -1,13 +1,9 @@
 [package]
-name = "eventplanedb_server"
+name = "eventplanedb_access"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
-
-[[bin]]
-name = "eventplanedb_server"
-path = "src/main.rs"
 
 [dependencies]
 core_affinity.workspace = true
@@ -17,15 +13,11 @@ tokio.workspace = true
 nanoid.workspace = true
 tempfile.workspace = true
 event_storage = { path = "../event_storage" }
-eventplanedb_access = { path = "../eventplanedb_access" }
-event_storage_threads = { path = "../event_storage_threads" }
 rand.workspace = true
 futures.workspace = true
-axum.workspace = true
 serde.workspace = true
 chrono.workspace = true
 tikv-jemallocator = { workspace = true, optional = true }
-tower-http.workspace = true
 rsa.workspace = true
 sha2.workspace = true
 base64.workspace = true
@@ -36,5 +28,4 @@ rand.workspace = true
 nanoid.workspace = true
 tempfile.workspace = true
 criterion.workspace = true
-axum-test = "17.3.0"
 
