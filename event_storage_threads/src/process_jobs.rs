@@ -1,9 +1,10 @@
 use crate::job::Job;
-use crate::job_error::JobError;
 use core_affinity;
 use crossbeam::channel::{Receiver, Sender, unbounded};
 use event_storage::catchup_result::CatchupResult;
+use event_storage::event_item::EventItem;
 use event_storage::event_storage_cache::EventStorageCache;
+use eventplanedb_access::job_error::JobError;
 use eventplanedb_access::share_links_cache::ShareLinksCache;
 use eventplanedb_access::user_access_cache::UserAccessCache;
 
@@ -23,11 +24,35 @@ pub fn create_thread_pool(required_thread_count: usize) -> Vec<Sender<Job>> {
             core_affinity::set_for_current(core_id);
 
             let mut event_storage_cache = EventStorageCache::new(30, 1000000, 10000);
-            let mut share_links_cache = ShareLinksCache::new(&mut event_storage_cache);
-            let mut user_access_cache = UserAccessCache::new(&mut event_storage_cache);
+            let mut share_links_cache = ShareLinksCache::new();
+            let mut user_access_cache = UserAccessCache::new();
 
             for job in rx.iter() {
                 match job {
+
+                    Job::Share {
+                        file_path,
+                        share_hash,
+                        access_level,
+                        is_single_use,
+                        iv,
+                        description,
+                        expires_on,
+                        responder,
+                    } => {
+                        let result: Result<EventItem, JobError> = share_links_cache.create_share_link(
+                            &mut event_storage_cache,
+                            file_path,
+                            share_hash,
+                            access_level,
+                            is_single_use,
+                            iv,
+                            description,
+                            expires_on,
+                        );
+                        let _ = responder.send(result);
+                    }
+
                     Job::Write {
                         file_path,
                         allow_create,

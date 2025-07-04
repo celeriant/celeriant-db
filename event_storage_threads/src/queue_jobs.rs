@@ -1,8 +1,27 @@
 use crossbeam::channel::Sender;
-use event_storage::{catchup_result::CatchupResult, event_batch_item::EventBatchItem};
+use event_storage::{catchup_result::CatchupResult, event_batch_item::EventBatchItem, event_item::EventItem};
+use eventplanedb_access::{job_error::JobError, share_links_cache::AccessLevel};
 use tokio::sync::oneshot;
 
-use crate::{job::Job, job_error::JobError, thread_assigner::hash_string_to_index};
+use crate::{job::Job, thread_assigner::hash_string_to_index};
+
+async fn send_job<T>(
+    workers: &[Sender<Job>],
+    file_path: String,
+    job_creator: impl FnOnce(oneshot::Sender<T>) -> Job,
+) -> Result<T, JobError> {
+    let index = hash_string_to_index(&file_path, workers.len());
+    let (tx, rx) = oneshot::channel();
+
+    let job = job_creator(tx);
+
+    workers[index]
+        .send(job)
+        .map_err(|_| JobError::Other("Worker thread channel closed".to_string()))?;
+
+    rx.await
+        .map_err(|_| JobError::Other("Worker thread dropped responder".to_string()))
+}
 
 pub async fn write_async(
     workers: &[Sender<Job>],
@@ -11,23 +30,45 @@ pub async fn write_async(
     share_key: Option<String>,
     event_batch_item: EventBatchItem,
 ) -> Result<u64, JobError> {
-    let index = hash_string_to_index(&file_path, workers.len());
-    let (tx, rx) = oneshot::channel();
+    send_job(
+        workers,
+        file_path.clone(),
+        |responder| Job::Write {
+            file_path,
+            allow_create,
+            share_key,
+            event_batch_item,
+            responder,
+        },
+    )
+    .await?
+}
 
-    let job = Job::Write {
-        file_path,
-        allow_create,
-        share_key,
-        event_batch_item,
-        responder: tx,
-    };
-
-    workers[index]
-        .send(job)
-        .map_err(|_| JobError::Other("Worker thread channel closed".to_string()))?;
-
-    rx.await
-        .map_err(|_| JobError::Other("Worker thread dropped responder".to_string()))?
+pub async fn share_async(
+    workers: &[Sender<Job>],
+    file_path: String,
+    share_hash: String,
+    access_level: AccessLevel,
+    is_single_use: bool,
+    iv: Option<String>,
+    description: Option<String>,
+    expires_on: Option<i64>,
+) -> Result<EventItem, JobError> {
+    send_job(
+        workers,
+        file_path.clone(),
+        |responder| Job::Share {
+            file_path,
+            share_hash,
+            access_level,
+            is_single_use,
+            iv,
+            description,
+            expires_on,
+            responder,
+        },
+    )
+    .await?
 }
 
 pub async fn read_async(
@@ -38,24 +79,19 @@ pub async fn read_async(
     from_si: u64,
     max_bytes: usize,
 ) -> Result<CatchupResult, JobError> {
-    let index = hash_string_to_index(&file_path, workers.len());
-    let (tx, rx) = oneshot::channel();
-
-    let job = Job::Read {
-        file_path,
-        from_si,
-        cb,
-        share_key,
-        max_bytes,
-        responder: tx,
-    };
-
-    workers[index]
-        .send(job)
-        .map_err(|_| JobError::Other("Worker thread channel closed".to_string()))?;
-
-    rx.await
-        .map_err(|_| JobError::Other("Worker thread dropped responder".to_string()))?
+    send_job(
+        workers,
+        file_path.clone(),
+        |responder| Job::Read {
+            file_path,
+            from_si,
+            cb,
+            share_key,
+            max_bytes,
+            responder,
+        },
+    )
+    .await?
 }
 
 pub async fn shutdown_workers(workers: Vec<Sender<Job>>) -> Result<(), Box<dyn std::error::Error>> {

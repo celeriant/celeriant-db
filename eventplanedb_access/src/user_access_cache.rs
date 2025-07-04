@@ -1,14 +1,12 @@
 use event_storage::event_storage_cache::EventStorageCache;
 
-pub struct UserAccessCache<'a> {
-    event_storage_cache: &'a mut EventStorageCache,
+pub struct UserAccessCache {
 }
 
-impl<'a> UserAccessCache<'a> {
+impl UserAccessCache {
 
-    pub fn new(event_storage_cache: &'a mut EventStorageCache) -> Self {
+    pub fn new() -> Self {
         Self {
-            event_storage_cache,
         }
     }
     

@@ -1,8 +1,9 @@
 use axum::{extract::Query, http::StatusCode, Json};
 use event_storage::{event_item::EventItem};
-use eventplanedb_access::share_links_cache::AccessLevel;
+use event_storage_threads::{queue_jobs::share_async};
+use eventplanedb_access::{job_error::JobError, share_links_cache::AccessLevel};
 use serde::{Deserialize, Serialize};
-use crate::{app_state::AppState};
+use crate::{app_state::AppState, crypto::Crypto};
 
 #[derive(Debug, Deserialize)]
 pub struct ShareQuery {
@@ -27,31 +28,32 @@ pub async fn share(
     Query(params): Query<ShareQuery>,
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> Result<Json<ShareResponse>, (StatusCode, String)> {
-    // TODO: Implement authentication logic using:
-    // - params.pi (project identifier)
-    // - params.public_key
-    // - params.nonce
-    // - params.sign
-    // - params.is_owner
-    
-    let share_key = nanoid::nanoid!();
-    
-    // Create EventItem with tp == 43 (share event type)
-    let share_event = EventItem {
-        tp: 43,
-        ed: chrono::Utc::now().timestamp_millis() as u64,
-        iv: None,
-        int_values: None,
-        uint_values: None,
-        f32_values: None,
-        f64_values: None,
-        bool_values: None,
-        string_values: None,
-        byte_arrays: None,
+
+    let cb = match Crypto::validate_with_public_key(&params.public_key, &params.nonce, &params.sign) {
+        Ok(cb) => cb, 
+        Err(e) => return Err((StatusCode::UNAUTHORIZED, e.to_string())),
     };
 
-    Ok(Json(ShareResponse {
-        share_key: share_key.clone(),
-        share_event,
-    }))
+    let file_path = state.get_file_path(&params.pi);
+    let share_key = nanoid::nanoid!();
+    let share_hash = Crypto::generate_short_client_identity(share_key.as_bytes());
+
+    match share_async(&state.workers, file_path, share_hash, params.access_level, params.is_single_use, params.iv, params.description, params.expires_on).await {
+        Ok(share_event) => {
+            Ok(Json(ShareResponse {
+                share_key,
+                share_event,
+            }))
+        }
+        Err(e) => {
+            let (status, message) = match e {
+                JobError::PermissionDenied(msg) => (StatusCode::FORBIDDEN, msg),
+                JobError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
+                JobError::Other(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+            };
+            Err((status, format!("Failed to write events: {}", message)))
+        }
+    }
+
+    
 }

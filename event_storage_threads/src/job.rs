@@ -1,8 +1,18 @@
-use crate::job_error::JobError;
-use event_storage::{catchup_result::CatchupResult, event_batch_item::EventBatchItem};
+use event_storage::{catchup_result::CatchupResult, event_batch_item::EventBatchItem, event_item::EventItem};
+use eventplanedb_access::{job_error::JobError, share_links_cache::AccessLevel};
 use tokio::sync::oneshot;
 
 pub enum Job {
+    Share {
+        file_path: String,
+        share_hash: String,
+        access_level: AccessLevel,
+        is_single_use: bool,
+        iv: Option<String>,
+        description: Option<String>,
+        expires_on: Option<i64>,
+        responder: oneshot::Sender<Result<EventItem, JobError>>,
+    },
     Write {
         file_path: String,
         allow_create: bool,

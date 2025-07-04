@@ -1,6 +1,7 @@
 use axum::{extract::Query, http::StatusCode, Json};
 use event_storage::{event_batch_item::EventBatchItem, event_item::EventItem};
-use event_storage_threads::{job_error::JobError, queue_jobs::write_async};
+use event_storage_threads::{queue_jobs::write_async};
+use eventplanedb_access::job_error::JobError;
 use serde::{Deserialize, Serialize};
 use crate::{app_state::AppState, crypto::Crypto};
 

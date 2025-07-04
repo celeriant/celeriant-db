@@ -1,4 +1,3 @@
-pub mod job_error;
 pub mod process_jobs;
 pub mod thread_assigner;
 pub mod queue_jobs;

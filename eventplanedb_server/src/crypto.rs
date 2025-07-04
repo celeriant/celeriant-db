@@ -16,7 +16,7 @@ pub enum CryptoError {
 pub struct Crypto;
 
 impl Crypto {
-    fn generate_short_client_identity(public_key: &[u8]) -> String {
+    pub fn generate_short_client_identity(public_key: &[u8]) -> String {
         let mut hasher = Sha256::new();
         hasher.update(public_key);
         let hash = hasher.finalize();
