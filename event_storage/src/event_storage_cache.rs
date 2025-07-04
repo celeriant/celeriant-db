@@ -197,7 +197,7 @@ impl EventStorageCache {
         Ok(si)
     }
 
-    pub fn read(&mut self, file_path: &str, from_si: u64, max_bytes: usize) -> io::Result<CatchupResult> {
+    pub fn read(&mut self, file_path: &str, from_si: u64, max_bytes: usize, tp: Option<u64>) -> io::Result<CatchupResult> {
         let mut event_batches = Vec::new();
         let mut current_si = from_si;
         let mut number_bytes: usize = 0;
@@ -310,7 +310,7 @@ mod tests {
 
         // Verify file exists and has content
         assert!(std::path::Path::new(file_path).exists());
-        let events = storage.read(file_path, 0, 1000).unwrap();
+        let events = storage.read(file_path, 0, 1000, None).unwrap();
         assert_eq!(events.flatten_events().len(), 2);
 
         // Delete the file
@@ -321,7 +321,7 @@ mod tests {
         assert!(!std::path::Path::new(file_path).exists());
 
         // Verify reading returns empty result
-        let result_read = storage.read(file_path, 0, 1000);
+        let result_read = storage.read(file_path, 0, 1000, None);
         assert!(result_read.is_err());
         assert_eq!(result_read.unwrap_err().kind(), io::ErrorKind::NotFound);
 
@@ -366,7 +366,7 @@ mod tests {
         let last_si = storage.write(&events_bin.to_str().unwrap(), true, event_batch_item_3).unwrap();
         assert_eq!(last_si, 2);
 
-        let events_from_1 = storage.read(&events_bin.to_str().unwrap(), 1, 40000).unwrap();
+        let events_from_1 = storage.read(&events_bin.to_str().unwrap(), 1, 40000, None).unwrap();
 
         assert_eq!(events_from_1.flatten_events().len(), 3);
         assert_eq!(events_from_1.next_si, None);
@@ -382,7 +382,7 @@ mod tests {
     #[test]
     fn test_read_file_not_exists() {
         let mut storage = EventStorageCache::new(30, 1000000, 10000);
-        let events_from_3 = storage.read("unknownfile.bin", 0, 40000);
+        let events_from_3 = storage.read("unknownfile.bin", 0, 40000, None);
         assert!(events_from_3.is_err());
         assert_eq!(events_from_3.unwrap_err().kind(), io::ErrorKind::NotFound);
     }
@@ -411,8 +411,8 @@ mod tests {
         let last_si_2 = storage.write(&events_bin_2.to_str().unwrap(), true, event_batch_item_2).unwrap();
         assert_eq!(last_si_2, 0);
 
-        let file1 = storage.read(&events_bin.to_str().unwrap(), 0, 100).unwrap();
-        let file2 = storage.read(&events_bin_2.to_str().unwrap(), 0, 100).unwrap();
+        let file1 = storage.read(&events_bin.to_str().unwrap(), 0, 100, None).unwrap();
+        let file2 = storage.read(&events_bin_2.to_str().unwrap(), 0, 100, None).unwrap();
 
         assert_eq!(file1.flatten_events().len(), 3);
         assert_eq!(file2.flatten_events().len(), 2);
@@ -448,7 +448,7 @@ mod tests {
 
         storage.memory_cache.invalidate_file(events_bin.to_str().unwrap());
 
-        let events_from_0 = storage.read(&events_bin.to_str().unwrap(), 0, 100).unwrap();
+        let events_from_0 = storage.read(&events_bin.to_str().unwrap(), 0, 100, None).unwrap();
         assert_eq!(events_from_0.flatten_events().len(), 3);
         
     }
@@ -493,7 +493,7 @@ mod tests {
 
 
         // Same assertions as above round trip test, no duplicate write
-        let events_from_3 = storage.read(&events_bin.to_str().unwrap(), 1, 40000).unwrap();
+        let events_from_3 = storage.read(&events_bin.to_str().unwrap(), 1, 40000, None).unwrap();
 
         assert_eq!(events_from_3.flatten_events().len(), 3);
         assert_eq!(events_from_3.next_si, None);
@@ -525,16 +525,16 @@ mod tests {
         storage.write(&events_bin.to_str().unwrap(), true, event_batch_item_2.clone()).unwrap();
 
         // Read events from memory cache
-        let cached_events = storage.read(&events_bin.to_str().unwrap(), 0, 1000000).unwrap();
+        let cached_events = storage.read(&events_bin.to_str().unwrap(), 0, 1000000, None).unwrap();
         assert_eq!(cached_events.flatten_events().len(), 3);
 
         // Test max_bytes limit
-        let partial_events = storage.read(&events_bin.to_str().unwrap(), 0, 1).unwrap();
+        let partial_events = storage.read(&events_bin.to_str().unwrap(), 0, 1, None).unwrap();
         assert_eq!(partial_events.next_si, Some(1)); // Should continue from SI 1 after reaching the limit
         assert_eq!(partial_events.flatten_events().len(), 2);
 
         //Test in-mem from si 1
-        let partial_events = storage.read(&events_bin.to_str().unwrap(), 1, 1).unwrap();
+        let partial_events = storage.read(&events_bin.to_str().unwrap(), 1, 1, None).unwrap();
         assert_eq!(partial_events.next_si, None); // Should continue from SI 1 after reaching the limit
         assert_eq!(partial_events.flatten_events().len(), 1);
     }
@@ -600,7 +600,7 @@ mod tests {
         storage.last_si_cache.remove(file_path);
 
         // Test 2: read should recover and return only valid batches
-        let events = storage.read(file_path, 0, 1000000).unwrap();
+        let events = storage.read(file_path, 0, 1000000, None).unwrap();
         assert_eq!(events.flatten_events().len(), 3); // Only first two batches
         assert_eq!(events.event_batches.len(), 2);
         assert_eq!(events.event_batches[0].si, 0);
@@ -627,7 +627,7 @@ mod tests {
 
         // Verify we can read all three batches (original 2 + new 1)
         storage.memory_cache.invalidate_file(file_path); // Clear cache to read from disk
-        let final_events = storage.read(file_path, 0, 1000000).unwrap();
+        let final_events = storage.read(file_path, 0, 1000000, None).unwrap();
         assert_eq!(final_events.flatten_events().len(), 4); // 2 + 1 + 1 events
         assert_eq!(final_events.event_batches.len(), 3);
         assert_eq!(final_events.event_batches[0].si, 0);

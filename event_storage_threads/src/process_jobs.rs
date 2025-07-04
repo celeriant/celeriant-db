@@ -25,13 +25,14 @@ pub fn create_thread_pool(required_thread_count: usize) -> Vec<Sender<Job>> {
 
             let mut event_storage_cache = EventStorageCache::new(30, 1000000, 10000);
             let mut share_links_cache = ShareLinksCache::new();
-            let mut user_access_cache = UserAccessCache::new();
+            let mut user_access_cache = UserAccessCache::new(1, 10000);
 
             for job in rx.iter() {
                 match job {
 
                     Job::Share {
                         file_path,
+                        cb,
                         share_hash,
                         access_level,
                         is_single_use,
@@ -43,6 +44,7 @@ pub fn create_thread_pool(required_thread_count: usize) -> Vec<Sender<Job>> {
                         let result: Result<EventItem, JobError> = share_links_cache.create_share_link(
                             &mut event_storage_cache,
                             file_path,
+                            cb,
                             share_hash,
                             access_level,
                             is_single_use,
@@ -79,7 +81,7 @@ pub fn create_thread_pool(required_thread_count: usize) -> Vec<Sender<Job>> {
                         //TODO: Check user has read access or provide access using share link
 
                         let result: Result<CatchupResult, JobError> = event_storage_cache
-                            .read(&file_path, from_si, max_bytes)
+                            .read(&file_path, from_si, max_bytes, None)
                             .map_err(Into::into);
                         let _ = responder.send(result);
                     }

@@ -1,10 +1,11 @@
 use event_storage::{catchup_result::CatchupResult, event_batch_item::EventBatchItem, event_item::EventItem};
-use eventplanedb_access::{job_error::JobError, share_links_cache::AccessLevel};
+use eventplanedb_access::{access_level::AccessLevel, job_error::JobError};
 use tokio::sync::oneshot;
 
 pub enum Job {
     Share {
         file_path: String,
+        cb: String,
         share_hash: String,
         access_level: AccessLevel,
         is_single_use: bool,

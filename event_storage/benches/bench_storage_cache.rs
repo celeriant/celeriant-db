@@ -109,7 +109,7 @@ fn benchmark_storage_cache_ops(c: &mut Criterion) {
                     storage.write(file_path, true, event_batch_item).expect("Write events");
 
                     // Read events
-                    storage.read(file_path, 0, usize::MAX).expect("Read events");
+                    storage.read(file_path, 0, usize::MAX, None).expect("Read events");
 
                     // Delete file
                     storage.delete(file_path).expect("Delete file");
@@ -139,7 +139,7 @@ fn benchmark_storage_cache_ops(c: &mut Criterion) {
                     storage.write(file_path, true, event_batch_item).expect("Write events");
 
                     // Read events immediately after writing
-                    storage.read(file_path, 0, usize::MAX).expect("Read events");
+                    storage.read(file_path, 0, usize::MAX, None).expect("Read events");
                 });
             },
         );

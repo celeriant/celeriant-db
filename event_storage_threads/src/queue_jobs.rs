@@ -1,6 +1,6 @@
 use crossbeam::channel::Sender;
 use event_storage::{catchup_result::CatchupResult, event_batch_item::EventBatchItem, event_item::EventItem};
-use eventplanedb_access::{job_error::JobError, share_links_cache::AccessLevel};
+use eventplanedb_access::{access_level::AccessLevel, job_error::JobError};
 use tokio::sync::oneshot;
 
 use crate::{job::Job, thread_assigner::hash_string_to_index};
@@ -47,6 +47,7 @@ pub async fn write_async(
 pub async fn share_async(
     workers: &[Sender<Job>],
     file_path: String,
+    cb: String,
     share_hash: String,
     access_level: AccessLevel,
     is_single_use: bool,
@@ -59,6 +60,7 @@ pub async fn share_async(
         file_path.clone(),
         |responder| Job::Share {
             file_path,
+            cb,
             share_hash,
             access_level,
             is_single_use,
