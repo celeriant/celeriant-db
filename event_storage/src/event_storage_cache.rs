@@ -197,7 +197,7 @@ impl EventStorageCache {
         Ok(si)
     }
 
-    pub fn read(&mut self, file_path: &str, from_si: u64, max_bytes: usize, tp: Option<u64>) -> io::Result<CatchupResult> {
+    pub fn read(&mut self, file_path: &str, from_si: u64, max_bytes: usize, tp_filter: Option<u64>) -> io::Result<CatchupResult> {
         let mut event_batches = Vec::new();
         let mut current_si = from_si;
         let mut number_bytes: usize = 0;
@@ -207,7 +207,16 @@ impl EventStorageCache {
         loop {
             if let Some((cached_event_batch_item, compressed_batch_size)) = self.memory_cache.get(file_path, current_si) {
                 current_si = cached_event_batch_item.si + 1;
+
+                //Skip batch if tp_filter is set and does not match tp on the batch
+                if let Some(tp) = tp_filter {
+                    if cached_event_batch_item.events.len() != 1 || cached_event_batch_item.events[0].tp != tp {
+                        continue;
+                    }
+                }
+
                 event_batches.push(cached_event_batch_item);
+
                 number_bytes += compressed_batch_size;
                 more_batches_to_go = number_bytes >= max_bytes;
                 if more_batches_to_go {
@@ -236,13 +245,13 @@ impl EventStorageCache {
             Ok(reader_mut) => {
                 let mut reader = reader_mut.borrow_mut();
 
-                match read_from_si(&mut reader, from_si, max_bytes) {
+                match read_from_si(&mut reader, from_si, max_bytes, tp_filter) {
                     Ok(catchup_result) => return Ok(catchup_result),
                     Err(_) => {
                         //File is corrupted, try to recover it
                         self.recover_file_using_magic_number(file_path, &mut reader)?;
                         
-                        match read_from_si(&mut reader, from_si, max_bytes) {
+                        match read_from_si(&mut reader, from_si, max_bytes, tp_filter) {
                             Ok(catchup_result) => return Ok(catchup_result),
                             Err(_) => {
                                 return Err(io::Error::new(io::ErrorKind::Other, "File is corrupted and cannot be recovered"));
@@ -634,5 +643,103 @@ mod tests {
         assert_eq!(final_events.event_batches[1].si, 1);
         assert_eq!(final_events.event_batches[2].si, 2);
         assert_eq!(final_events.event_batches[2].sd, 999); // New batch
+    }
+
+    #[test]
+    fn test_read_with_tp() {
+        let mut storage = EventStorageCache::new(30, 1000000, 10000);
+
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let temp_path = temp_dir.path();
+        let events_bin = temp_path.join("events.bin");
+        let file_path = events_bin.to_str().unwrap();
+
+        // Create events with specific TPs
+        let mut event1 = create_test_event_item();
+        let mut event2 = create_minimal_event_item();
+        let mut event3 = create_test_event_item();
+        let mut event4 = create_minimal_event_item();
+
+        event1.tp = 100;
+        event2.tp = 200;
+        event3.tp = 100;
+        event4.tp = 300;
+
+        let events_batch_1 = vec![event1.clone(), event2.clone()]; // Mixed TP
+        let events_batch_2 = vec![event3.clone()]; // Single TP = 100
+        let events_batch_3 = vec![event4.clone()]; // Single TP = 300
+
+        let event_batch_item_1 = create_event_batch_item(0, None, 0, events_batch_1);
+        let event_batch_item_2 = create_event_batch_item(0, None, 0, events_batch_2);
+        let event_batch_item_3 = create_event_batch_item(0, None, 0, events_batch_3);
+
+        storage.write(file_path, true, event_batch_item_1).unwrap();
+        storage.write(file_path, true, event_batch_item_2).unwrap();
+        storage.write(file_path, true, event_batch_item_3).unwrap();
+
+        // Read with TP = 100, should only return batch 2
+        let result = storage.read(file_path, 0, 1000, Some(100)).unwrap();
+        assert_eq!(result.event_batches.len(), 1);
+        assert_eq!(result.flatten_events().len(), 1);
+        assert_eq!(result.event_batches[0].si, 1);
+        assert_eq!(result.flatten_events()[0].tp, 100);
+        assert_eq!(result.next_si, Some(2));
+
+        // Read with TP = 300, should only return batch 3
+        let result = storage.read(file_path, 0, 1000, Some(300)).unwrap();
+        assert_eq!(result.event_batches.len(), 1);
+        assert_eq!(result.flatten_events().len(), 1);
+        assert_eq!(result.event_batches[0].si, 2);
+        assert_eq!(result.flatten_events()[0].tp, 300);
+        assert_eq!(result.next_si, None);
+
+        // Read with TP = 200, should return nothing
+        let result = storage.read(file_path, 0, 1000, Some(200)).unwrap();
+        assert_eq!(result.event_batches.len(), 0);
+        assert_eq!(result.flatten_events().len(), 0);
+        assert_eq!(result.next_si, None);
+    }
+
+    #[test]
+    fn test_read_with_tp_and_max_bytes() {
+        for i in [0, 30] {
+            let mut storage = EventStorageCache::new(i, 1000000, 10000);
+
+            let temp_dir = TempDir::new().expect("Failed to create temp directory");
+            let temp_path = temp_dir.path();
+            let events_bin = temp_path.join("events.bin");
+            let file_path = events_bin.to_str().unwrap();
+
+            // Create events with specific TPs and sizes
+            let mut event1 = create_test_event_item();
+            let mut event2 = create_minimal_event_item();
+            let mut event3 = create_test_event_item();
+
+            event1.tp = 100;
+            event2.tp = 100;
+            event3.tp = 100;
+
+            //events_batch_1 will be returned since it has a single event and the tp is 100
+            let events_batch_1 = vec![event1.clone()]; // Single TP = 100
+            //events_batch_2 will NOT be returned since it has 2 events and the tp is 100
+            let events_batch_2 = vec![event2.clone(), event3.clone()]; // Multiple events, all TP = 100
+
+            let event_batch_item_1 = create_event_batch_item(0, None, 0, events_batch_1);
+            let event_batch_item_2 = create_event_batch_item(0, None, 0, events_batch_2);
+
+            // Write the batches
+            storage.write(file_path, true, event_batch_item_1).unwrap();
+            storage.write(file_path, true, event_batch_item_2).unwrap();
+
+            // Attempt to read with max_bytes such that only the first batch fits
+            let result = storage.read(file_path, 0, 50, Some(100)).unwrap();
+
+            // Verify that only the first batch is returned
+            assert_eq!(result.event_batches.len(), 1);
+            assert_eq!(result.flatten_events().len(), 1);
+            assert_eq!(result.event_batches[0].si, 0);
+            assert_eq!(result.flatten_events()[0].tp, 100);
+            assert_eq!(result.next_si, Some(1));
+        }
     }
 }

@@ -139,13 +139,13 @@ fn benchmark_event_storage_ops(c: &mut Criterion) {
                     // Read all events
                     let mut reader = create_reader(events_bin.to_str().unwrap())
                         .expect("Open reader to events.bin");
-                    let _all_read_events = read_from_si(&mut reader, 0, usize::MAX).expect("Read all events");
+                    let _all_read_events = read_from_si(&mut reader, 0, usize::MAX, None).expect("Read all events");
 
                     // Catchup from a specific si
                     let mut reader = create_reader(events_bin.to_str().unwrap())
                         .expect("Open reader to events.bin");
                     let target_si = (event_count / 2) as u64; // Catchup from middle si
-                    let _catchup_result = read_from_si(&mut reader, target_si, usize::max_value())
+                    let _catchup_result = read_from_si(&mut reader, target_si, usize::max_value(), None)
                         .expect("Read from si");
                 });
             },

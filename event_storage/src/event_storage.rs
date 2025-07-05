@@ -19,7 +19,7 @@ pub fn append_event_batch(writer: &mut BufWriter<File>, event_batch_item: &Event
     let compressed_event_batch_item = compress_data(&encoded_event_batch_item)?;
 
     // Write everything in one go to minimize syscalls
-    let total_size = BATCH_START_SIZE as usize + compressed_event_batch_item.len() + BATCH_METADATA_SIZE as usize; // 24 bytes for metadata
+    let total_size = BATCH_START_SIZE as usize + compressed_event_batch_item.len() + BATCH_METADATA_SIZE as usize;
     let mut write_buffer = Vec::with_capacity(total_size);
     
     //Write the length of the compressed event batch item first for forward-based file recovery
@@ -30,10 +30,18 @@ pub fn append_event_batch(writer: &mut BufWriter<File>, event_batch_item: &Event
     
     // We need the original size of the event in bytes before compression to create the right buffer size
     write_buffer.extend_from_slice(&(encoded_event_batch_item.len() as u64).to_le_bytes());
-    
+        
+    // Write the event type if there is only a single event in the batch (for filtering later)
+    let tp = if event_batch_item.events.len() == 1 {
+        event_batch_item.events[0].tp
+    } else {
+        u64::MAX
+    };
+    write_buffer.extend_from_slice(&tp.to_le_bytes());
+
     // We need the si of the first event in the batch to determine which batch to start the catch-up process from
     write_buffer.extend_from_slice(&event_batch_item.si.to_le_bytes());
-    
+
     // Each batch is variable in length, so we need to know where it starts when reading backwards through the file
     write_buffer.extend_from_slice(&batch_start_pos.to_le_bytes());
     
@@ -79,10 +87,11 @@ fn seek_to_and_read_exact(
 }
 
 const BATCH_START_SIZE: u64 = 8;
-const BATCH_METADATA_SIZE: u64 = 32;
+const BATCH_METADATA_SIZE: u64 = 40;
 const BATCH_START_POS_OFFSET: u64 = 16;
+const TP_OFFSET: u64 = 32;
 const SI_OFFSET: u64 = 24;
-const ORIGINAL_SIZE_OFFSET: u64 = 32;
+const ORIGINAL_SIZE_OFFSET: u64 = 40;
 const MAGIC_NUMBER_OFFSET: u64 = 8;
 const MAGIC_NUMBER: u64 = 0xDEADBEEFCAFEBABE;
 
@@ -154,7 +163,7 @@ fn is_batch_corrupt(mut reader: &mut BufReader<File>, current_pos: u64) -> bool 
 }
 
 /// Read events starting from a specific si (efficient catchup)
-pub fn read_from_si(mut reader: &mut BufReader<File>, target_si: u64, max_bytes: usize) -> io::Result<CatchupResult> {
+pub fn read_from_si(mut reader: &mut BufReader<File>, target_si: u64, max_bytes: usize, tp_filter: Option<u64>) -> io::Result<CatchupResult> {
     let file_size = reader.get_ref().metadata()?.len();
 
     if file_size < BATCH_METADATA_SIZE {
@@ -197,11 +206,25 @@ pub fn read_from_si(mut reader: &mut BufReader<File>, target_si: u64, max_bytes:
     let mut event_batches: Vec<Arc<EventBatchItem>> = Vec::new();
     let mut total_bytes = 0;
     
-    for (i, (batch_start_pos, batch_end_pos)) in batch_positions.iter().enumerate() {        
-        let compressed_data_size = (batch_end_pos - batch_start_pos) as usize;
+    for (i, (batch_start_pos, batch_end_pos)) in batch_positions.iter().enumerate() {
+
+        // If there is a tp_filter first check if this batch matches this tp
+        if let Some(tp_filter) = tp_filter {
+            let batch_tp = read_u64_at_offset(reader, *batch_end_pos, TP_OFFSET)?;
+            if batch_tp != tp_filter {
+                continue;
+            }
+        }
+
         
+        let events = read_batch_at_position(&mut reader, *batch_end_pos, *batch_start_pos)?;        
+        event_batches.push(Arc::new(events));
+                
+        let compressed_data_size = (batch_end_pos - batch_start_pos) as usize;
+        total_bytes += compressed_data_size + BATCH_START_SIZE as usize + BATCH_METADATA_SIZE as usize;
+
         // Check if adding this batch would exceed our limit
-        if i > 0 && total_bytes + compressed_data_size > max_bytes {
+        if total_bytes > max_bytes {
             // We've hit our limit, return what we have
             let next_si = Some(event_batches.last().unwrap().si + 1);
             return Ok(CatchupResult {
@@ -209,11 +232,6 @@ pub fn read_from_si(mut reader: &mut BufReader<File>, target_si: u64, max_bytes:
                 next_si: next_si
             });
         }
-
-        let events = read_batch_at_position(&mut reader, *batch_end_pos, *batch_start_pos)?;
-        total_bytes += compressed_data_size + BATCH_START_SIZE as usize + BATCH_METADATA_SIZE as usize;
-        
-        event_batches.push(Arc::new(events));
     }
 
     Ok(CatchupResult {
@@ -285,7 +303,7 @@ pub mod tests {
         file.set_len(current_file_size + 99).unwrap();
         
         let mut reader = create_reader(events_bin.to_str().unwrap()).unwrap();
-        let catchup_result = read_from_si(&mut reader, 0, usize::MAX);
+        let catchup_result = read_from_si(&mut reader, 0, usize::MAX, None);
         
         assert!(catchup_result.is_err());
         let error = catchup_result.unwrap_err();
@@ -323,26 +341,26 @@ pub mod tests {
 
         let mut reader = create_reader(events_bin.to_str().unwrap()).unwrap();
 
-        let catchup_result = read_from_si(&mut reader, 0, 1).unwrap();
+        let catchup_result = read_from_si(&mut reader, 0, 1, None).unwrap();
 
         assert_eq!(catchup_result.event_batches.len(), 1);
         assert_eq!(catchup_result.next_si, Some(1));
 
         let current_file_size = reader.get_ref().metadata().unwrap().len();
 
-        let catchup_result = read_from_si(&mut reader, 0, current_file_size as usize + 42).unwrap();
-
-        assert_eq!(catchup_result.event_batches.len(), 2);
-        assert_eq!(catchup_result.next_si, None);
-
-        append_event_batch(&mut writer, &events_batch_3).unwrap();
-
-        let catchup_result = read_from_si(&mut reader, 0, current_file_size as usize + 42).unwrap();
+        let catchup_result = read_from_si(&mut reader, 0, current_file_size as usize + 58, None).unwrap();
 
         assert_eq!(catchup_result.event_batches.len(), 2);
         assert_eq!(catchup_result.next_si, Some(2));
 
-        let catchup_result = read_from_si(&mut reader, 0, current_file_size as usize + 300).unwrap();
+        append_event_batch(&mut writer, &events_batch_3).unwrap();
+
+        let catchup_result = read_from_si(&mut reader, 0, current_file_size as usize + 58, None).unwrap();
+
+        assert_eq!(catchup_result.event_batches.len(), 2);
+        assert_eq!(catchup_result.next_si, Some(2));
+
+        let catchup_result = read_from_si(&mut reader, 0, current_file_size as usize + 316, None).unwrap();
 
         assert_eq!(catchup_result.event_batches.len(), 3);
         assert_eq!(catchup_result.next_si, None);
@@ -373,7 +391,7 @@ pub mod tests {
 
         let mut reader = create_reader(events_bin.to_str().unwrap()).unwrap();
 
-        let result_events_batch_1 = read_from_si(&mut reader, 0, usize::MAX).unwrap().event_batches;
+        let result_events_batch_1 = read_from_si(&mut reader, 0, usize::MAX, None).unwrap().event_batches;
 
         assert_eq!(result_events_batch_1.len(), 1);
         assert_eq!(events_batch_1.si, result_events_batch_1[0].si);
@@ -385,7 +403,7 @@ pub mod tests {
 
         append_event_batch(&mut writer, &events_batch_2).unwrap();
 
-        let result_events_batches = read_from_si(&mut reader, 0, usize::MAX).unwrap().event_batches;
+        let result_events_batches = read_from_si(&mut reader, 0, usize::MAX, None).unwrap().event_batches;
 
         assert_eq!(result_events_batches.len(), 2);
         assert_eq!(events_batch_1.si, result_events_batches[0].si);
@@ -396,7 +414,7 @@ pub mod tests {
 
         append_event_batch(&mut writer, &events_batch_3).unwrap();
 
-        let result_events_batches = read_from_si(&mut reader, 0, usize::MAX).unwrap().event_batches;
+        let result_events_batches = read_from_si(&mut reader, 0, usize::MAX, None).unwrap().event_batches;
 
         assert_eq!(result_events_batches.len(), 3);
         assert_eq!(events_batch_1.si, result_events_batches[0].si);
@@ -425,7 +443,7 @@ pub mod tests {
 
         let mut reader = create_reader(events_bin.to_str().unwrap()).unwrap();
 
-        let invalid_si_over = read_from_si(&mut reader, 1000, usize::max_value()).unwrap();
+        let invalid_si_over = read_from_si(&mut reader, 1000, usize::max_value(), None).unwrap();
 
         assert_eq!(invalid_si_over.event_batches.len(), 0);
         assert_eq!(invalid_si_over.next_si, Option::None);
@@ -459,7 +477,7 @@ pub mod tests {
         let last_si = find_last_si(&mut reader).unwrap();
         assert_eq!(last_si, Some(0));
 
-        let si_0_result = read_from_si(&mut reader, 0, usize::max_value()).unwrap();
+        let si_0_result = read_from_si(&mut reader, 0, usize::max_value(), None).unwrap();
 
         assert_eq!(si_0_result.event_batches.len(), 1);
         assert_eq!(si_0_result.event_batches[0].events.len(), 3);
@@ -470,13 +488,13 @@ pub mod tests {
         let last_si = find_last_si(&mut reader).unwrap();
         assert_eq!(last_si, Some(1));
 
-        let read_result = read_from_si(&mut reader, 0, usize::max_value()).unwrap();
+        let read_result = read_from_si(&mut reader, 0, usize::max_value(), None).unwrap();
 
         assert_eq!(read_result.event_batches.len(), 2);
         assert_eq!(events_batch_1.si, read_result.event_batches[0].si);
         assert_eq!(events_batch_2.si, read_result.event_batches[1].si);
 
-        let read_result = read_from_si(&mut reader, 1, usize::max_value()).unwrap();
+        let read_result = read_from_si(&mut reader, 1, usize::max_value(), None).unwrap();
 
         assert_eq!(read_result.event_batches.len(), 1);
         assert_eq!(events_batch_2.si, read_result.event_batches[0].si);
@@ -486,13 +504,13 @@ pub mod tests {
         let last_si = find_last_si(&mut reader).unwrap();
         assert_eq!(last_si, Some(2));
 
-        let read_result = read_from_si(&mut reader, 2, usize::max_value()).unwrap();
+        let read_result = read_from_si(&mut reader, 2, usize::max_value(), None).unwrap();
 
         assert_eq!(read_result.event_batches.len(), 1);
         assert_eq!(read_result.event_batches[0].events.len(), 1);
         assert_eq!(events_batch_3.si, read_result.event_batches[0].si);
 
-        let read_result = read_from_si(&mut reader, 1, usize::max_value()).unwrap();
+        let read_result = read_from_si(&mut reader, 1, usize::max_value(), None).unwrap();
         assert_eq!(read_result.event_batches.len(), 2);
         assert_eq!(events_batch_2.si, read_result.event_batches[0].si);
         assert_eq!(events_batch_3.si, read_result.event_batches[1].si);

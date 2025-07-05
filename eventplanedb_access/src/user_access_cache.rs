@@ -305,8 +305,13 @@ mod tests {
         let event2 = create_provide_access_event("user2", AccessLevel::Contributor, None);
         let event3 = create_provide_access_event("user1", AccessLevel::Viewer, None); // Update user1
 
-        let event_batch = create_event_batch_item_with_events(vec![event1, event2, event3], "admin");
-        event_storage_cache.write(&file_path, true, event_batch).unwrap();
+        let event_batch_1 = create_event_batch_item_with_events(vec![event1], "admin");
+        let event_batch_2 = create_event_batch_item_with_events(vec![event2], "admin");
+        let event_batch_3 = create_event_batch_item_with_events(vec![event3], "admin");
+
+        event_storage_cache.write(&file_path, true, event_batch_1).unwrap();
+        event_storage_cache.write(&file_path, true, event_batch_2).unwrap();
+        event_storage_cache.write(&file_path, true, event_batch_3).unwrap();
 
         // Populate cache for the project
         user_access_cache.cache.insert(file_path.clone(), ProjectToUserAccessLevel::new());
@@ -330,8 +335,13 @@ mod tests {
         event2.tp = ProjectEventType::AddShareLink as u64; // Change type to AddShareLink
         let event3 = create_provide_access_event("user1", AccessLevel::Viewer, None);
 
-        let event_batch = create_event_batch_item_with_events(vec![event1, event2, event3], "admin");
-        event_storage_cache.write(&file_path, true, event_batch).unwrap();
+        let event_batch_1 = create_event_batch_item_with_events(vec![event1], "admin");
+        let event_batch_2 = create_event_batch_item_with_events(vec![event2], "admin");
+        let event_batch_3 = create_event_batch_item_with_events(vec![event3], "admin");
+
+        event_storage_cache.write(&file_path, true, event_batch_1).unwrap();
+        event_storage_cache.write(&file_path, true, event_batch_2).unwrap();
+        event_storage_cache.write(&file_path, true, event_batch_3).unwrap();
 
         // Populate cache for the project
         user_access_cache.cache.insert(file_path.clone(), ProjectToUserAccessLevel::new());
@@ -355,8 +365,10 @@ mod tests {
         let mut event2 = create_provide_access_event("user2", AccessLevel::Contributor, None);
         event2.uint_values = None; // Missing uint_values
 
-        let event_batch = create_event_batch_item_with_events(vec![event1, event2], "admin");
-        event_storage_cache.write(&file_path, true, event_batch).unwrap();
+        let event_batch_1 = create_event_batch_item_with_events(vec![event1], "admin");
+        let event_batch_2 = create_event_batch_item_with_events(vec![event2], "admin");
+        event_storage_cache.write(&file_path, true, event_batch_1).unwrap();
+        event_storage_cache.write(&file_path, true, event_batch_2).unwrap();
 
         // Populate cache for the project
         user_access_cache.cache.insert(file_path.clone(), ProjectToUserAccessLevel::new());
@@ -415,15 +427,17 @@ mod tests {
         let file_path = create_file_path(&temp_dir, "project1.bin");
 
         // Create an event with string_values having insufficient length
-        let mut event = create_provide_access_event("user1", AccessLevel::Owner, None);
-        event.string_values = Some(vec![]); // Shortened vector
+        let mut event1 = create_provide_access_event("user1", AccessLevel::Owner, None);
+        event1.string_values = Some(vec![]); // Shortened vector
 
         // Create an event with uint_values having insufficient length
         let mut event2 = create_provide_access_event("user2", AccessLevel::Contributor, None);
         event2.uint_values = Some(vec![]); // Empty vector
 
-        let event_batch = create_event_batch_item_with_events(vec![event, event2], "admin");
-        event_storage_cache.write(&file_path, true, event_batch).unwrap();
+        let event_batch_1 = create_event_batch_item_with_events(vec![event1], "admin");
+        let event_batch_2 = create_event_batch_item_with_events(vec![event2], "admin");
+        event_storage_cache.write(&file_path, true, event_batch_1).unwrap();
+        event_storage_cache.write(&file_path, true, event_batch_2).unwrap();
 
         // Populate the cache
         user_access_cache.cache.insert(file_path.clone(), ProjectToUserAccessLevel::new());
@@ -502,8 +516,13 @@ mod tests {
         let event2 = create_provide_access_event("user1", AccessLevel::Owner, Some(1)); // Earlier timestamp
         let event3 = create_provide_access_event("user1", AccessLevel::Viewer, Some(3)); // Later timestamp
 
-        let event_batch = create_event_batch_item_with_events(vec![event1, event2, event3], "admin");
-        event_storage_cache.write(&file_path, true, event_batch).unwrap();
+        let event_batch_1 = create_event_batch_item_with_events(vec![event1], "admin");
+        let event_batch_2 = create_event_batch_item_with_events(vec![event2], "admin");
+        let event_batch_3 = create_event_batch_item_with_events(vec![event3], "admin");
+
+        event_storage_cache.write(&file_path, true, event_batch_1).unwrap();
+        event_storage_cache.write(&file_path, true, event_batch_2).unwrap();
+        event_storage_cache.write(&file_path, true, event_batch_3).unwrap();
 
         // Populate cache for the project
         user_access_cache.cache.insert(file_path.clone(), ProjectToUserAccessLevel::new());
