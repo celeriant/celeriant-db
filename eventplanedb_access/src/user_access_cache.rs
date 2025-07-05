@@ -66,7 +66,7 @@ impl UserAccessCache {
     fn populate_cache_for_project(&mut self, event_storage_cache: &mut EventStorageCache, file_path: &str) {
         let project_to_user_access_level = self.cache.get_mut(file_path).unwrap();
 
-        match event_storage_cache.read(file_path, 0, usize::MAX, Some(ProjectEventType::ProvideAccess as u64)) {
+        match event_storage_cache.read(file_path, 0, usize::MAX, Some(&[ProjectEventType::ProvideAccess as u64])) {
             Ok(result) => {
                 for batch in result.event_batches  {
                     for event in batch.events.iter() {

@@ -197,7 +197,7 @@ impl EventStorageCache {
         Ok(si)
     }
 
-    pub fn read(&mut self, file_path: &str, from_si: u64, max_bytes: usize, tp_filter: Option<u64>) -> io::Result<CatchupResult> {
+    pub fn read(&mut self, file_path: &str, from_si: u64, max_bytes: usize, tp_filter: Option<&[u64]>) -> io::Result<CatchupResult> {
         let mut event_batches = Vec::new();
         let mut current_si = from_si;
         let mut number_bytes: usize = 0;
@@ -209,8 +209,15 @@ impl EventStorageCache {
                 current_si = cached_event_batch_item.si + 1;
 
                 //Skip batch if tp_filter is set and does not match tp on the batch
-                if let Some(tp) = tp_filter {
-                    if cached_event_batch_item.events.len() != 1 || cached_event_batch_item.events[0].tp != tp {
+                if let Some(tp_filter) = tp_filter {
+                    let mut tp_matched: bool = false;
+                    for tp in tp_filter {
+                        if cached_event_batch_item.events.len() == 1 && cached_event_batch_item.events[0].tp == *tp {
+                            tp_matched = true;
+                            break;
+                        }
+                    }
+                    if !tp_matched {
                         continue;
                     }
                 }
@@ -678,7 +685,7 @@ mod tests {
         storage.write(file_path, true, event_batch_item_3).unwrap();
 
         // Read with TP = 100, should only return batch 2
-        let result = storage.read(file_path, 0, 1000, Some(100)).unwrap();
+        let result = storage.read(file_path, 0, 1000, Some(&[100])).unwrap();
         assert_eq!(result.event_batches.len(), 1);
         assert_eq!(result.flatten_events().len(), 1);
         assert_eq!(result.event_batches[0].si, 1);
@@ -686,7 +693,7 @@ mod tests {
         assert_eq!(result.next_si, Some(2));
 
         // Read with TP = 300, should only return batch 3
-        let result = storage.read(file_path, 0, 1000, Some(300)).unwrap();
+        let result = storage.read(file_path, 0, 1000, Some(&[300])).unwrap();
         assert_eq!(result.event_batches.len(), 1);
         assert_eq!(result.flatten_events().len(), 1);
         assert_eq!(result.event_batches[0].si, 2);
@@ -694,7 +701,7 @@ mod tests {
         assert_eq!(result.next_si, None);
 
         // Read with TP = 200, should return nothing
-        let result = storage.read(file_path, 0, 1000, Some(200)).unwrap();
+        let result = storage.read(file_path, 0, 1000, Some(&[200])).unwrap();
         assert_eq!(result.event_batches.len(), 0);
         assert_eq!(result.flatten_events().len(), 0);
         assert_eq!(result.next_si, None);
@@ -732,7 +739,7 @@ mod tests {
             storage.write(file_path, true, event_batch_item_2).unwrap();
 
             // Attempt to read with max_bytes such that only the first batch fits
-            let result = storage.read(file_path, 0, 50, Some(100)).unwrap();
+            let result = storage.read(file_path, 0, 50, Some(&[100])).unwrap();
 
             // Verify that only the first batch is returned
             assert_eq!(result.event_batches.len(), 1);

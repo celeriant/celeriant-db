@@ -163,7 +163,7 @@ fn is_batch_corrupt(mut reader: &mut BufReader<File>, current_pos: u64) -> bool 
 }
 
 /// Read events starting from a specific si (efficient catchup)
-pub fn read_from_si(mut reader: &mut BufReader<File>, target_si: u64, max_bytes: usize, tp_filter: Option<u64>) -> io::Result<CatchupResult> {
+pub fn read_from_si(mut reader: &mut BufReader<File>, target_si: u64, max_bytes: usize, tp_filter: Option<&[u64]>) -> io::Result<CatchupResult> {
     let file_size = reader.get_ref().metadata()?.len();
 
     if file_size < BATCH_METADATA_SIZE {
@@ -211,7 +211,14 @@ pub fn read_from_si(mut reader: &mut BufReader<File>, target_si: u64, max_bytes:
         // If there is a tp_filter first check if this batch matches this tp
         if let Some(tp_filter) = tp_filter {
             let batch_tp = read_u64_at_offset(reader, *batch_end_pos, TP_OFFSET)?;
-            if batch_tp != tp_filter {
+            let mut tp_matched: bool = false;
+            for tp in tp_filter {
+                if batch_tp == *tp {
+                    tp_matched = true;
+                    break;
+                }
+            }
+            if !tp_matched {
                 continue;
             }
         }

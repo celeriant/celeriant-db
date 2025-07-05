@@ -24,7 +24,7 @@ pub fn create_thread_pool(required_thread_count: usize) -> Vec<Sender<Job>> {
             core_affinity::set_for_current(core_id);
 
             let mut event_storage_cache = EventStorageCache::new(30, 1000000, 10000);
-            let mut share_links_cache = ShareLinksCache::new();
+            let mut share_links_cache = ShareLinksCache::new(10000);
             let mut user_access_cache = UserAccessCache::new(10000);
 
             for job in rx.iter() {
@@ -41,18 +41,18 @@ pub fn create_thread_pool(required_thread_count: usize) -> Vec<Sender<Job>> {
                         expires_on,
                         responder,
                     } => {
-                        let result: Result<EventItem, JobError> = share_links_cache.create_share_link(
-                            &mut event_storage_cache,
-                            file_path,
-                            cb,
-                            share_hash,
-                            access_level,
-                            is_single_use,
-                            iv,
-                            description,
-                            expires_on,
-                        );
-                        let _ = responder.send(result);
+                        // let result: Result<EventItem, JobError> = share_links_cache.create_share_link(
+                        //     &mut event_storage_cache,
+                        //     file_path,
+                        //     cb,
+                        //     share_hash,
+                        //     access_level,
+                        //     is_single_use,
+                        //     iv,
+                        //     description,
+                        //     expires_on,
+                        // );
+                        // let _ = responder.send(result);
                     }
 
                     Job::Write {
