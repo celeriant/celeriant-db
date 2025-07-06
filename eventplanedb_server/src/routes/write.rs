@@ -17,7 +17,7 @@ pub struct WriteQuery {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WriteResponse {
     si: u64,
-    events: Vec<EventBatchItem>,
+    event_batches: Vec<EventBatchItem>,
     server_time: u64,
 }
 
@@ -50,7 +50,7 @@ pub async fn write_events(
         Ok(write_result) => {
             Ok(Json(WriteResponse {
                 si: write_result.si,
-                events: write_result.events,
+                event_batches: write_result.events,
                 server_time,
             }))
         }
