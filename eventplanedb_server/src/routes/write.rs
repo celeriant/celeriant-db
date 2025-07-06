@@ -12,7 +12,6 @@ pub struct WriteQuery {
     nonce: String,
     sign: String,
     create_if_not_exist: bool,
-    share_key: Option<String>
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -48,7 +47,7 @@ pub async fn write_events(
         events: events,
     };
 
-    match write_async(&state.workers, file_path, params.create_if_not_exist, params.share_key, event_batch).await {
+    match write_async(&state.workers, file_path, params.create_if_not_exist, event_batch).await {
         Ok(server_id) => {
             Ok(Json(WriteResponse {
                 server_id,

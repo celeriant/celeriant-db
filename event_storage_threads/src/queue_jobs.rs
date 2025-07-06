@@ -27,7 +27,6 @@ pub async fn write_async(
     workers: &[Sender<Job>],
     file_path: String,
     allow_create: bool,
-    share_key: Option<String>,
     event_batch_item: EventBatchItem,
 ) -> Result<u64, JobError> {
     send_job(
@@ -36,7 +35,6 @@ pub async fn write_async(
         |responder| Job::Write {
             file_path,
             allow_create,
-            share_key,
             event_batch_item,
             responder,
         },

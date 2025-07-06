@@ -17,7 +17,6 @@ pub enum Job {
     Write {
         file_path: String,
         allow_create: bool,
-        share_key: Option<String>,
         event_batch_item: EventBatchItem,
         responder: oneshot::Sender<Result<u64, JobError>>,
     },

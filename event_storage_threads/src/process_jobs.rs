@@ -1,5 +1,6 @@
 use crate::job::Job;
 use crate::process_share::handle_share_job;
+use crate::process_write::handle_write_job;
 use core_affinity;
 use crossbeam::channel::{Receiver, Sender, unbounded};
 use event_storage::catchup_result::CatchupResult;
@@ -59,16 +60,17 @@ pub fn create_thread_pool(required_thread_count: usize) -> Vec<Sender<Job>> {
                     Job::Write {
                         file_path,
                         allow_create,
-                        share_key,
                         event_batch_item,
                         responder,
                     } => {
-                        //TODO: Check user has write access or provide access using share link
-
-                        let result: Result<u64, JobError> = event_storage_cache
-                            .write(&file_path, allow_create, event_batch_item)
-                            .map_err(Into::into);
-                        let _ = responder.send(result);
+                        let _ = responder.send(handle_write_job(
+                            file_path,
+                            allow_create,
+                            event_batch_item,
+                            &mut event_storage_cache,
+                            &mut share_links_cache,
+                            &mut user_access_cache,
+                        ));
                     }
 
                     Job::Read {
