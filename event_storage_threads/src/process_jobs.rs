@@ -1,8 +1,8 @@
 use crate::job::Job;
+use crate::process_share::handle_share_job;
 use core_affinity;
 use crossbeam::channel::{Receiver, Sender, unbounded};
 use event_storage::catchup_result::CatchupResult;
-use event_storage::event_item::EventItem;
 use event_storage::event_storage_cache::EventStorageCache;
 use eventplanedb_access::job_error::JobError;
 use eventplanedb_access::share_links_cache::ShareLinksCache;
@@ -41,18 +41,19 @@ pub fn create_thread_pool(required_thread_count: usize) -> Vec<Sender<Job>> {
                         expires_on,
                         responder,
                     } => {
-                        // let result: Result<EventItem, JobError> = share_links_cache.create_share_link(
-                        //     &mut event_storage_cache,
-                        //     file_path,
-                        //     cb,
-                        //     share_hash,
-                        //     access_level,
-                        //     is_single_use,
-                        //     iv,
-                        //     description,
-                        //     expires_on,
-                        // );
-                        // let _ = responder.send(result);
+                        let _ = responder.send(handle_share_job(
+                            file_path,
+                            cb,
+                            share_hash,
+                            access_level,
+                            is_single_use,
+                            iv,
+                            description,
+                            expires_on,
+                            &mut event_storage_cache,
+                            &mut share_links_cache,
+                            &mut user_access_cache,
+                        ));
                     }
 
                     Job::Write {

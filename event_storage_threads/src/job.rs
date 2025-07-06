@@ -9,9 +9,9 @@ pub enum Job {
         share_hash: String,
         access_level: AccessLevel,
         is_single_use: bool,
-        iv: Option<String>,
+        iv: Option<Vec<u8>>,
         description: Option<String>,
-        expires_on: Option<i64>,
+        expires_on: u64,
         responder: oneshot::Sender<Result<EventItem, JobError>>,
     },
     Write {

@@ -126,7 +126,7 @@ impl ShareLinksCache {
         iv: Option<Vec<u8>>,
         description: Option<String>,
         expires_on: u64,
-    ) -> io::Result<Option<EventItem>> {
+    ) -> io::Result<EventItem> {
         let current_time = chrono::Utc::now().timestamp_millis() as u64;
 
         let mut event_item = EventItem::new();
@@ -149,7 +149,7 @@ impl ShareLinksCache {
         let cache = self.get_or_build_cache(event_storage_cache, &file_path);
         cache.add_share_link(share_key_hash, share_link_info);
 
-        Ok(Some(event_item))
+        Ok(event_item)
     }
 
     /// Pulls the share link from the cache, returning a dto with
@@ -675,7 +675,6 @@ mod tests {
 
         // Verify that the event was created successfully
         assert!(result.is_ok());
-        assert!(result.as_ref().unwrap().is_some());
 
         // Verify that the cache was updated
         let project_cache = share_links_cache.get_or_build_cache(&mut event_storage_cache, &file_path);
