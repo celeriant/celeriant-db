@@ -2,6 +2,8 @@ use event_storage::{catchup_result::CatchupResult, event_batch_item::EventBatchI
 use eventplanedb_access::{access_level::AccessLevel, job_error::JobError};
 use tokio::sync::oneshot;
 
+use crate::process_write::WriteResult;
+
 pub enum Job {
     Share {
         file_path: String,
@@ -18,7 +20,7 @@ pub enum Job {
         file_path: String,
         allow_create: bool,
         event_batch_item: EventBatchItem,
-        responder: oneshot::Sender<Result<u64, JobError>>,
+        responder: oneshot::Sender<Result<WriteResult, JobError>>,
     },
     Read {
         file_path: String,

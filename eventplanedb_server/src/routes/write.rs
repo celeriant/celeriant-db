@@ -16,9 +16,8 @@ pub struct WriteQuery {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WriteResponse {
-    #[serde(rename = "si")]
-    server_id: u64,
-    #[serde(rename = "sd")]
+    si: u64,
+    events: Vec<EventBatchItem>,
     server_time: u64,
 }
 
@@ -48,9 +47,10 @@ pub async fn write_events(
     };
 
     match write_async(&state.workers, file_path, params.create_if_not_exist, event_batch).await {
-        Ok(server_id) => {
+        Ok(write_result) => {
             Ok(Json(WriteResponse {
-                server_id,
+                si: write_result.si,
+                events: write_result.events,
                 server_time,
             }))
         }

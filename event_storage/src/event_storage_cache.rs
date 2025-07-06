@@ -297,6 +297,11 @@ impl EventStorageCache {
             Err(e) => Err(e)
         }
     }
+    
+    pub fn exists(&self, file_path: &str) -> bool {
+        std::path::Path::new(file_path).exists()
+    }
+
 }
 
 #[cfg(test)]

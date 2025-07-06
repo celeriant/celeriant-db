@@ -3,7 +3,7 @@ use event_storage::{catchup_result::CatchupResult, event_batch_item::EventBatchI
 use eventplanedb_access::{access_level::AccessLevel, job_error::JobError};
 use tokio::sync::oneshot;
 
-use crate::{job::Job, thread_assigner::hash_string_to_index};
+use crate::{job::Job, process_write::WriteResult, thread_assigner::hash_string_to_index};
 
 async fn send_job<T>(
     workers: &[Sender<Job>],
@@ -28,7 +28,7 @@ pub async fn write_async(
     file_path: String,
     allow_create: bool,
     event_batch_item: EventBatchItem,
-) -> Result<u64, JobError> {
+) -> Result<WriteResult, JobError> {
     send_job(
         workers,
         file_path.clone(),

@@ -36,7 +36,8 @@ futures = "0.3.31"
 axum = "0.8.4"
 chrono = "0.4.41"
 tower-http = { version = "0.6.6", features = ["cors"] }
-rsa = { version = "0.9.8", features = ["sha2"] }
+rsa = { version = "0.9.8", features = ["sha2", "pem"] }
 sha2 = "0.10.9"
 base64 = "0.22.1"
 thiserror = "2.0.12"
+spki = "0.7"
