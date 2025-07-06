@@ -187,7 +187,7 @@ impl ShareLinksCache {
         file_path: &str,
         current_user_hash: String,
         share_key_hash: String,
-    ) -> io::Result<Option<EventItem>> {
+    ) -> io::Result<EventItem> {
         let current_time = chrono::Utc::now().timestamp_millis() as u64;
 
         let mut event_item = EventItem::new();
@@ -205,7 +205,7 @@ impl ShareLinksCache {
         let cache = self.get_or_build_cache(event_storage_cache, &file_path);
         cache.remove_share_link(&share_key_hash);
 
-        Ok(Some(event_item))
+        Ok(event_item)
     }
 }
 
@@ -808,7 +808,6 @@ mod tests {
 
         // Verify that the event was created successfully
         assert!(result.is_ok());
-        assert!(result.as_ref().unwrap().is_some());
 
         // Verify that the share link was removed from the cache
         let project_cache = share_links_cache.cache.get(&file_path).unwrap();
