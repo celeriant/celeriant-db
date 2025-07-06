@@ -126,7 +126,7 @@ impl ShareLinksCache {
         iv: Option<Vec<u8>>,
         description: Option<String>,
         expires_on: u64,
-    ) -> io::Result<EventItem> {
+    ) -> io::Result<EventBatchItem> {
         let current_time = chrono::Utc::now().timestamp_millis() as u64;
 
         let mut event_item = EventItem::new();
@@ -142,14 +142,14 @@ impl ShareLinksCache {
         event_batch_item.cb = Some(current_user_hash.clone());
         event_batch_item.sd = current_time;
 
-        event_storage_cache.write(&file_path, false, event_batch_item)?;
+        event_batch_item.si = event_storage_cache.write(&file_path, false, event_batch_item.clone())?;
 
         let share_link_info = ShareLinkAccessInfo::new(access_level, share_key_hash.clone(), is_single_use, current_user_hash, expires_on);
 
         let cache = self.get_or_build_cache(event_storage_cache, &file_path);
         cache.add_share_link(share_key_hash, share_link_info);
 
-        Ok(event_item)
+        Ok(event_batch_item)
     }
 
     /// Pulls the share link from the cache, returning a dto with
@@ -187,7 +187,7 @@ impl ShareLinksCache {
         file_path: &str,
         current_user_hash: String,
         share_key_hash: String,
-    ) -> io::Result<EventItem> {
+    ) -> io::Result<EventBatchItem> {
         let current_time = chrono::Utc::now().timestamp_millis() as u64;
 
         let mut event_item = EventItem::new();
@@ -200,12 +200,12 @@ impl ShareLinksCache {
         event_batch_item.cb = Some(current_user_hash.clone());
         event_batch_item.sd = current_time;
 
-        event_storage_cache.write(&file_path, false, event_batch_item)?;
+        event_batch_item.si = event_storage_cache.write(&file_path, false, event_batch_item.clone())?;
 
         let cache = self.get_or_build_cache(event_storage_cache, &file_path);
         cache.remove_share_link(&share_key_hash);
 
-        Ok(event_item)
+        Ok(event_batch_item)
     }
 }
 

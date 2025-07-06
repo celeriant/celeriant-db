@@ -1,11 +1,10 @@
 use crate::job::Job;
+use crate::process_read::handle_read_job;
 use crate::process_share::handle_share_job;
 use crate::process_write::handle_write_job;
 use core_affinity;
 use crossbeam::channel::{Receiver, Sender, unbounded};
-use event_storage::catchup_result::CatchupResult;
 use event_storage::event_storage_cache::EventStorageCache;
-use eventplanedb_access::job_error::JobError;
 use eventplanedb_access::share_links_cache::ShareLinksCache;
 use eventplanedb_access::user_access_cache::UserAccessCache;
 
@@ -79,14 +78,20 @@ pub fn create_thread_pool(required_thread_count: usize) -> Vec<Sender<Job>> {
                         cb,
                         share_key,
                         max_bytes,
+                        own_events,
                         responder,
                     } => {
-                        //TODO: Check user has read access or provide access using share link
-
-                        let result: Result<CatchupResult, JobError> = event_storage_cache
-                            .read(&file_path, from_si, max_bytes, None)
-                            .map_err(Into::into);
-                        let _ = responder.send(result);
+                        let _ = responder.send(handle_read_job(
+                            file_path,
+                            from_si,
+                            cb,
+                            share_key,
+                            max_bytes,
+                            own_events,
+                            &mut event_storage_cache,
+                            &mut share_links_cache,
+                            &mut user_access_cache,
+                        ));
                     }
 
                     Job::Shutdown { responder } => {

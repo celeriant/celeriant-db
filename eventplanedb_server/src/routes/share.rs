@@ -1,5 +1,5 @@
 use axum::{extract::Query, http::StatusCode, Json};
-use event_storage::{event_item::EventItem};
+use event_storage::{event_batch_item::EventBatchItem, event_item::EventItem};
 use event_storage_threads::{queue_jobs::share_async};
 use eventplanedb_access::{access_level::AccessLevel, job_error::JobError};
 use serde::{Deserialize, Serialize};
@@ -21,7 +21,7 @@ pub struct ShareQuery {
 #[derive(Debug, Serialize)]
 pub struct ShareResponse {
     share_key: String,
-    share_event: EventItem,
+    share_event: EventBatchItem,
 }
 
 pub async fn share(

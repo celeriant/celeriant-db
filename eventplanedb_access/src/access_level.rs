@@ -1,4 +1,4 @@
-use event_storage::{event_item::EventItem, event_storage_cache::EventStorageCache};
+use event_storage::{event_batch_item::EventBatchItem, event_item::EventItem, event_storage_cache::EventStorageCache};
 use serde::{Deserialize, Serialize};
 
 use crate::{job_error::JobError, share_links_cache::ShareLinksCache, user_access_cache::{self, UserAccessCache}};
@@ -41,7 +41,7 @@ impl AccessLevel {
         current_user_hash: &str,
         required_access_level: AccessLevel,
         potential_share_key_hash: Option<&str>,
-    ) -> Result<Vec<EventItem>, JobError> {
+    ) -> Result<Vec<EventBatchItem>, JobError> {
         
         let mut new_events = Vec::new();
         let mut current_acces_level = user_access_cache.get_current_access_level(event_storage_cache, file_path, current_user_hash);

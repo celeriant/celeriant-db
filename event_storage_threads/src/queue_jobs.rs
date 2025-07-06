@@ -52,7 +52,7 @@ pub async fn share_async(
     iv: Option<Vec<u8>>,
     description: Option<String>,
     expires_on: u64,
-) -> Result<EventItem, JobError> {
+) -> Result<EventBatchItem, JobError> {
     send_job(
         workers,
         file_path.clone(),
@@ -78,6 +78,7 @@ pub async fn read_async(
     share_key: Option<String>,
     from_si: u64,
     max_bytes: usize,
+    own_events: bool,
 ) -> Result<CatchupResult, JobError> {
     send_job(
         workers,
@@ -88,6 +89,7 @@ pub async fn read_async(
             cb,
             share_key,
             max_bytes,
+            own_events,
             responder,
         },
     )

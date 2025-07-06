@@ -113,7 +113,7 @@ impl UserAccessCache {
         potential_access_level: AccessLevel,
         allow_downgrade: bool, 
         share_key_hash: Option<&str>, 
-        ed_override: Option<u64>) -> io::Result<Option<EventItem>> {
+        ed_override: Option<u64>) -> io::Result<Option<EventBatchItem>> {
 
         //Not allowed to downgrade your own permissions
         if allow_downgrade && current_user_hash == for_user_hash
@@ -139,16 +139,16 @@ impl UserAccessCache {
         event_item.uint_values = Some(vec![potential_access_level as u64]);
 
         let mut event_batch_item = EventBatchItem::new();
-        event_batch_item.events = vec![event_item.clone()];
+        event_batch_item.events = vec![event_item];
         event_batch_item.cb = Some(current_user_hash.to_string());
         event_batch_item.sd = current_time;
 
-        event_storage_cache.write(file_path, false, event_batch_item)?;
-
+        event_batch_item.si = event_storage_cache.write(file_path, false, event_batch_item.clone())?;
+        
         let project_to_user_access_level = self.get_or_build_cache(event_storage_cache, file_path);
         project_to_user_access_level.update_cache_for_user(for_user_hash, potential_access_level, allow_downgrade);
         
-        Ok(Some(event_item))
+        Ok(Some(event_batch_item))
     }
     
 }

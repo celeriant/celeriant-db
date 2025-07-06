@@ -12,7 +12,8 @@ pub struct ReadQuery {
     nonce: String,
     sign: String,
     from_si: Option<u64>,
-    share_key: Option<String>
+    share_key: Option<String>,
+    own_events: bool,
 }
 
 pub async fn read_events(
@@ -29,7 +30,7 @@ pub async fn read_events(
     let from_si = params.from_si.map_or(0, |f| f);
     let max_bytes = usize::MAX; //TODO: Implement proper max_bytes logic
     
-    match read_async(&state.workers, file_path, cb, params.share_key, from_si, max_bytes).await {
+    match read_async(&state.workers, file_path, cb, params.share_key, from_si, max_bytes, params.own_events).await {
         Ok(result) => {
             Ok(Json(result))
         }

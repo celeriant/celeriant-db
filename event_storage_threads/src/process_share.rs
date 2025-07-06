@@ -1,4 +1,4 @@
-use event_storage::{event_item::EventItem, event_storage_cache::EventStorageCache};
+use event_storage::{event_batch_item::EventBatchItem, event_item::EventItem, event_storage_cache::EventStorageCache};
 use eventplanedb_access::{access_level::AccessLevel, job_error::JobError, share_links_cache::ShareLinksCache, user_access_cache::UserAccessCache};
 
 pub fn handle_share_job(
@@ -13,7 +13,7 @@ pub fn handle_share_job(
     event_storage_cache: &mut EventStorageCache,
     share_links_cache: &mut ShareLinksCache,
     user_access_cache: &mut UserAccessCache,
-) -> Result<EventItem, JobError> {
+) -> Result<EventBatchItem, JobError> {
 
     AccessLevel::require_permission(
         event_storage_cache,

@@ -12,7 +12,7 @@ pub enum Job {
         iv: Option<Vec<u8>>,
         description: Option<String>,
         expires_on: u64,
-        responder: oneshot::Sender<Result<EventItem, JobError>>,
+        responder: oneshot::Sender<Result<EventBatchItem, JobError>>,
     },
     Write {
         file_path: String,
@@ -26,6 +26,7 @@ pub enum Job {
         cb: String,
         share_key: Option<String>,
         max_bytes: usize,
+        own_events: bool,
         responder: oneshot::Sender<Result<CatchupResult, JobError>>,
     },
     Shutdown {
