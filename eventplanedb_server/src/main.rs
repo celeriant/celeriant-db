@@ -47,13 +47,13 @@ pub fn create_router(state: AppState) -> Router {
         .allow_headers(Any)
         .max_age(Duration::from_secs(86400)); // 24 hours
 
-    let api = Router::new()
-        .route("/read", get(read_events))
-        .route("/write", post(write_events))
-        .route("/share", post(share));
+    let api_v1 = Router::new()
+        .route("/{pi}/read", get(read_events))
+        .route("/{pi}/write", post(write_events))
+        .route("/{pi}/share", post(share));
 
     Router::new()
-        .nest("/api", api)
+        .nest("/api/v1", api_v1)
         .layer(cors)
         .with_state(state)
 }

@@ -1,4 +1,4 @@
-use axum::{extract::Query, http::{HeaderMap, StatusCode}, Json};
+use axum::{extract::{Path, Query}, http::{HeaderMap, StatusCode}, Json};
 use event_storage::{event_batch_item::EventBatchItem};
 use event_storage_threads::{queue_jobs::share_async};
 use eventplanedb_access::{access_level::{AccessLevel}, job_error::JobError};
@@ -7,7 +7,6 @@ use crate::{app_state::AppState, crypto::Crypto};
 
 #[derive(Debug, Deserialize)]
 pub struct ShareQuery {
-    pi: String,
     access_level: u64,
     is_single_use: bool,
     iv: Option<Vec<u8>>,
@@ -22,9 +21,10 @@ pub struct ShareResponse {
 }
 
 pub async fn share(
-    Query(params): Query<ShareQuery>,
+    Path(id): Path<String>,
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: HeaderMap,
+    Json(share_body): Json<ShareQuery>,
 ) -> Result<Json<ShareResponse>, (StatusCode, String)> {
 
     let cb = match state.validate_auth_headers(&headers) {
@@ -32,12 +32,12 @@ pub async fn share(
         Err(e) => return Err(e),
     };
 
-    let file_path = state.get_file_path(&params.pi);
+    let file_path = state.get_file_path(&id);
     let share_key = nanoid::nanoid!();
     let share_hash = Crypto::generate_short_client_identity(share_key.as_bytes());
-    let access_level = AccessLevel::from(params.access_level);
+    let access_level = AccessLevel::from(share_body.access_level);
 
-    match share_async(&state.workers, file_path, cb, share_hash, access_level, params.is_single_use, params.iv, params.description, params.expires_on).await {
+    match share_async(&state.workers, file_path, cb, share_hash, access_level, share_body.is_single_use, share_body.iv, share_body.description, share_body.expires_on).await {
         Ok(share_event) => {
             Ok(Json(ShareResponse {
                 share_key,

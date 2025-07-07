@@ -1,4 +1,4 @@
-use axum::{extract::Query, http::{HeaderMap, StatusCode}, Json};
+use axum::{extract::{Path, Query}, http::{HeaderMap, StatusCode}, Json};
 use event_storage::{event_batch_item::EventBatchItem, event_item::EventItem};
 use event_storage_threads::{queue_jobs::write_async};
 use eventplanedb_access::job_error::JobError;
@@ -7,8 +7,7 @@ use crate::{app_state::AppState};
 
 #[derive(Debug, Deserialize)]
 pub struct WriteQuery {
-    pi: String,
-    create_if_not_exist: bool,
+    create_if_not_exist: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -19,6 +18,7 @@ pub struct WriteResponse {
 }
 
 pub async fn write_events(
+    Path(id): Path<String>,
     Query(params): Query<WriteQuery>,
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: HeaderMap,
@@ -33,7 +33,7 @@ pub async fn write_events(
         Err(e) => return Err(e),
     };
 
-    let file_path = state.get_file_path(&params.pi);
+    let file_path = state.get_file_path(&id);
     let server_time = chrono::Utc::now().timestamp_millis() as u64;
     
     // Create an EventBatchItem from the events
@@ -44,7 +44,7 @@ pub async fn write_events(
         events: events,
     };
 
-    match write_async(&state.workers, file_path, params.create_if_not_exist, event_batch).await {
+    match write_async(&state.workers, file_path, params.create_if_not_exist.unwrap_or(false), event_batch).await {
         Ok(write_result) => {
             Ok(Json(WriteResponse {
                 si: write_result.si,
