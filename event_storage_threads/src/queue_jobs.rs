@@ -1,5 +1,5 @@
 use crossbeam::channel::Sender;
-use event_storage::{catchup_result::CatchupResult, event_batch_item::EventBatchItem, event_item::EventItem};
+use event_storage::{catchup_result::CatchupResult, event_batch_item::EventBatchItem};
 use eventplanedb_access::{access_level::AccessLevel, job_error::JobError};
 use tokio::sync::oneshot;
 

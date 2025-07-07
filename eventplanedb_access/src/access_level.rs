@@ -1,7 +1,7 @@
-use event_storage::{event_batch_item::EventBatchItem, event_item::EventItem, event_storage_cache::EventStorageCache};
+use event_storage::{event_batch_item::EventBatchItem, event_storage_cache::EventStorageCache};
 use serde::{Deserialize, Serialize};
 
-use crate::{job_error::JobError, share_links_cache::ShareLinksCache, user_access_cache::{self, UserAccessCache}};
+use crate::{job_error::JobError, share_links_cache::ShareLinksCache, user_access_cache::{UserAccessCache}};
 
 #[derive(PartialEq, Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum AccessLevel {

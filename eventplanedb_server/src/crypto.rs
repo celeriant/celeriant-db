@@ -74,7 +74,7 @@ impl Crypto {
             Ok(data) => {
                 data
             }
-            Err(e) => {
+            Err(_) => {
                 return Err(CryptoError::InvalidSignature);
             }
         };
@@ -84,7 +84,7 @@ impl Crypto {
             Ok(sig) => {
                 sig
             }
-            Err(e) => {
+            Err(_) => {
                 return Err(CryptoError::InvalidSignature);
             }
         };
@@ -93,7 +93,7 @@ impl Crypto {
             Ok(_) => {
                 Ok(())
             }
-            Err(e) => {
+            Err(_) => {
                 Err(CryptoError::InvalidSignature)
             }
         }

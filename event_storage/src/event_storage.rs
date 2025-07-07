@@ -206,7 +206,7 @@ pub fn read_from_si(mut reader: &mut BufReader<File>, target_si: u64, max_bytes:
     let mut event_batches: Vec<Arc<EventBatchItem>> = Vec::new();
     let mut total_bytes = 0;
     
-    for (i, (batch_start_pos, batch_end_pos)) in batch_positions.iter().enumerate() {
+    for (batch_start_pos, batch_end_pos) in batch_positions.iter() {
 
         // If there is a tp_filter first check if this batch matches this tp
         if let Some(tp_filter) = tp_filter {
