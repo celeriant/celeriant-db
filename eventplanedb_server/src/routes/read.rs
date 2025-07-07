@@ -1,16 +1,13 @@
-use axum::{extract::Query, http::StatusCode, Json};
+use axum::{extract::Query, http::{HeaderMap, StatusCode}, Json};
 use event_storage::catchup_result::CatchupResult;
 use event_storage_threads::{queue_jobs::read_async};
 use eventplanedb_access::job_error::JobError;
 use serde::Deserialize;
-use crate::{app_state::AppState, crypto::Crypto};
+use crate::{app_state::AppState};
 
 #[derive(Debug, Deserialize)]
 pub struct ReadQuery {
     pi: String,
-    public_key: String,
-    nonce: String,
-    sign: String,
     from_si: Option<u64>,
     share_key: Option<String>,
     own_events: bool,
@@ -19,11 +16,12 @@ pub struct ReadQuery {
 pub async fn read_events(
     Query(params): Query<ReadQuery>,
     axum::extract::State(state): axum::extract::State<AppState>,
+    headers: HeaderMap,
 ) -> Result<Json<CatchupResult>, (StatusCode, String)> {
 
-    let cb = match Crypto::validate_with_public_key(&params.public_key, &params.nonce, &params.sign) {
-        Ok(cb) => cb, 
-        Err(e) => return Err((StatusCode::UNAUTHORIZED, e.to_string())),
+    let cb = match state.validate_auth_headers(&headers) {
+        Ok(cb) => cb,
+        Err(e) => return Err(e),
     };
     
     let file_path = state.get_file_path(&params.pi);

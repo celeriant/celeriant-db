@@ -1,4 +1,4 @@
-use axum::{extract::Query, http::StatusCode, Json};
+use axum::{extract::Query, http::{HeaderMap, StatusCode}, Json};
 use event_storage::{event_batch_item::EventBatchItem};
 use event_storage_threads::{queue_jobs::share_async};
 use eventplanedb_access::{access_level::{AccessLevel}, job_error::JobError};
@@ -8,9 +8,6 @@ use crate::{app_state::AppState, crypto::Crypto};
 #[derive(Debug, Deserialize)]
 pub struct ShareQuery {
     pi: String,
-    public_key: String,
-    nonce: String,
-    sign: String,
     access_level: u64,
     is_single_use: bool,
     iv: Option<Vec<u8>>,
@@ -27,11 +24,12 @@ pub struct ShareResponse {
 pub async fn share(
     Query(params): Query<ShareQuery>,
     axum::extract::State(state): axum::extract::State<AppState>,
+    headers: HeaderMap,
 ) -> Result<Json<ShareResponse>, (StatusCode, String)> {
 
-    let cb = match Crypto::validate_with_public_key(&params.public_key, &params.nonce, &params.sign) {
-        Ok(cb) => cb, 
-        Err(e) => return Err((StatusCode::UNAUTHORIZED, e.to_string())),
+    let cb = match state.validate_auth_headers(&headers) {
+        Ok(cb) => cb,
+        Err(e) => return Err(e),
     };
 
     let file_path = state.get_file_path(&params.pi);

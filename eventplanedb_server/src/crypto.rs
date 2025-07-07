@@ -1,8 +1,12 @@
 use std::time::{SystemTime, UNIX_EPOCH};
-use rsa::{pkcs1::DecodeRsaPublicKey, pkcs1v15::VerifyingKey, signature::Verifier, RsaPublicKey};
 use base64::{Engine as _, engine::general_purpose};
 use sha2::{Sha256, Digest};
-use rsa::pkcs8::DecodePublicKey;
+use rsa::{
+    pkcs8::DecodePublicKey,
+    pkcs1v15::{Signature}, 
+    RsaPublicKey,
+    signature::Verifier
+};
 
 const MAX_NONCE_TIME_MINUTES: f64 = 2.0;
 
@@ -43,30 +47,18 @@ impl Crypto {
         sign: &str,
     ) -> Result<(), CryptoError> {
         
-        // Fix the PEM formatting
-        let formatted_public_key = Self::fix_pem_formatting(public_key);
-
-        // Try to parse the public key - use SPKI format since your client sends "BEGIN PUBLIC KEY"
-        let rsa_public_key = match RsaPublicKey::from_public_key_pem(&formatted_public_key) {
-            Ok(key) => {
-                key
-            }
-            Err(e) => {
-                println!("DEBUG: Failed to parse as SPKI: {:?}", e);
-                // Fallback to PKCS#1 format
-                match RsaPublicKey::from_pkcs1_pem(&formatted_public_key) {
-                    Ok(key) => {
-                        key
-                    }
-                    Err(_) => {
-                        return Err(CryptoError::InvalidSignature);
-                    }
-                }
-            }
+        // Decode the base64 encoded public key
+        let public_key_bytes = match general_purpose::STANDARD.decode(public_key) {
+            Ok(bytes) => bytes,
+            Err(_) => return Err(CryptoError::InvalidSignature),
         };
 
-        // Create verifying key
-        let verifying_key = VerifyingKey::<Sha256>::new(rsa_public_key);
+        // Decode the RSA public key from DER format
+        let rsa_public_key = RsaPublicKey::from_public_key_der(&public_key_bytes)
+            .map_err(|_| CryptoError::InvalidSignature)?;
+
+        // Create a VerifyingKey for RSASSA-PKCS1-v1_5 with SHA-256
+        let verifying_key = rsa::pkcs1v15::VerifyingKey::<Sha256>::new(rsa_public_key);
 
         // Prepare data for verification
         let nonce_data = nonce.as_bytes();
@@ -79,83 +71,16 @@ impl Crypto {
             }
         };
 
-        // Verify signature
-        let signature = match rsa::pkcs1v15::Signature::try_from(sign_data.as_slice()) {
-            Ok(sig) => {
-                sig
-            }
-            Err(_) => {
-                return Err(CryptoError::InvalidSignature);
-            }
-        };
+        // Create a Signature from the decoded signature bytes
+        let signature = Signature::try_from(sign_data.as_slice())
+            .map_err(|_| CryptoError::InvalidSignature)?;
 
-        match verifying_key.verify(nonce_data, &signature) {
-            Ok(_) => {
-                Ok(())
-            }
-            Err(_) => {
-                Err(CryptoError::InvalidSignature)
-            }
-        }
+        // Verify the signature
+        verifying_key.verify(nonce_data, &signature)
+            .map_err(|_| CryptoError::InvalidSignature)?;
+
+        Ok(())
     }
-
-    fn fix_pem_formatting(pem_input: &str) -> String {
-        // Fast path: check if already properly formatted
-        if pem_input.lines().count() > 2 && 
-        pem_input.lines().skip(1).take_while(|line| !line.starts_with("-----END")).all(|line| line.len() <= 64) {
-            return pem_input.to_string();
-        }
-        
-        let is_spki = pem_input.contains("BEGIN PUBLIC KEY");
-        
-        let (start_marker, end_marker) = if is_spki {
-            ("-----BEGIN PUBLIC KEY-----", "-----END PUBLIC KEY-----")
-        } else {
-            ("-----BEGIN RSA PUBLIC KEY-----", "-----END RSA PUBLIC KEY-----")
-        };
-        
-        // Find markers - return original if not found
-        let start_pos = match pem_input.find(start_marker) {
-            Some(pos) => pos,
-            None => return pem_input.to_string(),
-        };
-        let end_pos = match pem_input.find(end_marker) {
-            Some(pos) => pos,
-            None => return pem_input.to_string(),
-        };
-        
-        // Extract base64 content directly
-        let content_start = start_pos + start_marker.len();
-        let raw_content = &pem_input[content_start..end_pos];
-        
-        // Pre-allocate with estimated capacity
-        let base64_len = raw_content.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '+' || *c == '/' || *c == '=').count();
-        let mut result = String::with_capacity(start_marker.len() + end_marker.len() + base64_len + (base64_len / 64) + 4);
-        
-        result.push_str(start_marker);
-        result.push('\n');
-        
-        // Process base64 content in chunks without collecting into Vec
-        let mut line_len = 0;
-        for c in raw_content.chars() {
-            if c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=' {
-                if line_len == 64 {
-                    result.push('\n');
-                    line_len = 0;
-                }
-                result.push(c);
-                line_len += 1;
-            }
-        }
-        
-        if line_len > 0 {
-            result.push('\n');
-        }
-        result.push_str(end_marker);
-        
-        result
-    }
-
 
     fn validate_nonce(nonce: &str) -> Result<(), CryptoError> {
         // Parse nonce as Unix timestamp

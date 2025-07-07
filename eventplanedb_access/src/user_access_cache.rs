@@ -155,7 +155,7 @@ impl UserAccessCache {
 
 #[cfg(test)]
 mod tests {
-    use std::{io, vec};
+    use std::{vec};
     use event_storage::event_item::EventItem;
     use crate::{access_level::AccessLevel, project_event_type::ProjectEventType, project_to_user_access_level::ProjectToUserAccessLevel};
     use event_storage::{event_batch_item::EventBatchItem, event_storage_cache::EventStorageCache};
@@ -543,7 +543,7 @@ mod tests {
 
         // Get the cache for the project
         {
-            let project_cache = user_access_cache.get_or_build_cache(&mut event_storage_cache, &file_path);
+            let _ = user_access_cache.get_or_build_cache(&mut event_storage_cache, &file_path);
         }
 
         // Verify that the cache is the same one that was inserted

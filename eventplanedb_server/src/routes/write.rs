@@ -1,16 +1,13 @@
-use axum::{extract::Query, http::StatusCode, Json};
+use axum::{extract::Query, http::{HeaderMap, StatusCode}, Json};
 use event_storage::{event_batch_item::EventBatchItem, event_item::EventItem};
 use event_storage_threads::{queue_jobs::write_async};
 use eventplanedb_access::job_error::JobError;
 use serde::{Deserialize, Serialize};
-use crate::{app_state::AppState, crypto::Crypto};
+use crate::{app_state::AppState};
 
 #[derive(Debug, Deserialize)]
 pub struct WriteQuery {
     pi: String,
-    public_key: String,
-    nonce: String,
-    sign: String,
     create_if_not_exist: bool,
 }
 
@@ -24,15 +21,16 @@ pub struct WriteResponse {
 pub async fn write_events(
     Query(params): Query<WriteQuery>,
     axum::extract::State(state): axum::extract::State<AppState>,
+    headers: HeaderMap,
     Json(events): Json<Vec<EventItem>>,
 ) -> Result<Json<WriteResponse>, (StatusCode, String)> {
     if events.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "No events provided".to_string()));
     }
 
-    let cb = match Crypto::validate_with_public_key(&params.public_key, &params.nonce, &params.sign) {
-        Ok(cb) => cb, 
-        Err(e) => return Err((StatusCode::UNAUTHORIZED, e.to_string())),
+    let cb = match state.validate_auth_headers(&headers) {
+        Ok(cb) => cb,
+        Err(e) => return Err(e),
     };
 
     let file_path = state.get_file_path(&params.pi);
