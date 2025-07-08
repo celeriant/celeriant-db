@@ -1,9 +1,13 @@
-use axum::{extract::{Path, Query}, http::{HeaderMap, StatusCode}, Json};
+use crate::app_state::AppState;
+use axum::{
+    Json,
+    extract::{Path, Query},
+    http::{HeaderMap, StatusCode},
+};
 use event_storage::{event_batch_item::EventBatchItem, event_item::EventItem};
-use event_storage_threads::{queue_jobs::write_async};
+use event_storage_threads::queue_jobs::write_async;
 use eventplanedb_access::job_error::JobError;
 use serde::{Deserialize, Serialize};
-use crate::{app_state::AppState};
 
 #[derive(Debug, Deserialize)]
 pub struct WriteQuery {
@@ -35,30 +39,28 @@ pub async fn write_events(
 
     let file_path = state.get_file_path(&id);
     let server_time = chrono::Utc::now().timestamp_millis() as u64;
-    
+
     // Create an EventBatchItem from the events
     let event_batch = EventBatchItem {
         si: 0, // Will be assigned by the storage system
         cb: Some(cb),
         sd: server_time,
-        events: events,
+        events,
     };
 
     match write_async(&state.workers, file_path, params.create_if_not_exist.unwrap_or(false), event_batch).await {
-        Ok(write_result) => {
-            Ok(Json(WriteResponse {
-                si: write_result.si,
-                event_batches: write_result.events,
-                server_time,
-            }))
-        }
+        Ok(write_result) => Ok(Json(WriteResponse {
+            si: write_result.si,
+            event_batches: write_result.events,
+            server_time,
+        })),
         Err(e) => {
             let (status, message) = match e {
                 JobError::PermissionDenied(msg) => (StatusCode::FORBIDDEN, msg),
                 JobError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
                 JobError::Other(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
             };
-            Err((status, format!("Failed to write events: {}", message)))
+            Err((status, format!("Failed to write events: {message}")))
         }
     }
 }

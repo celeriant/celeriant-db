@@ -1,7 +1,7 @@
 use event_storage::{event_batch_item::EventBatchItem, event_storage_cache::EventStorageCache};
 use serde::{Deserialize, Serialize};
 
-use crate::{job_error::JobError, share_links_cache::ShareLinksCache, user_access_cache::{UserAccessCache}};
+use crate::{job_error::JobError, share_links_cache::ShareLinksCache, user_access_cache::UserAccessCache};
 
 #[derive(PartialEq, Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum AccessLevel {
@@ -23,7 +23,6 @@ impl From<u64> for AccessLevel {
     }
 }
 
-
 impl AccessLevel {
     pub fn increases_access_level(current_access_level: AccessLevel, potential_access_level: AccessLevel) -> bool {
         current_access_level as u64 > potential_access_level as u64
@@ -42,11 +41,10 @@ impl AccessLevel {
         required_access_level: AccessLevel,
         potential_share_key_hash: Option<&str>,
     ) -> Result<Vec<EventBatchItem>, JobError> {
-        
         let mut new_events = Vec::new();
         let mut current_acces_level = user_access_cache.get_current_access_level(event_storage_cache, file_path, current_user_hash);
 
-        //Is there a share link provided that can increase the user's access level? 
+        //Is there a share link provided that can increase the user's access level?
         //If yes, use it (eager use of share links even when current action doesn't require that permission level)
         if let Some(share_key_hash) = potential_share_key_hash {
             if let Some(share_key_info) = share_links_cache.get_share_key_data_if_still_valid(event_storage_cache, file_path, share_key_hash) {
@@ -59,20 +57,28 @@ impl AccessLevel {
                     //The share link exists and can improve the users access level.
                     //Disable the share link if it is single use
                     if share_key_info.is_single_use {
-                        let disable_event_item = share_links_cache.disable_share_link(event_storage_cache, file_path, current_user_hash.to_string(), share_key_hash.to_string())?;
+                        let current_time = chrono::Utc::now().timestamp_millis() as u64;
+                        let disable_event_item = share_links_cache.disable_share_link(
+                            event_storage_cache,
+                            file_path,
+                            current_user_hash.to_string(),
+                            share_key_hash.to_string(),
+                            current_time,
+                        )?;
                         new_events.push(disable_event_item);
                     }
 
                     //Upgrade the users permissions linking the share link that was used
                     let provide_access_event = user_access_cache.update_access_for_user(
-                        event_storage_cache, 
-                        file_path, 
-                        current_user_hash, 
-                        current_user_hash, 
-                        new_access_level_granted_by_share_link, 
+                        event_storage_cache,
+                        file_path,
+                        current_user_hash,
+                        current_user_hash,
+                        new_access_level_granted_by_share_link,
                         false,
                         Some(share_key_hash),
-                        None)?;
+                        None,
+                    )?;
                     new_events.push(provide_access_event.unwrap());
                 }
             }
@@ -85,7 +91,6 @@ impl AccessLevel {
 
         Ok(new_events)
     }
-    
 }
 
 // ... existing code ...
@@ -141,7 +146,18 @@ mod tests {
         let mut user_access_cache = UserAccessCache::new(5);
 
         // Set user's access level to Contributor
-        user_access_cache.update_access_for_user(&mut event_storage_cache, &file_path, "admin", user_hash, AccessLevel::Contributor, false, None, None).unwrap();
+        user_access_cache
+            .update_access_for_user(
+                &mut event_storage_cache,
+                &file_path,
+                "admin",
+                user_hash,
+                AccessLevel::Contributor,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
 
         // Require Viewer access (which Contributor meets)
         let result = AccessLevel::require_permission(
@@ -177,7 +193,9 @@ mod tests {
         let mut user_access_cache = UserAccessCache::new(5);
 
         // Set user's access level to Viewer
-        user_access_cache.update_access_for_user(&mut event_storage_cache, &file_path, "admin", user_hash, AccessLevel::Viewer, false, None, None).unwrap();
+        user_access_cache
+            .update_access_for_user(&mut event_storage_cache, &file_path, "admin", user_hash, AccessLevel::Viewer, false, None, None)
+            .unwrap();
 
         // Require Contributor access (which Viewer does not meet)
         let result = AccessLevel::require_permission(
@@ -214,17 +232,19 @@ mod tests {
         let mut user_access_cache = UserAccessCache::new(5);
 
         // Create a share link with Contributor access
-        share_links_cache.create_share_link(
-            &mut event_storage_cache,
-            file_path.clone(),
-            "admin".to_string(),
-            share_key_hash.to_string(),
-            AccessLevel::Contributor,
-            false,
-            None,
-            None,
-            0
-        ).unwrap();
+        share_links_cache
+            .create_share_link(
+                &mut event_storage_cache,
+                file_path.clone(),
+                "admin".to_string(),
+                share_key_hash.to_string(),
+                AccessLevel::Contributor,
+                false,
+                None,
+                None,
+                0,
+            )
+            .unwrap();
 
         // Require Contributor access, providing the share link
         let result = AccessLevel::require_permission(
@@ -265,20 +285,24 @@ mod tests {
         let mut user_access_cache = UserAccessCache::new(5);
 
         // Set user's access level to Viewer
-        user_access_cache.update_access_for_user(&mut event_storage_cache, &file_path, "admin", user_hash, AccessLevel::Viewer, false, None, None).unwrap();
+        user_access_cache
+            .update_access_for_user(&mut event_storage_cache, &file_path, "admin", user_hash, AccessLevel::Viewer, false, None, None)
+            .unwrap();
 
         // Create a share link with Contributor access
-        share_links_cache.create_share_link(
-            &mut event_storage_cache,
-            file_path.clone(),
-            "admin".to_string(),
-            share_key_hash.to_string(),
-            AccessLevel::Contributor,
-            false,
-            None,
-            None,
-            0
-        ).unwrap();
+        share_links_cache
+            .create_share_link(
+                &mut event_storage_cache,
+                file_path.clone(),
+                "admin".to_string(),
+                share_key_hash.to_string(),
+                AccessLevel::Contributor,
+                false,
+                None,
+                None,
+                0,
+            )
+            .unwrap();
 
         // Require Owner access, providing the share link (Contributor is not enough)
         let result = AccessLevel::require_permission(
@@ -319,17 +343,19 @@ mod tests {
         let mut user_access_cache = UserAccessCache::new(5);
 
         // Create a single-use share link with Contributor access
-        share_links_cache.create_share_link(
-            &mut event_storage_cache,
-            file_path.clone(),
-            "admin".to_string(),
-            share_key_hash.to_string(),
-            AccessLevel::Contributor,
-            true,
-            None,
-            None,
-            0
-        ).unwrap();
+        share_links_cache
+            .create_share_link(
+                &mut event_storage_cache,
+                file_path.clone(),
+                "admin".to_string(),
+                share_key_hash.to_string(),
+                AccessLevel::Contributor,
+                true,
+                None,
+                None,
+                0,
+            )
+            .unwrap();
 
         // Require Contributor access, providing the share link
         let result = AccessLevel::require_permission(
@@ -346,10 +372,14 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify that the share link has been disabled (removed from cache)
-        assert!(share_links_cache.get_share_key_data_if_still_valid(&mut event_storage_cache, &file_path, share_key_hash).is_none());
+        assert!(
+            share_links_cache
+                .get_share_key_data_if_still_valid(&mut event_storage_cache, &file_path, share_key_hash)
+                .is_none()
+        );
 
         //Try to use the share link again, it should not work since single use
-         let result2 = AccessLevel::require_permission(
+        let result2 = AccessLevel::require_permission(
             &mut event_storage_cache,
             &mut share_links_cache,
             &mut user_access_cache,
@@ -382,20 +412,33 @@ mod tests {
         let mut user_access_cache = UserAccessCache::new(5);
 
         // Set user's access level to Contributor
-        user_access_cache.update_access_for_user(&mut event_storage_cache, &file_path, "admin", user_hash, AccessLevel::Contributor, false, None, None).unwrap();
+        user_access_cache
+            .update_access_for_user(
+                &mut event_storage_cache,
+                &file_path,
+                "admin",
+                user_hash,
+                AccessLevel::Contributor,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
 
         // Create a share link with Viewer access (lower than current)
-        share_links_cache.create_share_link(
-            &mut event_storage_cache,
-            file_path.clone(),
-            "admin".to_string(),
-            share_key_hash.to_string(),
-            AccessLevel::Viewer,
-            false,
-            None,
-            None,
-            0
-        ).unwrap();
+        share_links_cache
+            .create_share_link(
+                &mut event_storage_cache,
+                file_path.clone(),
+                "admin".to_string(),
+                share_key_hash.to_string(),
+                AccessLevel::Viewer,
+                false,
+                None,
+                None,
+                0,
+            )
+            .unwrap();
 
         // Require Contributor access, providing the share link
         let result = AccessLevel::require_permission(

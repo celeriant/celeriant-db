@@ -21,16 +21,16 @@ pub fn append_event_batch(writer: &mut BufWriter<File>, event_batch_item: &Event
     // Write everything in one go to minimize syscalls
     let total_size = BATCH_START_SIZE as usize + compressed_event_batch_item.len() + BATCH_METADATA_SIZE as usize;
     let mut write_buffer = Vec::with_capacity(total_size);
-    
+
     //Write the length of the compressed event batch item first for forward-based file recovery
     write_buffer.extend_from_slice(&(compressed_event_batch_item.len() as u64).to_le_bytes());
 
-    //Now we can write the actual event_batch_item data 
+    //Now we can write the actual event_batch_item data
     write_buffer.extend_from_slice(&compressed_event_batch_item);
-    
+
     // We need the original size of the event in bytes before compression to create the right buffer size
     write_buffer.extend_from_slice(&(encoded_event_batch_item.len() as u64).to_le_bytes());
-        
+
     // Write the event type if there is only a single event in the batch (for filtering later)
     let tp = if event_batch_item.events.len() == 1 {
         event_batch_item.events[0].tp
@@ -44,7 +44,7 @@ pub fn append_event_batch(writer: &mut BufWriter<File>, event_batch_item: &Event
 
     // Each batch is variable in length, so we need to know where it starts when reading backwards through the file
     write_buffer.extend_from_slice(&batch_start_pos.to_le_bytes());
-    
+
     // Magic number for corruption detection
     write_buffer.extend_from_slice(&MAGIC_NUMBER.to_le_bytes());
 
@@ -56,11 +56,7 @@ pub fn append_event_batch(writer: &mut BufWriter<File>, event_batch_item: &Event
     Ok(total_size)
 }
 
-fn read_u64_at_offset(
-    reader: &mut BufReader<File>,
-    current_pos: u64,
-    offset: u64,
-) -> io::Result<u64> {
+fn read_u64_at_offset(reader: &mut BufReader<File>, current_pos: u64, offset: u64) -> io::Result<u64> {
     reader.seek(SeekFrom::Start(current_pos - offset))?;
 
     let mut bytes = [0u8; 8];
@@ -69,18 +65,10 @@ fn read_u64_at_offset(
     Ok(u64::from_le_bytes(bytes))
 }
 
-fn seek_to_and_read_exact(
-    reader: &mut BufReader<File>,
-    seek_to: u64,
-    data_size: usize
-) -> io::Result<Vec<u8>> {
+fn seek_to_and_read_exact(reader: &mut BufReader<File>, seek_to: u64, data_size: usize) -> io::Result<Vec<u8>> {
     reader.seek(SeekFrom::Start(seek_to))?;
 
-    // Pre-allocate with known capacity and avoid zeroing
-    let mut data = Vec::with_capacity(data_size);
-    unsafe {
-        data.set_len(data_size);
-    }
+    let mut data = vec![0; data_size];
     reader.read_exact(&mut data)?;
 
     Ok(data)
@@ -106,26 +94,26 @@ fn read_batch_at_position(reader: &mut BufReader<File>, current_pos: u64, batch_
 
 pub fn find_last_valid_event_batch(mut reader: &mut BufReader<File>) -> io::Result<u64> {
     let file_size = reader.get_ref().metadata()?.len();
-    
+
     if file_size < BATCH_START_SIZE + BATCH_METADATA_SIZE {
         return Ok(0); // File too small to contain any valid batch
     }
-    
+
     let mut current_pos = 0u64;
     let mut last_valid_pos = 0u64;
-    
+
     while current_pos + BATCH_START_SIZE + BATCH_METADATA_SIZE <= file_size {
         // Read the compressed data size from the beginning of the batch
         let compressed_size = read_u64_at_offset(&mut reader, current_pos, 0)?;
-        
+
         // Calculate where this batch should end
         let batch_end_pos = current_pos + BATCH_START_SIZE + compressed_size + BATCH_METADATA_SIZE;
-        
+
         // Check if the batch would extend beyond the file
         if batch_end_pos > file_size {
             break;
         }
-        
+
         // Check if the magic number is correct at the expected end position
         if !is_batch_corrupt(&mut reader, batch_end_pos) {
             last_valid_pos = batch_end_pos;
@@ -134,7 +122,7 @@ pub fn find_last_valid_event_batch(mut reader: &mut BufReader<File>) -> io::Resu
             break; // Found corruption, stop here
         }
     }
-    
+
     Ok(last_valid_pos)
 }
 
@@ -142,10 +130,7 @@ pub fn find_last_si(mut reader: &mut BufReader<File>) -> io::Result<Option<u64>>
     let file_size = reader.get_ref().metadata()?.len();
 
     if file_size < BATCH_METADATA_SIZE || is_batch_corrupt(&mut reader, file_size) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Batch data is corrupt, file recovery needed"
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Batch data is corrupt, file recovery needed"));
     }
 
     let last_si = read_u64_at_offset(&mut reader, file_size, SI_OFFSET)?;
@@ -167,10 +152,7 @@ pub fn read_from_si(mut reader: &mut BufReader<File>, target_si: u64, max_bytes:
     let file_size = reader.get_ref().metadata()?.len();
 
     if file_size < BATCH_METADATA_SIZE {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Batch data is corrupt, file recovery needed"
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Batch data is corrupt, file recovery needed"));
     }
 
     let mut batch_positions = Vec::new();
@@ -179,12 +161,9 @@ pub fn read_from_si(mut reader: &mut BufReader<File>, target_si: u64, max_bytes:
     // Collect batch positions until we find the target batch (scanning backwards)
     while current_pos >= BATCH_METADATA_SIZE {
         if is_batch_corrupt(&mut reader, current_pos) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Batch data is corrupt, file recovery needed"
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Batch data is corrupt, file recovery needed"));
         }
-        
+
         let batch_start_pos = read_u64_at_offset(&mut reader, current_pos, BATCH_START_POS_OFFSET)?;
 
         // Read first si of this batch to check if we've reached our target
@@ -205,9 +184,8 @@ pub fn read_from_si(mut reader: &mut BufReader<File>, target_si: u64, max_bytes:
 
     let mut event_batches: Vec<Arc<EventBatchItem>> = Vec::new();
     let mut total_bytes = 0;
-    
-    for (batch_start_pos, batch_end_pos) in batch_positions.iter() {
 
+    for (batch_start_pos, batch_end_pos) in batch_positions.iter() {
         // If there is a tp_filter first check if this batch matches this tp
         if let Some(tp_filter) = tp_filter {
             let batch_tp = read_u64_at_offset(reader, *batch_end_pos, TP_OFFSET)?;
@@ -223,10 +201,9 @@ pub fn read_from_si(mut reader: &mut BufReader<File>, target_si: u64, max_bytes:
             }
         }
 
-        
-        let events = read_batch_at_position(&mut reader, *batch_end_pos, *batch_start_pos)?;        
+        let events = read_batch_at_position(&mut reader, *batch_end_pos, *batch_start_pos)?;
         event_batches.push(Arc::new(events));
-                
+
         let compressed_data_size = (batch_end_pos - batch_start_pos) as usize;
         total_bytes += compressed_data_size + BATCH_START_SIZE as usize + BATCH_METADATA_SIZE as usize;
 
@@ -236,7 +213,7 @@ pub fn read_from_si(mut reader: &mut BufReader<File>, target_si: u64, max_bytes:
             let next_si = Some(event_batches.last().unwrap().si + 1);
             return Ok(CatchupResult {
                 event_batches: event_batches,
-                next_si: next_si
+                next_si: next_si,
             });
         }
     }
@@ -250,48 +227,34 @@ pub fn read_from_si(mut reader: &mut BufReader<File>, target_si: u64, max_bytes:
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use crate::event_item::tests::{create_minimal_event_item, create_test_event_item};
     use crate::event_item::EventItem;
+    use crate::event_item::tests::{create_minimal_event_item, create_test_event_item};
     use crate::file_cache::{create_append_writer, create_reader};
     use std::fs::OpenOptions;
     use std::usize;
     use tempfile::TempDir;
 
-    pub fn create_event_batch_item(
-        si: u64,
-        cb: Option<String>,
-        sd: u64,
-        events: Vec<EventItem>,
-    ) -> EventBatchItem {
-        EventBatchItem {
-            si,
-            cb,
-            sd,
-            events,
-        }
+    pub fn create_event_batch_item(si: u64, cb: Option<String>, sd: u64, events: Vec<EventItem>) -> EventBatchItem {
+        EventBatchItem { si, cb, sd, events }
     }
 
     #[test]
     fn test_corrupt_file() {
-        let events_batch_1 = create_event_batch_item(0, None, 123, vec![
-            create_test_event_item(),
-            create_minimal_event_item(),
-            create_test_event_item(),
-        ]);
-        let events_batch_2 = create_event_batch_item(1, None, 456, vec![
-            create_test_event_item(),
-            create_minimal_event_item(),
-        ]);
-        let events_batch_3 = create_event_batch_item(2, None, 789, vec![
-            create_minimal_event_item(),
-        ]);
+        let events_batch_1 = create_event_batch_item(
+            0,
+            None,
+            123,
+            vec![create_test_event_item(), create_minimal_event_item(), create_test_event_item()],
+        );
+        let events_batch_2 = create_event_batch_item(1, None, 456, vec![create_test_event_item(), create_minimal_event_item()]);
+        let events_batch_3 = create_event_batch_item(2, None, 789, vec![create_minimal_event_item()]);
 
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let temp_path = temp_dir.path();
         let events_bin = temp_path.join("events.bin");
 
         let mut writer = create_append_writer(events_bin.to_str().unwrap()).unwrap();
-        
+
         append_event_batch(&mut writer, &events_batch_1).unwrap();
         append_event_batch(&mut writer, &events_batch_2).unwrap();
 
@@ -301,17 +264,14 @@ pub mod tests {
         append_event_batch(&mut writer, &events_batch_3).unwrap();
 
         //Truncate the file back
-        let file = OpenOptions::new()
-            .write(true)
-            .open(events_bin.to_str().unwrap())
-            .unwrap();
+        let file = OpenOptions::new().write(true).open(events_bin.to_str().unwrap()).unwrap();
 
         // Set the file length.
         file.set_len(current_file_size + 99).unwrap();
-        
+
         let mut reader = create_reader(events_bin.to_str().unwrap()).unwrap();
         let catchup_result = read_from_si(&mut reader, 0, usize::MAX, None);
-        
+
         assert!(catchup_result.is_err());
         let error = catchup_result.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
@@ -324,18 +284,14 @@ pub mod tests {
 
     #[test]
     fn test_max_bytes_limit() {
-        let events_batch_1 = create_event_batch_item(0, None, 123, vec![
-            create_test_event_item(),
-            create_minimal_event_item(),
-            create_test_event_item(),
-        ]);
-        let events_batch_2 = create_event_batch_item(1, None, 456, vec![
-            create_test_event_item(),
-            create_minimal_event_item(),
-        ]);
-        let events_batch_3 = create_event_batch_item(2, None, 789, vec![
-            create_minimal_event_item(),
-        ]);
+        let events_batch_1 = create_event_batch_item(
+            0,
+            None,
+            123,
+            vec![create_test_event_item(), create_minimal_event_item(), create_test_event_item()],
+        );
+        let events_batch_2 = create_event_batch_item(1, None, 456, vec![create_test_event_item(), create_minimal_event_item()]);
+        let events_batch_3 = create_event_batch_item(2, None, 789, vec![create_minimal_event_item()]);
 
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let temp_path = temp_dir.path();
@@ -375,18 +331,14 @@ pub mod tests {
 
     #[test]
     fn test_read_write_with_event_storage_format() {
-        let events_batch_1 = create_event_batch_item(0, None, 123, vec![
-            create_test_event_item(),
-            create_minimal_event_item(),
-            create_test_event_item(),
-        ]);
-        let events_batch_2 = create_event_batch_item(1, None, 456, vec![
-            create_test_event_item(),
-            create_minimal_event_item(),
-        ]);
-        let events_batch_3 = create_event_batch_item(2, None, 789, vec![
-            create_minimal_event_item(),
-        ]);
+        let events_batch_1 = create_event_batch_item(
+            0,
+            None,
+            123,
+            vec![create_test_event_item(), create_minimal_event_item(), create_test_event_item()],
+        );
+        let events_batch_2 = create_event_batch_item(1, None, 456, vec![create_test_event_item(), create_minimal_event_item()]);
+        let events_batch_3 = create_event_batch_item(2, None, 789, vec![create_minimal_event_item()]);
 
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let temp_path = temp_dir.path();
@@ -434,11 +386,12 @@ pub mod tests {
 
     #[test]
     fn test_invalid_catch_up() {
-        let events_batch_1 = create_event_batch_item(0, None, 123, vec![
-            create_test_event_item(),
-            create_minimal_event_item(),
-            create_test_event_item(),
-        ]);
+        let events_batch_1 = create_event_batch_item(
+            0,
+            None,
+            123,
+            vec![create_test_event_item(), create_minimal_event_item(), create_test_event_item()],
+        );
 
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let temp_path = temp_dir.path();
@@ -458,18 +411,14 @@ pub mod tests {
 
     #[test]
     fn test_valid_catchup_scenarios() {
-        let events_batch_1 = create_event_batch_item(0, None, 123, vec![
-            create_test_event_item(),
-            create_minimal_event_item(),
-            create_test_event_item(),
-        ]);
-        let events_batch_2 = create_event_batch_item(1, None, 456, vec![
-            create_test_event_item(),
-            create_minimal_event_item(),
-        ]);
-        let events_batch_3 = create_event_batch_item(2, None, 789, vec![
-            create_minimal_event_item(),
-        ]);
+        let events_batch_1 = create_event_batch_item(
+            0,
+            None,
+            123,
+            vec![create_test_event_item(), create_minimal_event_item(), create_test_event_item()],
+        );
+        let events_batch_2 = create_event_batch_item(1, None, 456, vec![create_test_event_item(), create_minimal_event_item()]);
+        let events_batch_3 = create_event_batch_item(2, None, 789, vec![create_minimal_event_item()]);
 
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let temp_path = temp_dir.path();
@@ -525,23 +474,16 @@ pub mod tests {
 
     #[test]
     fn test_find_last_valid_event_batch_corrupted_file() {
-        let events_batch_1 = create_event_batch_item(0, None, 123, vec![
-            create_test_event_item(),
-            create_minimal_event_item(),
-        ]);
-        let events_batch_2 = create_event_batch_item(1, None, 456, vec![
-            create_test_event_item(),
-        ]);
-        let events_batch_3 = create_event_batch_item(2, None, 789, vec![
-            create_minimal_event_item(),
-        ]);
+        let events_batch_1 = create_event_batch_item(0, None, 123, vec![create_test_event_item(), create_minimal_event_item()]);
+        let events_batch_2 = create_event_batch_item(1, None, 456, vec![create_test_event_item()]);
+        let events_batch_3 = create_event_batch_item(2, None, 789, vec![create_minimal_event_item()]);
 
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let temp_path = temp_dir.path();
         let events_bin = temp_path.join("events.bin");
 
         let mut writer = create_append_writer(events_bin.to_str().unwrap()).unwrap();
-        
+
         append_event_batch(&mut writer, &events_batch_1).unwrap();
         append_event_batch(&mut writer, &events_batch_2).unwrap();
 
@@ -553,43 +495,35 @@ pub mod tests {
         append_event_batch(&mut writer, &events_batch_3).unwrap();
 
         // Corrupt the file by truncating it in the middle of the third batch
-        let file = OpenOptions::new()
-            .write(true)
-            .open(events_bin.to_str().unwrap())
-            .unwrap();
+        let file = OpenOptions::new().write(true).open(events_bin.to_str().unwrap()).unwrap();
         file.set_len(valid_end_pos + 50).unwrap(); // Truncate partway through third batch
 
         // Test that find_last_valid_event_batch returns position after second batch
         let mut reader = create_reader(events_bin.to_str().unwrap()).unwrap();
         let last_valid_pos = find_last_valid_event_batch(&mut reader).unwrap();
-        
+
         assert_eq!(last_valid_pos, valid_end_pos);
     }
 
     #[test]
     fn test_find_last_valid_event_batch_uncorrupted_file() {
-        let events_batch_1 = create_event_batch_item(0, None, 123, vec![
-            create_test_event_item(),
-            create_minimal_event_item(),
-        ]);
-        let events_batch_2 = create_event_batch_item(1, None, 456, vec![
-            create_test_event_item(),
-        ]);
+        let events_batch_1 = create_event_batch_item(0, None, 123, vec![create_test_event_item(), create_minimal_event_item()]);
+        let events_batch_2 = create_event_batch_item(1, None, 456, vec![create_test_event_item()]);
 
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let temp_path = temp_dir.path();
         let events_bin = temp_path.join("events.bin");
 
         let mut writer = create_append_writer(events_bin.to_str().unwrap()).unwrap();
-        
+
         append_event_batch(&mut writer, &events_batch_1).unwrap();
         append_event_batch(&mut writer, &events_batch_2).unwrap();
 
         let mut reader = create_reader(events_bin.to_str().unwrap()).unwrap();
         let file_size = reader.get_ref().metadata().unwrap().len();
-        
+
         let last_valid_pos = find_last_valid_event_batch(&mut reader).unwrap();
-        
+
         // Should return the exact end of file position since no corruption
         assert_eq!(last_valid_pos, file_size);
     }
@@ -607,9 +541,8 @@ pub mod tests {
 
         let mut reader = create_reader(events_bin.to_str().unwrap()).unwrap();
         let last_valid_pos = find_last_valid_event_batch(&mut reader).unwrap();
-        
+
         // Should return 0 since no valid batches found
         assert_eq!(last_valid_pos, 0);
     }
-
 }

@@ -31,6 +31,32 @@ pub enum Job {
         own_events: bool,
         responder: oneshot::Sender<Result<CatchupResult, JobError>>,
     },
+    DisableUser {
+        file_path: String,
+        cb: String,
+        server_time: u64,
+        user_hash: String,
+        responder: oneshot::Sender<Result<WriteResult, JobError>>,
+    },
+    DisableShare {
+        file_path: String,
+        cb: String,
+        server_time: u64,
+        share_hash: String,
+        responder: oneshot::Sender<Result<WriteResult, JobError>>,
+    },
+    Delete {
+        file_path: String,
+        cb: String,
+        server_time: u64,
+        responder: oneshot::Sender<Result<WriteResult, JobError>>,
+    },
+    Restore {
+        file_path: String,
+        cb: String,
+        server_time: u64,
+        responder: oneshot::Sender<Result<WriteResult, JobError>>,
+    },
     Shutdown {
         responder: oneshot::Sender<()>,
     },

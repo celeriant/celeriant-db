@@ -1,6 +1,9 @@
-use std::{collections::{HashMap, VecDeque}, io, usize};
-use event_storage::{event_batch_item::EventBatchItem, event_item::EventItem, event_storage_cache::{EventStorageCache}};
 use crate::{access_level::AccessLevel, project_event_type::ProjectEventType, project_to_user_access_level::ProjectToUserAccessLevel};
+use event_storage::{event_batch_item::EventBatchItem, event_item::EventItem, event_storage_cache::EventStorageCache};
+use std::{
+    collections::{HashMap, VecDeque},
+    io, usize,
+};
 
 pub struct UserAccessCache {
     // The queue is used to evict the oldest files from the cache when the cache is full
@@ -14,9 +17,7 @@ pub struct UserAccessCache {
 }
 
 impl UserAccessCache {
-    pub fn new(
-        cache_max_project_count: usize,
-    ) -> Self {
+    pub fn new(cache_max_project_count: usize) -> Self {
         Self {
             cache_queue: VecDeque::new(),
             cache: HashMap::new(),
@@ -26,7 +27,6 @@ impl UserAccessCache {
 
     /// If we have exeeded the maximum nbr of projects in the cache, clear out the oldest ones
     fn clear_cache(&mut self) {
-        
         if self.cache.len() < self.cache_max_project_count {
             return;
         }
@@ -41,11 +41,7 @@ impl UserAccessCache {
     }
 
     /// Grab the current cache for a project, or build it if it doesn't exist and add it to the cache
-    fn get_or_build_cache(
-        &mut self,
-        event_storage_cache: &mut EventStorageCache,
-        file_path: &str,
-    ) -> &mut ProjectToUserAccessLevel {
+    fn get_or_build_cache(&mut self, event_storage_cache: &mut EventStorageCache, file_path: &str) -> &mut ProjectToUserAccessLevel {
         self.clear_cache();
 
         if self.cache.contains_key(file_path) {
@@ -68,16 +64,16 @@ impl UserAccessCache {
 
         match event_storage_cache.read(file_path, 0, usize::MAX, Some(&[ProjectEventType::ProvideAccess as u64])) {
             Ok(result) => {
-                for batch in result.event_batches  {
+                for batch in result.event_batches {
                     for event in batch.events.iter() {
-
                         // Check the event is a ProvideAccess event and has the correct data
-                        if event.tp != ProjectEventType::ProvideAccess as u64 ||
-                        event.string_values.as_ref().is_none() ||
-                        event.string_values.as_ref().unwrap().len() < 1 ||
-                        event.string_values.as_ref().unwrap()[0].is_none() ||
-                        event.uint_values.is_none() || 
-                        event.uint_values.as_ref().unwrap().len() == 0{
+                        if event.tp != ProjectEventType::ProvideAccess as u64
+                            || event.string_values.as_ref().is_none()
+                            || event.string_values.as_ref().unwrap().len() < 1
+                            || event.string_values.as_ref().unwrap()[0].is_none()
+                            || event.uint_values.is_none()
+                            || event.uint_values.as_ref().unwrap().len() == 0
+                        {
                             continue;
                         }
 
@@ -86,15 +82,15 @@ impl UserAccessCache {
                         let user_hash = event.string_values.as_ref().unwrap()[0].as_ref().unwrap().clone();
                         let access_level = AccessLevel::from(event.uint_values.as_ref().unwrap()[0]);
 
-                        // As we process events in chronological order, allow the users' access 
+                        // As we process events in chronological order, allow the users' access
                         // to upgrade OR downgrade depending on the event's access level
                         project_to_user_access_level.update_cache_for_user(&user_hash, access_level, true);
                     }
                 }
-            },
+            }
 
             // Fail to read, skip populating the cache for this project. Could be a new project or file deleted.
-            Err(_) => { }
+            Err(_) => {}
         }
     }
 
@@ -105,27 +101,27 @@ impl UserAccessCache {
     }
 
     /// Change the access level for for_user_hash. Adds an event to the file and updates the cache.
-    pub fn update_access_for_user(&mut self, 
-        event_storage_cache: &mut EventStorageCache, 
-        file_path: &str, 
-        current_user_hash: &str, 
+    pub fn update_access_for_user(
+        &mut self,
+        event_storage_cache: &mut EventStorageCache,
+        file_path: &str,
+        current_user_hash: &str,
         for_user_hash: &str,
         potential_access_level: AccessLevel,
-        allow_downgrade: bool, 
-        share_key_hash: Option<&str>, 
-        ed_override: Option<u64>) -> io::Result<Option<EventBatchItem>> {
-
+        allow_downgrade: bool,
+        share_key_hash: Option<&str>,
+        ed_override: Option<u64>,
+    ) -> io::Result<Option<EventBatchItem>> {
         //Not allowed to downgrade your own permissions
-        if allow_downgrade && current_user_hash == for_user_hash
-        {
+        if allow_downgrade && current_user_hash == for_user_hash {
             return Ok(None);
         }
 
         let current_access_level = self.get_current_access_level(event_storage_cache, file_path, for_user_hash);
 
         //No op as same permission level or lower level and not downgrading
-        if current_access_level == potential_access_level || 
-        !allow_downgrade && !AccessLevel::increases_access_level(current_access_level, potential_access_level)
+        if current_access_level == potential_access_level
+            || !allow_downgrade && !AccessLevel::increases_access_level(current_access_level, potential_access_level)
         {
             return Ok(None);
         }
@@ -135,7 +131,7 @@ impl UserAccessCache {
         let mut event_item = EventItem::new();
         event_item.ed = current_time;
         event_item.tp = ProjectEventType::ProvideAccess as u64;
-        event_item.string_values = Some(vec![Some(for_user_hash.to_string()), share_key_hash.map_or(None,|f| Some(f.to_string()))]);
+        event_item.string_values = Some(vec![Some(for_user_hash.to_string()), share_key_hash.map_or(None, |f| Some(f.to_string()))]);
         event_item.uint_values = Some(vec![potential_access_level as u64]);
 
         let mut event_batch_item = EventBatchItem::new();
@@ -144,21 +140,20 @@ impl UserAccessCache {
         event_batch_item.sd = current_time;
 
         event_batch_item.si = event_storage_cache.write(file_path, false, event_batch_item.clone())?;
-        
+
         let project_to_user_access_level = self.get_or_build_cache(event_storage_cache, file_path);
         project_to_user_access_level.update_cache_for_user(for_user_hash, potential_access_level, allow_downgrade);
-        
+
         Ok(Some(event_batch_item))
     }
-    
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{vec};
-    use event_storage::event_item::EventItem;
     use crate::{access_level::AccessLevel, project_event_type::ProjectEventType, project_to_user_access_level::ProjectToUserAccessLevel};
+    use event_storage::event_item::EventItem;
     use event_storage::{event_batch_item::EventBatchItem, event_storage_cache::EventStorageCache};
+    use std::vec;
     use tempfile::TempDir;
 
     use super::*;
@@ -651,11 +646,26 @@ mod tests {
         user_access_cache.cache.insert(file_path.clone(), project_cache);
 
         // Verify that the correct access levels are returned
-        assert_eq!(user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, "owner"), AccessLevel::Owner);
-        assert_eq!(user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, "contributor"), AccessLevel::Contributor);
-        assert_eq!(user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, "viewer"), AccessLevel::Viewer);
-        assert_eq!(user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, "none"), AccessLevel::None);
-        assert_eq!(user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, "unknown"), AccessLevel::None); // Non-existent user
+        assert_eq!(
+            user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, "owner"),
+            AccessLevel::Owner
+        );
+        assert_eq!(
+            user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, "contributor"),
+            AccessLevel::Contributor
+        );
+        assert_eq!(
+            user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, "viewer"),
+            AccessLevel::Viewer
+        );
+        assert_eq!(
+            user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, "none"),
+            AccessLevel::None
+        );
+        assert_eq!(
+            user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, "unknown"),
+            AccessLevel::None
+        ); // Non-existent user
     }
 
     #[test]
@@ -670,7 +680,18 @@ mod tests {
         user_access_cache.cache.insert(file_path.clone(), project_cache);
 
         // Attempt to downgrade own access level
-        let result = user_access_cache.update_access_for_user(&mut event_storage_cache, &file_path, user_hash, user_hash, AccessLevel::Viewer, true, None, None).unwrap();
+        let result = user_access_cache
+            .update_access_for_user(
+                &mut event_storage_cache,
+                &file_path,
+                user_hash,
+                user_hash,
+                AccessLevel::Viewer,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
 
         // Verify that the update was prevented (returns None)
         assert!(result.is_none());
@@ -692,7 +713,9 @@ mod tests {
         user_access_cache.cache.insert(file_path.clone(), project_cache);
 
         // Attempt to upgrade own access level
-        let result = user_access_cache.update_access_for_user(&mut event_storage_cache, &file_path, user_hash, user_hash, AccessLevel::Owner, true, None, None).unwrap();
+        let result = user_access_cache
+            .update_access_for_user(&mut event_storage_cache, &file_path, user_hash, user_hash, AccessLevel::Owner, true, None, None)
+            .unwrap();
 
         // Verify that the update was successful (returns Some(EventItem))
         assert!(result.is_none());
@@ -704,7 +727,7 @@ mod tests {
 
     #[test]
     fn test_update_access_for_user_returns_none_for_same_access_level_no_op() {
-       let (mut user_access_cache, mut event_storage_cache, temp_dir) = setup_cache(5);
+        let (mut user_access_cache, mut event_storage_cache, temp_dir) = setup_cache(5);
         let file_path = create_file_path(&temp_dir, "project1.bin");
         let user_hash = "user1";
 
@@ -714,7 +737,18 @@ mod tests {
         user_access_cache.cache.insert(file_path.clone(), project_cache);
 
         // Attempt to set same access level
-        let result = user_access_cache.update_access_for_user(&mut event_storage_cache, &file_path, "admin", user_hash, AccessLevel::Contributor, true, None, None).unwrap();
+        let result = user_access_cache
+            .update_access_for_user(
+                &mut event_storage_cache,
+                &file_path,
+                "admin",
+                user_hash,
+                AccessLevel::Contributor,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
 
         // Verify that the update was a no-op (returns None)
         assert!(result.is_none());

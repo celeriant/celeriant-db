@@ -1,5 +1,9 @@
 use crate::job::Job;
+use crate::process_delete::handle_delete_job;
+use crate::process_disable_share::handle_disable_share_job;
+use crate::process_disable_user::handle_disable_user_job;
 use crate::process_read::handle_read_job;
+use crate::process_restore::handle_restore_job;
 use crate::process_share::handle_share_job;
 use crate::process_write::handle_write_job;
 use core_affinity;
@@ -29,7 +33,6 @@ pub fn create_thread_pool(required_thread_count: usize) -> Vec<Sender<Job>> {
 
             for job in rx.iter() {
                 match job {
-
                     Job::Share {
                         file_path,
                         cb,
@@ -88,6 +91,74 @@ pub fn create_thread_pool(required_thread_count: usize) -> Vec<Sender<Job>> {
                             share_key,
                             max_bytes,
                             own_events,
+                            &mut event_storage_cache,
+                            &mut share_links_cache,
+                            &mut user_access_cache,
+                        ));
+                    }
+
+                    Job::Delete {
+                        file_path,
+                        cb,
+                        server_time,
+                        responder,
+                    } => {
+                        let _ = responder.send(handle_delete_job(
+                            file_path,
+                            cb,
+                            server_time,
+                            &mut event_storage_cache,
+                            &mut share_links_cache,
+                            &mut user_access_cache,
+                        ));
+                    }
+
+                    Job::Restore {
+                        file_path,
+                        cb,
+                        server_time,
+                        responder,
+                    } => {
+                        let _ = responder.send(handle_restore_job(
+                            file_path,
+                            cb,
+                            server_time,
+                            &mut event_storage_cache,
+                            &mut share_links_cache,
+                            &mut user_access_cache,
+                        ));
+                    }
+
+                    Job::DisableUser {
+                        file_path,
+                        cb,
+                        server_time,
+                        user_hash,
+                        responder,
+                    } => {
+                        let _ = responder.send(handle_disable_user_job(
+                            file_path,
+                            cb,
+                            server_time,
+                            user_hash,
+                            &mut event_storage_cache,
+                            &mut share_links_cache,
+                            &mut user_access_cache,
+                        ));
+                    }
+
+                    Job::DisableShare {
+                        file_path,
+                        cb,
+                        server_time,
+                        share_hash,
+                        responder,
+                    } => {
+                        let _ = responder.send(handle_disable_share_job(
+                            file_path,
+                            cb,
+                            server_time,
+                            share_hash,
                             &mut event_storage_cache,
                             &mut share_links_cache,
                             &mut user_access_cache,
