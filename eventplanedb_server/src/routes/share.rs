@@ -1,4 +1,4 @@
-use crate::{app_state::AppState, crypto::Crypto};
+use crate::{app_state::AppState, crypto::Crypto, json_formatter::CompactJson};
 use axum::{
     Json,
     extract::Path,
@@ -29,7 +29,7 @@ pub async fn share(
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: HeaderMap,
     Json(share_body): Json<ShareQuery>,
-) -> Result<Json<ShareResponse>, (StatusCode, String)> {
+) -> Result<CompactJson<ShareResponse>, (StatusCode, String)> {
     let cb = match state.validate_auth_headers(&headers) {
         Ok(cb) => cb,
         Err(e) => return Err(e),
@@ -53,7 +53,7 @@ pub async fn share(
     )
     .await
     {
-        Ok(share_event) => Ok(Json(ShareResponse { share_key, share_event })),
+        Ok(share_event) => Ok(CompactJson(ShareResponse { share_key, share_event })),
         Err(e) => {
             let (status, message) = match e {
                 JobError::PermissionDenied(msg) => (StatusCode::FORBIDDEN, msg),

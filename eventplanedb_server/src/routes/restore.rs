@@ -1,6 +1,5 @@
-use crate::app_state::AppState;
+use crate::{app_state::AppState, json_formatter::CompactJson};
 use axum::{
-    Json,
     extract::Path,
     http::{HeaderMap, StatusCode},
 };
@@ -20,7 +19,7 @@ pub async fn restore(
     Path(pi): Path<String>,
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<RestoreResponse>, (StatusCode, String)> {
+) -> Result<CompactJson<RestoreResponse>, (StatusCode, String)> {
     let cb = match state.validate_auth_headers(&headers) {
         Ok(cb) => cb,
         Err(e) => return Err(e),
@@ -31,7 +30,7 @@ pub async fn restore(
     let server_time = chrono::Utc::now().timestamp_millis() as u64;
 
     match restore_async(&state.workers, file_path, cb, server_time).await {
-        Ok(write_result) => Ok(Json(RestoreResponse {
+        Ok(write_result) => Ok(CompactJson(RestoreResponse {
             si: write_result.si,
             event_batches: write_result.events,
             server_time,

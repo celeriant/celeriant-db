@@ -5,14 +5,37 @@ use serde::{Deserialize, Serialize};
 pub struct EventItem {
     pub ed: u64,
     pub tp: u64,
-    
+
+    #[serde(skip_serializing_if = "Option::is_none", rename = "vi")]
+    #[serde(alias = "vi")]
     pub int_values: Option<Vec<i64>>,
+
+    #[serde(skip_serializing_if = "Option::is_none", rename = "vu")]
+    #[serde(alias = "vu")]
     pub uint_values: Option<Vec<u64>>,
+
+    #[serde(skip_serializing_if = "Option::is_none", rename = "vf")]
+    #[serde(alias = "vf")]
     pub f32_values: Option<Vec<f32>>,
+
+    #[serde(skip_serializing_if = "Option::is_none", rename = "vd")]
+    #[serde(alias = "vd")]
     pub f64_values: Option<Vec<f64>>,
+
+    #[serde(skip_serializing_if = "Option::is_none", rename = "vb")]
+    #[serde(alias = "vb")]
     pub bool_values: Option<Vec<bool>>,
+
+    #[serde(skip_serializing_if = "Option::is_none", rename = "vs")]
+    #[serde(alias = "vs")]
     pub string_values: Option<Vec<Option<String>>>,
+
+    #[serde(skip_serializing_if = "Option::is_none", rename = "iv")]
+    #[serde(alias = "iv")]
     pub iv_arrays: Option<Vec<Option<Vec<u8>>>>,
+
+    #[serde(skip_serializing_if = "Option::is_none", rename = "by")]
+    #[serde(alias = "by")]
     pub byte_arrays: Option<Vec<Option<Vec<u8>>>>,
 }
 
@@ -33,10 +56,9 @@ impl EventItem {
     }
 }
 
-
 #[cfg(test)]
 pub mod tests {
-    use std::{fs};
+    use std::fs;
     use tempfile::TempDir;
 
     use super::*;
@@ -82,10 +104,7 @@ pub mod tests {
             .expect("Failed to create STL file");
 
         // Convert flat vertex array to Vector3 points
-        let vertex_points: Vec<[f32; 3]> = vertices
-            .chunks(3)
-            .map(|chunk| [chunk[0], chunk[1], chunk[2]])
-            .collect();
+        let vertex_points: Vec<[f32; 3]> = vertices.chunks(3).map(|chunk| [chunk[0], chunk[1], chunk[2]]).collect();
 
         // Create triangles from indices
         let triangles: Vec<stl_io::Triangle> = indices
@@ -106,11 +125,7 @@ pub mod tests {
 
                 stl_io::Triangle {
                     normal: stl_io::Vector::new(normal),
-                    vertices: [
-                        stl_io::Vector::new(v0),
-                        stl_io::Vector::new(v1),
-                        stl_io::Vector::new(v2),
-                    ],
+                    vertices: [stl_io::Vector::new(v0), stl_io::Vector::new(v1), stl_io::Vector::new(v2)],
                 }
             })
             .collect();
@@ -119,14 +134,9 @@ pub mod tests {
     }
 
     pub fn test_read_lorem() -> Vec<String> {
-        let ipsum_text = fs::read_to_string("tests/resources/ipsum.txt")
-            .expect("Failed to read tests/resources/ipsum.txt");
+        let ipsum_text = fs::read_to_string("tests/resources/ipsum.txt").expect("Failed to read tests/resources/ipsum.txt");
 
-        ipsum_text
-            .lines()
-            .filter(|line| !line.is_empty())
-            .map(|line| line.to_string())
-            .collect()
+        ipsum_text.lines().filter(|line| !line.is_empty()).map(|line| line.to_string()).collect()
     }
 
     pub fn test_stl_data() -> (Vec<f32>, Vec<i32>) {
@@ -140,40 +150,23 @@ pub mod tests {
         let stl = stl_io::read_stl(&mut file).expect("Failed to read STL file");
 
         // Extract all vertex coordinates into a flat f32 array
-        let vertices: Vec<f32> = stl
-            .vertices
-            .iter()
-            .flat_map(|vertex| [vertex[0], vertex[1], vertex[2]])
-            .collect();
+        let vertices: Vec<f32> = stl.vertices.iter().flat_map(|vertex| [vertex[0], vertex[1], vertex[2]]).collect();
 
         // Extract face indices
-        let indices: Vec<i32> = stl
-            .faces
-            .iter()
-            .flat_map(|face| face.vertices.iter())
-            .map(|&idx| idx as i32)
-            .collect();
+        let indices: Vec<i32> = stl.faces.iter().flat_map(|face| face.vertices.iter()).map(|&idx| idx as i32).collect();
 
         (vertices, indices)
     }
 
     pub fn test_image(blur: u32) -> Vec<u8> {
-        let img = image::open("tests/resources/image.jpg")
-            .expect("Failed to read tests/resources/image.jpg");
+        let img = image::open("tests/resources/image.jpg").expect("Failed to read tests/resources/image.jpg");
 
-        let processed_img = if blur == 0 {
-            img
-        } else {
-            img.blur(blur as f32)
-        };
+        let processed_img = if blur == 0 { img } else { img.blur(blur as f32) };
 
         // Encode as JPEG and return the encoded bytes
         let mut buffer = Vec::new();
         processed_img
-            .write_to(
-                &mut std::io::Cursor::new(&mut buffer),
-                image::ImageFormat::Jpeg,
-            )
+            .write_to(&mut std::io::Cursor::new(&mut buffer), image::ImageFormat::Jpeg)
             .expect("Failed to encode image");
         buffer
     }
@@ -227,5 +220,4 @@ pub mod tests {
 
         assert!(path.exists());
     }
-
 }

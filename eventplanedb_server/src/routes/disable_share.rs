@@ -1,6 +1,5 @@
-use crate::app_state::AppState;
+use crate::{app_state::AppState, json_formatter::CompactJson};
 use axum::{
-    Json,
     extract::Path,
     http::{HeaderMap, StatusCode},
 };
@@ -20,7 +19,7 @@ pub async fn disable_share(
     Path((pi, share_hash)): Path<(String, String)>,
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<DisableShareResponse>, (StatusCode, String)> {
+) -> Result<CompactJson<DisableShareResponse>, (StatusCode, String)> {
     let cb = match state.validate_auth_headers(&headers) {
         Ok(cb) => cb,
         Err(e) => return Err(e),
@@ -31,7 +30,7 @@ pub async fn disable_share(
     let server_time = chrono::Utc::now().timestamp_millis() as u64;
 
     match disable_share_async(&state.workers, file_path, cb, server_time, share_hash).await {
-        Ok(write_result) => Ok(Json(DisableShareResponse {
+        Ok(write_result) => Ok(CompactJson(DisableShareResponse {
             si: write_result.si,
             event_batches: write_result.events,
             server_time,

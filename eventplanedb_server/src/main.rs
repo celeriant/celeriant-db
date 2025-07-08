@@ -15,6 +15,7 @@ use crate::{
 
 mod app_state;
 mod crypto;
+mod json_formatter;
 mod routes;
 
 #[tokio::main]

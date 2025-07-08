@@ -1,6 +1,5 @@
-use crate::app_state::AppState;
+use crate::{app_state::AppState, json_formatter::CompactJson};
 use axum::{
-    Json,
     extract::{Path, Query},
     http::{HeaderMap, StatusCode},
 };
@@ -21,7 +20,7 @@ pub async fn read_events(
     Query(params): Query<ReadQuery>,
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<CatchupResult>, (StatusCode, String)> {
+) -> Result<CompactJson<CatchupResult>, (StatusCode, String)> {
     let cb = match state.validate_auth_headers(&headers) {
         Ok(cb) => cb,
         Err(e) => return Err(e),
@@ -42,7 +41,7 @@ pub async fn read_events(
     )
     .await
     {
-        Ok(result) => Ok(Json(result)),
+        Ok(result) => Ok(CompactJson(result)),
         Err(e) => {
             let (status, message) = match e {
                 JobError::PermissionDenied(msg) => (StatusCode::FORBIDDEN, msg),

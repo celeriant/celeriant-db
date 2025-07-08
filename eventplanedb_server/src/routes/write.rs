@@ -1,4 +1,4 @@
-use crate::app_state::AppState;
+use crate::{app_state::AppState, json_formatter::CompactJson};
 use axum::{
     Json,
     extract::{Path, Query},
@@ -27,7 +27,7 @@ pub async fn write_events(
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: HeaderMap,
     Json(events): Json<Vec<EventItem>>,
-) -> Result<Json<WriteResponse>, (StatusCode, String)> {
+) -> Result<CompactJson<WriteResponse>, (StatusCode, String)> {
     if events.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "No events provided".to_string()));
     }
@@ -49,7 +49,7 @@ pub async fn write_events(
     };
 
     match write_async(&state.workers, file_path, params.create_if_not_exist.unwrap_or(false), event_batch).await {
-        Ok(write_result) => Ok(Json(WriteResponse {
+        Ok(write_result) => Ok(CompactJson(WriteResponse {
             si: write_result.si,
             event_batches: write_result.events,
             server_time,
