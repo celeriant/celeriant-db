@@ -1,20 +1,23 @@
-use std::sync::Arc;
 use crossbeam::channel::Sender;
-use event_storage_threads::{job::Job, process_jobs::create_thread_pool};
+use event_storage_threads::{event_notifications::EventNotifier, job::Job, process_jobs::create_thread_pool};
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct AppState {
     pub workers: Arc<Vec<Sender<Job>>>,
+    pub event_notifier: EventNotifier,
     pub base_path: String,
 }
 
 impl AppState {
     pub fn new(base_path: String) -> Self {
         let cores = core_affinity::get_core_ids().unwrap_or_else(|| vec![core_affinity::CoreId { id: 0 }]);
-        let workers = create_thread_pool(cores.len());
-        
+        let event_notifier = EventNotifier::new();
+        let workers = create_thread_pool(cores.len(), event_notifier.clone());
+
         Self {
             workers: Arc::new(workers),
+            event_notifier,
             base_path,
         }
     }
@@ -22,7 +25,14 @@ impl AppState {
     pub fn get_file_path(&self, pi: &str) -> String {
         format!("{}/{}.dat", self.base_path, pi)
     }
-    
+
+    pub fn validate_auth_params(&self, public_key: &str, nonce: &str, signature: &str) -> Result<String, (axum::http::StatusCode, String)> {
+        match crate::crypto::Crypto::validate_with_public_key(public_key, nonce, signature) {
+            Ok(cb) => Ok(cb),
+            Err(e) => Err((axum::http::StatusCode::UNAUTHORIZED, e.to_string())),
+        }
+    }
+
     pub fn validate_auth_headers(&self, headers: &axum::http::HeaderMap) -> Result<String, (axum::http::StatusCode, String)> {
         let public_key = match headers.get("X-Public-Key").and_then(|h| h.to_str().ok()) {
             Some(pk) => pk.to_string(),

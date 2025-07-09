@@ -1,3 +1,4 @@
+pub mod event_notifications;
 pub mod job;
 pub mod process_delete;
 pub mod process_disable_share;

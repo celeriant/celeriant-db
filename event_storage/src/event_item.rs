@@ -26,7 +26,7 @@ pub struct EventItem {
     #[serde(alias = "vb")]
     pub bool_values: Option<Vec<bool>>,
 
-    #[serde(skip_serializing_if = "Option::is_none", rename = "vs")]
+    #[serde(skip_serializing_if = "Option::is_none", rename = "sv")]
     #[serde(alias = "vs")]
     pub string_values: Option<Vec<Option<String>>>,
 

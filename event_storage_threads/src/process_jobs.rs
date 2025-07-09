@@ -1,3 +1,4 @@
+use crate::event_notifications::EventNotifier;
 use crate::job::Job;
 use crate::process_delete::handle_delete_job;
 use crate::process_disable_share::handle_disable_share_job;
@@ -12,7 +13,7 @@ use event_storage::event_storage_cache::EventStorageCache;
 use eventplanedb_access::share_links_cache::ShareLinksCache;
 use eventplanedb_access::user_access_cache::UserAccessCache;
 
-pub fn create_thread_pool(required_thread_count: usize) -> Vec<Sender<Job>> {
+pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNotifier) -> Vec<Sender<Job>> {
     let cores = core_affinity::get_core_ids().unwrap();
     let num_available_cores = cores.len(); // Get the total number of cores
     let num_threads_to_use = std::cmp::min(required_thread_count, num_available_cores); // Use min to not exceed available cores
@@ -22,6 +23,7 @@ pub fn create_thread_pool(required_thread_count: usize) -> Vec<Sender<Job>> {
     for i in 0..num_threads_to_use {
         let (tx, rx): (Sender<Job>, Receiver<Job>) = unbounded();
         let core_id = cores[i];
+        let notifier = event_notifier.clone();
 
         // Spawn pinned thread
         std::thread::spawn(move || {
@@ -72,6 +74,7 @@ pub fn create_thread_pool(required_thread_count: usize) -> Vec<Sender<Job>> {
                             &mut event_storage_cache,
                             &mut share_links_cache,
                             &mut user_access_cache,
+                            Some(&notifier),
                         ));
                     }
 

@@ -9,7 +9,8 @@ use tower_http::cors::{Any, CorsLayer};
 use crate::{
     app_state::AppState,
     routes::{
-        delete::delete, disable_share::disable_share, disable_user::disable_user, read::read_events, restore::restore, share::share, write::write_events,
+        delete::delete, disable_share::disable_share, disable_user::disable_user, read::read_events, restore::restore, share::share,
+        subscribe::subscribe_events, write::write_events,
     },
 };
 
@@ -59,6 +60,7 @@ pub fn create_router(state: AppState) -> Router {
 
     let api_v1 = Router::new()
         .route("/{pi}/read", get(read_events))
+        .route("/{pi}/subscribe", get(subscribe_events))
         .route("/{pi}/write", post(write_events))
         .route("/{pi}/delete", post(delete))
         .route("/{pi}/restore", post(restore))
