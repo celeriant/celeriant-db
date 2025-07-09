@@ -1,7 +1,9 @@
-use std::{sync::Arc};
+use std::sync::Arc;
 
 use event_storage::{catchup_result::CatchupResult, event_storage_cache::EventStorageCache};
 use eventplanedb_access::{access_level::AccessLevel, job_error::JobError, share_links_cache::ShareLinksCache, user_access_cache::UserAccessCache};
+
+use crate::event_notifications::EventNotifier;
 
 pub fn handle_read_job(
     file_path: String,
@@ -13,8 +15,8 @@ pub fn handle_read_job(
     event_storage_cache: &mut EventStorageCache,
     share_links_cache: &mut ShareLinksCache,
     user_access_cache: &mut UserAccessCache,
+    event_notifier: Option<&EventNotifier>,
 ) -> Result<CatchupResult, JobError> {
-
     let access_events = AccessLevel::require_permission(
         event_storage_cache,
         share_links_cache,
@@ -24,6 +26,13 @@ pub fn handle_read_job(
         AccessLevel::Viewer,
         share_key.as_deref(),
     )?;
+
+    if access_events.len() > 0 {
+        // Notify subscribers that there are new events for this file path
+        if let Some(notifier) = event_notifier {
+            notifier.notify(&file_path, &cb);
+        }
+    }
 
     let mut catchup_result = event_storage_cache.read(&file_path, from_si, max_bytes, None)?;
 

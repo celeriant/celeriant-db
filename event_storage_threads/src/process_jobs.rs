@@ -59,6 +59,7 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
                             &mut event_storage_cache,
                             &mut share_links_cache,
                             &mut user_access_cache,
+                            Some(&notifier),
                         ));
                     }
 
@@ -114,6 +115,7 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
                             &mut event_storage_cache,
                             &mut share_links_cache,
                             &mut user_access_cache,
+                            Some(&notifier),
                         ));
                     }
 
@@ -130,6 +132,7 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
                             &mut event_storage_cache,
                             &mut share_links_cache,
                             &mut user_access_cache,
+                            Some(&notifier),
                         ));
                     }
 
@@ -146,6 +149,7 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
                             &mut event_storage_cache,
                             &mut share_links_cache,
                             &mut user_access_cache,
+                            Some(&notifier),
                         ));
                     }
 
@@ -164,6 +168,7 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
                             &mut event_storage_cache,
                             &mut share_links_cache,
                             &mut user_access_cache,
+                            Some(&notifier),
                         ));
                     }
 
@@ -182,6 +187,7 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
                             &mut event_storage_cache,
                             &mut share_links_cache,
                             &mut user_access_cache,
+                            Some(&notifier),
                         ));
                     }
 
