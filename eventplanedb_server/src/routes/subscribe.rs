@@ -8,7 +8,10 @@ use event_storage_threads::queue_jobs::access_check_async;
 use eventplanedb_access::job_error::JobError;
 use futures::stream::{self, Stream};
 use serde::Deserialize;
-use std::{convert::Infallible, time::Duration};
+use std::{
+    convert::Infallible,
+    time::{Duration, Instant},
+};
 
 #[derive(Deserialize)]
 pub struct AuthParams {
@@ -57,35 +60,53 @@ pub async fn subscribe_events(
     // Subscribe to event notifications for this file path
     let receiver = state.event_notifier.subscribe(&file_path);
 
-    // Create an SSE stream that sends events when notifications are received
-    let stream = stream::unfold((receiver, current_user_hash), move |(mut receiver, current_user)| async move {
-        loop {
-            tokio::select! {
-                result = receiver.recv() => {
-                    match result {
-                        Ok(notifier_user_hash) => {
-                            // Only send notification if the event was created by a different user
-                            if notifier_user_hash != current_user {
-                                let event = Event::default().data("ne");
-                                return Some((Ok(event), (receiver, current_user)));
+    // Define cooldown period
+    let cooldown_period = Duration::from_millis(200);
+
+    // Create an SSE stream with cooldown mechanism
+    let stream = stream::unfold(
+        (
+            receiver,
+            current_user_hash,
+            Instant::now().checked_sub(cooldown_period).unwrap_or_else(Instant::now),
+        ),
+        move |(mut receiver, current_user, last_notification)| async move {
+            loop {
+                tokio::select! {
+                    result = receiver.recv() => {
+                        match result {
+                            Ok(notifier_user_hash) => {
+                                // Only send notification if the event was created by a different user
+                                if notifier_user_hash != current_user {
+                                    let now = Instant::now();
+                                    let time_since_last = now.duration_since(last_notification);
+
+                                    // Check if we're outside the cooldown period
+                                    if time_since_last >= cooldown_period {
+                                        let event = Event::default().data("ne");
+                                        return Some((Ok(event), (receiver, current_user, now)));
+                                    }
+                                    // If inside cooldown period, ignore this notification
+                                    // and continue waiting
+                                }
+                                // If it's the same user or within cooldown, just continue the loop
+                                continue;
                             }
-                            // If it's the same user, just continue the loop without sending anything
-                            continue;
-                        }
-                        Err(_) => {
-                            // On channel error, continue the loop
-                            continue;
+                            Err(_) => {
+                                // On channel error, continue the loop
+                                continue;
+                            }
                         }
                     }
-                }
-                _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                    // Send a keep-alive comment every 30 seconds
-                    let event = Event::default().comment("ka");
-                    return Some((Ok(event), (receiver, current_user)));
+                    _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                        // Send a keep-alive comment every 30 seconds
+                        let event = Event::default().comment("ka");
+                        return Some((Ok(event), (receiver, current_user, last_notification)));
+                    }
                 }
             }
-        }
-    });
+        },
+    );
 
     Ok(Sse::new(stream))
 }
