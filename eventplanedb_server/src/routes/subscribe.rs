@@ -38,30 +38,30 @@ pub async fn subscribe_events(
 
     // Create an SSE stream that sends events when notifications are received
     let stream = stream::unfold((receiver, current_user_hash), move |(mut receiver, current_user)| async move {
-        tokio::select! {
-            result = receiver.recv() => {
-                match result {
-                    Ok(notifier_user_hash) => {
-                        // Only send notification if the event was created by a different user
-                        if notifier_user_hash != current_user {
-                            let event = Event::default().data("new_events");
-                            Some((Ok(event), (receiver, current_user)))
-                        } else {
-                            // Skip notifications caused by the current user
-                            Some((Ok(Event::default().comment("skipped-own-event")), (receiver, current_user)))
+        loop {
+            tokio::select! {
+                result = receiver.recv() => {
+                    match result {
+                        Ok(notifier_user_hash) => {
+                            // Only send notification if the event was created by a different user
+                            if notifier_user_hash != current_user {
+                                let event = Event::default().data("new_events");
+                                return Some((Ok(event), (receiver, current_user)));
+                            }
+                            // If it's the same user, just continue the loop without sending anything
+                            continue;
+                        }
+                        Err(_) => {
+                            // On channel error, continue the loop
+                            continue;
                         }
                     }
-                    Err(_) => {
-                        // Handle channel error - just return a comment
-                        let event = Event::default().comment("channel-error");
-                        Some((Ok(event), (receiver, current_user)))
-                    }
                 }
-            }
-            _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                // Send a keep-alive comment every 30 seconds
-                let event = Event::default().comment("keep-alive");
-                Some((Ok(event), (receiver, current_user)))
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                    // Send a keep-alive comment every 30 seconds
+                    let event = Event::default().comment("keep-alive");
+                    return Some((Ok(event), (receiver, current_user)));
+                }
             }
         }
     });
