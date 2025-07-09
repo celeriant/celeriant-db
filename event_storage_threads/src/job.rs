@@ -22,6 +22,12 @@ pub enum Job {
         event_batch_item: EventBatchItem,
         responder: oneshot::Sender<Result<WriteResult, JobError>>,
     },
+    AccessCheck {
+        file_path: String,
+        current_user_hash: String,
+        required_access_level: AccessLevel,
+        responder: oneshot::Sender<Result<(), JobError>>,
+    },
     Read {
         file_path: String,
         from_si: u64,

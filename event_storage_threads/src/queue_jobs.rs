@@ -101,6 +101,21 @@ pub async fn share_async(
     .await?
 }
 
+pub async fn access_check_async(
+    workers: &[Sender<Job>],
+    file_path: String,
+    current_user_hash: String,
+    required_access_level: AccessLevel,
+) -> Result<(), JobError> {
+    send_job(workers, file_path.clone(), |responder| Job::AccessCheck {
+        file_path,
+        current_user_hash,
+        required_access_level,
+        responder,
+    })
+    .await?
+}
+
 pub async fn read_async(
     workers: &[Sender<Job>],
     file_path: String,

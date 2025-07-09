@@ -1,5 +1,6 @@
 use crate::event_notifications::EventNotifier;
 use crate::job::Job;
+use crate::process_access_check::handle_access_check;
 use crate::process_delete::handle_delete_job;
 use crate::process_disable_share::handle_disable_share_job;
 use crate::process_disable_user::handle_disable_user_job;
@@ -75,6 +76,22 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
                             &mut share_links_cache,
                             &mut user_access_cache,
                             Some(&notifier),
+                        ));
+                    }
+
+                    Job::AccessCheck {
+                        file_path,
+                        current_user_hash,
+                        required_access_level,
+                        responder,
+                    } => {
+                        let _ = responder.send(handle_access_check(
+                            file_path,
+                            current_user_hash,
+                            required_access_level,
+                            &mut event_storage_cache,
+                            &mut share_links_cache,
+                            &mut user_access_cache,
                         ));
                     }
 

@@ -4,6 +4,8 @@ use axum::{
     http::StatusCode,
     response::sse::{Event, Sse},
 };
+use event_storage_threads::queue_jobs::access_check_async;
+use eventplanedb_access::job_error::JobError;
 use futures::stream::{self, Stream};
 use serde::Deserialize;
 use std::{convert::Infallible, time::Duration};
@@ -33,6 +35,25 @@ pub async fn subscribe_events(
 
     let file_path = state.get_file_path(&id);
 
+    match access_check_async(
+        &state.workers,
+        file_path.clone(),
+        current_user_hash.clone(),
+        eventplanedb_access::access_level::AccessLevel::Viewer,
+    )
+    .await
+    {
+        Ok(_) => {}
+        Err(e) => {
+            let (status, message) = match e {
+                JobError::PermissionDenied(msg) => (StatusCode::FORBIDDEN, msg),
+                JobError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
+                JobError::Other(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+            };
+            return Err((status, format!("Failed to subscribe: {message}")));
+        }
+    }
+
     // Subscribe to event notifications for this file path
     let receiver = state.event_notifier.subscribe(&file_path);
 
@@ -45,7 +66,7 @@ pub async fn subscribe_events(
                         Ok(notifier_user_hash) => {
                             // Only send notification if the event was created by a different user
                             if notifier_user_hash != current_user {
-                                let event = Event::default().data("new_events");
+                                let event = Event::default().data("ne");
                                 return Some((Ok(event), (receiver, current_user)));
                             }
                             // If it's the same user, just continue the loop without sending anything
@@ -59,7 +80,7 @@ pub async fn subscribe_events(
                 }
                 _ = tokio::time::sleep(Duration::from_secs(30)) => {
                     // Send a keep-alive comment every 30 seconds
-                    let event = Event::default().comment("keep-alive");
+                    let event = Event::default().comment("ka");
                     return Some((Ok(event), (receiver, current_user)));
                 }
             }
