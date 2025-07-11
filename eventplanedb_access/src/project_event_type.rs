@@ -1,10 +1,10 @@
 
 
-pub enum ProjectEventType
+pub enum TopicEventType
 {
-    AddShareLink = 43,
-    ProvideAccess = 45,
-    DisableShareLink = 46,
-    ProjectDeleted = 47,
-    ProjectRestored = 48
+    ShareLinkCreated = 43,
+    UserAccessUpdated = 45,
+    ShareLinkDisabled = 46,
+    TopicDisabled = 47,
+    TopicRestored = 48
 }

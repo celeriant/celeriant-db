@@ -1,12 +1,12 @@
-use crate::{app_state::AppState, crypto::Crypto, json_formatter::CompactJson};
+use crate::{app_state::AppState, crypto::Crypto, error_response::RouteError, json_formatter::CompactJson};
 use axum::{
     Json,
     extract::Path,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap},
 };
 use eventplanedb_storage::event_batch_item::EventBatchItem;
 use eventplanedb_thread_worker::queue_jobs::share_async;
-use eventplanedb_access::{access_level::AccessLevel, job_error::JobError};
+use eventplanedb_access::{access_level::AccessLevel};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
@@ -29,38 +29,25 @@ pub async fn share(
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: HeaderMap,
     Json(share_body): Json<ShareQuery>,
-) -> Result<CompactJson<ShareResponse>, (StatusCode, String)> {
-    let cb = match state.validate_auth_headers(&headers) {
-        Ok(cb) => cb,
-        Err(e) => return Err(e),
-    };
-
+) -> Result<CompactJson<ShareResponse>, RouteError> {
+    let server_time = state.server_time();
+    let current_user_hash = state.validate_auth_headers(&headers)?;
     let file_path = state.get_file_path(&id);
     let share_key = nanoid::nanoid!();
     let share_hash = Crypto::generate_short_client_identity(share_key.as_bytes());
     let access_level = AccessLevel::from(share_body.access_level);
 
-    match share_async(
+    let share_event = share_async(
         &state.workers,
         file_path,
-        cb,
+        current_user_hash,
+        server_time,
         share_hash,
         access_level,
         share_body.is_single_use,
         share_body.iv,
         share_body.description,
-        share_body.expires_on,
-    )
-    .await
-    {
-        Ok(share_event) => Ok(CompactJson(ShareResponse { share_key, share_event })),
-        Err(e) => {
-            let (status, message) = match e {
-                JobError::PermissionDenied(msg) => (StatusCode::FORBIDDEN, msg),
-                JobError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
-                JobError::Other(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
-            };
-            Err((status, format!("Failed to share: {message}")))
-        }
-    }
+        share_body.expires_on).await?;
+
+    Ok(CompactJson(ShareResponse { share_key, share_event }))
 }

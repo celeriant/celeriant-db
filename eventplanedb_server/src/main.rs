@@ -9,7 +9,7 @@ use tower_http::cors::{Any, CorsLayer};
 use crate::{
     app_state::AppState,
     routes::{
-        delete::delete, disable_share::disable_share, disable_user::disable_user, read::read_events, restore::restore, share::share,
+        delete::delete, disable_share::disable_share, disable_user::disable_user, read::read_events, share::share,
         subscribe::subscribe_events, write::write_events,
     },
 };
@@ -18,6 +18,7 @@ mod app_state;
 mod crypto;
 mod json_formatter;
 mod routes;
+mod error_response;
 
 #[cfg(feature = "tikv-jemallocator")]
 mod jemalloc {
@@ -67,14 +68,13 @@ pub fn create_router(state: AppState) -> Router {
         .max_age(Duration::from_secs(86400)); // 24 hours
 
     let api_v1 = Router::new()
-        .route("/{pi}/read", get(read_events))
-        .route("/{pi}/subscribe", get(subscribe_events))
-        .route("/{pi}/write", post(write_events))
-        .route("/{pi}/delete", post(delete))
-        .route("/{pi}/restore", post(restore))
-        .route("/{pi}/disableshare/{share_hash}", post(disable_share))
-        .route("/{pi}/disableuser/{user_hash}", post(disable_user))
-        .route("/{pi}/share", post(share));
+        .route("/{id}/read", get(read_events))
+        .route("/{id}/subscribe", get(subscribe_events))
+        .route("/{id}/write", post(write_events))
+        .route("/{id}/delete", post(delete))
+        .route("/{id}/disableshare/{share_hash}", post(disable_share))
+        .route("/{id}/disableuser/{user_hash}", post(disable_user))
+        .route("/{id}/share", post(share));
 
     Router::new().nest("/api/v1", api_v1).layer(cors).with_state(state)
 }

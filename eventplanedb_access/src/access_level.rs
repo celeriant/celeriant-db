@@ -38,6 +38,7 @@ impl AccessLevel {
         user_access_cache: &mut UserAccessCache,
         file_path: &str,
         current_user_hash: &str,
+        server_time: u64,
         required_access_level: AccessLevel,
         potential_share_key_hash: Option<&str>,
     ) -> Result<Vec<EventBatchItem>, JobError> {
@@ -57,13 +58,12 @@ impl AccessLevel {
                     //The share link exists and can improve the users access level.
                     //Disable the share link if it is single use
                     if share_key_info.is_single_use {
-                        let current_time = chrono::Utc::now().timestamp_millis() as u64;
                         let disable_event_item = share_links_cache.disable_share_link(
                             event_storage_cache,
                             file_path,
                             current_user_hash.to_string(),
                             share_key_hash.to_string(),
-                            current_time,
+                            server_time,
                         )?;
                         new_events.push(disable_event_item);
                     }
@@ -159,6 +159,8 @@ mod tests {
             )
             .unwrap();
 
+        let server_time = 1000;
+
         // Require Viewer access (which Contributor meets)
         let result = AccessLevel::require_permission(
             &mut event_storage_cache,
@@ -166,6 +168,7 @@ mod tests {
             &mut user_access_cache,
             &file_path,
             user_hash,
+            server_time,
             AccessLevel::Viewer,
             None,
         );
@@ -197,6 +200,8 @@ mod tests {
             .update_access_for_user(&mut event_storage_cache, &file_path, "admin", user_hash, AccessLevel::Viewer, false, None, None)
             .unwrap();
 
+
+        let server_time = 1000;
         // Require Contributor access (which Viewer does not meet)
         let result = AccessLevel::require_permission(
             &mut event_storage_cache,
@@ -204,6 +209,7 @@ mod tests {
             &mut user_access_cache,
             &file_path,
             user_hash,
+            server_time,
             AccessLevel::Contributor,
             None,
         );
@@ -246,6 +252,8 @@ mod tests {
             )
             .unwrap();
 
+
+        let server_time = 1000;
         // Require Contributor access, providing the share link
         let result = AccessLevel::require_permission(
             &mut event_storage_cache,
@@ -253,6 +261,7 @@ mod tests {
             &mut user_access_cache,
             &file_path,
             user_hash,
+            server_time,
             AccessLevel::Contributor,
             Some(share_key_hash),
         );
@@ -304,6 +313,8 @@ mod tests {
             )
             .unwrap();
 
+
+        let server_time = 1000;
         // Require Owner access, providing the share link (Contributor is not enough)
         let result = AccessLevel::require_permission(
             &mut event_storage_cache,
@@ -311,6 +322,7 @@ mod tests {
             &mut user_access_cache,
             &file_path,
             user_hash,
+            server_time,
             AccessLevel::Owner,
             Some(share_key_hash),
         );
@@ -357,6 +369,8 @@ mod tests {
             )
             .unwrap();
 
+
+        let server_time = 1000;
         // Require Contributor access, providing the share link
         let result = AccessLevel::require_permission(
             &mut event_storage_cache,
@@ -364,6 +378,7 @@ mod tests {
             &mut user_access_cache,
             &file_path,
             user_hash,
+            server_time,
             AccessLevel::Contributor,
             Some(share_key_hash),
         );
@@ -385,6 +400,7 @@ mod tests {
             &mut user_access_cache,
             &file_path,
             "another_user",
+            server_time,
             AccessLevel::Contributor,
             Some(share_key_hash),
         );
@@ -440,6 +456,8 @@ mod tests {
             )
             .unwrap();
 
+
+        let server_time = 1000;
         // Require Contributor access, providing the share link
         let result = AccessLevel::require_permission(
             &mut event_storage_cache,
@@ -447,6 +465,7 @@ mod tests {
             &mut user_access_cache,
             &file_path,
             user_hash,
+            server_time,
             AccessLevel::Contributor,
             Some(share_key_hash),
         );

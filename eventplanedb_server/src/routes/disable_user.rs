@@ -1,11 +1,10 @@
-use crate::{app_state::AppState, json_formatter::CompactJson};
+use crate::{app_state::AppState, error_response::RouteError, json_formatter::CompactJson};
 use axum::{
     extract::Path,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap},
 };
 use eventplanedb_storage::event_batch_item::EventBatchItem;
 use eventplanedb_thread_worker::queue_jobs::disable_user_async;
-use eventplanedb_access::job_error::JobError;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -16,32 +15,19 @@ pub struct DisableUserResponse {
 }
 
 pub async fn disable_user(
-    Path((pi, user_hash)): Path<(String, String)>,
+    Path((id, user_hash)): Path<(String, String)>,
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: HeaderMap,
-) -> Result<CompactJson<DisableUserResponse>, (StatusCode, String)> {
-    let cb = match state.validate_auth_headers(&headers) {
-        Ok(cb) => cb,
-        Err(e) => return Err(e),
-    };
+) -> Result<CompactJson<DisableUserResponse>, RouteError> {
+    let server_time = state.server_time();
+    let current_user_hash = state.validate_auth_headers(&headers)?;
+    let file_path = state.get_file_path(&id);
 
-    // Get the file path from the ID
-    let file_path = state.get_file_path(&pi);
-    let server_time = chrono::Utc::now().timestamp_millis() as u64;
+    let result = disable_user_async(&state.workers, file_path, current_user_hash, server_time, user_hash).await?;
 
-    match disable_user_async(&state.workers, file_path, cb, server_time, user_hash).await {
-        Ok(write_result) => Ok(CompactJson(DisableUserResponse {
-            si: write_result.si,
-            event_batches: write_result.events,
-            server_time,
-        })),
-        Err(e) => {
-            let (status, message) = match e {
-                JobError::PermissionDenied(msg) => (StatusCode::FORBIDDEN, msg),
-                JobError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
-                JobError::Other(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
-            };
-            Err((status, format!("Failed to disable user: {message}")))
-        }
-    }
+    Ok(CompactJson(DisableUserResponse {
+        si: result.si,
+        event_batches: result.events,
+        server_time,
+    }))
 }

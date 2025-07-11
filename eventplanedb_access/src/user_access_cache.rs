@@ -1,4 +1,4 @@
-use crate::{access_level::AccessLevel, project_event_type::ProjectEventType, project_to_user_access_level::ProjectToUserAccessLevel};
+use crate::{access_level::AccessLevel, project_event_type::TopicEventType, project_to_user_access_level::ProjectToUserAccessLevel};
 use eventplanedb_storage::{event_batch_item::EventBatchItem, event_item::EventItem, event_storage_cache::EventStorageCache};
 use std::{
     collections::{HashMap, VecDeque},
@@ -62,12 +62,12 @@ impl UserAccessCache {
     fn populate_cache_for_project(&mut self, event_storage_cache: &mut EventStorageCache, file_path: &str) {
         let project_to_user_access_level = self.cache.get_mut(file_path).unwrap();
 
-        match event_storage_cache.read(file_path, 0, usize::MAX, Some(&[ProjectEventType::ProvideAccess as u64])) {
+        match event_storage_cache.read(file_path, 0, usize::MAX, Some(&[TopicEventType::UserAccessUpdated as u64])) {
             Ok(result) => {
                 for batch in result.event_batches {
                     for event in batch.events.iter() {
                         // Check the event is a ProvideAccess event and has the correct data
-                        if event.tp != ProjectEventType::ProvideAccess as u64
+                        if event.tp != TopicEventType::UserAccessUpdated as u64
                             || event.string_values.as_ref().is_none()
                             || event.string_values.as_ref().unwrap().len() < 1
                             || event.string_values.as_ref().unwrap()[0].is_none()
@@ -130,7 +130,7 @@ impl UserAccessCache {
 
         let mut event_item = EventItem::new();
         event_item.ed = current_time;
-        event_item.tp = ProjectEventType::ProvideAccess as u64;
+        event_item.tp = TopicEventType::UserAccessUpdated as u64;
         event_item.string_values = Some(vec![Some(for_user_hash.to_string()), share_key_hash.map_or(None, |f| Some(f.to_string()))]);
         event_item.uint_values = Some(vec![potential_access_level as u64]);
 
@@ -150,7 +150,7 @@ impl UserAccessCache {
 
 #[cfg(test)]
 mod tests {
-    use crate::{access_level::AccessLevel, project_event_type::ProjectEventType, project_to_user_access_level::ProjectToUserAccessLevel};
+    use crate::{access_level::AccessLevel, project_event_type::TopicEventType, project_to_user_access_level::ProjectToUserAccessLevel};
     use eventplanedb_storage::event_item::EventItem;
     use eventplanedb_storage::{event_batch_item::EventBatchItem, event_storage_cache::EventStorageCache};
     use std::vec;
@@ -178,7 +178,7 @@ mod tests {
 
         let mut event_item = EventItem::new();
         event_item.ed = current_time;
-        event_item.tp = ProjectEventType::ProvideAccess as u64;
+        event_item.tp = TopicEventType::UserAccessUpdated as u64;
         event_item.string_values = Some(vec![Some(user_hash.to_string()), None]);
         event_item.uint_values = Some(vec![access_level as u64]);
         event_item
@@ -327,7 +327,7 @@ mod tests {
         // Create ProvideAccess and other event types
         let event1 = create_provide_access_event("user1", AccessLevel::Owner, None);
         let mut event2 = create_provide_access_event("user2", AccessLevel::Contributor, None);
-        event2.tp = ProjectEventType::AddShareLink as u64; // Change type to AddShareLink
+        event2.tp = TopicEventType::ShareLinkCreated as u64; // Change type to AddShareLink
         let event3 = create_provide_access_event("user1", AccessLevel::Viewer, None);
 
         let event_batch_1 = create_event_batch_item_with_events(vec![event1], "admin");

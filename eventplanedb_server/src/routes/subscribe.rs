@@ -1,7 +1,6 @@
-use crate::app_state::AppState;
+use crate::{app_state::AppState, error_response::RouteError};
 use axum::{
     extract::{Path, Query},
-    http::StatusCode,
     response::sse::{Event, Sse},
 };
 use eventplanedb_thread_worker::queue_jobs::access_check_async;
@@ -24,44 +23,23 @@ pub async fn subscribe_events(
     Path(id): Path<String>,
     Query(params): Query<AuthParams>,
     axum::extract::State(state): axum::extract::State<AppState>,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)> {
-    // Get the current user's hash for filtering notifications
-    let current_user_hash =
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, RouteError> {
+    let server_time = state.server_time();
+    let current_user_hash = 
         if let (Some(public_key), Some(nonce), Some(signature)) = (params.public_key.as_deref(), params.nonce.as_deref(), params.signature.as_deref()) {
-            match state.validate_auth_params(public_key, nonce, signature) {
-                Ok(cb) => cb,
-                Err(e) => return Err(e),
-            }
+            state.validate_auth_params(public_key, nonce, signature)?
         } else {
-            return Err((StatusCode::BAD_REQUEST, "Missing authentication parameters".to_string()));
+            return Err(RouteError::JobError(JobError::InvalidParameters("Missing authentication parameters".to_string())));
         };
-
     let file_path = state.get_file_path(&id);
 
-    match access_check_async(
-        &state.workers,
-        file_path.clone(),
-        current_user_hash.clone(),
-        eventplanedb_access::access_level::AccessLevel::Viewer,
-    )
-    .await
-    {
-        Ok(_) => {}
-        Err(e) => {
-            let (status, message) = match e {
-                JobError::PermissionDenied(msg) => (StatusCode::FORBIDDEN, msg),
-                JobError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
-                JobError::Other(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
-            };
-            return Err((status, format!("Failed to subscribe: {message}")));
-        }
-    }
+    access_check_async(&state.workers, file_path.clone(), current_user_hash.clone(), server_time, eventplanedb_access::access_level::AccessLevel::Viewer,).await?;
 
     // Subscribe to event notifications for this file path
     let receiver = state.event_notifier.subscribe(&file_path);
 
     // Define cooldown period
-    let cooldown_period = Duration::from_millis(200);
+    let cooldown_period = Duration::from_millis(state.subscribe_cooldown_period_ms);
 
     // Create an SSE stream with cooldown mechanism
     let stream = stream::unfold(

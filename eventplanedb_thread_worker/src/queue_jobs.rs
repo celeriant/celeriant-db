@@ -1,6 +1,6 @@
 use crossbeam::channel::Sender;
-use eventplanedb_storage::{catchup_result::CatchupResult, event_batch_item::EventBatchItem};
 use eventplanedb_access::{access_level::AccessLevel, job_error::JobError};
+use eventplanedb_storage::{catchup_result::CatchupResult, event_batch_item::EventBatchItem, event_item::EventItem};
 use tokio::sync::oneshot;
 
 use crate::{job::Job, process_write::WriteResult, thread_assigner::hash_string_to_index};
@@ -18,11 +18,28 @@ async fn send_job<T>(workers: &[Sender<Job>], file_path: String, job_creator: im
     rx.await.map_err(|_| JobError::Other("Worker thread dropped responder".to_string()))
 }
 
-pub async fn write_async(workers: &[Sender<Job>], file_path: String, allow_create: bool, event_batch_item: EventBatchItem) -> Result<WriteResult, JobError> {
+pub async fn write_async(workers: &[Sender<Job>], file_path: String, current_user_hash: String, server_time: u64, allow_create: bool, events: Vec<EventItem>) -> Result<WriteResult, JobError> {
     send_job(workers, file_path.clone(), |responder| Job::Write {
         file_path,
+        current_user_hash,
+        server_time,
         allow_create,
-        event_batch_item,
+        events,
+        responder,
+    })
+    .await?
+}
+
+pub async fn delete_async(
+    workers: &[Sender<Job>],
+    file_path: String,
+    current_user_hash: String,
+    server_time: u64,
+) -> Result<(), JobError> {
+    send_job(workers, file_path.clone(), |responder| Job::Delete {
+        file_path,
+        current_user_hash,
+        server_time,
         responder,
     })
     .await?
@@ -31,13 +48,13 @@ pub async fn write_async(workers: &[Sender<Job>], file_path: String, allow_creat
 pub async fn disable_share_async(
     workers: &[Sender<Job>],
     file_path: String,
-    cb: String,
+    current_user_hash: String,
     server_time: u64,
     share_hash: String,
 ) -> Result<WriteResult, JobError> {
     send_job(workers, file_path.clone(), |responder| Job::DisableShare {
         file_path,
-        cb,
+        current_user_hash,
         server_time,
         share_hash,
         responder,
@@ -45,32 +62,12 @@ pub async fn disable_share_async(
     .await?
 }
 
-pub async fn disable_user_async(workers: &[Sender<Job>], file_path: String, cb: String, server_time: u64, user_hash: String) -> Result<WriteResult, JobError> {
+pub async fn disable_user_async(workers: &[Sender<Job>], file_path: String, current_user_hash: String, server_time: u64, user_hash: String) -> Result<WriteResult, JobError> {
     send_job(workers, file_path.clone(), |responder| Job::DisableUser {
         file_path,
-        cb,
+        current_user_hash,
         server_time,
         user_hash,
-        responder,
-    })
-    .await?
-}
-
-pub async fn delete_async(workers: &[Sender<Job>], file_path: String, cb: String, server_time: u64) -> Result<WriteResult, JobError> {
-    send_job(workers, file_path.clone(), |responder| Job::Delete {
-        file_path,
-        cb,
-        server_time,
-        responder,
-    })
-    .await?
-}
-
-pub async fn restore_async(workers: &[Sender<Job>], file_path: String, cb: String, server_time: u64) -> Result<WriteResult, JobError> {
-    send_job(workers, file_path.clone(), |responder| Job::Restore {
-        file_path,
-        cb,
-        server_time,
         responder,
     })
     .await?
@@ -79,7 +76,8 @@ pub async fn restore_async(workers: &[Sender<Job>], file_path: String, cb: Strin
 pub async fn share_async(
     workers: &[Sender<Job>],
     file_path: String,
-    cb: String,
+    current_user_hash: String,
+    server_time: u64,
     share_hash: String,
     access_level: AccessLevel,
     is_single_use: bool,
@@ -89,7 +87,8 @@ pub async fn share_async(
 ) -> Result<EventBatchItem, JobError> {
     send_job(workers, file_path.clone(), |responder| Job::Share {
         file_path,
-        cb,
+        current_user_hash,
+        server_time,
         share_hash,
         access_level,
         is_single_use,
@@ -105,11 +104,13 @@ pub async fn access_check_async(
     workers: &[Sender<Job>],
     file_path: String,
     current_user_hash: String,
+    server_time: u64,
     required_access_level: AccessLevel,
 ) -> Result<(), JobError> {
     send_job(workers, file_path.clone(), |responder| Job::AccessCheck {
         file_path,
         current_user_hash,
+        server_time,
         required_access_level,
         responder,
     })
@@ -119,7 +120,8 @@ pub async fn access_check_async(
 pub async fn read_async(
     workers: &[Sender<Job>],
     file_path: String,
-    cb: String,
+    current_user_hash: String,
+    server_time: u64,
     share_key: Option<String>,
     from_si: u64,
     max_bytes: usize,
@@ -128,7 +130,8 @@ pub async fn read_async(
     send_job(workers, file_path.clone(), |responder| Job::Read {
         file_path,
         from_si,
-        cb,
+        current_user_hash,
+        server_time,
         share_key,
         max_bytes,
         own_events,

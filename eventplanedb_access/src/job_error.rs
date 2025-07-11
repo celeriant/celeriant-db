@@ -4,6 +4,7 @@ use std::io;
 pub enum JobError {
     PermissionDenied(String),
     NotFound(String),
+    InvalidParameters(String),
     Other(String),
 }
 

@@ -5,7 +5,8 @@ use crate::event_notifications::EventNotifier;
 
 pub fn handle_share_job(
     file_path: String,
-    cb: String,
+    current_user_hash: String,
+    server_time: u64,
     share_hash: String,
     access_level: AccessLevel,
     is_single_use: bool,
@@ -22,7 +23,8 @@ pub fn handle_share_job(
         share_links_cache,
         user_access_cache,
         &file_path,
-        &cb,
+        &current_user_hash,
+        server_time,
         AccessLevel::Owner,
         None,
     )?;
@@ -30,7 +32,7 @@ pub fn handle_share_job(
     let create_share_link_result = share_links_cache.create_share_link(
         event_storage_cache,
         file_path.clone(),
-        cb.clone(),
+        current_user_hash.clone(),
         share_hash.clone(),
         access_level,
         is_single_use,
@@ -41,7 +43,7 @@ pub fn handle_share_job(
 
     // Notify subscribers that there are new events for this file path
     if let Some(notifier) = event_notifier {
-        notifier.notify(&file_path, &cb);
+        notifier.notify(&file_path, &current_user_hash);
     }
 
     Ok(create_share_link_result)

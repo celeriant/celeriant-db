@@ -1,4 +1,4 @@
-use eventplanedb_storage::{catchup_result::CatchupResult, event_batch_item::EventBatchItem};
+use eventplanedb_storage::{catchup_result::CatchupResult, event_batch_item::EventBatchItem, event_item::EventItem};
 use eventplanedb_access::{access_level::AccessLevel, job_error::JobError};
 use tokio::sync::oneshot;
 
@@ -7,7 +7,8 @@ use crate::process_write::WriteResult;
 pub enum Job {
     Share {
         file_path: String,
-        cb: String,
+        current_user_hash: String,
+        server_time: u64,
         share_hash: String,
         access_level: AccessLevel,
         is_single_use: bool,
@@ -17,21 +18,25 @@ pub enum Job {
         responder: oneshot::Sender<Result<EventBatchItem, JobError>>,
     },
     Write {
-        file_path: String,
+        file_path: String, 
+        current_user_hash: String, 
+        server_time: u64, 
         allow_create: bool,
-        event_batch_item: EventBatchItem,
+        events: Vec<EventItem>,
         responder: oneshot::Sender<Result<WriteResult, JobError>>,
     },
     AccessCheck {
         file_path: String,
         current_user_hash: String,
+        server_time: u64,
         required_access_level: AccessLevel,
         responder: oneshot::Sender<Result<(), JobError>>,
     },
     Read {
         file_path: String,
         from_si: u64,
-        cb: String,
+        current_user_hash: String,
+        server_time: u64,
         share_key: Option<String>,
         max_bytes: usize,
         own_events: bool,
@@ -39,29 +44,23 @@ pub enum Job {
     },
     DisableUser {
         file_path: String,
-        cb: String,
+        current_user_hash: String,
         server_time: u64,
         user_hash: String,
         responder: oneshot::Sender<Result<WriteResult, JobError>>,
     },
     DisableShare {
         file_path: String,
-        cb: String,
+        current_user_hash: String,
         server_time: u64,
         share_hash: String,
         responder: oneshot::Sender<Result<WriteResult, JobError>>,
     },
     Delete {
         file_path: String,
-        cb: String,
+        current_user_hash: String,
         server_time: u64,
-        responder: oneshot::Sender<Result<WriteResult, JobError>>,
-    },
-    Restore {
-        file_path: String,
-        cb: String,
-        server_time: u64,
-        responder: oneshot::Sender<Result<WriteResult, JobError>>,
+        responder: oneshot::Sender<Result<(), JobError>>,
     },
     Shutdown {
         responder: oneshot::Sender<()>,

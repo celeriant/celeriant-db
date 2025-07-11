@@ -1,8 +1,8 @@
-use crate::{app_state::AppState, json_formatter::CompactJson};
+use crate::{app_state::AppState, error_response::RouteError, json_formatter::CompactJson};
 use axum::{
     Json,
     extract::{Path, Query},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap},
 };
 use eventplanedb_storage::{event_batch_item::EventBatchItem, event_item::EventItem};
 use eventplanedb_thread_worker::queue_jobs::write_async;
@@ -27,40 +27,21 @@ pub async fn write_events(
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: HeaderMap,
     Json(events): Json<Vec<EventItem>>,
-) -> Result<CompactJson<WriteResponse>, (StatusCode, String)> {
+) -> Result<CompactJson<WriteResponse>, RouteError> {
     if events.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "No events provided".to_string()));
+        return Err(RouteError::JobError(JobError::InvalidParameters("No events provided".to_string())));
     }
 
-    let cb = match state.validate_auth_headers(&headers) {
-        Ok(cb) => cb,
-        Err(e) => return Err(e),
-    };
-
+    let server_time = state.server_time();
+    let current_user_hash = state.validate_auth_headers(&headers)?;
     let file_path = state.get_file_path(&id);
-    let server_time = chrono::Utc::now().timestamp_millis() as u64;
+    let allow_create = params.create_if_not_exist.unwrap_or(false);
 
-    // Create an EventBatchItem from the events
-    let event_batch = EventBatchItem {
-        si: 0, // Will be assigned by the storage system
-        cb: Some(cb),
-        sd: server_time,
-        events,
-    };
+    let result = write_async(&state.workers, file_path, current_user_hash, server_time, allow_create, events).await?;
 
-    match write_async(&state.workers, file_path, params.create_if_not_exist.unwrap_or(false), event_batch).await {
-        Ok(write_result) => Ok(CompactJson(WriteResponse {
-            si: write_result.si,
-            event_batches: write_result.events,
-            server_time,
-        })),
-        Err(e) => {
-            let (status, message) = match e {
-                JobError::PermissionDenied(msg) => (StatusCode::FORBIDDEN, msg),
-                JobError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
-                JobError::Other(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
-            };
-            Err((status, format!("Failed to write events: {message}")))
-        }
-    }
+    Ok(CompactJson(WriteResponse {
+        si: result.si,
+        event_batches: result.events,
+        server_time,
+    }))
 }

@@ -5,7 +5,7 @@ use std::{
 
 use crate::{
     access_level::AccessLevel,
-    project_event_type::ProjectEventType,
+    project_event_type::TopicEventType,
     project_to_share_links::{ProjectToShareLinks, ShareLinkAccessInfo},
 };
 use eventplanedb_storage::{event_batch_item::EventBatchItem, event_item::EventItem, event_storage_cache::EventStorageCache};
@@ -71,13 +71,13 @@ impl ShareLinksCache {
             file_path,
             0,
             usize::MAX,
-            Some(&[ProjectEventType::AddShareLink as u64, ProjectEventType::DisableShareLink as u64]),
+            Some(&[TopicEventType::ShareLinkCreated as u64, TopicEventType::ShareLinkDisabled as u64]),
         ) {
             Ok(result) => {
                 for event_batch_item in result.event_batches {
                     for event_item in event_batch_item.events.iter() {
                         // Share links are stored in the cache for quick lookup when a user tries to join
-                        if event_item.tp == ProjectEventType::AddShareLink as u64
+                        if event_item.tp == TopicEventType::ShareLinkCreated as u64
                             && event_item.uint_values.is_some()
                             && event_item.string_values.is_some()
                             && event_item.bool_values.is_some()
@@ -97,7 +97,7 @@ impl ShareLinksCache {
                         }
 
                         // Share links can be disabled if used (single use link) or if an owner explicitly disables it
-                        if event_item.tp == ProjectEventType::DisableShareLink as u64
+                        if event_item.tp == TopicEventType::ShareLinkDisabled as u64
                             && event_item.string_values.is_some()
                             && event_item.string_values.as_ref().unwrap().len() > 0
                         {
@@ -131,7 +131,7 @@ impl ShareLinksCache {
 
         let mut event_item = EventItem::new();
         event_item.ed = current_time;
-        event_item.tp = ProjectEventType::AddShareLink as u64;
+        event_item.tp = TopicEventType::ShareLinkCreated as u64;
         event_item.iv_arrays = Some(vec![iv]);
         event_item.string_values = Some(vec![description, Some(share_key_hash.clone())]);
         event_item.uint_values = Some(vec![access_level as u64, expires_on]);
@@ -191,7 +191,7 @@ impl ShareLinksCache {
     ) -> io::Result<EventBatchItem> {
         let mut event_item = EventItem::new();
         event_item.ed = current_time;
-        event_item.tp = ProjectEventType::DisableShareLink as u64;
+        event_item.tp = TopicEventType::ShareLinkDisabled as u64;
         event_item.string_values = Some(vec![Some(share_key_hash.clone())]);
 
         let mut event_batch_item = EventBatchItem::new();
@@ -213,7 +213,7 @@ impl ShareLinksCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{access_level::AccessLevel, project_event_type::ProjectEventType};
+    use crate::{access_level::AccessLevel, project_event_type::TopicEventType};
     use eventplanedb_storage::{event_batch_item::EventBatchItem, event_item::EventItem, event_storage_cache::EventStorageCache};
     use tempfile::TempDir;
 
@@ -253,7 +253,7 @@ mod tests {
 
         let mut event_item = EventItem::new();
         event_item.ed = current_time;
-        event_item.tp = ProjectEventType::AddShareLink as u64;
+        event_item.tp = TopicEventType::ShareLinkCreated as u64;
         event_item.string_values = Some(vec![description, Some(share_key_hash.to_string())]);
         event_item.uint_values = Some(vec![access_level as u64, expires_on]);
         event_item.bool_values = Some(vec![is_single_use]);
@@ -266,7 +266,7 @@ mod tests {
 
         let mut event_item = EventItem::new();
         event_item.ed = current_time;
-        event_item.tp = ProjectEventType::DisableShareLink as u64;
+        event_item.tp = TopicEventType::ShareLinkDisabled as u64;
         event_item.string_values = Some(vec![Some(share_key_hash.to_string())]);
         event_item
     }
@@ -441,7 +441,7 @@ mod tests {
         // Create AddShareLink and other event types
         let event1 = create_add_share_link_event("share1", AccessLevel::Viewer, false, 0, Some("desc1".to_string()));
         let mut event2 = create_add_share_link_event("share2", AccessLevel::Contributor, true, 0, Some("desc2".to_string()));
-        event2.tp = ProjectEventType::ProvideAccess as u64; // Change type to ProvideAccess
+        event2.tp = TopicEventType::UserAccessUpdated as u64; // Change type to ProvideAccess
         let event3 = create_disable_share_link_event("share1");
 
         let event_batch_1 = create_event_batch_item_with_events(vec![event1], "admin");

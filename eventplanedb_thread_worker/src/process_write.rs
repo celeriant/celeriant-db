@@ -1,4 +1,4 @@
-use eventplanedb_storage::{event_batch_item::EventBatchItem, event_storage_cache::EventStorageCache};
+use eventplanedb_storage::{event_batch_item::EventBatchItem, event_item::EventItem, event_storage_cache::EventStorageCache};
 use eventplanedb_access::{access_level::AccessLevel, job_error::JobError, share_links_cache::ShareLinksCache, user_access_cache::UserAccessCache};
 
 use crate::event_notifications::EventNotifier;
@@ -9,9 +9,11 @@ pub struct WriteResult {
 }
 
 pub fn handle_write_job(
-    file_path: String,
+    file_path: String, 
+    current_user_hash: String, 
+    server_time: u64, 
     allow_create: bool,
-    event_batch_item: EventBatchItem,
+    events: Vec<EventItem>,
     event_storage_cache: &mut EventStorageCache,
     share_links_cache: &mut ShareLinksCache,
     user_access_cache: &mut UserAccessCache,
@@ -23,8 +25,6 @@ pub fn handle_write_job(
         return Err(JobError::NotFound("Project does not exist".to_string()));
     }
 
-    let current_user_hash = event_batch_item.cb.as_ref().unwrap().clone();
-
     if file_exists {
         AccessLevel::require_permission(
             event_storage_cache,
@@ -32,11 +32,16 @@ pub fn handle_write_job(
             user_access_cache,
             &file_path,
             &current_user_hash,
+            server_time,
             AccessLevel::Contributor,
             None,
         )?;
     }
-    let ed_override = Some(event_batch_item.sd);
+    let mut event_batch_item = EventBatchItem::new();
+    event_batch_item.events = events;
+    event_batch_item.sd = server_time;
+    event_batch_item.cb = Some(current_user_hash.clone());
+
     let si: u64 = event_storage_cache.write(&file_path, allow_create, event_batch_item)?;
 
     let mut events: Vec<EventBatchItem> = vec![];
@@ -51,7 +56,7 @@ pub fn handle_write_job(
             AccessLevel::Owner,
             false,
             None,
-            ed_override,
+            Some(server_time),
         )?);
     }
 

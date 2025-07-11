@@ -5,7 +5,6 @@ use crate::process_delete::handle_delete_job;
 use crate::process_disable_share::handle_disable_share_job;
 use crate::process_disable_user::handle_disable_user_job;
 use crate::process_read::handle_read_job;
-use crate::process_restore::handle_restore_job;
 use crate::process_share::handle_share_job;
 use crate::process_write::handle_write_job;
 use core_affinity;
@@ -38,7 +37,8 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
                 match job {
                     Job::Share {
                         file_path,
-                        cb,
+                        current_user_hash: cb,
+                        server_time,
                         share_hash,
                         access_level,
                         is_single_use,
@@ -50,6 +50,7 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
                         let _ = responder.send(handle_share_job(
                             file_path,
                             cb,
+                            server_time,
                             share_hash,
                             access_level,
                             is_single_use,
@@ -64,15 +65,19 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
                     }
 
                     Job::Write {
-                        file_path,
-                        allow_create,
-                        event_batch_item,
+                        file_path, 
+                        current_user_hash, 
+                        server_time, 
+                        allow_create, 
+                        events,
                         responder,
                     } => {
                         let _ = responder.send(handle_write_job(
-                            file_path,
-                            allow_create,
-                            event_batch_item,
+                            file_path, 
+                            current_user_hash, 
+                            server_time, 
+                            allow_create, 
+                            events,
                             &mut event_storage_cache,
                             &mut share_links_cache,
                             &mut user_access_cache,
@@ -83,12 +88,14 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
                     Job::AccessCheck {
                         file_path,
                         current_user_hash,
+                        server_time,
                         required_access_level,
                         responder,
                     } => {
                         let _ = responder.send(handle_access_check(
                             file_path,
                             current_user_hash,
+                            server_time,
                             required_access_level,
                             &mut event_storage_cache,
                             &mut share_links_cache,
@@ -99,7 +106,8 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
                     Job::Read {
                         file_path,
                         from_si,
-                        cb,
+                        current_user_hash: cb,
+                        server_time,
                         share_key,
                         max_bytes,
                         own_events,
@@ -109,6 +117,7 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
                             file_path,
                             from_si,
                             cb,
+                            server_time,
                             share_key,
                             max_bytes,
                             own_events,
@@ -121,7 +130,7 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
 
                     Job::Delete {
                         file_path,
-                        cb,
+                        current_user_hash: cb,
                         server_time,
                         responder,
                     } => {
@@ -136,26 +145,9 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
                         ));
                     }
 
-                    Job::Restore {
-                        file_path,
-                        cb,
-                        server_time,
-                        responder,
-                    } => {
-                        let _ = responder.send(handle_restore_job(
-                            file_path,
-                            cb,
-                            server_time,
-                            &mut event_storage_cache,
-                            &mut share_links_cache,
-                            &mut user_access_cache,
-                            Some(&notifier),
-                        ));
-                    }
-
                     Job::DisableUser {
                         file_path,
-                        cb,
+                        current_user_hash: cb,
                         server_time,
                         user_hash,
                         responder,
@@ -174,7 +166,7 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
 
                     Job::DisableShare {
                         file_path,
-                        cb,
+                        current_user_hash: cb,
                         server_time,
                         share_hash,
                         responder,

@@ -1,6 +1,6 @@
 use eventplanedb_storage::{event_batch_item::EventBatchItem, event_item::EventItem, event_storage_cache::EventStorageCache};
 use eventplanedb_access::{
-    access_level::AccessLevel, job_error::JobError, project_event_type::ProjectEventType, share_links_cache::ShareLinksCache,
+    access_level::AccessLevel, job_error::JobError, project_event_type::TopicEventType, share_links_cache::ShareLinksCache,
     user_access_cache::UserAccessCache,
 };
 
@@ -21,13 +21,14 @@ pub fn handle_restore_job(
         user_access_cache,
         &file_path,
         &current_user_hash,
+        server_time,
         AccessLevel::Owner,
         None,
     )?;
 
     let mut event_item = EventItem::new();
     event_item.ed = server_time;
-    event_item.tp = ProjectEventType::ProjectRestored as u64;
+    event_item.tp = TopicEventType::TopicRestored as u64;
 
     let mut event_batch_item = EventBatchItem::new();
     event_batch_item.events = vec![event_item.clone()];

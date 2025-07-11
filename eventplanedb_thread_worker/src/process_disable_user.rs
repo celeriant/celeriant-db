@@ -19,6 +19,7 @@ pub fn handle_disable_user_job(
         user_access_cache,
         &file_path,
         &current_user_hash,
+        server_time,
         AccessLevel::Owner,
         None,
     )?;
