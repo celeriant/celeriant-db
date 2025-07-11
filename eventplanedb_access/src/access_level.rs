@@ -1,4 +1,4 @@
-use event_storage::{event_batch_item::EventBatchItem, event_storage_cache::EventStorageCache};
+use eventplanedb_storage::{event_batch_item::EventBatchItem, event_storage_cache::EventStorageCache};
 use serde::{Deserialize, Serialize};
 
 use crate::{job_error::JobError, share_links_cache::ShareLinksCache, user_access_cache::UserAccessCache};
@@ -98,14 +98,14 @@ impl AccessLevel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use event_storage::{event_batch_item::EventBatchItem, event_item::EventItem, event_storage_cache::EventStorageCache};
+    use eventplanedb_storage::{event_batch_item::EventBatchItem, event_item::EventItem, event_storage_cache::EventStorageCache};
     use tempfile::TempDir;
 
     use crate::share_links_cache::ShareLinksCache;
     use crate::user_access_cache::UserAccessCache;
 
     // Helper function to create a basic EventStorageCache for testing
-    fn setup_cache(max_projects: usize) -> (EventStorageCache, TempDir) {
+    fn setup_cache() -> (EventStorageCache, TempDir) {
         let event_storage_cache = EventStorageCache::new(30, 1000000, 10000);
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         (event_storage_cache, temp_dir)
@@ -129,7 +129,7 @@ mod tests {
 
     #[test]
     fn test_require_permission_user_has_sufficient_access() {
-        let (mut event_storage_cache, temp_dir) = setup_cache(5);
+        let (mut event_storage_cache, temp_dir) = setup_cache();
         let file_path = create_file_path(&temp_dir, "project1.bin");
         let user_hash = "user1";
 
@@ -176,7 +176,7 @@ mod tests {
 
     #[test]
     fn test_require_permission_user_has_insufficient_access() {
-        let (mut event_storage_cache, temp_dir) = setup_cache(5);
+        let (mut event_storage_cache, temp_dir) = setup_cache();
         let file_path = create_file_path(&temp_dir, "project1.bin");
         let user_hash = "user1";
 
@@ -214,7 +214,7 @@ mod tests {
 
     #[test]
     fn test_require_permission_user_has_sufficient_access_with_share_link() {
-        let (mut event_storage_cache, temp_dir) = setup_cache(5);
+        let (mut event_storage_cache, temp_dir) = setup_cache();
         let file_path = create_file_path(&temp_dir, "project1.bin");
         let user_hash = "user1";
         let share_key_hash = "share1";
@@ -267,7 +267,7 @@ mod tests {
 
     #[test]
     fn test_require_permission_user_has_insufficient_access_despite_share_link() {
-        let (mut event_storage_cache, temp_dir) = setup_cache(5);
+        let (mut event_storage_cache, temp_dir) = setup_cache();
         let file_path = create_file_path(&temp_dir, "project1.bin");
         let user_hash = "user1";
         let share_key_hash = "share1";
@@ -325,7 +325,7 @@ mod tests {
 
     #[test]
     fn test_require_permission_share_link_is_single_use_and_disabled() {
-        let (mut event_storage_cache, temp_dir) = setup_cache(5);
+        let (mut event_storage_cache, temp_dir) = setup_cache();
         let file_path = create_file_path(&temp_dir, "project1.bin");
         let user_hash = "user1";
         let share_key_hash = "share1";
@@ -394,7 +394,7 @@ mod tests {
 
     #[test]
     fn test_require_permission_share_link_does_not_increase_access() {
-        let (mut event_storage_cache, temp_dir) = setup_cache(5);
+        let (mut event_storage_cache, temp_dir) = setup_cache();
         let file_path = create_file_path(&temp_dir, "project1.bin");
         let user_hash = "user1";
         let share_key_hash = "share1";

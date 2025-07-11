@@ -84,7 +84,6 @@ impl Crypto {
 
 #[cfg(test)]
 mod tests {
-    use rsa::pkcs1::EncodeRsaPublicKey;
     use rsa::pkcs8::EncodePublicKey; // Add this import
     use rsa::signature::SignatureEncoding;
     use rsa::{RsaPrivateKey, pkcs1v15::SigningKey, signature::SignerMut};

@@ -1,8 +1,8 @@
 [workspace]
 # In alphabetical order
 members = [
-    "event_storage",
-    "event_storage_threads",
+    "eventplanedb_storage",
+    "eventplanedb_thread_worker",
     "eventplanedb_server",
     "eventplanedb_access",
 ]

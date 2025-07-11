@@ -3,8 +3,8 @@ use axum::{
     extract::{Path, Query},
     http::{HeaderMap, StatusCode},
 };
-use event_storage::catchup_result::CatchupResult;
-use event_storage_threads::queue_jobs::read_async;
+use eventplanedb_storage::catchup_result::CatchupResult;
+use eventplanedb_thread_worker::queue_jobs::read_async;
 use eventplanedb_access::job_error::JobError;
 use serde::Deserialize;
 

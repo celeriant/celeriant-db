@@ -121,15 +121,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "atomic-polyfill"
-version = "1.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8cf2bce30dfe09ef0bfaef228b9d414faaf7e563035494d7fe092dba54b300f4"
-dependencies = [
- "critical-section",
-]
-
-[[package]]
 name = "auto-future"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -470,15 +461,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b94f61472cee1439c0b966b47e3aca9ae07e45d070759512cd390ea2bebc6675"
 
 [[package]]
-name = "cobs"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0fa961b519f0b462e3a3b4a34b64d119eeaca1d59af726fe450bbba07a9fc0a1"
-dependencies = [
- "thiserror 2.0.12",
-]
-
-[[package]]
 name = "color_quant"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -567,12 +549,6 @@ dependencies = [
  "cast",
  "itertools 0.10.5",
 ]
-
-[[package]]
-name = "critical-section"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "790eea4361631c5e7d22598ecd5723ff611904e3344ce8720784c93e3d83d40b"
 
 [[package]]
 name = "crossbeam"
@@ -701,18 +677,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
-name = "embedded-io"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef1a6892d9eef45c8fa6b9e0086428a2cca8491aca8f787c534a3d6d0bcb3ced"
-
-[[package]]
-name = "embedded-io"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
-
-[[package]]
 name = "equator"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -749,41 +713,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "event_storage"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "criterion",
- "image",
- "nanoid",
- "postcard",
- "rand 0.8.5",
- "serde",
- "simd-json",
- "stl_io",
- "tempfile",
- "tikv-jemallocator",
- "zstd",
-]
-
-[[package]]
-name = "event_storage_threads"
-version = "0.1.0"
-dependencies = [
- "ahash",
- "core_affinity",
- "criterion",
- "crossbeam",
- "event_storage",
- "eventplanedb_access",
- "futures",
- "nanoid",
- "rand 0.8.5",
- "tempfile",
- "tokio",
-]
-
-[[package]]
 name = "eventplanedb_access"
 version = "0.1.0"
 dependencies = [
@@ -793,7 +722,7 @@ dependencies = [
  "core_affinity",
  "criterion",
  "crossbeam",
- "event_storage",
+ "eventplanedb_storage",
  "futures",
  "nanoid",
  "rand 0.8.5",
@@ -818,9 +747,9 @@ dependencies = [
  "core_affinity",
  "criterion",
  "crossbeam",
- "event_storage",
- "event_storage_threads",
  "eventplanedb_access",
+ "eventplanedb_storage",
+ "eventplanedb_thread_worker",
  "futures",
  "nanoid",
  "rand 0.8.5",
@@ -835,6 +764,39 @@ dependencies = [
  "tikv-jemallocator",
  "tokio",
  "tower-http",
+]
+
+[[package]]
+name = "eventplanedb_storage"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "criterion",
+ "image",
+ "nanoid",
+ "rand 0.8.5",
+ "serde",
+ "simd-json",
+ "stl_io",
+ "tempfile",
+ "zstd",
+]
+
+[[package]]
+name = "eventplanedb_thread_worker"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "core_affinity",
+ "criterion",
+ "crossbeam",
+ "eventplanedb_access",
+ "eventplanedb_storage",
+ "futures",
+ "nanoid",
+ "rand 0.8.5",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -1077,15 +1039,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hash32"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0c35f58762feb77d74ebe43bdbc3210f09be9fe6742234d573bacc26ed92b67"
-dependencies = [
- "byteorder",
-]
-
-[[package]]
 name = "hashbrown"
 version = "0.15.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1094,20 +1047,6 @@ dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash",
-]
-
-[[package]]
-name = "heapless"
-version = "0.7.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdc6457c0eb62c71aac4bc17216026d8410337c4126773b9c5daba343f17964f"
-dependencies = [
- "atomic-polyfill",
- "hash32",
- "rustc_version",
- "serde",
- "spin",
- "stable_deref_trait",
 ]
 
 [[package]]
@@ -1871,19 +1810,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "postcard"
-version = "1.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c1de96e20f51df24ca73cafcc4690e044854d803259db27a00a461cb3b9d17a"
-dependencies = [
- "cobs",
- "embedded-io 0.4.0",
- "embedded-io 0.6.1",
- "heapless",
- "serde",
-]
-
-[[package]]
 name = "potential_utf"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2220,15 +2146,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "989e6739f80c4ad5b13e0fd7fe89531180375b18520cc8c82080e4dc4035b84f"
 
 [[package]]
-name = "rustc_version"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
-dependencies = [
- "semver",
-]
-
-[[package]]
 name = "rustix"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2267,12 +2184,6 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
-
-[[package]]
-name = "semver"
-version = "1.0.26"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56e6fa9c48d24d85fb3de5ad847117517440f6beceb7798af16b4a87d616b8d0"
 
 [[package]]
 name = "serde"
@@ -2436,9 +2347,6 @@ name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
-dependencies = [
- "lock_api",
-]
 
 [[package]]
 name = "spki"

@@ -3,8 +3,8 @@ use axum::{
     extract::Path,
     http::{HeaderMap, StatusCode},
 };
-use event_storage::event_batch_item::EventBatchItem;
-use event_storage_threads::queue_jobs::delete_async;
+use eventplanedb_storage::event_batch_item::EventBatchItem;
+use eventplanedb_thread_worker::queue_jobs::delete_async;
 use eventplanedb_access::job_error::JobError;
 use serde::{Deserialize, Serialize};
 

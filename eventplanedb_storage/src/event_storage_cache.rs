@@ -310,7 +310,7 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use crate::{event_item::{tests::{create_minimal_event_item, create_test_event_item}, EventItem}, event_storage::tests::create_event_batch_item};
+    use crate::{event_item::{tests::{create_minimal_event_item, create_test_event_item}}, event_storage::tests::create_event_batch_item};
 
     use super::*;
 

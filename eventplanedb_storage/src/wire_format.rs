@@ -1,11 +1,9 @@
-use std::{fs, io};
+use std::{io};
 use crate::{event_batch_item::EventBatchItem};
 
 pub fn serialize_event_batch_item(events: &EventBatchItem) -> io::Result<Vec<u8>> {
     bincode::encode_to_vec(events, bincode::config::standard())
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
-    // postcard::to_allocvec(events)
-    //     .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
 }
 
 pub fn compress_data(data: &[u8]) -> io::Result<Vec<u8>> {
@@ -22,22 +20,6 @@ pub fn deserialize_event_batch_item(data: &[u8]) -> io::Result<EventBatchItem> {
     bincode::decode_from_slice(data, bincode::config::standard())
         .map(|(events, _)| events)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
-    // postcard::from_bytes(data)
-    //     .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
-}
-
-pub fn load_event_batch_item_from_json(path: &str) -> Result<EventBatchItem, Box<dyn std::error::Error>> {
-    let mut json_content = fs::read(path)?; // Note: read bytes, not string
-    let storage: EventBatchItem = simd_json::from_slice(&mut json_content)?;
-
-    Ok(storage)
-}
-
-pub fn save_event_batch_item_to_json(event_item: &EventBatchItem, path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let json_content = simd_json::to_string(event_item)?;
-    fs::write(path, json_content)?;
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -46,6 +28,21 @@ mod tests {
     use tempfile::TempDir;
     use crate::{event_item::tests::{create_minimal_event_item, create_test_event_item}, file_cache::create_append_writer};
     use super::*;
+
+
+    fn load_event_batch_item_from_json(path: &str) -> Result<EventBatchItem, Box<dyn std::error::Error>> {
+        let mut json_content = fs::read(path)?; // Note: read bytes, not string
+        let storage: EventBatchItem = simd_json::from_slice(&mut json_content)?;
+
+        Ok(storage)
+    }
+
+    fn save_event_batch_item_to_json(event_item: &EventBatchItem, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let json_content = simd_json::to_string(event_item)?;
+        fs::write(path, json_content)?;
+
+        Ok(())
+    }
 
     #[test]
     fn test_write_event_batch_item() {

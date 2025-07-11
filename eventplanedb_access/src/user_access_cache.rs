@@ -1,5 +1,5 @@
 use crate::{access_level::AccessLevel, project_event_type::ProjectEventType, project_to_user_access_level::ProjectToUserAccessLevel};
-use event_storage::{event_batch_item::EventBatchItem, event_item::EventItem, event_storage_cache::EventStorageCache};
+use eventplanedb_storage::{event_batch_item::EventBatchItem, event_item::EventItem, event_storage_cache::EventStorageCache};
 use std::{
     collections::{HashMap, VecDeque},
     io, usize,
@@ -151,8 +151,8 @@ impl UserAccessCache {
 #[cfg(test)]
 mod tests {
     use crate::{access_level::AccessLevel, project_event_type::ProjectEventType, project_to_user_access_level::ProjectToUserAccessLevel};
-    use event_storage::event_item::EventItem;
-    use event_storage::{event_batch_item::EventBatchItem, event_storage_cache::EventStorageCache};
+    use eventplanedb_storage::event_item::EventItem;
+    use eventplanedb_storage::{event_batch_item::EventBatchItem, event_storage_cache::EventStorageCache};
     use std::vec;
     use tempfile::TempDir;
 

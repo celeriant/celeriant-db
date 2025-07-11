@@ -8,7 +8,7 @@ use crate::{
     project_event_type::ProjectEventType,
     project_to_share_links::{ProjectToShareLinks, ShareLinkAccessInfo},
 };
-use event_storage::{event_batch_item::EventBatchItem, event_item::EventItem, event_storage_cache::EventStorageCache};
+use eventplanedb_storage::{event_batch_item::EventBatchItem, event_item::EventItem, event_storage_cache::EventStorageCache};
 
 pub struct ShareLinksCache {
     // The queue is used to evict the oldest files from the cache when the cache is full
@@ -214,7 +214,7 @@ impl ShareLinksCache {
 mod tests {
     use super::*;
     use crate::{access_level::AccessLevel, project_event_type::ProjectEventType};
-    use event_storage::{event_batch_item::EventBatchItem, event_item::EventItem, event_storage_cache::EventStorageCache};
+    use eventplanedb_storage::{event_batch_item::EventBatchItem, event_item::EventItem, event_storage_cache::EventStorageCache};
     use tempfile::TempDir;
 
     fn create_test_event_item() -> EventItem {

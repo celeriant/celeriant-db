@@ -10,7 +10,7 @@ use crate::process_share::handle_share_job;
 use crate::process_write::handle_write_job;
 use core_affinity;
 use crossbeam::channel::{Receiver, Sender, unbounded};
-use event_storage::event_storage_cache::EventStorageCache;
+use eventplanedb_storage::event_storage_cache::EventStorageCache;
 use eventplanedb_access::share_links_cache::ShareLinksCache;
 use eventplanedb_access::user_access_cache::UserAccessCache;
 

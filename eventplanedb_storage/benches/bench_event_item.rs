@@ -1,8 +1,8 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use event_storage::event_batch_item::{EventBatchItem};
-use event_storage::event_item::EventItem;
-use event_storage::file_cache::create_append_writer;
-use event_storage::wire_format::{compress_data, decompress_data, deserialize_event_batch_item, serialize_event_batch_item};
+use eventplanedb_storage::event_batch_item::{EventBatchItem};
+use eventplanedb_storage::event_item::EventItem;
+use eventplanedb_storage::file_cache::create_append_writer;
+use eventplanedb_storage::wire_format::{compress_data, decompress_data, deserialize_event_batch_item, serialize_event_batch_item};
 use std::fs;
 use std::io::Write;
 use tempfile::TempDir;

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use event_storage::{catchup_result::CatchupResult, event_storage_cache::EventStorageCache};
+use eventplanedb_storage::{catchup_result::CatchupResult, event_storage_cache::EventStorageCache};
 use eventplanedb_access::{access_level::AccessLevel, job_error::JobError, share_links_cache::ShareLinksCache, user_access_cache::UserAccessCache};
 
 use crate::event_notifications::EventNotifier;

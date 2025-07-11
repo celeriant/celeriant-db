@@ -19,6 +19,14 @@ mod crypto;
 mod json_formatter;
 mod routes;
 
+#[cfg(feature = "tikv-jemallocator")]
+mod jemalloc {
+    use tikv_jemallocator::Jemalloc;
+
+    #[global_allocator]
+    static GLOBAL: Jemalloc = Jemalloc;
+}
+
 #[tokio::main]
 async fn main() {
     // Get base path from environment variable or use default

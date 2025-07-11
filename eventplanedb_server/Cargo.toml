@@ -16,9 +16,9 @@ ahash.workspace = true
 tokio.workspace = true
 nanoid.workspace = true
 tempfile.workspace = true
-event_storage = { path = "../event_storage" }
+eventplanedb_storage = { path = "../eventplanedb_storage" }
 eventplanedb_access = { path = "../eventplanedb_access" }
-event_storage_threads = { path = "../event_storage_threads" }
+eventplanedb_thread_worker = { path = "../eventplanedb_thread_worker" }
 rand.workspace = true
 futures.workspace = true
 axum.workspace = true

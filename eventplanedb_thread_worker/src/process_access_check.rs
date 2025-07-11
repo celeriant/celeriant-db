@@ -1,4 +1,4 @@
-use event_storage::event_storage_cache::EventStorageCache;
+use eventplanedb_storage::event_storage_cache::EventStorageCache;
 use eventplanedb_access::{access_level::AccessLevel, job_error::JobError, share_links_cache::ShareLinksCache, user_access_cache::UserAccessCache};
 
 pub fn handle_access_check(

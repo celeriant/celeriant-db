@@ -1,7 +1,7 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use event_storage::event_batch_item::{EventBatchItem};
-use event_storage::event_item::EventItem;
-use event_storage::event_storage_cache::EventStorageCache;
+use eventplanedb_storage::event_batch_item::{EventBatchItem};
+use eventplanedb_storage::event_item::EventItem;
+use eventplanedb_storage::event_storage_cache::EventStorageCache;
 use std::fs;
 use tempfile::TempDir;
 use rand::prelude::*;

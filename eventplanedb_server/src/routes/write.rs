@@ -4,8 +4,8 @@ use axum::{
     extract::{Path, Query},
     http::{HeaderMap, StatusCode},
 };
-use event_storage::{event_batch_item::EventBatchItem, event_item::EventItem};
-use event_storage_threads::queue_jobs::write_async;
+use eventplanedb_storage::{event_batch_item::EventBatchItem, event_item::EventItem};
+use eventplanedb_thread_worker::queue_jobs::write_async;
 use eventplanedb_access::job_error::JobError;
 use serde::{Deserialize, Serialize};
 

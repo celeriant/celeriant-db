@@ -1,4 +1,4 @@
-use event_storage::{event_batch_item::EventBatchItem, event_item::EventItem, event_storage_cache::EventStorageCache};
+use eventplanedb_storage::{event_batch_item::EventBatchItem, event_item::EventItem, event_storage_cache::EventStorageCache};
 use eventplanedb_access::{
     access_level::AccessLevel, job_error::JobError, project_event_type::ProjectEventType, share_links_cache::ShareLinksCache,
     user_access_cache::UserAccessCache,

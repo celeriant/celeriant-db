@@ -1,10 +1,10 @@
 use std::usize;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use event_storage::event_batch_item::{EventBatchItem};
-use event_storage::event_item::EventItem;
-use event_storage::event_storage::{append_event_batch, read_from_si};
-use event_storage::file_cache::{create_append_writer, create_reader};
+use eventplanedb_storage::event_batch_item::{EventBatchItem};
+use eventplanedb_storage::event_item::EventItem;
+use eventplanedb_storage::event_storage::{append_event_batch, read_from_si};
+use eventplanedb_storage::file_cache::{create_append_writer, create_reader};
 use tempfile::TempDir;
 use rand::prelude::*;
 

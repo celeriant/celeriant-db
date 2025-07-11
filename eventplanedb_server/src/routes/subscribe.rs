@@ -4,7 +4,7 @@ use axum::{
     http::StatusCode,
     response::sse::{Event, Sse},
 };
-use event_storage_threads::queue_jobs::access_check_async;
+use eventplanedb_thread_worker::queue_jobs::access_check_async;
 use eventplanedb_access::job_error::JobError;
 use futures::stream::{self, Stream};
 use serde::Deserialize;

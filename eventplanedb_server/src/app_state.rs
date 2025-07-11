@@ -1,5 +1,5 @@
 use crossbeam::channel::Sender;
-use event_storage_threads::{event_notifications::EventNotifier, job::Job, process_jobs::create_thread_pool};
+use eventplanedb_thread_worker::{event_notifications::EventNotifier, job::Job, process_jobs::create_thread_pool};
 use std::sync::Arc;
 
 #[derive(Clone)]

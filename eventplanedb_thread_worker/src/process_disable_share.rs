@@ -1,4 +1,4 @@
-use event_storage::{event_batch_item::EventBatchItem, event_storage_cache::EventStorageCache};
+use eventplanedb_storage::{event_batch_item::EventBatchItem, event_storage_cache::EventStorageCache};
 use eventplanedb_access::{access_level::AccessLevel, job_error::JobError, share_links_cache::ShareLinksCache, user_access_cache::UserAccessCache};
 
 use crate::{event_notifications::EventNotifier, process_write::WriteResult};
