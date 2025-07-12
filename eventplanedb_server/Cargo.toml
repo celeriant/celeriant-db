@@ -17,6 +17,7 @@ tokio.workspace = true
 nanoid.workspace = true
 tempfile.workspace = true
 eventplanedb_storage = { path = "../eventplanedb_storage" }
+eventplanedb_crypto = { path = "../eventplanedb_crypto" }
 eventplanedb_access = { path = "../eventplanedb_access" }
 eventplanedb_thread_worker = { path = "../eventplanedb_thread_worker" }
 rand.workspace = true

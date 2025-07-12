@@ -15,7 +15,6 @@ use crate::{
 };
 
 mod app_state;
-mod crypto;
 mod json_formatter;
 mod routes;
 mod error_response;

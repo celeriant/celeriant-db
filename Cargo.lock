@@ -736,6 +736,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "eventplanedb_crypto"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "nanoid",
+ "rand 0.8.5",
+ "rsa",
+ "sha2",
+ "thiserror 2.0.12",
+]
+
+[[package]]
 name = "eventplanedb_server"
 version = "0.1.0"
 dependencies = [
@@ -748,6 +760,7 @@ dependencies = [
  "criterion",
  "crossbeam",
  "eventplanedb_access",
+ "eventplanedb_crypto",
  "eventplanedb_storage",
  "eventplanedb_thread_worker",
  "futures",
