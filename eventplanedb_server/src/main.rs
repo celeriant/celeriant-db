@@ -17,6 +17,7 @@ use crate::{
 mod app_state;
 mod json_formatter;
 mod routes;
+mod auth;
 mod error_response;
 
 #[cfg(feature = "tikv-jemallocator")]

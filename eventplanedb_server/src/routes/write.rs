@@ -33,7 +33,7 @@ pub async fn write_events(
     }
 
     let server_time = state.server_time();
-    let current_user_hash = state.validate_auth_headers(&headers)?;
+    let current_user_hash = state.validate_auth_headers(&headers).await?;
     let file_path = state.get_file_path(&id);
     let allow_create = params.create_if_not_exist.unwrap_or(false);
 

@@ -34,6 +34,8 @@ thiserror.workspace = true
 spki.workspace = true
 serde_json.workspace = true
 simd-json.workspace = true
+reqwest.workspace = true
+jsonwebtoken.workspace = true
 
 [dev-dependencies]
 rand.workspace = true

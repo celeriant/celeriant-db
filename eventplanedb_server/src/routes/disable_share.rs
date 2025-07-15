@@ -17,7 +17,7 @@ pub async fn disable_share(
     headers: HeaderMap,
 ) -> Result<CompactJson<DisableShareResponse>, RouteError> {
     let server_time = state.server_time();
-    let current_user_hash = state.validate_auth_headers(&headers)?;
+    let current_user_hash = state.validate_auth_headers(&headers).await?;
     let file_path = state.get_file_path(&id);
 
     let result = disable_share_async(&state.workers, file_path, current_user_hash, server_time, share_hash).await?;
