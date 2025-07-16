@@ -22,7 +22,7 @@ pub fn handle_write_job(
     let file_exists = event_storage_cache.exists(&file_path);
 
     if !file_exists && !allow_create {
-        return Err(JobError::NotFound("Project does not exist".to_string()));
+        return Err(JobError::NotFound("Aggregate does not exist".to_string()));
     }
 
     if file_exists {

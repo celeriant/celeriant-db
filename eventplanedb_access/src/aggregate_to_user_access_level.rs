@@ -2,11 +2,11 @@ use std::collections::HashMap;
 
 use crate::access_level::AccessLevel;
 
-pub struct ProjectToUserAccessLevel {
+pub struct AggregateToUserAccessLevel {
     users: HashMap<String, AccessLevel>,
 }
 
-impl ProjectToUserAccessLevel {
+impl AggregateToUserAccessLevel {
     pub fn new() -> Self {
         Self {
             users: HashMap::new()
@@ -58,13 +58,13 @@ mod tests {
 
     #[test]
     fn test_new_creates_empty_cache() {
-        let cache = ProjectToUserAccessLevel::new();
+        let cache = AggregateToUserAccessLevel::new();
         assert_eq!(cache.count(), 0);
     }
 
     #[test]
     fn test_update_cache_no_op_no_access_to_no_access() {
-        let mut cache = ProjectToUserAccessLevel::new();
+        let mut cache = AggregateToUserAccessLevel::new();
         let user_hash = "user123";
         
         cache.update_cache_for_user(user_hash, AccessLevel::None, false);
@@ -75,7 +75,7 @@ mod tests {
 
     #[test]
     fn test_update_cache_grant_access_to_new_user() {
-        let mut cache = ProjectToUserAccessLevel::new();
+        let mut cache = AggregateToUserAccessLevel::new();
         let user_hash = "user123";
         
         cache.update_cache_for_user(user_hash, AccessLevel::Viewer, false);
@@ -86,7 +86,7 @@ mod tests {
 
     #[test]
     fn test_update_cache_no_op_has_access_cannot_remove() {
-        let mut cache = ProjectToUserAccessLevel::new();
+        let mut cache = AggregateToUserAccessLevel::new();
         let user_hash = "user123";
         
         // First grant access
@@ -101,7 +101,7 @@ mod tests {
 
     #[test]
     fn test_update_cache_remove_access_with_override() {
-        let mut cache = ProjectToUserAccessLevel::new();
+        let mut cache = AggregateToUserAccessLevel::new();
         let user_hash = "user123";
         
         // First grant access
@@ -116,7 +116,7 @@ mod tests {
 
     #[test]
     fn test_update_cache_increase_access_level() {
-        let mut cache = ProjectToUserAccessLevel::new();
+        let mut cache = AggregateToUserAccessLevel::new();
         let user_hash = "user123";
         
         // Grant viewer access
@@ -131,7 +131,7 @@ mod tests {
 
     #[test]
     fn test_update_cache_decrease_access_level_without_override() {
-        let mut cache = ProjectToUserAccessLevel::new();
+        let mut cache = AggregateToUserAccessLevel::new();
         let user_hash = "user123";
         
         // Grant owner access
@@ -146,7 +146,7 @@ mod tests {
 
     #[test]
     fn test_update_cache_decrease_access_level_with_override() {
-        let mut cache = ProjectToUserAccessLevel::new();
+        let mut cache = AggregateToUserAccessLevel::new();
         let user_hash = "user123";
         
         // Grant owner access
@@ -161,7 +161,7 @@ mod tests {
 
     #[test]
     fn test_update_cache_same_access_level_with_override() {
-        let mut cache = ProjectToUserAccessLevel::new();
+        let mut cache = AggregateToUserAccessLevel::new();
         let user_hash = "user123";
         
         // Grant contributor access
@@ -176,7 +176,7 @@ mod tests {
 
     #[test]
     fn test_multiple_users() {
-        let mut cache = ProjectToUserAccessLevel::new();
+        let mut cache = AggregateToUserAccessLevel::new();
         
         cache.update_cache_for_user("user1", AccessLevel::Owner, false);
         cache.update_cache_for_user("user2", AccessLevel::Contributor, false);
@@ -191,13 +191,13 @@ mod tests {
 
     #[test]
     fn test_current_access_level_for_nonexistent_user() {
-        let cache = ProjectToUserAccessLevel::new();
+        let cache = AggregateToUserAccessLevel::new();
         assert_eq!(cache.current_access_level_for_user("nonexistent"), AccessLevel::None);
     }
 
     #[test]
     fn test_count_reflects_additions_and_removals() {
-        let mut cache = ProjectToUserAccessLevel::new();
+        let mut cache = AggregateToUserAccessLevel::new();
         
         assert_eq!(cache.count(), 0);
         

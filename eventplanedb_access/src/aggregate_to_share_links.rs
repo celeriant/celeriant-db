@@ -28,11 +28,11 @@ impl ShareLinkAccessInfo {
     }
 }
 
-pub struct ProjectToShareLinks {
+pub struct AggregateToShareLinks {
     share_links: HashMap<String, ShareLinkAccessInfo>,
 }
 
-impl ProjectToShareLinks {
+impl AggregateToShareLinks {
     pub fn new() -> Self {
         Self {
             share_links: HashMap::new(),
@@ -62,13 +62,13 @@ mod tests {
 
     #[test]
     fn test_new_creates_empty_share_links() {
-        let project_share_links = ProjectToShareLinks::new();
-        assert_eq!(project_share_links.count(), 0);
+        let aggregate_share_links = AggregateToShareLinks::new();
+        assert_eq!(aggregate_share_links.count(), 0);
     }
 
     #[test]
     fn test_add_and_get_share_link() {
-        let mut project_share_links = ProjectToShareLinks::new();
+        let mut aggregate_share_links = AggregateToShareLinks::new();
         let share_hash = "share123".to_string();
         let share_link_info = ShareLinkAccessInfo {
             access_level: AccessLevel::Viewer,
@@ -78,10 +78,10 @@ mod tests {
             expires_on: 0
         };
 
-        project_share_links.add_share_link(share_hash.clone(), share_link_info);
-        assert_eq!(project_share_links.count(), 1);
+        aggregate_share_links.add_share_link(share_hash.clone(), share_link_info);
+        assert_eq!(aggregate_share_links.count(), 1);
 
-        let retrieved_share_link = project_share_links.get_share_link(&share_hash).unwrap();
+        let retrieved_share_link = aggregate_share_links.get_share_link(&share_hash).unwrap();
         assert_eq!(retrieved_share_link.access_level, AccessLevel::Viewer);
         assert_eq!(retrieved_share_link.share_key, "key123");
         assert_eq!(retrieved_share_link.is_single_use, false);
@@ -90,7 +90,7 @@ mod tests {
 
     #[test]
     fn test_remove_share_link() {
-        let mut project_share_links = ProjectToShareLinks::new();
+        let mut aggregate_share_links = AggregateToShareLinks::new();
         let share_hash = "share123".to_string();
         let share_link_info = ShareLinkAccessInfo {
             access_level: AccessLevel::Viewer,
@@ -100,23 +100,23 @@ mod tests {
             expires_on: 0
         };
 
-        project_share_links.add_share_link(share_hash.clone(), share_link_info);
-        assert_eq!(project_share_links.count(), 1);
+        aggregate_share_links.add_share_link(share_hash.clone(), share_link_info);
+        assert_eq!(aggregate_share_links.count(), 1);
 
-        project_share_links.remove_share_link(&share_hash);
-        assert_eq!(project_share_links.count(), 0);
-        assert!(project_share_links.get_share_link(&share_hash).is_none());
+        aggregate_share_links.remove_share_link(&share_hash);
+        assert_eq!(aggregate_share_links.count(), 0);
+        assert!(aggregate_share_links.get_share_link(&share_hash).is_none());
     }
 
     #[test]
     fn test_get_nonexistent_share_link() {
-        let project_share_links = ProjectToShareLinks::new();
-        assert!(project_share_links.get_share_link("nonexistent").is_none());
+        let aggregate_share_links = AggregateToShareLinks::new();
+        assert!(aggregate_share_links.get_share_link("nonexistent").is_none());
     }
 
     #[test]
     fn test_multiple_share_links() {
-        let mut project_share_links = ProjectToShareLinks::new();
+        let mut aggregate_share_links = AggregateToShareLinks::new();
 
         let share_link_info1 = ShareLinkAccessInfo {
             access_level: AccessLevel::Viewer,
@@ -133,11 +133,11 @@ mod tests {
             expires_on: 0
         };
 
-        project_share_links.add_share_link("share1".to_string(), share_link_info1);
-        project_share_links.add_share_link("share2".to_string(), share_link_info2);
+        aggregate_share_links.add_share_link("share1".to_string(), share_link_info1);
+        aggregate_share_links.add_share_link("share2".to_string(), share_link_info2);
 
-        assert_eq!(project_share_links.count(), 2);
-        assert_eq!(project_share_links.get_share_link("share1").unwrap().access_level, AccessLevel::Viewer);
-        assert_eq!(project_share_links.get_share_link("share2").unwrap().access_level, AccessLevel::Contributor);
+        assert_eq!(aggregate_share_links.count(), 2);
+        assert_eq!(aggregate_share_links.get_share_link("share1").unwrap().access_level, AccessLevel::Viewer);
+        assert_eq!(aggregate_share_links.get_share_link("share2").unwrap().access_level, AccessLevel::Contributor);
     }
 }

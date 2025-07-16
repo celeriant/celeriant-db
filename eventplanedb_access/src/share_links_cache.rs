@@ -5,8 +5,8 @@ use std::{
 
 use crate::{
     access_level::AccessLevel,
-    project_event_type::TopicEventType,
-    project_to_share_links::{ProjectToShareLinks, ShareLinkAccessInfo},
+    aggregate_event_type::AggregateEventType,
+    aggregate_to_share_links::{AggregateToShareLinks, ShareLinkAccessInfo},
 };
 use eventplanedb_storage::{event_batch_item::EventBatchItem, event_item::EventItem, event_storage_cache::EventStorageCache};
 
@@ -15,28 +15,28 @@ pub struct ShareLinksCache {
     cache_queue: VecDeque<String>,
 
     // The cache maps a file to another hashmap of share_hash to share link data
-    cache: HashMap<String, ProjectToShareLinks>,
+    cache: HashMap<String, AggregateToShareLinks>,
 
     // The maximum number of projects to cache, currently we can have unlimited share links inside a project
-    cache_max_project_count: usize,
+    cache_max_aggregate_count: usize,
 }
 
 impl ShareLinksCache {
-    pub fn new(cache_max_project_count: usize) -> Self {
+    pub fn new(cache_max_aggregate_count: usize) -> Self {
         Self {
             cache_queue: VecDeque::new(),
             cache: HashMap::new(),
-            cache_max_project_count,
+            cache_max_aggregate_count,
         }
     }
 
     /// If we have exeeded the maximum nbr of projects in the cache, clear out the oldest ones
     fn clear_cache(&mut self) {
-        if self.cache.len() < self.cache_max_project_count {
+        if self.cache.len() < self.cache_max_aggregate_count {
             return;
         }
 
-        while self.cache.len() > self.cache_max_project_count {
+        while self.cache.len() > self.cache_max_aggregate_count {
             if let Some(file_path) = self.cache_queue.pop_front() {
                 self.cache.remove(&file_path);
             } else {
@@ -46,17 +46,17 @@ impl ShareLinksCache {
     }
 
     /// Grab the current cache for a project, or build it if it doesn't exist and add it to the cache
-    fn get_or_build_cache(&mut self, event_storage_cache: &mut EventStorageCache, file_path: &str) -> &mut ProjectToShareLinks {
+    fn get_or_build_cache(&mut self, event_storage_cache: &mut EventStorageCache, file_path: &str) -> &mut AggregateToShareLinks {
         self.clear_cache();
 
         if self.cache.contains_key(file_path) {
             return self.cache.get_mut(file_path).unwrap();
         }
 
-        self.cache.insert(file_path.to_string(), ProjectToShareLinks::new());
+        self.cache.insert(file_path.to_string(), AggregateToShareLinks::new());
         self.cache_queue.push_back(file_path.to_string());
 
-        self.populate_cache_for_project(event_storage_cache, file_path);
+        self.populate_cache_for_aggregate(event_storage_cache, file_path);
 
         self.clear_cache();
 
@@ -64,20 +64,20 @@ impl ShareLinksCache {
     }
 
     /// Read all the ProvideAccess events for a project and build the cache for that project from the events found
-    fn populate_cache_for_project(&mut self, event_storage_cache: &mut EventStorageCache, file_path: &str) {
-        let project_to_user_access_level = self.cache.get_mut(file_path).unwrap();
+    fn populate_cache_for_aggregate(&mut self, event_storage_cache: &mut EventStorageCache, file_path: &str) {
+        let aggregate_to_user_access_level = self.cache.get_mut(file_path).unwrap();
 
         match event_storage_cache.read(
             file_path,
             0,
             usize::MAX,
-            Some(&[TopicEventType::ShareLinkCreated as u64, TopicEventType::ShareLinkDisabled as u64]),
+            Some(&[AggregateEventType::ShareLinkCreated as u64, AggregateEventType::ShareLinkDisabled as u64]),
         ) {
             Ok(result) => {
                 for event_batch_item in result.event_batches {
                     for event_item in event_batch_item.events.iter() {
                         // Share links are stored in the cache for quick lookup when a user tries to join
-                        if event_item.tp == TopicEventType::ShareLinkCreated as u64
+                        if event_item.tp == AggregateEventType::ShareLinkCreated as u64
                             && event_item.uint_values.is_some()
                             && event_item.string_values.is_some()
                             && event_item.bool_values.is_some()
@@ -93,15 +93,15 @@ impl ShareLinksCache {
                                 event_batch_item.cb.clone().unwrap(),
                                 event_item.uint_values.as_ref().unwrap()[1],
                             );
-                            project_to_user_access_level.add_share_link(share_link_access_info.share_key.clone(), share_link_access_info);
+                            aggregate_to_user_access_level.add_share_link(share_link_access_info.share_key.clone(), share_link_access_info);
                         }
 
                         // Share links can be disabled if used (single use link) or if an owner explicitly disables it
-                        if event_item.tp == TopicEventType::ShareLinkDisabled as u64
+                        if event_item.tp == AggregateEventType::ShareLinkDisabled as u64
                             && event_item.string_values.is_some()
                             && event_item.string_values.as_ref().unwrap().len() > 0
                         {
-                            project_to_user_access_level.remove_share_link(&event_item.string_values.as_ref().unwrap()[0].as_ref().unwrap());
+                            aggregate_to_user_access_level.remove_share_link(&event_item.string_values.as_ref().unwrap()[0].as_ref().unwrap());
                         }
                     }
                 }
@@ -131,7 +131,7 @@ impl ShareLinksCache {
 
         let mut event_item = EventItem::new();
         event_item.ed = current_time;
-        event_item.tp = TopicEventType::ShareLinkCreated as u64;
+        event_item.tp = AggregateEventType::ShareLinkCreated as u64;
         event_item.iv_arrays = Some(vec![iv]);
         event_item.string_values = Some(vec![description, Some(share_key_hash.clone())]);
         event_item.uint_values = Some(vec![access_level as u64, expires_on]);
@@ -160,9 +160,9 @@ impl ShareLinksCache {
         file_path: &str,
         share_key_hash: &str,
     ) -> Option<&ShareLinkAccessInfo> {
-        let project_cache = self.get_or_build_cache(event_storage_cache, file_path);
+        let aggregate_cache = self.get_or_build_cache(event_storage_cache, file_path);
 
-        let is_expired = if let Some(share_link_access_info) = project_cache.get_share_link(share_key_hash) {
+        let is_expired = if let Some(share_link_access_info) = aggregate_cache.get_share_link(share_key_hash) {
             share_link_access_info.expires_on > 0 && share_link_access_info.expires_on < chrono::Utc::now().timestamp_millis() as u64
         } else {
             return None; // Share link doesn't exist
@@ -170,12 +170,12 @@ impl ShareLinksCache {
 
         // If expired, remove it from cache
         if is_expired {
-            project_cache.remove_share_link(share_key_hash);
+            aggregate_cache.remove_share_link(share_key_hash);
             return None;
         }
 
         // Return the valid share link (we know it exists since we checked above)
-        project_cache.get_share_link(share_key_hash)
+        aggregate_cache.get_share_link(share_key_hash)
     }
 
     /// Creates a DisableShareLink event and writes it without
@@ -191,7 +191,7 @@ impl ShareLinksCache {
     ) -> io::Result<EventBatchItem> {
         let mut event_item = EventItem::new();
         event_item.ed = current_time;
-        event_item.tp = TopicEventType::ShareLinkDisabled as u64;
+        event_item.tp = AggregateEventType::ShareLinkDisabled as u64;
         event_item.string_values = Some(vec![Some(share_key_hash.clone())]);
 
         let mut event_batch_item = EventBatchItem::new();
@@ -213,7 +213,7 @@ impl ShareLinksCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{access_level::AccessLevel, project_event_type::TopicEventType};
+    use crate::{access_level::AccessLevel, aggregate_event_type::AggregateEventType};
     use eventplanedb_storage::{event_batch_item::EventBatchItem, event_item::EventItem, event_storage_cache::EventStorageCache};
     use tempfile::TempDir;
 
@@ -228,8 +228,8 @@ mod tests {
     }
 
     // Helper function to create a basic EventStorageCache for testing
-    fn setup_cache(max_projects: usize) -> (ShareLinksCache, EventStorageCache, TempDir) {
-        let share_links_cache = ShareLinksCache::new(max_projects);
+    fn setup_cache(max_aggregates: usize) -> (ShareLinksCache, EventStorageCache, TempDir) {
+        let share_links_cache = ShareLinksCache::new(max_aggregates);
         let event_storage_cache = EventStorageCache::new(30, 1000000, 10000);
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         (share_links_cache, event_storage_cache, temp_dir)
@@ -253,7 +253,7 @@ mod tests {
 
         let mut event_item = EventItem::new();
         event_item.ed = current_time;
-        event_item.tp = TopicEventType::ShareLinkCreated as u64;
+        event_item.tp = AggregateEventType::ShareLinkCreated as u64;
         event_item.string_values = Some(vec![description, Some(share_key_hash.to_string())]);
         event_item.uint_values = Some(vec![access_level as u64, expires_on]);
         event_item.bool_values = Some(vec![is_single_use]);
@@ -266,7 +266,7 @@ mod tests {
 
         let mut event_item = EventItem::new();
         event_item.ed = current_time;
-        event_item.tp = TopicEventType::ShareLinkDisabled as u64;
+        event_item.tp = AggregateEventType::ShareLinkDisabled as u64;
         event_item.string_values = Some(vec![Some(share_key_hash.to_string())]);
         event_item
     }
@@ -285,19 +285,19 @@ mod tests {
     #[test]
     fn test_new() {
         let cache = ShareLinksCache::new(5);
-        assert_eq!(cache.cache_max_project_count, 5);
+        assert_eq!(cache.cache_max_aggregate_count, 5);
         assert_eq!(cache.cache.len(), 0);
         assert_eq!(cache.cache_queue.len(), 0);
 
         let cache = ShareLinksCache::new(0);
-        assert_eq!(cache.cache_max_project_count, 0);
+        assert_eq!(cache.cache_max_aggregate_count, 0);
     }
 
     #[test]
     fn test_clear_cache_does_nothing_when_under_max_capacity() {
         let (mut share_links_cache, _, _) = setup_cache(3);
-        share_links_cache.cache.insert("project1".to_string(), ProjectToShareLinks::new());
-        share_links_cache.cache.insert("project2".to_string(), ProjectToShareLinks::new());
+        share_links_cache.cache.insert("project1".to_string(), AggregateToShareLinks::new());
+        share_links_cache.cache.insert("project2".to_string(), AggregateToShareLinks::new());
         share_links_cache.cache_queue.push_back("project1".to_string());
         share_links_cache.cache_queue.push_back("project2".to_string());
 
@@ -310,9 +310,9 @@ mod tests {
     #[test]
     fn test_clear_cache_removes_oldest_projects_when_at_max_capacity() {
         let (mut share_links_cache, _, _) = setup_cache(2);
-        share_links_cache.cache.insert("project1".to_string(), ProjectToShareLinks::new());
-        share_links_cache.cache.insert("project2".to_string(), ProjectToShareLinks::new());
-        share_links_cache.cache.insert("project3".to_string(), ProjectToShareLinks::new());
+        share_links_cache.cache.insert("project1".to_string(), AggregateToShareLinks::new());
+        share_links_cache.cache.insert("project2".to_string(), AggregateToShareLinks::new());
+        share_links_cache.cache.insert("project3".to_string(), AggregateToShareLinks::new());
 
         //project1 is the oldest
         share_links_cache.cache_queue.push_back("project1".to_string());
@@ -328,9 +328,9 @@ mod tests {
     #[test]
     fn test_clear_cache_removes_multiple_projects_when_significantly_over_capacity() {
         let (mut share_links_cache, _, _) = setup_cache(1);
-        share_links_cache.cache.insert("project1".to_string(), ProjectToShareLinks::new());
-        share_links_cache.cache.insert("project2".to_string(), ProjectToShareLinks::new());
-        share_links_cache.cache.insert("project3".to_string(), ProjectToShareLinks::new());
+        share_links_cache.cache.insert("project1".to_string(), AggregateToShareLinks::new());
+        share_links_cache.cache.insert("project2".to_string(), AggregateToShareLinks::new());
+        share_links_cache.cache.insert("project3".to_string(), AggregateToShareLinks::new());
 
         share_links_cache.cache_queue.push_back("project1".to_string());
         share_links_cache.cache_queue.push_back("project2".to_string());
@@ -346,8 +346,8 @@ mod tests {
     #[test]
     fn test_clear_cache_handles_empty_queue_gracefully() {
         let (mut share_links_cache, _, _) = setup_cache(1);
-        share_links_cache.cache.insert("project1".to_string(), ProjectToShareLinks::new());
-        share_links_cache.cache.insert("project2".to_string(), ProjectToShareLinks::new());
+        share_links_cache.cache.insert("project1".to_string(), AggregateToShareLinks::new());
+        share_links_cache.cache.insert("project2".to_string(), AggregateToShareLinks::new());
         share_links_cache.cache_queue.clear(); // Empty the queue
 
         share_links_cache.clear_cache();
@@ -360,11 +360,11 @@ mod tests {
         let (mut share_links_cache, _, _) = setup_cache(2);
         share_links_cache.cache_queue.push_back("project1".to_string());
         share_links_cache.cache_queue.push_back("project2".to_string());
-        share_links_cache.cache.insert("project1".to_string(), ProjectToShareLinks::new());
-        share_links_cache.cache.insert("project2".to_string(), ProjectToShareLinks::new());
+        share_links_cache.cache.insert("project1".to_string(), AggregateToShareLinks::new());
+        share_links_cache.cache.insert("project2".to_string(), AggregateToShareLinks::new());
 
         // Add a third project, which should evict "project1" (oldest)
-        share_links_cache.cache.insert("project3".to_string(), ProjectToShareLinks::new());
+        share_links_cache.cache.insert("project3".to_string(), AggregateToShareLinks::new());
         share_links_cache.cache_queue.push_back("project3".to_string());
         share_links_cache.clear_cache(); // Force eviction
 
@@ -393,8 +393,8 @@ mod tests {
         event_storage_cache.write(&file_path, true, event_batch_2).unwrap();
 
         // Populate cache for the project
-        share_links_cache.cache.insert(file_path.clone(), ProjectToShareLinks::new());
-        share_links_cache.populate_cache_for_project(&mut event_storage_cache, &file_path);
+        share_links_cache.cache.insert(file_path.clone(), AggregateToShareLinks::new());
+        share_links_cache.populate_cache_for_aggregate(&mut event_storage_cache, &file_path);
 
         // Verify cache content
         let project_cache = share_links_cache.cache.get(&file_path).unwrap();
@@ -424,8 +424,8 @@ mod tests {
         event_storage_cache.write(&file_path, true, event_batch_2).unwrap();
 
         // Populate cache for the project
-        share_links_cache.cache.insert(file_path.clone(), ProjectToShareLinks::new());
-        share_links_cache.populate_cache_for_project(&mut event_storage_cache, &file_path);
+        share_links_cache.cache.insert(file_path.clone(), AggregateToShareLinks::new());
+        share_links_cache.populate_cache_for_aggregate(&mut event_storage_cache, &file_path);
 
         // Verify cache content
         let project_cache = share_links_cache.cache.get(&file_path).unwrap();
@@ -441,7 +441,7 @@ mod tests {
         // Create AddShareLink and other event types
         let event1 = create_add_share_link_event("share1", AccessLevel::Viewer, false, 0, Some("desc1".to_string()));
         let mut event2 = create_add_share_link_event("share2", AccessLevel::Contributor, true, 0, Some("desc2".to_string()));
-        event2.tp = TopicEventType::UserAccessUpdated as u64; // Change type to ProvideAccess
+        event2.tp = AggregateEventType::UserAccessUpdated as u64; // Change type to ProvideAccess
         let event3 = create_disable_share_link_event("share1");
 
         let event_batch_1 = create_event_batch_item_with_events(vec![event1], "admin");
@@ -453,8 +453,8 @@ mod tests {
         event_storage_cache.write(&file_path, true, event_batch_3).unwrap();
 
         // Populate cache for the project
-        share_links_cache.cache.insert(file_path.clone(), ProjectToShareLinks::new());
-        share_links_cache.populate_cache_for_project(&mut event_storage_cache, &file_path);
+        share_links_cache.cache.insert(file_path.clone(), AggregateToShareLinks::new());
+        share_links_cache.populate_cache_for_aggregate(&mut event_storage_cache, &file_path);
 
         // Verify cache content (only AddShareLink and DisableShareLink events should be processed)
         let project_cache = share_links_cache.cache.get(&file_path).unwrap();
@@ -484,8 +484,8 @@ mod tests {
         event_storage_cache.write(&file_path, true, event_batch_3).unwrap();
 
         // Populate cache for the project
-        share_links_cache.cache.insert(file_path.clone(), ProjectToShareLinks::new());
-        share_links_cache.populate_cache_for_project(&mut event_storage_cache, &file_path);
+        share_links_cache.cache.insert(file_path.clone(), AggregateToShareLinks::new());
+        share_links_cache.populate_cache_for_aggregate(&mut event_storage_cache, &file_path);
 
         // Verify cache content (malformed events should be ignored)
         let project_cache = share_links_cache.cache.get(&file_path).unwrap();
@@ -498,8 +498,8 @@ mod tests {
         let file_path = create_file_path(&temp_dir, "nonexistent_project.bin");
 
         // Attempt to populate cache for a non-existent file
-        share_links_cache.cache.insert(file_path.clone(), ProjectToShareLinks::new());
-        share_links_cache.populate_cache_for_project(&mut event_storage_cache, &file_path);
+        share_links_cache.cache.insert(file_path.clone(), AggregateToShareLinks::new());
+        share_links_cache.populate_cache_for_aggregate(&mut event_storage_cache, &file_path);
 
         // Verify that the cache remains empty
         let project_cache = share_links_cache.cache.get(&file_path).unwrap();
@@ -521,8 +521,8 @@ mod tests {
         event_storage_cache.write(&file_path, true, event_batch).unwrap();
 
         // Populate the cache
-        share_links_cache.cache.insert(file_path.clone(), ProjectToShareLinks::new());
-        share_links_cache.populate_cache_for_project(&mut event_storage_cache, &file_path);
+        share_links_cache.cache.insert(file_path.clone(), AggregateToShareLinks::new());
+        share_links_cache.populate_cache_for_aggregate(&mut event_storage_cache, &file_path);
 
         // Verify that the cache remains empty
         let project_cache = share_links_cache.cache.get(&file_path).unwrap();
@@ -535,7 +535,7 @@ mod tests {
         let file_path = create_file_path(&temp_dir, "project1.bin");
 
         // Insert a project into the cache
-        share_links_cache.cache.insert(file_path.clone(), ProjectToShareLinks::new());
+        share_links_cache.cache.insert(file_path.clone(), AggregateToShareLinks::new());
 
         // Get the cache for the project
         share_links_cache.get_or_build_cache(&mut event_storage_cache, &file_path);
@@ -575,7 +575,7 @@ mod tests {
         let file_path2 = create_file_path(&temp_dir, "project2.bin");
 
         // Fill the cache to capacity
-        share_links_cache.cache.insert(file_path1.clone(), ProjectToShareLinks::new());
+        share_links_cache.cache.insert(file_path1.clone(), AggregateToShareLinks::new());
         share_links_cache.cache_queue.push_back(file_path1.clone());
 
         // Add a new project, which should trigger cache clearing
@@ -646,7 +646,7 @@ mod tests {
         let share_key_hash = "share123";
 
         // Create a share link and add it to the cache
-        let mut project_cache = ProjectToShareLinks::new();
+        let mut project_cache = AggregateToShareLinks::new();
         let share_link_info = ShareLinkAccessInfo::new(AccessLevel::Viewer, share_key_hash.to_string(), false, "user1".to_string(), 0);
         project_cache.add_share_link(share_key_hash.to_string(), share_link_info);
         share_links_cache.cache.insert(file_path.clone(), project_cache);
@@ -679,7 +679,7 @@ mod tests {
         let share_key_hash = "share123";
 
         // Create an expired share link and add it to the cache
-        let mut project_cache = ProjectToShareLinks::new();
+        let mut project_cache = AggregateToShareLinks::new();
         let share_link_info = ShareLinkAccessInfo::new(
             AccessLevel::Viewer,
             share_key_hash.to_string(),
@@ -718,7 +718,7 @@ mod tests {
         event_storage_cache.write(&file_path, true, first_batch).unwrap();
 
         // Create a share link and add it to the cache
-        let mut project_cache = ProjectToShareLinks::new();
+        let mut project_cache = AggregateToShareLinks::new();
         let share_link_info = ShareLinkAccessInfo::new(AccessLevel::Viewer, share_key_hash.to_string(), false, "user1".to_string(), 0);
         project_cache.add_share_link(share_key_hash.to_string(), share_link_info);
         share_links_cache.cache.insert(file_path.clone(), project_cache);

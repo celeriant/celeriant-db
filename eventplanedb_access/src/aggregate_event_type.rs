@@ -1,6 +1,6 @@
 
 
-pub enum TopicEventType
+pub enum AggregateEventType
 {
     ShareLinkCreated = 43,
     UserAccessUpdated = 45,

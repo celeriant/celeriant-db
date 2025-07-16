@@ -68,13 +68,13 @@ pub fn create_router(state: AppState) -> Router {
         .max_age(Duration::from_secs(86400)); // 24 hours
 
     let api_v1 = Router::new()
-        .route("/{id}/read", get(read_events))
-        .route("/{id}/subscribe", get(subscribe_events))
-        .route("/{id}/write", post(write_events))
-        .route("/{id}/delete", post(delete))
-        .route("/{id}/disableshare/{share_hash}", post(disable_share))
-        .route("/{id}/disableuser/{user_hash}", post(disable_user))
-        .route("/{id}/share", post(share));
+        .route("/aggregate/{id}/read", get(read_events))
+        .route("/aggregate/{id}/subscribe", get(subscribe_events))
+        .route("/aggregate/{id}/write", post(write_events))
+        .route("/aggregate/{id}/delete", post(delete))
+        .route("/aggregate/{id}/disableshare/{share_hash}", post(disable_share))
+        .route("/aggregate/{id}/disableuser/{user_hash}", post(disable_user))
+        .route("/aggregate/{id}/share", post(share));
 
     Router::new().nest("/api/v1", api_v1).layer(cors).with_state(state)
 }

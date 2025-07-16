@@ -1,4 +1,4 @@
-use crate::{access_level::AccessLevel, project_event_type::TopicEventType, project_to_user_access_level::ProjectToUserAccessLevel};
+use crate::{access_level::AccessLevel, aggregate_event_type::AggregateEventType, aggregate_to_user_access_level::AggregateToUserAccessLevel};
 use eventplanedb_storage::{event_batch_item::EventBatchItem, event_item::EventItem, event_storage_cache::EventStorageCache};
 use std::{
     collections::{HashMap, VecDeque},
@@ -10,28 +10,28 @@ pub struct UserAccessCache {
     cache_queue: VecDeque<String>,
 
     // The cache maps a file to another hashmap of user_hash to access level
-    cache: HashMap<String, ProjectToUserAccessLevel>,
+    cache: HashMap<String, AggregateToUserAccessLevel>,
 
     // The maximum number of projects to cache, currently we can have unlimited users inside a project (str+u64)
-    cache_max_project_count: usize,
+    cache_max_aggregate_count: usize,
 }
 
 impl UserAccessCache {
-    pub fn new(cache_max_project_count: usize) -> Self {
+    pub fn new(cache_max_aggregate_count: usize) -> Self {
         Self {
             cache_queue: VecDeque::new(),
             cache: HashMap::new(),
-            cache_max_project_count,
+            cache_max_aggregate_count,
         }
     }
 
     /// If we have exeeded the maximum nbr of projects in the cache, clear out the oldest ones
     fn clear_cache(&mut self) {
-        if self.cache.len() < self.cache_max_project_count {
+        if self.cache.len() < self.cache_max_aggregate_count {
             return;
         }
 
-        while self.cache.len() > self.cache_max_project_count {
+        while self.cache.len() > self.cache_max_aggregate_count {
             if let Some(file_path) = self.cache_queue.pop_front() {
                 self.cache.remove(&file_path);
             } else {
@@ -41,17 +41,17 @@ impl UserAccessCache {
     }
 
     /// Grab the current cache for a project, or build it if it doesn't exist and add it to the cache
-    fn get_or_build_cache(&mut self, event_storage_cache: &mut EventStorageCache, file_path: &str) -> &mut ProjectToUserAccessLevel {
+    fn get_or_build_cache(&mut self, event_storage_cache: &mut EventStorageCache, file_path: &str) -> &mut AggregateToUserAccessLevel {
         self.clear_cache();
 
         if self.cache.contains_key(file_path) {
             return self.cache.get_mut(file_path).unwrap();
         }
 
-        self.cache.insert(file_path.to_string(), ProjectToUserAccessLevel::new());
+        self.cache.insert(file_path.to_string(), AggregateToUserAccessLevel::new());
         self.cache_queue.push_back(file_path.to_string());
 
-        self.populate_cache_for_project(event_storage_cache, file_path);
+        self.populate_cache_for_aggregate(event_storage_cache, file_path);
 
         self.clear_cache();
 
@@ -59,15 +59,15 @@ impl UserAccessCache {
     }
 
     /// Read all the ProvideAccess events for a project and build the cache for that project from the events found
-    fn populate_cache_for_project(&mut self, event_storage_cache: &mut EventStorageCache, file_path: &str) {
-        let project_to_user_access_level = self.cache.get_mut(file_path).unwrap();
+    fn populate_cache_for_aggregate(&mut self, event_storage_cache: &mut EventStorageCache, file_path: &str) {
+        let aggregate_to_user_access_level = self.cache.get_mut(file_path).unwrap();
 
-        match event_storage_cache.read(file_path, 0, usize::MAX, Some(&[TopicEventType::UserAccessUpdated as u64])) {
+        match event_storage_cache.read(file_path, 0, usize::MAX, Some(&[AggregateEventType::UserAccessUpdated as u64])) {
             Ok(result) => {
                 for batch in result.event_batches {
                     for event in batch.events.iter() {
                         // Check the event is a ProvideAccess event and has the correct data
-                        if event.tp != TopicEventType::UserAccessUpdated as u64
+                        if event.tp != AggregateEventType::UserAccessUpdated as u64
                             || event.string_values.as_ref().is_none()
                             || event.string_values.as_ref().unwrap().len() < 1
                             || event.string_values.as_ref().unwrap()[0].is_none()
@@ -84,7 +84,7 @@ impl UserAccessCache {
 
                         // As we process events in chronological order, allow the users' access
                         // to upgrade OR downgrade depending on the event's access level
-                        project_to_user_access_level.update_cache_for_user(&user_hash, access_level, true);
+                        aggregate_to_user_access_level.update_cache_for_user(&user_hash, access_level, true);
                     }
                 }
             }
@@ -96,8 +96,8 @@ impl UserAccessCache {
 
     /// Get the current access level for a user. Will build a cache if one does not exist.
     pub fn get_current_access_level(&mut self, event_storage_cache: &mut EventStorageCache, file_path: &str, user_hash: &str) -> AccessLevel {
-        let project_to_user_access_level = self.get_or_build_cache(event_storage_cache, file_path);
-        project_to_user_access_level.current_access_level_for_user(user_hash)
+        let aggregate_to_user_access_level = self.get_or_build_cache(event_storage_cache, file_path);
+        aggregate_to_user_access_level.current_access_level_for_user(user_hash)
     }
 
     /// Change the access level for for_user_hash. Adds an event to the file and updates the cache.
@@ -130,7 +130,7 @@ impl UserAccessCache {
 
         let mut event_item = EventItem::new();
         event_item.ed = current_time;
-        event_item.tp = TopicEventType::UserAccessUpdated as u64;
+        event_item.tp = AggregateEventType::UserAccessUpdated as u64;
         event_item.string_values = Some(vec![Some(for_user_hash.to_string()), share_key_hash.map_or(None, |f| Some(f.to_string()))]);
         event_item.uint_values = Some(vec![potential_access_level as u64]);
 
@@ -141,8 +141,8 @@ impl UserAccessCache {
 
         event_batch_item.si = event_storage_cache.write(file_path, false, event_batch_item.clone())?;
 
-        let project_to_user_access_level = self.get_or_build_cache(event_storage_cache, file_path);
-        project_to_user_access_level.update_cache_for_user(for_user_hash, potential_access_level, allow_downgrade);
+        let aggregate_to_user_access_level = self.get_or_build_cache(event_storage_cache, file_path);
+        aggregate_to_user_access_level.update_cache_for_user(for_user_hash, potential_access_level, allow_downgrade);
 
         Ok(Some(event_batch_item))
     }
@@ -150,7 +150,7 @@ impl UserAccessCache {
 
 #[cfg(test)]
 mod tests {
-    use crate::{access_level::AccessLevel, project_event_type::TopicEventType, project_to_user_access_level::ProjectToUserAccessLevel};
+    use crate::{access_level::AccessLevel, aggregate_event_type::AggregateEventType, aggregate_to_user_access_level::AggregateToUserAccessLevel};
     use eventplanedb_storage::event_item::EventItem;
     use eventplanedb_storage::{event_batch_item::EventBatchItem, event_storage_cache::EventStorageCache};
     use std::vec;
@@ -178,7 +178,7 @@ mod tests {
 
         let mut event_item = EventItem::new();
         event_item.ed = current_time;
-        event_item.tp = TopicEventType::UserAccessUpdated as u64;
+        event_item.tp = AggregateEventType::UserAccessUpdated as u64;
         event_item.string_values = Some(vec![Some(user_hash.to_string()), None]);
         event_item.uint_values = Some(vec![access_level as u64]);
         event_item
@@ -198,19 +198,19 @@ mod tests {
     #[test]
     fn test_new() {
         let cache = UserAccessCache::new(5);
-        assert_eq!(cache.cache_max_project_count, 5);
+        assert_eq!(cache.cache_max_aggregate_count, 5);
         assert_eq!(cache.cache.len(), 0);
         assert_eq!(cache.cache_queue.len(), 0);
 
         let cache = UserAccessCache::new(0);
-        assert_eq!(cache.cache_max_project_count, 0);
+        assert_eq!(cache.cache_max_aggregate_count, 0);
     }
 
     #[test]
     fn test_clear_cache_does_nothing_when_under_max_capacity() {
         let (mut user_access_cache, _, _) = setup_cache(3);
-        user_access_cache.cache.insert("project1".to_string(), ProjectToUserAccessLevel::new());
-        user_access_cache.cache.insert("project2".to_string(), ProjectToUserAccessLevel::new());
+        user_access_cache.cache.insert("project1".to_string(), AggregateToUserAccessLevel::new());
+        user_access_cache.cache.insert("project2".to_string(), AggregateToUserAccessLevel::new());
         user_access_cache.cache_queue.push_back("project1".to_string());
         user_access_cache.cache_queue.push_back("project2".to_string());
 
@@ -223,9 +223,9 @@ mod tests {
     #[test]
     fn test_clear_cache_removes_oldest_projects_when_at_max_capacity() {
         let (mut user_access_cache, _, _) = setup_cache(2);
-        user_access_cache.cache.insert("project1".to_string(), ProjectToUserAccessLevel::new());
-        user_access_cache.cache.insert("project2".to_string(), ProjectToUserAccessLevel::new());
-        user_access_cache.cache.insert("project3".to_string(), ProjectToUserAccessLevel::new());
+        user_access_cache.cache.insert("project1".to_string(), AggregateToUserAccessLevel::new());
+        user_access_cache.cache.insert("project2".to_string(), AggregateToUserAccessLevel::new());
+        user_access_cache.cache.insert("project3".to_string(), AggregateToUserAccessLevel::new());
 
         //project1 is the oldest
         user_access_cache.cache_queue.push_back("project1".to_string());
@@ -241,9 +241,9 @@ mod tests {
     #[test]
     fn test_clear_cache_removes_multiple_projects_when_significantly_over_capacity() {
         let (mut user_access_cache, _, _) = setup_cache(1);
-        user_access_cache.cache.insert("project1".to_string(), ProjectToUserAccessLevel::new());
-        user_access_cache.cache.insert("project2".to_string(), ProjectToUserAccessLevel::new());
-        user_access_cache.cache.insert("project3".to_string(), ProjectToUserAccessLevel::new());
+        user_access_cache.cache.insert("project1".to_string(), AggregateToUserAccessLevel::new());
+        user_access_cache.cache.insert("project2".to_string(), AggregateToUserAccessLevel::new());
+        user_access_cache.cache.insert("project3".to_string(), AggregateToUserAccessLevel::new());
 
         user_access_cache.cache_queue.push_back("project1".to_string());
         user_access_cache.cache_queue.push_back("project2".to_string());
@@ -259,8 +259,8 @@ mod tests {
     #[test]
     fn test_clear_cache_handles_empty_queue_gracefully() {
         let (mut user_access_cache, _, _) = setup_cache(1);
-        user_access_cache.cache.insert("project1".to_string(), ProjectToUserAccessLevel::new());
-        user_access_cache.cache.insert("project2".to_string(), ProjectToUserAccessLevel::new());
+        user_access_cache.cache.insert("project1".to_string(), AggregateToUserAccessLevel::new());
+        user_access_cache.cache.insert("project2".to_string(), AggregateToUserAccessLevel::new());
         user_access_cache.cache_queue.clear(); // Empty the queue
 
         user_access_cache.clear_cache();
@@ -273,11 +273,11 @@ mod tests {
         let (mut user_access_cache, _, _) = setup_cache(2);
         user_access_cache.cache_queue.push_back("project1".to_string());
         user_access_cache.cache_queue.push_back("project2".to_string());
-        user_access_cache.cache.insert("project1".to_string(), ProjectToUserAccessLevel::new());
-        user_access_cache.cache.insert("project2".to_string(), ProjectToUserAccessLevel::new());
+        user_access_cache.cache.insert("project1".to_string(), AggregateToUserAccessLevel::new());
+        user_access_cache.cache.insert("project2".to_string(), AggregateToUserAccessLevel::new());
 
         // Add a third project, which should evict "project1" (oldest)
-        user_access_cache.cache.insert("project3".to_string(), ProjectToUserAccessLevel::new());
+        user_access_cache.cache.insert("project3".to_string(), AggregateToUserAccessLevel::new());
         user_access_cache.cache_queue.push_back("project3".to_string());
         user_access_cache.clear_cache(); // Force eviction
 
@@ -309,8 +309,8 @@ mod tests {
         event_storage_cache.write(&file_path, true, event_batch_3).unwrap();
 
         // Populate cache for the project
-        user_access_cache.cache.insert(file_path.clone(), ProjectToUserAccessLevel::new());
-        user_access_cache.populate_cache_for_project(&mut event_storage_cache, &file_path);
+        user_access_cache.cache.insert(file_path.clone(), AggregateToUserAccessLevel::new());
+        user_access_cache.populate_cache_for_aggregate(&mut event_storage_cache, &file_path);
 
         // Verify cache content
         let project_cache = user_access_cache.cache.get(&file_path).unwrap();
@@ -327,7 +327,7 @@ mod tests {
         // Create ProvideAccess and other event types
         let event1 = create_provide_access_event("user1", AccessLevel::Owner, None);
         let mut event2 = create_provide_access_event("user2", AccessLevel::Contributor, None);
-        event2.tp = TopicEventType::ShareLinkCreated as u64; // Change type to AddShareLink
+        event2.tp = AggregateEventType::ShareLinkCreated as u64; // Change type to AddShareLink
         let event3 = create_provide_access_event("user1", AccessLevel::Viewer, None);
 
         let event_batch_1 = create_event_batch_item_with_events(vec![event1], "admin");
@@ -339,8 +339,8 @@ mod tests {
         event_storage_cache.write(&file_path, true, event_batch_3).unwrap();
 
         // Populate cache for the project
-        user_access_cache.cache.insert(file_path.clone(), ProjectToUserAccessLevel::new());
-        user_access_cache.populate_cache_for_project(&mut event_storage_cache, &file_path);
+        user_access_cache.cache.insert(file_path.clone(), AggregateToUserAccessLevel::new());
+        user_access_cache.populate_cache_for_aggregate(&mut event_storage_cache, &file_path);
 
         // Verify cache content (only ProvideAccess events should be processed)
         let project_cache = user_access_cache.cache.get(&file_path).unwrap();
@@ -366,8 +366,8 @@ mod tests {
         event_storage_cache.write(&file_path, true, event_batch_2).unwrap();
 
         // Populate cache for the project
-        user_access_cache.cache.insert(file_path.clone(), ProjectToUserAccessLevel::new());
-        user_access_cache.populate_cache_for_project(&mut event_storage_cache, &file_path);
+        user_access_cache.cache.insert(file_path.clone(), AggregateToUserAccessLevel::new());
+        user_access_cache.populate_cache_for_aggregate(&mut event_storage_cache, &file_path);
 
         // Verify cache content (malformed events should be ignored)
         let project_cache = user_access_cache.cache.get(&file_path).unwrap();
@@ -387,8 +387,8 @@ mod tests {
         event_storage_cache.write(&file_path, true, event_batch).unwrap();
 
         // Populate the cache
-        user_access_cache.cache.insert(file_path.clone(), ProjectToUserAccessLevel::new());
-        user_access_cache.populate_cache_for_project(&mut event_storage_cache, &file_path);
+        user_access_cache.cache.insert(file_path.clone(), AggregateToUserAccessLevel::new());
+        user_access_cache.populate_cache_for_aggregate(&mut event_storage_cache, &file_path);
 
         // Verify that the malformed event was ignored
         let project_cache = user_access_cache.cache.get(&file_path).unwrap();
@@ -408,8 +408,8 @@ mod tests {
         event_storage_cache.write(&file_path, true, event_batch).unwrap();
 
         // Populate the cache
-        user_access_cache.cache.insert(file_path.clone(), ProjectToUserAccessLevel::new());
-        user_access_cache.populate_cache_for_project(&mut event_storage_cache, &file_path);
+        user_access_cache.cache.insert(file_path.clone(), AggregateToUserAccessLevel::new());
+        user_access_cache.populate_cache_for_aggregate(&mut event_storage_cache, &file_path);
 
         // Verify that the malformed event was ignored
         let project_cache = user_access_cache.cache.get(&file_path).unwrap();
@@ -435,8 +435,8 @@ mod tests {
         event_storage_cache.write(&file_path, true, event_batch_2).unwrap();
 
         // Populate the cache
-        user_access_cache.cache.insert(file_path.clone(), ProjectToUserAccessLevel::new());
-        user_access_cache.populate_cache_for_project(&mut event_storage_cache, &file_path);
+        user_access_cache.cache.insert(file_path.clone(), AggregateToUserAccessLevel::new());
+        user_access_cache.populate_cache_for_aggregate(&mut event_storage_cache, &file_path);
 
         // Verify that the malformed events were ignored
         let project_cache = user_access_cache.cache.get(&file_path).unwrap();
@@ -456,8 +456,8 @@ mod tests {
         event_storage_cache.write(&file_path, true, event_batch).unwrap();
 
         // Populate the cache
-        user_access_cache.cache.insert(file_path.clone(), ProjectToUserAccessLevel::new());
-        user_access_cache.populate_cache_for_project(&mut event_storage_cache, &file_path);
+        user_access_cache.cache.insert(file_path.clone(), AggregateToUserAccessLevel::new());
+        user_access_cache.populate_cache_for_aggregate(&mut event_storage_cache, &file_path);
 
         // Verify that the malformed event was ignored
         let project_cache = user_access_cache.cache.get(&file_path).unwrap();
@@ -470,8 +470,8 @@ mod tests {
         let file_path = create_file_path(&temp_dir, "nonexistent_project.bin");
 
         // Attempt to populate cache for a non-existent file
-        user_access_cache.cache.insert(file_path.clone(), ProjectToUserAccessLevel::new());
-        user_access_cache.populate_cache_for_project(&mut event_storage_cache, &file_path);
+        user_access_cache.cache.insert(file_path.clone(), AggregateToUserAccessLevel::new());
+        user_access_cache.populate_cache_for_aggregate(&mut event_storage_cache, &file_path);
 
         // Verify that the cache remains empty
         let project_cache = user_access_cache.cache.get(&file_path).unwrap();
@@ -493,8 +493,8 @@ mod tests {
         event_storage_cache.write(&file_path, true, event_batch).unwrap();
 
         // Populate the cache
-        user_access_cache.cache.insert(file_path.clone(), ProjectToUserAccessLevel::new());
-        user_access_cache.populate_cache_for_project(&mut event_storage_cache, &file_path);
+        user_access_cache.cache.insert(file_path.clone(), AggregateToUserAccessLevel::new());
+        user_access_cache.populate_cache_for_aggregate(&mut event_storage_cache, &file_path);
 
         // Verify that the cache remains empty
         let project_cache = user_access_cache.cache.get(&file_path).unwrap();
@@ -520,8 +520,8 @@ mod tests {
         event_storage_cache.write(&file_path, true, event_batch_3).unwrap();
 
         // Populate cache for the project
-        user_access_cache.cache.insert(file_path.clone(), ProjectToUserAccessLevel::new());
-        user_access_cache.populate_cache_for_project(&mut event_storage_cache, &file_path);
+        user_access_cache.cache.insert(file_path.clone(), AggregateToUserAccessLevel::new());
+        user_access_cache.populate_cache_for_aggregate(&mut event_storage_cache, &file_path);
 
         // Verify that the latest event (highest timestamp) determines the access level
         let project_cache = user_access_cache.cache.get(&file_path).unwrap();
@@ -576,7 +576,7 @@ mod tests {
         let file_path2 = create_file_path(&temp_dir, "project2.bin");
 
         // Fill the cache to capacity
-        user_access_cache.cache.insert(file_path1.clone(), ProjectToUserAccessLevel::new());
+        user_access_cache.cache.insert(file_path1.clone(), AggregateToUserAccessLevel::new());
         user_access_cache.cache_queue.push_back(file_path1.clone());
 
         // Add a new project, which should trigger cache clearing
@@ -593,7 +593,7 @@ mod tests {
         let file_path = create_file_path(&temp_dir, "project1.bin");
 
         // Insert a project into the cache with a user and access level
-        let mut project_cache = ProjectToUserAccessLevel::new();
+        let mut project_cache = AggregateToUserAccessLevel::new();
         project_cache.update_cache_for_user("user1", AccessLevel::Contributor, true);
         user_access_cache.cache.insert(file_path.clone(), project_cache);
 
@@ -610,7 +610,7 @@ mod tests {
         let file_path = create_file_path(&temp_dir, "project1.bin");
 
         // Insert a project into the cache (no users)
-        user_access_cache.cache.insert(file_path.clone(), ProjectToUserAccessLevel::new());
+        user_access_cache.cache.insert(file_path.clone(), AggregateToUserAccessLevel::new());
 
         // Get the access level for a non-existent user
         let access_level = user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, "user1");
@@ -638,7 +638,7 @@ mod tests {
         let file_path = create_file_path(&temp_dir, "project1.bin");
 
         // Create a project cache and add a user with different access levels
-        let mut project_cache = ProjectToUserAccessLevel::new();
+        let mut project_cache = AggregateToUserAccessLevel::new();
         project_cache.update_cache_for_user("owner", AccessLevel::Owner, true);
         project_cache.update_cache_for_user("contributor", AccessLevel::Contributor, true);
         project_cache.update_cache_for_user("viewer", AccessLevel::Viewer, true);
@@ -675,7 +675,7 @@ mod tests {
         let user_hash = "user1";
 
         // Initialize user's access level to Contributor
-        let mut project_cache = ProjectToUserAccessLevel::new();
+        let mut project_cache = AggregateToUserAccessLevel::new();
         project_cache.update_cache_for_user(user_hash, AccessLevel::Contributor, true);
         user_access_cache.cache.insert(file_path.clone(), project_cache);
 
@@ -708,7 +708,7 @@ mod tests {
         let user_hash = "user1";
 
         // Initialize user's access level to Contributor
-        let mut project_cache = ProjectToUserAccessLevel::new();
+        let mut project_cache = AggregateToUserAccessLevel::new();
         project_cache.update_cache_for_user(user_hash, AccessLevel::Contributor, true);
         user_access_cache.cache.insert(file_path.clone(), project_cache);
 
@@ -732,7 +732,7 @@ mod tests {
         let user_hash = "user1";
 
         // Initialize user's access level to Contributor
-        let mut project_cache = ProjectToUserAccessLevel::new();
+        let mut project_cache = AggregateToUserAccessLevel::new();
         project_cache.update_cache_for_user(user_hash, AccessLevel::Contributor, true);
         user_access_cache.cache.insert(file_path.clone(), project_cache);
 
