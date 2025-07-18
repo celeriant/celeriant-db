@@ -1,5 +1,5 @@
 use eventplanedb_storage::{catchup_result::CatchupResult, event_batch_item::EventBatchItem, event_item::EventItem};
-use eventplanedb_access::{access_level::AccessLevel, job_error::JobError};
+use eventplanedb_access::{access_level::AccessLevel, claims::Claims, job_error::JobError};
 use tokio::sync::oneshot;
 
 use crate::process_write::WriteResult;
@@ -7,7 +7,8 @@ use crate::process_write::WriteResult;
 pub enum Job {
     Share {
         file_path: String,
-        current_user_hash: String,
+        current_user_hash: String, 
+        current_user_claims: Option<Claims>,
         server_time: u64,
         share_hash: String,
         access_level: AccessLevel,
@@ -20,6 +21,7 @@ pub enum Job {
     Write {
         file_path: String, 
         current_user_hash: String, 
+        current_user_claims: Option<Claims>, 
         server_time: u64, 
         allow_create: bool,
         events: Vec<EventItem>,
@@ -27,7 +29,7 @@ pub enum Job {
     },
     AccessCheck {
         file_path: String,
-        current_user_hash: String,
+        current_user_hash: String, current_user_claims: Option<Claims>,
         server_time: u64,
         required_access_level: AccessLevel,
         responder: oneshot::Sender<Result<(), JobError>>,
@@ -35,7 +37,8 @@ pub enum Job {
     Read {
         file_path: String,
         from_si: u64,
-        current_user_hash: String,
+        current_user_hash: String, 
+        current_user_claims: Option<Claims>,
         server_time: u64,
         share_key: Option<String>,
         max_bytes: usize,
@@ -44,21 +47,24 @@ pub enum Job {
     },
     DisableUser {
         file_path: String,
-        current_user_hash: String,
+        current_user_hash: String, 
+        current_user_claims: Option<Claims>,
         server_time: u64,
         user_hash: String,
         responder: oneshot::Sender<Result<WriteResult, JobError>>,
     },
     DisableShare {
         file_path: String,
-        current_user_hash: String,
+        current_user_hash: String, 
+        current_user_claims: Option<Claims>,
         server_time: u64,
         share_hash: String,
         responder: oneshot::Sender<Result<WriteResult, JobError>>,
     },
     Delete {
         file_path: String,
-        current_user_hash: String,
+        current_user_hash: String, 
+        current_user_claims: Option<Claims>,
         server_time: u64,
         responder: oneshot::Sender<Result<(), JobError>>,
     },

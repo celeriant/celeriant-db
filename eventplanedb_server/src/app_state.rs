@@ -1,10 +1,10 @@
 use crossbeam::channel::Sender;
-use eventplanedb_access::job_error::JobError;
+use eventplanedb_access::{claims::Claims, job_error::JobError};
 use eventplanedb_crypto::Crypto;
 use eventplanedb_thread_worker::{event_notifications::EventNotifier, job::Job, process_jobs::create_thread_pool};
 use std::sync::Arc;
 
-use crate::auth::{jwks_client::JwksClient, oauth_config::OAuthConfig};
+use crate::auth::{jwks_client::JwksClient, jwt_middleware::{extract_bearer_token, validate_jwt_token}, oauth_config::OAuthConfig};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -36,10 +36,6 @@ impl AppState {
         }
     }
 
-    pub fn extract_user_hash(&self, request: &axum::extract::Request) -> Option<String> {
-        request.extensions().get::<String>().cloned()
-    }
-
     pub fn server_time(&self) -> u64 {
         chrono::Utc::now().timestamp_millis() as u64
     }
@@ -55,28 +51,11 @@ impl AppState {
         }
     }
 
-    async fn validate_jwt_token(&self, token: &str) -> Result<crate::auth::jwt_middleware::Claims, Box<dyn std::error::Error>> {
-        crate::auth::jwt_middleware::validate_jwt_token(self, token).await
-    }
-
-    pub async fn validate_auth_headers(&self, headers: &axum::http::HeaderMap) -> Result<String, JobError> {
-         // First try OAuth authentication
-        if let Some(auth_header) = headers.get("Authorization").and_then(|h| h.to_str().ok()) {
-            if auth_header.starts_with("Bearer ") {
-                let token = &auth_header[7..]; // Remove "Bearer " prefix
-                
-                // Validate JWT token and extract client_id
-                match self.validate_jwt_token(token).await {
-                    Ok(claims) => {
-                        // With RFC 9068, client_id is directly available
-                        return Ok(claims.client_id);
-                    }
-                    Err(_) => {
-                        // If JWT validation fails, fall through to crypto validation
-                    }
-                }
-            }
-        }
+    pub async fn validate_auth_headers(&self, headers: &axum::http::HeaderMap) -> Result<(String, Option<Claims>), JobError> {      
+        let claims = match extract_bearer_token(&headers) {
+            Some(bearer_token) => validate_jwt_token(self, &bearer_token).await.ok(),
+            None => None,
+        };
 
         let public_key = match headers.get("X-Public-Key").and_then(|h| h.to_str().ok()) {
             Some(pk) => pk.to_string(),
@@ -94,7 +73,7 @@ impl AppState {
         };
 
         match Crypto::validate_with_public_key(&public_key, &nonce, &sign) {
-            Ok(cb) => Ok(cb),
+            Ok(current_user_hash) => Ok((current_user_hash, claims)),
             Err(e) => Err(JobError::InvalidParameters(e.to_string())),
         }
     }

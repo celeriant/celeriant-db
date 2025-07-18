@@ -37,7 +37,8 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
                 match job {
                     Job::Share {
                         file_path,
-                        current_user_hash: cb,
+                        current_user_hash,
+                        current_user_claims,
                         server_time,
                         share_hash,
                         access_level,
@@ -49,7 +50,8 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
                     } => {
                         let _ = responder.send(handle_share_job(
                             file_path,
-                            cb,
+                            current_user_hash,
+                            current_user_claims,
                             server_time,
                             share_hash,
                             access_level,
@@ -67,6 +69,7 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
                     Job::Write {
                         file_path, 
                         current_user_hash, 
+                        current_user_claims,
                         server_time, 
                         allow_create, 
                         events,
@@ -75,6 +78,7 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
                         let _ = responder.send(handle_write_job(
                             file_path, 
                             current_user_hash, 
+                            current_user_claims,
                             server_time, 
                             allow_create, 
                             events,
@@ -88,6 +92,7 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
                     Job::AccessCheck {
                         file_path,
                         current_user_hash,
+                        current_user_claims,
                         server_time,
                         required_access_level,
                         responder,
@@ -95,6 +100,7 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
                         let _ = responder.send(handle_access_check(
                             file_path,
                             current_user_hash,
+                            current_user_claims,
                             server_time,
                             required_access_level,
                             &mut event_storage_cache,
@@ -106,7 +112,8 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
                     Job::Read {
                         file_path,
                         from_si,
-                        current_user_hash: cb,
+                        current_user_hash,
+                        current_user_claims,
                         server_time,
                         share_key,
                         max_bytes,
@@ -116,7 +123,8 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
                         let _ = responder.send(handle_read_job(
                             file_path,
                             from_si,
-                            cb,
+                            current_user_hash,
+                            current_user_claims,
                             server_time,
                             share_key,
                             max_bytes,
@@ -130,13 +138,15 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
 
                     Job::Delete {
                         file_path,
-                        current_user_hash: cb,
+                        current_user_hash,
+                        current_user_claims,
                         server_time,
                         responder,
                     } => {
                         let _ = responder.send(handle_delete_job(
                             file_path,
-                            cb,
+                            current_user_hash,
+                            current_user_claims,
                             server_time,
                             &mut event_storage_cache,
                             &mut share_links_cache,
@@ -147,14 +157,16 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
 
                     Job::DisableUser {
                         file_path,
-                        current_user_hash: cb,
+                        current_user_hash,
+                        current_user_claims,
                         server_time,
                         user_hash,
                         responder,
                     } => {
                         let _ = responder.send(handle_disable_user_job(
                             file_path,
-                            cb,
+                            current_user_hash,
+                            current_user_claims,
                             server_time,
                             user_hash,
                             &mut event_storage_cache,
@@ -166,14 +178,16 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
 
                     Job::DisableShare {
                         file_path,
-                        current_user_hash: cb,
+                        current_user_hash,
+                        current_user_claims,
                         server_time,
                         share_hash,
                         responder,
                     } => {
                         let _ = responder.send(handle_disable_share_job(
                             file_path,
-                            cb,
+                            current_user_hash,
+                            current_user_claims,
                             server_time,
                             share_hash,
                             &mut event_storage_cache,

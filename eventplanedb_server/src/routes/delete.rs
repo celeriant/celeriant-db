@@ -17,10 +17,10 @@ pub async fn delete(
     headers: HeaderMap,
 ) -> Result<CompactJson<DeleteResponse>, RouteError> {
     let server_time = state.server_time();
-    let current_user_hash = state.validate_auth_headers(&headers).await?;
+    let (current_user_hash, current_user_claims) = state.validate_auth_headers(&headers).await?;
     let file_path = state.get_file_path(&id);
 
-    delete_async(&state.workers, file_path, current_user_hash, server_time).await?;
+    delete_async(&state.workers, file_path, current_user_hash, current_user_claims, server_time).await?;
 
     Ok(CompactJson(DeleteResponse {
         server_time,

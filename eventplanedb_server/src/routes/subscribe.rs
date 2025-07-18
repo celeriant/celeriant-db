@@ -11,9 +11,11 @@ use std::{
     convert::Infallible,
     time::{Duration, Instant},
 };
+use crate::auth::{jwt_middleware::{validate_jwt_token}};
 
 #[derive(Deserialize)]
 pub struct AuthParams {
+    pub token: Option<String>,
     pub public_key: Option<String>,
     pub nonce: Option<String>,
     pub signature: Option<String>,
@@ -31,9 +33,13 @@ pub async fn subscribe_events(
         } else {
             return Err(RouteError::JobError(JobError::InvalidParameters("Missing authentication parameters".to_string())));
         };
+    let current_user_claims = match params.token.as_deref() {
+        Some(token) => validate_jwt_token(&state, token).await.ok(),
+        None => None,
+    };
     let file_path = state.get_file_path(&id);
 
-    access_check_async(&state.workers, file_path.clone(), current_user_hash.clone(), server_time, eventplanedb_access::access_level::AccessLevel::Viewer,).await?;
+    access_check_async(&state.workers, file_path.clone(), current_user_hash.clone(), current_user_claims, server_time, eventplanedb_access::access_level::AccessLevel::Viewer,).await?;
 
     // Subscribe to event notifications for this file path
     let receiver = state.event_notifier.subscribe(&file_path);

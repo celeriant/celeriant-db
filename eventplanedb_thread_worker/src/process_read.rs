@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use eventplanedb_storage::{catchup_result::CatchupResult, event_storage_cache::EventStorageCache};
-use eventplanedb_access::{access_level::AccessLevel, job_error::JobError, share_links_cache::ShareLinksCache, user_access_cache::UserAccessCache};
+use eventplanedb_access::{access_level::AccessLevel, claims::Claims, job_error::JobError, share_links_cache::ShareLinksCache, user_access_cache::UserAccessCache};
 
 use crate::event_notifications::EventNotifier;
 
@@ -9,6 +9,7 @@ pub fn handle_read_job(
     file_path: String,
     from_si: u64,
     current_user_hash: String,
+    current_user_claims: Option<Claims>,
     server_time: u64,
     share_key: Option<String>,
     max_bytes: usize,

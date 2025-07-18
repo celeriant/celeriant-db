@@ -33,11 +33,11 @@ pub async fn write_events(
     }
 
     let server_time = state.server_time();
-    let current_user_hash = state.validate_auth_headers(&headers).await?;
+    let (current_user_hash, current_user_claims) = state.validate_auth_headers(&headers).await?;
     let file_path = state.get_file_path(&id);
     let allow_create = params.create_if_not_exist.unwrap_or(false);
 
-    let result = write_async(&state.workers, file_path, current_user_hash, server_time, allow_create, events).await?;
+    let result = write_async(&state.workers, file_path, current_user_hash, current_user_claims, server_time, allow_create, events).await?;
 
     Ok(CompactJson(WriteResponse {
         si: result.si,

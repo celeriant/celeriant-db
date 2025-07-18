@@ -54,7 +54,11 @@ impl JwksClient {
         }
 
         // Fetch from remote using reqwest
-        let response = self.client.get(&self.jwks_url).send().await?;
+        let response = self.client
+            .get(&self.jwks_url)
+            .send()
+            .await?
+            .error_for_status()?;  // Check HTTP status
         let jwks: Jwks = response.json().await?;
 
         // Update cache

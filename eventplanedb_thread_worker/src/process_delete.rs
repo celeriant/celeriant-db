@@ -1,7 +1,6 @@
 use eventplanedb_storage::{event_storage_cache::EventStorageCache};
 use eventplanedb_access::{
-    access_level::AccessLevel, job_error::JobError, share_links_cache::ShareLinksCache,
-    user_access_cache::UserAccessCache,
+    access_level::AccessLevel, claims::Claims, job_error::JobError, share_links_cache::ShareLinksCache, user_access_cache::UserAccessCache
 };
 
 use crate::{event_notifications::EventNotifier};
@@ -9,6 +8,7 @@ use crate::{event_notifications::EventNotifier};
 pub fn handle_delete_job(
     file_path: String,
     current_user_hash: String,
+    current_user_claims: Option<Claims>,
     server_time: u64,
     event_storage_cache: &mut EventStorageCache,
     share_links_cache: &mut ShareLinksCache,

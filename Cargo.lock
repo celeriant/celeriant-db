@@ -753,6 +753,7 @@ dependencies = [
  "rand 0.8.5",
  "rsa",
  "serde",
+ "serde_json",
  "sha2",
  "tempfile",
  "thiserror 2.0.12",

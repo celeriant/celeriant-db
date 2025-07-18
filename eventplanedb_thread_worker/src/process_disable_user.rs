@@ -1,11 +1,12 @@
 use eventplanedb_storage::{event_batch_item::EventBatchItem, event_storage_cache::EventStorageCache};
-use eventplanedb_access::{access_level::AccessLevel, job_error::JobError, share_links_cache::ShareLinksCache, user_access_cache::UserAccessCache};
+use eventplanedb_access::{access_level::AccessLevel, claims::Claims, job_error::JobError, share_links_cache::ShareLinksCache, user_access_cache::UserAccessCache};
 
 use crate::{event_notifications::EventNotifier, process_write::WriteResult};
 
 pub fn handle_disable_user_job(
     file_path: String,
     current_user_hash: String,
+    current_user_claims: Option<Claims>,
     server_time: u64,
     for_user_hash: String,
     event_storage_cache: &mut EventStorageCache,
