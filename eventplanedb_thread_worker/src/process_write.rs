@@ -40,11 +40,12 @@ pub fn handle_write_job(
         )?;
     }
 
-    let user_id = current_user_claims.as_ref().map(|c| c.sub.clone()).unwrap_or(current_user_hash.unwrap());
-    let mut user_id_type = UserIdType::ZeroTrust;
-    if current_user_claims.is_some() {
-        user_id_type = UserIdType::OAuth2;
+    //Critical that we preference the machine public key here as the same user could be logged in on multiple devices
+    let mut user_id_type = UserIdType::OAuth2;
+    if current_user_hash.is_some() {
+        user_id_type = UserIdType::ZeroTrust;
     }
+    let user_id = current_user_hash.unwrap_or(current_user_claims.unwrap().sub);
 
     let mut event_batch_item = EventBatchItem::new();
     event_batch_item.events = events;

@@ -31,7 +31,8 @@ pub fn handle_read_job(
         share_key.as_deref(),
     )?;
 
-    let user_id = current_user_claims.as_ref().map(|c| c.sub.clone()).unwrap_or(current_user_hash.unwrap());
+    //Critical that we preference the machine public key here as the same user could be logged in on multiple devices
+    let user_id = current_user_hash.unwrap_or(current_user_claims.unwrap().sub);
 
     if access_events.len() > 0 {
         // Notify subscribers that there are new events for this file path

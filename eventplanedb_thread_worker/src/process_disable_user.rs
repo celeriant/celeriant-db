@@ -26,7 +26,12 @@ pub fn handle_disable_user_job(
         None,
     )?;
 
-    let user_id = current_user_claims.as_ref().map(|c| c.sub.clone()).unwrap_or(current_user_hash.unwrap());
+    //Critical that we preference the machine public key here as the same user could be logged in on multiple devices
+    let mut user_id_type = UserIdType::OAuth2; //TODO: Not technically correct as is based on current user, not user we are disabling
+    if current_user_hash.is_some() {
+        user_id_type = UserIdType::ZeroTrust;
+    }
+    let user_id = current_user_hash.unwrap_or(current_user_claims.unwrap().sub);
 
     let event_batch = user_access_cache.update_access_for_user(
         event_storage_cache,
@@ -37,7 +42,7 @@ pub fn handle_disable_user_job(
         true,
         None,
         server_time,
-        UserIdType::None
+        user_id_type
     )?;
 
     if event_batch.is_none() {

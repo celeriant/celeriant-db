@@ -31,7 +31,9 @@ pub fn handle_share_job(
         None,
     )?;
 
-    let user_id = current_user_claims.as_ref().map(|c| c.sub.clone()).unwrap_or(current_user_hash.unwrap());
+    //Critical that we preference the machine public key here as the same user could be logged in on multiple devices
+    let user_id = current_user_hash.unwrap_or(current_user_claims.unwrap().sub);
+
     let create_share_link_result = share_links_cache.create_share_link(
         event_storage_cache,
         file_path.clone(),

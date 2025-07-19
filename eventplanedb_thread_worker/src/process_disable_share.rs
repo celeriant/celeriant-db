@@ -26,7 +26,8 @@ pub fn handle_disable_share_job(
         None,
     )?;
 
-    let user_id = current_user_claims.as_ref().map(|c| c.sub.clone()).unwrap_or(current_user_hash.unwrap());
+    //Critical that we preference the machine public key here as the same user could be logged in on multiple devices
+    let user_id = current_user_hash.unwrap_or(current_user_claims.unwrap().sub);
     let event_batch = share_links_cache.disable_share_link(event_storage_cache, &file_path, user_id.clone(), share_hash, server_time)?;
 
     let si = event_batch.si;

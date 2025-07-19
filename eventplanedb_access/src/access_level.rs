@@ -63,7 +63,7 @@ impl AccessLevel {
             let cuh_access_level = user_access_cache.get_current_access_level(event_storage_cache, file_path, current_user_hash);
 
             // Transfer the access level from current_user_hash to current_sub if it increases the access level
-            let transfer_event = user_access_cache.update_access_for_user(event_storage_cache, file_path, user_id, user_id, cuh_access_level, false, None, server_time, UserIdType::OAuth2)?;
+            let transfer_event = user_access_cache.update_access_for_user(event_storage_cache, file_path, current_user_hash, user_id, cuh_access_level, false, None, server_time, UserIdType::OAuth2)?;
             if transfer_event.is_some() {
                 new_events.push(transfer_event.unwrap());
                 current_access_level = user_access_cache.get_current_access_level(event_storage_cache, file_path, user_id);
