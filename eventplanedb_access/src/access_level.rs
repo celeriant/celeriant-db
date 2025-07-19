@@ -1,7 +1,7 @@
 use eventplanedb_storage::{event_batch_item::EventBatchItem, event_storage_cache::EventStorageCache};
 use serde::{Deserialize, Serialize};
 
-use crate::{job_error::JobError, share_links_cache::ShareLinksCache, user_access_cache::UserAccessCache};
+use crate::{claims::Claims, job_error::JobError, share_links_cache::ShareLinksCache, user_access_cache::{UserAccessCache, UserIdType}};
 
 #[derive(PartialEq, Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum AccessLevel {
@@ -37,13 +37,44 @@ impl AccessLevel {
         share_links_cache: &mut ShareLinksCache,
         user_access_cache: &mut UserAccessCache,
         file_path: &str,
-        current_user_hash: &str,
+        current_user_hash: Option<&str>,
+        current_sub: Option<&str>,
         server_time: u64,
         required_access_level: AccessLevel,
         potential_share_key_hash: Option<&str>,
     ) -> Result<Vec<EventBatchItem>, JobError> {
         let mut new_events = Vec::new();
-        let mut current_acces_level = user_access_cache.get_current_access_level(event_storage_cache, file_path, current_user_hash);
+
+        let user_id = current_sub.unwrap_or(current_user_hash.unwrap());
+        let mut user_id_type = UserIdType::ZeroTrust;
+        if current_sub.is_some() {
+            user_id_type = UserIdType::OAuth2;
+        }
+
+        let mut current_access_level = user_access_cache.get_current_access_level(event_storage_cache, file_path, user_id);
+
+        //Allow the 'current_sub' to take over the 'current_user_hash' by assuming its permissions.
+        //We then disable the 'current_user_hash' by setting it to None.
+        //If both current_user_hash and current_sub_hash is specified and current_user_hash still has some access,
+        //Remove that access as now the user has logged in properly with oAuth2
+        if current_user_hash.is_some() && current_sub.is_some() {
+            let current_user_hash = current_user_hash.unwrap();
+
+            let cuh_access_level = user_access_cache.get_current_access_level(event_storage_cache, file_path, current_user_hash);
+
+            // Transfer the access level from current_user_hash to current_sub if it increases the access level
+            let transfer_event = user_access_cache.update_access_for_user(event_storage_cache, file_path, user_id, user_id, cuh_access_level, false, None, server_time, UserIdType::OAuth2)?;
+            if transfer_event.is_some() {
+                new_events.push(transfer_event.unwrap());
+                current_access_level = user_access_cache.get_current_access_level(event_storage_cache, file_path, user_id);
+            }
+
+            // Disable the current_user_hash by setting it to None
+            if cuh_access_level != AccessLevel::None {
+                let disable_event_item = user_access_cache.update_access_for_user(event_storage_cache, file_path, user_id, current_user_hash, AccessLevel::None, true, None, server_time, UserIdType::ZeroTrust)?;
+                new_events.push(disable_event_item.unwrap());
+            }
+        }
 
         //Is there a share link provided that can increase the user's access level?
         //If yes, use it (eager use of share links even when current action doesn't require that permission level)
@@ -52,8 +83,8 @@ impl AccessLevel {
                 let new_access_level_granted_by_share_link = share_key_info.access_level;
 
                 //will the share link give the user more access? if yes, we can use it
-                if AccessLevel::increases_access_level(current_acces_level, new_access_level_granted_by_share_link) {
-                    current_acces_level = new_access_level_granted_by_share_link;
+                if AccessLevel::increases_access_level(current_access_level, new_access_level_granted_by_share_link) {
+                    current_access_level = new_access_level_granted_by_share_link;
 
                     //The share link exists and can improve the users access level.
                     //Disable the share link if it is single use
@@ -61,7 +92,7 @@ impl AccessLevel {
                         let disable_event_item = share_links_cache.disable_share_link(
                             event_storage_cache,
                             file_path,
-                            current_user_hash.to_string(),
+                            user_id.to_string(),
                             share_key_hash.to_string(),
                             server_time,
                         )?;
@@ -72,12 +103,13 @@ impl AccessLevel {
                     let provide_access_event = user_access_cache.update_access_for_user(
                         event_storage_cache,
                         file_path,
-                        current_user_hash,
-                        current_user_hash,
+                        user_id,
+                        user_id,
                         new_access_level_granted_by_share_link,
                         false,
                         Some(share_key_hash),
-                        None,
+                        server_time,
+                        user_id_type
                     )?;
                     new_events.push(provide_access_event.unwrap());
                 }
@@ -85,7 +117,7 @@ impl AccessLevel {
         }
 
         //Now the user has increased access, but is it enough to perform the action?
-        if !AccessLevel::meets_required_access_level(current_acces_level, required_access_level) {
+        if !AccessLevel::meets_required_access_level(current_access_level, required_access_level) {
             return Err(JobError::PermissionDenied("User does not have permission to perform this action".to_string()));
         }
 
@@ -155,7 +187,8 @@ mod tests {
                 AccessLevel::Contributor,
                 false,
                 None,
-                None,
+                645,
+                UserIdType::ZeroTrust
             )
             .unwrap();
 
@@ -167,7 +200,8 @@ mod tests {
             &mut share_links_cache,
             &mut user_access_cache,
             &file_path,
-            user_hash,
+            Some(user_hash),
+            None,
             server_time,
             AccessLevel::Viewer,
             None,
@@ -197,7 +231,7 @@ mod tests {
 
         // Set user's access level to Viewer
         user_access_cache
-            .update_access_for_user(&mut event_storage_cache, &file_path, "admin", user_hash, AccessLevel::Viewer, false, None, None)
+            .update_access_for_user(&mut event_storage_cache, &file_path, "admin", user_hash, AccessLevel::Viewer, false, None, 654, UserIdType::ZeroTrust)
             .unwrap();
 
 
@@ -208,7 +242,8 @@ mod tests {
             &mut share_links_cache,
             &mut user_access_cache,
             &file_path,
-            user_hash,
+            Some(user_hash),
+            None,
             server_time,
             AccessLevel::Contributor,
             None,
@@ -249,6 +284,7 @@ mod tests {
                 None,
                 None,
                 0,
+                654
             )
             .unwrap();
 
@@ -260,7 +296,8 @@ mod tests {
             &mut share_links_cache,
             &mut user_access_cache,
             &file_path,
-            user_hash,
+            Some(user_hash),
+            None,
             server_time,
             AccessLevel::Contributor,
             Some(share_key_hash),
@@ -295,7 +332,7 @@ mod tests {
 
         // Set user's access level to Viewer
         user_access_cache
-            .update_access_for_user(&mut event_storage_cache, &file_path, "admin", user_hash, AccessLevel::Viewer, false, None, None)
+            .update_access_for_user(&mut event_storage_cache, &file_path, "admin", user_hash, AccessLevel::Viewer, false, None, 654, UserIdType::ZeroTrust)
             .unwrap();
 
         // Create a share link with Contributor access
@@ -310,6 +347,7 @@ mod tests {
                 None,
                 None,
                 0,
+                654
             )
             .unwrap();
 
@@ -321,7 +359,8 @@ mod tests {
             &mut share_links_cache,
             &mut user_access_cache,
             &file_path,
-            user_hash,
+            Some(user_hash),
+            None,
             server_time,
             AccessLevel::Owner,
             Some(share_key_hash),
@@ -366,6 +405,7 @@ mod tests {
                 None,
                 None,
                 0,
+                654
             )
             .unwrap();
 
@@ -377,7 +417,8 @@ mod tests {
             &mut share_links_cache,
             &mut user_access_cache,
             &file_path,
-            user_hash,
+            Some(user_hash),
+            None,
             server_time,
             AccessLevel::Contributor,
             Some(share_key_hash),
@@ -399,7 +440,8 @@ mod tests {
             &mut share_links_cache,
             &mut user_access_cache,
             &file_path,
-            "another_user",
+            Some("another_user"),
+            None,
             server_time,
             AccessLevel::Contributor,
             Some(share_key_hash),
@@ -437,7 +479,8 @@ mod tests {
                 AccessLevel::Contributor,
                 false,
                 None,
-                None,
+                654, 
+                UserIdType::ZeroTrust,
             )
             .unwrap();
 
@@ -453,6 +496,7 @@ mod tests {
                 None,
                 None,
                 0,
+                654
             )
             .unwrap();
 
@@ -464,7 +508,8 @@ mod tests {
             &mut share_links_cache,
             &mut user_access_cache,
             &file_path,
-            user_hash,
+            Some(user_hash),
+            None,
             server_time,
             AccessLevel::Contributor,
             Some(share_key_hash),

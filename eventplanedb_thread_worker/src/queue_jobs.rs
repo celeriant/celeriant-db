@@ -21,7 +21,7 @@ async fn send_job<T>(workers: &[Sender<Job>], file_path: String, job_creator: im
 pub async fn write_async(
     workers: &[Sender<Job>], 
     file_path: String, 
-    current_user_hash: String, 
+    current_user_hash: Option<String>, 
     current_user_claims: Option<Claims>, 
     server_time: u64, 
     allow_create: bool, 
@@ -42,7 +42,7 @@ pub async fn write_async(
 pub async fn delete_async(
     workers: &[Sender<Job>],
     file_path: String,
-    current_user_hash: String, 
+    current_user_hash: Option<String>, 
     current_user_claims: Option<Claims>,
     server_time: u64,
 ) -> Result<(), JobError> {
@@ -59,7 +59,8 @@ pub async fn delete_async(
 pub async fn disable_share_async(
     workers: &[Sender<Job>],
     file_path: String,
-    current_user_hash: String, current_user_claims: Option<Claims>,
+    current_user_hash: Option<String>, 
+    current_user_claims: Option<Claims>,
     server_time: u64,
     share_hash: String,
 ) -> Result<WriteResult, JobError> {
@@ -76,7 +77,7 @@ pub async fn disable_share_async(
 pub async fn disable_user_async(
     workers: &[Sender<Job>], 
     file_path: String, 
-    current_user_hash: String, 
+    current_user_hash: Option<String>, 
     current_user_claims: Option<Claims>, 
     server_time: u64, 
     user_hash: String
@@ -95,7 +96,7 @@ pub async fn disable_user_async(
 pub async fn share_async(
     workers: &[Sender<Job>],
     file_path: String,
-    current_user_hash: String, 
+    current_user_hash: Option<String>, 
     current_user_claims: Option<Claims>,
     server_time: u64,
     share_hash: String,
@@ -124,7 +125,7 @@ pub async fn share_async(
 pub async fn access_check_async(
     workers: &[Sender<Job>],
     file_path: String,
-    current_user_hash: String, 
+    current_user_hash: Option<String>, 
     current_user_claims: Option<Claims>,
     server_time: u64,
     required_access_level: AccessLevel,
@@ -143,7 +144,7 @@ pub async fn access_check_async(
 pub async fn read_async(
     workers: &[Sender<Job>],
     file_path: String,
-    current_user_hash: String, 
+    current_user_hash: Option<String>, 
     current_user_claims: Option<Claims>,
     server_time: u64,
     share_key: Option<String>,

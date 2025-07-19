@@ -51,7 +51,7 @@ impl AppState {
         }
     }
 
-    pub async fn validate_auth_headers(&self, headers: &axum::http::HeaderMap) -> Result<(String, Option<Claims>), JobError> {      
+    pub async fn validate_auth_headers(&self, headers: &axum::http::HeaderMap) -> Result<(Option<String>, Option<Claims>), JobError> {      
         let claims = match extract_bearer_token(&headers) {
             Some(bearer_token) => validate_jwt_token(self, &bearer_token).await.ok(),
             None => None,
@@ -59,21 +59,21 @@ impl AppState {
 
         let public_key = match headers.get("X-Public-Key").and_then(|h| h.to_str().ok()) {
             Some(pk) => pk.to_string(),
-            None => return Err(JobError::InvalidParameters("Missing X-Public-Key header".to_string())),
+            None => return Ok((None, claims)),
         };
 
         let nonce = match headers.get("X-Nonce").and_then(|h| h.to_str().ok()) {
             Some(n) => n.to_string(),
-            None => return Err(JobError::InvalidParameters("Missing X-Nonce header".to_string())),
+            None => return Ok((None, claims)),
         };
 
         let sign = match headers.get("X-Signature").and_then(|h| h.to_str().ok()) {
             Some(s) => s.to_string(),
-            None => return Err(JobError::InvalidParameters("Missing X-Signature header".to_string())),
+            None => return Ok((None, claims)),
         };
 
         match Crypto::validate_with_public_key(&public_key, &nonce, &sign) {
-            Ok(current_user_hash) => Ok((current_user_hash, claims)),
+            Ok(current_user_hash) => Ok((Some(current_user_hash), claims)),
             Err(e) => Err(JobError::InvalidParameters(e.to_string())),
         }
     }

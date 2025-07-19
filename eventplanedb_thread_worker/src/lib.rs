@@ -6,7 +6,6 @@ pub mod process_disable_share;
 pub mod process_disable_user;
 pub mod process_jobs;
 pub mod process_read;
-pub mod process_restore;
 pub mod process_share;
 pub mod process_write;
 pub mod queue_jobs;

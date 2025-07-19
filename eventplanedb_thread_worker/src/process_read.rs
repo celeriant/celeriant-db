@@ -8,7 +8,7 @@ use crate::event_notifications::EventNotifier;
 pub fn handle_read_job(
     file_path: String,
     from_si: u64,
-    current_user_hash: String,
+    current_user_hash: Option<String>,
     current_user_claims: Option<Claims>,
     server_time: u64,
     share_key: Option<String>,
@@ -24,23 +24,26 @@ pub fn handle_read_job(
         share_links_cache,
         user_access_cache,
         &file_path,
-        &current_user_hash,
+        current_user_hash.as_deref(),
+        current_user_claims.as_ref().map(|c| c.sub.as_str()),
         server_time,
         AccessLevel::Viewer,
         share_key.as_deref(),
     )?;
 
+    let user_id = current_user_claims.as_ref().map(|c| c.sub.clone()).unwrap_or(current_user_hash.unwrap());
+
     if access_events.len() > 0 {
         // Notify subscribers that there are new events for this file path
         if let Some(notifier) = event_notifier {
-            notifier.notify(&file_path, &current_user_hash);
+            notifier.notify(&file_path, &user_id);
         }
     }
 
     let mut catchup_result = event_storage_cache.read(&file_path, from_si, max_bytes, None)?;
 
     if !own_events {
-        let cb_clone = Some(current_user_hash.clone());
+        let cb_clone = Some(user_id.clone());
         catchup_result.event_batches.retain(|event_batch_item| event_batch_item.cb != cb_clone);
     }
 

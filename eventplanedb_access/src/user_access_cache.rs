@@ -5,6 +5,12 @@ use std::{
     io, usize,
 };
 
+pub enum UserIdType {
+    None = 0,
+    ZeroTrust = 1,
+    OAuth2 = 2,
+}
+
 pub struct UserAccessCache {
     // The queue is used to evict the oldest files from the cache when the cache is full
     cache_queue: VecDeque<String>,
@@ -17,7 +23,7 @@ pub struct UserAccessCache {
 }
 
 impl UserAccessCache {
-    pub fn new(cache_max_aggregate_count: usize) -> Self {
+    pub fn new( cache_max_aggregate_count: usize) -> Self {
         Self {
             cache_queue: VecDeque::new(),
             cache: HashMap::new(),
@@ -110,7 +116,8 @@ impl UserAccessCache {
         potential_access_level: AccessLevel,
         allow_downgrade: bool,
         share_key_hash: Option<&str>,
-        ed_override: Option<u64>,
+        server_time: u64,
+        user_id_type: UserIdType,
     ) -> io::Result<Option<EventBatchItem>> {
         //Not allowed to downgrade your own permissions
         if allow_downgrade && current_user_hash == for_user_hash {
@@ -126,18 +133,16 @@ impl UserAccessCache {
             return Ok(None);
         }
 
-        let current_time = ed_override.unwrap_or(chrono::Utc::now().timestamp_millis() as u64);
-
         let mut event_item = EventItem::new();
-        event_item.ed = current_time;
+        event_item.ed = server_time;
         event_item.tp = AggregateEventType::UserAccessUpdated as u64;
         event_item.string_values = Some(vec![Some(for_user_hash.to_string()), share_key_hash.map_or(None, |f| Some(f.to_string()))]);
-        event_item.uint_values = Some(vec![potential_access_level as u64]);
+        event_item.uint_values = Some(vec![potential_access_level as u64, user_id_type as u64]);
 
         let mut event_batch_item = EventBatchItem::new();
         event_batch_item.events = vec![event_item];
         event_batch_item.cb = Some(current_user_hash.to_string());
-        event_batch_item.sd = current_time;
+        event_batch_item.sd = server_time;
 
         event_batch_item.si = event_storage_cache.write(file_path, false, event_batch_item.clone())?;
 
@@ -689,7 +694,8 @@ mod tests {
                 AccessLevel::Viewer,
                 true,
                 None,
-                None,
+                654,
+                UserIdType::ZeroTrust
             )
             .unwrap();
 
@@ -714,7 +720,7 @@ mod tests {
 
         // Attempt to upgrade own access level
         let result = user_access_cache
-            .update_access_for_user(&mut event_storage_cache, &file_path, user_hash, user_hash, AccessLevel::Owner, true, None, None)
+            .update_access_for_user(&mut event_storage_cache, &file_path, user_hash, user_hash, AccessLevel::Owner, true, None, 654, UserIdType::ZeroTrust)
             .unwrap();
 
         // Verify that the update was successful (returns Some(EventItem))
@@ -746,7 +752,8 @@ mod tests {
                 AccessLevel::Contributor,
                 true,
                 None,
-                None,
+                654,
+                UserIdType::ZeroTrust
             )
             .unwrap();
 

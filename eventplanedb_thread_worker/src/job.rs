@@ -7,7 +7,7 @@ use crate::process_write::WriteResult;
 pub enum Job {
     Share {
         file_path: String,
-        current_user_hash: String, 
+        current_user_hash: Option<String>, 
         current_user_claims: Option<Claims>,
         server_time: u64,
         share_hash: String,
@@ -20,7 +20,7 @@ pub enum Job {
     },
     Write {
         file_path: String, 
-        current_user_hash: String, 
+        current_user_hash: Option<String>, 
         current_user_claims: Option<Claims>, 
         server_time: u64, 
         allow_create: bool,
@@ -29,7 +29,8 @@ pub enum Job {
     },
     AccessCheck {
         file_path: String,
-        current_user_hash: String, current_user_claims: Option<Claims>,
+        current_user_hash: Option<String>, 
+        current_user_claims: Option<Claims>,
         server_time: u64,
         required_access_level: AccessLevel,
         responder: oneshot::Sender<Result<(), JobError>>,
@@ -37,7 +38,7 @@ pub enum Job {
     Read {
         file_path: String,
         from_si: u64,
-        current_user_hash: String, 
+        current_user_hash: Option<String>, 
         current_user_claims: Option<Claims>,
         server_time: u64,
         share_key: Option<String>,
@@ -47,7 +48,7 @@ pub enum Job {
     },
     DisableUser {
         file_path: String,
-        current_user_hash: String, 
+        current_user_hash: Option<String>, 
         current_user_claims: Option<Claims>,
         server_time: u64,
         user_hash: String,
@@ -55,7 +56,7 @@ pub enum Job {
     },
     DisableShare {
         file_path: String,
-        current_user_hash: String, 
+        current_user_hash: Option<String>, 
         current_user_claims: Option<Claims>,
         server_time: u64,
         share_hash: String,
@@ -63,7 +64,7 @@ pub enum Job {
     },
     Delete {
         file_path: String,
-        current_user_hash: String, 
+        current_user_hash: Option<String>, 
         current_user_claims: Option<Claims>,
         server_time: u64,
         responder: oneshot::Sender<Result<(), JobError>>,

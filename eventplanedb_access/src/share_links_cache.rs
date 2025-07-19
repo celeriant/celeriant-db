@@ -119,18 +119,17 @@ impl ShareLinksCache {
         &mut self,
         event_storage_cache: &mut EventStorageCache,
         file_path: String,
-        current_user_hash: String,
+        user_id: String,
         share_key_hash: String,
         access_level: AccessLevel,
         is_single_use: bool,
         iv: Option<Vec<u8>>,
         description: Option<String>,
         expires_on: u64,
+        server_time: u64,
     ) -> io::Result<EventBatchItem> {
-        let current_time = chrono::Utc::now().timestamp_millis() as u64;
-
         let mut event_item = EventItem::new();
-        event_item.ed = current_time;
+        event_item.ed = server_time;
         event_item.tp = AggregateEventType::ShareLinkCreated as u64;
         event_item.iv_arrays = Some(vec![iv]);
         event_item.string_values = Some(vec![description, Some(share_key_hash.clone())]);
@@ -139,12 +138,12 @@ impl ShareLinksCache {
 
         let mut event_batch_item = EventBatchItem::new();
         event_batch_item.events = vec![event_item.clone()];
-        event_batch_item.cb = Some(current_user_hash.clone());
-        event_batch_item.sd = current_time;
+        event_batch_item.cb = Some(user_id.clone());
+        event_batch_item.sd = server_time;
 
         event_batch_item.si = event_storage_cache.write(&file_path, false, event_batch_item.clone())?;
 
-        let share_link_info = ShareLinkAccessInfo::new(access_level, share_key_hash.clone(), is_single_use, current_user_hash, expires_on);
+        let share_link_info = ShareLinkAccessInfo::new(access_level, share_key_hash.clone(), is_single_use, user_id, expires_on);
 
         let cache = self.get_or_build_cache(event_storage_cache, &file_path);
         cache.add_share_link(share_key_hash, share_link_info);
@@ -185,7 +184,7 @@ impl ShareLinksCache {
         &mut self,
         event_storage_cache: &mut EventStorageCache,
         file_path: &str,
-        current_user_hash: String,
+        user_id: String,
         share_key_hash: String,
         current_time: u64,
     ) -> io::Result<EventBatchItem> {
@@ -196,7 +195,7 @@ impl ShareLinksCache {
 
         let mut event_batch_item = EventBatchItem::new();
         event_batch_item.events = vec![event_item.clone()];
-        event_batch_item.cb = Some(current_user_hash.clone());
+        event_batch_item.cb = Some(user_id.clone());
         event_batch_item.sd = current_time;
 
         event_batch_item.si = event_storage_cache.write(&file_path, false, event_batch_item.clone())?;
@@ -621,6 +620,7 @@ mod tests {
             iv.clone(),
             description.clone(),
             expires_on,
+            654,
         );
 
         // Verify that the event was created successfully

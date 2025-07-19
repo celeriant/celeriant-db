@@ -1,9 +1,9 @@
 use eventplanedb_storage::event_storage_cache::EventStorageCache;
-use eventplanedb_access::{access_level::AccessLevel, claims::Claims, job_error::JobError, share_links_cache::ShareLinksCache, user_access_cache::UserAccessCache};
+use eventplanedb_access::{access_level::AccessLevel, claims::{Claims}, job_error::JobError, share_links_cache::ShareLinksCache, user_access_cache::UserAccessCache};
 
 pub fn handle_access_check(
     file_path: String,
-    current_user_hash: String,
+    current_user_hash: Option<String>,
     current_user_claims: Option<Claims>,
     server_time: u64,
     required_access_level: AccessLevel,
@@ -16,10 +16,11 @@ pub fn handle_access_check(
         share_links_cache,
         user_access_cache,
         &file_path,
-        &current_user_hash,
+        current_user_hash.as_deref(),
+        current_user_claims.as_ref().map(|c| c.sub.as_str()),
         server_time,
         required_access_level,
-        None,
+        None
     )?;
 
     Ok(())

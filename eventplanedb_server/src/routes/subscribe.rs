@@ -29,17 +29,18 @@ pub async fn subscribe_events(
     let server_time = state.server_time();
     let current_user_hash = 
         if let (Some(public_key), Some(nonce), Some(signature)) = (params.public_key.as_deref(), params.nonce.as_deref(), params.signature.as_deref()) {
-            state.validate_auth_params(public_key, nonce, signature)?
+            Some(state.validate_auth_params(public_key, nonce, signature)?)
         } else {
-            return Err(RouteError::JobError(JobError::InvalidParameters("Missing authentication parameters".to_string())));
+            None
         };
     let current_user_claims = match params.token.as_deref() {
         Some(token) => validate_jwt_token(&state, token).await.ok(),
         None => None,
     };
+    let user_id = current_user_claims.as_ref().map(|c| c.sub.clone()).unwrap_or(current_user_hash.clone().unwrap());
     let file_path = state.get_file_path(&id);
 
-    access_check_async(&state.workers, file_path.clone(), current_user_hash.clone(), current_user_claims, server_time, eventplanedb_access::access_level::AccessLevel::Viewer,).await?;
+    access_check_async(&state.workers, file_path.clone(), current_user_hash, current_user_claims, server_time, eventplanedb_access::access_level::AccessLevel::Viewer,).await?;
 
     // Subscribe to event notifications for this file path
     let receiver = state.event_notifier.subscribe(&file_path);
@@ -51,7 +52,7 @@ pub async fn subscribe_events(
     let stream = stream::unfold(
         (
             receiver,
-            current_user_hash,
+            user_id,
             Instant::now().checked_sub(cooldown_period).unwrap_or_else(Instant::now),
         ),
         move |(mut receiver, current_user, last_notification)| async move {
