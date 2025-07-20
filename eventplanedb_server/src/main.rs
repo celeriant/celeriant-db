@@ -4,7 +4,10 @@ use axum::{
     routing::{get, post},
 };
 use std::{env, time::Duration};
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::{
+    cors::{Any, CorsLayer},
+    compression::CompressionLayer,
+};
 
 use crate::{
     app_state::AppState,
@@ -20,12 +23,12 @@ mod routes;
 mod auth;
 mod error_response;
 
-#[cfg(feature = "tikv-jemallocator")]
-mod jemalloc {
-    use tikv_jemallocator::Jemalloc;
+#[cfg(feature = "mimalloc")]
+mod mimalloc {
+    use mimalloc::MiMalloc;
 
     #[global_allocator]
-    static GLOBAL: Jemalloc = Jemalloc;
+    static GLOBAL: MiMalloc = MiMalloc;
 }
 
 #[tokio::main]
@@ -76,5 +79,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/aggregate/{id}/disableuser/{user_hash}", post(disable_user))
         .route("/aggregate/{id}/share", post(share));
 
-    Router::new().nest("/api/v1", api_v1).layer(cors).with_state(state)
+    Router::new().nest("/api/v1", api_v1)
+        .layer(CompressionLayer::new())
+        .layer(cors)
+        .with_state(state)
 }
