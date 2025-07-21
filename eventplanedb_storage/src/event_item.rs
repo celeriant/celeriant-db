@@ -3,47 +3,42 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct EventItem {
-    pub ed: u64,
-    pub tp: u64,
+    #[serde(rename = "ed")]
+    pub event_date: u64,
+
+    #[serde(rename = "tp")]
+    pub event_type: u64,
 
     #[serde(skip_serializing_if = "Option::is_none", rename = "vi")]
-    #[serde(alias = "vi")]
     pub int_values: Option<Vec<i64>>,
 
     #[serde(skip_serializing_if = "Option::is_none", rename = "vu")]
-    #[serde(alias = "vu")]
     pub uint_values: Option<Vec<u64>>,
 
     #[serde(skip_serializing_if = "Option::is_none", rename = "vf")]
-    #[serde(alias = "vf")]
     pub f32_values: Option<Vec<f32>>,
 
     #[serde(skip_serializing_if = "Option::is_none", rename = "vd")]
-    #[serde(alias = "vd")]
     pub f64_values: Option<Vec<f64>>,
 
     #[serde(skip_serializing_if = "Option::is_none", rename = "vb")]
-    #[serde(alias = "vb")]
     pub bool_values: Option<Vec<bool>>,
 
     #[serde(skip_serializing_if = "Option::is_none", rename = "sv")]
-    #[serde(alias = "vs")]
     pub string_values: Option<Vec<Option<String>>>,
 
     #[serde(skip_serializing_if = "Option::is_none", rename = "iv")]
-    #[serde(alias = "iv")]
-    pub iv_arrays: Option<Vec<Option<Vec<u8>>>>,
+    pub iv_arrays: Option<Vec<Option<[u8; 12]>>>,
 
     #[serde(skip_serializing_if = "Option::is_none", rename = "by")]
-    #[serde(alias = "by")]
     pub byte_arrays: Option<Vec<Option<Vec<u8>>>>,
 }
 
 impl EventItem {
     pub fn new() -> Self {
         EventItem {
-            ed: 0,
-            tp: 0,
+            event_date: 0,
+            event_type: 0,
             int_values: None,
             uint_values: None,
             f32_values: None,
@@ -70,8 +65,8 @@ pub mod tests {
 
         let mut event1 = EventItem::new();
 
-        event1.ed = 443;
-        event1.tp = 4;
+        event1.event_date = 443;
+        event1.event_type = 4;
         event1.int_values = Some(stl_i32.into_iter().map(|v| v as i64).collect());
         event1.f32_values = Some(stl_f32.into_iter().map(|v| v).collect());
         event1.string_values = Some(lorem_text.into_iter().map(|v| Some(v)).collect());
@@ -87,8 +82,8 @@ pub mod tests {
         event2.f64_values = Some(vec![1.0, 2.0, 3.0]);
         event2.bool_values = Some(vec![true, false, true]);
         event2.string_values = Some(vec![Some("Hello".to_string()), Some("World".to_string())]);
-        event2.ed = 443;
-        event2.tp = 4;
+        event2.event_date = 443;
+        event2.event_type = 4;
 
         event2
     }

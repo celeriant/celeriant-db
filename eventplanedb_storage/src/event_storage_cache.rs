@@ -174,7 +174,7 @@ impl EventStorageCache {
             return Err(io::Error::new(io::ErrorKind::NotFound, "File not found"));
         }
 
-        event_batch_item.si = last_si.map_or(0, |si| si + 1);
+        event_batch_item.server_id = last_si.map_or(0, |si| si + 1);
 
         self.open_transaction(file_path)?;
         
@@ -187,37 +187,44 @@ impl EventStorageCache {
             &event_batch_item)?;
 
         // Update cache and return the last SI that was assigned
-        let si = event_batch_item.si;
+        let server_id = event_batch_item.server_id;
 
-        self.last_si_cache.update(file_path, si);
-        self.memory_cache.put(file_path, si, Arc::new(event_batch_item), compressed_batch_size);
+        self.last_si_cache.update(file_path, server_id);
+        self.memory_cache.put(file_path, server_id, Arc::new(event_batch_item), compressed_batch_size);
 
         self.commit_transaction(file_path)?;
 
-        Ok(si)
+        Ok(server_id)
     }
 
-    pub fn read(&mut self, file_path: &str, from_si: u64, max_bytes: usize, tp_filter: Option<&[u64]>) -> io::Result<CatchupResult> {
+    pub fn read(&mut self, file_path: &str, from_server_id: u64, max_bytes: usize, event_type_filter: Option<&[u64]>, exclude_client_id_filter: Option<u128>) -> io::Result<CatchupResult> {
         let mut event_batches = Vec::new();
-        let mut current_si = from_si;
+        let mut current_server_id = from_server_id;
         let mut number_bytes: usize = 0;
         let mut more_batches_to_go: bool = false;
 
         // First, try to use the memory cache to get events if within the TTL
         loop {
-            if let Some((cached_event_batch_item, compressed_batch_size)) = self.memory_cache.get(file_path, current_si) {
-                current_si = cached_event_batch_item.si + 1;
+            if let Some((cached_event_batch_item, compressed_batch_size)) = self.memory_cache.get(file_path, current_server_id) {
+                current_server_id = cached_event_batch_item.server_id + 1;
 
                 //Skip batch if tp_filter is set and does not match tp on the batch
-                if let Some(tp_filter) = tp_filter {
+                if let Some(tp_filter) = event_type_filter {
                     let mut tp_matched: bool = false;
                     for tp in tp_filter {
-                        if cached_event_batch_item.events.len() == 1 && cached_event_batch_item.events[0].tp == *tp {
+                        if cached_event_batch_item.events.len() == 1 && cached_event_batch_item.events[0].event_type == *tp {
                             tp_matched = true;
                             break;
                         }
                     }
                     if !tp_matched {
+                        continue;
+                    }
+                }
+
+                //Skip batch if we match on the same client id
+                if let Some(exclude_client_id_filter) = exclude_client_id_filter {
+                    if cached_event_batch_item.client_id == exclude_client_id_filter {
                         continue;
                     }
                 }
@@ -235,14 +242,14 @@ impl EventStorageCache {
         }
 
         if more_batches_to_go {
-            let next_batch_cannot_return = self.memory_cache.get(file_path, current_si);
+            let next_batch_cannot_return = self.memory_cache.get(file_path, current_server_id);
             more_batches_to_go = next_batch_cannot_return.is_some();
         }        
 
         if !event_batches.is_empty() {
             return Ok(CatchupResult {
                 event_batches: event_batches,
-                next_si: if more_batches_to_go { Some(current_si) } else { None },
+                next_si: if more_batches_to_go { Some(current_server_id) } else { None },
             });
         }
         
@@ -252,13 +259,13 @@ impl EventStorageCache {
             Ok(reader_mut) => {
                 let mut reader = reader_mut.borrow_mut();
 
-                match read_from_si(&mut reader, from_si, max_bytes, tp_filter) {
+                match read_from_si(&mut reader, from_server_id, max_bytes, event_type_filter, exclude_client_id_filter) {
                     Ok(catchup_result) => return Ok(catchup_result),
                     Err(_) => {
                         //File is corrupted, try to recover it
                         self.recover_file_using_magic_number(file_path, &mut reader)?;
                         
-                        match read_from_si(&mut reader, from_si, max_bytes, tp_filter) {
+                        match read_from_si(&mut reader, from_server_id, max_bytes, event_type_filter, exclude_client_id_filter) {
                             Ok(catchup_result) => return Ok(catchup_result),
                             Err(_) => {
                                 return Err(io::Error::new(io::ErrorKind::Other, "File is corrupted and cannot be recovered"));
@@ -325,13 +332,13 @@ mod tests {
 
         // Write some events
         let events_batch = vec![create_test_event_item(), create_minimal_event_item()];
-        let event_batch_item = create_event_batch_item(0, None, 0, events_batch);
+        let event_batch_item = create_event_batch_item(0, 0, None, 0, events_batch);
         let last_si = storage.write(file_path, true, event_batch_item).unwrap();
         assert_eq!(last_si, 0);
 
         // Verify file exists and has content
         assert!(std::path::Path::new(file_path).exists());
-        let events = storage.read(file_path, 0, 1000, None).unwrap();
+        let events = storage.read(file_path, 0, 1000, None, None).unwrap();
         assert_eq!(events.flatten_events().len(), 2);
 
         // Delete the file
@@ -342,7 +349,7 @@ mod tests {
         assert!(!std::path::Path::new(file_path).exists());
 
         // Verify reading returns empty result
-        let result_read = storage.read(file_path, 0, 1000, None);
+        let result_read = storage.read(file_path, 0, 1000, None, None);
         assert!(result_read.is_err());
         assert_eq!(result_read.unwrap_err().kind(), io::ErrorKind::NotFound);
 
@@ -374,9 +381,9 @@ mod tests {
 
         let str_compare_value = events_batch_2[0].string_values.as_ref().unwrap()[4].as_ref().unwrap().clone();
 
-        let event_batch_item_1 = create_event_batch_item(0, None, 0, events_batch_1);
-        let event_batch_item_2 = create_event_batch_item(0, None, 0, events_batch_2);
-        let event_batch_item_3 = create_event_batch_item(0, None, 0, events_batch_3);
+        let event_batch_item_1 = create_event_batch_item(0, 0, None, 0, events_batch_1);
+        let event_batch_item_2 = create_event_batch_item(0, 0, None, 0, events_batch_2);
+        let event_batch_item_3 = create_event_batch_item(0, 0, None, 0, events_batch_3);
 
         let last_si = storage.write(&events_bin.to_str().unwrap(), true, event_batch_item_1).unwrap();
         assert_eq!(last_si, 0);
@@ -387,13 +394,13 @@ mod tests {
         let last_si = storage.write(&events_bin.to_str().unwrap(), true, event_batch_item_3).unwrap();
         assert_eq!(last_si, 2);
 
-        let events_from_1 = storage.read(&events_bin.to_str().unwrap(), 1, 40000, None).unwrap();
+        let events_from_1 = storage.read(&events_bin.to_str().unwrap(), 1, 40000, None, None).unwrap();
 
         assert_eq!(events_from_1.flatten_events().len(), 3);
         assert_eq!(events_from_1.next_si, None);
         assert_eq!(events_from_1.event_batches.len(), 2);
-        assert_eq!(events_from_1.event_batches[0].si, 1);
-        assert_eq!(events_from_1.event_batches[1].si, 2);
+        assert_eq!(events_from_1.event_batches[0].server_id, 1);
+        assert_eq!(events_from_1.event_batches[1].server_id, 2);
 
         assert_eq!(events_from_1.flatten_events()[1].string_values.as_ref().unwrap()[1].as_ref().unwrap(), "World");
 
@@ -403,7 +410,7 @@ mod tests {
     #[test]
     fn test_read_file_not_exists() {
         let mut storage = EventStorageCache::new(30, 1000000, 10000);
-        let events_from_3 = storage.read("unknownfile.bin", 0, 40000, None);
+        let events_from_3 = storage.read("unknownfile.bin", 0, 40000, None, None);
         assert!(events_from_3.is_err());
         assert_eq!(events_from_3.unwrap_err().kind(), io::ErrorKind::NotFound);
     }
@@ -423,8 +430,8 @@ mod tests {
         let events_batch_1 = vec![create_test_event_item(), create_minimal_event_item(), create_test_event_item()];
         let events_batch_2 = vec![create_test_event_item(), create_minimal_event_item()];
 
-        let event_batch_item_1 = create_event_batch_item(0, None, 0, events_batch_1);
-        let event_batch_item_2 = create_event_batch_item(0, None, 0, events_batch_2);
+        let event_batch_item_1 = create_event_batch_item(0, 0, None, 0, events_batch_1);
+        let event_batch_item_2 = create_event_batch_item(0, 0, None, 0, events_batch_2);
 
         let last_si_1 = storage.write(&events_bin.to_str().unwrap(), true, event_batch_item_1).unwrap();
         assert_eq!(last_si_1, 0);
@@ -432,8 +439,8 @@ mod tests {
         let last_si_2 = storage.write(&events_bin_2.to_str().unwrap(), true, event_batch_item_2).unwrap();
         assert_eq!(last_si_2, 0);
 
-        let file1 = storage.read(&events_bin.to_str().unwrap(), 0, 100, None).unwrap();
-        let file2 = storage.read(&events_bin_2.to_str().unwrap(), 0, 100, None).unwrap();
+        let file1 = storage.read(&events_bin.to_str().unwrap(), 0, 100, None, None).unwrap();
+        let file2 = storage.read(&events_bin_2.to_str().unwrap(), 0, 100, None, None).unwrap();
 
         assert_eq!(file1.flatten_events().len(), 3);
         assert_eq!(file2.flatten_events().len(), 2);
@@ -452,8 +459,8 @@ mod tests {
         let events_batch_1 = vec![create_test_event_item(), create_minimal_event_item(), create_test_event_item()];
         let events_batch_2 = vec![create_test_event_item(), create_minimal_event_item()];
 
-        let event_batch_item_1 = create_event_batch_item(0, None, 0, events_batch_1);
-        let event_batch_item_2 = create_event_batch_item(0, None, 0, events_batch_2);
+        let event_batch_item_1 = create_event_batch_item(0, 0, None, 0, events_batch_1);
+        let event_batch_item_2 = create_event_batch_item(0, 0, None, 0, events_batch_2);
 
         let last_si = storage.write(&events_bin.to_str().unwrap(), true, event_batch_item_1).unwrap();
         assert_eq!(last_si, 0);
@@ -469,7 +476,7 @@ mod tests {
 
         storage.memory_cache.invalidate_file(events_bin.to_str().unwrap());
 
-        let events_from_0 = storage.read(&events_bin.to_str().unwrap(), 0, 100, None).unwrap();
+        let events_from_0 = storage.read(&events_bin.to_str().unwrap(), 0, 100, None, None).unwrap();
         assert_eq!(events_from_0.flatten_events().len(), 3);
         
     }
@@ -488,9 +495,9 @@ mod tests {
         let str_compare_value = events_batch_2[0].string_values.as_ref().unwrap()[4].as_ref().unwrap().clone();
         let events_batch_3 = vec![create_minimal_event_item()];
 
-        let event_batch_item_1 = create_event_batch_item(0, None, 0, events_batch_1);
-        let event_batch_item_2 = create_event_batch_item(0, None, 0, events_batch_2);
-        let event_batch_item_3 = create_event_batch_item(0, None, 0, events_batch_3);
+        let event_batch_item_1 = create_event_batch_item(0, 0, None, 0, events_batch_1);
+        let event_batch_item_2 = create_event_batch_item(0, 0, None, 0, events_batch_2);
+        let event_batch_item_3 = create_event_batch_item(0, 0, None, 0, events_batch_3);
 
         let last_si = storage.write(&events_bin.to_str().unwrap(), true, event_batch_item_1).unwrap();
         assert_eq!(last_si, 0);
@@ -514,13 +521,13 @@ mod tests {
 
 
         // Same assertions as above round trip test, no duplicate write
-        let events_from_3 = storage.read(&events_bin.to_str().unwrap(), 1, 40000, None).unwrap();
+        let events_from_3 = storage.read(&events_bin.to_str().unwrap(), 1, 40000, None, None).unwrap();
 
         assert_eq!(events_from_3.flatten_events().len(), 3);
         assert_eq!(events_from_3.next_si, None);
         assert_eq!(events_from_3.event_batches.len(), 2);
-        assert_eq!(events_from_3.event_batches[0].si, 1);
-        assert_eq!(events_from_3.event_batches[1].si, 2);
+        assert_eq!(events_from_3.event_batches[0].server_id, 1);
+        assert_eq!(events_from_3.event_batches[1].server_id, 2);
 
         assert_eq!(events_from_3.flatten_events()[1].string_values.as_ref().unwrap()[1].as_ref().unwrap(), "World");
 
@@ -539,23 +546,23 @@ mod tests {
         let events_batch_1 = vec![create_test_event_item(), create_minimal_event_item()];
         let events_batch_2 = vec![create_test_event_item()];
         
-        let event_batch_item_1 = create_event_batch_item(0, None, 0, events_batch_1);
-        let event_batch_item_2 = create_event_batch_item(0, None, 0, events_batch_2);
+        let event_batch_item_1 = create_event_batch_item(0, 0, None, 0, events_batch_1);
+        let event_batch_item_2 = create_event_batch_item(0, 0, None, 0, events_batch_2);
 
         storage.write(&events_bin.to_str().unwrap(), true, event_batch_item_1.clone()).unwrap();
         storage.write(&events_bin.to_str().unwrap(), true, event_batch_item_2.clone()).unwrap();
 
         // Read events from memory cache
-        let cached_events = storage.read(&events_bin.to_str().unwrap(), 0, 1000000, None).unwrap();
+        let cached_events = storage.read(&events_bin.to_str().unwrap(), 0, 1000000, None, None).unwrap();
         assert_eq!(cached_events.flatten_events().len(), 3);
 
         // Test max_bytes limit
-        let partial_events = storage.read(&events_bin.to_str().unwrap(), 0, 1, None).unwrap();
+        let partial_events = storage.read(&events_bin.to_str().unwrap(), 0, 1, None, None).unwrap();
         assert_eq!(partial_events.next_si, Some(1)); // Should continue from SI 1 after reaching the limit
         assert_eq!(partial_events.flatten_events().len(), 2);
 
         //Test in-mem from si 1
-        let partial_events = storage.read(&events_bin.to_str().unwrap(), 1, 1, None).unwrap();
+        let partial_events = storage.read(&events_bin.to_str().unwrap(), 1, 1, None, None).unwrap();
         assert_eq!(partial_events.next_si, None); // Should continue from SI 1 after reaching the limit
         assert_eq!(partial_events.flatten_events().len(), 1);
     }
@@ -574,9 +581,9 @@ mod tests {
         let events_batch_2 = vec![create_test_event_item()];
         let events_batch_3 = vec![create_minimal_event_item()];
         
-        let event_batch_item_1 = create_event_batch_item(0, None, 123, events_batch_1);
-        let event_batch_item_2 = create_event_batch_item(0, None, 456, events_batch_2);
-        let event_batch_item_3 = create_event_batch_item(0, None, 789, events_batch_3);
+        let event_batch_item_1 = create_event_batch_item(0, 0, None, 123, events_batch_1);
+        let event_batch_item_2 = create_event_batch_item(0, 0, None, 456, events_batch_2);
+        let event_batch_item_3 = create_event_batch_item(0, 0, None, 789, events_batch_3);
 
         // Write first two batches
         let last_si = storage.write(file_path, true, event_batch_item_1).unwrap();
@@ -621,11 +628,11 @@ mod tests {
         storage.last_si_cache.remove(file_path);
 
         // Test 2: read should recover and return only valid batches
-        let events = storage.read(file_path, 0, 1000000, None).unwrap();
+        let events = storage.read(file_path, 0, 1000000, None, None).unwrap();
         assert_eq!(events.flatten_events().len(), 3); // Only first two batches
         assert_eq!(events.event_batches.len(), 2);
-        assert_eq!(events.event_batches[0].si, 0);
-        assert_eq!(events.event_batches[1].si, 1);
+        assert_eq!(events.event_batches[0].server_id, 0);
+        assert_eq!(events.event_batches[1].server_id, 1);
         assert_eq!(events.next_si, None);
 
         // Verify file was truncated again
@@ -642,19 +649,19 @@ mod tests {
         storage.last_si_cache.remove(file_path);
 
         // Test 3: write should recover and then successfully write new batch
-        let new_event_batch = create_event_batch_item(0, None, 999, vec![create_test_event_item()]);
+        let new_event_batch = create_event_batch_item(0, 0, None, 999, vec![create_test_event_item()]);
         let last_si = storage.write(file_path, true, new_event_batch).unwrap();
         assert_eq!(last_si, 2); // Should be SI 2 after recovery
 
         // Verify we can read all three batches (original 2 + new 1)
         storage.memory_cache.invalidate_file(file_path); // Clear cache to read from disk
-        let final_events = storage.read(file_path, 0, 1000000, None).unwrap();
+        let final_events = storage.read(file_path, 0, 1000000, None, None).unwrap();
         assert_eq!(final_events.flatten_events().len(), 4); // 2 + 1 + 1 events
         assert_eq!(final_events.event_batches.len(), 3);
-        assert_eq!(final_events.event_batches[0].si, 0);
-        assert_eq!(final_events.event_batches[1].si, 1);
-        assert_eq!(final_events.event_batches[2].si, 2);
-        assert_eq!(final_events.event_batches[2].sd, 999); // New batch
+        assert_eq!(final_events.event_batches[0].server_id, 0);
+        assert_eq!(final_events.event_batches[1].server_id, 1);
+        assert_eq!(final_events.event_batches[2].server_id, 2);
+        assert_eq!(final_events.event_batches[2].server_date, 999); // New batch
     }
 
     #[test]
@@ -672,41 +679,41 @@ mod tests {
         let mut event3 = create_test_event_item();
         let mut event4 = create_minimal_event_item();
 
-        event1.tp = 100;
-        event2.tp = 200;
-        event3.tp = 100;
-        event4.tp = 300;
+        event1.event_type = 100;
+        event2.event_type = 200;
+        event3.event_type = 100;
+        event4.event_type = 300;
 
         let events_batch_1 = vec![event1.clone(), event2.clone()]; // Mixed TP
         let events_batch_2 = vec![event3.clone()]; // Single TP = 100
         let events_batch_3 = vec![event4.clone()]; // Single TP = 300
 
-        let event_batch_item_1 = create_event_batch_item(0, None, 0, events_batch_1);
-        let event_batch_item_2 = create_event_batch_item(0, None, 0, events_batch_2);
-        let event_batch_item_3 = create_event_batch_item(0, None, 0, events_batch_3);
+        let event_batch_item_1 = create_event_batch_item(0, 0, None, 0, events_batch_1);
+        let event_batch_item_2 = create_event_batch_item(0, 0, None, 0, events_batch_2);
+        let event_batch_item_3 = create_event_batch_item(0, 0, None, 0, events_batch_3);
 
         storage.write(file_path, true, event_batch_item_1).unwrap();
         storage.write(file_path, true, event_batch_item_2).unwrap();
         storage.write(file_path, true, event_batch_item_3).unwrap();
 
         // Read with TP = 100, should only return batch 2
-        let result = storage.read(file_path, 0, 1000, Some(&[100])).unwrap();
+        let result = storage.read(file_path, 0, 1000, Some(&[100]), None).unwrap();
         assert_eq!(result.event_batches.len(), 1);
         assert_eq!(result.flatten_events().len(), 1);
-        assert_eq!(result.event_batches[0].si, 1);
-        assert_eq!(result.flatten_events()[0].tp, 100);
+        assert_eq!(result.event_batches[0].server_id, 1);
+        assert_eq!(result.flatten_events()[0].event_type, 100);
         assert_eq!(result.next_si, Some(2));
 
         // Read with TP = 300, should only return batch 3
-        let result = storage.read(file_path, 0, 1000, Some(&[300])).unwrap();
+        let result = storage.read(file_path, 0, 1000, Some(&[300]), None).unwrap();
         assert_eq!(result.event_batches.len(), 1);
         assert_eq!(result.flatten_events().len(), 1);
-        assert_eq!(result.event_batches[0].si, 2);
-        assert_eq!(result.flatten_events()[0].tp, 300);
+        assert_eq!(result.event_batches[0].server_id, 2);
+        assert_eq!(result.flatten_events()[0].event_type, 300);
         assert_eq!(result.next_si, None);
 
         // Read with TP = 200, should return nothing
-        let result = storage.read(file_path, 0, 1000, Some(&[200])).unwrap();
+        let result = storage.read(file_path, 0, 1000, Some(&[200]), None).unwrap();
         assert_eq!(result.event_batches.len(), 0);
         assert_eq!(result.flatten_events().len(), 0);
         assert_eq!(result.next_si, None);
@@ -727,30 +734,30 @@ mod tests {
             let mut event2 = create_minimal_event_item();
             let mut event3 = create_test_event_item();
 
-            event1.tp = 100;
-            event2.tp = 100;
-            event3.tp = 100;
+            event1.event_type = 100;
+            event2.event_type = 100;
+            event3.event_type = 100;
 
             //events_batch_1 will be returned since it has a single event and the tp is 100
             let events_batch_1 = vec![event1.clone()]; // Single TP = 100
             //events_batch_2 will NOT be returned since it has 2 events and the tp is 100
             let events_batch_2 = vec![event2.clone(), event3.clone()]; // Multiple events, all TP = 100
 
-            let event_batch_item_1 = create_event_batch_item(0, None, 0, events_batch_1);
-            let event_batch_item_2 = create_event_batch_item(0, None, 0, events_batch_2);
+            let event_batch_item_1 = create_event_batch_item(0, 0, None, 0, events_batch_1);
+            let event_batch_item_2 = create_event_batch_item(0, 0, None, 0, events_batch_2);
 
             // Write the batches
             storage.write(file_path, true, event_batch_item_1).unwrap();
             storage.write(file_path, true, event_batch_item_2).unwrap();
 
             // Attempt to read with max_bytes such that only the first batch fits
-            let result = storage.read(file_path, 0, 50, Some(&[100])).unwrap();
+            let result = storage.read(file_path, 0, 50, Some(&[100]), None).unwrap();
 
             // Verify that only the first batch is returned
             assert_eq!(result.event_batches.len(), 1);
             assert_eq!(result.flatten_events().len(), 1);
-            assert_eq!(result.event_batches[0].si, 0);
-            assert_eq!(result.flatten_events()[0].tp, 100);
+            assert_eq!(result.event_batches[0].server_id, 0);
+            assert_eq!(result.flatten_events()[0].event_type, 100);
             assert_eq!(result.next_si, Some(1));
         }
     }

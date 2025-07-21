@@ -96,17 +96,15 @@ impl Crypto {
     }
 
     /// Generate a short client identity from a public key
-    pub fn generate_short_client_identity(public_key: &[u8]) -> String {
+    pub fn generate_short_client_identity(public_key: &[u8]) -> u128 {
         let mut hasher = Sha256::new();
         hasher.update(public_key);
         let hash = hasher.finalize();
-
-        // Take first 16 bytes for shorter ID (still collision-resistant)
-        general_purpose::URL_SAFE_NO_PAD.encode(&hash[..16])
+        u128::from_ne_bytes(hash[..16].try_into().unwrap())
     }
 
     /// Validate a signature and nonce with a public key, returning the client identity
-    pub fn validate_with_public_key(public_key: &str, nonce: &str, signature: &str) -> Result<String, CryptoError> {
+    pub fn validate_with_public_key(public_key: &str, nonce: &str, signature: &str) -> Result<u128, CryptoError> {
         Self::validate_nonce(nonce)?;
         Self::validate_signature(public_key, nonce, signature)?;
         let client_identity = Self::generate_short_client_identity(public_key.as_bytes());
@@ -214,7 +212,7 @@ mod tests {
 
         // Validate with public key
         let client_identity = Crypto::validate_with_public_key(&keypair.public_key_base64, &nonce, &signature).unwrap();
-        assert!(!client_identity.is_empty());
+        assert!(client_identity > 0);
     }
 
     #[test]

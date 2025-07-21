@@ -2,9 +2,6 @@
 # In alphabetical order
 members = [
     "eventplanedb_storage",
-    "eventplanedb_thread_worker",
-    "eventplanedb_server",
-    "eventplanedb_access",
     "eventplanedb_crypto",
 ]
 

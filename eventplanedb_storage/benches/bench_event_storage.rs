@@ -9,16 +9,18 @@ use tempfile::TempDir;
 use rand::prelude::*;
 
 fn create_event_batch_item(
-    si: u64,
-    cb: Option<String>,
-    sd: u64,
+    server_id: u64,
+    client_id: u128,
+    user_id: Option<String>,
+    server_date: u64,
     events: Vec<EventItem>,
 ) -> EventBatchItem {
     EventBatchItem {
-        si,
-        cb,
-        sd,
+        server_id,
         events,
+        server_date,
+        client_id,
+        user_id,
     }
 }
 
@@ -29,8 +31,8 @@ fn random_event_item(array_size: i32) -> EventItem {
     let mut dummy_storage = EventItem::new();
     let mut rng = rand::thread_rng();
 
-    dummy_storage.ed = rng.r#gen::<u64>();
-    dummy_storage.tp = rng.r#gen::<u16>() as u64;
+    dummy_storage.event_date = rng.r#gen::<u64>();
+    dummy_storage.event_type = rng.r#gen::<u16>() as u64;
 
     dummy_storage.int_values = Some((0..array_size).map(|_| rng.r#gen::<i64>()).collect());
 
@@ -123,7 +125,7 @@ fn benchmark_event_storage_ops(c: &mut Criterion) {
                             })
                             .collect();
 
-                        let event_batch_item = create_event_batch_item(324234234, None, 32423423432, events_batch);
+                        let event_batch_item = create_event_batch_item(324234234, 43534543, None, 32423423432, events_batch);
                         batches.push(event_batch_item);
                     }
 
@@ -139,13 +141,13 @@ fn benchmark_event_storage_ops(c: &mut Criterion) {
                     // Read all events
                     let mut reader = create_reader(events_bin.to_str().unwrap())
                         .expect("Open reader to events.bin");
-                    let _all_read_events = read_from_si(&mut reader, 0, usize::MAX, None).expect("Read all events");
+                    let _all_read_events = read_from_si(&mut reader, 0, usize::MAX, None, None).expect("Read all events");
 
                     // Catchup from a specific si
                     let mut reader = create_reader(events_bin.to_str().unwrap())
                         .expect("Open reader to events.bin");
                     let target_si = (event_count / 2) as u64; // Catchup from middle si
-                    let _catchup_result = read_from_si(&mut reader, target_si, usize::max_value(), None)
+                    let _catchup_result = read_from_si(&mut reader, target_si, usize::max_value(), None, None)
                         .expect("Read from si");
                 });
             },

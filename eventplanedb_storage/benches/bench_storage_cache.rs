@@ -2,7 +2,6 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use eventplanedb_storage::event_batch_item::{EventBatchItem};
 use eventplanedb_storage::event_item::EventItem;
 use eventplanedb_storage::event_storage_cache::EventStorageCache;
-use std::fs;
 use tempfile::TempDir;
 use rand::prelude::*;
 
@@ -13,8 +12,8 @@ fn random_event_item(array_size: i32) -> EventItem {
     let mut dummy_storage = EventItem::new();
     let mut rng = rand::thread_rng();
 
-    dummy_storage.ed = rng.r#gen::<u64>();
-    dummy_storage.tp = rng.r#gen::<u16>() as u64;
+    dummy_storage.event_date = rng.r#gen::<u64>();
+    dummy_storage.event_type = rng.r#gen::<u16>() as u64;
 
     dummy_storage.int_values = Some((0..array_size).map(|_| rng.r#gen::<i64>()).collect());
 
@@ -69,14 +68,21 @@ fn random_event_item(array_size: i32) -> EventItem {
 
     dummy_storage
 }
-// Utility function to create EventBatchItem
+
 fn create_event_batch_item(
-    si: u64,
-    cb: Option<String>,
-    sd: u64,
+    server_id: u64,
+    client_id: u128,
+    user_id: Option<String>,
+    server_date: u64,
     events: Vec<EventItem>,
 ) -> EventBatchItem {
-    EventBatchItem { si, cb, sd, events }
+    EventBatchItem {
+        server_id,
+        events,
+        server_date,
+        client_id,
+        user_id,
+    }
 }
 
 fn benchmark_storage_cache_ops(c: &mut Criterion) {
@@ -102,13 +108,13 @@ fn benchmark_storage_cache_ops(c: &mut Criterion) {
                     let events_batch: Vec<EventItem> = (0..event_count)
                         .map(|_| random_event_item(array_size))
                         .collect();
-                    let event_batch_item = create_event_batch_item(0, None, 0, events_batch);
+                    let event_batch_item = create_event_batch_item(0, 34234, None, 0, events_batch);
 
                     // Write events
                     storage.write(file_path, true, event_batch_item).expect("Write events");
 
                     // Read events
-                    storage.read(file_path, 0, usize::MAX, None).expect("Read events");
+                    storage.read(file_path, 0, usize::MAX, None, None).expect("Read events");
 
                     // Delete file
                     storage.delete(file_path).expect("Delete file");
@@ -132,13 +138,13 @@ fn benchmark_storage_cache_ops(c: &mut Criterion) {
                     let events_batch: Vec<EventItem> = (0..event_count)
                         .map(|_| random_event_item(array_size))
                         .collect();
-                    let event_batch_item = create_event_batch_item(0, None, 0, events_batch);
+                    let event_batch_item = create_event_batch_item(0, 34234, None, 0, events_batch);
 
                     // Write events
                     storage.write(file_path, true, event_batch_item).expect("Write events");
 
                     // Read events immediately after writing
-                    storage.read(file_path, 0, usize::MAX, None).expect("Read events");
+                    storage.read(file_path, 0, usize::MAX, None, None).expect("Read events");
                 });
             },
         );

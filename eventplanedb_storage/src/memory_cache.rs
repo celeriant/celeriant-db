@@ -88,6 +88,7 @@ impl MemoryCache {
 mod tests {
     use super::*;
     use crate::event_item::tests::create_test_event_item;
+    use crate::wire_format::tests::generate_short_client_identity;
     use std::thread;
 
     #[test]
@@ -95,9 +96,10 @@ mod tests {
         let mut cache = MemoryCache::new(30);
 
         let mut event_batch_item = EventBatchItem::new();
-        event_batch_item.cb = Some("test".to_string());
-        event_batch_item.si = 0;
-        event_batch_item.sd = 23432;
+        event_batch_item.user_id = Some("test".to_string());
+        event_batch_item.client_id = generate_short_client_identity("test2");
+        event_batch_item.server_id = 0;
+        event_batch_item.server_date = 23432;
         event_batch_item.events.push(create_test_event_item());
         
         // Test put and get
@@ -116,9 +118,10 @@ mod tests {
         let mut cache = MemoryCache::new(30);
 
         let mut event_batch_item = EventBatchItem::new();
-        event_batch_item.cb = Some("test".to_string());
-        event_batch_item.si = 0;
-        event_batch_item.sd = 23432;
+        event_batch_item.user_id = Some("test".to_string());
+        event_batch_item.client_id = generate_short_client_identity("test2");
+        event_batch_item.server_id = 0;
+        event_batch_item.server_date = 23432;
         event_batch_item.events.push(create_test_event_item());
         
         cache.put("test1.bin", 0, Arc::new(event_batch_item.clone()), 512);
@@ -144,9 +147,10 @@ mod tests {
         };
         
         let mut event_batch_item = EventBatchItem::new();
-        event_batch_item.cb = Some("test".to_string());
-        event_batch_item.si = 0;
-        event_batch_item.sd = 23432;
+        event_batch_item.user_id = Some("test".to_string());
+        event_batch_item.client_id = generate_short_client_identity("test2");
+        event_batch_item.server_id = 0;
+        event_batch_item.server_date = 23432;
         event_batch_item.events.push(create_test_event_item());
 
         cache.put("test.bin", 0, Arc::new(event_batch_item), 256);
@@ -164,9 +168,10 @@ mod tests {
         let mut cache = MemoryCache::new(0);
 
         let mut event_batch_item = EventBatchItem::new();
-        event_batch_item.cb = Some("test".to_string());
-        event_batch_item.si = 0;
-        event_batch_item.sd = 23432;
+        event_batch_item.user_id = Some("test".to_string());
+        event_batch_item.client_id = generate_short_client_identity("test2");
+        event_batch_item.server_id = 0;
+        event_batch_item.server_date = 23432;
         event_batch_item.events.push(create_test_event_item());
         
         // Test that put does nothing when cache is disabled

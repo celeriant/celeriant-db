@@ -14,8 +14,8 @@ fn random_event_item(array_size: i32) -> EventItem {
     let mut dummy_storage = EventItem::new();
     let mut rng = rand::thread_rng();
 
-    dummy_storage.ed = rng.r#gen::<u64>();
-    dummy_storage.tp = rng.r#gen::<u16>() as u64;
+    dummy_storage.event_date = rng.r#gen::<u64>();
+    dummy_storage.event_type = rng.r#gen::<u16>() as u64;
 
     dummy_storage.int_values = Some((0..array_size).map(|_| rng.r#gen::<i64>()).collect());
 
@@ -93,16 +93,18 @@ fn benchmark_event_generation(c: &mut Criterion) {
 }
 
 fn create_event_batch_item(
-    si: u64,
-    cb: Option<String>,
-    sd: u64,
+    server_id: u64,
+    client_id: u128,
+    user_id: Option<String>,
+    server_date: u64,
     events: Vec<EventItem>,
 ) -> EventBatchItem {
     EventBatchItem {
-        si,
-        cb,
-        sd,
+        server_id,
         events,
+        server_date,
+        client_id,
+        user_id,
     }
 }
 
@@ -120,7 +122,7 @@ fn benchmark_event_item_full_cycle(c: &mut Criterion) {
         let events: Vec<_> = (0..event_count)
             .map(|_| random_event_item(array_size))
             .collect();
-        let event_batch_item = create_event_batch_item(32423, Some("lksdflkjdslk".to_string()), 32423423423, events);
+        let event_batch_item = create_event_batch_item(32423, 32423, Some("lksdflkjdslk".to_string()), 32423423423, events);
         let encoded_events = serialize_event_batch_item(&event_batch_item).expect("Serialize events");
         
         // Set throughput to show bytes processed per second
@@ -145,7 +147,7 @@ fn benchmark_event_item_full_cycle(c: &mut Criterion) {
                     let events: Vec<_> = (0..event_count)
                         .map(|_| random_event_item(array_size))
                         .collect();
-                    let event_batch_item = create_event_batch_item(32423, Some("lksdflkjdslk".to_string()), 32423423423, events);
+                    let event_batch_item = create_event_batch_item(32423, 32423, Some("lksdflkjdslk".to_string()), 32423423423, events);
 
                     // Serialize
                     let encoded_events = serialize_event_batch_item(&event_batch_item).expect("Serialize events");
@@ -190,13 +192,13 @@ fn benchmark_serialization(c: &mut Criterion) {
     let events_100_1000: Vec<_> = (0..100).map(|_| random_event_item(1000)).collect();
 
     // Pre-serialize to get sizes for throughput
-    let event_batch_item_events_10_100 = create_event_batch_item(32423, Some("lksdflkjdslk".to_string()), 32423423423, events_10_100);
+    let event_batch_item_events_10_100 = create_event_batch_item(32423, 32423, Some("lksdflkjdslk".to_string()), 32423423423, events_10_100);
     let encoded_10_100 = serialize_event_batch_item(&event_batch_item_events_10_100).expect("Serialize events");
 
-    let event_batch_item_events_50_500 = create_event_batch_item(32423, Some("lksdflkjdslk".to_string()), 32423423423, events_50_500);
+    let event_batch_item_events_50_500 = create_event_batch_item(32423, 32423, Some("lksdflkjdslk".to_string()), 32423423423, events_50_500);
     let encoded_50_500 = serialize_event_batch_item(&event_batch_item_events_50_500).expect("Serialize events");
 
-    let event_batch_item_events_100_1000 = create_event_batch_item(32423, Some("lksdflkjdslk".to_string()), 32423423423, events_100_1000);
+    let event_batch_item_events_100_1000 = create_event_batch_item(32423, 32423, Some("lksdflkjdslk".to_string()), 32423423423, events_100_1000);
     let encoded_100_1000 = serialize_event_batch_item(&event_batch_item_events_100_1000).expect("Serialize events");
 
     group.throughput(Throughput::Bytes(encoded_10_100.len() as u64));
@@ -246,13 +248,13 @@ fn benchmark_compression(c: &mut Criterion) {
     let events_50_500: Vec<_> = (0..50).map(|_| random_event_item(500)).collect();
     let events_100_1000: Vec<_> = (0..100).map(|_| random_event_item(1000)).collect();
 
-    let event_batch_item_events_10_100 = create_event_batch_item(32423, Some("lksdflkjdslk".to_string()), 32423423423, events_10_100);
+    let event_batch_item_events_10_100 = create_event_batch_item(32423, 32423, Some("lksdflkjdslk".to_string()), 32423423423, events_10_100);
     let encoded_10_100 = serialize_event_batch_item(&event_batch_item_events_10_100).expect("Serialize events");
 
-    let event_batch_item_events_50_500 = create_event_batch_item(32423, Some("lksdflkjdslk".to_string()), 32423423423, events_50_500);
+    let event_batch_item_events_50_500 = create_event_batch_item(32423, 32423, Some("lksdflkjdslk".to_string()), 32423423423, events_50_500);
     let encoded_50_500 = serialize_event_batch_item(&event_batch_item_events_50_500).expect("Serialize events");
 
-    let event_batch_item_events_100_1000 = create_event_batch_item(32423, Some("lksdflkjdslk".to_string()), 32423423423, events_100_1000);
+    let event_batch_item_events_100_1000 = create_event_batch_item(32423, 32423, Some("lksdflkjdslk".to_string()), 32423423423, events_100_1000);
     let encoded_100_1000 = serialize_event_batch_item(&event_batch_item_events_100_1000).expect("Serialize events");
 
     group.throughput(Throughput::Bytes(encoded_10_100.len() as u64));
@@ -302,13 +304,13 @@ fn benchmark_decompression(c: &mut Criterion) {
     let events_50_500: Vec<_> = (0..50).map(|_| random_event_item(500)).collect();
     let events_100_1000: Vec<_> = (0..100).map(|_| random_event_item(1000)).collect();
 
-    let event_batch_item_events_10_100 = create_event_batch_item(32423, Some("lksdflkjdslk".to_string()), 32423423423, events_10_100);
+    let event_batch_item_events_10_100 = create_event_batch_item(32423, 32423, Some("lksdflkjdslk".to_string()), 32423423423, events_10_100);
     let encoded_10_100 = serialize_event_batch_item(&event_batch_item_events_10_100).expect("Serialize events");
 
-    let event_batch_item_events_50_500 = create_event_batch_item(32423, Some("lksdflkjdslk".to_string()), 32423423423, events_50_500);
+    let event_batch_item_events_50_500 = create_event_batch_item(32423, 32423, Some("lksdflkjdslk".to_string()), 32423423423, events_50_500);
     let encoded_50_500 = serialize_event_batch_item(&event_batch_item_events_50_500).expect("Serialize events");
 
-    let event_batch_item_events_100_1000 = create_event_batch_item(32423, Some("lksdflkjdslk".to_string()), 32423423423, events_100_1000);
+    let event_batch_item_events_100_1000 = create_event_batch_item(32423, 32423, Some("lksdflkjdslk".to_string()), 32423423423, events_100_1000);
     let encoded_100_1000 = serialize_event_batch_item(&event_batch_item_events_100_1000).expect("Serialize events");
 
     let compressed_10_100 = compress_data(&encoded_10_100).expect("Compress events");
@@ -380,7 +382,7 @@ fn benchmark_size_metrics(c: &mut Criterion) {
                 b.iter(|| {
                     // Just do a minimal operation to measure the "cost" of these sizes
                     let events: Vec<_> = (0..event_count).map(|_| random_event_item(array_size)).collect();
-                    let event_batch_item = create_event_batch_item(23423432, None, 3232423432, events);
+                    let event_batch_item = create_event_batch_item(23423432, 32423, None, 3232423432, events);
                     let encoded = serialize_event_batch_item(std::hint::black_box(&event_batch_item)).expect("Serialize");
                     let compressed = compress_data(std::hint::black_box(&encoded)).expect("Compress");
                     std::hint::black_box((encoded.len(), compressed.len()));

@@ -23,12 +23,19 @@ pub fn deserialize_event_batch_item(data: &[u8]) -> io::Result<EventBatchItem> {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use std::{fs, io::Write};
+    use sha2::{Digest, Sha256};
     use tempfile::TempDir;
     use crate::{event_item::tests::{create_minimal_event_item, create_test_event_item}, file_cache::create_append_writer};
     use super::*;
 
+    pub fn generate_short_client_identity(value: &str) -> u128 {
+        let mut hasher = Sha256::new();
+        hasher.update(value.as_bytes());
+        let hash = hasher.finalize();
+        u128::from_ne_bytes(hash[..16].try_into().unwrap())
+    }
 
     fn load_event_batch_item_from_json(path: &str) -> Result<EventBatchItem, Box<dyn std::error::Error>> {
         let mut json_content = fs::read(path)?; // Note: read bytes, not string
@@ -48,9 +55,10 @@ mod tests {
     fn test_write_event_batch_item() {
 
         let mut event_batch_item = EventBatchItem::new();
-        event_batch_item.cb = Some("test".to_string());
-        event_batch_item.si = 0;
-        event_batch_item.sd = 23432;
+        event_batch_item.user_id = Some("test".to_string());
+        event_batch_item.client_id = generate_short_client_identity("test2");
+        event_batch_item.server_id = 0;
+        event_batch_item.server_date = 23432;
         event_batch_item.events.push(create_test_event_item());
         event_batch_item.events.push(create_minimal_event_item());
 
@@ -96,10 +104,11 @@ mod tests {
         );
 
         // Compare event1
-        assert_eq!(deserialized_events.cb, event_batch_item.cb);
-        assert_eq!(deserialized_events.si, event_batch_item.si);
-        assert_eq!(deserialized_events.events[0].ed, event_batch_item.events[0].ed);
-        assert_eq!(deserialized_events.events[0].tp, event_batch_item.events[0].tp);
+        assert_eq!(deserialized_events.user_id, event_batch_item.user_id);
+        assert_eq!(deserialized_events.client_id, event_batch_item.client_id);
+        assert_eq!(deserialized_events.server_id, event_batch_item.server_id);
+        assert_eq!(deserialized_events.events[0].event_date, event_batch_item.events[0].event_date);
+        assert_eq!(deserialized_events.events[0].event_type, event_batch_item.events[0].event_type);
         assert_eq!(deserialized_events.events[0].int_values, event_batch_item.events[0].int_values);
         assert_eq!(deserialized_events.events[0].f32_values, event_batch_item.events[0].f32_values);
         assert_eq!(
@@ -109,8 +118,8 @@ mod tests {
         assert_eq!(deserialized_events.events[0].byte_arrays, event_batch_item.events[0].byte_arrays);
 
         // Compare event2
-        assert_eq!(deserialized_events.events[1].ed, event_batch_item.events[1].ed);
-        assert_eq!(deserialized_events.events[1].tp, event_batch_item.events[1].tp);
+        assert_eq!(deserialized_events.events[1].event_date, event_batch_item.events[1].event_date);
+        assert_eq!(deserialized_events.events[1].event_type, event_batch_item.events[1].event_type);
         assert_eq!(deserialized_events.events[1].int_values, event_batch_item.events[1].int_values);
         assert_eq!(deserialized_events.events[1].f32_values, event_batch_item.events[1].f32_values);
         assert_eq!(
@@ -122,10 +131,11 @@ mod tests {
         let event1_from_json = load_event_batch_item_from_json(event_batch_json.to_str().unwrap()).expect("Failed to read event_batch from JSON");
 
         // Compare event1
-        assert_eq!(event1_from_json.cb, event_batch_item.cb);
-        assert_eq!(event1_from_json.si, event_batch_item.si);
-        assert_eq!(event1_from_json.events[0].ed, event_batch_item.events[0].ed);
-        assert_eq!(event1_from_json.events[0].tp, event_batch_item.events[0].tp);
+        assert_eq!(event1_from_json.user_id, event_batch_item.user_id);
+        assert_eq!(event1_from_json.client_id, event_batch_item.client_id);
+        assert_eq!(event1_from_json.server_id, event_batch_item.server_id);
+        assert_eq!(event1_from_json.events[0].event_date, event_batch_item.events[0].event_date);
+        assert_eq!(event1_from_json.events[0].event_type, event_batch_item.events[0].event_type);
         assert_eq!(event1_from_json.events[0].int_values, event_batch_item.events[0].int_values);
         assert_eq!(event1_from_json.events[0].f32_values, event_batch_item.events[0].f32_values);
         assert_eq!(
@@ -135,8 +145,8 @@ mod tests {
         assert_eq!(event1_from_json.events[0].byte_arrays, event_batch_item.events[0].byte_arrays);
 
         // Compare event2
-        assert_eq!(event1_from_json.events[1].ed, event_batch_item.events[1].ed);
-        assert_eq!(event1_from_json.events[1].tp, event_batch_item.events[1].tp);
+        assert_eq!(event1_from_json.events[1].event_date, event_batch_item.events[1].event_date);
+        assert_eq!(event1_from_json.events[1].event_type, event_batch_item.events[1].event_type);
         assert_eq!(event1_from_json.events[1].int_values, event_batch_item.events[1].int_values);
         assert_eq!(event1_from_json.events[1].f32_values, event_batch_item.events[1].f32_values);
         assert_eq!(
