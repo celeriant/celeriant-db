@@ -1,18 +1,16 @@
-use eventplanedb_storage::{event_batch_item::EventBatchItem, event_item::EventItem, event_storage_cache::EventStorageCache};
-use eventplanedb_access::{access_level::AccessLevel, claims::Claims, job_error::JobError, share_links_cache::ShareLinksCache, user_access_cache::{UserAccessCache, UserIdType}};
+use eventplanedb_storage::{event_batch_item::EventBatchItem, event_item::EventItem};
+use eventplanedb_storage::{event_storage_cache::EventStorageCache};
+use eventplanedb_access::{access_level::AccessLevel, job_error::JobError, require_permission::require_permission, share_links_cache::ShareLinksCache, user_access_cache::UserAccessCache};
 
-use crate::event_notifications::EventNotifier;
+use crate::{event_notifications::EventNotifier, job_context::JobContext};
 
 pub struct WriteResult {
-    pub si: u64,
+    pub server_id: u64,
     pub events: Vec<EventBatchItem>,
 }
 
 pub fn handle_write_job(
-    file_path: String, 
-    current_user_hash: Option<String>, 
-    current_user_claims: Option<Claims>,
-    server_time: u64, 
+    context: JobContext,
     allow_create: bool,
     events: Vec<EventItem>,
     event_storage_cache: &mut EventStorageCache,
@@ -20,39 +18,34 @@ pub fn handle_write_job(
     user_access_cache: &mut UserAccessCache,
     event_notifier: Option<&EventNotifier>,
 ) -> Result<WriteResult, JobError> {
-    let file_exists = event_storage_cache.exists(&file_path);
+
+    let file_exists = event_storage_cache.exists(&context.file_path);
 
     if !file_exists && !allow_create {
         return Err(JobError::NotFound("Aggregate does not exist".to_string()));
     }
 
     if file_exists {
-        AccessLevel::require_permission(
+        require_permission(
             event_storage_cache,
             share_links_cache,
             user_access_cache,
-            &file_path,
-            current_user_hash.as_deref(),
-            current_user_claims.as_ref().map(|c| c.sub.as_str()),
-            server_time,
+            &context.file_path,
+            &context.current_client_id,
+            context.current_user_id.as_deref(),
+            context.server_time,
             AccessLevel::Contributor,
             None,
         )?;
     }
 
-    //Critical that we preference the machine public key here as the same user could be logged in on multiple devices
-    let mut user_id_type = UserIdType::OAuth2;
-    if current_user_hash.is_some() {
-        user_id_type = UserIdType::ZeroTrust;
-    }
-    let user_id = current_user_hash.unwrap_or(current_user_claims.unwrap().sub);
-
     let mut event_batch_item = EventBatchItem::new();
     event_batch_item.events = events;
-    event_batch_item.sd = server_time;
-    event_batch_item.cb = Some(user_id.clone());
+    event_batch_item.client_id = context.current_client_id;
+    event_batch_item.user_id = context.current_user_id.clone();
+    event_batch_item.server_date = context.server_time;
 
-    let si: u64 = event_storage_cache.write(&file_path, allow_create, event_batch_item)?;
+    let server_id: u64 = event_storage_cache.write(&context.file_path, allow_create, event_batch_item)?;
 
     let mut events: Vec<EventBatchItem> = vec![];
 
@@ -60,21 +53,22 @@ pub fn handle_write_job(
         // Give owner access
         events.extend(user_access_cache.update_access_for_user(
             event_storage_cache,
-            &file_path,
-            &user_id,
-            &user_id,
+            &context.file_path,
+            &context.current_client_id,
+            context.current_user_id.as_deref(),
+            &context.current_client_id,
+            context.current_user_id.as_deref(),
             AccessLevel::Owner,
             false,
             None,
-            server_time,
-            user_id_type,
+            context.server_time
         )?);
     }
 
     // Notify subscribers that there are new events for this file path
     if let Some(notifier) = event_notifier {
-        notifier.notify(&file_path, &user_id);
+        notifier.notify(&context.file_path, &context.current_client_id);
     }
 
-    Ok(WriteResult { si, events })
+    Ok(WriteResult { server_id, events })
 }

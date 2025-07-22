@@ -1,10 +1,9 @@
-use eventplanedb_access::claims::Claims;
 use axum::{
     http::{HeaderMap},
 };
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 
-use crate::app_state::AppState;
+use crate::{app_state::AppState, auth::claims::Claims};
 
 pub fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
     let auth_header = headers.get("Authorization")?;

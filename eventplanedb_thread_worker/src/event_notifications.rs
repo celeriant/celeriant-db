@@ -4,7 +4,7 @@ use tokio::sync::broadcast;
 
 #[derive(Debug, Clone)]
 pub struct EventNotifier {
-    channels: Arc<Mutex<HashMap<String, broadcast::Sender<String>>>>, // Changed to send String (user hash)
+    channels: Arc<Mutex<HashMap<String, broadcast::Sender<u128>>>>,
 }
 
 impl EventNotifier {
@@ -15,12 +15,13 @@ impl EventNotifier {
     }
 
     // Get or create a channel for a specific file path
-    pub fn subscribe(&self, file_path: &str) -> broadcast::Receiver<String> {
+    pub fn subscribe(&self, file_path: &str) -> broadcast::Receiver<u128> {
         let mut channels = self.channels.lock().unwrap();
 
         // Get or create the channel
         let sender = channels.entry(file_path.to_string()).or_insert_with(|| {
             // Create a new broadcast channel with capacity for 100 messages
+            // TODO: What should we set this capacity to?
             let (tx, _) = broadcast::channel(100);
             tx
         });
@@ -30,12 +31,12 @@ impl EventNotifier {
     }
 
     // Notify all subscribers for a specific file path
-    pub fn notify(&self, file_path: &str, user_hash: &str) {
+    pub fn notify(&self, file_path: &str, client_id: &u128) {
         let channels = self.channels.lock().unwrap();
 
         if let Some(sender) = channels.get(file_path) {
             // Send the user hash that caused this notification
-            let _ = sender.send(user_hash.to_string());
+            let _ = sender.send(*client_id);
         }
     }
 }

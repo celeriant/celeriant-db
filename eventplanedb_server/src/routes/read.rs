@@ -10,7 +10,7 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 pub struct ReadQuery {
     from_si: Option<u64>,
-    share_key: Option<String>,
+    share_id: Option<u128>,
     own_events: Option<bool>,
 }
 

@@ -1,43 +1,46 @@
 use eventplanedb_storage::{event_batch_item::EventBatchItem, event_storage_cache::EventStorageCache};
-use eventplanedb_access::{access_level::AccessLevel, claims::Claims, job_error::JobError, share_links_cache::ShareLinksCache, user_access_cache::UserAccessCache};
+use eventplanedb_access::{access_level::AccessLevel, job_error::JobError, require_permission::require_permission, share_links_cache::ShareLinksCache, user_access_cache::UserAccessCache};
 
-use crate::{event_notifications::EventNotifier, process_write::WriteResult};
+use crate::{event_notifications::EventNotifier, job_context::JobContext, process_write::WriteResult};
 
 pub fn handle_disable_share_job(
-    file_path: String,
-    current_user_hash: Option<String>,
-    current_user_claims: Option<Claims>,
-    server_time: u64,
-    share_hash: String,
+    context: JobContext,
+    share_id: u128,
     event_storage_cache: &mut EventStorageCache,
     share_links_cache: &mut ShareLinksCache,
     user_access_cache: &mut UserAccessCache,
     event_notifier: Option<&EventNotifier>,
 ) -> Result<WriteResult, JobError> {
-    AccessLevel::require_permission(
+
+    require_permission(
         event_storage_cache,
         share_links_cache,
         user_access_cache,
-        &file_path,
-        current_user_hash.as_deref(),
-        current_user_claims.as_ref().map(|c| c.sub.as_str()),
-        server_time,
+        &context.file_path,
+        &context.current_client_id,
+        context.current_user_id.as_deref(),
+        context.server_time,
         AccessLevel::Owner,
         None,
     )?;
 
-    //Critical that we preference the machine public key here as the same user could be logged in on multiple devices
-    let user_id = current_user_hash.unwrap_or(current_user_claims.unwrap().sub);
-    let event_batch = share_links_cache.disable_share_link(event_storage_cache, &file_path, user_id.clone(), share_hash, server_time)?;
+    let event_batch = share_links_cache.disable_share_link(
+        event_storage_cache, 
+        &context.file_path, 
+        &context.current_client_id,
+        context.current_user_id.as_deref(),
+        share_id,
+        context.server_time)?;
 
-    let si = event_batch.si;
+    let server_id = event_batch.server_id;
 
     // Notify subscribers that there are new events for this file path
     if let Some(notifier) = event_notifier {
-        notifier.notify(&file_path, &user_id);
+        notifier.notify(&context.file_path, &context.current_client_id);
     }
 
     let events: Vec<EventBatchItem> = vec![event_batch];
 
-    Ok(WriteResult { si, events })
+    Ok(WriteResult { server_id, events })
+    
 }

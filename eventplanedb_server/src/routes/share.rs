@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 pub struct ShareQuery {
     access_level: u64,
     is_single_use: bool,
-    iv: Option<Vec<u8>>,
+    iv: Option<[u8; 12]>,
     description: Option<String>,
     expires_on: u64,
 }

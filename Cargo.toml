@@ -4,6 +4,8 @@ members = [
     "eventplanedb_storage",
     "eventplanedb_crypto",
     "eventplanedb_access",
+    "eventplanedb_thread_worker",
+    "eventplanedb_server",
 ]
 
 resolver = "2"

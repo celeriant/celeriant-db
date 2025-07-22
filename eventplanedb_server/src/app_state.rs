@@ -1,10 +1,10 @@
 use crossbeam::channel::Sender;
-use eventplanedb_access::{claims::Claims, job_error::JobError};
+use eventplanedb_access::{job_error::JobError};
 use eventplanedb_crypto::Crypto;
 use eventplanedb_thread_worker::{event_notifications::EventNotifier, job::Job, process_jobs::create_thread_pool};
 use std::sync::Arc;
 
-use crate::auth::{jwks_client::JwksClient, jwt_middleware::{extract_bearer_token, validate_jwt_token}, oauth_config::OAuthConfig};
+use crate::auth::{claims::Claims, jwks_client::JwksClient, jwt_middleware::{extract_bearer_token, validate_jwt_token}, oauth_config::OAuthConfig};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -44,14 +44,14 @@ impl AppState {
         format!("{}/{}.dat", self.base_path, pi)
     }
 
-    pub fn validate_auth_params(&self, public_key: &str, nonce: &str, signature: &str) -> Result<String, JobError> {
+    pub fn validate_auth_params(&self, public_key: &str, nonce: &str, signature: &str) -> Result<u128, JobError> {
         match Crypto::validate_with_public_key(public_key, nonce, signature) {
-            Ok(cb) => Ok(cb),
+            Ok(client_id) => Ok(client_id),
             Err(e) => Err(JobError::InvalidParameters(e.to_string())),
         }
     }
 
-    pub async fn validate_auth_headers(&self, headers: &axum::http::HeaderMap) -> Result<(Option<String>, Option<Claims>), JobError> {      
+    pub async fn validate_auth_headers(&self, headers: &axum::http::HeaderMap) -> Result<(Option<u128>, Option<Claims>), JobError> {      
         let claims = match extract_bearer_token(&headers) {
             Some(bearer_token) => validate_jwt_token(self, &bearer_token).await.ok(),
             None => None,
@@ -73,7 +73,7 @@ impl AppState {
         };
 
         match Crypto::validate_with_public_key(&public_key, &nonce, &sign) {
-            Ok(current_user_hash) => Ok((Some(current_user_hash), claims)),
+            Ok(client_id) => Ok((Some(client_id), claims)),
             Err(e) => Err(JobError::InvalidParameters(e.to_string())),
         }
     }

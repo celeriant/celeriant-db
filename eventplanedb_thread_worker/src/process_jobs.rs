@@ -36,11 +36,8 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
             for job in rx.iter() {
                 match job {
                     Job::Share {
-                        file_path,
-                        current_user_hash,
-                        current_user_claims,
-                        server_time,
-                        share_hash,
+                        context,
+                        share_id,
                         access_level,
                         is_single_use,
                         iv,
@@ -49,11 +46,8 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
                         responder,
                     } => {
                         let _ = responder.send(handle_share_job(
-                            file_path,
-                            current_user_hash,
-                            current_user_claims,
-                            server_time,
-                            share_hash,
+                            context,
+                            share_id,
                             access_level,
                             is_single_use,
                             iv,
@@ -67,19 +61,13 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
                     }
 
                     Job::Write {
-                        file_path, 
-                        current_user_hash, 
-                        current_user_claims,
-                        server_time, 
+                        context,
                         allow_create, 
                         events,
                         responder,
                     } => {
                         let _ = responder.send(handle_write_job(
-                            file_path, 
-                            current_user_hash, 
-                            current_user_claims,
-                            server_time, 
+                            context, 
                             allow_create, 
                             events,
                             &mut event_storage_cache,
@@ -90,18 +78,12 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
                     }
 
                     Job::AccessCheck {
-                        file_path,
-                        current_user_hash,
-                        current_user_claims,
-                        server_time,
+                        context,
                         required_access_level,
                         responder,
                     } => {
                         let _ = responder.send(handle_access_check(
-                            file_path,
-                            current_user_hash,
-                            current_user_claims,
-                            server_time,
+                            context,
                             required_access_level,
                             &mut event_storage_cache,
                             &mut share_links_cache,
@@ -110,25 +92,19 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
                     }
 
                     Job::Read {
-                        file_path,
-                        from_si,
-                        current_user_hash,
-                        current_user_claims,
-                        server_time,
-                        share_key,
+                        context,
+                        from_server_id,
+                        share_id,
                         max_bytes,
-                        own_events,
+                        include_own_events,
                         responder,
                     } => {
                         let _ = responder.send(handle_read_job(
-                            file_path,
-                            from_si,
-                            current_user_hash,
-                            current_user_claims,
-                            server_time,
-                            share_key,
+                            context,
+                            from_server_id,
+                            share_id,
                             max_bytes,
-                            own_events,
+                            include_own_events,
                             &mut event_storage_cache,
                             &mut share_links_cache,
                             &mut user_access_cache,
@@ -137,17 +113,11 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
                     }
 
                     Job::Delete {
-                        file_path,
-                        current_user_hash,
-                        current_user_claims,
-                        server_time,
+                        context,
                         responder,
                     } => {
                         let _ = responder.send(handle_delete_job(
-                            file_path,
-                            current_user_hash,
-                            current_user_claims,
-                            server_time,
+                            context,
                             &mut event_storage_cache,
                             &mut share_links_cache,
                             &mut user_access_cache,
@@ -156,19 +126,15 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
                     }
 
                     Job::DisableUser {
-                        file_path,
-                        current_user_hash,
-                        current_user_claims,
-                        server_time,
-                        user_hash,
+                        context,
+                        for_client_id,
+                        for_user_id,
                         responder,
                     } => {
                         let _ = responder.send(handle_disable_user_job(
-                            file_path,
-                            current_user_hash,
-                            current_user_claims,
-                            server_time,
-                            user_hash,
+                            context,
+                            for_client_id,
+                            for_user_id,
                             &mut event_storage_cache,
                             &mut share_links_cache,
                             &mut user_access_cache,
@@ -177,19 +143,13 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
                     }
 
                     Job::DisableShare {
-                        file_path,
-                        current_user_hash,
-                        current_user_claims,
-                        server_time,
-                        share_hash,
+                        context,
+                        share_id,
                         responder,
                     } => {
                         let _ = responder.send(handle_disable_share_job(
-                            file_path,
-                            current_user_hash,
-                            current_user_claims,
-                            server_time,
-                            share_hash,
+                            context,
+                            share_id,
                             &mut event_storage_cache,
                             &mut share_links_cache,
                             &mut user_access_cache,

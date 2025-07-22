@@ -10,3 +10,4 @@ pub mod process_share;
 pub mod process_write;
 pub mod queue_jobs;
 pub mod thread_assigner;
+pub mod job_context;

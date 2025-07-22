@@ -1,40 +1,39 @@
 use eventplanedb_storage::{event_storage_cache::EventStorageCache};
 use eventplanedb_access::{
-    access_level::AccessLevel, claims::Claims, job_error::JobError, share_links_cache::ShareLinksCache, user_access_cache::UserAccessCache
+    access_level::AccessLevel, job_error::JobError, require_permission::require_permission, share_links_cache::ShareLinksCache, user_access_cache::UserAccessCache
 };
 
-use crate::{event_notifications::EventNotifier};
+use crate::{event_notifications::EventNotifier, job_context::JobContext};
 
 pub fn handle_delete_job(
-    file_path: String,
-    current_user_hash: Option<String>,
-    current_user_claims: Option<Claims>,
-    server_time: u64,
+    context: JobContext,
     event_storage_cache: &mut EventStorageCache,
     share_links_cache: &mut ShareLinksCache,
     user_access_cache: &mut UserAccessCache,
     event_notifier: Option<&EventNotifier>,
 ) -> Result<(), JobError> {
-    AccessLevel::require_permission(
+
+    require_permission(
         event_storage_cache,
         share_links_cache,
         user_access_cache,
-        &file_path,
-        current_user_hash.as_deref(),
-        current_user_claims.as_ref().map(|c| c.sub.as_str()),
-        server_time,
+        &context.file_path,
+        &context.current_client_id,
+        context.current_user_id.as_deref(),
+        context.server_time,
         AccessLevel::Owner,
         None,
     )?;
 
-    event_storage_cache.delete(&file_path)?;
+    event_storage_cache.delete(&context.file_path)?;
+
+    //TODO: Now that the file has been deleted, we should clear any in-memory caches
 
     // Notify subscribers that there are new events for this file path
     if let Some(notifier) = event_notifier {
-        //Critical that we preference the machine public key here as the same user could be logged in on multiple devices
-        let user_id = current_user_hash.unwrap_or(current_user_claims.unwrap().sub);
-        notifier.notify(&file_path, user_id.as_str());
+        notifier.notify(&context.file_path, &context.current_client_id);
     }
 
     Ok(())
+    
 }

@@ -1,26 +1,26 @@
 use eventplanedb_storage::event_storage_cache::EventStorageCache;
-use eventplanedb_access::{access_level::AccessLevel, claims::{Claims}, job_error::JobError, share_links_cache::ShareLinksCache, user_access_cache::UserAccessCache};
+use eventplanedb_access::{access_level::AccessLevel, job_error::JobError, require_permission::require_permission, share_links_cache::ShareLinksCache, user_access_cache::UserAccessCache};
+
+use crate::job_context::JobContext;
 
 pub fn handle_access_check(
-    file_path: String,
-    current_user_hash: Option<String>,
-    current_user_claims: Option<Claims>,
-    server_time: u64,
+    context: JobContext,
     required_access_level: AccessLevel,
     event_storage_cache: &mut EventStorageCache,
     share_links_cache: &mut ShareLinksCache,
     user_access_cache: &mut UserAccessCache,
 ) -> Result<(), JobError> {
-    AccessLevel::require_permission(
+
+    require_permission(
         event_storage_cache,
         share_links_cache,
         user_access_cache,
-        &file_path,
-        current_user_hash.as_deref(),
-        current_user_claims.as_ref().map(|c| c.sub.as_str()),
-        server_time,
+        &context.file_path,
+        &context.current_client_id,
+        context.current_user_id.as_deref(),
+        context.server_time,
         required_access_level,
-        None
+        None,
     )?;
 
     Ok(())

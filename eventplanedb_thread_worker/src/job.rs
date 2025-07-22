@@ -1,72 +1,52 @@
 use eventplanedb_storage::{catchup_result::CatchupResult, event_batch_item::EventBatchItem, event_item::EventItem};
-use eventplanedb_access::{access_level::AccessLevel, claims::Claims, job_error::JobError};
+use eventplanedb_access::{access_level::AccessLevel, job_error::JobError};
 use tokio::sync::oneshot;
 
-use crate::process_write::WriteResult;
+use crate::{job_context::JobContext, process_write::WriteResult};
 
 pub enum Job {
     Share {
-        file_path: String,
-        current_user_hash: Option<String>, 
-        current_user_claims: Option<Claims>,
-        server_time: u64,
-        share_hash: String,
+        context: JobContext,
+        share_id: u128,
         access_level: AccessLevel,
         is_single_use: bool,
-        iv: Option<Vec<u8>>,
+        iv: Option<[u8; 12]>,
         description: Option<String>,
         expires_on: u64,
         responder: oneshot::Sender<Result<EventBatchItem, JobError>>,
     },
     Write {
-        file_path: String, 
-        current_user_hash: Option<String>, 
-        current_user_claims: Option<Claims>, 
-        server_time: u64, 
+        context: JobContext,
         allow_create: bool,
         events: Vec<EventItem>,
         responder: oneshot::Sender<Result<WriteResult, JobError>>,
     },
     AccessCheck {
-        file_path: String,
-        current_user_hash: Option<String>, 
-        current_user_claims: Option<Claims>,
-        server_time: u64,
+        context: JobContext,
         required_access_level: AccessLevel,
         responder: oneshot::Sender<Result<(), JobError>>,
     },
     Read {
-        file_path: String,
-        from_si: u64,
-        current_user_hash: Option<String>, 
-        current_user_claims: Option<Claims>,
-        server_time: u64,
-        share_key: Option<String>,
+        context: JobContext,
+        from_server_id: u64,
+        share_id: Option<u128>,
         max_bytes: usize,
-        own_events: bool,
+        include_own_events: bool,
         responder: oneshot::Sender<Result<CatchupResult, JobError>>,
     },
     DisableUser {
-        file_path: String,
-        current_user_hash: Option<String>, 
-        current_user_claims: Option<Claims>,
-        server_time: u64,
-        user_hash: String,
+        context: JobContext,
+        for_client_id: Option<u128>,
+        for_user_id: Option<String>,
         responder: oneshot::Sender<Result<WriteResult, JobError>>,
     },
     DisableShare {
-        file_path: String,
-        current_user_hash: Option<String>, 
-        current_user_claims: Option<Claims>,
-        server_time: u64,
-        share_hash: String,
+        context: JobContext,
+        share_id: u128,
         responder: oneshot::Sender<Result<WriteResult, JobError>>,
     },
     Delete {
-        file_path: String,
-        current_user_hash: Option<String>, 
-        current_user_claims: Option<Claims>,
-        server_time: u64,
+        context: JobContext,
         responder: oneshot::Sender<Result<(), JobError>>,
     },
     Shutdown {

@@ -27,7 +27,9 @@ pub fn require_permission(
         if let Some(share_key_info) = share_links_cache.get_share_key_data_if_still_valid(event_storage_cache, file_path, share_id) {
 
             // Will the share link give the user more access?
-            if AccessLevel::increases_access_level(current_access_level, share_key_info.access_level) {
+            if  AccessLevel::increases_access_level(current_access_level, share_key_info.access_level) &&
+                AccessLevel::meets_required_access_level(share_key_info.access_level, required_access_level) 
+            {
                 final_access_level = share_key_info.access_level;
                 share_link_used = Some(*share_id);
 
@@ -47,6 +49,11 @@ pub fn require_permission(
         }
     }
 
+    // Check if final access level meets requirements
+    if !AccessLevel::meets_required_access_level(final_access_level, required_access_level) {
+        return Err(JobError::PermissionDenied("User does not have permission to perform this action".to_string()));
+    }
+
     let needs_access_update = user_id.is_some() && client_id_access_level != AccessLevel::None || final_access_level != current_access_level;
 
     if needs_access_update {
@@ -63,11 +70,6 @@ pub fn require_permission(
             server_time
         )?;
         new_events.push(provide_access_event.unwrap());
-    }
-
-    // Check if final access level meets requirements
-    if !AccessLevel::meets_required_access_level(final_access_level, required_access_level) {
-        return Err(JobError::PermissionDenied("User does not have permission to perform this action".to_string()));
     }
 
     Ok(new_events)
@@ -357,9 +359,11 @@ mod tests {
             _ => panic!("Expected PermissionDenied error"),
         }
 
-        // Verify that the user's access level has been updated to the share link level
+        // Verify that the user's access level has NOT been updated to the share link level
+        // We don't want to needlessly 'use' a share link if access is not enough anyway
+        // And also we return 403 so client can't process the events generated if we were to use it
         let access_level = user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, &client_id, Some(user_id));
-        assert_eq!(access_level, AccessLevel::Contributor);
+        assert_eq!(access_level, AccessLevel::Viewer);
     }
 
     #[test]

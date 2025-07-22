@@ -199,6 +199,8 @@ impl ShareLinksCache {
         share_id: u128,
         server_time: u64,
     ) -> io::Result<EventBatchItem> {
+        //TODO: Should we check if the share_id is valid? Could create duplicate disable events
+
         let mut event_item = EventItem::new();
         event_item.event_date = server_time;
         event_item.event_type = AggregateEventType::ShareLinkDisabled as u64;
