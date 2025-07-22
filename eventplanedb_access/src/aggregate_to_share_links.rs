@@ -4,32 +4,29 @@ use crate::access_level::AccessLevel;
 
 pub struct ShareLinkAccessInfo {
     pub access_level: AccessLevel,
-    pub share_key: String,
+    pub share_id: u128,
     pub is_single_use: bool,
-    pub created_by: String,
     pub expires_on: u64,
 }
 
 impl ShareLinkAccessInfo {
     pub fn new(
         access_level: AccessLevel,
-        share_key: String,
+        share_id: u128,
         is_single_use: bool,
-        created_by: String,
         expires_on: u64
     ) -> Self {
         Self {
             access_level,
-            share_key,
+            share_id,
             is_single_use,
-            created_by,
             expires_on
         }
     }
 }
 
 pub struct AggregateToShareLinks {
-    share_links: HashMap<String, ShareLinkAccessInfo>,
+    share_links: HashMap<u128, ShareLinkAccessInfo>,
 }
 
 impl AggregateToShareLinks {
@@ -39,16 +36,16 @@ impl AggregateToShareLinks {
         }
     }
 
-    pub fn add_share_link(&mut self, share_hash: String, share_link_info: ShareLinkAccessInfo) {
-        self.share_links.insert(share_hash, share_link_info);
+    pub fn add_share_link(&mut self, share_id: u128, share_link_info: ShareLinkAccessInfo) {
+        self.share_links.insert(share_id, share_link_info);
     }
 
-    pub fn get_share_link(&self, share_hash: &str) -> Option<&ShareLinkAccessInfo> {
-        self.share_links.get(share_hash)
+    pub fn get_share_link(&self, share_id: &u128) -> Option<&ShareLinkAccessInfo> {
+        self.share_links.get(share_id)
     }
 
-    pub fn remove_share_link(&mut self, share_hash: &str) {
-        self.share_links.remove(share_hash);
+    pub fn remove_share_link(&mut self, share_id: &u128) {
+        self.share_links.remove(share_id);
     }
 
     pub fn count(&self) -> usize {
@@ -69,49 +66,46 @@ mod tests {
     #[test]
     fn test_add_and_get_share_link() {
         let mut aggregate_share_links = AggregateToShareLinks::new();
-        let share_hash = "share123".to_string();
+        let share_id = 123;
         let share_link_info = ShareLinkAccessInfo {
             access_level: AccessLevel::Viewer,
-            share_key: "key123".to_string(),
+            share_id,
             is_single_use: false,
-            created_by: "user123".to_string(),
             expires_on: 0
         };
 
-        aggregate_share_links.add_share_link(share_hash.clone(), share_link_info);
+        aggregate_share_links.add_share_link(share_id, share_link_info);
         assert_eq!(aggregate_share_links.count(), 1);
 
-        let retrieved_share_link = aggregate_share_links.get_share_link(&share_hash).unwrap();
+        let retrieved_share_link = aggregate_share_links.get_share_link(&share_id).unwrap();
         assert_eq!(retrieved_share_link.access_level, AccessLevel::Viewer);
-        assert_eq!(retrieved_share_link.share_key, "key123");
+        assert_eq!(retrieved_share_link.share_id, 123);
         assert_eq!(retrieved_share_link.is_single_use, false);
-        assert_eq!(retrieved_share_link.created_by, "user123");
     }
 
     #[test]
     fn test_remove_share_link() {
         let mut aggregate_share_links = AggregateToShareLinks::new();
-        let share_hash = "share123".to_string();
+        let share_id = 123;
         let share_link_info = ShareLinkAccessInfo {
             access_level: AccessLevel::Viewer,
-            share_key: "key123".to_string(),
+            share_id: 123,
             is_single_use: false,
-            created_by: "user123".to_string(),
             expires_on: 0
         };
 
-        aggregate_share_links.add_share_link(share_hash.clone(), share_link_info);
+        aggregate_share_links.add_share_link(share_id.clone(), share_link_info);
         assert_eq!(aggregate_share_links.count(), 1);
 
-        aggregate_share_links.remove_share_link(&share_hash);
+        aggregate_share_links.remove_share_link(&share_id);
         assert_eq!(aggregate_share_links.count(), 0);
-        assert!(aggregate_share_links.get_share_link(&share_hash).is_none());
+        assert!(aggregate_share_links.get_share_link(&share_id).is_none());
     }
 
     #[test]
     fn test_get_nonexistent_share_link() {
         let aggregate_share_links = AggregateToShareLinks::new();
-        assert!(aggregate_share_links.get_share_link("nonexistent").is_none());
+        assert!(aggregate_share_links.get_share_link(&666).is_none());
     }
 
     #[test]
@@ -120,24 +114,22 @@ mod tests {
 
         let share_link_info1 = ShareLinkAccessInfo {
             access_level: AccessLevel::Viewer,
-            share_key: "key1".to_string(),
+            share_id: 1,
             is_single_use: false,
-            created_by: "user1".to_string(),
             expires_on: 0
         };
         let share_link_info2 = ShareLinkAccessInfo {
             access_level: AccessLevel::Contributor,
-            share_key: "key2".to_string(),
+            share_id: 2,
             is_single_use: true,
-            created_by: "user2".to_string(),
             expires_on: 0
         };
 
-        aggregate_share_links.add_share_link("share1".to_string(), share_link_info1);
-        aggregate_share_links.add_share_link("share2".to_string(), share_link_info2);
+        aggregate_share_links.add_share_link(1, share_link_info1);
+        aggregate_share_links.add_share_link(2, share_link_info2);
 
         assert_eq!(aggregate_share_links.count(), 2);
-        assert_eq!(aggregate_share_links.get_share_link("share1").unwrap().access_level, AccessLevel::Viewer);
-        assert_eq!(aggregate_share_links.get_share_link("share2").unwrap().access_level, AccessLevel::Contributor);
+        assert_eq!(aggregate_share_links.get_share_link(&1).unwrap().access_level, AccessLevel::Viewer);
+        assert_eq!(aggregate_share_links.get_share_link(&2).unwrap().access_level, AccessLevel::Contributor);
     }
 }

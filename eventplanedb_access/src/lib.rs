@@ -6,4 +6,4 @@ pub mod access_level;
 pub mod aggregate_event_type;
 pub mod aggregate_to_share_links;
 pub mod claims;
-pub mod user_sub_mapping_cache;
+pub mod require_permission;

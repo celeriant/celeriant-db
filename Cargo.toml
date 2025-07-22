@@ -3,6 +3,7 @@
 members = [
     "eventplanedb_storage",
     "eventplanedb_crypto",
+    "eventplanedb_access",
 ]
 
 resolver = "2"
