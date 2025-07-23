@@ -4,6 +4,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use eventplanedb_access::job_error::JobError;
+use eventplanedb_crypto::CryptoError;
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
@@ -14,12 +15,24 @@ struct ErrorBody {
 #[derive(Debug)]
 pub enum RouteError {
     JobError(JobError),
+    CryptoError(CryptoError),
     Other(String),
+    BadRequest(String),
 }
 
 impl From<JobError> for RouteError {
     fn from(e: JobError) -> Self {
         RouteError::JobError(e)
+    }
+}
+
+// Add conversion from CryptoError to RouteError
+impl From<CryptoError> for RouteError {
+    fn from(e: CryptoError) -> Self {
+        match e {
+            CryptoError::KeyDecodingFailed(msg) => RouteError::BadRequest(msg),
+            _ => RouteError::CryptoError(e),
+        }
     }
 }
 
@@ -40,6 +53,14 @@ impl IntoResponse for RouteError {
                 JobError::AuthenticationFailed(msg) => (StatusCode::UNAUTHORIZED, msg),
                 JobError::Other(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
             },
+            RouteError::CryptoError(crypto_error) => {
+                let msg = crypto_error.to_string();
+                match crypto_error {
+                    CryptoError::InvalidSignature | CryptoError::InvalidNonce => (StatusCode::BAD_REQUEST, msg),
+                    _ => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+                }
+            }
+            RouteError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             RouteError::Other(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
         };
 

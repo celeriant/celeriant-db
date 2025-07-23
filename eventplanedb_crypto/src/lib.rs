@@ -6,7 +6,10 @@ use rsa::{
     signature::{SignatureEncoding, SignerMut, Verifier},
 };
 use sha2::{Digest, Sha256};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    error::Error,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 const MAX_NONCE_TIME_MINUTES: f64 = 2.0;
 const DEFAULT_KEY_SIZE: usize = 2048;
@@ -38,6 +41,31 @@ pub struct KeyPair {
 pub struct Crypto;
 
 impl Crypto {
+    // Helper function to decode the client ID from URL-safe base64
+    pub fn decode_client_id_from_path(client_id_b64: &str) -> Result<u128, CryptoError> {
+        // Replace URL-safe characters back to standard base64
+        let fixed_b64 = client_id_b64.replace('-', "+").replace('_', "/");
+
+        // Add padding if needed
+        let padded_b64 = match fixed_b64.len() % 4 {
+            0 => fixed_b64,
+            n => fixed_b64 + &"=".repeat(4 - n),
+        };
+
+        // Decode from base64
+        let bytes = general_purpose::STANDARD
+            .decode(padded_b64)
+            .map_err(|_| CryptoError::KeyDecodingFailed("Invalid client ID format".to_string()))?;
+
+        if bytes.len() != 16 {
+            return Err(CryptoError::KeyDecodingFailed("Invalid client ID length".to_string()));
+        }
+
+        let mut array = [0u8; 16];
+        array.copy_from_slice(&bytes);
+        Ok(u128::from_le_bytes(array))
+    }
+
     /// Generate a new RSA key pair with the specified key size (default 2048 bits)
     pub fn generate_keypair(key_size: Option<usize>) -> Result<KeyPair, CryptoError> {
         let bits = key_size.unwrap_or(DEFAULT_KEY_SIZE);

@@ -3,6 +3,7 @@ use axum::{
     extract::{Path, Query},
     http::HeaderMap,
 };
+use eventplanedb_crypto::Crypto;
 use eventplanedb_storage::catchup_result::CatchupResult;
 use eventplanedb_thread_worker::{job_context::JobContext, queue_jobs::read_async};
 use serde::Deserialize;
@@ -10,7 +11,7 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 pub struct ReadQuery {
     from_server_id: Option<u64>,
-    share_id: Option<u128>,
+    share_id: Option<String>,
     own_events: Option<bool>,
 }
 
@@ -29,10 +30,14 @@ pub async fn read_events(
         server_time: state.server_time(),
     };
 
+    let share_id = match params.share_id {
+        Some(s) => Some(Crypto::decode_client_id_from_path(s.as_ref())?),
+        None => None,
+    };
     let response = read_async(
         &state.workers,
         context,
-        params.share_id,
+        share_id,
         params.from_server_id.map_or(0, |f| f),
         state.read_max_bytes,
         params.own_events.unwrap_or(false),
