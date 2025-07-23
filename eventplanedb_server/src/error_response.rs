@@ -1,7 +1,7 @@
 use axum::{
+    Json,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use eventplanedb_access::job_error::JobError;
 use serde::Serialize;
@@ -37,6 +37,7 @@ impl IntoResponse for RouteError {
                 JobError::PermissionDenied(msg) => (StatusCode::FORBIDDEN, msg),
                 JobError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
                 JobError::InvalidParameters(msg) => (StatusCode::BAD_REQUEST, msg),
+                JobError::AuthenticationFailed(msg) => (StatusCode::UNAUTHORIZED, msg),
                 JobError::Other(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
             },
             RouteError::Other(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),

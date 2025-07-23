@@ -5,23 +5,23 @@ use axum::{
 };
 use std::{env, time::Duration};
 use tower_http::{
-    cors::{Any, CorsLayer},
     compression::CompressionLayer,
+    cors::{Any, CorsLayer},
 };
 
 use crate::{
     app_state::AppState,
     routes::{
-        delete::delete, disable_share::disable_share, disable_user::disable_user, read::read_events, share::share,
+        delete::delete, disable_client::disable_client, disable_share::disable_share, disable_user::disable_user, read::read_events, share::share,
         subscribe::subscribe_events, write::write_events,
     },
 };
 
 mod app_state;
-mod json_formatter;
-mod routes;
 mod auth;
 mod error_response;
+mod json_formatter;
+mod routes;
 
 #[cfg(feature = "mimalloc")]
 mod mimalloc {
@@ -77,9 +77,11 @@ pub fn create_router(state: AppState) -> Router {
         .route("/aggregate/{id}/delete", post(delete))
         .route("/aggregate/{id}/disableshare/{share_hash}", post(disable_share))
         .route("/aggregate/{id}/disableuser/{user_hash}", post(disable_user))
+        .route("/aggregate/{id}/disableclient/{client_id}", post(disable_client))
         .route("/aggregate/{id}/share", post(share));
 
-    Router::new().nest("/api/v1", api_v1)
+    Router::new()
+        .nest("/api/v1", api_v1)
         .layer(CompressionLayer::new())
         .layer(cors)
         .with_state(state)

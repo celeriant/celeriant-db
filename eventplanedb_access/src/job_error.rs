@@ -5,6 +5,7 @@ pub enum JobError {
     PermissionDenied(String),
     NotFound(String),
     InvalidParameters(String),
+    AuthenticationFailed(String),
     Other(String),
 }
 

@@ -1,6 +1,9 @@
+use eventplanedb_access::{
+    access_level::AccessLevel, job_error::JobError, require_permission::require_permission, share_links_cache::ShareLinksCache,
+    user_access_cache::UserAccessCache,
+};
+use eventplanedb_storage::event_storage_cache::EventStorageCache;
 use eventplanedb_storage::{event_batch_item::EventBatchItem, event_item::EventItem};
-use eventplanedb_storage::{event_storage_cache::EventStorageCache};
-use eventplanedb_access::{access_level::AccessLevel, job_error::JobError, require_permission::require_permission, share_links_cache::ShareLinksCache, user_access_cache::UserAccessCache};
 
 use crate::{event_notifications::EventNotifier, job_context::JobContext};
 
@@ -18,7 +21,6 @@ pub fn handle_write_job(
     user_access_cache: &mut UserAccessCache,
     event_notifier: Option<&EventNotifier>,
 ) -> Result<WriteResult, JobError> {
-
     let file_exists = event_storage_cache.exists(&context.file_path);
 
     if !file_exists && !allow_create {
@@ -56,12 +58,12 @@ pub fn handle_write_job(
             &context.file_path,
             &context.current_client_id,
             context.current_user_id.as_deref(),
-            &context.current_client_id,
+            Some(&context.current_client_id),
             context.current_user_id.as_deref(),
             AccessLevel::Owner,
             false,
             None,
-            context.server_time
+            context.server_time,
         )?);
     }
 

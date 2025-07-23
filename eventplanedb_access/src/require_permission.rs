@@ -15,34 +15,27 @@ pub fn require_permission(
 ) -> Result<Vec<EventBatchItem>, JobError> {
     let mut new_events = Vec::new();
 
-    let client_id_access_level = user_access_cache.get_current_access_level(event_storage_cache, file_path, client_id, None);
-    let user_id_access_level = user_access_cache.get_current_access_level(event_storage_cache, file_path, client_id, user_id);
+    let client_id_access_level = user_access_cache.get_current_access_level(event_storage_cache, file_path, Some(client_id), None);
+    let user_id_access_level = user_access_cache.get_current_access_level(event_storage_cache, file_path, Some(client_id), user_id);
     let current_access_level = AccessLevel::greatest_access_level(client_id_access_level, user_id_access_level);
-    
+
     let mut final_access_level = current_access_level;
     let mut share_link_used: Option<u128> = None;
 
     // Check if there's a share link that can increase access level
     if let Some(share_id) = share_id {
         if let Some(share_key_info) = share_links_cache.get_share_key_data_if_still_valid(event_storage_cache, file_path, share_id) {
-
             // Will the share link give the user more access?
-            if  AccessLevel::increases_access_level(current_access_level, share_key_info.access_level) &&
-                AccessLevel::meets_required_access_level(share_key_info.access_level, required_access_level) 
+            if AccessLevel::increases_access_level(current_access_level, share_key_info.access_level)
+                && AccessLevel::meets_required_access_level(share_key_info.access_level, required_access_level)
             {
                 final_access_level = share_key_info.access_level;
                 share_link_used = Some(*share_id);
 
                 // Disable the share link if it is single use
                 if share_key_info.is_single_use {
-                    let disable_event_item = share_links_cache.disable_share_link(
-                        event_storage_cache,
-                        file_path,
-                        client_id,
-                        user_id,
-                        *share_id,
-                        server_time,
-                    )?;
+                    let disable_event_item =
+                        share_links_cache.disable_share_link(event_storage_cache, file_path, client_id, user_id, *share_id, server_time)?;
                     new_events.push(disable_event_item);
                 }
             }
@@ -62,12 +55,12 @@ pub fn require_permission(
             file_path,
             client_id,
             user_id,
-            client_id,
+            Some(client_id),
             user_id,
             final_access_level,
             false,
             share_link_used,
-            server_time
+            server_time,
         )?;
         new_events.push(provide_access_event.unwrap());
     }
@@ -134,7 +127,7 @@ mod tests {
                 &file_path,
                 &999u128,
                 Some("admin"),
-                &client_id,
+                Some(&client_id),
                 Some(user_id),
                 AccessLevel::Contributor,
                 false,
@@ -187,16 +180,16 @@ mod tests {
         // Set user's access level to Viewer
         user_access_cache
             .update_access_for_user(
-                &mut event_storage_cache, 
-                &file_path, 
-                &999u128, 
-                Some("admin"), 
-                &client_id,
-                Some(user_id), 
-                AccessLevel::Viewer, 
-                false, 
-                None, 
-                654
+                &mut event_storage_cache,
+                &file_path,
+                &999u128,
+                Some("admin"),
+                Some(&client_id),
+                Some(user_id),
+                AccessLevel::Viewer,
+                false,
+                None,
+                654,
             )
             .unwrap();
 
@@ -256,7 +249,7 @@ mod tests {
                 None,
                 None,
                 0,
-                654
+                654,
             )
             .unwrap();
 
@@ -280,7 +273,7 @@ mod tests {
         assert!(!events.is_empty()); // Should have access update event
 
         // Verify that the user's access level has been updated
-        let access_level = user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, &client_id, Some(user_id));
+        let access_level = user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, Some(&client_id), Some(user_id));
         assert_eq!(access_level, AccessLevel::Contributor);
     }
 
@@ -308,16 +301,16 @@ mod tests {
         // Set user's access level to Viewer
         user_access_cache
             .update_access_for_user(
-                &mut event_storage_cache, 
-                &file_path, 
-                &999u128, 
-                Some("admin"), 
-                &client_id,
-                Some(user_id), 
-                AccessLevel::Viewer, 
-                false, 
-                None, 
-                654
+                &mut event_storage_cache,
+                &file_path,
+                &999u128,
+                Some("admin"),
+                Some(&client_id),
+                Some(user_id),
+                AccessLevel::Viewer,
+                false,
+                None,
+                654,
             )
             .unwrap();
 
@@ -334,7 +327,7 @@ mod tests {
                 None,
                 None,
                 0,
-                654
+                654,
             )
             .unwrap();
 
@@ -362,7 +355,7 @@ mod tests {
         // Verify that the user's access level has NOT been updated to the share link level
         // We don't want to needlessly 'use' a share link if access is not enough anyway
         // And also we return 403 so client can't process the events generated if we were to use it
-        let access_level = user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, &client_id, Some(user_id));
+        let access_level = user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, Some(&client_id), Some(user_id));
         assert_eq!(access_level, AccessLevel::Viewer);
     }
 
@@ -400,7 +393,7 @@ mod tests {
                 None,
                 None,
                 0,
-                654
+                654,
             )
             .unwrap();
 
@@ -479,7 +472,7 @@ mod tests {
                 &file_path,
                 &999u128,
                 Some("admin"),
-                &client_id,
+                Some(&client_id),
                 Some(user_id),
                 AccessLevel::Contributor,
                 false,
@@ -501,7 +494,7 @@ mod tests {
                 None,
                 None,
                 0,
-                654
+                654,
             )
             .unwrap();
 
@@ -525,7 +518,7 @@ mod tests {
         assert!(events.is_empty()); // No events should be generated since no access change
 
         // Verify that the user's access level remains unchanged
-        let access_level = user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, &client_id, Some(user_id));
+        let access_level = user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, Some(&client_id), Some(user_id));
         assert_eq!(access_level, AccessLevel::Contributor);
     }
 
@@ -556,7 +549,7 @@ mod tests {
                 &file_path,
                 &999u128,
                 Some("admin"),
-                &client_id,
+                Some(&client_id),
                 None, // No user_id initially (PKI-only access)
                 AccessLevel::Contributor,
                 false,
@@ -566,13 +559,13 @@ mod tests {
             .unwrap();
 
         // Verify client has Contributor access but user has None
-        let client_access = user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, &client_id, None);
-        let user_access_before = user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, &client_id, Some(user_id));
+        let client_access = user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, Some(&client_id), None);
+        let user_access_before = user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, Some(&client_id), Some(user_id));
         assert_eq!(client_access, AccessLevel::Contributor);
         assert_eq!(user_access_before, AccessLevel::None);
 
         let server_time = 1000;
-        
+
         // User logs in with OAuth2 and requires Viewer access
         // This should trigger access transfer from client_id to user_id
         let result = require_permission(
@@ -593,13 +586,11 @@ mod tests {
         assert_eq!(events.len(), 1); // Should have access update event
 
         // Verify that the user now has the client's access level
-        let user_access_after = user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, &client_id, Some(user_id));
+        let user_access_after = user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, Some(&client_id), Some(user_id));
         assert_eq!(user_access_after, AccessLevel::Contributor);
-        
+
         // Verify the client no longer has access
-        let client_access_after = user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, &client_id, None);
+        let client_access_after = user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, Some(&client_id), None);
         assert_eq!(client_access_after, AccessLevel::None);
     }
-
-
 }

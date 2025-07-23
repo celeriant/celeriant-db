@@ -100,7 +100,7 @@ impl Crypto {
         let mut hasher = Sha256::new();
         hasher.update(public_key);
         let hash = hasher.finalize();
-        u128::from_ne_bytes(hash[..16].try_into().unwrap())
+        u128::from_le_bytes(hash[..16].try_into().unwrap())
     }
 
     /// Validate a signature and nonce with a public key, returning the client identity

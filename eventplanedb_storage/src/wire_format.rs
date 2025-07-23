@@ -1,19 +1,16 @@
-use std::{io};
-use crate::{event_batch_item::EventBatchItem};
+use crate::event_batch_item::EventBatchItem;
+use std::io;
 
 pub fn serialize_event_batch_item(events: &EventBatchItem) -> io::Result<Vec<u8>> {
-    bincode::encode_to_vec(events, bincode::config::standard())
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+    bincode::encode_to_vec(events, bincode::config::standard()).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
 }
 
 pub fn compress_data(data: &[u8]) -> io::Result<Vec<u8>> {
-    zstd::bulk::compress(data, 6)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+    zstd::bulk::compress(data, 6).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
 }
 
 pub fn decompress_data(data: &[u8], capacity: usize) -> io::Result<Vec<u8>> {
-    zstd::bulk::decompress(data, capacity)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+    zstd::bulk::decompress(data, capacity).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
 }
 
 pub fn deserialize_event_batch_item(data: &[u8]) -> io::Result<EventBatchItem> {
@@ -24,17 +21,20 @@ pub fn deserialize_event_batch_item(data: &[u8]) -> io::Result<EventBatchItem> {
 
 #[cfg(test)]
 pub mod tests {
-    use std::{fs, io::Write};
-    use sha2::{Digest, Sha256};
-    use tempfile::TempDir;
-    use crate::{event_item::tests::{create_minimal_event_item, create_test_event_item}, file_cache::create_append_writer};
     use super::*;
+    use crate::{
+        event_item::tests::{create_minimal_event_item, create_test_event_item},
+        file_cache::create_append_writer,
+    };
+    use sha2::{Digest, Sha256};
+    use std::{fs, io::Write};
+    use tempfile::TempDir;
 
     pub fn generate_short_client_identity(value: &str) -> u128 {
         let mut hasher = Sha256::new();
         hasher.update(value.as_bytes());
         let hash = hasher.finalize();
-        u128::from_ne_bytes(hash[..16].try_into().unwrap())
+        u128::from_le_bytes(hash[..16].try_into().unwrap())
     }
 
     fn load_event_batch_item_from_json(path: &str) -> Result<EventBatchItem, Box<dyn std::error::Error>> {
@@ -53,7 +53,6 @@ pub mod tests {
 
     #[test]
     fn test_write_event_batch_item() {
-
         let mut event_batch_item = EventBatchItem::new();
         event_batch_item.user_id = Some("test".to_string());
         event_batch_item.client_id = generate_short_client_identity("test2");
@@ -68,13 +67,10 @@ pub mod tests {
         let event_batch_bin = temp_path.join("event_batch.bin");
         let event_batch_json = temp_path.join("event_batch.json");
 
-        let mut writer =
-            create_append_writer(event_batch_bin.to_str().unwrap()).expect("Open writer to event_batch.bin");
+        let mut writer = create_append_writer(event_batch_bin.to_str().unwrap()).expect("Open writer to event_batch.bin");
         let encoded_events = serialize_event_batch_item(&event_batch_item).expect("Serialize event_batch");
         let compressed_events = compress_data(&encoded_events).expect("Compress event_batch");
-        writer
-            .write_all(&compressed_events)
-            .expect("write event_batch to bin");
+        writer.write_all(&compressed_events).expect("write event_batch to bin");
         writer.flush().expect("flush event_batch bin");
 
         save_event_batch_item_to_json(&event_batch_item, event_batch_json.to_str().unwrap()).expect("Failed to write event_batch to json");
@@ -82,7 +78,7 @@ pub mod tests {
         // Print file sizes
         let bin_size = fs::metadata(&event_batch_bin).expect("Failed to get bin file metadata").len();
         let json_size = fs::metadata(&event_batch_json).expect("Failed to get event_batch json metadata").len();
-        
+
         println!("File sizes:");
         println!("  event_batch.bin (compressed): {} bytes", bin_size);
         println!("  event_batch.json: {} bytes", json_size);
@@ -92,16 +88,10 @@ pub mod tests {
 
         let compressed_data = fs::read(&event_batch_bin).expect("Failed to read event_batch.bin");
         let original_size = u64::from_le_bytes((encoded_events.len() as u64).to_le_bytes());
-        let decompressed_data = decompress_data(&compressed_data, original_size as usize)
-            .expect("Failed to decompress data");
-        let deserialized_events =
-            deserialize_event_batch_item(&decompressed_data).expect("Failed to deserialize event_batch");
+        let decompressed_data = decompress_data(&compressed_data, original_size as usize).expect("Failed to decompress data");
+        let deserialized_events = deserialize_event_batch_item(&decompressed_data).expect("Failed to deserialize event_batch");
 
-        assert_eq!(
-            2,
-            deserialized_events.events.len(),
-            "Event count mismatch"
-        );
+        assert_eq!(2, deserialized_events.events.len(), "Event count mismatch");
 
         // Compare event1
         assert_eq!(deserialized_events.user_id, event_batch_item.user_id);
@@ -111,10 +101,7 @@ pub mod tests {
         assert_eq!(deserialized_events.events[0].event_type, event_batch_item.events[0].event_type);
         assert_eq!(deserialized_events.events[0].int_values, event_batch_item.events[0].int_values);
         assert_eq!(deserialized_events.events[0].f32_values, event_batch_item.events[0].f32_values);
-        assert_eq!(
-            deserialized_events.events[0].string_values,
-            event_batch_item.events[0].string_values
-        );
+        assert_eq!(deserialized_events.events[0].string_values, event_batch_item.events[0].string_values);
         assert_eq!(deserialized_events.events[0].byte_arrays, event_batch_item.events[0].byte_arrays);
 
         // Compare event2
@@ -122,10 +109,7 @@ pub mod tests {
         assert_eq!(deserialized_events.events[1].event_type, event_batch_item.events[1].event_type);
         assert_eq!(deserialized_events.events[1].int_values, event_batch_item.events[1].int_values);
         assert_eq!(deserialized_events.events[1].f32_values, event_batch_item.events[1].f32_values);
-        assert_eq!(
-            deserialized_events.events[1].string_values,
-            event_batch_item.events[1].string_values
-        );
+        assert_eq!(deserialized_events.events[1].string_values, event_batch_item.events[1].string_values);
 
         // Validation: Read back JSON files and compare
         let event1_from_json = load_event_batch_item_from_json(event_batch_json.to_str().unwrap()).expect("Failed to read event_batch from JSON");
@@ -138,10 +122,7 @@ pub mod tests {
         assert_eq!(event1_from_json.events[0].event_type, event_batch_item.events[0].event_type);
         assert_eq!(event1_from_json.events[0].int_values, event_batch_item.events[0].int_values);
         assert_eq!(event1_from_json.events[0].f32_values, event_batch_item.events[0].f32_values);
-        assert_eq!(
-            event1_from_json.events[0].string_values,
-            event_batch_item.events[0].string_values
-        );
+        assert_eq!(event1_from_json.events[0].string_values, event_batch_item.events[0].string_values);
         assert_eq!(event1_from_json.events[0].byte_arrays, event_batch_item.events[0].byte_arrays);
 
         // Compare event2
@@ -149,9 +130,6 @@ pub mod tests {
         assert_eq!(event1_from_json.events[1].event_type, event_batch_item.events[1].event_type);
         assert_eq!(event1_from_json.events[1].int_values, event_batch_item.events[1].int_values);
         assert_eq!(event1_from_json.events[1].f32_values, event_batch_item.events[1].f32_values);
-        assert_eq!(
-            event1_from_json.events[1].string_values,
-            event_batch_item.events[1].string_values
-        );
+        assert_eq!(event1_from_json.events[1].string_values, event_batch_item.events[1].string_values);
     }
 }
