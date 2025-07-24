@@ -6,10 +6,7 @@ use rsa::{
     signature::{SignatureEncoding, SignerMut, Verifier},
 };
 use sha2::{Digest, Sha256};
-use std::{
-    error::Error,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_NONCE_TIME_MINUTES: f64 = 2.0;
 const DEFAULT_KEY_SIZE: usize = 2048;

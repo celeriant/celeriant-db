@@ -1,6 +1,9 @@
 use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
+use crate::serde_array_byte_vec_base64;
+use crate::serde_arrays_byte_12_base64;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct EventItem {
     #[serde(rename = "ed")]
@@ -27,10 +30,10 @@ pub struct EventItem {
     #[serde(skip_serializing_if = "Option::is_none", rename = "sv")]
     pub string_values: Option<Vec<Option<String>>>,
 
-    #[serde(skip_serializing_if = "Option::is_none", rename = "iv")]
+    #[serde(skip_serializing_if = "Option::is_none", rename = "iv", default, with = "serde_arrays_byte_12_base64")]
     pub iv_arrays: Option<Vec<Option<[u8; 12]>>>,
 
-    #[serde(skip_serializing_if = "Option::is_none", rename = "by")]
+    #[serde(skip_serializing_if = "Option::is_none", rename = "by", default, with = "serde_array_byte_vec_base64")]
     pub byte_arrays: Option<Vec<Option<Vec<u8>>>>,
 }
 

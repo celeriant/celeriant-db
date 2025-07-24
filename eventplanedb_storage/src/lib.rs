@@ -1,11 +1,12 @@
+pub mod catchup_result;
+pub mod event_batch_item;
 pub mod event_item;
 pub mod event_storage;
-pub mod file_cache;
-pub mod wire_format;
 pub mod event_storage_cache;
+pub mod file_cache;
 pub mod last_si_cache;
 pub mod memory_cache;
-pub mod event_batch_item;
-pub mod catchup_result;
-pub mod serde_u128_string;
+pub mod serde_array_byte_vec_base64;
+pub mod serde_arrays_byte_12_base64;
 pub mod serde_u128_base64;
+pub mod wire_format;

@@ -47,9 +47,26 @@ pub fn require_permission(
         return Err(JobError::PermissionDenied("User does not have permission to perform this action".to_string()));
     }
 
-    let needs_access_update = user_id.is_some() && client_id_access_level != AccessLevel::None || final_access_level != current_access_level;
+    let requires_transition_to_user_id = user_id.is_some() && client_id_access_level != AccessLevel::None;
+    let share_link_increased_access_level = final_access_level != current_access_level;
 
-    if needs_access_update {
+    if requires_transition_to_user_id {
+        let disable_client_id_event = user_access_cache.update_access_for_user(
+            event_storage_cache,
+            file_path,
+            client_id,
+            user_id,
+            Some(client_id),
+            None,
+            AccessLevel::None,
+            true,
+            None,
+            server_time,
+        )?;
+        new_events.push(disable_client_id_event.unwrap());
+    }
+
+    if requires_transition_to_user_id || share_link_increased_access_level {
         let provide_access_event = user_access_cache.update_access_for_user(
             event_storage_cache,
             file_path,
@@ -583,7 +600,7 @@ mod tests {
         // Verify that permission is granted
         assert!(result.is_ok());
         let events = result.unwrap();
-        assert_eq!(events.len(), 1); // Should have access update event
+        assert_eq!(events.len(), 2); // Should have access update event and disable client_id event
 
         // Verify that the user now has the client's access level
         let user_access_after = user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, Some(&client_id), Some(user_id));

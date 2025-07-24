@@ -51,21 +51,21 @@ pub async fn subscribe_events(
             current_client_id,
             Instant::now().checked_sub(cooldown_period).unwrap_or_else(Instant::now),
         ),
-        move |(mut receiver, current_user, last_notification)| async move {
+        move |(mut receiver, current_client_id, last_notification)| async move {
             loop {
                 tokio::select! {
                     result = receiver.recv() => {
                         match result {
-                            Ok(notifier_user_hash) => {
+                            Ok(notifier_client_id) => {
                                 // Only send notification if the event was created by a different user
-                                if notifier_user_hash != current_user {
+                                if notifier_client_id != current_client_id {
                                     let now = Instant::now();
                                     let time_since_last = now.duration_since(last_notification);
 
                                     // Check if we're outside the cooldown period
                                     if time_since_last >= cooldown_period {
                                         let event = Event::default().data("ne");
-                                        return Some((Ok(event), (receiver, current_user, now)));
+                                        return Some((Ok(event), (receiver, current_client_id, now)));
                                     }
                                     // If inside cooldown period, ignore this notification
                                     // and continue waiting
@@ -82,7 +82,7 @@ pub async fn subscribe_events(
                     _ = tokio::time::sleep(Duration::from_secs(30)) => {
                         // Send a keep-alive comment every 30 seconds
                         let event = Event::default().comment("ka");
-                        return Some((Ok(event), (receiver, current_user, last_notification)));
+                        return Some((Ok(event), (receiver, current_client_id, last_notification)));
                     }
                 }
             }

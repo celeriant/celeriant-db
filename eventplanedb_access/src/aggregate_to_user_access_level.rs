@@ -24,11 +24,6 @@ impl AggregateToUserAccessLevel {
     ) {
         match user_id {
             Some(user_id) => {
-                // We are using oauth, remove direct client access
-                if let Some(client_id) = client_id {
-                    self.clients.remove(client_id);
-                }
-
                 // Now attempt to add or update the oauth user access level
                 match self.users.get(user_id) {
                     //No op - Providing NO access and currently has NO access
@@ -94,11 +89,11 @@ impl AggregateToUserAccessLevel {
     }
 
     pub fn get_access_level_for_user(&self, user_id: &str) -> AccessLevel {
-        self.users.get(user_id).unwrap_or(&AccessLevel::None).clone()
+        *self.users.get(user_id).unwrap_or(&AccessLevel::None)
     }
 
     pub fn get_access_level_for_client(&self, client_id: &u128) -> AccessLevel {
-        self.clients.get(client_id).unwrap_or(&AccessLevel::None).clone()
+        *self.clients.get(client_id).unwrap_or(&AccessLevel::None)
     }
 
     pub fn get_access_level(&self, client_id: Option<&u128>, user_id: Option<&str>) -> AccessLevel {
@@ -302,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn test_oauth_overrides_pki_client_access() {
+    fn test_oauth_does_not_override_pki_client_access() {
         let mut cache = AggregateToUserAccessLevel::new();
         let client_id: u128 = 12345;
         let user_id = "user123";
@@ -315,14 +310,14 @@ mod tests {
         // OAuth login should remove client access and add user access
         cache.update_cache_for_user(Some(&client_id), Some(user_id), AccessLevel::Owner, false);
 
-        assert_eq!(cache.count(), 1); // Still 1 total, but switched from client to user
-        assert_eq!(cache.get_access_level_for_client(&client_id), AccessLevel::None);
+        assert_eq!(cache.count(), 2);
+        assert_eq!(cache.get_access_level_for_client(&client_id), AccessLevel::Contributor);
         assert_eq!(cache.get_access_level_for_user(user_id), AccessLevel::Owner);
         assert_eq!(cache.get_access_level(Some(&client_id), Some(user_id)), AccessLevel::Owner);
     }
 
     #[test]
-    fn test_oauth_override_removes_even_with_no_new_access() {
+    fn test_oauth_added_client_not_affected() {
         let mut cache = AggregateToUserAccessLevel::new();
         let client_id: u128 = 12345;
         let user_id = "user123";
@@ -334,8 +329,8 @@ mod tests {
         // OAuth login with None access should still remove client access
         cache.update_cache_for_user(Some(&client_id), Some(user_id), AccessLevel::None, false);
 
-        assert_eq!(cache.count(), 0); // Both client and user should have no access
-        assert_eq!(cache.get_access_level_for_client(&client_id), AccessLevel::None);
+        assert_eq!(cache.count(), 1); // Client still has access
+        assert_eq!(cache.get_access_level_for_client(&client_id), AccessLevel::Viewer);
         assert_eq!(cache.get_access_level_for_user(user_id), AccessLevel::None);
     }
 
@@ -442,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pki_to_oauth_transition_preserves_higher_access() {
+    fn test_pki_to_oauth_transition_ignores_higher_access() {
         let mut cache = AggregateToUserAccessLevel::new();
         let client_id: u128 = 12345;
         let user_id = "user123";
@@ -450,12 +445,11 @@ mod tests {
         // Start with high PKI access
         cache.update_cache_for_user(Some(&client_id), None, AccessLevel::Owner, false);
 
-        // OAuth login with lower proposed access should still grant the higher level if allow_override is false
-        // But since it's OAuth override, the client access gets removed regardless
+        // OAuth login with lower proposed access should just grant that access even though its lower
         cache.update_cache_for_user(Some(&client_id), Some(user_id), AccessLevel::Viewer, false);
 
-        assert_eq!(cache.count(), 1);
-        assert_eq!(cache.get_access_level_for_client(&client_id), AccessLevel::None);
+        assert_eq!(cache.count(), 2);
+        assert_eq!(cache.get_access_level_for_client(&client_id), AccessLevel::Owner);
         assert_eq!(cache.get_access_level_for_user(user_id), AccessLevel::Viewer); // Gets what was proposed
     }
 

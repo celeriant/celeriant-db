@@ -124,21 +124,6 @@ impl UserAccessCache {
         share_id: Option<u128>,
         server_time: u64,
     ) -> io::Result<Option<EventBatchItem>> {
-        //TODO: This is really a programmer guard, not business logic
-        //Not allowed to downgrade your own permissions - client id check.
-        if let Some(for_client_id) = for_client_id {
-            if allow_downgrade && *current_client_id == *for_client_id {
-                return Ok(None);
-            }
-        }
-
-        //Not allowed to downgrade your own permissions - user id check
-        if let Some(for_user_id) = for_user_id {
-            if allow_downgrade && (current_user_id.is_some_and(|x| x == for_user_id)) {
-                return Ok(None);
-            }
-        }
-
         let current_access_level = self.get_current_access_level(event_storage_cache, file_path, for_client_id, for_user_id);
 
         //No op as same permission level or lower level and not downgrading
@@ -205,6 +190,19 @@ mod tests {
         event_item.event_date = current_time;
         event_item.event_type = AggregateEventType::UserAccessUpdated as u64;
         event_item.string_values = Some(vec![Some(user_hash.to_string()), None]);
+        event_item.uint_values = Some(vec![access_level as u64]);
+        event_item.byte_arrays = Some(vec![client_id.map(|id| id.to_le_bytes().to_vec())]);
+        event_item
+    }
+
+    // Helper function to create a mock ProvideAccess EventItem
+    fn create_provide_access_event_client_only(client_id: Option<&u128>, access_level: AccessLevel, ed_override: Option<u64>) -> EventItem {
+        let current_time = ed_override.unwrap_or(chrono::Utc::now().timestamp_millis() as u64);
+
+        let mut event_item = EventItem::new();
+        event_item.event_date = current_time;
+        event_item.event_type = AggregateEventType::UserAccessUpdated as u64;
+        event_item.string_values = Some(vec![None, None]);
         event_item.uint_values = Some(vec![access_level as u64]);
         event_item.byte_arrays = Some(vec![client_id.map(|id| id.to_le_bytes().to_vec())]);
         event_item
@@ -711,46 +709,35 @@ mod tests {
         ); // Non-existent user
     }
 
-    #[test]
-    fn test_update_access_for_user_prevents_self_downgrade_when_allow_downgrade_is_true() {
-        let (mut user_access_cache, mut event_storage_cache, temp_dir) = setup_cache(5);
-        let file_path = create_file_path(&temp_dir, "project1.bin");
-        let user_hash = "user1";
+    fn create_test_event_item() -> EventItem {
+        let mut event1 = EventItem::new();
 
-        // Initialize user's access level to Contributor
-        let mut project_cache = AggregateToUserAccessLevel::new();
-        project_cache.update_cache_for_user(None, Some(user_hash), AccessLevel::Contributor, true);
-        user_access_cache.cache.insert(file_path.clone(), project_cache);
+        event1.event_date = 443;
+        event1.event_type = 4;
+        event1.int_values = Some(vec![1, 2, 3]);
 
-        // Attempt to downgrade own access level
-        let result = user_access_cache
-            .update_access_for_user(
-                &mut event_storage_cache,
-                &file_path,
-                &334,
-                Some(user_hash),
-                Some(&334),
-                Some(user_hash),
-                AccessLevel::Viewer,
-                true,
-                None,
-                654,
-            )
-            .unwrap();
+        event1
+    }
 
-        // Verify that the update was prevented (returns None)
-        assert!(result.is_none());
-
-        // Verify that the access level remains unchanged
-        let access_level = user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, None, Some(user_hash));
-        assert_eq!(access_level, AccessLevel::Contributor);
+    fn write_initial_event(event_storage_cache: &mut EventStorageCache, file_path: &str) {
+        let first_event = create_test_event_item();
+        let first_batch = EventBatchItem {
+            server_id: 0,
+            client_id: 0,
+            user_id: None,
+            server_date: 0,
+            events: vec![first_event],
+        };
+        event_storage_cache.write(file_path, true, first_batch).unwrap();
     }
 
     #[test]
-    fn test_update_access_for_user_disallows_self_upgrade() {
+    fn test_update_access_for_user_allows_self_upgrade() {
         let (mut user_access_cache, mut event_storage_cache, temp_dir) = setup_cache(5);
         let file_path = create_file_path(&temp_dir, "project1.bin");
         let user_hash = "user1";
+
+        write_initial_event(&mut event_storage_cache, &file_path);
 
         // Initialize user's access level to Contributor
         let mut project_cache = AggregateToUserAccessLevel::new();
@@ -774,11 +761,11 @@ mod tests {
             .unwrap();
 
         // Verify that the update was successful (returns Some(EventItem))
-        assert!(result.is_none());
+        assert!(result.is_some());
 
         // Verify that the access level was updated
         let access_level = user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, None, Some(user_hash));
-        assert_eq!(access_level, AccessLevel::Contributor);
+        assert_eq!(access_level, AccessLevel::Owner);
     }
 
     #[test]
@@ -833,48 +820,6 @@ mod tests {
 
         // Verify that same client_id with any user_id gets None (no OAuth override yet)
         let access_level = user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, Some(&12345), Some("any_user"));
-        assert_eq!(access_level, AccessLevel::None);
-    }
-
-    #[test]
-    fn test_oauth_override_of_pki_client_id() {
-        let (mut user_access_cache, mut event_storage_cache, temp_dir) = setup_cache(5);
-        let file_path = create_file_path(&temp_dir, "project1.bin");
-        let _ = event_storage_cache.write(&file_path, true, initial_event());
-
-        // Start with PKI-only access
-        let mut project_cache = AggregateToUserAccessLevel::new();
-        project_cache.update_cache_for_user(Some(&12345), None, AccessLevel::Contributor, true);
-        user_access_cache.cache.insert(file_path.clone(), project_cache);
-
-        // Verify initial PKI access
-        let access_level = user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, Some(&12345), None);
-        assert_eq!(access_level, AccessLevel::Contributor);
-
-        // Now add OAuth user_id for same client_id (simulating user login)
-        let result = user_access_cache
-            .update_access_for_user(
-                &mut event_storage_cache,
-                &file_path,
-                &99999, // Different admin client_id
-                Some("admin"),
-                Some(&12345),       // Same client_id being upgraded
-                Some("oauth_user"), // Now has OAuth user_id
-                AccessLevel::Owner,
-                false, // No downgrade
-                None,
-                1000,
-            )
-            .unwrap();
-
-        assert!(result.is_some());
-
-        // Verify that OAuth access now takes precedence
-        let access_level = user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, Some(&12345), Some("oauth_user"));
-        assert_eq!(access_level, AccessLevel::Owner);
-
-        // Verify that PKI-only access for same client_id is now None
-        let access_level = user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, Some(&12345), None);
         assert_eq!(access_level, AccessLevel::None);
     }
 
@@ -934,7 +879,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prevent_oauth_user_downgrading_self_across_client_ids() {
+    fn test_allow_oauth_user_downgrading_self_across_client_ids() {
         let (mut user_access_cache, mut event_storage_cache, temp_dir) = setup_cache(5);
         let file_path = create_file_path(&temp_dir, "project1.bin");
         let _ = event_storage_cache.write(&file_path, true, initial_event());
@@ -966,11 +911,11 @@ mod tests {
             .unwrap();
 
         // Should be prevented due to same OAuth user
-        assert!(result.is_none());
+        assert!(result.is_some());
 
-        // Verify access levels remain unchanged
+        // Verify access level has been updated
         let access_level = user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, Some(&2), Some(oauth_user));
-        assert_eq!(access_level, AccessLevel::Contributor);
+        assert_eq!(access_level, AccessLevel::Viewer);
     }
 
     fn initial_event() -> EventBatchItem {
@@ -1065,9 +1010,9 @@ mod tests {
         let oauth_access = user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, Some(&client_id), Some("new_oauth_user"));
         assert_eq!(oauth_access, AccessLevel::Contributor);
 
-        // PKI access should no longer work for this client_id
+        // PKI access should still work for this client_id
         let pki_access_after = user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, Some(&client_id), None);
-        assert_eq!(pki_access_after, AccessLevel::None);
+        assert_eq!(pki_access_after, AccessLevel::Contributor);
     }
 
     #[test]
@@ -1130,7 +1075,47 @@ mod tests {
 
         let project_cache = user_access_cache.cache.get(&file_path).unwrap();
 
-        // Verify PKI access is gone due to migration
+        // PKI access has to be explicity removed
+        assert_eq!(project_cache.get_access_level(Some(&11111), None), AccessLevel::Owner);
+
+        // Verify OAuth user access
+        assert_eq!(project_cache.get_access_level(Some(&22222), Some("oauth_user")), AccessLevel::Contributor);
+        assert_eq!(project_cache.get_access_level(Some(&11111), Some("migrated_user")), AccessLevel::Owner);
+
+        assert_eq!(project_cache.count(), 3);
+    }
+
+    #[test]
+    fn test_populate_cache_handles_mixed_pki_oauth_events_2() {
+        let (mut user_access_cache, mut event_storage_cache, temp_dir) = setup_cache(5);
+        let file_path = create_file_path(&temp_dir, "project1.bin");
+        let _ = event_storage_cache.write(&file_path, true, initial_event());
+
+        // Create mixed PKI and OAuth events
+        let pki_event = create_provide_access_event_only_client(&11111, AccessLevel::Owner, Some(1));
+        let oauth_event1 = create_provide_access_event(Some(&22222), "oauth_user", AccessLevel::Contributor, Some(2));
+        let oauth_event2 = create_provide_access_event(Some(&11111), "migrated_user", AccessLevel::Owner, Some(3)); // PKI->OAuth migration
+
+        let event_batch_1 = create_event_batch_item_with_events(vec![pki_event], "admin");
+        let event_batch_2 = create_event_batch_item_with_events(vec![oauth_event1], "admin");
+        let event_batch_3 = create_event_batch_item_with_events(vec![oauth_event2], "admin");
+
+        event_storage_cache.write(&file_path, true, event_batch_1).unwrap();
+        event_storage_cache.write(&file_path, true, event_batch_2).unwrap();
+        event_storage_cache.write(&file_path, true, event_batch_3).unwrap();
+
+        //Remove PKI access for client_id
+        let pki_remove_event = create_provide_access_event_client_only(Some(&11111), AccessLevel::None, Some(3)); // PKI->OAuth migration
+        let event_batch_4 = create_event_batch_item_with_events(vec![pki_remove_event], "admin");
+        event_storage_cache.write(&file_path, true, event_batch_4).unwrap();
+
+        // Populate cache
+        user_access_cache.cache.insert(file_path.clone(), AggregateToUserAccessLevel::new());
+        user_access_cache.populate_cache_for_aggregate(&mut event_storage_cache, &file_path);
+
+        let project_cache = user_access_cache.cache.get(&file_path).unwrap();
+
+        // PKI access has been explicity removed
         assert_eq!(project_cache.get_access_level(Some(&11111), None), AccessLevel::None);
 
         // Verify OAuth user access
@@ -1279,7 +1264,8 @@ mod tests {
             user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, Some(&recipient_client_id), Some("oauth_migrated_user"));
         assert_eq!(oauth_access, AccessLevel::Viewer);
 
+        // PKI still has access, has to be explicitly removed
         let pki_access = user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, Some(&recipient_client_id), None);
-        assert_eq!(pki_access, AccessLevel::None);
+        assert_eq!(pki_access, AccessLevel::Viewer);
     }
 }
