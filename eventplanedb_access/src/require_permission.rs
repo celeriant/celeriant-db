@@ -79,7 +79,9 @@ pub fn require_permission(
             share_link_used,
             server_time,
         )?;
-        new_events.push(provide_access_event.unwrap());
+        if let Some(provide_access_event) = provide_access_event {
+            new_events.push(provide_access_event);
+        }
     }
 
     Ok(new_events)
@@ -115,6 +117,103 @@ mod tests {
         event1.int_values = Some(vec![1, 2, 3]);
 
         event1
+    }
+
+    #[test]
+    fn test_require_permission_multiple_clients_same_user_id() {
+        let (mut event_storage_cache, temp_dir) = setup_cache();
+        let file_path = create_file_path(&temp_dir, "project1.bin");
+        let client_id1 = 12345u128;
+        let client_id2 = 67890u128;
+        let user_id = "user1";
+
+        let first_event = create_test_event_item();
+        let first_batch = EventBatchItem {
+            server_id: 0,
+            client_id: 0,
+            user_id: None,
+            server_date: 0,
+            events: vec![first_event],
+        };
+        event_storage_cache.write(&file_path, true, first_batch).unwrap();
+
+        let mut share_links_cache = ShareLinksCache::new(5);
+        let mut user_access_cache = UserAccessCache::new(5);
+
+        // Set client_id1 access level to Contributor
+        user_access_cache
+            .update_access_for_user(
+                &mut event_storage_cache,
+                &file_path,
+                &999u128,
+                Some("admin"),
+                Some(&client_id1),
+                None,
+                AccessLevel::Contributor,
+                false,
+                None,
+                654,
+            )
+            .unwrap();
+
+        // Set client_id2 access level to Contributor
+        user_access_cache
+            .update_access_for_user(
+                &mut event_storage_cache,
+                &file_path,
+                &999u128,
+                Some("admin"),
+                Some(&client_id2),
+                None,
+                AccessLevel::Contributor,
+                false,
+                None,
+                655,
+            )
+            .unwrap();
+
+        // First, user logs in on client_id1 and transitions the permission
+        let server_time = 1000;
+        let result1 = require_permission(
+            &mut event_storage_cache,
+            &mut share_links_cache,
+            &mut user_access_cache,
+            &file_path,
+            &client_id1,
+            Some(user_id),
+            server_time,
+            AccessLevel::Viewer,
+            None,
+        );
+
+        assert!(result1.is_ok());
+
+        // Now user logs in on client_id2 - this should handle the case where the user already has access
+        // The current implementation would panic here because provide_access_event returns None
+        // (since user already has Contributor access from client_id1)
+        let server_time = 1001;
+        let result2 = require_permission(
+            &mut event_storage_cache,
+            &mut share_links_cache,
+            &mut user_access_cache,
+            &file_path,
+            &client_id2,
+            Some(user_id),
+            server_time,
+            AccessLevel::Viewer,
+            None,
+        );
+
+        // This should not panic and should successfully grant permission
+        assert!(result2.is_ok());
+
+        // Verify client_id2 access is now None
+        let client2_access = user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, Some(&client_id2), None);
+        assert_eq!(client2_access, AccessLevel::None);
+
+        // User access should still be Contributor
+        let user_access = user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, Some(&client_id2), Some(user_id));
+        assert_eq!(user_access, AccessLevel::Contributor);
     }
 
     #[test]
