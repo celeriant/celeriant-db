@@ -7,6 +7,7 @@ use std::{env, time::Duration};
 use tower_http::{
     compression::CompressionLayer,
     cors::{Any, CorsLayer},
+    limit::RequestBodyLimitLayer,
 };
 
 use crate::{
@@ -41,8 +42,6 @@ async fn main() {
 
     // Create application state
     let app_state = AppState::new(base_path);
-
-    //TODO: Enforce maximum upload size
 
     //TODO: Rate limiting
 
@@ -80,8 +79,12 @@ pub fn create_router(state: AppState) -> Router {
         .route("/aggregate/{id}/disableclient/{client_id}", post(disable_client))
         .route("/aggregate/{id}/share", post(share));
 
+    //Enforce maximum upload size (512 KB)
+    let size_limit = RequestBodyLimitLayer::new(512 * 1024);
+
     Router::new()
         .nest("/api/v1", api_v1)
+        .layer(size_limit) // Add the size limit middleware
         .layer(CompressionLayer::new())
         .layer(cors)
         .with_state(state)
