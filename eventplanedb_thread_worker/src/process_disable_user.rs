@@ -22,6 +22,7 @@ pub fn handle_disable_user_job(
         &context.file_path,
         &context.current_client_id,
         context.current_user_id.as_deref(),
+        context.current_org_id.as_deref(),
         context.server_time,
         AccessLevel::Owner,
         None,
@@ -40,6 +41,7 @@ pub fn handle_disable_user_job(
         context.current_user_id.as_deref(),
         for_client_id.as_ref(), //Edge case where user wants to disable user instead of client
         for_user_id.as_deref(),
+        None,
         AccessLevel::None,
         true,
         None,

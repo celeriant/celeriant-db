@@ -29,11 +29,15 @@ pub async fn subscribe_events(
     let current_user_claims = state.get_claims_direct(params.token.as_deref()).await?;
     let file_path = state.get_file_path(&aggregate_id);
 
+    let server_time = state.server_time();
+    let (current_user_id, current_org_id) = current_user_claims.map(|claims| (Some(claims.sub), claims.org_id)).unwrap_or((None, None));
+
     let context = JobContext {
-        file_path: file_path.clone(),
+        file_path: state.get_file_path(&aggregate_id),
         current_client_id,
-        current_user_id: current_user_claims.map(|claims| claims.sub),
-        server_time: state.server_time(),
+        current_user_id,
+        current_org_id,
+        server_time,
     };
 
     access_check_async(&state.workers, context, eventplanedb_access::access_level::AccessLevel::Viewer).await?;

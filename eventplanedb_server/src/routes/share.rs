@@ -29,11 +29,15 @@ pub async fn share(
 ) -> Result<CompactJson<ShareResponse>, RouteError> {
     let current_user_claims = state.get_claims(&headers).await?;
 
+    let server_time = state.server_time();
+    let (current_user_id, current_org_id) = current_user_claims.map(|claims| (Some(claims.sub), claims.org_id)).unwrap_or((None, None));
+
     let context = JobContext {
         file_path: state.get_file_path(&aggregate_id),
         current_client_id: state.get_client_id(&headers)?,
-        current_user_id: current_user_claims.map(|claims| claims.sub),
-        server_time: state.server_time(),
+        current_user_id,
+        current_org_id,
+        server_time,
     };
 
     let share_key = nanoid::nanoid!();

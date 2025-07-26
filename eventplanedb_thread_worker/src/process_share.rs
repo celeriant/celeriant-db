@@ -1,5 +1,8 @@
+use eventplanedb_access::{
+    access_level::AccessLevel, job_error::JobError, require_permission::require_permission, share_links_cache::ShareLinksCache,
+    user_access_cache::UserAccessCache,
+};
 use eventplanedb_storage::{event_batch_item::EventBatchItem, event_storage_cache::EventStorageCache};
-use eventplanedb_access::{access_level::AccessLevel, job_error::JobError, require_permission::require_permission, share_links_cache::ShareLinksCache, user_access_cache::UserAccessCache};
 
 use crate::{event_notifications::EventNotifier, job_context::JobContext};
 
@@ -16,7 +19,6 @@ pub fn handle_share_job(
     user_access_cache: &mut UserAccessCache,
     event_notifier: Option<&EventNotifier>,
 ) -> Result<EventBatchItem, JobError> {
-
     require_permission(
         event_storage_cache,
         share_links_cache,
@@ -24,6 +26,7 @@ pub fn handle_share_job(
         &context.file_path,
         &context.current_client_id,
         context.current_user_id.as_deref(),
+        context.current_org_id.as_deref(),
         context.server_time,
         AccessLevel::Owner,
         None,
@@ -49,5 +52,4 @@ pub fn handle_share_job(
     }
 
     Ok(create_share_link_result)
-    
 }

@@ -19,14 +19,17 @@ pub async fn disable_client(
 ) -> Result<CompactJson<DisableClientResponse>, RouteError> {
     let client_id = Crypto::decode_client_id_from_path(&client_id_b64)?;
 
+    let server_time = state.server_time();
+
     let current_user_claims = state.get_claims(&headers).await?;
 
-    let server_time = state.server_time();
+    let (current_user_id, current_org_id) = current_user_claims.map(|claims| (Some(claims.sub), claims.org_id)).unwrap_or((None, None));
 
     let context = JobContext {
         file_path: state.get_file_path(&aggregate_id),
         current_client_id: state.get_client_id(&headers)?,
-        current_user_id: current_user_claims.map(|claims| claims.sub),
+        current_user_id,
+        current_org_id,
         server_time,
     };
 

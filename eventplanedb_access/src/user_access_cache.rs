@@ -119,6 +119,7 @@ impl UserAccessCache {
         current_user_id: Option<&str>,
         for_client_id: Option<&u128>,
         for_user_id: Option<&str>,
+        for_org_id: Option<&str>,
         potential_access_level: AccessLevel,
         allow_downgrade: bool,
         share_id: Option<u128>,
@@ -136,7 +137,7 @@ impl UserAccessCache {
         let mut event_item = EventItem::new();
         event_item.event_date = server_time;
         event_item.event_type = AggregateEventType::UserAccessUpdated as u64;
-        event_item.string_values = Some(vec![for_user_id.as_ref().map(|f| f.to_string())]);
+        event_item.string_values = Some(vec![for_user_id.as_ref().map(|f| f.to_string()), for_org_id.as_ref().map(|f| f.to_string())]);
         event_item.uint_values = Some(vec![potential_access_level as u64]);
         event_item.byte_arrays = Some(vec![
             for_client_id.map(|id| id.to_le_bytes().to_vec()),
@@ -753,6 +754,7 @@ mod tests {
                 Some(user_hash),
                 Some(&33),
                 Some(user_hash),
+                None,
                 AccessLevel::Owner,
                 true,
                 None,
@@ -788,6 +790,7 @@ mod tests {
                 Some(user_hash),
                 Some(&345),
                 Some(user_hash),
+                None,
                 AccessLevel::Contributor,
                 true,
                 None,
@@ -899,10 +902,11 @@ mod tests {
             .update_access_for_user(
                 &mut event_storage_cache,
                 &file_path,
-                &client_id1,         // Current client_id
-                Some(oauth_user),    // Current OAuth user
-                Some(&client_id2),   // Target client_id (different)
-                Some(oauth_user),    // Same OAuth user
+                &client_id1,       // Current client_id
+                Some(oauth_user),  // Current OAuth user
+                Some(&client_id2), // Target client_id (different)
+                Some(oauth_user),  // Same OAuth user
+                None,
                 AccessLevel::Viewer, // Downgrade attempt
                 true,                // Allow downgrade flag
                 None,
@@ -952,10 +956,11 @@ mod tests {
             .update_access_for_user(
                 &mut event_storage_cache,
                 &file_path,
-                &client_id1,              // Current client_id (has Owner)
-                Some(oauth_user),         // Current OAuth user
-                Some(&client_id2),        // Target client_id (different)
-                Some(oauth_user),         // Same OAuth user
+                &client_id1,       // Current client_id (has Owner)
+                Some(oauth_user),  // Current OAuth user
+                Some(&client_id2), // Target client_id (different)
+                Some(oauth_user),  // Same OAuth user
+                None,
                 AccessLevel::Contributor, // Upgrade from Viewer
                 false,                    // No downgrade flag
                 None,
@@ -995,8 +1000,9 @@ mod tests {
                 &file_path,
                 &99999, // Admin client_id
                 Some("admin"),
-                Some(&client_id),         // Same client_id, now with OAuth
-                Some("new_oauth_user"),   // New OAuth identity
+                Some(&client_id),       // Same client_id, now with OAuth
+                Some("new_oauth_user"), // New OAuth identity
+                None,
                 AccessLevel::Contributor, // Same access level
                 false,
                 None,
@@ -1149,6 +1155,7 @@ mod tests {
                 Some("admin"),
                 Some(&pki_user_client_id),
                 None, // PKI user (no OAuth)
+                None,
                 AccessLevel::Contributor,
                 false,
                 None,
@@ -1166,6 +1173,7 @@ mod tests {
                 Some("admin"),
                 Some(&oauth_user_client_id),
                 Some("oauth_user"), // OAuth user
+                None,
                 AccessLevel::Viewer,
                 false,
                 None,
@@ -1234,6 +1242,7 @@ mod tests {
                 Some("admin"),
                 Some(&recipient_client_id),
                 None, // PKI recipient
+                None,
                 AccessLevel::Viewer,
                 false,
                 Some(34324),
@@ -1251,7 +1260,8 @@ mod tests {
                 Some("admin"),
                 Some(&recipient_client_id),
                 Some("oauth_migrated_user"), // Now OAuth
-                AccessLevel::Viewer,         // Same level
+                None,
+                AccessLevel::Viewer, // Same level
                 false,
                 Some(34324), // Same share key
                 1001,
