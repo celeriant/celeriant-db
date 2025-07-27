@@ -45,21 +45,34 @@ async fn main() {
 
     //TODO: Rate limiting
 
-    // Create the router
-    let app = create_router(app_state);
+    // Create the router and metrics handler
+    let (app, metrics_app) = create_router(app_state);
 
     // Get port from environment or use default
     let port = env::var("PORT").unwrap_or_else(|_| "5198".to_string());
     let addr = format!("0.0.0.0:{port}");
 
-    println!("Starting EventPlaneDB server on {addr}");
+    // Get metrics port from environment or use default
+    let metrics_port = env::var("METRICS_PORT").unwrap_or_else(|_| "9101".to_string());
+    let metrics_addr = format!("0.0.0.0:{metrics_port}");
 
-    // Start the server
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    println!("Starting EventPlaneDB server on {addr}");
+    println!("Starting metrics server on {metrics_addr}");
+
+    // Start both servers concurrently
+    tokio::join!(
+        async {
+            let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+            axum::serve(listener, app).await.unwrap();
+        },
+        async {
+            let metrics_listener = tokio::net::TcpListener::bind(&metrics_addr).await.unwrap();
+            axum::serve(metrics_listener, metrics_app).await.unwrap();
+        }
+    );
 }
 
-pub fn create_router(state: AppState) -> Router {
+pub fn create_router(state: AppState) -> (Router, Router) {
     let cors = CorsLayer::new()
         .allow_origin([
             "http://localhost:5174".parse::<HeaderValue>().unwrap(),
@@ -69,6 +82,8 @@ pub fn create_router(state: AppState) -> Router {
         .allow_headers(Any)
         .max_age(Duration::from_secs(86400)); // 24 hours
 
+    let (prometheus_layer, metric_handle) = axum_prometheus::PrometheusMetricLayer::pair();
+
     let api_v1 = Router::new()
         .route("/aggregate/{id}/read", get(read_events))
         .route("/aggregate/{id}/subscribe", get(subscribe_events))
@@ -77,15 +92,21 @@ pub fn create_router(state: AppState) -> Router {
         .route("/aggregate/{id}/disableshare/{share_hash}", post(disable_share))
         .route("/aggregate/{id}/disableuser/{user_hash}", post(disable_user))
         .route("/aggregate/{id}/disableclient/{client_id}", post(disable_client))
-        .route("/aggregate/{id}/share", post(share));
+        .route("/aggregate/{id}/share", post(share))
+        .layer(prometheus_layer);
+
+    // Create a separate router just for metrics
+    let metrics_router = Router::new().route("/metrics", get(|| async move { metric_handle.render() }));
 
     //Enforce maximum upload size (512 KB)
     let size_limit = RequestBodyLimitLayer::new(512 * 1024);
 
-    Router::new()
+    let main_router = Router::new()
         .nest("/api/v1", api_v1)
         .layer(size_limit) // Add the size limit middleware
         .layer(CompressionLayer::new())
         .layer(cors)
-        .with_state(state)
+        .with_state(state);
+
+    (main_router, metrics_router)
 }

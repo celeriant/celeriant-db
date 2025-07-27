@@ -36,6 +36,7 @@ serde_json.workspace = true
 simd-json.workspace = true
 reqwest.workspace = true
 jsonwebtoken.workspace = true
+axum-prometheus = "0.8.0"
 
 [dev-dependencies]
 rand.workspace = true
