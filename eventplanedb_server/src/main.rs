@@ -1,8 +1,11 @@
 use axum::{
     Router,
     http::{HeaderValue, Method},
+    response::IntoResponse,
     routing::{get, post},
 };
+use axum_prometheus::{EndpointLabel, PrometheusMetricLayerBuilder};
+use reqwest::StatusCode;
 use std::{env, time::Duration};
 use tower_http::{
     compression::CompressionLayer,
@@ -30,6 +33,10 @@ mod mimalloc {
 
     #[global_allocator]
     static GLOBAL: MiMalloc = MiMalloc;
+}
+
+async fn health_check() -> impl IntoResponse {
+    StatusCode::OK
 }
 
 #[tokio::main]
@@ -82,7 +89,11 @@ pub fn create_router(state: AppState) -> (Router, Router) {
         .allow_headers(Any)
         .max_age(Duration::from_secs(86400)); // 24 hours
 
-    let (prometheus_layer, metric_handle) = axum_prometheus::PrometheusMetricLayer::pair();
+    let (prometheus_layer, metric_handle) = PrometheusMetricLayerBuilder::new()
+        .enable_response_body_size(true)
+        .with_endpoint_label_type(EndpointLabel::MatchedPath)
+        .with_default_metrics()
+        .build_pair();
 
     let api_v1 = Router::new()
         .route("/aggregate/{id}/read", get(read_events))
@@ -103,6 +114,7 @@ pub fn create_router(state: AppState) -> (Router, Router) {
 
     let main_router = Router::new()
         .nest("/api/v1", api_v1)
+        .route("/health", get(health_check)) // Add health endpoint at the root level
         .layer(size_limit) // Add the size limit middleware
         .layer(CompressionLayer::new())
         .layer(cors)
