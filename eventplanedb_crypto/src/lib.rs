@@ -39,7 +39,7 @@ pub struct Crypto;
 
 impl Crypto {
     // Helper function to decode the client ID from URL-safe base64
-    pub fn decode_client_id_from_path(client_id_b64: &str) -> Result<u128, CryptoError> {
+    pub fn decode_base64_u128_from_path(client_id_b64: &str) -> Result<u128, CryptoError> {
         // Replace URL-safe characters back to standard base64
         let fixed_b64 = client_id_b64.replace('-', "+").replace('_', "/");
 

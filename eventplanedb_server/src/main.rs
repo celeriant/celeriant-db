@@ -1,6 +1,7 @@
 use axum::{
     Router,
     http::{HeaderValue, Method},
+    middleware::from_fn,
     response::IntoResponse,
     routing::{get, post},
 };
@@ -15,6 +16,7 @@ use tower_http::{
 
 use crate::{
     app_state::AppState,
+    correlation_id::correlation_id_middleware,
     routes::{
         delete::delete, disable_client::disable_client, disable_share::disable_share, disable_user::disable_user, read::read_events, share::share,
         subscribe::subscribe_events, write::write_events,
@@ -23,6 +25,7 @@ use crate::{
 
 mod app_state;
 mod auth;
+mod correlation_id;
 mod error_response;
 mod json_formatter;
 mod routes;
@@ -116,6 +119,7 @@ pub fn create_router(state: AppState) -> (Router, Router) {
         .nest("/api/v1", api_v1)
         .route("/health", get(health_check)) // Add health endpoint at the root level
         .layer(size_limit) // Add the size limit middleware
+        .layer(from_fn(correlation_id_middleware))
         .layer(CompressionLayer::new())
         .layer(cors)
         .with_state(state);

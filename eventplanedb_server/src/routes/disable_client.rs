@@ -17,7 +17,7 @@ pub async fn disable_client(
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: HeaderMap,
 ) -> Result<CompactJson<DisableClientResponse>, RouteError> {
-    let client_id = Crypto::decode_client_id_from_path(&client_id_b64)?;
+    let client_id = Crypto::decode_base64_u128_from_path(&client_id_b64)?;
 
     let server_time = state.server_time();
 

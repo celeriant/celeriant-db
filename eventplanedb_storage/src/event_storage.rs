@@ -163,7 +163,13 @@ fn is_batch_corrupt(mut reader: &mut BufReader<File>, current_pos: u64) -> bool 
 }
 
 /// Read events starting from a specific si (efficient catchup)
-pub fn read_from_si(mut reader: &mut BufReader<File>, target_server_id: u64, max_bytes: usize, event_type_filter: Option<&[u64]>, exclude_client_id_filter: Option<u128>) -> io::Result<CatchupResult> {
+pub fn read_from_si(
+    mut reader: &mut BufReader<File>,
+    target_server_id: u64,
+    max_bytes: usize,
+    event_type_filter: Option<&[u64]>,
+    exclude_client_id_filter: Option<u128>,
+) -> io::Result<CatchupResult> {
     let file_size = reader.get_ref().metadata()?.len();
 
     if file_size < BATCH_METADATA_SIZE {
@@ -223,7 +229,7 @@ pub fn read_from_si(mut reader: &mut BufReader<File>, target_server_id: u64, max
             }
         }
 
-        let events = read_batch_at_position(&mut reader, *batch_end_pos, *batch_start_pos)?;
+        let events = read_batch_at_position(reader, *batch_end_pos, *batch_start_pos)?;
         event_batches.push(Arc::new(events));
 
         let compressed_data_size = (batch_end_pos - batch_start_pos) as usize;
@@ -232,17 +238,14 @@ pub fn read_from_si(mut reader: &mut BufReader<File>, target_server_id: u64, max
         // Check if adding this batch would exceed our limit
         if total_bytes > max_bytes {
             // We've hit our limit, return what we have
-            let next_si = Some(event_batches.last().unwrap().server_id + 1);
-            return Ok(CatchupResult {
-                event_batches: event_batches,
-                next_si: next_si,
-            });
+            let next_server_id = Some(event_batches.last().unwrap().server_id + 1);
+            return Ok(CatchupResult { event_batches, next_server_id });
         }
     }
 
     Ok(CatchupResult {
-        event_batches: event_batches,
-        next_si: None,
+        event_batches,
+        next_server_id: None,
     })
 }
 
@@ -257,7 +260,13 @@ pub mod tests {
     use tempfile::TempDir;
 
     pub fn create_event_batch_item(server_id: u64, client_id: u128, user_id: Option<String>, server_date: u64, events: Vec<EventItem>) -> EventBatchItem {
-        EventBatchItem { server_id, client_id, user_id, server_date, events }
+        EventBatchItem {
+            server_id,
+            client_id,
+            user_id,
+            server_date,
+            events,
+        }
     }
 
     //TODO: Tests for exclude_client_id_filter
@@ -265,7 +274,8 @@ pub mod tests {
     #[test]
     fn test_corrupt_file() {
         let events_batch_1 = create_event_batch_item(
-            0, 0,
+            0,
+            0,
             None,
             123,
             vec![create_test_event_item(), create_minimal_event_item(), create_test_event_item()],
@@ -309,7 +319,8 @@ pub mod tests {
     #[test]
     fn test_max_bytes_limit() {
         let events_batch_1 = create_event_batch_item(
-            0, 0,
+            0,
+            0,
             None,
             123,
             vec![create_test_event_item(), create_minimal_event_item(), create_test_event_item()],
@@ -331,32 +342,33 @@ pub mod tests {
         let catchup_result = read_from_si(&mut reader, 0, 1, None, None).unwrap();
 
         assert_eq!(catchup_result.event_batches.len(), 1);
-        assert_eq!(catchup_result.next_si, Some(1));
+        assert_eq!(catchup_result.next_server_id, Some(1));
 
         let current_file_size = reader.get_ref().metadata().unwrap().len();
 
         let catchup_result = read_from_si(&mut reader, 0, current_file_size as usize + 78, None, None).unwrap();
 
         assert_eq!(catchup_result.event_batches.len(), 2);
-        assert_eq!(catchup_result.next_si, Some(2));
+        assert_eq!(catchup_result.next_server_id, Some(2));
 
         append_event_batch(&mut writer, &events_batch_3).unwrap();
 
         let catchup_result = read_from_si(&mut reader, 0, current_file_size as usize + 78, None, None).unwrap();
 
         assert_eq!(catchup_result.event_batches.len(), 2);
-        assert_eq!(catchup_result.next_si, Some(2));
+        assert_eq!(catchup_result.next_server_id, Some(2));
 
         let catchup_result = read_from_si(&mut reader, 0, current_file_size as usize + 336, None, None).unwrap();
 
         assert_eq!(catchup_result.event_batches.len(), 3);
-        assert_eq!(catchup_result.next_si, None);
+        assert_eq!(catchup_result.next_server_id, None);
     }
 
     #[test]
     fn test_read_write_with_event_storage_format() {
         let events_batch_1 = create_event_batch_item(
-            0, 0,
+            0,
+            0,
             None,
             123,
             vec![create_test_event_item(), create_minimal_event_item(), create_test_event_item()],
@@ -411,7 +423,8 @@ pub mod tests {
     #[test]
     fn test_invalid_catch_up() {
         let events_batch_1 = create_event_batch_item(
-            0, 0,
+            0,
+            0,
             None,
             123,
             vec![create_test_event_item(), create_minimal_event_item(), create_test_event_item()],
@@ -430,13 +443,14 @@ pub mod tests {
         let invalid_si_over = read_from_si(&mut reader, 1000, usize::max_value(), None, None).unwrap();
 
         assert_eq!(invalid_si_over.event_batches.len(), 0);
-        assert_eq!(invalid_si_over.next_si, Option::None);
+        assert_eq!(invalid_si_over.next_server_id, Option::None);
     }
 
     #[test]
     fn test_valid_catchup_scenarios() {
         let events_batch_1 = create_event_batch_item(
-            0, 0,
+            0,
+            0,
             None,
             123,
             vec![create_test_event_item(), create_minimal_event_item(), create_test_event_item()],

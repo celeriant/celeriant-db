@@ -249,7 +249,7 @@ impl EventStorageCache {
         if !event_batches.is_empty() {
             return Ok(CatchupResult {
                 event_batches: event_batches,
-                next_si: if more_batches_to_go { Some(current_server_id) } else { None },
+                next_server_id: if more_batches_to_go { Some(current_server_id) } else { None },
             });
         }
         
@@ -397,7 +397,7 @@ mod tests {
         let events_from_1 = storage.read(&events_bin.to_str().unwrap(), 1, 40000, None, None).unwrap();
 
         assert_eq!(events_from_1.flatten_events().len(), 3);
-        assert_eq!(events_from_1.next_si, None);
+        assert_eq!(events_from_1.next_server_id, None);
         assert_eq!(events_from_1.event_batches.len(), 2);
         assert_eq!(events_from_1.event_batches[0].server_id, 1);
         assert_eq!(events_from_1.event_batches[1].server_id, 2);
@@ -524,7 +524,7 @@ mod tests {
         let events_from_3 = storage.read(&events_bin.to_str().unwrap(), 1, 40000, None, None).unwrap();
 
         assert_eq!(events_from_3.flatten_events().len(), 3);
-        assert_eq!(events_from_3.next_si, None);
+        assert_eq!(events_from_3.next_server_id, None);
         assert_eq!(events_from_3.event_batches.len(), 2);
         assert_eq!(events_from_3.event_batches[0].server_id, 1);
         assert_eq!(events_from_3.event_batches[1].server_id, 2);
@@ -558,12 +558,12 @@ mod tests {
 
         // Test max_bytes limit
         let partial_events = storage.read(&events_bin.to_str().unwrap(), 0, 1, None, None).unwrap();
-        assert_eq!(partial_events.next_si, Some(1)); // Should continue from SI 1 after reaching the limit
+        assert_eq!(partial_events.next_server_id, Some(1)); // Should continue from SI 1 after reaching the limit
         assert_eq!(partial_events.flatten_events().len(), 2);
 
         //Test in-mem from si 1
         let partial_events = storage.read(&events_bin.to_str().unwrap(), 1, 1, None, None).unwrap();
-        assert_eq!(partial_events.next_si, None); // Should continue from SI 1 after reaching the limit
+        assert_eq!(partial_events.next_server_id, None); // Should continue from SI 1 after reaching the limit
         assert_eq!(partial_events.flatten_events().len(), 1);
     }
 
@@ -633,7 +633,7 @@ mod tests {
         assert_eq!(events.event_batches.len(), 2);
         assert_eq!(events.event_batches[0].server_id, 0);
         assert_eq!(events.event_batches[1].server_id, 1);
-        assert_eq!(events.next_si, None);
+        assert_eq!(events.next_server_id, None);
 
         // Verify file was truncated again
         let recovered_file_length = fs::metadata(&events_bin).unwrap().len();
@@ -702,7 +702,7 @@ mod tests {
         assert_eq!(result.flatten_events().len(), 1);
         assert_eq!(result.event_batches[0].server_id, 1);
         assert_eq!(result.flatten_events()[0].event_type, 100);
-        assert_eq!(result.next_si, Some(2));
+        assert_eq!(result.next_server_id, Some(2));
 
         // Read with TP = 300, should only return batch 3
         let result = storage.read(file_path, 0, 1000, Some(&[300]), None).unwrap();
@@ -710,13 +710,13 @@ mod tests {
         assert_eq!(result.flatten_events().len(), 1);
         assert_eq!(result.event_batches[0].server_id, 2);
         assert_eq!(result.flatten_events()[0].event_type, 300);
-        assert_eq!(result.next_si, None);
+        assert_eq!(result.next_server_id, None);
 
         // Read with TP = 200, should return nothing
         let result = storage.read(file_path, 0, 1000, Some(&[200]), None).unwrap();
         assert_eq!(result.event_batches.len(), 0);
         assert_eq!(result.flatten_events().len(), 0);
-        assert_eq!(result.next_si, None);
+        assert_eq!(result.next_server_id, None);
     }
 
     #[test]
@@ -758,7 +758,7 @@ mod tests {
             assert_eq!(result.flatten_events().len(), 1);
             assert_eq!(result.event_batches[0].server_id, 0);
             assert_eq!(result.flatten_events()[0].event_type, 100);
-            assert_eq!(result.next_si, Some(1));
+            assert_eq!(result.next_server_id, Some(1));
         }
     }
 }

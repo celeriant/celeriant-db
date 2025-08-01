@@ -35,7 +35,7 @@ pub async fn read_events(
     };
 
     let share_id = match params.share_id {
-        Some(s) => Some(Crypto::decode_client_id_from_path(s.as_ref())?),
+        Some(s) => Some(Crypto::decode_base64_u128_from_path(s.as_ref())?),
         None => None,
     };
     let response = read_async(

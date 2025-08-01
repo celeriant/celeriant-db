@@ -1,5 +1,6 @@
 use crate::{app_state::AppState, error_response::RouteError, json_formatter::CompactJson};
 use axum::{extract::Path, http::HeaderMap};
+use eventplanedb_crypto::Crypto;
 use eventplanedb_storage::event_batch_item::EventBatchItem;
 use eventplanedb_thread_worker::{job_context::JobContext, queue_jobs::disable_share_async};
 use serde::{Deserialize, Serialize};
@@ -12,11 +13,12 @@ pub struct DisableShareResponse {
 }
 
 pub async fn disable_share(
-    Path((aggregate_id, share_id)): Path<(String, u128)>,
+    Path((aggregate_id, share_id_b64)): Path<(String, String)>,
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: HeaderMap,
 ) -> Result<CompactJson<DisableShareResponse>, RouteError> {
     let current_user_claims = state.get_claims(&headers).await?;
+    let share_id = Crypto::decode_base64_u128_from_path(&share_id_b64)?;
 
     let server_time = state.server_time();
 
