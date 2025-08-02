@@ -1,0 +1,20 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug RandomWorkload",
+            "type": "cppvsdbg", // Use "cppvsdbg" for Windows instead of "lldb"
+            "request": "launch",
+            "program": "${workspaceFolder}\\target\\debug\\eventplanedb.exe",
+            "args": [
+                "random-workload",
+                "http://192.168.0.109",
+                "test-bulk-7",
+            ],
+            "cwd": "${workspaceFolder}",
+            "stopAtEntry": false, // Note: "stopAtEntry" instead of "stopOnEntry" for cppvsdbg
+            "environment": [],
+            "console": "integratedTerminal"
+        }
+    ]
+}

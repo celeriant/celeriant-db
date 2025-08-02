@@ -6,6 +6,8 @@ members = [
     "eventplanedb_access",
     "eventplanedb_thread_worker",
     "eventplanedb_server",
+    "eventplanedb",
+    "eventplanedb_client",
 ]
 
 resolver = "2"
@@ -17,6 +19,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
+url = "2.5.4"
 bincode = "2.0.1"
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 simd-json = "0.15.1"
