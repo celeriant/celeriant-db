@@ -6,7 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-clap = { version = "4.5.42", features = ["derive"] }
+clap.workspace = true
 tokio.workspace = true
 chrono.workspace = true
 rand.workspace = true

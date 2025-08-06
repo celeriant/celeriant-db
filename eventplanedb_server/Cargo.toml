@@ -36,9 +36,10 @@ serde_json.workspace = true
 simd-json.workspace = true
 reqwest.workspace = true
 jsonwebtoken.workspace = true
-axum-prometheus = "0.8.0"
-tracing = "0.1.41"
-uuid = { version = "1.10.0", features = ["v4"] }
+axum-prometheus.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
 rand.workspace = true

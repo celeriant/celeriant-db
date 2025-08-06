@@ -15,6 +15,22 @@
             "stopAtEntry": false, // Note: "stopAtEntry" instead of "stopOnEntry" for cppvsdbg
             "environment": [],
             "console": "integratedTerminal"
+        },
+        {
+            "name": "Debug EventPlaneDB Server",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}\\target\\debug\\eventplanedb_server.exe",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "stopAtEntry": false,
+            "environment": [
+                {
+                    "name": "LOG_LEVEL",
+                    "value": "trace"
+                }
+            ],
+            "console": "integratedTerminal"
         }
     ]
 }

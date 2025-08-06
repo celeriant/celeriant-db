@@ -58,7 +58,7 @@ impl AppState {
 
     pub async fn get_claims_direct(&self, token: Option<&str>) -> Result<Option<Claims>, JobError> {
         match token {
-            Some(bearer_token) => match validate_jwt_token(self, &bearer_token).await {
+            Some(bearer_token) => match validate_jwt_token(self, bearer_token).await {
                 Ok(claims) => Ok(Some(claims)),
                 Err(err) => Err(JobError::AuthenticationFailed(err.to_string())),
             },

@@ -11,6 +11,7 @@ use std::{
     convert::Infallible,
     time::{Duration, Instant},
 };
+use tracing::{info, instrument, trace, warn};
 
 #[derive(Deserialize)]
 pub struct AuthParams {
@@ -20,6 +21,15 @@ pub struct AuthParams {
     pub signature: String,
 }
 
+#[instrument(
+    name = "subscribe_events",
+    skip(state, params),
+    fields(
+        aggregate_id = %aggregate_id,
+        client_id,
+        user_id,
+    )
+)]
 pub async fn subscribe_events(
     Path(aggregate_id): Path<String>,
     Query(params): Query<AuthParams>,
@@ -28,9 +38,24 @@ pub async fn subscribe_events(
     let current_client_id = state.get_client_id_direct(params.public_key.as_str(), params.nonce.as_str(), params.signature.as_str())?;
     let current_user_claims = state.get_claims_direct(params.token.as_deref()).await?;
     let file_path = state.get_file_path(&aggregate_id);
+    {
+        {
+            trace!("Testing trace log in subscribe_events");
+        }
+    }
+    // Set span fields that weren't available when the function was called
+    tracing::Span::current().record("client_id", current_client_id);
 
     let server_time = state.server_time();
-    let (current_user_id, current_org_id) = current_user_claims.map(|claims| (Some(claims.sub), claims.org_id)).unwrap_or((None, None));
+    let (current_user_id, current_org_id) = current_user_claims
+        .map(|claims| {
+            tracing::Span::current().record("user_id", &claims.sub);
+            (Some(claims.sub), claims.org_id)
+        })
+        .unwrap_or_else(|| {
+            tracing::Span::current().record("user_id", tracing::field::display("anonymous"));
+            (None, None)
+        });
 
     let context = JobContext {
         file_path: state.get_file_path(&aggregate_id),
@@ -41,6 +66,8 @@ pub async fn subscribe_events(
     };
 
     access_check_async(&state.workers, context, eventplanedb_access::access_level::AccessLevel::Viewer).await?;
+
+    info!("Subscribing to aggregate_id: {} for client_id: {}", &aggregate_id, current_client_id);
 
     // Subscribe to event notifications for this file path
     let receiver = state.event_notifier.subscribe(&file_path);
@@ -69,7 +96,10 @@ pub async fn subscribe_events(
                                     // Check if we're outside the cooldown period
                                     if time_since_last >= cooldown_period {
                                         let event = Event::default().data("ne");
+                                        trace!("Sending 'ne' event notification to client_id: {}", current_client_id);
                                         return Some((Ok(event), (receiver, current_client_id, now)));
+                                    } else {
+                                        trace!("Suppressed 'ne' event notification due to cooldown for client_id: {}", current_client_id);
                                     }
                                     // If inside cooldown period, ignore this notification
                                     // and continue waiting
@@ -79,6 +109,7 @@ pub async fn subscribe_events(
                             }
                             Err(_) => {
                                 // On channel error, continue the loop
+                                warn!("Event notification channel closed, continuing to wait for new events");
                                 continue;
                             }
                         }
@@ -86,6 +117,7 @@ pub async fn subscribe_events(
                     _ = tokio::time::sleep(Duration::from_secs(30)) => {
                         // Send a keep-alive comment every 30 seconds
                         let event = Event::default().comment("ka");
+                        trace!("Sending keep-alive 'ka' comment to client_id: {}", current_client_id);
                         return Some((Ok(event), (receiver, current_client_id, last_notification)));
                     }
                 }

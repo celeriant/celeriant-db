@@ -13,6 +13,8 @@ use tower_http::{
     cors::{Any, CorsLayer},
     limit::RequestBodyLimitLayer,
 };
+use tracing::info;
+use tracing_subscriber::EnvFilter;
 
 use crate::{
     app_state::AppState,
@@ -44,8 +46,19 @@ async fn health_check() -> impl IntoResponse {
 
 #[tokio::main]
 async fn main() {
+    // Initialize tracing
+    let log_level = env::var("LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(format!("eventplanedb_server={log_level}")));
+
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_max_level(tracing::Level::TRACE)
+        .with_target(true)
+        .init();
+
     // Get base path from environment variable or use default
     let base_path = env::var("DATA_PATH").unwrap_or_else(|_| "./data".to_string());
+    info!(path = %base_path, "Using data directory");
 
     // Create data directory if it doesn't exist
     std::fs::create_dir_all(&base_path).expect("Failed to create data directory");
@@ -66,8 +79,8 @@ async fn main() {
     let metrics_port = env::var("METRICS_PORT").unwrap_or_else(|_| "9101".to_string());
     let metrics_addr = format!("0.0.0.0:{metrics_port}");
 
-    println!("Starting EventPlaneDB server on {addr}");
-    println!("Starting metrics server on {metrics_addr}");
+    info!(addr = %addr, "Starting EventPlaneDB server");
+    info!(metrics_addr = %metrics_addr, "Starting metrics server");
 
     // Start both servers concurrently
     tokio::join!(
