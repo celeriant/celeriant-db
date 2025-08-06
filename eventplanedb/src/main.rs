@@ -85,9 +85,12 @@ async fn run_workload(server: &str, aggregate_id: &str, share_key: &Option<Strin
 
     let mut from_server_id: i64 = 0;
 
+    let client = EventPlaneDBClient::new(server.to_string()).await.unwrap();
+
     if let Some(share_key) = share_key {
         println!("Using sharekey: {}", share_key);
-        let event_batches = EventPlaneDBClient::read_events(server, &auth_data, aggregate_id, from_server_id, Some(share_key.to_string()), false)
+        let event_batches = client
+            .read_events(&auth_data, aggregate_id, from_server_id, Some(share_key.to_string()), false)
             .await
             .unwrap();
         if (!event_batches.is_empty()) {
@@ -108,22 +111,12 @@ async fn run_workload(server: &str, aggregate_id: &str, share_key: &Option<Strin
             sv: None,
             by: None,
         };
-        EventPlaneDBClient::write_events(server, &auth_data, aggregate_id, true, vec![initial_event])
+        client.write_events(&auth_data, aggregate_id, true, vec![initial_event]).await.unwrap();
+
+        let share_response = client
+            .share(&auth_data, aggregate_id, eventplanedb_client::AccessLevel::Contributor, false, None, None, 0)
             .await
             .unwrap();
-
-        let share_response = EventPlaneDBClient::share(
-            server,
-            &auth_data,
-            aggregate_id,
-            eventplanedb_client::AccessLevel::Contributor,
-            false,
-            None,
-            None,
-            0,
-        )
-        .await
-        .unwrap();
 
         println!("Share key created: {}", share_response.share_key);
     }
@@ -141,9 +134,7 @@ async fn run_workload(server: &str, aggregate_id: &str, share_key: &Option<Strin
             bearer_token: None,
         };
 
-        EventPlaneDBClient::write_events(server, &auth_data, aggregate_id, true, color_events)
-            .await
-            .unwrap();
+        client.write_events(&auth_data, aggregate_id, true, color_events).await.unwrap();
     }
 }
 

@@ -146,14 +146,56 @@ fn url_friendly_base64(input: &str) -> String {
     base64_encoded.replace("+", "-").replace("/", "_").replace("=", "")
 }
 
-pub struct EventPlaneDBClient {}
+// ... existing code ...
+pub struct EventPlaneDBClient {
+    base_url: String,
+    client: reqwest::Client,
+}
 
 impl EventPlaneDBClient {
+    pub async fn new(base_url: String) -> Result<Self, Box<dyn std::error::Error>> {
+        let client = reqwest::Client::builder().build()?;
+        Ok(EventPlaneDBClient { base_url, client })
+    }
+
+    fn build_headers(&self, auth_data: &AuthData) -> reqwest::header::HeaderMap {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::CONTENT_TYPE, reqwest::header::HeaderValue::from_static("application/json"));
+        headers.insert("X-Public-Key", reqwest::header::HeaderValue::from_str(&auth_data.public_key).unwrap());
+        headers.insert("X-Nonce", reqwest::header::HeaderValue::from_str(&auth_data.nonce).unwrap());
+        headers.insert("X-Signature", reqwest::header::HeaderValue::from_str(&auth_data.sign).unwrap());
+
+        if let Some(bearer_token) = &auth_data.bearer_token {
+            headers.insert(
+                reqwest::header::AUTHORIZATION,
+                reqwest::header::HeaderValue::from_str(&format!("Bearer {}", bearer_token)).unwrap(),
+            );
+        }
+
+        headers
+    }
+
+    async fn post(&self, url: &str, auth_data: &AuthData, body: Option<String>) -> Result<reqwest::Response, Box<dyn std::error::Error>> {
+        sleep(time::Duration::from_millis(50)).await;
+
+        let request = self.client.post(url).headers(self.build_headers(auth_data));
+        let response = match body {
+            Some(b) => request.body(b).send().await?,
+            None => request.send().await?,
+        };
+        Ok(response)
+    }
+
+    async fn get(&self, url: &str, auth_data: &AuthData) -> Result<reqwest::Response, Box<dyn std::error::Error>> {
+        let response = self.client.get(url).headers(self.build_headers(auth_data)).send().await?;
+        Ok(response)
+    }
+
     /**
      * Creates a new aggregate or adds events to an existing aggregate
      */
     pub async fn write_events(
-        base_url: &str,
+        &self,
         auth_data: &AuthData,
         aggregate_id: &str,
         create_if_not_exist: bool,
@@ -166,13 +208,18 @@ impl EventPlaneDBClient {
 
         let url_params_str = form_urlencoded::Serializer::new(String::new()).extend_pairs(url_params).finish();
 
-        let url = format!("{}/api/v1/aggregate/{}/write?{}", base_url, aggregate_id, url_params_str);
+        let url = format!("{}/api/v1/aggregate/{}/write?{}", self.base_url, aggregate_id, url_params_str);
 
         // Function to send a batch of events
-        async fn send_batch(url: &str, auth_data: &AuthData, events: Vec<ServerEvent>) -> Result<Option<WriteResponse>, Box<dyn std::error::Error>> {
-            let (client, body) = post_fetch_options(auth_data, Some(serde_json::to_string(&events)?)).await?;
+        async fn send_batch(
+            client: &EventPlaneDBClient,
+            url: &str,
+            auth_data: &AuthData,
+            events: Vec<ServerEvent>,
+        ) -> Result<Option<WriteResponse>, Box<dyn std::error::Error>> {
+            let body = Some(serde_json::to_string(&events)?);
 
-            let response = client.post(url).body(body.unwrap()).send().await?;
+            let response = client.post(url, auth_data, body).await?;
 
             if response.status() == reqwest::StatusCode::FORBIDDEN {
                 return Err(Box::new(ErrorForbidden::new("Forbidden".to_string())));
@@ -189,7 +236,12 @@ impl EventPlaneDBClient {
         }
 
         // Recursive function to handle batch splitting
-        async fn process_batch(url: &str, auth_data: &AuthData, events: Vec<ServerEvent>) -> Result<Vec<WriteResponse>, Box<dyn std::error::Error>> {
+        async fn process_batch(
+            client: &EventPlaneDBClient,
+            url: &str,
+            auth_data: &AuthData,
+            events: Vec<ServerEvent>,
+        ) -> Result<Vec<WriteResponse>, Box<dyn std::error::Error>> {
             if events.is_empty() {
                 return Ok(vec![]);
             }
@@ -197,7 +249,7 @@ impl EventPlaneDBClient {
             // Box the recursive async function to allow dynamic size
             Box::pin(async move {
                 // Try sending the current batch
-                let result = send_batch(url, auth_data, events.clone()).await?;
+                let result = send_batch(client, url, auth_data, events.clone()).await?;
 
                 // If successful, return the result
                 if let Some(result) = result {
@@ -215,8 +267,8 @@ impl EventPlaneDBClient {
                 let second_half = events[midpoint..].to_vec();
 
                 // Process each half and combine results
-                let first_results = process_batch(url, auth_data, first_half).await?;
-                let second_results = process_batch(url, auth_data, second_half).await?;
+                let first_results = process_batch(client, url, auth_data, first_half).await?;
+                let second_results = process_batch(client, url, auth_data, second_half).await?;
 
                 let mut combined_results = first_results;
                 combined_results.extend(second_results);
@@ -226,7 +278,7 @@ impl EventPlaneDBClient {
         }
 
         // Start the recursive process
-        let results = process_batch(&url, auth_data, events_not_on_server).await?;
+        let results = process_batch(self, &url, auth_data, events_not_on_server).await?;
 
         // Combine all results (if multiple batches were sent)
         if results.len() == 1 {
@@ -256,7 +308,7 @@ impl EventPlaneDBClient {
      * Reads events from an aggregate
      */
     pub async fn read_events(
-        base_url: &str,
+        &self,
         auth_data: &AuthData,
         aggregate_id: &str,
         from_server_id: i64,
@@ -278,10 +330,9 @@ impl EventPlaneDBClient {
 
             let url_params_str = form_urlencoded::Serializer::new(String::new()).extend_pairs(url_params).finish();
 
-            let url = format!("{}/api/v1/aggregate/{}/read?{}", base_url, aggregate_id, url_params_str);
+            let url = format!("{}/api/v1/aggregate/{}/read?{}", self.base_url, aggregate_id, url_params_str);
 
-            let client = get_fetch_options(auth_data).await?;
-            let response = client.get(&url).send().await?;
+            let response = self.get(&url, auth_data).await?;
 
             if response.status() == reqwest::StatusCode::FORBIDDEN {
                 return Err(Box::new(ErrorForbidden::new("Forbidden".to_string())));
@@ -306,7 +357,7 @@ impl EventPlaneDBClient {
      * Creates a share link for an aggregate
      */
     pub async fn share(
-        base_url: &str,
+        &self,
         auth_data: &AuthData,
         aggregate_id: &str,
         access_level: AccessLevel,
@@ -323,9 +374,9 @@ impl EventPlaneDBClient {
             "iv": iv,
         });
 
-        let url = format!("{}/api/v1/aggregate/{}/share", base_url, aggregate_id);
-        let (client, body) = post_fetch_options(auth_data, Some(share_body.to_string())).await?;
-        let response = client.post(&url).body(body.unwrap()).send().await?;
+        let url = format!("{}/api/v1/aggregate/{}/share", self.base_url, aggregate_id);
+        let body = Some(share_body.to_string());
+        let response = self.post(&url, auth_data, body).await?;
 
         if response.status() == reqwest::StatusCode::FORBIDDEN {
             return Err(Box::new(ErrorForbidden::new("Forbidden".to_string())));
@@ -342,19 +393,18 @@ impl EventPlaneDBClient {
      * Disables a share link
      */
     pub async fn disable_share(
-        base_url: &str,
+        &self,
         auth_data: &AuthData,
         aggregate_id: &str,
         share_id_hash: &str,
     ) -> Result<DisableAccessResponse, Box<dyn std::error::Error>> {
         let url = format!(
             "{}/api/v1/aggregate/{}/disableshare/{}",
-            base_url,
+            self.base_url,
             aggregate_id,
             url_friendly_base64(share_id_hash)
         );
-        let (client, _body) = post_fetch_options(auth_data, None).await?;
-        let response = client.post(&url).send().await?;
+        let response = self.post(&url, auth_data, None).await?;
 
         if response.status() == reqwest::StatusCode::FORBIDDEN {
             return Err(Box::new(ErrorForbidden::new("Forbidden".to_string())));
@@ -371,19 +421,18 @@ impl EventPlaneDBClient {
      * Disables a user's access to an aggregate
      */
     pub async fn disable_client(
-        base_url: &str,
+        &self,
         auth_data: &AuthData,
         aggregate_id: &str,
         client_id_hash: &str,
     ) -> Result<DisableAccessResponse, Box<dyn std::error::Error>> {
         let url = format!(
             "{}/api/v1/aggregate/{}/disableclient/{}",
-            base_url,
+            self.base_url,
             aggregate_id,
             url_friendly_base64(client_id_hash)
         );
-        let (client, _body) = post_fetch_options(auth_data, None).await?;
-        let response = client.post(&url).send().await?;
+        let response = self.post(&url, auth_data, None).await?;
 
         if response.status() == reqwest::StatusCode::FORBIDDEN {
             return Err(Box::new(ErrorForbidden::new("Forbidden".to_string())));
@@ -400,19 +449,18 @@ impl EventPlaneDBClient {
      * Disables a user's access to an aggregate
      */
     pub async fn disable_user(
-        base_url: &str,
+        &self,
         auth_data: &AuthData,
         aggregate_id: &str,
         user_id_hash: &str,
     ) -> Result<DisableAccessResponse, Box<dyn std::error::Error>> {
         let url = format!(
             "{}/api/v1/aggregate/{}/disableuser/{}",
-            base_url,
+            self.base_url,
             aggregate_id,
             url_friendly_base64(user_id_hash)
         );
-        let (client, _body) = post_fetch_options(auth_data, None).await?;
-        let response = client.post(&url).send().await?;
+        let response = self.post(&url, auth_data, None).await?;
 
         if response.status() == reqwest::StatusCode::FORBIDDEN {
             return Err(Box::new(ErrorForbidden::new("Forbidden".to_string())));
@@ -428,10 +476,9 @@ impl EventPlaneDBClient {
     /**
      * Deletes an aggregate
      */
-    pub async fn delete_project(base_url: &str, auth_data: &AuthData, aggregate_id: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let url = format!("{}/api/v1/aggregate/{}/delete", base_url, aggregate_id);
-        let (client, _body) = post_fetch_options(auth_data, None).await?;
-        let response = client.post(&url).send().await?;
+    pub async fn delete_project(&self, auth_data: &AuthData, aggregate_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let url = format!("{}/api/v1/aggregate/{}/delete", self.base_url, aggregate_id);
+        let response = self.post(&url, auth_data, None).await?;
 
         if response.status() == reqwest::StatusCode::FORBIDDEN {
             return Err(Box::new(ErrorForbidden::new("Forbidden".to_string())));
@@ -452,13 +499,13 @@ impl EventPlaneDBClient {
      * @returns EventSource object that can be used to manage the connection
      */
     pub async fn create_realtime_connection(
-        base_url: &str,
+        &self,
         auth_data: &AuthData,
         aggregate_id: &str,
         message_handler: impl Fn(String) -> (),
         error_handler: Option<impl Fn(reqwest::Error) -> ()>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let endpoint_url = format!("{}/api/v1/aggregate/{}/subscribe", base_url, aggregate_id);
+        let endpoint_url = format!("{}/api/v1/aggregate/{}/subscribe", self.base_url, aggregate_id);
 
         let mut query_params = Vec::new();
         query_params.push(("public_key", auth_data.public_key.clone()));
@@ -473,8 +520,7 @@ impl EventPlaneDBClient {
 
         let url = format!("{}?{}", endpoint_url, query_params_str);
 
-        let client = reqwest::Client::new();
-        let mut response = client.get(&url).send().await?;
+        let mut response = self.client.get(&url).send().await?;
 
         if response.status() != reqwest::StatusCode::OK {
             return Err(format!("Failed to connect: {}", response.status()).into());
