@@ -1,5 +1,5 @@
 use axum::{extract::Request, middleware::Next, response::Response};
-use tracing::info_span;
+use tracing::{Span, info_span};
 use uuid::Uuid;
 
 // Correlation ID header name
@@ -16,17 +16,26 @@ pub async fn correlation_id_middleware(request: Request, next: Next) -> Response
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
     // Create a span with the correlation ID
-    let span = info_span!(
-        "request",
-        correlation_id = %correlation_id,
-        method = %request.method(),
-        uri = %request.uri(),
-    );
+    let span = match Span::current().id() {
+        Some(_) => {
+            // There's already a span, so just add the correlation ID to it.
+            Span::current()
+        }
+        None => {
+            // Create a span with the correlation ID
+            let span = info_span!(
+                "request",
+                correlation_id = %correlation_id,
+                method = %request.method(),
+                uri = %request.uri(),
+            );
+            span
+        }
+    };
 
     // Execute the rest of the stack inside the span
     let response = {
         let _guard = span.enter();
-        tracing::debug!("Processing request");
 
         // Clone the request with a new header containing the correlation ID
         let mut request = request;

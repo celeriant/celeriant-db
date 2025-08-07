@@ -1,9 +1,10 @@
-use crate::{app_state::AppState, error_response::RouteError, json_formatter::CompactJson};
+use crate::{app_state::AppState, error_response::RouteError, json_formatter::CompactJson, routes::utils::record_span_fields};
 use axum::{extract::Path, http::HeaderMap};
 use eventplanedb_crypto::Crypto;
 use eventplanedb_storage::event_batch_item::EventBatchItem;
-use eventplanedb_thread_worker::{job_context::JobContext, queue_jobs::disable_user_async};
+use eventplanedb_thread_worker::{queue_jobs::disable_user_async};
 use serde::{Deserialize, Serialize};
+use tracing::{info, instrument};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DisableClientResponse {
@@ -12,29 +13,39 @@ pub struct DisableClientResponse {
     server_time: u64,
 }
 
+#[instrument(
+    name = "disable_client",
+    skip(state, headers), 
+    fields(
+        aggregate_id = %aggregate_id,
+        client_id, 
+        server_time,
+        user_id, 
+        org_id,
+    )
+)]
 pub async fn disable_client(
     Path((aggregate_id, client_id_b64)): Path<(String, String)>,
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: HeaderMap,
 ) -> Result<CompactJson<DisableClientResponse>, RouteError> {
-    let client_id = Crypto::decode_base64_u128_from_path(&client_id_b64)?;
+    // Establish the request context from headers and aggregate ID
+    let context = state.create_job_context(aggregate_id.clone(), &headers).await?;
+    record_span_fields(&context);
 
-    let server_time = state.server_time();
+    // Send the job context and additional parameters to the worker for processing
+    let for_client_id = Crypto::decode_base64_u128_from_path(&client_id_b64)?;
+    info!(for_client_id = for_client_id, "Processing disable_client request");
+    let server_time = context.server_time;
+    let result = disable_user_async(&state.workers, context, Some(for_client_id), None).await?;
 
-    let current_user_claims = state.get_claims(&headers).await?;
-
-    let (current_user_id, current_org_id) = current_user_claims.map(|claims| (Some(claims.sub), claims.org_id)).unwrap_or((None, None));
-
-    let context = JobContext {
-        file_path: state.get_file_path(&aggregate_id),
-        current_client_id: state.get_client_id(&headers)?,
-        current_user_id,
-        current_org_id,
-        server_time,
-    };
-
-    let result = disable_user_async(&state.workers, context, Some(client_id), None).await?;
-
+    // Log completion and return the response to the client
+    info!(
+        return_event_batch_count = result.events.len(),
+        server_id = result.server_id,
+        for_client_id = for_client_id,
+        "Completed disable_client operation"
+    );
     let response = DisableClientResponse {
         server_id: result.server_id,
         event_batches: result.events,

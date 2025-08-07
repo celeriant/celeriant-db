@@ -1,7 +1,7 @@
 use crossbeam::channel::Sender;
 use eventplanedb_access::job_error::JobError;
 use eventplanedb_crypto::Crypto;
-use eventplanedb_thread_worker::{event_notifications::EventNotifier, job::Job, process_jobs::create_thread_pool};
+use eventplanedb_thread_worker::{event_notifications::EventNotifier, job::Job, job_context::JobContext, process_jobs::create_thread_pool};
 use std::sync::Arc;
 
 use crate::auth::{
@@ -39,6 +39,25 @@ impl AppState {
             oauth_config,
             jwks_client,
         }
+    }
+
+    pub async fn create_job_context(&self, aggregate_id: String, headers: &axum::http::HeaderMap) -> Result<JobContext, JobError> {
+        let (current_user_id, current_org_id) = self
+            .get_claims(headers)
+            .await?
+            .map(|claims| (Some(claims.sub), claims.org_id))
+            .unwrap_or((None, None));
+
+        let context = JobContext {
+            aggregate_id: aggregate_id.clone(),
+            file_path: self.get_file_path(&aggregate_id),
+            current_client_id: self.get_client_id(headers)?,
+            current_user_id,
+            current_org_id,
+            server_time: self.server_time(),
+        };
+
+        Ok(context)
     }
 
     pub fn server_time(&self) -> u64 {

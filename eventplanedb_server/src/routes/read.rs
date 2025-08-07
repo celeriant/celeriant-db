@@ -1,12 +1,13 @@
-use crate::{app_state::AppState, error_response::RouteError, json_formatter::CompactJson};
+use crate::{app_state::AppState, error_response::RouteError, json_formatter::CompactJson, routes::utils::record_span_fields};
 use axum::{
     extract::{Path, Query},
     http::HeaderMap,
 };
 use eventplanedb_crypto::Crypto;
 use eventplanedb_storage::catchup_result::CatchupResult;
-use eventplanedb_thread_worker::{job_context::JobContext, queue_jobs::read_async};
+use eventplanedb_thread_worker::{queue_jobs::read_async};
 use serde::Deserialize;
+use tracing::{debug, instrument};
 
 #[derive(Debug, Deserialize)]
 pub struct ReadQuery {
@@ -15,38 +16,47 @@ pub struct ReadQuery {
     own_events: Option<bool>,
 }
 
+#[instrument(
+    name = "read_events",
+    skip(state, headers, params), 
+    fields(
+        aggregate_id = %aggregate_id,
+        client_id, 
+        server_time,
+        user_id, 
+        org_id,
+    )
+)]
 pub async fn read_events(
     Path(aggregate_id): Path<String>,
     Query(params): Query<ReadQuery>,
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: HeaderMap,
 ) -> Result<CompactJson<CatchupResult>, RouteError> {
-    let current_user_claims = state.get_claims(&headers).await?;
+    // Establish the request context from headers and aggregate ID
+    let context = state.create_job_context(aggregate_id.clone(), &headers).await?;
+    record_span_fields(&context);
 
-    let server_time = state.server_time();
-    let (current_user_id, current_org_id) = current_user_claims.map(|claims| (Some(claims.sub), claims.org_id)).unwrap_or((None, None));
-
-    let context = JobContext {
-        file_path: state.get_file_path(&aggregate_id),
-        current_client_id: state.get_client_id(&headers)?,
-        current_user_id,
-        current_org_id,
-        server_time,
-    };
-
+    // Send the job context and additional parameters to the worker for processing
+    let include_own_events = params.own_events.unwrap_or(false);
+    let from_server_id = params.from_server_id.map_or(0, |f| f);
+    debug!(
+        include_own_events = include_own_events,
+        from_server_id = from_server_id,
+        has_share_id = params.share_id.is_some(),
+        "Processing read_events request"
+    );
     let share_id = match params.share_id {
         Some(s) => Some(Crypto::decode_base64_u128_from_path(s.as_ref())?),
         None => None,
     };
-    let response = read_async(
-        &state.workers,
-        context,
-        share_id,
-        params.from_server_id.map_or(0, |f| f),
-        state.read_max_bytes,
-        params.own_events.unwrap_or(false),
-    )
-    .await?;
+    let response = read_async(&state.workers, context, share_id, from_server_id, state.read_max_bytes, include_own_events).await?;
 
+    // Log completion and return the response to the client
+    debug!(
+        return_event_batch_count = response.event_batches.len(),
+        next_server_id = response.next_server_id,
+        "Completed read_events operation"
+    );
     Ok(CompactJson(response))
 }

@@ -13,8 +13,8 @@ use tower_http::{
     cors::{Any, CorsLayer},
     limit::RequestBodyLimitLayer,
 };
-use tracing::info;
-use tracing_subscriber::EnvFilter;
+use tracing::{Level, info};
+use tracing_subscriber::{EnvFilter, FmtSubscriber, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
     app_state::AppState,
@@ -46,14 +46,14 @@ async fn health_check() -> impl IntoResponse {
 
 #[tokio::main]
 async fn main() {
-    // Initialize tracing
     let log_level = env::var("LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(format!("eventplanedb_server={log_level}")));
 
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .with_max_level(tracing::Level::TRACE)
-        .with_target(true)
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| format!("{}={},tower_http=info,axum::rejection=info", env!("CARGO_CRATE_NAME"), log_level).into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
         .init();
 
     // Get base path from environment variable or use default
