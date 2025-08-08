@@ -51,6 +51,14 @@ pub async fn write_events(
         return Err(RouteError::JobError(JobError::InvalidParameters("No events provided".to_string())));
     }
 
+    // Validate event types - reject if any event_type <= 50
+    for event in &events {
+        if event.event_type <= 50 {
+            error!("Invalid event_type {} - must be greater than 50", event.event_type);
+            return Err(RouteError::JobError(JobError::PermissionDenied("Client passing in reserved event types is not allowed".to_string())));
+        }
+    }
+
     // Send the job context and additional parameters to the worker for processing
     debug!("Processing write request with {} events", events.len());
     let create_if_not_exist = params.create_if_not_exist.unwrap_or(false);
