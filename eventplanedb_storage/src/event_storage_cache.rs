@@ -1,10 +1,23 @@
-use std::{fs::{metadata, File}, io::{self, BufReader, Read, Seek, SeekFrom, Write}, sync::Arc};
+use std::{
+    fs::{File, metadata},
+    io::{self, BufReader, Read, Seek, SeekFrom, Write},
+    sync::Arc,
+};
 
-use crate::{catchup_result::CatchupResult, event_batch_item::EventBatchItem, event_storage::{append_event_batch, find_last_si, find_last_valid_event_batch, read_from_si}, file_cache::FileCache, last_si_cache::LastSiCache, memory_cache::MemoryCache};
+use crate::{
+    catchup_result::CatchupResult,
+    event_batch_item::EventBatchItem,
+    event_storage::{append_event_batch, find_last_li, find_last_si, find_last_valid_event_batch, read_from_si},
+    file_cache::FileCache,
+    last_si_cache::LastSiCache,
+    local_index_cache::LocalIndexCache,
+    memory_cache::MemoryCache,
+};
 
 pub struct EventStorageCache {
     file_cache: FileCache,
     last_si_cache: LastSiCache,
+    local_index_cache: LocalIndexCache,
     memory_cache: MemoryCache,
 }
 
@@ -13,6 +26,7 @@ impl EventStorageCache {
         Self {
             file_cache: FileCache::new(file_cache_max_handles),
             last_si_cache: LastSiCache::new(last_si_cache_max_size),
+            local_index_cache: LocalIndexCache::new(last_si_cache_max_size),
             memory_cache: MemoryCache::new(memory_cache_ttl_secs),
         }
     }
@@ -23,13 +37,13 @@ impl EventStorageCache {
 
     fn open_transaction(&mut self, file_path: &str) -> io::Result<()> {
         let transaction_path = self.get_transaction_path(file_path);
-        
+
         // Get current file length
         let file_length = match metadata(file_path) {
             Ok(metadata) => metadata.len(),
             Err(_) => 0, // File doesn't exist yet
         };
-        
+
         // Write file length to transaction file
         self.write_transaction_value(&transaction_path, file_length)
     }
@@ -43,10 +57,10 @@ impl EventStorageCache {
         writer.flush()?;
         Ok(())
     }
-    
+
     fn has_transaction(&mut self, file_path: &str) -> io::Result<Option<u64>> {
         let transaction_path = self.get_transaction_path(file_path);
-        
+
         match self.file_cache.create_reader(&transaction_path) {
             Ok(reader_ref) => {
                 let mut reader = reader_ref.borrow_mut();
@@ -58,17 +72,17 @@ impl EventStorageCache {
                     Ok(_) => {
                         let file_length = u64::from_le_bytes(buffer);
                         Ok(Some(file_length))
-                    },
+                    }
                     Err(_) => Ok(None), // File is empty or can't read 8 bytes
                 }
             }
             Err(_) => Ok(None), // File doesn't existc
         }
     }
-    
+
     fn commit_transaction(&mut self, file_path: &str) -> io::Result<()> {
         let transaction_path = self.get_transaction_path(file_path);
-        
+
         // Empty out the file but keep it
         let writer_ref = self.file_cache.create_overwrite_writer(&transaction_path)?;
         let mut writer = writer_ref.borrow_mut();
@@ -89,16 +103,14 @@ impl EventStorageCache {
     }
 
     fn truncate_file_and_invalidate_cache(&mut self, file_path: &str, truncate_to: u64) -> io::Result<()> {
-        if let Ok(file) = std::fs::OpenOptions::new()
-            .write(true)
-            .open(file_path)
-        {
+        if let Ok(file) = std::fs::OpenOptions::new().write(true).open(file_path) {
             file.set_len(truncate_to)?;
         }
-        
+
         // Clear the caches for this file
         self.file_cache.remove(file_path);
         self.last_si_cache.remove(file_path);
+        self.local_index_cache.remove(file_path);
 
         Ok(())
     }
@@ -119,23 +131,58 @@ impl EventStorageCache {
         Ok(())
     }
 
-    
     pub fn get_last_si(&mut self, file_path: &str) -> io::Result<Option<u64>> {
         self.recover_from_transaction_file(file_path);
         self.get_last_si_internal(file_path, true)
     }
 
+    fn get_local_index_internal(&mut self, file_path: &str, client_id: u128, use_cache: bool) -> io::Result<Option<u64>> {
+        let mut last_li: Option<u64> = None;
+
+        if use_cache {
+            last_li = self.local_index_cache.get(file_path, client_id);
+        }
+
+        if last_li == None {
+            match self.file_cache.create_reader(file_path) {
+                Ok(reader_ref) => {
+                    //File exists, try to read it
+                    let mut reader = reader_ref.borrow_mut();
+
+                    match find_last_li(&mut reader, client_id) {
+                        Ok(li) => last_li = li,
+                        Err(_) => {
+                            //File is corrupted, try to recover it
+                            self.recover_file_using_magic_number(file_path, &mut reader)?;
+
+                            match find_last_li(&mut reader, client_id) {
+                                Ok(li) => last_li = li,
+                                Err(_) => {
+                                    return Err(io::Error::new(io::ErrorKind::Other, "File is corrupted and cannot be recovered"));
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    //File doesn't exist yet, keep si as None
+                }
+            };
+        }
+
+        Ok(last_li)
+    }
+
     fn get_last_si_internal(&mut self, file_path: &str, use_cache: bool) -> io::Result<Option<u64>> {
         let mut last_si: Option<u64> = None;
-        
+
         if use_cache {
             self.last_si_cache.get(file_path);
         }
-        
+
         if last_si == None {
             match self.file_cache.create_reader(file_path) {
                 Ok(reader_ref) => {
-
                     //File exists, try to read it
                     let mut reader = reader_ref.borrow_mut();
 
@@ -149,12 +196,12 @@ impl EventStorageCache {
                                 Ok(si) => last_si = si,
                                 Err(_) => {
                                     return Err(io::Error::new(io::ErrorKind::Other, "File is corrupted and cannot be recovered"));
-                                },
+                                }
                             }
                         }
                     }
-                },
-                Err(_) => { 
+                }
+                Err(_) => {
                     //File doesn't exist yet, keep si as None
                 }
             };
@@ -163,8 +210,7 @@ impl EventStorageCache {
         Ok(last_si)
     }
 
-    pub fn write(&mut self, file_path: &str, allow_create: bool, mut event_batch_item: EventBatchItem) -> io::Result<u64> {
-
+    pub fn write(&mut self, file_path: &str, allow_create: bool, ignore_client_duplicate_write: bool, mut event_batch_item: EventBatchItem) -> io::Result<u64> {
         self.recover_from_transaction_file(file_path);
 
         // Get the last SI from cache or load from file
@@ -176,20 +222,35 @@ impl EventStorageCache {
 
         event_batch_item.server_id = last_si.map_or(0, |si| si + 1);
 
+        if !ignore_client_duplicate_write {
+            let client_local_index = self.get_local_index_internal(file_path, event_batch_item.client_id, true)?;
+
+            if let Some(client_local_index) = client_local_index {
+                event_batch_item.events.retain(|event| event.local_index > client_local_index);
+                if event_batch_item.events.is_empty() {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "Events already written by client"));
+                }
+            }
+        }
+
+        if event_batch_item.events.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "No new events to write"));
+        }
+
         self.open_transaction(file_path)?;
-        
+
         // Write the batch to disk
         let writer_ref = self.file_cache.create_append_writer(file_path)?;
         let mut writer = writer_ref.borrow_mut();
 
-        let compressed_batch_size = append_event_batch(
-            &mut writer, 
-            &event_batch_item)?;
+        let compressed_batch_size = append_event_batch(&mut writer, &event_batch_item)?;
 
         // Update cache and return the last SI that was assigned
         let server_id = event_batch_item.server_id;
 
         self.last_si_cache.update(file_path, server_id);
+        let last_write_index = event_batch_item.events.last().map_or(0, |e| e.local_index);
+        self.local_index_cache.update(file_path, event_batch_item.client_id, last_write_index);
         self.memory_cache.put(file_path, server_id, Arc::new(event_batch_item), compressed_batch_size);
 
         self.commit_transaction(file_path)?;
@@ -197,7 +258,14 @@ impl EventStorageCache {
         Ok(server_id)
     }
 
-    pub fn read(&mut self, file_path: &str, from_server_id: u64, max_bytes: usize, event_type_filter: Option<&[u64]>, exclude_client_id_filter: Option<u128>) -> io::Result<CatchupResult> {
+    pub fn read(
+        &mut self,
+        file_path: &str,
+        from_server_id: u64,
+        max_bytes: usize,
+        event_type_filter: Option<&[u64]>,
+        exclude_client_id_filter: Option<u128>,
+    ) -> io::Result<CatchupResult> {
         let mut event_batches = Vec::new();
         let mut current_server_id = from_server_id;
         let mut number_bytes: usize = 0;
@@ -244,7 +312,7 @@ impl EventStorageCache {
         if more_batches_to_go {
             let next_batch_cannot_return = self.memory_cache.get(file_path, current_server_id);
             more_batches_to_go = next_batch_cannot_return.is_some();
-        }        
+        }
 
         if !event_batches.is_empty() {
             return Ok(CatchupResult {
@@ -252,7 +320,7 @@ impl EventStorageCache {
                 next_server_id: if more_batches_to_go { Some(current_server_id) } else { None },
             });
         }
-        
+
         self.recover_from_transaction_file(file_path);
 
         match self.file_cache.create_reader(file_path) {
@@ -264,29 +332,28 @@ impl EventStorageCache {
                     Err(_) => {
                         //File is corrupted, try to recover it
                         self.recover_file_using_magic_number(file_path, &mut reader)?;
-                        
+
                         match read_from_si(&mut reader, from_server_id, max_bytes, event_type_filter, exclude_client_id_filter) {
                             Ok(catchup_result) => return Ok(catchup_result),
                             Err(_) => {
                                 return Err(io::Error::new(io::ErrorKind::Other, "File is corrupted and cannot be recovered"));
-                            },
+                            }
                         }
                     }
                 }
-                
-            },
+            }
             Err(_) => {
                 return Err(io::Error::new(io::ErrorKind::NotFound, "File not found"));
             }
         }
     }
 
-    pub fn delete(&mut self, file_path: &str) -> io::Result<bool> {        
+    pub fn delete(&mut self, file_path: &str) -> io::Result<bool> {
         // Check if file exists
         if !std::path::Path::new(file_path).exists() {
-                return Err(io::Error::new(io::ErrorKind::NotFound, "File not found"));
+            return Err(io::Error::new(io::ErrorKind::NotFound, "File not found"));
         }
-        
+
         // Remove the actual file (this is atomic)
         match std::fs::remove_file(file_path) {
             Ok(_) => {
@@ -294,21 +361,20 @@ impl EventStorageCache {
                 self.file_cache.remove(file_path);
                 self.last_si_cache.remove(file_path);
                 self.memory_cache.invalidate_file(file_path);
-                
+
                 // Clean up any leftover transaction file
                 let transaction_path = self.get_transaction_path(file_path);
                 let _ = std::fs::remove_file(transaction_path); // Ignore errors
-                
+
                 Ok(true)
-            },
-            Err(e) => Err(e)
+            }
+            Err(e) => Err(e),
         }
     }
-    
+
     pub fn exists(&self, file_path: &str) -> bool {
         std::path::Path::new(file_path).exists()
     }
-
 }
 
 #[cfg(test)]
@@ -317,7 +383,10 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use crate::{event_item::{tests::{create_minimal_event_item, create_test_event_item}}, event_storage::tests::create_event_batch_item};
+    use crate::{
+        event_item::tests::{create_minimal_event_item, create_test_event_item},
+        event_storage::tests::create_event_batch_item,
+    };
 
     use super::*;
 
@@ -333,7 +402,7 @@ mod tests {
         // Write some events
         let events_batch = vec![create_test_event_item(), create_minimal_event_item()];
         let event_batch_item = create_event_batch_item(0, 0, None, 0, events_batch);
-        let last_si = storage.write(file_path, true, event_batch_item).unwrap();
+        let last_si = storage.write(file_path, true, false, event_batch_item).unwrap();
         assert_eq!(last_si, 0);
 
         // Verify file exists and has content
@@ -361,12 +430,12 @@ mod tests {
     #[test]
     fn test_delete_nonexistent_file() {
         let mut storage = EventStorageCache::new(30, 1000000, 10000);
-        
+
         let result = storage.delete("nonexistent_file.bin");
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::NotFound);
     }
-    
+
     #[test]
     fn test_round_trip() {
         let mut storage = EventStorageCache::new(30, 1000000, 10000);
@@ -385,13 +454,13 @@ mod tests {
         let event_batch_item_2 = create_event_batch_item(0, 0, None, 0, events_batch_2);
         let event_batch_item_3 = create_event_batch_item(0, 0, None, 0, events_batch_3);
 
-        let last_si = storage.write(&events_bin.to_str().unwrap(), true, event_batch_item_1).unwrap();
+        let last_si = storage.write(&events_bin.to_str().unwrap(), true, false, event_batch_item_1).unwrap();
         assert_eq!(last_si, 0);
 
-        let last_si = storage.write(&events_bin.to_str().unwrap(), true, event_batch_item_2).unwrap();
+        let last_si = storage.write(&events_bin.to_str().unwrap(), true, false, event_batch_item_2).unwrap();
         assert_eq!(last_si, 1);
 
-        let last_si = storage.write(&events_bin.to_str().unwrap(), true, event_batch_item_3).unwrap();
+        let last_si = storage.write(&events_bin.to_str().unwrap(), true, false, event_batch_item_3).unwrap();
         assert_eq!(last_si, 2);
 
         let events_from_1 = storage.read(&events_bin.to_str().unwrap(), 1, 40000, None, None).unwrap();
@@ -404,7 +473,10 @@ mod tests {
 
         assert_eq!(events_from_1.flatten_events()[1].string_values.as_ref().unwrap()[1].as_ref().unwrap(), "World");
 
-        assert_eq!(str_compare_value, *events_from_1.flatten_events()[0].string_values.as_ref().unwrap()[4].as_ref().unwrap());
+        assert_eq!(
+            str_compare_value,
+            *events_from_1.flatten_events()[0].string_values.as_ref().unwrap()[4].as_ref().unwrap()
+        );
     }
 
     #[test]
@@ -433,10 +505,10 @@ mod tests {
         let event_batch_item_1 = create_event_batch_item(0, 0, None, 0, events_batch_1);
         let event_batch_item_2 = create_event_batch_item(0, 0, None, 0, events_batch_2);
 
-        let last_si_1 = storage.write(&events_bin.to_str().unwrap(), true, event_batch_item_1).unwrap();
+        let last_si_1 = storage.write(&events_bin.to_str().unwrap(), true, false, event_batch_item_1).unwrap();
         assert_eq!(last_si_1, 0);
 
-        let last_si_2 = storage.write(&events_bin_2.to_str().unwrap(), true, event_batch_item_2).unwrap();
+        let last_si_2 = storage.write(&events_bin_2.to_str().unwrap(), true, false, event_batch_item_2).unwrap();
         assert_eq!(last_si_2, 0);
 
         let file1 = storage.read(&events_bin.to_str().unwrap(), 0, 100, None, None).unwrap();
@@ -444,7 +516,6 @@ mod tests {
 
         assert_eq!(file1.flatten_events().len(), 3);
         assert_eq!(file2.flatten_events().len(), 2);
-
     }
 
     // Ensure the read also does a recovery on crash check
@@ -462,12 +533,12 @@ mod tests {
         let event_batch_item_1 = create_event_batch_item(0, 0, None, 0, events_batch_1);
         let event_batch_item_2 = create_event_batch_item(0, 0, None, 0, events_batch_2);
 
-        let last_si = storage.write(&events_bin.to_str().unwrap(), true, event_batch_item_1).unwrap();
+        let last_si = storage.write(&events_bin.to_str().unwrap(), true, false, event_batch_item_1).unwrap();
         assert_eq!(last_si, 0);
 
         let file_length = fs::metadata(&events_bin).unwrap().len();
 
-        let last_si = storage.write(&events_bin.to_str().unwrap(), true, event_batch_item_2).unwrap();
+        let last_si = storage.write(&events_bin.to_str().unwrap(), true, false, event_batch_item_2).unwrap();
         assert_eq!(last_si, 1);
 
         // simulate crash by writing the transaction file with the prev len
@@ -478,7 +549,6 @@ mod tests {
 
         let events_from_0 = storage.read(&events_bin.to_str().unwrap(), 0, 100, None, None).unwrap();
         assert_eq!(events_from_0.flatten_events().len(), 3);
-        
     }
 
     // Ensure the write does a recovery on crash check (re-write scenario)
@@ -499,13 +569,13 @@ mod tests {
         let event_batch_item_2 = create_event_batch_item(0, 0, None, 0, events_batch_2);
         let event_batch_item_3 = create_event_batch_item(0, 0, None, 0, events_batch_3);
 
-        let last_si = storage.write(&events_bin.to_str().unwrap(), true, event_batch_item_1).unwrap();
+        let last_si = storage.write(&events_bin.to_str().unwrap(), true, false, event_batch_item_1).unwrap();
         assert_eq!(last_si, 0);
 
         // store file len here
         let file_length = fs::metadata(&events_bin).unwrap().len();
 
-        let last_si = storage.write(&events_bin.to_str().unwrap(), true, event_batch_item_2.clone()).unwrap();
+        let last_si = storage.write(&events_bin.to_str().unwrap(), true, false, event_batch_item_2.clone()).unwrap();
         assert_eq!(last_si, 1);
 
         // simulate crash by writing the transaction file with the prev len
@@ -513,12 +583,11 @@ mod tests {
         storage.write_transaction_value(&transaction_path, file_length).unwrap();
 
         // try write again
-        let last_si = storage.write(&events_bin.to_str().unwrap(), true, event_batch_item_2).unwrap();
+        let last_si = storage.write(&events_bin.to_str().unwrap(), true, false, event_batch_item_2).unwrap();
         assert_eq!(last_si, 1);
 
-        let last_si = storage.write(&events_bin.to_str().unwrap(), true, event_batch_item_3).unwrap();
+        let last_si = storage.write(&events_bin.to_str().unwrap(), true, false, event_batch_item_3).unwrap();
         assert_eq!(last_si, 2);
-
 
         // Same assertions as above round trip test, no duplicate write
         let events_from_3 = storage.read(&events_bin.to_str().unwrap(), 1, 40000, None, None).unwrap();
@@ -531,8 +600,10 @@ mod tests {
 
         assert_eq!(events_from_3.flatten_events()[1].string_values.as_ref().unwrap()[1].as_ref().unwrap(), "World");
 
-        assert_eq!(str_compare_value, *events_from_3.flatten_events()[0].string_values.as_ref().unwrap()[4].as_ref().unwrap());
-
+        assert_eq!(
+            str_compare_value,
+            *events_from_3.flatten_events()[0].string_values.as_ref().unwrap()[4].as_ref().unwrap()
+        );
     }
 
     #[test]
@@ -545,12 +616,12 @@ mod tests {
 
         let events_batch_1 = vec![create_test_event_item(), create_minimal_event_item()];
         let events_batch_2 = vec![create_test_event_item()];
-        
+
         let event_batch_item_1 = create_event_batch_item(0, 0, None, 0, events_batch_1);
         let event_batch_item_2 = create_event_batch_item(0, 0, None, 0, events_batch_2);
 
-        storage.write(&events_bin.to_str().unwrap(), true, event_batch_item_1.clone()).unwrap();
-        storage.write(&events_bin.to_str().unwrap(), true, event_batch_item_2.clone()).unwrap();
+        storage.write(&events_bin.to_str().unwrap(), true, false, event_batch_item_1.clone()).unwrap();
+        storage.write(&events_bin.to_str().unwrap(), true, false, event_batch_item_2.clone()).unwrap();
 
         // Read events from memory cache
         let cached_events = storage.read(&events_bin.to_str().unwrap(), 0, 1000000, None, None).unwrap();
@@ -580,29 +651,26 @@ mod tests {
         let events_batch_1 = vec![create_test_event_item(), create_minimal_event_item()];
         let events_batch_2 = vec![create_test_event_item()];
         let events_batch_3 = vec![create_minimal_event_item()];
-        
+
         let event_batch_item_1 = create_event_batch_item(0, 0, None, 123, events_batch_1);
         let event_batch_item_2 = create_event_batch_item(0, 0, None, 456, events_batch_2);
         let event_batch_item_3 = create_event_batch_item(0, 0, None, 789, events_batch_3);
 
         // Write first two batches
-        let last_si = storage.write(file_path, true, event_batch_item_1).unwrap();
+        let last_si = storage.write(file_path, true, false, event_batch_item_1).unwrap();
         assert_eq!(last_si, 0);
-        let last_si = storage.write(file_path, true, event_batch_item_2).unwrap();
+        let last_si = storage.write(file_path, true, false, event_batch_item_2).unwrap();
         assert_eq!(last_si, 1);
 
         // Get file length after valid batches
         let valid_file_length = fs::metadata(&events_bin).unwrap().len();
 
         // Write third batch
-        let last_si = storage.write(file_path, true, event_batch_item_3).unwrap();
+        let last_si = storage.write(file_path, true, false, event_batch_item_3).unwrap();
         assert_eq!(last_si, 2);
 
         // Corrupt the file by truncating it in the middle of the third batch
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(file_path)
-            .unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(file_path).unwrap();
         file.set_len(valid_file_length + 50).unwrap(); // Truncate partway through third batch
 
         // Clear all caches to force re-reading from disk
@@ -619,10 +687,7 @@ mod tests {
         assert_eq!(recovered_file_length, valid_file_length);
 
         // Re-corrupt the file for next test
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(file_path)
-            .unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(file_path).unwrap();
         file.set_len(valid_file_length + 50).unwrap();
         storage.file_cache.remove(file_path);
         storage.last_si_cache.remove(file_path);
@@ -640,17 +705,14 @@ mod tests {
         assert_eq!(recovered_file_length, valid_file_length);
 
         // Re-corrupt the file for final test
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(file_path)
-            .unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(file_path).unwrap();
         file.set_len(valid_file_length + 50).unwrap();
         storage.file_cache.remove(file_path);
         storage.last_si_cache.remove(file_path);
 
         // Test 3: write should recover and then successfully write new batch
         let new_event_batch = create_event_batch_item(0, 0, None, 999, vec![create_test_event_item()]);
-        let last_si = storage.write(file_path, true, new_event_batch).unwrap();
+        let last_si = storage.write(file_path, true, false, new_event_batch).unwrap();
         assert_eq!(last_si, 2); // Should be SI 2 after recovery
 
         // Verify we can read all three batches (original 2 + new 1)
@@ -692,9 +754,9 @@ mod tests {
         let event_batch_item_2 = create_event_batch_item(0, 0, None, 0, events_batch_2);
         let event_batch_item_3 = create_event_batch_item(0, 0, None, 0, events_batch_3);
 
-        storage.write(file_path, true, event_batch_item_1).unwrap();
-        storage.write(file_path, true, event_batch_item_2).unwrap();
-        storage.write(file_path, true, event_batch_item_3).unwrap();
+        storage.write(file_path, true, false, event_batch_item_1).unwrap();
+        storage.write(file_path, true, false, event_batch_item_2).unwrap();
+        storage.write(file_path, true, false, event_batch_item_3).unwrap();
 
         // Read with TP = 100, should only return batch 2
         let result = storage.read(file_path, 0, 1000, Some(&[100]), None).unwrap();
@@ -747,8 +809,8 @@ mod tests {
             let event_batch_item_2 = create_event_batch_item(0, 0, None, 0, events_batch_2);
 
             // Write the batches
-            storage.write(file_path, true, event_batch_item_1).unwrap();
-            storage.write(file_path, true, event_batch_item_2).unwrap();
+            storage.write(file_path, true, false, event_batch_item_1).unwrap();
+            storage.write(file_path, true, false, event_batch_item_2).unwrap();
 
             // Attempt to read with max_bytes such that only the first batch fits
             let result = storage.read(file_path, 0, 50, Some(&[100]), None).unwrap();
@@ -760,5 +822,117 @@ mod tests {
             assert_eq!(result.flatten_events()[0].event_type, 100);
             assert_eq!(result.next_server_id, Some(1));
         }
+    }
+
+    #[test]
+    fn test_duplicate_event_prevention() {
+        let mut storage = EventStorageCache::new(0, 0, 0);
+
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let temp_path = temp_dir.path();
+        let events_bin = temp_path.join("events.bin");
+        let file_path = events_bin.to_str().unwrap();
+
+        let client_id = 12345u128;
+
+        // Create events with specific local indices
+        let mut event1 = create_test_event_item();
+        let mut event2 = create_minimal_event_item();
+        let mut event3 = create_test_event_item();
+
+        event1.local_index = 1;
+        event2.local_index = 2;
+        event3.local_index = 3;
+
+        // First write: events with local indices 1, 2, 3
+        let events_batch_1 = vec![event1.clone(), event2.clone(), event3.clone()];
+        let event_batch_item_1 = create_event_batch_item(0, client_id, None, 0, events_batch_1);
+
+        let last_si = storage.write(file_path, true, false, event_batch_item_1).unwrap();
+        assert_eq!(last_si, 0);
+
+        // Verify all 3 events were written
+        let result = storage.read(file_path, 0, usize::MAX, None, None).unwrap();
+        assert_eq!(result.flatten_events().len(), 3);
+        assert_eq!(result.event_batches[0].client_id, client_id);
+
+        // Second write: attempt to write events with local indices 2, 3, 4
+        // Events 2 and 3 should be filtered out as duplicates, only 4 should be written
+        let mut event4 = create_minimal_event_item();
+        event4.local_index = 4;
+
+        let mut duplicate_event2 = event2.clone();
+        let mut duplicate_event3 = event3.clone();
+        duplicate_event2.local_index = 2; // Already written
+        duplicate_event3.local_index = 3; // Already written
+
+        let events_batch_2 = vec![duplicate_event2, duplicate_event3, event4.clone()];
+        let event_batch_item_2 = create_event_batch_item(0, client_id, None, 0, events_batch_2);
+
+        let last_si = storage.write(file_path, true, false, event_batch_item_2).unwrap();
+        assert_eq!(last_si, 1);
+
+        // Verify only 1 new event was added (event with local_index 4)
+        let result = storage.read(file_path, 0, usize::MAX, None, None).unwrap();
+        assert_eq!(result.flatten_events().len(), 4); // 3 from first batch + 1 from second
+        assert_eq!(result.event_batches.len(), 2);
+        assert_eq!(result.event_batches[1].events.len(), 1); // Only 1 event in second batch after filtering
+        assert_eq!(result.event_batches[1].events[0].local_index, 4);
+
+        // Third write: attempt to write an event with local index 3 again (should be filtered out)
+        let mut old_event = create_test_event_item();
+        old_event.local_index = 3; // This should be filtered out
+
+        let events_batch_3 = vec![old_event];
+        let event_batch_item_3 = create_event_batch_item(0, client_id, None, 0, events_batch_3);
+
+        // This write should still succeed but create an empty batch (no events after filtering)
+        let write_result = storage.write(file_path, false, true, event_batch_item_3);
+        assert!(write_result.is_err());
+        let error = write_result.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        // Verify no new events were added
+        let result = storage.read(file_path, 0, usize::MAX, None, None).unwrap();
+        assert_eq!(result.flatten_events().len(), 4); // Still 4 events total
+        assert_eq!(result.event_batches.len(), 2);
+    }
+
+    #[test]
+    fn test_different_clients_can_write_same_local_index() {
+        let mut storage = EventStorageCache::new(30, 1000000, 10000);
+
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let temp_path = temp_dir.path();
+        let events_bin = temp_path.join("events.bin");
+        let file_path = events_bin.to_str().unwrap();
+
+        let client_id_1 = 11111u128;
+        let client_id_2 = 22222u128;
+
+        // Client 1 writes event with local_index 1
+        let mut event1 = create_test_event_item();
+        event1.local_index = 1;
+        let events_batch_1 = vec![event1];
+        let event_batch_item_1 = create_event_batch_item(0, client_id_1, None, 0, events_batch_1);
+
+        storage.write(file_path, true, false, event_batch_item_1).unwrap();
+
+        // Client 2 writes event with same local_index 1 (should be allowed)
+        let mut event2 = create_minimal_event_item();
+        event2.local_index = 1;
+        let events_batch_2 = vec![event2];
+        let event_batch_item_2 = create_event_batch_item(0, client_id_2, None, 0, events_batch_2);
+
+        storage.write(file_path, true, false, event_batch_item_2).unwrap();
+
+        // Verify both events were written (different clients can have same local_index)
+        let result = storage.read(file_path, 0, usize::MAX, None, None).unwrap();
+        assert_eq!(result.flatten_events().len(), 2);
+        assert_eq!(result.event_batches.len(), 2);
+        assert_eq!(result.event_batches[0].client_id, client_id_1);
+        assert_eq!(result.event_batches[1].client_id, client_id_2);
+        assert_eq!(result.event_batches[0].events[0].local_index, 1);
+        assert_eq!(result.event_batches[1].events[0].local_index, 1);
     }
 }

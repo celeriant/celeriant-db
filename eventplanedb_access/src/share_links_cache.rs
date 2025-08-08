@@ -72,7 +72,7 @@ impl ShareLinksCache {
             0,
             usize::MAX,
             Some(&[AggregateEventType::ShareLinkCreated as u64, AggregateEventType::ShareLinkDisabled as u64]),
-            None
+            None,
         ) {
             Ok(result) => {
                 for event_batch_item in result.event_batches {
@@ -151,7 +151,7 @@ impl ShareLinksCache {
         event_batch_item.server_date = server_time;
 
         // We don't allow auto create of the aggregate here as there should already be user access events added and file created
-        event_batch_item.server_id = event_storage_cache.write(&file_path, false, event_batch_item.clone())?;
+        event_batch_item.server_id = event_storage_cache.write(&file_path, false, true, event_batch_item.clone())?;
 
         let share_link_info = ShareLinkAccessInfo::new(access_level, share_id, is_single_use, expires_on);
 
@@ -212,7 +212,7 @@ impl ShareLinksCache {
         event_batch_item.user_id = current_user_id.map(|f| f.to_string());
         event_batch_item.server_date = server_time;
 
-        event_batch_item.server_id = event_storage_cache.write(&file_path, false, event_batch_item.clone())?;
+        event_batch_item.server_id = event_storage_cache.write(&file_path, false, true, event_batch_item.clone())?;
 
         let cache = self.get_or_build_cache(event_storage_cache, &file_path);
         cache.remove_share_link(&share_id);
@@ -253,13 +253,7 @@ mod tests {
     }
 
     // Helper function to create a mock AddShareLink EventItem
-    fn create_add_share_link_event(
-        share_id: u128,
-        access_level: AccessLevel,
-        is_single_use: bool,
-        expires_on: u64,
-        description: Option<String>,
-    ) -> EventItem {
+    fn create_add_share_link_event(share_id: u128, access_level: AccessLevel, is_single_use: bool, expires_on: u64, description: Option<String>) -> EventItem {
         let current_time = chrono::Utc::now().timestamp_millis() as u64;
 
         let mut event_item = EventItem::new();
@@ -402,8 +396,8 @@ mod tests {
         let event_batch_1 = create_event_batch_item_with_events(vec![event1], 123, "admin");
         let event_batch_2 = create_event_batch_item_with_events(vec![event2], 123, "admin");
 
-        event_storage_cache.write(&file_path, true, event_batch_1).unwrap();
-        event_storage_cache.write(&file_path, true, event_batch_2).unwrap();
+        event_storage_cache.write(&file_path, true, true, event_batch_1).unwrap();
+        event_storage_cache.write(&file_path, true, true, event_batch_2).unwrap();
 
         // Populate cache for the project
         share_links_cache.cache.insert(file_path.clone(), AggregateToShareLinks::new());
@@ -433,8 +427,8 @@ mod tests {
         let event_batch_1 = create_event_batch_item_with_events(vec![event1], 123, "admin");
         let event_batch_2 = create_event_batch_item_with_events(vec![event2], 123, "admin");
 
-        event_storage_cache.write(&file_path, true, event_batch_1).unwrap();
-        event_storage_cache.write(&file_path, true, event_batch_2).unwrap();
+        event_storage_cache.write(&file_path, true, true, event_batch_1).unwrap();
+        event_storage_cache.write(&file_path, true, true, event_batch_2).unwrap();
 
         // Populate cache for the project
         share_links_cache.cache.insert(file_path.clone(), AggregateToShareLinks::new());
@@ -461,9 +455,9 @@ mod tests {
         let event_batch_2 = create_event_batch_item_with_events(vec![event2], 123, "admin");
         let event_batch_3 = create_event_batch_item_with_events(vec![event3], 123, "admin");
 
-        event_storage_cache.write(&file_path, true, event_batch_1).unwrap();
-        event_storage_cache.write(&file_path, true, event_batch_2).unwrap();
-        event_storage_cache.write(&file_path, true, event_batch_3).unwrap();
+        event_storage_cache.write(&file_path, true, true, event_batch_1).unwrap();
+        event_storage_cache.write(&file_path, true, true, event_batch_2).unwrap();
+        event_storage_cache.write(&file_path, true, true, event_batch_3).unwrap();
 
         // Populate cache for the project
         share_links_cache.cache.insert(file_path.clone(), AggregateToShareLinks::new());
@@ -492,9 +486,9 @@ mod tests {
         let event_batch_1 = create_event_batch_item_with_events(vec![event1], 123, "admin");
         let event_batch_2 = create_event_batch_item_with_events(vec![event2], 123, "admin");
         let event_batch_3 = create_event_batch_item_with_events(vec![event3], 123, "admin");
-        event_storage_cache.write(&file_path, true, event_batch_1).unwrap();
-        event_storage_cache.write(&file_path, true, event_batch_2).unwrap();
-        event_storage_cache.write(&file_path, true, event_batch_3).unwrap();
+        event_storage_cache.write(&file_path, true, true, event_batch_1).unwrap();
+        event_storage_cache.write(&file_path, true, true, event_batch_2).unwrap();
+        event_storage_cache.write(&file_path, true, true, event_batch_3).unwrap();
 
         // Populate cache for the project
         share_links_cache.cache.insert(file_path.clone(), AggregateToShareLinks::new());
@@ -532,7 +526,7 @@ mod tests {
             server_date: chrono::Utc::now().timestamp_millis() as u64,
             events: vec![],
         };
-        event_storage_cache.write(&file_path, true, event_batch).unwrap();
+        event_storage_cache.write(&file_path, true, true, event_batch).unwrap();
 
         // Populate the cache
         share_links_cache.cache.insert(file_path.clone(), AggregateToShareLinks::new());
@@ -620,7 +614,7 @@ mod tests {
             server_date: 0,
             events: vec![first_event],
         };
-        event_storage_cache.write(&file_path, true, first_batch).unwrap();
+        event_storage_cache.write(&file_path, true, true, first_batch).unwrap();
 
         let none_check = share_links_cache.get_share_key_data_if_still_valid(&mut event_storage_cache, &file_path, &share_id);
         assert!(none_check.is_none());
@@ -731,7 +725,7 @@ mod tests {
             server_date: 0,
             events: vec![first_event],
         };
-        event_storage_cache.write(&file_path, true, first_batch).unwrap();
+        event_storage_cache.write(&file_path, true, true, first_batch).unwrap();
 
         // Create a share link and add it to the cache
         let mut project_cache = AggregateToShareLinks::new();
@@ -740,14 +734,7 @@ mod tests {
         share_links_cache.cache.insert(file_path.clone(), project_cache);
 
         // Disable the share link
-        let result = share_links_cache.disable_share_link(
-            &mut event_storage_cache,
-            &file_path,
-            &1,
-            Some(current_user_hash),
-            share_id,
-            999,
-        );
+        let result = share_links_cache.disable_share_link(&mut event_storage_cache, &file_path, &1, Some(current_user_hash), share_id, 999);
 
         // Verify that the event was created successfully
         assert!(result.is_ok());

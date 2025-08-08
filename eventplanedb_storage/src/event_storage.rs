@@ -39,6 +39,11 @@ pub fn append_event_batch(writer: &mut BufWriter<File>, event_batch_item: &Event
     };
     write_buffer.extend_from_slice(&tp.to_le_bytes());
 
+    // Write the clients last local index (8 bytes)
+    // This helps the server to stop the client from writing duplicate events
+    let last_local_index = event_batch_item.events.last().map_or(0, |e| e.local_index);
+    write_buffer.extend_from_slice(&last_local_index.to_le_bytes());
+
     // We need the si of the first event in the batch to determine which batch to start the catch-up process from
     write_buffer.extend_from_slice(&event_batch_item.server_id.to_le_bytes());
 
@@ -91,10 +96,11 @@ const MAGIC_NUMBER: u64 = 0xDEADBEEFCAFEBABE;
 const BATCH_START_SIZE: u64 = 8;
 const BATCH_METADATA_SIZE: u64 = UNCOMPRESSED_BATCH_SIZE_OFFSET;
 
-const UNCOMPRESSED_BATCH_SIZE_OFFSET: u64 = 56;
-const EVENT_TYPE_OFFSET: u64 = 48;
+const UNCOMPRESSED_BATCH_SIZE_OFFSET: u64 = 64;
+const EVENT_TYPE_OFFSET: u64 = 56;
+const LOCAL_INDEX_OFFSET: u64 = 48;
 const SERVER_ID_OFFSET: u64 = 40;
-const CLIENT_ID_OFFSET: u64 = 24;
+const CLIENT_ID_OFFSET: u64 = 32;
 const BATCH_START_POS_OFFSET: u64 = 16;
 const MAGIC_NUMBER_OFFSET: u64 = 8;
 
@@ -151,6 +157,35 @@ pub fn find_last_si(mut reader: &mut BufReader<File>) -> io::Result<Option<u64>>
     let last_si = read_u64_at_offset(&mut reader, file_size, SERVER_ID_OFFSET)?;
 
     Ok(Some(last_si))
+}
+
+pub fn find_last_li(mut reader: &mut BufReader<File>, client_id: u128) -> io::Result<Option<u64>> {
+    let file_size = reader.get_ref().metadata()?.len();
+
+    if file_size < BATCH_METADATA_SIZE {
+        return Ok(None);
+    }
+
+    let mut current_pos = file_size;
+
+    // Scan backwards through the file to find the last batch from this client
+    while current_pos >= BATCH_METADATA_SIZE {
+        if is_batch_corrupt(&mut reader, current_pos) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Batch data is corrupt, file recovery needed"));
+        }
+
+        let batch_client_id = read_u128_at_offset(reader, current_pos, CLIENT_ID_OFFSET)?;
+
+        if batch_client_id == client_id {
+            let last_li = read_u64_at_offset(&mut reader, current_pos, LOCAL_INDEX_OFFSET)?;
+            return Ok(Some(last_li));
+        }
+
+        let batch_start_pos = read_u64_at_offset(&mut reader, current_pos, BATCH_START_POS_OFFSET)?;
+        current_pos = batch_start_pos;
+    }
+
+    Ok(None)
 }
 
 fn is_batch_corrupt(mut reader: &mut BufReader<File>, current_pos: u64) -> bool {
@@ -346,19 +381,19 @@ pub mod tests {
 
         let current_file_size = reader.get_ref().metadata().unwrap().len();
 
-        let catchup_result = read_from_si(&mut reader, 0, current_file_size as usize + 78, None, None).unwrap();
+        let catchup_result = read_from_si(&mut reader, 0, current_file_size as usize + 86, None, None).unwrap();
 
         assert_eq!(catchup_result.event_batches.len(), 2);
         assert_eq!(catchup_result.next_server_id, Some(2));
 
         append_event_batch(&mut writer, &events_batch_3).unwrap();
 
-        let catchup_result = read_from_si(&mut reader, 0, current_file_size as usize + 78, None, None).unwrap();
+        let catchup_result = read_from_si(&mut reader, 0, current_file_size as usize + 86, None, None).unwrap();
 
         assert_eq!(catchup_result.event_batches.len(), 2);
         assert_eq!(catchup_result.next_server_id, Some(2));
 
-        let catchup_result = read_from_si(&mut reader, 0, current_file_size as usize + 336, None, None).unwrap();
+        let catchup_result = read_from_si(&mut reader, 0, current_file_size as usize + 396, None, None).unwrap();
 
         assert_eq!(catchup_result.event_batches.len(), 3);
         assert_eq!(catchup_result.next_server_id, None);
@@ -582,5 +617,163 @@ pub mod tests {
 
         // Should return 0 since no valid batches found
         assert_eq!(last_valid_pos, 0);
+    }
+
+    #[test]
+    fn test_find_last_li_not_found() {
+        let events_batch_1 = create_event_batch_item(0, 123, None, 123, vec![create_test_event_item()]);
+        let events_batch_2 = create_event_batch_item(1, 456, None, 456, vec![create_test_event_item()]);
+
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let temp_path = temp_dir.path();
+        let events_bin = temp_path.join("events.bin");
+
+        let mut writer = create_append_writer(events_bin.to_str().unwrap()).unwrap();
+
+        append_event_batch(&mut writer, &events_batch_1).unwrap();
+        append_event_batch(&mut writer, &events_batch_2).unwrap();
+
+        let mut reader = create_reader(events_bin.to_str().unwrap()).unwrap();
+
+        // Try to find last local index for a client that doesn't exist
+        let last_li = find_last_li(&mut reader, 999).unwrap();
+        assert_eq!(last_li, None);
+    }
+
+    #[test]
+    fn test_li_simple() {
+        let mut event1 = create_test_event_item();
+        event1.local_index = 10;
+        let events_batch_1 = create_event_batch_item(0, 123, None, 100, vec![event1]);
+
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let temp_path = temp_dir.path();
+        let events_bin = temp_path.join("events.bin");
+
+        let mut writer = create_append_writer(events_bin.to_str().unwrap()).unwrap();
+
+        append_event_batch(&mut writer, &events_batch_1).unwrap();
+
+        let mut reader = create_reader(events_bin.to_str().unwrap()).unwrap();
+
+        // Find last local index for client 123 - should return 40 (from the last batch)
+        let last_li = find_last_li(&mut reader, 123).unwrap();
+        assert_eq!(last_li, Some(10));
+    }
+
+    #[test]
+    fn test_find_last_li_multiple_clients() {
+        // Create events with different local indexes for different clients
+        let mut event1 = create_test_event_item();
+        event1.local_index = 10;
+        let mut event2 = create_test_event_item();
+        event2.local_index = 20;
+        let mut event3 = create_test_event_item();
+        event3.local_index = 30;
+
+        let mut event4 = create_test_event_item();
+        event4.local_index = 15;
+        let mut event5 = create_test_event_item();
+        event5.local_index = 25;
+
+        // Client 123 batches
+        let events_batch_1 = create_event_batch_item(0, 123, None, 100, vec![event1, event2]);
+        let events_batch_2 = create_event_batch_item(1, 123, None, 200, vec![event3.clone()]);
+
+        // Client 456 batches
+        let events_batch_3 = create_event_batch_item(2, 456, None, 150, vec![event4]);
+        let events_batch_4 = create_event_batch_item(3, 456, None, 250, vec![event5.clone()]);
+
+        // Another batch from client 123 (should be the last one found)
+        let mut event6 = create_test_event_item();
+        event6.local_index = 40;
+        let events_batch_5 = create_event_batch_item(4, 123, None, 300, vec![event6.clone()]);
+
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let temp_path = temp_dir.path();
+        let events_bin = temp_path.join("events.bin");
+
+        let mut writer = create_append_writer(events_bin.to_str().unwrap()).unwrap();
+
+        append_event_batch(&mut writer, &events_batch_1).unwrap();
+        append_event_batch(&mut writer, &events_batch_2).unwrap();
+        append_event_batch(&mut writer, &events_batch_3).unwrap();
+        append_event_batch(&mut writer, &events_batch_4).unwrap();
+        append_event_batch(&mut writer, &events_batch_5).unwrap();
+
+        let mut reader = create_reader(events_bin.to_str().unwrap()).unwrap();
+
+        // Find last local index for client 123 - should return 40 (from the last batch)
+        let last_li = find_last_li(&mut reader, 123).unwrap();
+        assert_eq!(last_li, Some(40));
+
+        // Find last local index for client 456 - should return 25
+        let last_li = find_last_li(&mut reader, 456).unwrap();
+        assert_eq!(last_li, Some(25));
+    }
+
+    #[test]
+    fn test_exclude_client_id_filter() {
+        let mut event1 = create_test_event_item();
+        event1.local_index = 10;
+        let mut event2 = create_test_event_item();
+        event2.local_index = 20;
+        let mut event3 = create_test_event_item();
+        event3.local_index = 30;
+        let mut event4 = create_test_event_item();
+        event4.local_index = 40;
+
+        // Create batches from different clients
+        let events_batch_1 = create_event_batch_item(0, 123, None, 100, vec![event1]); // Client 123
+        let events_batch_2 = create_event_batch_item(1, 456, None, 200, vec![event2]); // Client 456
+        let events_batch_3 = create_event_batch_item(2, 123, None, 300, vec![event3]); // Client 123 again
+        let events_batch_4 = create_event_batch_item(3, 789, None, 400, vec![event4]); // Client 789
+
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let temp_path = temp_dir.path();
+        let events_bin = temp_path.join("events.bin");
+
+        let mut writer = create_append_writer(events_bin.to_str().unwrap()).unwrap();
+
+        append_event_batch(&mut writer, &events_batch_1).unwrap();
+        append_event_batch(&mut writer, &events_batch_2).unwrap();
+        append_event_batch(&mut writer, &events_batch_3).unwrap();
+        append_event_batch(&mut writer, &events_batch_4).unwrap();
+
+        let mut reader = create_reader(events_bin.to_str().unwrap()).unwrap();
+
+        // Test excluding client 123 - should return only batches from clients 456 and 789
+        let result = read_from_si(&mut reader, 0, usize::MAX, None, Some(123)).unwrap();
+
+        assert_eq!(result.event_batches.len(), 2);
+        assert_eq!(result.event_batches[0].client_id, 456);
+        assert_eq!(result.event_batches[0].server_id, 1);
+        assert_eq!(result.event_batches[1].client_id, 789);
+        assert_eq!(result.event_batches[1].server_id, 3);
+
+        // Test excluding client 456 - should return batches from clients 123 and 789
+        let result = read_from_si(&mut reader, 0, usize::MAX, None, Some(456)).unwrap();
+
+        assert_eq!(result.event_batches.len(), 3);
+        assert_eq!(result.event_batches[0].client_id, 123);
+        assert_eq!(result.event_batches[0].server_id, 0);
+        assert_eq!(result.event_batches[1].client_id, 123);
+        assert_eq!(result.event_batches[1].server_id, 2);
+        assert_eq!(result.event_batches[2].client_id, 789);
+        assert_eq!(result.event_batches[2].server_id, 3);
+
+        // Test with no exclusion - should return all batches
+        let result = read_from_si(&mut reader, 0, usize::MAX, None, None).unwrap();
+
+        assert_eq!(result.event_batches.len(), 4);
+        assert_eq!(result.event_batches[0].client_id, 123);
+        assert_eq!(result.event_batches[1].client_id, 456);
+        assert_eq!(result.event_batches[2].client_id, 123);
+        assert_eq!(result.event_batches[3].client_id, 789);
+
+        // Test excluding non-existent client - should return all batches
+        let result = read_from_si(&mut reader, 0, usize::MAX, None, Some(999)).unwrap();
+
+        assert_eq!(result.event_batches.len(), 4);
     }
 }

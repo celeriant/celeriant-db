@@ -150,7 +150,7 @@ impl UserAccessCache {
         event_batch_item.user_id = current_user_id.map(|f| f.to_string());
         event_batch_item.server_date = server_time;
 
-        event_batch_item.server_id = event_storage_cache.write(file_path, false, event_batch_item.clone())?;
+        event_batch_item.server_id = event_storage_cache.write(file_path, false, true, event_batch_item.clone())?;
 
         let aggregate_to_user_access_level = self.get_or_build_cache(event_storage_cache, file_path);
         aggregate_to_user_access_level.update_cache_for_user(for_client_id, for_user_id, potential_access_level, allow_downgrade);
@@ -343,9 +343,9 @@ mod tests {
         let event_batch_2 = create_event_batch_item_with_events(vec![event2], "admin");
         let event_batch_3 = create_event_batch_item_with_events(vec![event3], "admin");
 
-        event_storage_cache.write(&file_path, true, event_batch_1).unwrap();
-        event_storage_cache.write(&file_path, true, event_batch_2).unwrap();
-        event_storage_cache.write(&file_path, true, event_batch_3).unwrap();
+        event_storage_cache.write(&file_path, true, true, event_batch_1).unwrap();
+        event_storage_cache.write(&file_path, true, true, event_batch_2).unwrap();
+        event_storage_cache.write(&file_path, true, true, event_batch_3).unwrap();
 
         // Populate cache for the project
         user_access_cache.cache.insert(file_path.clone(), AggregateToUserAccessLevel::new());
@@ -373,9 +373,9 @@ mod tests {
         let event_batch_2 = create_event_batch_item_with_events(vec![event2], "admin");
         let event_batch_3 = create_event_batch_item_with_events(vec![event3], "admin");
 
-        event_storage_cache.write(&file_path, true, event_batch_1).unwrap();
-        event_storage_cache.write(&file_path, true, event_batch_2).unwrap();
-        event_storage_cache.write(&file_path, true, event_batch_3).unwrap();
+        event_storage_cache.write(&file_path, true, true, event_batch_1).unwrap();
+        event_storage_cache.write(&file_path, true, true, event_batch_2).unwrap();
+        event_storage_cache.write(&file_path, true, true, event_batch_3).unwrap();
 
         // Populate cache for the project
         user_access_cache.cache.insert(file_path.clone(), AggregateToUserAccessLevel::new());
@@ -401,8 +401,8 @@ mod tests {
 
         let event_batch_1 = create_event_batch_item_with_events(vec![event1], "admin");
         let event_batch_2 = create_event_batch_item_with_events(vec![event2], "admin");
-        event_storage_cache.write(&file_path, true, event_batch_1).unwrap();
-        event_storage_cache.write(&file_path, true, event_batch_2).unwrap();
+        event_storage_cache.write(&file_path, true, true, event_batch_1).unwrap();
+        event_storage_cache.write(&file_path, true, true, event_batch_2).unwrap();
 
         // Populate cache for the project
         user_access_cache.cache.insert(file_path.clone(), AggregateToUserAccessLevel::new());
@@ -423,7 +423,7 @@ mod tests {
         event.string_values = None;
 
         let event_batch = create_event_batch_item_with_events(vec![event], "admin");
-        event_storage_cache.write(&file_path, true, event_batch).unwrap();
+        event_storage_cache.write(&file_path, true, true, event_batch).unwrap();
 
         // Populate the cache
         user_access_cache.cache.insert(file_path.clone(), AggregateToUserAccessLevel::new());
@@ -444,7 +444,7 @@ mod tests {
         event.uint_values = None;
 
         let event_batch = create_event_batch_item_with_events(vec![event], "admin");
-        event_storage_cache.write(&file_path, true, event_batch).unwrap();
+        event_storage_cache.write(&file_path, true, true, event_batch).unwrap();
 
         // Populate the cache
         user_access_cache.cache.insert(file_path.clone(), AggregateToUserAccessLevel::new());
@@ -470,8 +470,8 @@ mod tests {
 
         let event_batch_1 = create_event_batch_item_with_events(vec![event1], "admin");
         let event_batch_2 = create_event_batch_item_with_events(vec![event2], "admin");
-        event_storage_cache.write(&file_path, true, event_batch_1).unwrap();
-        event_storage_cache.write(&file_path, true, event_batch_2).unwrap();
+        event_storage_cache.write(&file_path, true, true, event_batch_1).unwrap();
+        event_storage_cache.write(&file_path, true, true, event_batch_2).unwrap();
 
         // Populate the cache
         user_access_cache.cache.insert(file_path.clone(), AggregateToUserAccessLevel::new());
@@ -492,7 +492,7 @@ mod tests {
         event.string_values = Some(vec![None, Some("share_key".to_string())]);
 
         let event_batch = create_event_batch_item_with_events(vec![event], "admin");
-        event_storage_cache.write(&file_path, true, event_batch).unwrap();
+        event_storage_cache.write(&file_path, true, true, event_batch).unwrap();
 
         // Populate the cache
         user_access_cache.cache.insert(file_path.clone(), AggregateToUserAccessLevel::new());
@@ -532,7 +532,7 @@ mod tests {
             server_date: chrono::Utc::now().timestamp_millis() as u64,
             events: vec![],
         };
-        event_storage_cache.write(&file_path, true, event_batch).unwrap();
+        event_storage_cache.write(&file_path, true, true, event_batch).unwrap();
 
         // Populate the cache
         user_access_cache.cache.insert(file_path.clone(), AggregateToUserAccessLevel::new());
@@ -557,9 +557,9 @@ mod tests {
         let event_batch_2 = create_event_batch_item_with_events(vec![event2], "admin");
         let event_batch_3 = create_event_batch_item_with_events(vec![event3], "admin");
 
-        event_storage_cache.write(&file_path, true, event_batch_1).unwrap();
-        event_storage_cache.write(&file_path, true, event_batch_2).unwrap();
-        event_storage_cache.write(&file_path, true, event_batch_3).unwrap();
+        event_storage_cache.write(&file_path, true, true, event_batch_1).unwrap();
+        event_storage_cache.write(&file_path, true, true, event_batch_2).unwrap();
+        event_storage_cache.write(&file_path, true, true, event_batch_3).unwrap();
 
         // Populate cache for the project
         user_access_cache.cache.insert(file_path.clone(), AggregateToUserAccessLevel::new());
@@ -729,7 +729,7 @@ mod tests {
             server_date: 0,
             events: vec![first_event],
         };
-        event_storage_cache.write(file_path, true, first_batch).unwrap();
+        event_storage_cache.write(file_path, true, true, first_batch).unwrap();
     }
 
     #[test]
@@ -810,7 +810,7 @@ mod tests {
     fn test_client_id_only_access_level_retrieval() {
         let (mut user_access_cache, mut event_storage_cache, temp_dir) = setup_cache(5);
         let file_path = create_file_path(&temp_dir, "project1.bin");
-        let _ = event_storage_cache.write(&file_path, true, initial_event());
+        let _ = event_storage_cache.write(&file_path, true, true, initial_event());
 
         // Create a project cache with client_id-only access (no user_id)
         let mut project_cache = AggregateToUserAccessLevel::new();
@@ -830,7 +830,7 @@ mod tests {
     fn test_different_oauth_users_same_client_id() {
         let (mut user_access_cache, mut event_storage_cache, temp_dir) = setup_cache(5);
         let file_path = create_file_path(&temp_dir, "project1.bin");
-        let _ = event_storage_cache.write(&file_path, true, initial_event());
+        let _ = event_storage_cache.write(&file_path, true, true, initial_event());
 
         let client_id = 54321;
         let mut project_cache = AggregateToUserAccessLevel::new();
@@ -856,7 +856,7 @@ mod tests {
     fn test_cross_device_access_with_oauth() {
         let (mut user_access_cache, mut event_storage_cache, temp_dir) = setup_cache(5);
         let file_path = create_file_path(&temp_dir, "project1.bin");
-        let _ = event_storage_cache.write(&file_path, true, initial_event());
+        let _ = event_storage_cache.write(&file_path, true, true, initial_event());
 
         let device1_client_id = 11111;
         let device2_client_id = 22222;
@@ -885,7 +885,7 @@ mod tests {
     fn test_allow_oauth_user_downgrading_self_across_client_ids() {
         let (mut user_access_cache, mut event_storage_cache, temp_dir) = setup_cache(5);
         let file_path = create_file_path(&temp_dir, "project1.bin");
-        let _ = event_storage_cache.write(&file_path, true, initial_event());
+        let _ = event_storage_cache.write(&file_path, true, true, initial_event());
 
         let client_id1 = 11111;
         let client_id2 = 22222;
@@ -939,7 +939,7 @@ mod tests {
     fn test_allow_oauth_user_upgrade_across_client_ids() {
         let (mut user_access_cache, mut event_storage_cache, temp_dir) = setup_cache(5);
         let file_path = create_file_path(&temp_dir, "project1.bin");
-        let _ = event_storage_cache.write(&file_path, true, initial_event());
+        let _ = event_storage_cache.write(&file_path, true, true, initial_event());
 
         let client_id1 = 11111;
         let client_id2 = 22222;
@@ -980,7 +980,7 @@ mod tests {
     fn test_pki_to_oauth_migration_workflow() {
         let (mut user_access_cache, mut event_storage_cache, temp_dir) = setup_cache(5);
         let file_path = create_file_path(&temp_dir, "project1.bin");
-        let _ = event_storage_cache.write(&file_path, true, initial_event());
+        let _ = event_storage_cache.write(&file_path, true, true, initial_event());
 
         let client_id = 12345;
 
@@ -1025,7 +1025,7 @@ mod tests {
     fn test_mixed_pki_and_oauth_users_in_same_project() {
         let (mut user_access_cache, mut event_storage_cache, temp_dir) = setup_cache(5);
         let file_path = create_file_path(&temp_dir, "project1.bin");
-        let _ = event_storage_cache.write(&file_path, true, initial_event());
+        let _ = event_storage_cache.write(&file_path, true, true, initial_event());
 
         let pki_client_id = 11111;
         let oauth_client_id = 22222;
@@ -1060,7 +1060,7 @@ mod tests {
     fn test_populate_cache_handles_mixed_pki_oauth_events() {
         let (mut user_access_cache, mut event_storage_cache, temp_dir) = setup_cache(5);
         let file_path = create_file_path(&temp_dir, "project1.bin");
-        let _ = event_storage_cache.write(&file_path, true, initial_event());
+        let _ = event_storage_cache.write(&file_path, true, true, initial_event());
 
         // Create mixed PKI and OAuth events
         let pki_event = create_provide_access_event_only_client(&11111, AccessLevel::Owner, Some(1));
@@ -1071,9 +1071,9 @@ mod tests {
         let event_batch_2 = create_event_batch_item_with_events(vec![oauth_event1], "admin");
         let event_batch_3 = create_event_batch_item_with_events(vec![oauth_event2], "admin");
 
-        event_storage_cache.write(&file_path, true, event_batch_1).unwrap();
-        event_storage_cache.write(&file_path, true, event_batch_2).unwrap();
-        event_storage_cache.write(&file_path, true, event_batch_3).unwrap();
+        event_storage_cache.write(&file_path, true, true, event_batch_1).unwrap();
+        event_storage_cache.write(&file_path, true, true, event_batch_2).unwrap();
+        event_storage_cache.write(&file_path, true, true, event_batch_3).unwrap();
 
         // Populate cache
         user_access_cache.cache.insert(file_path.clone(), AggregateToUserAccessLevel::new());
@@ -1095,7 +1095,7 @@ mod tests {
     fn test_populate_cache_handles_mixed_pki_oauth_events_2() {
         let (mut user_access_cache, mut event_storage_cache, temp_dir) = setup_cache(5);
         let file_path = create_file_path(&temp_dir, "project1.bin");
-        let _ = event_storage_cache.write(&file_path, true, initial_event());
+        let _ = event_storage_cache.write(&file_path, true, true, initial_event());
 
         // Create mixed PKI and OAuth events
         let pki_event = create_provide_access_event_only_client(&11111, AccessLevel::Owner, Some(1));
@@ -1106,14 +1106,14 @@ mod tests {
         let event_batch_2 = create_event_batch_item_with_events(vec![oauth_event1], "admin");
         let event_batch_3 = create_event_batch_item_with_events(vec![oauth_event2], "admin");
 
-        event_storage_cache.write(&file_path, true, event_batch_1).unwrap();
-        event_storage_cache.write(&file_path, true, event_batch_2).unwrap();
-        event_storage_cache.write(&file_path, true, event_batch_3).unwrap();
+        event_storage_cache.write(&file_path, true, true, event_batch_1).unwrap();
+        event_storage_cache.write(&file_path, true, true, event_batch_2).unwrap();
+        event_storage_cache.write(&file_path, true, true, event_batch_3).unwrap();
 
         //Remove PKI access for client_id
         let pki_remove_event = create_provide_access_event_client_only(Some(&11111), AccessLevel::None, Some(3)); // PKI->OAuth migration
         let event_batch_4 = create_event_batch_item_with_events(vec![pki_remove_event], "admin");
-        event_storage_cache.write(&file_path, true, event_batch_4).unwrap();
+        event_storage_cache.write(&file_path, true, true, event_batch_4).unwrap();
 
         // Populate cache
         user_access_cache.cache.insert(file_path.clone(), AggregateToUserAccessLevel::new());
@@ -1135,7 +1135,7 @@ mod tests {
     fn test_admin_can_manage_both_pki_and_oauth_users() {
         let (mut user_access_cache, mut event_storage_cache, temp_dir) = setup_cache(5);
         let file_path = create_file_path(&temp_dir, "project1.bin");
-        let _ = event_storage_cache.write(&file_path, true, initial_event());
+        let _ = event_storage_cache.write(&file_path, true, true, initial_event());
 
         let admin_client_id = 99999;
         let pki_user_client_id = 11111;
@@ -1194,7 +1194,7 @@ mod tests {
     fn test_client_id_collision_with_different_oauth_users() {
         let (mut user_access_cache, mut event_storage_cache, temp_dir) = setup_cache(5);
         let file_path = create_file_path(&temp_dir, "project1.bin");
-        let _ = event_storage_cache.write(&file_path, true, initial_event());
+        let _ = event_storage_cache.write(&file_path, true, true, initial_event());
 
         let shared_client_id = 12345;
 
@@ -1223,7 +1223,7 @@ mod tests {
     fn test_share_key_scenarios_with_mixed_auth() {
         let (mut user_access_cache, mut event_storage_cache, temp_dir) = setup_cache(5);
         let file_path = create_file_path(&temp_dir, "project1.bin");
-        let _ = event_storage_cache.write(&file_path, true, initial_event());
+        let _ = event_storage_cache.write(&file_path, true, true, initial_event());
 
         let admin_client_id = 99999;
         let recipient_client_id = 12345;

@@ -1,13 +1,12 @@
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use eventplanedb_storage::event_batch_item::{EventBatchItem};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use eventplanedb_storage::event_batch_item::EventBatchItem;
 use eventplanedb_storage::event_item::EventItem;
 use eventplanedb_storage::event_storage_cache::EventStorageCache;
-use tempfile::TempDir;
 use rand::prelude::*;
+use tempfile::TempDir;
 
 // Include the random_event_item function from the other benchmark file
 fn random_event_item(array_size: i32) -> EventItem {
-
     // Create dummy storage data with configurable array sizes
     let mut dummy_storage = EventItem::new();
     let mut rng = rand::thread_rng();
@@ -21,14 +20,10 @@ fn random_event_item(array_size: i32) -> EventItem {
 
     dummy_storage.f64_values = Some((0..array_size).map(|_| rng.r#gen::<f64>()).collect());
 
-    dummy_storage.bool_values = Some(
-        (0..array_size)
-            .map(|_| rng.r#gen::<bool>())
-            .collect(),
-    );
+    dummy_storage.bool_values = Some((0..array_size).map(|_| rng.r#gen::<bool>()).collect());
 
     dummy_storage.uint_values = Some((0..array_size).map(|_| rng.r#gen::<u64>()).collect());
-    
+
     // Generate random strings using nanoid
     dummy_storage.string_values = Some((0..array_size).map(|_| Some(nanoid::nanoid!())).collect());
     // Null out positions 10, 11, 13
@@ -69,13 +64,7 @@ fn random_event_item(array_size: i32) -> EventItem {
     dummy_storage
 }
 
-fn create_event_batch_item(
-    server_id: u64,
-    client_id: u128,
-    user_id: Option<String>,
-    server_date: u64,
-    events: Vec<EventItem>,
-) -> EventBatchItem {
+fn create_event_batch_item(server_id: u64, client_id: u128, user_id: Option<String>, server_date: u64, events: Vec<EventItem>) -> EventBatchItem {
     EventBatchItem {
         server_id,
         events,
@@ -105,13 +94,11 @@ fn benchmark_storage_cache_ops(c: &mut Criterion) {
                     let mut storage = EventStorageCache::new(30, 1000000, 10000);
 
                     // Generate events
-                    let events_batch: Vec<EventItem> = (0..event_count)
-                        .map(|_| random_event_item(array_size))
-                        .collect();
+                    let events_batch: Vec<EventItem> = (0..event_count).map(|_| random_event_item(array_size)).collect();
                     let event_batch_item = create_event_batch_item(0, 34234, None, 0, events_batch);
 
                     // Write events
-                    storage.write(file_path, true, event_batch_item).expect("Write events");
+                    storage.write(file_path, true, true, event_batch_item).expect("Write events");
 
                     // Read events
                     storage.read(file_path, 0, usize::MAX, None, None).expect("Read events");
@@ -135,13 +122,11 @@ fn benchmark_storage_cache_ops(c: &mut Criterion) {
                     let mut storage = EventStorageCache::new(30, 1000000, 10000);
 
                     // Generate events
-                    let events_batch: Vec<EventItem> = (0..event_count)
-                        .map(|_| random_event_item(array_size))
-                        .collect();
+                    let events_batch: Vec<EventItem> = (0..event_count).map(|_| random_event_item(array_size)).collect();
                     let event_batch_item = create_event_batch_item(0, 34234, None, 0, events_batch);
 
                     // Write events
-                    storage.write(file_path, true, event_batch_item).expect("Write events");
+                    storage.write(file_path, true, true, event_batch_item).expect("Write events");
 
                     // Read events immediately after writing
                     storage.read(file_path, 0, usize::MAX, None, None).expect("Read events");

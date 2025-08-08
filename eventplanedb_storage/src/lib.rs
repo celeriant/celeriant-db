@@ -5,6 +5,7 @@ pub mod event_storage;
 pub mod event_storage_cache;
 pub mod file_cache;
 pub mod last_si_cache;
+pub mod local_index_cache;
 pub mod memory_cache;
 pub mod serde_array_byte_vec_base64;
 pub mod serde_arrays_byte_12_base64;

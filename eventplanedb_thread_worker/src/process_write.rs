@@ -48,7 +48,7 @@ pub fn handle_write_job(
     event_batch_item.user_id = context.current_user_id.clone();
     event_batch_item.server_date = context.server_time;
 
-    let server_id: u64 = event_storage_cache.write(&context.file_path, allow_create, event_batch_item)?;
+    let server_id: u64 = event_storage_cache.write(&context.file_path, allow_create, false, event_batch_item)?;
 
     let mut events: Vec<EventBatchItem> = vec![];
 

@@ -138,7 +138,7 @@ mod tests {
             server_date: 0,
             events: vec![first_event],
         };
-        event_storage_cache.write(&file_path, true, first_batch).unwrap();
+        event_storage_cache.write(&file_path, true, true, first_batch).unwrap();
 
         let mut share_links_cache = ShareLinksCache::new(5);
         let mut user_access_cache = UserAccessCache::new(5);
@@ -238,7 +238,7 @@ mod tests {
             server_date: 0,
             events: vec![first_event],
         };
-        event_storage_cache.write(&file_path, true, first_batch).unwrap();
+        event_storage_cache.write(&file_path, true, true, first_batch).unwrap();
 
         let mut share_links_cache = ShareLinksCache::new(5);
         let mut user_access_cache = UserAccessCache::new(5);
@@ -297,7 +297,7 @@ mod tests {
             server_date: 0,
             events: vec![first_event],
         };
-        event_storage_cache.write(&file_path, true, first_batch).unwrap();
+        event_storage_cache.write(&file_path, true, true, first_batch).unwrap();
 
         let mut share_links_cache = ShareLinksCache::new(5);
         let mut user_access_cache = UserAccessCache::new(5);
@@ -358,7 +358,7 @@ mod tests {
             server_date: 0,
             events: vec![first_event],
         };
-        event_storage_cache.write(&file_path, true, first_batch).unwrap();
+        event_storage_cache.write(&file_path, true, true, first_batch).unwrap();
 
         let mut share_links_cache = ShareLinksCache::new(5);
         let mut user_access_cache = UserAccessCache::new(5);
@@ -421,7 +421,7 @@ mod tests {
             server_date: 0,
             events: vec![first_event],
         };
-        event_storage_cache.write(&file_path, true, first_batch).unwrap();
+        event_storage_cache.write(&file_path, true, true, first_batch).unwrap();
 
         let mut share_links_cache = ShareLinksCache::new(5);
         let mut user_access_cache = UserAccessCache::new(5);
@@ -505,7 +505,7 @@ mod tests {
             server_date: 0,
             events: vec![first_event],
         };
-        event_storage_cache.write(&file_path, true, first_batch).unwrap();
+        event_storage_cache.write(&file_path, true, true, first_batch).unwrap();
 
         let mut share_links_cache = ShareLinksCache::new(5);
         let mut user_access_cache = UserAccessCache::new(5);
@@ -592,7 +592,7 @@ mod tests {
             server_date: 0,
             events: vec![first_event],
         };
-        event_storage_cache.write(&file_path, true, first_batch).unwrap();
+        event_storage_cache.write(&file_path, true, true, first_batch).unwrap();
 
         let mut share_links_cache = ShareLinksCache::new(5);
         let mut user_access_cache = UserAccessCache::new(5);
@@ -671,7 +671,7 @@ mod tests {
             server_date: 0,
             events: vec![first_event],
         };
-        event_storage_cache.write(&file_path, true, first_batch).unwrap();
+        event_storage_cache.write(&file_path, true, true, first_batch).unwrap();
 
         let mut share_links_cache = ShareLinksCache::new(5);
         let mut user_access_cache = UserAccessCache::new(5);

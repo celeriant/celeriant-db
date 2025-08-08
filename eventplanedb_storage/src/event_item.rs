@@ -6,6 +6,9 @@ use crate::serde_arrays_byte_12_base64;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct EventItem {
+    #[serde(rename = "li")]
+    pub local_index: u64,
+
     #[serde(rename = "ed")]
     pub event_date: u64,
 
@@ -40,6 +43,7 @@ pub struct EventItem {
 impl EventItem {
     pub fn new() -> Self {
         EventItem {
+            local_index: 0,
             event_date: 0,
             event_type: 0,
             int_values: None,
