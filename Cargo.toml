@@ -52,4 +52,5 @@ mimalloc = "0.1.47"
 axum-prometheus = "0.8.0"
 tracing = "0.1.41"
 uuid = { version = "1.10.0", features = ["v4"] }
-tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json", "fmt"] }
+tracing-appender = "0.2.3"

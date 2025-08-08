@@ -47,12 +47,17 @@ async fn health_check() -> impl IntoResponse {
 #[tokio::main]
 async fn main() {
     let log_level = env::var("LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
+    let log_file_path = env::var("LOG_FILE_PATH").unwrap_or_else(|_| "./logs".to_string());
+
+    let file_appender = tracing_appender::rolling::hourly(&log_file_path, "eventplanedb.log");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| format!("{}={},tower_http=info,axum::rejection=info", env!("CARGO_CRATE_NAME"), log_level).into()),
         )
+        .with(tracing_subscriber::fmt::layer().json().with_writer(non_blocking))
         .with(tracing_subscriber::fmt::layer())
         .init();
 
