@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
 pub struct WriteQuery {
+    client_last_server_id: Option<u64>,
     create_if_not_exist: Option<bool>,
 }
 
@@ -63,7 +64,7 @@ pub async fn write_events(
     debug!("Processing write request with {} events", events.len());
     let create_if_not_exist = params.create_if_not_exist.unwrap_or(false);
     let server_time = context.server_time;
-    let result = write_async(&state.workers, context, create_if_not_exist, events).await?;
+    let result = write_async(&state.workers, context, create_if_not_exist, params.client_last_server_id, events).await?;
     
     // Log completion and return the response to the client
     debug!(

@@ -49,6 +49,7 @@ impl IntoResponse for RouteError {
             RouteError::JobError(job_error) => match job_error {
                 JobError::PermissionDenied(msg) => (StatusCode::FORBIDDEN, msg),
                 JobError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
+                JobError::Conflict(msg) => (StatusCode::CONFLICT, msg),
                 JobError::InvalidParameters(msg) => (StatusCode::BAD_REQUEST, msg),
                 JobError::AuthenticationFailed(msg) => (StatusCode::UNAUTHORIZED, msg),
                 JobError::Other(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),

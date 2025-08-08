@@ -19,36 +19,27 @@ async fn send_job<T>(workers: &[Sender<Job>], file_path: String, job_creator: im
 }
 
 pub async fn write_async(
-    workers: &[Sender<Job>], 
+    workers: &[Sender<Job>],
     context: JobContext,
-    allow_create: bool, 
-    events: Vec<EventItem>
+    allow_create: bool,
+    client_last_server_id: Option<u64>,
+    events: Vec<EventItem>,
 ) -> Result<WriteResult, JobError> {
     send_job(workers, context.file_path.clone(), |responder| Job::Write {
         context,
         allow_create,
+        client_last_server_id,
         events,
         responder,
     })
     .await?
 }
 
-pub async fn delete_async(
-    workers: &[Sender<Job>],
-    context: JobContext,
-) -> Result<(), JobError> {
-    send_job(workers, context.file_path.clone(), |responder| Job::Delete {
-        context,
-        responder,
-    })
-    .await?
+pub async fn delete_async(workers: &[Sender<Job>], context: JobContext) -> Result<(), JobError> {
+    send_job(workers, context.file_path.clone(), |responder| Job::Delete { context, responder }).await?
 }
 
-pub async fn disable_share_async(
-    workers: &[Sender<Job>],
-    context: JobContext,
-    share_id: u128,
-) -> Result<WriteResult, JobError> {
+pub async fn disable_share_async(workers: &[Sender<Job>], context: JobContext, share_id: u128) -> Result<WriteResult, JobError> {
     send_job(workers, context.file_path.clone(), |responder| Job::DisableShare {
         context,
         share_id,
@@ -58,10 +49,10 @@ pub async fn disable_share_async(
 }
 
 pub async fn disable_user_async(
-    workers: &[Sender<Job>], 
+    workers: &[Sender<Job>],
     context: JobContext,
     for_client_id: Option<u128>,
-    for_user_id: Option<String>
+    for_user_id: Option<String>,
 ) -> Result<WriteResult, JobError> {
     send_job(workers, context.file_path.clone(), |responder| Job::DisableUser {
         context,
@@ -95,11 +86,7 @@ pub async fn share_async(
     .await?
 }
 
-pub async fn access_check_async(
-    workers: &[Sender<Job>],
-    context: JobContext,
-    required_access_level: AccessLevel,
-) -> Result<(), JobError> {
+pub async fn access_check_async(workers: &[Sender<Job>], context: JobContext, required_access_level: AccessLevel) -> Result<(), JobError> {
     send_job(workers, context.file_path.clone(), |responder| Job::AccessCheck {
         context,
         required_access_level,

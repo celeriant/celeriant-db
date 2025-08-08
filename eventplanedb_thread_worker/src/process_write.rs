@@ -15,6 +15,7 @@ pub struct WriteResult {
 pub fn handle_write_job(
     context: JobContext,
     allow_create: bool,
+    client_last_server_id: Option<u64>,
     events: Vec<EventItem>,
     event_storage_cache: &mut EventStorageCache,
     share_links_cache: &mut ShareLinksCache,
@@ -22,6 +23,7 @@ pub fn handle_write_job(
     event_notifier: Option<&EventNotifier>,
 ) -> Result<WriteResult, JobError> {
     let file_exists = event_storage_cache.exists(&context.file_path);
+    let current_server_id = event_storage_cache.get_last_si(&context.file_path)?;
 
     if !file_exists && !allow_create {
         return Err(JobError::NotFound("Aggregate does not exist".to_string()));
@@ -40,6 +42,12 @@ pub fn handle_write_job(
             AccessLevel::Contributor,
             None,
         )?;
+
+        if let Some(client_last_server_id) = client_last_server_id {
+            if current_server_id.is_some() && current_server_id.unwrap() != client_last_server_id {
+                return Err(JobError::Conflict("Optimistic concurrency violation.".to_string()));
+            }
+        }
     }
 
     let mut event_batch_item = EventBatchItem::new();
@@ -48,7 +56,7 @@ pub fn handle_write_job(
     event_batch_item.user_id = context.current_user_id.clone();
     event_batch_item.server_date = context.server_time;
 
-    let server_id: u64 = event_storage_cache.write(&context.file_path, allow_create, false, event_batch_item)?;
+    let mut server_id: u64 = event_storage_cache.write(&context.file_path, allow_create, false, event_batch_item)?;
 
     let mut events: Vec<EventBatchItem> = vec![];
 
@@ -67,6 +75,9 @@ pub fn handle_write_job(
             None,
             context.server_time,
         )?);
+
+        // Keep client up to date with the server ID
+        server_id += 1;
     }
 
     // Notify subscribers that there are new events for this file path

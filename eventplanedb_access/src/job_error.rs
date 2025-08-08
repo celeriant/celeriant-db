@@ -6,6 +6,7 @@ pub enum JobError {
     NotFound(String),
     InvalidParameters(String),
     AuthenticationFailed(String),
+    Conflict(String),
     Other(String),
 }
 

@@ -1,5 +1,5 @@
-use eventplanedb_storage::{catchup_result::CatchupResult, event_batch_item::EventBatchItem, event_item::EventItem};
 use eventplanedb_access::{access_level::AccessLevel, job_error::JobError};
+use eventplanedb_storage::{catchup_result::CatchupResult, event_batch_item::EventBatchItem, event_item::EventItem};
 use tokio::sync::oneshot;
 
 use crate::{job_context::JobContext, process_write::WriteResult};
@@ -18,6 +18,7 @@ pub enum Job {
     Write {
         context: JobContext,
         allow_create: bool,
+        client_last_server_id: Option<u64>,
         events: Vec<EventItem>,
         responder: oneshot::Sender<Result<WriteResult, JobError>>,
     },

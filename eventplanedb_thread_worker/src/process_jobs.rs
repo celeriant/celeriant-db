@@ -9,9 +9,9 @@ use crate::process_share::handle_share_job;
 use crate::process_write::handle_write_job;
 use core_affinity;
 use crossbeam::channel::{Receiver, Sender, unbounded};
-use eventplanedb_storage::event_storage_cache::EventStorageCache;
 use eventplanedb_access::share_links_cache::ShareLinksCache;
 use eventplanedb_access::user_access_cache::UserAccessCache;
+use eventplanedb_storage::event_storage_cache::EventStorageCache;
 
 pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNotifier) -> Vec<Sender<Job>> {
     let cores = core_affinity::get_core_ids().unwrap();
@@ -62,13 +62,15 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
 
                     Job::Write {
                         context,
-                        allow_create, 
+                        allow_create,
+                        client_last_server_id,
                         events,
                         responder,
                     } => {
                         let _ = responder.send(handle_write_job(
-                            context, 
-                            allow_create, 
+                            context,
+                            allow_create,
+                            client_last_server_id,
                             events,
                             &mut event_storage_cache,
                             &mut share_links_cache,
@@ -112,10 +114,7 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
                         ));
                     }
 
-                    Job::Delete {
-                        context,
-                        responder,
-                    } => {
+                    Job::Delete { context, responder } => {
                         let _ = responder.send(handle_delete_job(
                             context,
                             &mut event_storage_cache,
@@ -142,11 +141,7 @@ pub fn create_thread_pool(required_thread_count: usize, event_notifier: EventNot
                         ));
                     }
 
-                    Job::DisableShare {
-                        context,
-                        share_id,
-                        responder,
-                    } => {
+                    Job::DisableShare { context, share_id, responder } => {
                         let _ = responder.send(handle_disable_share_job(
                             context,
                             share_id,
