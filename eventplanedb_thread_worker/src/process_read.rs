@@ -2,11 +2,17 @@ use std::sync::Arc;
 
 use eventplanedb_access::{
     access_level::AccessLevel, job_error::JobError, require_permission::require_permission, share_links_cache::ShareLinksCache,
-    user_access_cache::UserAccessCache,
+    special_aggregates::SpecialAggregates, user_access_cache::UserAccessCache,
 };
-use eventplanedb_storage::{catchup_result::CatchupResult, event_storage_cache::EventStorageCache};
+use eventplanedb_storage::{event_batch_item::EventBatchItem, event_storage_cache::EventStorageCache};
 
 use crate::{event_notifications::EventNotifier, job_context::JobContext};
+
+pub struct ReadResult {
+    pub events: Vec<Arc<EventBatchItem>>,
+    pub next_server_id: Option<u64>,
+    pub special_aggregates: SpecialAggregates,
+}
 
 pub fn handle_read_job(
     context: JobContext,
@@ -18,11 +24,14 @@ pub fn handle_read_job(
     share_links_cache: &mut ShareLinksCache,
     user_access_cache: &mut UserAccessCache,
     event_notifier: Option<&EventNotifier>,
-) -> Result<CatchupResult, JobError> {
+) -> Result<ReadResult, JobError> {
+    let mut special_aggregates = SpecialAggregates::new(Some(context.current_client_id), context.current_user_id.clone(), context.current_org_id.clone());
+
     let access_events = require_permission(
         event_storage_cache,
         share_links_cache,
         user_access_cache,
+        &context.aggregate_id,
         &context.file_path,
         &context.current_client_id,
         context.current_user_id.as_deref(),
@@ -30,12 +39,13 @@ pub fn handle_read_job(
         context.server_time,
         AccessLevel::Viewer,
         share_id.as_ref(),
+        &mut special_aggregates,
     )?;
 
     if access_events.len() > 0 {
         // Notify subscribers that there are new events for this file path
         if let Some(notifier) = event_notifier {
-            notifier.notify(&context.file_path, &context.current_client_id);
+            notifier.notify(&context.aggregate_id, &context.current_client_id);
         }
     }
 
@@ -48,5 +58,9 @@ pub fn handle_read_job(
     // These events are wrapped in Arc as they could come from the in-memory cache or fresh from disk
     catchup_result.event_batches.extend(access_events.into_iter().map(|f| Arc::new(f)));
 
-    Ok(catchup_result)
+    Ok(ReadResult {
+        events: catchup_result.event_batches,
+        next_server_id: catchup_result.next_server_id,
+        special_aggregates,
+    })
 }

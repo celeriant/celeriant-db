@@ -1,4 +1,8 @@
-use crate::{access_level::AccessLevel, aggregate_event_type::AggregateEventType, aggregate_to_user_access_level::AggregateToUserAccessLevel};
+use crate::{
+    access_level::AccessLevel,
+    aggregate_event_type::{AggregateEventType, event_user_access_updated},
+    aggregate_to_user_access_level::AggregateToUserAccessLevel,
+};
 use eventplanedb_storage::{event_batch_item::EventBatchItem, event_item::EventItem, event_storage_cache::EventStorageCache};
 use std::{
     collections::{HashMap, VecDeque},
@@ -134,15 +138,15 @@ impl UserAccessCache {
             return Ok(None);
         }
 
-        let mut event_item = EventItem::new();
-        event_item.event_date = server_time;
-        event_item.event_type = AggregateEventType::UserAccessUpdated as u64;
-        event_item.string_values = Some(vec![for_user_id.as_ref().map(|f| f.to_string()), for_org_id.as_ref().map(|f| f.to_string())]);
-        event_item.uint_values = Some(vec![potential_access_level as u64]);
-        event_item.byte_arrays = Some(vec![
-            for_client_id.map(|id| id.to_le_bytes().to_vec()),
-            share_id.map(|sk| sk.to_le_bytes().to_vec()),
-        ]);
+        let event_item = event_user_access_updated(
+            server_time,
+            for_user_id,
+            for_org_id,
+            potential_access_level,
+            for_client_id.copied(),
+            share_id,
+            None,
+        );
 
         let mut event_batch_item = EventBatchItem::new();
         event_batch_item.events = vec![event_item];
@@ -156,6 +160,18 @@ impl UserAccessCache {
         aggregate_to_user_access_level.update_cache_for_user(for_client_id, for_user_id, potential_access_level, allow_downgrade);
 
         Ok(Some(event_batch_item))
+    }
+
+    pub fn clear_for_file_path(&mut self, file_path: &str) {
+        self.cache.remove(file_path);
+        self.cache_queue.retain(|path| path != file_path);
+    }
+
+    pub fn get_complete_access_list(&self, file_path: &str) -> (Vec<u128>, Vec<String>) {
+        match self.cache.get(file_path) {
+            Some(aggregate_to_user_access_level) => aggregate_to_user_access_level.get_complete_access_list(),
+            None => (Vec::new(), Vec::new()),
+        }
     }
 }
 

@@ -29,6 +29,7 @@ mod app_state;
 mod auth;
 mod correlation_id;
 mod error_response;
+mod internal_aggregates;
 mod json_formatter;
 mod routes;
 

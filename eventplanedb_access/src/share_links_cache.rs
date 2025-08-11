@@ -219,6 +219,11 @@ impl ShareLinksCache {
 
         Ok(event_batch_item)
     }
+
+    pub fn clear_for_file_path(&mut self, file_path: &str) {
+        self.cache.remove(file_path);
+        self.cache_queue.retain(|path| path != file_path);
+    }
 }
 
 #[cfg(test)]

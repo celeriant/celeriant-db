@@ -3,7 +3,11 @@ use eventplanedb_access::{access_level::AccessLevel, job_error::JobError};
 use eventplanedb_storage::{catchup_result::CatchupResult, event_batch_item::EventBatchItem, event_item::EventItem};
 use tokio::sync::oneshot;
 
-use crate::{job::Job, job_context::JobContext, process_write::WriteResult, thread_assigner::hash_string_to_index};
+use crate::{
+    job::Job, job_context::JobContext, process_access_check::AccessCheckResult, process_delete::DeleteResult, process_disable_share::DisableShareResult,
+    process_disable_user::DisableResult, process_read::ReadResult, process_share::ShareResult, process_write::WriteResult,
+    thread_assigner::hash_string_to_index,
+};
 
 async fn send_job<T>(workers: &[Sender<Job>], file_path: String, job_creator: impl FnOnce(oneshot::Sender<T>) -> Job) -> Result<T, JobError> {
     let index = hash_string_to_index(&file_path, workers.len());
@@ -35,11 +39,11 @@ pub async fn write_async(
     .await?
 }
 
-pub async fn delete_async(workers: &[Sender<Job>], context: JobContext) -> Result<(), JobError> {
+pub async fn delete_async(workers: &[Sender<Job>], context: JobContext) -> Result<DeleteResult, JobError> {
     send_job(workers, context.file_path.clone(), |responder| Job::Delete { context, responder }).await?
 }
 
-pub async fn disable_share_async(workers: &[Sender<Job>], context: JobContext, share_id: u128) -> Result<WriteResult, JobError> {
+pub async fn disable_share_async(workers: &[Sender<Job>], context: JobContext, share_id: u128) -> Result<DisableShareResult, JobError> {
     send_job(workers, context.file_path.clone(), |responder| Job::DisableShare {
         context,
         share_id,
@@ -53,7 +57,7 @@ pub async fn disable_user_async(
     context: JobContext,
     for_client_id: Option<u128>,
     for_user_id: Option<String>,
-) -> Result<WriteResult, JobError> {
+) -> Result<DisableResult, JobError> {
     send_job(workers, context.file_path.clone(), |responder| Job::DisableUser {
         context,
         for_client_id,
@@ -72,7 +76,7 @@ pub async fn share_async(
     iv: Option<[u8; 12]>,
     description: Option<String>,
     expires_on: u64,
-) -> Result<EventBatchItem, JobError> {
+) -> Result<ShareResult, JobError> {
     send_job(workers, context.file_path.clone(), |responder| Job::Share {
         context,
         share_id,
@@ -86,7 +90,7 @@ pub async fn share_async(
     .await?
 }
 
-pub async fn access_check_async(workers: &[Sender<Job>], context: JobContext, required_access_level: AccessLevel) -> Result<(), JobError> {
+pub async fn access_check_async(workers: &[Sender<Job>], context: JobContext, required_access_level: AccessLevel) -> Result<AccessCheckResult, JobError> {
     send_job(workers, context.file_path.clone(), |responder| Job::AccessCheck {
         context,
         required_access_level,
@@ -102,7 +106,7 @@ pub async fn read_async(
     from_server_id: u64,
     max_bytes: usize,
     include_own_events: bool,
-) -> Result<CatchupResult, JobError> {
+) -> Result<ReadResult, JobError> {
     send_job(workers, context.file_path.clone(), |responder| Job::Read {
         context,
         from_server_id,

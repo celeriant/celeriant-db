@@ -348,7 +348,7 @@ impl EventStorageCache {
         }
     }
 
-    pub fn delete(&mut self, file_path: &str) -> io::Result<bool> {
+    pub fn delete(&mut self, file_path: &str) -> io::Result<()> {
         // Check if file exists
         if !std::path::Path::new(file_path).exists() {
             return Err(io::Error::new(io::ErrorKind::NotFound, "File not found"));
@@ -366,7 +366,7 @@ impl EventStorageCache {
                 let transaction_path = self.get_transaction_path(file_path);
                 let _ = std::fs::remove_file(transaction_path); // Ignore errors
 
-                Ok(true)
+                Ok(())
             }
             Err(e) => Err(e),
         }
@@ -411,8 +411,7 @@ mod tests {
         assert_eq!(events.flatten_events().len(), 2);
 
         // Delete the file
-        let deleted = storage.delete(file_path).unwrap();
-        assert!(deleted);
+        storage.delete(file_path).unwrap();
 
         // Verify file is gone
         assert!(!std::path::Path::new(file_path).exists());

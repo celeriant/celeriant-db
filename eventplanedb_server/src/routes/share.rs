@@ -19,7 +19,8 @@ pub struct ShareQuery {
 #[derive(Debug, Serialize)]
 pub struct ShareResponse {
     share_key: String,
-    share_event: EventBatchItem,
+    server_id: u64,
+    event_batches: Vec<EventBatchItem>,
 }
 
 #[instrument(
@@ -52,7 +53,7 @@ pub async fn share(
     );
     let share_key = nanoid::nanoid!();
 
-    let share_event = share_async(
+    let result = share_async(
         &state.workers,
         context,
         Crypto::generate_short_client_identity(share_key.as_bytes()),
@@ -66,6 +67,6 @@ pub async fn share(
 
     // Log completion and return the response to the client
     info!("Completed share operation");
-    let response = ShareResponse { share_key, share_event };
+    let response = ShareResponse { share_key, event_batches: result.events, server_id: result.server_id };
     Ok(CompactJson(response))
 }

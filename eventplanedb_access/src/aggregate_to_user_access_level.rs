@@ -112,6 +112,13 @@ impl AggregateToUserAccessLevel {
     pub fn count(&self) -> usize {
         self.users.len() + self.clients.len()
     }
+
+    pub fn get_complete_access_list(&self) -> (Vec<u128>, Vec<String>) {
+        let client_ids: Vec<u128> = self.clients.keys().copied().collect();
+        let user_ids: Vec<String> = self.users.keys().cloned().collect();
+
+        (client_ids, user_ids)
+    }
 }
 
 #[cfg(test)]

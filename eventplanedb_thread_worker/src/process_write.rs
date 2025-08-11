@@ -1,3 +1,4 @@
+use eventplanedb_access::special_aggregates::SpecialAggregates;
 use eventplanedb_access::{
     access_level::AccessLevel, job_error::JobError, require_permission::require_permission, share_links_cache::ShareLinksCache,
     user_access_cache::UserAccessCache,
@@ -10,6 +11,7 @@ use crate::{event_notifications::EventNotifier, job_context::JobContext};
 pub struct WriteResult {
     pub server_id: u64,
     pub events: Vec<EventBatchItem>,
+    pub special_aggregates: SpecialAggregates,
 }
 
 pub fn handle_write_job(
@@ -22,6 +24,7 @@ pub fn handle_write_job(
     user_access_cache: &mut UserAccessCache,
     event_notifier: Option<&EventNotifier>,
 ) -> Result<WriteResult, JobError> {
+    let mut special_aggregates = SpecialAggregates::new(Some(context.current_client_id), context.current_user_id.clone(), context.current_org_id.clone());
     let file_exists = event_storage_cache.exists(&context.file_path);
     let current_server_id = event_storage_cache.get_last_si(&context.file_path)?;
 
@@ -29,11 +32,20 @@ pub fn handle_write_job(
         return Err(JobError::NotFound("Aggregate does not exist".to_string()));
     }
 
+    let mut new_events = Vec::new();
+
     if file_exists {
-        require_permission(
+        if let Some(client_last_server_id) = client_last_server_id {
+            if current_server_id.is_some() && current_server_id.unwrap() != client_last_server_id {
+                return Err(JobError::Conflict("Optimistic concurrency violation.".to_string()));
+            }
+        }
+
+        let access_events = require_permission(
             event_storage_cache,
             share_links_cache,
             user_access_cache,
+            &context.aggregate_id,
             &context.file_path,
             &context.current_client_id,
             context.current_user_id.as_deref(),
@@ -41,13 +53,10 @@ pub fn handle_write_job(
             context.server_time,
             AccessLevel::Contributor,
             None,
+            &mut special_aggregates,
         )?;
 
-        if let Some(client_last_server_id) = client_last_server_id {
-            if current_server_id.is_some() && current_server_id.unwrap() != client_last_server_id {
-                return Err(JobError::Conflict("Optimistic concurrency violation.".to_string()));
-            }
-        }
+        new_events.extend(access_events);
     }
 
     let mut event_batch_item = EventBatchItem::new();
@@ -58,11 +67,9 @@ pub fn handle_write_job(
 
     let mut server_id: u64 = event_storage_cache.write(&context.file_path, allow_create, false, event_batch_item)?;
 
-    let mut events: Vec<EventBatchItem> = vec![];
-
     if !file_exists {
         // Give owner access
-        events.extend(user_access_cache.update_access_for_user(
+        new_events.extend(user_access_cache.update_access_for_user(
             event_storage_cache,
             &context.file_path,
             &context.current_client_id,
@@ -78,12 +85,18 @@ pub fn handle_write_job(
 
         // Keep client up to date with the server ID
         server_id += 1;
+
+        special_aggregates.permission_updated_on_aggregate(&context.aggregate_id, AccessLevel::Owner, None, context.server_time);
     }
 
     // Notify subscribers that there are new events for this file path
     if let Some(notifier) = event_notifier {
-        notifier.notify(&context.file_path, &context.current_client_id);
+        notifier.notify(&context.aggregate_id, &context.current_client_id);
     }
 
-    Ok(WriteResult { server_id, events })
+    Ok(WriteResult {
+        server_id,
+        events: new_events,
+        special_aggregates,
+    })
 }

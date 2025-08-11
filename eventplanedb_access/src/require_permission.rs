@@ -1,11 +1,15 @@
 use eventplanedb_storage::{event_batch_item::EventBatchItem, event_storage_cache::EventStorageCache};
 
-use crate::{access_level::AccessLevel, job_error::JobError, share_links_cache::ShareLinksCache, user_access_cache::UserAccessCache};
+use crate::{
+    access_level::AccessLevel, job_error::JobError, share_links_cache::ShareLinksCache, special_aggregates::SpecialAggregates,
+    user_access_cache::UserAccessCache,
+};
 
 pub fn require_permission(
     event_storage_cache: &mut EventStorageCache,
     share_links_cache: &mut ShareLinksCache,
     user_access_cache: &mut UserAccessCache,
+    aggregate_id: &str,
     file_path: &str,
     client_id: &u128,
     user_id: Option<&str>,
@@ -13,6 +17,7 @@ pub fn require_permission(
     server_time: u64,
     required_access_level: AccessLevel,
     share_id: Option<&u128>,
+    special_aggregates: &mut SpecialAggregates,
 ) -> Result<Vec<EventBatchItem>, JobError> {
     let mut new_events = Vec::new();
 
@@ -66,6 +71,8 @@ pub fn require_permission(
             server_time,
         )?;
         new_events.push(disable_client_id_event.unwrap());
+
+        special_aggregates.client_removed_from_aggregate(aggregate_id, server_time);
     }
 
     if requires_transition_to_user_id || share_link_increased_access_level {
@@ -84,6 +91,8 @@ pub fn require_permission(
         )?;
         if let Some(provide_access_event) = provide_access_event {
             new_events.push(provide_access_event);
+
+            special_aggregates.permission_updated_on_aggregate(aggregate_id, final_access_level, share_link_used, server_time);
         }
     }
 
@@ -96,6 +105,7 @@ mod tests {
     use eventplanedb_storage::{event_batch_item::EventBatchItem, event_item::EventItem, event_storage_cache::EventStorageCache};
     use tempfile::TempDir;
 
+    use crate::aggregate_event_type::AggregateEventType;
     use crate::share_links_cache::ShareLinksCache;
     use crate::user_access_cache::UserAccessCache;
 
@@ -125,10 +135,14 @@ mod tests {
     #[test]
     fn test_require_permission_multiple_clients_same_user_id() {
         let (mut event_storage_cache, temp_dir) = setup_cache();
-        let file_path = create_file_path(&temp_dir, "project1.bin");
-        let client_id1 = 12345u128;
-        let client_id2 = 67890u128;
+        let aggregate_id = "project1.bin";
+        let file_path = create_file_path(&temp_dir, aggregate_id.clone());
         let user_id = "user1";
+
+        let client_id1 = 12345u128;
+        let mut special_aggregates_1 = SpecialAggregates::new(Some(client_id1), Some(user_id.to_string()), None);
+        let client_id2 = 67890u128;
+        let mut special_aggregates_2 = SpecialAggregates::new(Some(client_id2), Some(user_id.to_string()), None);
 
         let first_event = create_test_event_item();
         let first_batch = EventBatchItem {
@@ -183,6 +197,7 @@ mod tests {
             &mut event_storage_cache,
             &mut share_links_cache,
             &mut user_access_cache,
+            aggregate_id,
             &file_path,
             &client_id1,
             Some(user_id),
@@ -190,9 +205,45 @@ mod tests {
             server_time,
             AccessLevel::Viewer,
             None,
+            &mut special_aggregates_1,
         );
 
         assert!(result1.is_ok());
+
+        // Assert client_id1 client access is removed and user access is set correctly in special_aggregates_1
+        assert_eq!(special_aggregates_1.client_aggregate.len(), 1);
+        assert_eq!(special_aggregates_1.user_aggregate.len(), 1);
+        assert_eq!(
+            special_aggregates_1.client_aggregate[0].event_type,
+            AggregateEventType::UserAccessUpdated as u64
+        );
+        assert_eq!(
+            special_aggregates_1.client_aggregate[0].string_values.as_ref().unwrap()[0],
+            None //No user for client aggregate
+        );
+        assert_eq!(special_aggregates_1.client_aggregate[0].string_values.as_ref().unwrap()[1], None);
+        assert_eq!(
+            special_aggregates_1.client_aggregate[0].string_values.as_ref().unwrap()[2],
+            Some(aggregate_id.to_string())
+        );
+        assert_eq!(
+            special_aggregates_1.client_aggregate[0].uint_values.as_ref().unwrap()[0],
+            AccessLevel::None as u64
+        );
+        assert_eq!(special_aggregates_1.user_aggregate[0].event_type, AggregateEventType::UserAccessUpdated as u64);
+        assert_eq!(
+            special_aggregates_1.user_aggregate[0].uint_values.as_ref().unwrap()[0],
+            AccessLevel::Contributor as u64
+        );
+        assert_eq!(
+            special_aggregates_1.user_aggregate[0].string_values.as_ref().unwrap()[0],
+            Some(user_id.to_string())
+        );
+        assert_eq!(special_aggregates_1.user_aggregate[0].string_values.as_ref().unwrap()[1], None);
+        assert_eq!(
+            special_aggregates_1.user_aggregate[0].string_values.as_ref().unwrap()[2],
+            Some(aggregate_id.to_string())
+        );
 
         // Now user logs in on client_id2 - this should handle the case where the user already has access
         // The current implementation would panic here because provide_access_event returns None
@@ -202,6 +253,7 @@ mod tests {
             &mut event_storage_cache,
             &mut share_links_cache,
             &mut user_access_cache,
+            aggregate_id,
             &file_path,
             &client_id2,
             Some(user_id),
@@ -209,10 +261,23 @@ mod tests {
             server_time,
             AccessLevel::Viewer,
             None,
+            &mut special_aggregates_2,
         );
 
         // This should not panic and should successfully grant permission
         assert!(result2.is_ok());
+
+        // Assert client_id2 client access is removed and user access is set correctly in special_aggregates_2
+        assert_eq!(special_aggregates_2.client_aggregate.len(), 1);
+        assert_eq!(special_aggregates_2.user_aggregate.len(), 0);
+        assert_eq!(
+            special_aggregates_2.client_aggregate[0].event_type,
+            AggregateEventType::UserAccessUpdated as u64
+        );
+        assert_eq!(
+            special_aggregates_2.client_aggregate[0].uint_values.as_ref().unwrap()[0],
+            AccessLevel::None as u64
+        );
 
         // Verify client_id2 access is now None
         let client2_access = user_access_cache.get_current_access_level(&mut event_storage_cache, &file_path, Some(&client_id2), None);
@@ -226,9 +291,12 @@ mod tests {
     #[test]
     fn test_require_permission_user_has_sufficient_access() {
         let (mut event_storage_cache, temp_dir) = setup_cache();
+        let aggregate_id = "project1.bin";
         let file_path = create_file_path(&temp_dir, "project1.bin");
         let client_id = 12345u128;
         let user_id = "user1";
+
+        let mut special_aggregates_1 = SpecialAggregates::new(Some(client_id), Some(user_id.to_string()), None);
 
         let first_event = create_test_event_item();
         let first_batch = EventBatchItem {
@@ -267,6 +335,7 @@ mod tests {
             &mut event_storage_cache,
             &mut share_links_cache,
             &mut user_access_cache,
+            aggregate_id,
             &file_path,
             &client_id,
             Some(user_id),
@@ -274,6 +343,7 @@ mod tests {
             server_time,
             AccessLevel::Viewer,
             None,
+            &mut special_aggregates_1,
         );
 
         // Verify that permission is granted
@@ -285,9 +355,12 @@ mod tests {
     #[test]
     fn test_require_permission_user_has_insufficient_access() {
         let (mut event_storage_cache, temp_dir) = setup_cache();
+        let aggregate_id = "project1.bin";
         let file_path = create_file_path(&temp_dir, "project1.bin");
         let client_id = 12345u128;
         let user_id = "user1";
+
+        let mut special_aggregates_1 = SpecialAggregates::new(Some(client_id), Some(user_id.to_string()), None);
 
         let first_event = create_test_event_item();
         let first_batch = EventBatchItem {
@@ -325,6 +398,7 @@ mod tests {
             &mut event_storage_cache,
             &mut share_links_cache,
             &mut user_access_cache,
+            aggregate_id,
             &file_path,
             &client_id,
             Some(user_id),
@@ -332,6 +406,7 @@ mod tests {
             server_time,
             AccessLevel::Contributor,
             None,
+            &mut special_aggregates_1,
         );
 
         // Verify that permission is denied
@@ -345,10 +420,13 @@ mod tests {
     #[test]
     fn test_require_permission_user_has_sufficient_access_with_share_link() {
         let (mut event_storage_cache, temp_dir) = setup_cache();
+        let aggregate_id = "project1.bin";
         let file_path = create_file_path(&temp_dir, "project1.bin");
         let client_id = 12345u128;
         let user_id = "user1";
         let share_id = 67890u128;
+
+        let mut special_aggregates_1 = SpecialAggregates::new(Some(client_id), Some(user_id.to_string()), None);
 
         let first_event = create_test_event_item();
         let first_batch = EventBatchItem {
@@ -386,6 +464,7 @@ mod tests {
             &mut event_storage_cache,
             &mut share_links_cache,
             &mut user_access_cache,
+            aggregate_id,
             &file_path,
             &client_id,
             Some(user_id),
@@ -393,6 +472,7 @@ mod tests {
             server_time,
             AccessLevel::Contributor,
             Some(&share_id),
+            &mut special_aggregates_1,
         );
 
         // Verify that permission is granted
@@ -408,10 +488,13 @@ mod tests {
     #[test]
     fn test_require_permission_user_has_insufficient_access_despite_share_link() {
         let (mut event_storage_cache, temp_dir) = setup_cache();
+        let aggregate_id = "project1.bin";
         let file_path = create_file_path(&temp_dir, "project1.bin");
         let client_id = 12345u128;
         let user_id = "user1";
         let share_id = 67890u128;
+
+        let mut special_aggregates_1 = SpecialAggregates::new(Some(client_id), Some(user_id.to_string()), None);
 
         let first_event = create_test_event_item();
         let first_batch = EventBatchItem {
@@ -466,6 +549,7 @@ mod tests {
             &mut event_storage_cache,
             &mut share_links_cache,
             &mut user_access_cache,
+            aggregate_id,
             &file_path,
             &client_id,
             Some(user_id),
@@ -473,6 +557,7 @@ mod tests {
             server_time,
             AccessLevel::Owner,
             Some(&share_id),
+            &mut special_aggregates_1,
         );
 
         // Verify that permission is denied
@@ -492,10 +577,13 @@ mod tests {
     #[test]
     fn test_require_permission_share_link_is_single_use_and_disabled() {
         let (mut event_storage_cache, temp_dir) = setup_cache();
+        let aggregate_id = "project1.bin";
         let file_path = create_file_path(&temp_dir, "project1.bin");
         let client_id = 12345u128;
         let user_id = "user1";
         let share_id = 67890u128;
+
+        let mut special_aggregates_1 = SpecialAggregates::new(Some(client_id), Some(user_id.to_string()), None);
 
         let first_event = create_test_event_item();
         let first_batch = EventBatchItem {
@@ -533,6 +621,7 @@ mod tests {
             &mut event_storage_cache,
             &mut share_links_cache,
             &mut user_access_cache,
+            aggregate_id,
             &file_path,
             &client_id,
             Some(user_id),
@@ -540,12 +629,22 @@ mod tests {
             server_time,
             AccessLevel::Contributor,
             Some(&share_id),
+            &mut special_aggregates_1,
         );
 
         // Verify that permission is granted
         assert!(result.is_ok());
         let events = result.unwrap();
         assert_eq!(events.len(), 2); // Should have disable event and access update event
+
+        // Assert user access is granted
+        assert_eq!(special_aggregates_1.client_aggregate.len(), 0);
+        assert_eq!(special_aggregates_1.user_aggregate.len(), 1);
+        assert_eq!(special_aggregates_1.user_aggregate[0].event_type, AggregateEventType::UserAccessUpdated as u64);
+        assert_eq!(
+            special_aggregates_1.user_aggregate[0].uint_values.as_ref().unwrap()[0],
+            AccessLevel::Contributor as u64
+        );
 
         // Verify that the share link has been disabled (removed from cache)
         assert!(
@@ -556,10 +655,12 @@ mod tests {
 
         //Try to use the share link again, it should not work since single use
         let client_id2 = 54321u128;
+        let mut special_aggregates_2 = SpecialAggregates::new(Some(client_id2), Some("another_user".to_string()), None);
         let result2 = require_permission(
             &mut event_storage_cache,
             &mut share_links_cache,
             &mut user_access_cache,
+            aggregate_id,
             &file_path,
             &client_id2,
             Some("another_user"),
@@ -567,7 +668,15 @@ mod tests {
             server_time,
             AccessLevel::Contributor,
             Some(&share_id),
+            &mut special_aggregates_2,
         );
+
+        // Does not have required access level
+        assert!(result2.is_err());
+
+        // Assert client_id2 client access is removed and user access is set correctly in special_aggregates_2
+        assert_eq!(special_aggregates_2.client_aggregate.len(), 0);
+        assert_eq!(special_aggregates_2.user_aggregate.len(), 0);
 
         assert!(result2.is_err());
         match result2 {
@@ -579,10 +688,13 @@ mod tests {
     #[test]
     fn test_require_permission_share_link_does_not_increase_access() {
         let (mut event_storage_cache, temp_dir) = setup_cache();
+        let aggregate_id = "project1.bin";
         let file_path = create_file_path(&temp_dir, "project1.bin");
         let client_id = 12345u128;
         let user_id = "user1";
         let share_id = 67890u128;
+
+        let mut special_aggregates_1 = SpecialAggregates::new(Some(client_id), Some(user_id.to_string()), None);
 
         let first_event = create_test_event_item();
         let first_batch = EventBatchItem {
@@ -637,6 +749,7 @@ mod tests {
             &mut event_storage_cache,
             &mut share_links_cache,
             &mut user_access_cache,
+            aggregate_id,
             &file_path,
             &client_id,
             Some(user_id),
@@ -644,6 +757,7 @@ mod tests {
             server_time,
             AccessLevel::Contributor,
             Some(&share_id),
+            &mut special_aggregates_1,
         );
 
         // Verify that permission is granted (since user already has Contributor access)
@@ -659,9 +773,12 @@ mod tests {
     #[test]
     fn test_require_permission_access_transferred_from_client_id_to_user_id() {
         let (mut event_storage_cache, temp_dir) = setup_cache();
+        let aggregate_id = "project1.bin";
         let file_path = create_file_path(&temp_dir, "project1.bin");
         let client_id = 12345u128;
         let user_id = "user1";
+
+        let mut special_aggregates_1 = SpecialAggregates::new(Some(client_id), Some(user_id.to_string()), None);
 
         let first_event = create_test_event_item();
         let first_batch = EventBatchItem {
@@ -707,6 +824,7 @@ mod tests {
             &mut event_storage_cache,
             &mut share_links_cache,
             &mut user_access_cache,
+            aggregate_id,
             &file_path,
             &client_id,
             Some(user_id), // Now providing user_id (OAuth2 login)
@@ -714,6 +832,7 @@ mod tests {
             server_time,
             AccessLevel::Viewer,
             None,
+            &mut special_aggregates_1,
         );
 
         // Verify that permission is granted

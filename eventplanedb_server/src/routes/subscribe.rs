@@ -47,7 +47,7 @@ pub async fn subscribe_events(
     // Subscribe to event notifications for this aggregate
     // Create an SSE stream with cooldown mechanism
     info!("Subscribing to event stream using SSE");
-    let receiver = state.event_notifier.subscribe(&file_path);
+    let receiver = state.event_notifier.subscribe(&aggregate_id);
     let cooldown_period = Duration::from_millis(state.subscribe_cooldown_period_ms);
     let stream = stream::unfold(
         (

@@ -1,10 +1,16 @@
 use eventplanedb_access::{
     access_level::AccessLevel, job_error::JobError, require_permission::require_permission, share_links_cache::ShareLinksCache,
-    user_access_cache::UserAccessCache,
+    special_aggregates::SpecialAggregates, user_access_cache::UserAccessCache,
 };
 use eventplanedb_storage::{event_batch_item::EventBatchItem, event_storage_cache::EventStorageCache};
 
 use crate::{event_notifications::EventNotifier, job_context::JobContext};
+
+pub struct ShareResult {
+    pub server_id: u64,
+    pub events: Vec<EventBatchItem>,
+    pub special_aggregates: SpecialAggregates,
+}
 
 pub fn handle_share_job(
     context: JobContext,
@@ -18,11 +24,13 @@ pub fn handle_share_job(
     share_links_cache: &mut ShareLinksCache,
     user_access_cache: &mut UserAccessCache,
     event_notifier: Option<&EventNotifier>,
-) -> Result<EventBatchItem, JobError> {
-    require_permission(
+) -> Result<ShareResult, JobError> {
+    let mut special_aggregates = SpecialAggregates::new(Some(context.current_client_id), context.current_user_id.clone(), context.current_org_id.clone());
+    let mut events = require_permission(
         event_storage_cache,
         share_links_cache,
         user_access_cache,
+        &context.aggregate_id,
         &context.file_path,
         &context.current_client_id,
         context.current_user_id.as_deref(),
@@ -30,6 +38,7 @@ pub fn handle_share_job(
         context.server_time,
         AccessLevel::Owner,
         None,
+        &mut special_aggregates,
     )?;
 
     let create_share_link_result = share_links_cache.create_share_link(
@@ -48,8 +57,15 @@ pub fn handle_share_job(
 
     // Notify subscribers that there are new events for this file path
     if let Some(notifier) = event_notifier {
-        notifier.notify(&context.file_path, &context.current_client_id);
+        notifier.notify(&context.aggregate_id, &context.current_client_id);
     }
 
-    Ok(create_share_link_result)
+    let server_id = create_share_link_result.server_id;
+    events.push(create_share_link_result);
+
+    Ok(ShareResult {
+        server_id,
+        events,
+        special_aggregates,
+    })
 }
