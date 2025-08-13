@@ -1,18 +1,28 @@
 use crate::catchup_result::CatchupResult;
 use crate::event_batch_item::EventBatchItem;
 use crate::wire_format::{compress_data, decompress_data, deserialize_event_batch_item, serialize_event_batch_item};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
+
+const MAGIC_NUMBER: u64 = 0xDEADBEEFCAFEBABE;
+
+const BATCH_START_SIZE: u64 = 8;
+const BATCH_METADATA_SIZE: u64 = UNCOMPRESSED_BATCH_SIZE_OFFSET;
+
+const UNCOMPRESSED_BATCH_SIZE_OFFSET: u64 = 64;
+const EVENT_TYPE_OFFSET: u64 = 56;
+const LOCAL_INDEX_OFFSET: u64 = 48;
+const SERVER_ID_OFFSET: u64 = 40;
+const CLIENT_ID_OFFSET: u64 = 32;
+const BATCH_SIZE_OFFSET: u64 = 16;
+const MAGIC_NUMBER_OFFSET: u64 = 8;
 
 /// Append a batch of events with compression
 pub fn append_event_batch(writer: &mut BufWriter<File>, event_batch_item: &EventBatchItem) -> io::Result<usize> {
     if event_batch_item.events.is_empty() {
         return Ok(0);
     }
-
-    // Always write new batches at end of the file
-    let batch_start_pos = writer.get_ref().metadata()?.len();
 
     // Serialize and compress
     let encoded_event_batch_item = serialize_event_batch_item(event_batch_item)?;
@@ -51,7 +61,7 @@ pub fn append_event_batch(writer: &mut BufWriter<File>, event_batch_item: &Event
     write_buffer.extend_from_slice(&event_batch_item.client_id.to_le_bytes());
 
     // Each batch is variable in length, so we need to know where it starts when reading backwards through the file
-    write_buffer.extend_from_slice(&batch_start_pos.to_le_bytes());
+    write_buffer.extend_from_slice(&(compressed_event_batch_item.len() as u64).to_le_bytes());
 
     // Magic number for corruption detection
     write_buffer.extend_from_slice(&MAGIC_NUMBER.to_le_bytes());
@@ -91,19 +101,6 @@ fn seek_to_and_read_exact(reader: &mut BufReader<File>, seek_to: u64, data_size:
     Ok(data)
 }
 
-const MAGIC_NUMBER: u64 = 0xDEADBEEFCAFEBABE;
-
-const BATCH_START_SIZE: u64 = 8;
-const BATCH_METADATA_SIZE: u64 = UNCOMPRESSED_BATCH_SIZE_OFFSET;
-
-const UNCOMPRESSED_BATCH_SIZE_OFFSET: u64 = 64;
-const EVENT_TYPE_OFFSET: u64 = 56;
-const LOCAL_INDEX_OFFSET: u64 = 48;
-const SERVER_ID_OFFSET: u64 = 40;
-const CLIENT_ID_OFFSET: u64 = 32;
-const BATCH_START_POS_OFFSET: u64 = 16;
-const MAGIC_NUMBER_OFFSET: u64 = 8;
-
 fn read_batch_at_position(reader: &mut BufReader<File>, current_pos: u64, batch_start_pos: u64) -> io::Result<EventBatchItem> {
     let original_size = read_u64_at_offset(reader, current_pos, UNCOMPRESSED_BATCH_SIZE_OFFSET)?;
     let data_size = (current_pos - BATCH_START_SIZE - BATCH_METADATA_SIZE - batch_start_pos) as usize;
@@ -113,7 +110,7 @@ fn read_batch_at_position(reader: &mut BufReader<File>, current_pos: u64, batch_
     Ok(event_batch_item)
 }
 
-pub fn find_last_valid_event_batch(mut reader: &mut BufReader<File>) -> io::Result<u64> {
+pub fn find_last_valid_event_batch(reader: &mut BufReader<File>) -> io::Result<u64> {
     let file_size = reader.get_ref().metadata()?.len();
 
     if file_size < BATCH_START_SIZE + BATCH_METADATA_SIZE {
@@ -125,7 +122,7 @@ pub fn find_last_valid_event_batch(mut reader: &mut BufReader<File>) -> io::Resu
 
     while current_pos + BATCH_START_SIZE + BATCH_METADATA_SIZE <= file_size {
         // Read the compressed data size from the beginning of the batch
-        let compressed_size = read_u64_at_offset(&mut reader, current_pos, 0)?;
+        let compressed_size = read_u64_at_offset(reader, current_pos, 0)?;
 
         // Calculate where this batch should end
         let batch_end_pos = current_pos + BATCH_START_SIZE + compressed_size + BATCH_METADATA_SIZE;
@@ -136,7 +133,7 @@ pub fn find_last_valid_event_batch(mut reader: &mut BufReader<File>) -> io::Resu
         }
 
         // Check if the magic number is correct at the expected end position
-        if !is_batch_corrupt(&mut reader, batch_end_pos) {
+        if !is_batch_corrupt(reader, batch_end_pos) {
             last_valid_pos = batch_end_pos;
             current_pos = batch_end_pos;
         } else {
@@ -147,19 +144,19 @@ pub fn find_last_valid_event_batch(mut reader: &mut BufReader<File>) -> io::Resu
     Ok(last_valid_pos)
 }
 
-pub fn find_last_si(mut reader: &mut BufReader<File>) -> io::Result<Option<u64>> {
+pub fn find_last_si(reader: &mut BufReader<File>) -> io::Result<Option<u64>> {
     let file_size = reader.get_ref().metadata()?.len();
 
-    if file_size < BATCH_METADATA_SIZE || is_batch_corrupt(&mut reader, file_size) {
+    if file_size < BATCH_METADATA_SIZE || is_batch_corrupt(reader, file_size) {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "Batch data is corrupt, file recovery needed"));
     }
 
-    let last_si = read_u64_at_offset(&mut reader, file_size, SERVER_ID_OFFSET)?;
+    let last_si = read_u64_at_offset(reader, file_size, SERVER_ID_OFFSET)?;
 
     Ok(Some(last_si))
 }
 
-pub fn find_last_li(mut reader: &mut BufReader<File>, client_id: u128) -> io::Result<Option<u64>> {
+pub fn find_last_li(reader: &mut BufReader<File>, client_id: u128) -> io::Result<Option<u64>> {
     let file_size = reader.get_ref().metadata()?.len();
 
     if file_size < BATCH_METADATA_SIZE {
@@ -170,41 +167,31 @@ pub fn find_last_li(mut reader: &mut BufReader<File>, client_id: u128) -> io::Re
 
     // Scan backwards through the file to find the last batch from this client
     while current_pos >= BATCH_METADATA_SIZE {
-        if is_batch_corrupt(&mut reader, current_pos) {
+        if is_batch_corrupt(reader, current_pos) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Batch data is corrupt, file recovery needed"));
         }
 
         let batch_client_id = read_u128_at_offset(reader, current_pos, CLIENT_ID_OFFSET)?;
 
         if batch_client_id == client_id {
-            let last_li = read_u64_at_offset(&mut reader, current_pos, LOCAL_INDEX_OFFSET)?;
+            let last_li = read_u64_at_offset(reader, current_pos, LOCAL_INDEX_OFFSET)?;
             return Ok(Some(last_li));
         }
 
-        let batch_start_pos = read_u64_at_offset(&mut reader, current_pos, BATCH_START_POS_OFFSET)?;
-        current_pos = batch_start_pos;
+        let batch_data_size = read_u64_at_offset(reader, current_pos, BATCH_SIZE_OFFSET)?;
+        current_pos = current_pos - BATCH_START_SIZE - batch_data_size - BATCH_METADATA_SIZE;
     }
 
     Ok(None)
 }
 
-fn is_batch_corrupt(mut reader: &mut BufReader<File>, current_pos: u64) -> bool {
-    let magic = match read_u64_at_offset(&mut reader, current_pos, MAGIC_NUMBER_OFFSET) {
-        Ok(magic) => magic,
-        Err(_) => 0, // Can't read, assume corruption
-    };
-
+fn is_batch_corrupt(reader: &mut BufReader<File>, current_pos: u64) -> bool {
+    let magic = read_u64_at_offset(reader, current_pos, MAGIC_NUMBER_OFFSET).unwrap_or_default();
     magic != MAGIC_NUMBER
 }
 
-/// Read events starting from a specific si (efficient catchup)
-pub fn read_from_si(
-    mut reader: &mut BufReader<File>,
-    target_server_id: u64,
-    max_bytes: usize,
-    event_type_filter: Option<&[u64]>,
-    exclude_client_id_filter: Option<u128>,
-) -> io::Result<CatchupResult> {
+/// Collect batch positions scanning backwards from the end of file
+fn collect_batch_positions_backwards(reader: &mut BufReader<File>, target_server_id: u64) -> io::Result<Vec<(u64, u64)>> {
     let file_size = reader.get_ref().metadata()?.len();
 
     if file_size < BATCH_METADATA_SIZE {
@@ -213,27 +200,88 @@ pub fn read_from_si(
 
     let mut batch_positions = Vec::new();
     let mut current_pos = file_size;
+    let mut found_target_si = false;
 
     // Collect batch positions until we find the target batch (scanning backwards)
     while current_pos >= BATCH_METADATA_SIZE {
-        if is_batch_corrupt(&mut reader, current_pos) {
+        if is_batch_corrupt(reader, current_pos) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Batch data is corrupt, file recovery needed"));
         }
 
-        let batch_start_pos = read_u64_at_offset(&mut reader, current_pos, BATCH_START_POS_OFFSET)?;
+        // Read the batch size (length of compressed data)
+        let batch_data_size = read_u64_at_offset(reader, current_pos, BATCH_SIZE_OFFSET)?;
+        // Calculate where this batch starts
+        let batch_start_pos = current_pos - BATCH_START_SIZE - batch_data_size - BATCH_METADATA_SIZE;
 
         // Read first si of this batch to check if we've reached our target
-        let batch_si = read_u64_at_offset(&mut reader, current_pos, SERVER_ID_OFFSET)?;
+        let batch_si = read_u64_at_offset(reader, current_pos, SERVER_ID_OFFSET)?;
 
-        // Stop if this batch might contain our target_si
+        // Gone too far?
         if batch_si < target_server_id {
             break;
         }
 
+        found_target_si = batch_si == target_server_id;
         batch_positions.push((batch_start_pos, current_pos));
 
         current_pos = batch_start_pos;
     }
+
+    // If the file was trimmed, we might not have even got to our target_server_id
+    if !found_target_si && !batch_positions.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "Target server ID not found in file - may have been trimmed",
+        ));
+    }
+
+    Ok(batch_positions)
+}
+
+/// Trim the file by removing all batches up to remove_up_to_si
+pub fn trim_start(file_path: &str, reader: &mut BufReader<File>, remove_up_to_si: u64) -> io::Result<bool> {
+    let batch_positions = collect_batch_positions_backwards(reader, remove_up_to_si + 1)?;
+
+    if batch_positions.is_empty() {
+        // Error as this would clear the entire file
+        return Err(io::Error::new(io::ErrorKind::NotFound, "Cannot trim as no batches would remain"));
+    }
+
+    // Find the position where we should start keeping data
+    let keep_from_pos = batch_positions.last().unwrap().0; // batch_start_pos of the first batch to keep
+
+    // If we're keeping everything from the beginning, nothing to trim
+    if keep_from_pos == 0 {
+        return Ok(false);
+    }
+
+    // Get the original file path
+    // You'll need to store this or pass it as a parameter
+    let temp_path = format!("{file_path}.tmp");
+
+    // Create temporary file and copy the data we want to keep
+    {
+        let mut temp_file = BufWriter::new(File::create(&temp_path)?);
+        reader.seek(SeekFrom::Start(keep_from_pos))?;
+        io::copy(reader, &mut temp_file)?;
+        temp_file.flush()?;
+    } // temp_file is dropped here
+
+    // Replace original file with temp file
+    fs::rename(&temp_path, file_path)?;
+
+    Ok(true)
+}
+
+/// Read events starting from a specific si (efficient catchup)
+pub fn read_from_si(
+    reader: &mut BufReader<File>,
+    target_server_id: u64,
+    max_bytes: usize,
+    event_type_filter: Option<&[u64]>,
+    exclude_client_id_filter: Option<u128>,
+) -> io::Result<CatchupResult> {
+    let mut batch_positions = collect_batch_positions_backwards(reader, target_server_id)?;
 
     // Reverse to get chronological order (oldest to newest)
     batch_positions.reverse();
@@ -291,7 +339,6 @@ pub mod tests {
     use crate::event_item::tests::{create_minimal_event_item, create_test_event_item};
     use crate::file_cache::{create_append_writer, create_reader};
     use std::fs::OpenOptions;
-    use std::usize;
     use tempfile::TempDir;
 
     pub fn create_event_batch_item(server_id: u64, client_id: u128, user_id: Option<String>, server_date: u64, events: Vec<EventItem>) -> EventBatchItem {
@@ -475,7 +522,7 @@ pub mod tests {
 
         let mut reader = create_reader(events_bin.to_str().unwrap()).unwrap();
 
-        let invalid_si_over = read_from_si(&mut reader, 1000, usize::max_value(), None, None).unwrap();
+        let invalid_si_over = read_from_si(&mut reader, 1000, usize::MAX, None, None).unwrap();
 
         assert_eq!(invalid_si_over.event_batches.len(), 0);
         assert_eq!(invalid_si_over.next_server_id, Option::None);
@@ -506,7 +553,7 @@ pub mod tests {
         let last_si = find_last_si(&mut reader).unwrap();
         assert_eq!(last_si, Some(0));
 
-        let si_0_result = read_from_si(&mut reader, 0, usize::max_value(), None, None).unwrap();
+        let si_0_result = read_from_si(&mut reader, 0, usize::MAX, None, None).unwrap();
 
         assert_eq!(si_0_result.event_batches.len(), 1);
         assert_eq!(si_0_result.event_batches[0].events.len(), 3);
@@ -517,13 +564,13 @@ pub mod tests {
         let last_si = find_last_si(&mut reader).unwrap();
         assert_eq!(last_si, Some(1));
 
-        let read_result = read_from_si(&mut reader, 0, usize::max_value(), None, None).unwrap();
+        let read_result = read_from_si(&mut reader, 0, usize::MAX, None, None).unwrap();
 
         assert_eq!(read_result.event_batches.len(), 2);
         assert_eq!(events_batch_1.server_id, read_result.event_batches[0].server_id);
         assert_eq!(events_batch_2.server_id, read_result.event_batches[1].server_id);
 
-        let read_result = read_from_si(&mut reader, 1, usize::max_value(), None, None).unwrap();
+        let read_result = read_from_si(&mut reader, 1, usize::MAX, None, None).unwrap();
 
         assert_eq!(read_result.event_batches.len(), 1);
         assert_eq!(events_batch_2.server_id, read_result.event_batches[0].server_id);
@@ -533,13 +580,13 @@ pub mod tests {
         let last_si = find_last_si(&mut reader).unwrap();
         assert_eq!(last_si, Some(2));
 
-        let read_result = read_from_si(&mut reader, 2, usize::max_value(), None, None).unwrap();
+        let read_result = read_from_si(&mut reader, 2, usize::MAX, None, None).unwrap();
 
         assert_eq!(read_result.event_batches.len(), 1);
         assert_eq!(read_result.event_batches[0].events.len(), 1);
         assert_eq!(events_batch_3.server_id, read_result.event_batches[0].server_id);
 
-        let read_result = read_from_si(&mut reader, 1, usize::max_value(), None, None).unwrap();
+        let read_result = read_from_si(&mut reader, 1, usize::MAX, None, None).unwrap();
         assert_eq!(read_result.event_batches.len(), 2);
         assert_eq!(events_batch_2.server_id, read_result.event_batches[0].server_id);
         assert_eq!(events_batch_3.server_id, read_result.event_batches[1].server_id);
@@ -775,5 +822,132 @@ pub mod tests {
         let result = read_from_si(&mut reader, 0, usize::MAX, None, Some(999)).unwrap();
 
         assert_eq!(result.event_batches.len(), 4);
+    }
+
+    #[test]
+    fn test_trim_start_happy_path() {
+        let events_batch_1 = create_event_batch_item(0, 123, None, 100, vec![create_test_event_item()]);
+        let events_batch_2 = create_event_batch_item(1, 456, None, 200, vec![create_test_event_item()]);
+        let events_batch_3 = create_event_batch_item(2, 789, None, 300, vec![create_test_event_item()]);
+        let events_batch_4 = create_event_batch_item(3, 999, None, 400, vec![create_test_event_item()]);
+
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let temp_path = temp_dir.path();
+        let events_bin = temp_path.join("events.bin");
+
+        let mut writer = create_append_writer(events_bin.to_str().unwrap()).unwrap();
+
+        append_event_batch(&mut writer, &events_batch_1).unwrap();
+        append_event_batch(&mut writer, &events_batch_2).unwrap();
+        append_event_batch(&mut writer, &events_batch_3).unwrap();
+        append_event_batch(&mut writer, &events_batch_4).unwrap();
+
+        let file_path = events_bin.to_str().unwrap();
+        let mut reader = create_reader(file_path).unwrap();
+
+        // Trim everything up to server_id 2 (should keep batches 2 and 3)
+        let result = trim_start(file_path, &mut reader, 1).unwrap();
+        assert!(result);
+
+        let mut reader = create_reader(file_path).unwrap();
+        // Reading from server_id 0 should fail since it was trimmed
+        let result = read_from_si(&mut reader, 0, usize::MAX, None, None);
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("Target server ID not found"));
+
+        // Reading from server_id 1 should also fail since it was trimmed
+        let result = read_from_si(&mut reader, 1, usize::MAX, None, None);
+        assert!(result.is_err());
+
+        // Reading from server_id 2 should work and return batches 2 and 3
+        let result = read_from_si(&mut reader, 2, usize::MAX, None, None).unwrap();
+        assert_eq!(result.event_batches.len(), 2);
+        assert_eq!(result.event_batches[0].server_id, 2);
+        assert_eq!(result.event_batches[1].server_id, 3);
+    }
+
+    #[test]
+    fn test_trim_start_found_si_but_nothing_to_trim() {
+        let events_batch_1 = create_event_batch_item(5, 123, None, 100, vec![create_test_event_item()]);
+        let events_batch_2 = create_event_batch_item(10, 456, None, 200, vec![create_test_event_item()]);
+
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let temp_path = temp_dir.path();
+        let events_bin = temp_path.join("events.bin");
+
+        let file_path = events_bin.to_str().unwrap();
+        let mut writer = create_append_writer(events_bin.to_str().unwrap()).unwrap();
+
+        append_event_batch(&mut writer, &events_batch_1).unwrap();
+        append_event_batch(&mut writer, &events_batch_2).unwrap();
+
+        let original_file_size = writer.get_ref().metadata().unwrap().len();
+
+        let mut reader = create_reader(file_path).unwrap();
+        // Try to trim up to server_id 3 - this should find server_id 5 but not trim anything
+        // because the first batch (5) is already greater than 3
+        let result = trim_start(file_path, &mut reader, 3);
+        assert!(result.is_err());
+
+        // File size should remain the same
+        let new_file_size = writer.get_ref().metadata().unwrap().len();
+        assert_eq!(original_file_size, new_file_size);
+
+        // All data should still be accessible
+        let mut reader = create_reader(events_bin.to_str().unwrap()).unwrap();
+        let result = read_from_si(&mut reader, 5, usize::MAX, None, None).unwrap();
+        assert_eq!(result.event_batches.len(), 2);
+        assert_eq!(result.event_batches[0].server_id, 5);
+        assert_eq!(result.event_batches[1].server_id, 10);
+    }
+
+    #[test]
+    fn test_trim_start_did_not_find_si() {
+        let events_batch_1 = create_event_batch_item(10, 123, None, 100, vec![create_test_event_item()]);
+        let events_batch_2 = create_event_batch_item(20, 456, None, 200, vec![create_test_event_item()]);
+
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let temp_path = temp_dir.path();
+        let events_bin = temp_path.join("events.bin");
+
+        let file_path = events_bin.to_str().unwrap();
+        let mut writer = create_append_writer(events_bin.to_str().unwrap()).unwrap();
+
+        append_event_batch(&mut writer, &events_batch_1).unwrap();
+        append_event_batch(&mut writer, &events_batch_2).unwrap();
+
+        let mut reader = create_reader(events_bin.to_str().unwrap()).unwrap();
+        // Try to trim up to server_id 25 - this should fail because we can't find any batch
+        // with server_id less than 25 (our batches are 10 and 20)
+        let result = trim_start(file_path, &mut reader, 25);
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn test_trim_start_trim_all_batches() {
+        let events_batch_1 = create_event_batch_item(0, 123, None, 100, vec![create_test_event_item()]);
+        let events_batch_2 = create_event_batch_item(1, 456, None, 200, vec![create_test_event_item()]);
+
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let temp_path = temp_dir.path();
+        let events_bin = temp_path.join("events.bin");
+
+        let file_path = events_bin.to_str().unwrap();
+        let mut writer = create_append_writer(events_bin.to_str().unwrap()).unwrap();
+
+        append_event_batch(&mut writer, &events_batch_1).unwrap();
+        append_event_batch(&mut writer, &events_batch_2).unwrap();
+
+        let mut reader = create_reader(file_path).unwrap();
+
+        // Trim everything up to server_id 10 (higher than any existing batch)
+        let result = trim_start(file_path, &mut reader, 10);
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
     }
 }

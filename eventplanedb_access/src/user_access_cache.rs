@@ -548,7 +548,8 @@ mod tests {
             server_date: chrono::Utc::now().timestamp_millis() as u64,
             events: vec![],
         };
-        event_storage_cache.write(&file_path, true, true, event_batch).unwrap();
+        let result = event_storage_cache.write(&file_path, true, true, event_batch);
+        assert!(result.is_err());
 
         // Populate the cache
         user_access_cache.cache.insert(file_path.clone(), AggregateToUserAccessLevel::new());
