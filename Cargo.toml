@@ -1,0 +1,10 @@
+[package]
+name = "event-sourcing-storage"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bincode = "2.0.1"
+fastbloom = "0.14.0"
+serde = { version = "1.0.219", features = ["derive"] }
+zstd = "0.13.3"
