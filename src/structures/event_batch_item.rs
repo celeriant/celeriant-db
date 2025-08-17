@@ -3,7 +3,7 @@ use std::io;
 use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
-use crate::structures::event_item::EventItem;
+use crate::structures::{compression_type::CompressionType, event_item::EventItem};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct EventBatchItem {
@@ -46,17 +46,67 @@ impl EventBatchItem {
     }
 
     /// Serialize and compress the event batch item into a wire format
-    pub fn to_wire_format(&self) -> io::Result<Vec<u8>> {
+    pub fn to_wire_format(&self, compression_type: CompressionType) -> io::Result<Vec<u8>> {
         let serialized = bincode::encode_to_vec(self, bincode::config::standard())
             .map_err(|e| io::Error::other(e.to_string()))?;
 
-        zstd::bulk::compress(&serialized, 6).map_err(|e| io::Error::other(e.to_string()))
+        match compression_type {
+            CompressionType::None => Ok(serialized),
+            CompressionType::Zstd { level } => zstd::bulk::compress(&serialized, level)
+                .map_err(|e| io::Error::other(e.to_string())),
+            CompressionType::Snappy => snap::raw::Encoder::new()
+                .compress_vec(&serialized)
+                .map_err(|e| io::Error::other(e.to_string())),
+            CompressionType::Brotli { level } => {
+                let mut compressed = Vec::new();
+                let params = brotli::enc::BrotliEncoderParams {
+                    quality: level,
+                    ..Default::default()
+                };
+                brotli::BrotliCompress(
+                    &mut std::io::Cursor::new(&serialized),
+                    &mut compressed,
+                    &params,
+                )
+                .map_err(|e| io::Error::other(e.to_string()))?;
+                Ok(compressed)
+            }
+            CompressionType::Gzip { level } => {
+                use flate2::{Compression, write::GzEncoder};
+                let mut encoder = GzEncoder::new(Vec::new(), Compression::new(level as u32));
+                std::io::Write::write_all(&mut encoder, &serialized)?;
+                encoder.finish()
+            }
+        }
     }
 
     /// Deserialize and decompress from wire format
-    pub fn from_wire_format(data: &[u8], capacity: usize) -> io::Result<Self> {
-        let decompressed =
-            zstd::bulk::decompress(data, capacity).map_err(|e| io::Error::other(e.to_string()))?;
+    pub fn from_wire_format(
+        data: &[u8],
+        compression_type: CompressionType,
+        capacity: usize,
+    ) -> io::Result<Self> {
+        let decompressed = match compression_type {
+            CompressionType::None => data.to_vec(),
+            CompressionType::Zstd { .. } => zstd::bulk::decompress(data, capacity)
+                .map_err(|e| io::Error::other(e.to_string()))?,
+            CompressionType::Snappy => snap::raw::Decoder::new()
+                .decompress_vec(data)
+                .map_err(|e| io::Error::other(e.to_string()))?,
+            CompressionType::Brotli { .. } => {
+                let mut decompressed = Vec::with_capacity(capacity);
+                brotli::BrotliDecompress(&mut std::io::Cursor::new(data), &mut decompressed)
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                decompressed
+            }
+            CompressionType::Gzip { .. } => {
+                use flate2::read::GzDecoder;
+                let mut decoder = GzDecoder::new(data);
+                let mut decompressed = Vec::with_capacity(capacity);
+                std::io::Read::read_to_end(&mut decoder, &mut decompressed)?;
+                decompressed
+            }
+        };
 
         bincode::decode_from_slice(&decompressed, bincode::config::standard())
             .map(|(events, _)| events)

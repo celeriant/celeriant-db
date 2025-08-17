@@ -3,7 +3,7 @@ use std::{
     io::{self, BufWriter, Write},
 };
 
-use crate::structures::event_batch_item::EventBatchItem;
+use crate::structures::{compression_type::CompressionType, event_batch_item::EventBatchItem};
 
 /// Writes an event batch item to a binary stream
 ///
@@ -13,7 +13,11 @@ use crate::structures::event_batch_item::EventBatchItem;
 ///
 /// # Returns
 /// * `usize` - The size of the compressed event_batch_item data in bytes
-pub fn write<W: Write>(writer: &mut W, event_batch_item: &EventBatchItem) -> io::Result<usize> {
+pub fn write<W: Write>(
+    writer: &mut W,
+    compression_type: CompressionType,
+    event_batch_item: &EventBatchItem,
+) -> io::Result<usize> {
     let total_size = 9999;
     let mut write_buffer = Vec::with_capacity(total_size);
 

@@ -5,6 +5,9 @@ edition = "2024"
 
 [dependencies]
 bincode = "2.0.1"
+brotli = "8.0.2"
 fastbloom = "0.14.0"
+flate2 = "1.1.2"
 serde = { version = "1.0.219", features = ["derive"] }
+snap = "1.1.1"
 zstd = "0.13.3"
