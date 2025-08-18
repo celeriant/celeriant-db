@@ -46,17 +46,27 @@ impl EventBatchItem {
     }
 
     /// Serialize and compress the event batch item into a wire format
-    pub fn to_wire_format(&self, compression_type: CompressionType) -> io::Result<Vec<u8>> {
+    pub fn to_wire_format(
+        &self,
+        compression_type: CompressionType,
+    ) -> io::Result<(usize, Vec<u8>)> {
         let serialized = bincode::encode_to_vec(self, bincode::config::standard())
             .map_err(|e| io::Error::other(e.to_string()))?;
+        let uncompressed_size = serialized.len();
 
         match compression_type {
-            CompressionType::None => Ok(serialized),
-            CompressionType::Zstd { level } => zstd::bulk::compress(&serialized, level)
-                .map_err(|e| io::Error::other(e.to_string())),
-            CompressionType::Snappy => snap::raw::Encoder::new()
-                .compress_vec(&serialized)
-                .map_err(|e| io::Error::other(e.to_string())),
+            CompressionType::None => Ok((uncompressed_size, serialized)),
+            CompressionType::Zstd { level } => {
+                let compressed = zstd::bulk::compress(&serialized, level)
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                Ok((uncompressed_size, compressed))
+            }
+            CompressionType::Snappy => {
+                let compressed = snap::raw::Encoder::new()
+                    .compress_vec(&serialized)
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                Ok((uncompressed_size, compressed))
+            }
             CompressionType::Brotli { level } => {
                 let mut compressed = Vec::new();
                 let params = brotli::enc::BrotliEncoderParams {
@@ -69,13 +79,14 @@ impl EventBatchItem {
                     &params,
                 )
                 .map_err(|e| io::Error::other(e.to_string()))?;
-                Ok(compressed)
+                Ok((uncompressed_size, compressed))
             }
             CompressionType::Gzip { level } => {
                 use flate2::{Compression, write::GzEncoder};
                 let mut encoder = GzEncoder::new(Vec::new(), Compression::new(level as u32));
                 std::io::Write::write_all(&mut encoder, &serialized)?;
-                encoder.finish()
+                let compressed = encoder.finish()?;
+                Ok((uncompressed_size, compressed))
             }
         }
     }

@@ -1,6 +1,10 @@
 use std::io::{self, Read, Seek, SeekFrom};
 
-use crate::structures::{read_filters::ReadFilters, read_result::ReadResult};
+use fastbloom::BloomFilter;
+
+use crate::structures::{
+    constants::BLOOM_BYTES, read_filters::ReadFilters, read_result::ReadResult,
+};
 
 /// Reads event batches from a binary stream with filtering and pagination support
 ///
@@ -59,4 +63,18 @@ pub fn last_local_id<R: Read + Seek>(reader: &mut R) -> io::Result<Option<u64>> 
 /// * File position where the data in the file is beginning to be corrupt
 pub fn detect_corruption<R: Read + Seek>(reader: &mut R) -> io::Result<Option<u64>> {
     Ok(None)
+}
+
+fn bloom_filter_from_bytes(bloom_bytes: &[u8; BLOOM_BYTES], num_hashes: u32) -> BloomFilter {
+    // Convert bytes back to Vec<u64>
+    let mut u64_vec = Vec::with_capacity(BLOOM_BYTES / 8); // eg. 128 bytes = 16 u64s
+
+    for chunk in bloom_bytes.chunks_exact(8) {
+        let u64_val = u64::from_le_bytes([
+            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+        ]);
+        u64_vec.push(u64_val);
+    }
+
+    BloomFilter::from_vec(u64_vec).hashes(num_hashes)
 }

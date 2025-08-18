@@ -102,6 +102,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "brotli",
+ "crc32fast",
  "fastbloom",
  "flate2",
  "serde",
