@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::structures::{compression_type::CompressionType, event_item::EventItem};
 
+use crate::serde_option_u128_base64;
+use crate::serde_u128_base64;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct EventBatchItem {
     /// Unique, incremented integer assigned to each event batch when persisted on the server
@@ -16,12 +19,16 @@ pub struct EventBatchItem {
     pub server_time: u64,
 
     /// Unique identifyer of the machine that produced these events. Typically the truncated SHA256 of the clients' public key
-    #[serde(rename = "ci")]
-    pub client_id: u64,
+    #[serde(with = "serde_u128_base64", rename = "ci")]
+    pub client_id: u128,
 
-    /// Optional user id, if oauth is used or some other method of identifying a user
-    #[serde(skip_serializing_if = "Option::is_none", rename = "ui")]
-    pub user_id: Option<String>,
+    /// Unique identifyer of the user that produced these events. Typically the truncated SHA256 of the users' sub field
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        with = "serde_option_u128_base64",
+        rename = "ui"
+    )]
+    pub user_id: Option<u128>,
 
     /// Events present in this batch, all from the same client / user
     #[serde(rename = "ev")]
@@ -32,8 +39,8 @@ impl EventBatchItem {
     pub fn new(
         server_id: u64,
         server_time: u64,
-        client_id: u64,
-        user_id: Option<String>,
+        client_id: u128,
+        user_id: Option<u128>,
         events: Vec<EventItem>,
     ) -> Self {
         Self {

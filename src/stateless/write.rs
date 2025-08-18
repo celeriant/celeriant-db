@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     io::{self, Write},
+    u64,
 };
 
 use crc32fast::Hasher;
@@ -8,11 +9,9 @@ use fastbloom::BloomFilter;
 
 use crate::structures::{
     compression_type::CompressionType,
-    constants::{
-        BLOOM_BITS, BLOOM_BYTES, BLOOM_HASH_COUNT, HEAD_BATCH_START_SIZE, MAGIC_NUMBER,
-        TAIL_BATCH_METADATA_SIZE,
-    },
+    constants::{BLOOM_BYTES, HEAD_BATCH_START_SIZE, MAGIC_NUMBER, TAIL_BATCH_METADATA_SIZE},
     event_batch_item::EventBatchItem,
+    event_item::EventItem,
 };
 
 /// Writes an event batch item to a binary stream
@@ -25,6 +24,8 @@ use crate::structures::{
 /// * `usize` - The size of the uncompressed event_batch_item data in bytes
 pub fn append_event_batch<W: Write>(
     writer: &mut W,
+    bloom_filter: &mut BloomFilter,
+    event_type_dedup: &mut HashSet<u64>,
     compression_type: CompressionType,
     event_batch_item: &EventBatchItem,
 ) -> io::Result<usize> {
@@ -58,55 +59,21 @@ pub fn append_event_batch<W: Write>(
     write_buffer.extend_from_slice(&uncompressed_size_bytes);
     hasher.update(&uncompressed_size_bytes);
 
-    // Write the event type if there is only a single event in the batch (for filtering later)
-    let mut tp = if event_batch_item.events.len() == 1 {
-        event_batch_item.events[0].event_type_major
+    let (event_types, use_bloom) = extract_unique_event_types(&event_batch_item.events);
+    write_buffer.extend_from_slice(&(use_bloom as u8).to_le_bytes());
+
+    if use_bloom {
+        let bloom_bytes =
+            create_bloom_filter_bytes(bloom_filter, event_type_dedup, &event_batch_item.events);
+        write_buffer.extend_from_slice(&bloom_bytes);
+        hasher.update(&bloom_bytes);
     } else {
-        u64::MAX
-    };
-
-    // 128 bytes for a bloom filter (always written for fixed header size)
-    let mut bloom_bytes = [0u8; BLOOM_BYTES];
-
-    if event_batch_item.events.len() > 1 {
-        let event_types_major: HashSet<_> = event_batch_item
-            .events
-            .iter()
-            .map(|f| f.event_type_major)
-            .collect();
-
-        if event_types_major.len() == 1 {
-            tp = *event_types_major.iter().next().unwrap();
-        } else {
-            // Populate bloom filter with multiple event types
-            let mut filter = BloomFilter::with_num_bits(BLOOM_BITS).hashes(BLOOM_HASH_COUNT);
-
-            for event_type in &event_types_major {
-                filter.insert(&event_type.to_le_bytes());
-            }
-
-            // Get filter bytes (256 bits = 32 bytes)
-            let filter_slice = filter.as_slice(); // Returns &[u64]
-            let filter_bytes = unsafe {
-                core::slice::from_raw_parts(
-                    filter_slice.as_ptr() as *const u8,
-                    BLOOM_BYTES, // Convert u64 count to byte count
-                )
-            };
-            if filter_bytes.len() >= BLOOM_BYTES {
-                bloom_bytes.copy_from_slice(&filter_bytes[..BLOOM_BYTES]);
-            } else {
-                bloom_bytes[..filter_bytes.len()].copy_from_slice(filter_bytes);
-            }
+        for &event_type in &event_types {
+            let event_type_bytes = event_type.to_le_bytes();
+            write_buffer.extend_from_slice(&event_type_bytes);
+            hasher.update(&event_type_bytes);
         }
     }
-
-    let tp_bytes = tp.to_le_bytes();
-    write_buffer.extend_from_slice(&tp_bytes);
-    hasher.update(&tp_bytes);
-
-    write_buffer.extend_from_slice(&bloom_bytes);
-    hasher.update(&bloom_bytes);
 
     // Write the clients last local index (8 bytes)
     // This helps the server to stop the client from writing duplicate events
@@ -125,6 +92,14 @@ pub fn append_event_batch<W: Write>(
     let client_id_bytes = event_batch_item.client_id.to_le_bytes();
     write_buffer.extend_from_slice(&client_id_bytes);
     hasher.update(&client_id_bytes);
+
+    let user_id_bytes = event_batch_item.user_id.unwrap_or(0).to_le_bytes();
+    write_buffer.extend_from_slice(&user_id_bytes);
+    hasher.update(&user_id_bytes);
+
+    let server_time_bytes = event_batch_item.server_time.to_le_bytes();
+    write_buffer.extend_from_slice(&server_time_bytes);
+    hasher.update(&server_time_bytes);
 
     // Each batch is variable in length, so we need to know where it starts when reading backwards through the file
     write_buffer.extend_from_slice(&compressed_len_bytes);
@@ -148,4 +123,75 @@ pub fn append_event_batch<W: Write>(
     writer.flush()?;
 
     Ok(uncompressed_size)
+}
+
+fn extract_unique_event_types(events: &[EventItem]) -> ([u64; 4], bool) {
+    let mut bloom_or_event_types = [u64::MAX, u64::MAX, u64::MAX, u64::MAX];
+    let mut use_bloom = false;
+    let mut unique_count = 0;
+
+    for event in events {
+        let event_type = event.event_type_major;
+
+        // Check if we already have this event type
+        if unique_count > 0 && bloom_or_event_types[0] == event_type {
+            continue;
+        }
+        if unique_count > 1 && bloom_or_event_types[1] == event_type {
+            continue;
+        }
+        if unique_count > 2 && bloom_or_event_types[2] == event_type {
+            continue;
+        }
+        if unique_count > 3 && bloom_or_event_types[3] == event_type {
+            continue;
+        }
+
+        // New unique event type
+        if unique_count < 4 {
+            bloom_or_event_types[unique_count] = event_type;
+            unique_count += 1;
+        } else {
+            use_bloom = true;
+            break;
+        }
+    }
+
+    (bloom_or_event_types, use_bloom)
+}
+
+fn create_bloom_filter_bytes(
+    filter: &mut BloomFilter,
+    event_type_dedup: &mut HashSet<u64>,
+    events: &[EventItem],
+) -> [u8; BLOOM_BYTES] {
+    let mut bloom_bytes = [0u8; BLOOM_BYTES];
+
+    // Populate bloom filter with multiple event types
+    filter.clear();
+    event_type_dedup.clear();
+
+    for event in events {
+        event_type_dedup.insert(event.event_type_major);
+    }
+
+    for &event_type in event_type_dedup.iter() {
+        filter.insert(&event_type.to_le_bytes());
+    }
+
+    // Get filter bytes
+    let filter_slice = filter.as_slice(); // Returns &[u64]
+    let filter_bytes = unsafe {
+        core::slice::from_raw_parts(
+            filter_slice.as_ptr() as *const u8,
+            BLOOM_BYTES, // Convert u64 count to byte count
+        )
+    };
+    if filter_bytes.len() >= BLOOM_BYTES {
+        bloom_bytes.copy_from_slice(&filter_bytes[..BLOOM_BYTES]);
+    } else {
+        bloom_bytes[..filter_bytes.len()].copy_from_slice(filter_bytes);
+    }
+
+    bloom_bytes
 }
