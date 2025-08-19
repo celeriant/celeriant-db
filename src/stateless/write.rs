@@ -1,29 +1,30 @@
 use std::{
     collections::HashSet,
     io::{self, Write},
-    u64,
 };
 
-use crc32fast::Hasher;
 use fastbloom::BloomFilter;
 
 use crate::structures::{
-    compression_type::CompressionType,
-    constants::{BLOOM_BYTES, HEAD_BATCH_START_SIZE, MAGIC_NUMBER, TAIL_BATCH_METADATA_SIZE},
-    event_batch_item::EventBatchItem,
+    compression_type::CompressionType, constants::BLOOM_BYTES, event_batch_item::EventBatchItem,
     event_item::EventItem,
 };
 
-/// Writes an event batch item to a binary stream
+/// Writes an event batch item to a binary stream with separate metadata
 ///
 /// # Arguments
-/// * `writer` - Any writable destination (BufWriter<File>, Vec<u8>, Cursor<Vec<u8>>, etc.)
+/// * `event_batch_writer` - Writer for the compressed event data
+/// * `metadata_writer` - Writer for the metadata
+/// * `bloom_filter` - Bloom filter for event type deduplication
+/// * `event_type_dedup` - HashSet for tracking unique event types
+/// * `compression_type` - Compression algorithm to use
 /// * `event_batch_item` - The event batch item to serialize and write
 ///
 /// # Returns
 /// * `usize` - The size of the uncompressed event_batch_item data in bytes
-pub fn append_event_batch<W: Write>(
-    writer: &mut W,
+pub fn append_event_batch<W: Write, M: Write>(
+    event_batch_writer: &mut W,
+    metadata_writer: &mut M,
     bloom_filter: &mut BloomFilter,
     event_type_dedup: &mut HashSet<u64>,
     compression_type: CompressionType,
@@ -33,94 +34,39 @@ pub fn append_event_batch<W: Write>(
         return Err(io::Error::other("Cannot write empty event batch"));
     }
 
-    let mut hasher = Hasher::new();
-
-    // Serialize and compress
+    // Serialize and compress the event data
     let (uncompressed_size, compressed_event_batch_item) =
         event_batch_item.to_wire_format(compression_type)?;
+    let events_crc = crc32fast::hash(&compressed_event_batch_item);
 
-    // Write everything in one go to minimize syscalls
-    let compressed_event_batch_item_length = compressed_event_batch_item.len();
-    let total_size =
-        HEAD_BATCH_START_SIZE + compressed_event_batch_item_length + TAIL_BATCH_METADATA_SIZE;
-    let mut write_buffer = Vec::with_capacity(total_size);
-
-    //Write the length of the compressed event batch item first for forward-based file recovery
-    let compressed_len_bytes = (compressed_event_batch_item_length as u64).to_le_bytes();
-    write_buffer.extend_from_slice(&compressed_len_bytes);
-    hasher.update(&compressed_len_bytes);
-
-    //Now we can write the actual event_batch_item data
-    write_buffer.extend_from_slice(&compressed_event_batch_item);
-    hasher.update(&compressed_event_batch_item);
-
-    // We need the original size of the event in bytes before compression to create the right buffer size
-    let uncompressed_size_bytes = (uncompressed_size as u64).to_le_bytes();
-    write_buffer.extend_from_slice(&uncompressed_size_bytes);
-    hasher.update(&uncompressed_size_bytes);
-
+    // Determine event types data (bloom filter or direct array)
     let (event_types, use_bloom) = extract_unique_event_types(&event_batch_item.events);
-    write_buffer.extend_from_slice(&(use_bloom as u8).to_le_bytes());
-
-    if use_bloom {
+    let event_types_data = if use_bloom {
         let bloom_bytes =
             create_bloom_filter_bytes(bloom_filter, event_type_dedup, &event_batch_item.events);
-        write_buffer.extend_from_slice(&bloom_bytes);
-        hasher.update(&bloom_bytes);
+        crate::structures::event_batch_metadata::EventTypesData::Bloom(bloom_bytes)
     } else {
-        for &event_type in &event_types {
-            let event_type_bytes = event_type.to_le_bytes();
-            write_buffer.extend_from_slice(&event_type_bytes);
-            hasher.update(&event_type_bytes);
-        }
-    }
+        crate::structures::event_batch_metadata::EventTypesData::Direct(event_types)
+    };
 
-    // Write the clients last local index (8 bytes)
-    // This helps the server to stop the client from writing duplicate events
-    let last_local_index = event_batch_item.events.last().map_or(0, |e| e.local_index);
-    let last_local_index_bytes = last_local_index.to_le_bytes();
-    write_buffer.extend_from_slice(&last_local_index_bytes);
-    hasher.update(&last_local_index_bytes);
+    // Create and serialise metadata
+    let metadata = crate::structures::event_batch_metadata::EventBatchMetadata::from_batch_item(
+        event_batch_item,
+        uncompressed_size as u64,
+        compressed_event_batch_item.len() as u64,
+        compression_type,
+        event_types_data,
+        events_crc,
+    );
+    let metadata_bytes = bincode::encode_to_vec(&metadata, bincode::config::standard())
+        .map_err(|e| io::Error::other(e.to_string()))?;
 
-    // We need the si of the first event in the batch to determine which batch to start the catch-up process from
-    let server_id_bytes = event_batch_item.server_id.to_le_bytes();
-    write_buffer.extend_from_slice(&server_id_bytes);
-    hasher.update(&server_id_bytes);
+    // Write data to disk
+    event_batch_writer.write_all(&compressed_event_batch_item)?;
+    metadata_writer.write_all(&metadata_bytes)?;
 
-    // Write the client id who created the event batch
-    // Note we don't write the user_id as it's size is not fixed
-    let client_id_bytes = event_batch_item.client_id.to_le_bytes();
-    write_buffer.extend_from_slice(&client_id_bytes);
-    hasher.update(&client_id_bytes);
-
-    let user_id_bytes = event_batch_item.user_id.unwrap_or(0).to_le_bytes();
-    write_buffer.extend_from_slice(&user_id_bytes);
-    hasher.update(&user_id_bytes);
-
-    let server_time_bytes = event_batch_item.server_time.to_le_bytes();
-    write_buffer.extend_from_slice(&server_time_bytes);
-    hasher.update(&server_time_bytes);
-
-    // Each batch is variable in length, so we need to know where it starts when reading backwards through the file
-    write_buffer.extend_from_slice(&compressed_len_bytes);
-    hasher.update(&compressed_len_bytes);
-
-    // What compression algorithm we used
-    let compression_type_bytes = compression_type.to_tuple().0.to_le_bytes();
-    write_buffer.extend_from_slice(&compression_type_bytes);
-    hasher.update(&compression_type_bytes);
-
-    // Finalize checksum and add it
-    let checksum = hasher.finalize();
-    write_buffer.extend_from_slice(&checksum.to_le_bytes());
-
-    // Magic number for corruption detection
-    write_buffer.extend_from_slice(&MAGIC_NUMBER.to_le_bytes());
-
-    writer.write_all(&write_buffer)?;
-
-    // Force write to the disk to ensure we don't lose data if the program crashes
-    writer.flush()?;
+    event_batch_writer.flush()?;
+    metadata_writer.flush()?;
 
     Ok(uncompressed_size)
 }
