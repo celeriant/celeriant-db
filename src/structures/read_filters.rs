@@ -21,6 +21,14 @@ pub struct ReadFilters<'a> {
     pub after_server_time: Option<u64>,
     /// Optional timestamp filter, only include batches before this time (exclusive)
     pub before_server_time: Option<u64>,
+    /// Only include batches with max_local_index greater than or equal to this value
+    pub min_local_index: Option<u64>,
+    /// Only include batches with min_local_index less than or equal to this value
+    pub max_local_index: Option<u64>,
+    /// Only include batches with max_event_time greater than or equal to this value
+    pub min_event_time: Option<u64>,
+    /// Only include batches with min_event_time less than or equal to this value
+    pub max_event_time: Option<u64>,
 }
 
 impl<'a> ReadFilters<'a> {
@@ -79,6 +87,38 @@ impl<'a> ReadFilters<'a> {
     pub fn time_range(mut self, after: u64, before: u64) -> Self {
         self.after_server_time = Some(after);
         self.before_server_time = Some(before);
+        self
+    }
+
+    pub fn min_local_index(mut self, index: u64) -> Self {
+        self.min_local_index = Some(index);
+        self
+    }
+
+    pub fn max_local_index(mut self, index: u64) -> Self {
+        self.max_local_index = Some(index);
+        self
+    }
+
+    pub fn local_index_range(mut self, min: u64, max: u64) -> Self {
+        self.min_local_index = Some(min);
+        self.max_local_index = Some(max);
+        self
+    }
+
+    pub fn min_event_time(mut self, time: u64) -> Self {
+        self.min_event_time = Some(time);
+        self
+    }
+
+    pub fn max_event_time(mut self, time: u64) -> Self {
+        self.max_event_time = Some(time);
+        self
+    }
+
+    pub fn event_time_range(mut self, min: u64, max: u64) -> Self {
+        self.min_event_time = Some(min);
+        self.max_event_time = Some(max);
         self
     }
 }

@@ -3,6 +3,7 @@ use std::io;
 use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
+use crate::structures::constants::BINCODE_CONFIG_VARIABLE;
 use crate::structures::{compression_type::CompressionType, event_item::EventItem};
 
 use crate::serde_option_u128_base64;
@@ -57,7 +58,7 @@ impl EventBatchItem {
         &self,
         compression_type: CompressionType,
     ) -> io::Result<(usize, Vec<u8>)> {
-        let serialized = bincode::encode_to_vec(self, bincode::config::standard())
+        let serialized = bincode::encode_to_vec(self, BINCODE_CONFIG_VARIABLE)
             .map_err(|e| io::Error::other(e.to_string()))?;
         let uncompressed_size = serialized.len();
 
@@ -126,7 +127,7 @@ impl EventBatchItem {
             }
         };
 
-        bincode::decode_from_slice(&decompressed, bincode::config::standard())
+        bincode::decode_from_slice(&decompressed, BINCODE_CONFIG_VARIABLE)
             .map(|(events, _)| events)
             .map_err(|e| io::Error::other(e.to_string()))
     }

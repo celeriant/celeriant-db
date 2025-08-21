@@ -6,8 +6,7 @@ use std::{
 use fastbloom::BloomFilter;
 
 use crate::structures::{
-    compression_type::CompressionType, constants::BLOOM_BYTES, event_batch_item::EventBatchItem,
-    event_item::EventItem,
+    compression_type::CompressionType, constants::{BINCODE_CONFIG_FIXED, BLOOM_BYTES, METADATA_BATCH_SIZE_BYTES}, event_batch_item::EventBatchItem, event_batch_metadata::EventBatchMetadata, event_item::EventItem
 };
 
 /// Writes an event batch item to a binary stream with separate metadata
@@ -29,7 +28,7 @@ pub fn append_event_batch<W: Write, M: Write>(
     event_type_dedup: &mut HashSet<u64>,
     compression_type: CompressionType,
     event_batch_item: &EventBatchItem,
-) -> io::Result<usize> {
+) -> io::Result<EventBatchMetadata> {
     if event_batch_item.events.is_empty() {
         return Err(io::Error::other("Cannot write empty event batch"));
     }
@@ -58,7 +57,8 @@ pub fn append_event_batch<W: Write, M: Write>(
         event_types_data,
         events_crc,
     );
-    let metadata_bytes = bincode::encode_to_vec(&metadata, bincode::config::standard())
+
+    let metadata_bytes = bincode::encode_to_vec(&metadata, BINCODE_CONFIG_FIXED)
         .map_err(|e| io::Error::other(e.to_string()))?;
 
     // Write data to disk
@@ -68,7 +68,7 @@ pub fn append_event_batch<W: Write, M: Write>(
     event_batch_writer.flush()?;
     metadata_writer.flush()?;
 
-    Ok(uncompressed_size)
+    Ok(metadata)
 }
 
 fn extract_unique_event_types(events: &[EventItem]) -> ([u64; 4], bool) {

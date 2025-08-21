@@ -3,6 +3,10 @@ use io_uring::{IoUring, opcode, types};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::io::AsRawFd;
 
+use crate::structures::compression_type::CompressionType;
+use crate::structures::constants::{BINCODE_CONFIG_FIXED, BLOOM_HASH_COUNT};
+use crate::structures::event_batch_item::EventBatchItem;
+use crate::structures::event_batch_metadata::EventTypesData;
 use crate::structures::{
     constants::{BLOOM_BYTES, METADATA_BATCH_SIZE_BYTES},
     event_batch_metadata::EventBatchMetadata,
@@ -22,7 +26,7 @@ use crate::structures::{
 ///
 /// # Errors
 /// If corruption is detected, an error is raised.
-pub fn filtered_read<R: Read + Seek>(
+pub fn filtered_read<R: Read + Seek + AsRawFd>(
     event_batch_reader: &mut R,
     metadata_reader: &mut R,
     filters: &ReadFilters,
@@ -42,7 +46,7 @@ pub fn filtered_read<R: Read + Seek>(
     // Calculate how many metadata entries we can read
     let remaining_metadata_bytes =
         file_len_metadata.saturating_sub(start_reading_metadata_from_offset_position);
-    let max_metadata_entries = remaining_metadata_bytes / METADATA_BATCH_SIZE_BYTES as u64;
+    let max_metadata_entries = (remaining_metadata_bytes / METADATA_BATCH_SIZE_BYTES as u64) as usize;
 
     // Handle scenario where client requests server_id that hasn't been written yet
     if max_metadata_entries == 0 {
@@ -58,18 +62,19 @@ pub fn filtered_read<R: Read + Seek>(
     // Also calculate the absolute position (start and end pos) for each event batch blob in the event_batch file (metadata only stores batch lengths)
     // We can do all this inside io_uring collect phase as although its concurrent, the order is maintained (queue design)
 
-    // Phase 1: Read metadata entries using io_uring
-    let metadata_entries = read_metadata_entries_with_uring(
+    // Phase 1: Read and filter metadata entries using io_uring
+    let mut batches = read_metadata_entries_with_uring(
         metadata_reader,
         start_reading_metadata_from_offset_position,
         max_metadata_entries,
         filters,
     )?;
 
-    // Phase 2: Filter metadata and calculate event batch positions
-    let batch_info = filter_and_calculate_positions(&metadata_entries, filters)?;
+    calculate_absolute_positions(file_len_event_batch, &mut batches);
 
-    if batch_info.is_empty() {
+    let next_server_id: Option<u64> = trim_end_if_exceeds_max_bytes(&mut batches, filters.max_bytes);
+
+    if batches.is_empty() {
         return Ok(ReadResult {
             event_batches: Vec::new(),
             next_server_id: None,
@@ -82,13 +87,7 @@ pub fn filtered_read<R: Read + Seek>(
     // The bloom filter is not 100% accurate and metadata only stores 'in' types, not exclusive
 
     // Phase 3: Read event batches using io_uring
-    let event_batches = read_event_batches_with_uring(event_batch_reader, &batch_info, filters)?;
-
-    let next_server_id = if let Some(last_batch) = event_batches.last() {
-        Some(last_batch.server_id + 1)
-    } else {
-        None
-    };
+    let event_batches = read_event_batches_with_uring(event_batch_reader, &batches, filters)?;
 
     Ok(ReadResult {
         event_batches,
@@ -96,11 +95,73 @@ pub fn filtered_read<R: Read + Seek>(
     })
 }
 
+fn trim_end_if_exceeds_max_bytes(
+    batches: &mut Vec<MetadataBatchInfo>,
+    max_bytes: Option<usize>,
+) -> Option<u64> {
+    // If no max_bytes limit is specified, we don't need to trim
+    let max_bytes = match max_bytes {
+        Some(limit) => limit as u64,
+        None => return None,
+    };
+
+    // Only keep batches where include is true
+    batches.retain(|batch| batch.include);
+
+    // If after filtering we don't have any batches, return None
+    if batches.is_empty() {
+        return None;
+    }
+
+    // Calculate cumulative compressed size
+    let mut cumulative_size: u64 = 0;
+    let mut cut_index: Option<usize> = None;
+
+    // Batches are sorted by server_id (ascending)
+    for (index, batch) in batches.iter().enumerate() {
+        cumulative_size += batch.compressed_size;
+        
+        // If we exceed the max_bytes limit, store this index as the cut point
+        if cumulative_size > max_bytes {
+            cut_index = Some(index);
+            break;
+        }
+    }
+
+    // If we need to trim
+    if let Some(index) = cut_index {
+        // Get the server_id of the first batch we're trimming
+        let next_server_id = if index < batches.len() {
+            Some(batches[index].server_id)
+        } else {
+            None
+        };
+
+        // Keep only the batches that fit within the max_bytes limit
+        batches.truncate(index);
+        
+        next_server_id
+    } else {
+        // No trimming needed, all batches fit within the limit
+        None
+    }
+}
+
 #[derive(Debug)]
-struct BatchInfo {
-    metadata: EventBatchMetadata,
+struct MetadataBatchInfo {
+    server_id: u64,
+    uncompressed_size: u64,
+    compressed_size: u64,
+    compression_type: u8,
+    events_crc: u32,
     file_offset: u64,
     include: bool,
+}
+
+impl Default for MetadataBatchInfo {
+    fn default() -> Self {
+        Self { server_id: 0, uncompressed_size: 0, compressed_size: 0, compression_type: 0, events_crc: 0, file_offset: 0, include: false }
+    }
 }
 
 fn read_metadata_entries_with_uring<R: Read + Seek + AsRawFd>(
@@ -108,19 +169,20 @@ fn read_metadata_entries_with_uring<R: Read + Seek + AsRawFd>(
     start_offset: u64,
     max_entries: usize,
     filters: &ReadFilters,
-) -> io::Result<Vec<EventBatchMetadata>> {
+) -> io::Result<Vec<MetadataBatchInfo>> {
     let mut ring = IoUring::new(32)?;
     let fd = types::Fd(metadata_reader.as_raw_fd());
 
     // Prepare buffers for metadata entries
-    let mut buffers: Vec<Vec<u8>> = (0..max_entries)
-        .map(|_| vec![0u8; METADATA_BATCH_SIZE_BYTES as usize])
-        .collect();
+    let mut buffer_pool = Vec::with_capacity(max_entries);
+    for _ in 0..max_entries {
+        buffer_pool.push([0u8; METADATA_BATCH_SIZE_BYTES]);
+    }
 
     // Submit read operations
     let mut submission_count = 0;
-    for (i, buffer) in buffers.iter_mut().enumerate().take(max_entries) {
-        let offset = start_offset + (i as u64 * METADATA_BATCH_SIZE_BYTES);
+    for (i, buffer) in buffer_pool.iter_mut().enumerate().take(max_entries) {
+        let offset = start_offset + (i as u64 * METADATA_BATCH_SIZE_BYTES as u64);
         let read_op = opcode::Read::new(fd, buffer.as_mut_ptr(), buffer.len() as u32)
             .offset(offset)
             .build()
@@ -136,8 +198,14 @@ fn read_metadata_entries_with_uring<R: Read + Seek + AsRawFd>(
 
     ring.submit_and_wait(submission_count)?;
 
+    // Pre-allocate the result vector with the exact size
+    let mut batch_entries = Vec::with_capacity(submission_count);
+    for _ in 0..submission_count {
+        // We'll create actual entries based on the order of completion
+        batch_entries.push(MetadataBatchInfo::default());
+    }
+
     // Collect results
-    let mut metadata_entries = Vec::new();
     for _ in 0..submission_count {
         let cqe = ring
             .completion()
@@ -147,136 +215,124 @@ fn read_metadata_entries_with_uring<R: Read + Seek + AsRawFd>(
         let buffer_index = cqe.user_data() as usize;
         let bytes_read = cqe.result();
 
-        if bytes_read < 0 {
+        if (bytes_read as usize) < METADATA_BATCH_SIZE_BYTES {
             return Err(io::Error::other(format!("Read error: {}", bytes_read)));
         }
 
-        if bytes_read as usize >= std::mem::size_of::<EventBatchMetadata>() {
-            let metadata = bincode::decode_from_slice(
-                &buffers[buffer_index][..bytes_read as usize],
-                bincode::config::standard(),
-            )
-            .map_err(|e| io::Error::other(e.to_string()))?
-            .0;
+        let metadata: EventBatchMetadata = bincode::decode_from_slice(
+            &buffer_pool[buffer_index],
+            BINCODE_CONFIG_FIXED,
+        )
+        .map_err(|e| io::Error::other(e.to_string()))?
+        .0;
 
-            metadata_entries.push(metadata);
-        }
+        batch_entries[buffer_index].include = is_include_batch(&metadata, filters);
+        batch_entries[buffer_index].server_id = metadata.server_id;
+        batch_entries[buffer_index].uncompressed_size = metadata.uncompressed_size;
+        batch_entries[buffer_index].compressed_size = metadata.compressed_size;
+        batch_entries[buffer_index].compression_type = metadata.compression_type;
+        batch_entries[buffer_index].events_crc = metadata.events_crc;
     }
 
-    // Sort by server_id to maintain order
-    metadata_entries.sort_by_key(|m| m.server_id);
-
-    Ok(metadata_entries)
+    Ok(batch_entries)
 }
 
-fn filter_and_calculate_positions(
-    metadata_entries: &[EventBatchMetadata],
-    filters: &ReadFilters,
-) -> io::Result<Vec<BatchInfo>> {
-    let mut batch_info = Vec::new();
+fn is_include_batch(metadata: &EventBatchMetadata, filters: &ReadFilters) -> bool {
+    if metadata.server_id < filters.from_server_id {
+        return false;
+    }
+
+    if filters.to_server_id.map_or(false, |to_server_id| metadata.server_id > to_server_id) {
+        return false;
+    }
+
+    if filters.before_server_time.map_or(false, |before_server_time| metadata.server_time < before_server_time) {
+        return false;
+    }
+
+    if filters.after_server_time.map_or(false, |after_server_time| metadata.server_time > after_server_time) {
+        return false;
+    }
+
+    if filters.exclude_client_id.map_or(false, |exclude_client_id| metadata.client_id == exclude_client_id) {
+        return false;
+    }
+
+    if filters.include_client_id.map_or(false, |include_client_id| metadata.client_id != include_client_id) {
+        return false;
+    }
+
+    if filters.exclude_user_id.map_or(false, |exclude_user_id| metadata.user_id == exclude_user_id) {
+        return false;
+    }
+
+    if filters.include_user_id.map_or(false, |include_user_id| metadata.user_id != include_user_id) {
+        return false;
+    }
+
+    if filters.min_local_index.map_or(false, |min_index| metadata.max_local_index < min_index) {
+        return false;
+    }
+
+    if filters.max_local_index.map_or(false, |max_index| metadata.min_local_index > max_index) {
+        return false;
+    }
+
+    if filters.min_event_time.map_or(false, |min_time| metadata.max_event_time < min_time) {
+        return false;
+    }
+
+    if filters.max_event_time.map_or(false, |max_time| metadata.min_event_time > max_time) {
+        return false;
+    }
+
+    if filters.include_event_types.map_or(false, |include_event_types| {
+        //Is there at least one of the include_event_types in the event batch? If not, return true to skip
+        let at_least_one_match = check_event_types_match(&metadata.event_types_data, include_event_types);
+        !at_least_one_match
+    }) {
+        return false;
+    }
+
+    true
+}
+
+fn calculate_absolute_positions(
+    event_batches_file_len: u64,
+    batches: &mut [MetadataBatchInfo],
+) {
     let mut current_offset = 0u64;
-    let mut total_bytes = 0usize;
 
-    for metadata in metadata_entries {
-        // Check server_id range
-        if let Some(to_server_id) = filters.to_server_id {
-            if metadata.server_id > to_server_id {
-                break;
-            }
-        }
-
-        // Apply filters
-        let mut include = true;
-
-        // Client ID filters
-        if let Some(exclude_client) = filters.exclude_client_id {
-            if metadata.client_id == exclude_client {
-                include = false;
-            }
-        }
-        if let Some(include_client) = filters.include_client_id {
-            if metadata.client_id != include_client {
-                include = false;
-            }
-        }
-
-        // User ID filters
-        if let Some(exclude_user) = filters.exclude_user_id {
-            if metadata.user_id == exclude_user {
-                include = false;
-            }
-        }
-        if let Some(include_user) = filters.include_user_id {
-            if metadata.user_id != include_user {
-                include = false;
-            }
-        }
-
-        // Time filters
-        if let Some(after_time) = filters.after_server_time {
-            if metadata.server_time <= after_time {
-                include = false;
-            }
-        }
-        if let Some(before_time) = filters.before_server_time {
-            if metadata.server_time >= before_time {
-                include = false;
-            }
-        }
-
-        // Event type filter (preliminary check using bloom filter or direct array)
-        if let Some(event_types) = filters.include_event_types {
-            include = include && check_event_types_match(&metadata.event_types_data, event_types);
-        }
-
-        // Check max_bytes limit
-        if include {
-            if let Some(max_bytes) = filters.max_bytes {
-                if total_bytes + metadata.compressed_size as usize > max_bytes {
-                    break;
-                }
-            }
-            total_bytes += metadata.compressed_size as usize;
-        }
-
-        batch_info.push(BatchInfo {
-            metadata: metadata.clone(),
-            file_offset: current_offset,
-            include,
-        });
-
-        current_offset += metadata.compressed_size;
+    for batch in batches.iter_mut().rev() {
+        current_offset += batch.compressed_size;
+        batch.file_offset = event_batches_file_len - current_offset;
     }
-
-    Ok(batch_info)
 }
 
-fn check_event_types_match(event_types_data: &EventTypesData, filter_types: &[u64]) -> bool {
+fn check_event_types_match(event_types_data: &EventTypesData, include_event_types: &[u64]) -> bool {
     match event_types_data {
-        EventTypesData::Direct(types) => {
+        EventTypesData::Direct(event_types) => {
             // Check if any of the required types are in the direct array
-            filter_types.iter().any(|&filter_type| {
-                types
-                    .iter()
-                    .any(|&batch_type| batch_type != u64::MAX && batch_type == filter_type)
-            })
+            if event_types.len() < include_event_types.len() {
+                event_types.iter().any(|&batch_type| include_event_types.contains(&batch_type))
+            } else {
+                include_event_types.iter().any(|&include_event_type| event_types.contains(&include_event_type))
+            }
         }
         EventTypesData::Bloom(bloom_bytes) => {
             // Create bloom filter and test each required type
-            let mut bloom = BloomFilter::with_num_bits(BLOOM_BYTES * 8);
-            // Copy bloom bytes into filter (implementation depends on fastbloom API)
-            // This is a preliminary check - we'll do final filtering after decompression
-            true // For now, include all bloom filter batches for final filtering
+            let bloom = bloom_filter_from_bytes(bloom_bytes, BLOOM_HASH_COUNT);
+            include_event_types.iter().any(|&include_event_type| bloom.contains(&include_event_type))
         }
     }
 }
 
 fn read_event_batches_with_uring<R: Read + Seek + AsRawFd>(
     event_batch_reader: &mut R,
-    batch_info: &[BatchInfo],
+    batch_info: &[MetadataBatchInfo],
     filters: &ReadFilters,
 ) -> io::Result<Vec<EventBatchItem>> {
-    let included_batches: Vec<&BatchInfo> = batch_info.iter().filter(|b| b.include).collect();
+    let included_batches: Vec<&MetadataBatchInfo> = batch_info.iter().filter(|b| b.include).collect();
 
     if included_batches.is_empty() {
         return Ok(Vec::new());
@@ -288,7 +344,7 @@ fn read_event_batches_with_uring<R: Read + Seek + AsRawFd>(
     // Prepare buffers
     let mut buffers: Vec<Vec<u8>> = included_batches
         .iter()
-        .map(|batch| vec![0u8; batch.metadata.compressed_size as usize])
+        .map(|batch| vec![0u8; batch.compressed_size as usize])
         .collect();
 
     // Submit read operations
@@ -310,7 +366,7 @@ fn read_event_batches_with_uring<R: Read + Seek + AsRawFd>(
     ring.submit_and_wait(submission_count)?;
 
     // Collect and decompress results
-    let mut event_batches = Vec::new();
+    let mut event_batches = Vec::with_capacity(submission_count);
     for _ in 0..submission_count {
         let cqe = ring
             .completion()
@@ -329,16 +385,16 @@ fn read_event_batches_with_uring<R: Read + Seek + AsRawFd>(
 
         // Verify CRC
         let crc = crc32fast::hash(&buffer[..bytes_read as usize]);
-        if crc != batch.metadata.events_crc {
+        if crc != batch.events_crc {
             return Err(io::Error::other("CRC mismatch in event batch"));
         }
 
         // Decompress and deserialize
-        let compression_type = CompressionType::from_tuple((batch.metadata.compression_type, 0));
+        let compression_type = CompressionType::from_tuple(batch.compression_type, None);
         let mut event_batch = EventBatchItem::from_wire_format(
             &buffer[..bytes_read as usize],
             compression_type,
-            batch.metadata.uncompressed_size as usize,
+            batch.uncompressed_size as usize,
         )?;
 
         // Final event type filtering (bloom filter might have false positives)
@@ -346,6 +402,39 @@ fn read_event_batches_with_uring<R: Read + Seek + AsRawFd>(
             event_batch
                 .events
                 .retain(|event| event_types.contains(&event.event_type_major));
+        }
+
+        // Final filtering (metadata only contains min/max ranges)
+        if let Some(event_types) = filters.include_event_types {
+            event_batch
+                .events
+                .retain(|event| event_types.contains(&event.event_type_major));
+        }
+
+        // Final filtering for local_index
+        if let Some(min_local_index) = filters.min_local_index {
+            event_batch
+                .events
+                .retain(|event| event.local_index >= min_local_index);
+        }
+
+        if let Some(max_local_index) = filters.max_local_index {
+            event_batch
+                .events
+                .retain(|event| event.local_index <= max_local_index);
+        }
+
+        // Final filtering for event_time
+        if let Some(min_event_time) = filters.min_event_time {
+            event_batch
+                .events
+                .retain(|event| event.event_time >= min_event_time);
+        }
+
+        if let Some(max_event_time) = filters.max_event_time {
+            event_batch
+                .events
+                .retain(|event| event.event_time <= max_event_time);
         }
 
         if !event_batch.events.is_empty() {
@@ -374,7 +463,7 @@ fn get_minimum_available_server_id<R: Read + Seek>(
     }
 
     let first_metadata: EventBatchMetadata =
-        bincode::decode_from_slice(&buffer, bincode::config::standard())
+        bincode::decode_from_slice(&buffer, BINCODE_CONFIG_FIXED)
             .map_err(|e| io::Error::other(e.to_string()))?
             .0;
 
