@@ -3,14 +3,11 @@ pub mod serde_u128_base64;
 pub mod stateless;
 pub mod structures;
 
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::stateless::{read, write};
+    use crate::stateless::stateless_engine::StatelessEngine;
+    use crate::stateless::stateless_reader::StatelessReader;
+    use crate::stateless::stateless_writer::StatelessWriter;
     use crate::structures::{
         compression_type::CompressionType,
         constants::{BLOOM_BYTES, BLOOM_HASH_COUNT},
@@ -21,7 +18,7 @@ mod tests {
     use fastbloom::BloomFilter;
     use std::collections::HashSet;
     use std::fs::File;
-    use std::io::{self, Read, Seek, SeekFrom};
+    use std::io;
     use tempfile::tempdir;
 
     #[test]
@@ -30,6 +27,9 @@ mod tests {
         let temp_dir = tempdir()?;
         let event_batch_path = temp_dir.path().join("event_batches.bin");
         let metadata_path = temp_dir.path().join("metadata.bin");
+        
+        // Create the stateless engine
+        let engine = StatelessEngine::new();
         
         // Create test data
         let event1 = EventItem::new(
@@ -64,9 +64,9 @@ mod tests {
         let mut bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8).hashes(BLOOM_HASH_COUNT);
         let mut event_type_dedup = HashSet::new();
         
-        // Write the batch
+        // Write the batch using the trait method
         let compression_type = CompressionType::Zstd { level: 3 };
-        let metadata = write::append_event_batch(
+        let metadata = engine.append_event_batch(
             &mut event_batch_writer,
             &mut metadata_writer,
             &mut bloom_filter,
@@ -81,10 +81,10 @@ mod tests {
         let mut event_batch_reader = File::open(&event_batch_path)?;
         let mut metadata_reader = File::open(&metadata_path)?;
         
-        // Read with simple filter
+        // Read with simple filter using the trait method
         let filters = ReadFilters::new(1); // Start from server_id 1
         
-        let read_result = read::filtered_read(
+        let read_result = engine.read_filtered(
             &mut event_batch_reader,
             &mut metadata_reader,
             &filters,
@@ -92,7 +92,7 @@ mod tests {
         
         // Verify results
         assert_eq!(read_result.event_batches.len(), 1, "Should read 1 event batch");
-        assert_eq!(read_result.next_server_id, None, "Should not have next_server_id");
+        assert_eq!(read_result.next_server_id, None, "Should have next_server_id of None");
         
         let read_batch = &read_result.event_batches[0];
         assert_eq!(read_batch.server_id, 1, "Server ID should match");
@@ -109,11 +109,5 @@ mod tests {
         assert_eq!(read_event2.local_index, 2, "Event 2 local_index should match");
         
         Ok(())
-    }
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
     }
 }

@@ -10,8 +10,10 @@ brotli = "8.0.2"
 crc32fast = "1.5.0"
 fastbloom = "0.14.0"
 flate2 = "1.1.2"
-io-uring = "0.7.9"
 serde = { version = "1.0.219", features = ["derive"] }
 snap = "1.1.1"
 tempfile = "3.21.0"
 zstd = "0.13.3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7.9"

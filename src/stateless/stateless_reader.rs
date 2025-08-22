@@ -1,8 +1,11 @@
 use fastbloom::BloomFilter;
 use io_uring::{IoUring, opcode, types};
-use std::io::{self, Read, Seek, SeekFrom};
-use std::os::unix::io::AsRawFd;
+use std::{
+    io::{self, Read, Seek, SeekFrom},
+    os::fd::AsRawFd,
+};
 
+use crate::stateless::stateless_engine::StatelessEngine;
 use crate::structures::compression_type::CompressionType;
 use crate::structures::constants::{BINCODE_CONFIG_FIXED, BLOOM_HASH_COUNT};
 use crate::structures::event_batch_item::EventBatchItem;
@@ -14,19 +17,129 @@ use crate::structures::{
     read_result::ReadResult,
 };
 
-/// Reads event batches from a binary stream with filtering and pagination support
-///
-/// # Arguments
-/// * `event_batch_reader` - Any readable and seekable source (File, Cursor<Vec<u8>>, etc.) which contains all the event batches
-/// * `metadata_reader` - Any readable and seekable source (File, Cursor<Vec<u8>>, etc.) which contains all the metadata for each batch
-/// * `filters` - Filtering and pagination options
-///
-/// # Returns
-/// * `ReadResult` containing filtered event batches and optional pagination token
-///
-/// # Errors
-/// If corruption is detected, an error is raised.
-pub fn filtered_read<R: Read + Seek + AsRawFd>(
+pub trait StatelessReader {
+    /// Reads event batches from a binary stream with filtering and pagination support
+    ///
+    /// # Arguments
+    /// * `event_batch_reader` - Any readable and seekable source (File, Cursor<Vec<u8>>, etc.) which contains all the event batches
+    /// * `metadata_reader` - Any readable and seekable source (File, Cursor<Vec<u8>>, etc.) which contains all the metadata for each batch
+    /// * `filters` - Filtering and pagination options
+    ///
+    /// # Returns
+    /// * `ReadResult` containing filtered event batches and optional pagination token
+    ///
+    /// # Errors
+    /// If corruption is detected, an error is raised.
+    fn read_filtered<R: Read + Seek + AsRawFd>(
+        &self,
+        event_batch_reader: &mut R,
+        metadata_reader: &mut R,
+        filters: &ReadFilters,
+    ) -> io::Result<ReadResult>;
+
+    /// Reads event batches from a binary stream with filtering and pagination support. This reads without using io_uring.
+    ///
+    /// # Arguments
+    /// * `event_batch_reader` - Any readable and seekable source (File, Cursor<Vec<u8>>, etc.) which contains all the event batches
+    /// * `metadata_reader` - Any readable and seekable source (File, Cursor<Vec<u8>>, etc.) which contains all the metadata for each batch
+    /// * `filters` - Filtering and pagination options
+    ///
+    /// # Returns
+    /// * `ReadResult` containing filtered event batches and optional pagination token
+    ///
+    /// # Errors
+    /// If corruption is detected, an error is raised.
+    fn read_filtered_standard<R: Read + Seek>(
+        &self,
+        event_batch_reader: &mut R,
+        metadata_reader: &mut R,
+        filters: &ReadFilters,
+    ) -> io::Result<ReadResult>;
+
+    /// Get the most recent server id used when storing events.
+    ///
+    /// # Arguments
+    /// * `reader` - Any readable and seekable source (File, Cursor<Vec<u8>>, etc.)
+    ///
+    /// # Returns
+    /// * Server id (u64) for the last event batch save
+    fn last_server_id<R: Read + Seek>(&self, metadata_reader: &mut R) -> io::Result<u64>;
+
+    /// For a provided client, get the most recent local id they used when storing events.
+    ///
+    /// # Arguments
+    /// * `reader` - Any readable and seekable source (File, Cursor<Vec<u8>>, etc.)
+    ///
+    /// # Returns
+    /// * None if the client never saved any event batches
+    /// * Local id (u64) for the last event batch save that the client used
+    fn last_local_id<R: Read + Seek>(&self, metadata_reader: &mut R) -> io::Result<Option<u64>>;
+
+    /// Find the first position in the files where the data is corrupt.
+    ///
+    /// # Arguments
+    /// * `reader` - Any readable and seekable source (File, Cursor<Vec<u8>>, etc.)
+    ///
+    /// # Returns
+    /// * None if the file is not corrupt
+    /// * File positions where the data in the file is beginning to be corrupt
+    fn detect_corruption<R: Read + Seek>(&self, event_batch_reader: &mut R, metadata_reader: &mut R) -> io::Result<Option<CorruptPositions>>;
+}
+
+pub struct CorruptPositions {
+    metadata_position: u64,
+    event_batch_position: u64,
+}
+
+impl StatelessReader for StatelessEngine {
+
+    fn last_server_id<R: Read + Seek>(&self, metadata_reader: &mut R) -> io::Result<u64> {
+        Ok(0)
+    }
+
+    fn last_local_id<R: Read + Seek>(&self, metadata_reader: &mut R) -> io::Result<Option<u64>> {
+        Ok(None)
+    }
+
+    fn detect_corruption<R: Read + Seek>(&self, event_batch_reader: &mut R, metadata_reader: &mut R) -> io::Result<Option<CorruptPositions>> {
+        Ok(None)
+    }
+
+    fn read_filtered<R: Read + Seek + AsRawFd>(
+        &self,
+        event_batch_reader: &mut R,
+        metadata_reader: &mut R,
+        filters: &ReadFilters,
+    ) -> io::Result<ReadResult> {
+        if self.is_io_uring_available() {
+            internal_read_filtered_io_uring(event_batch_reader, metadata_reader, filters)
+        } else {
+            self.read_filtered_standard(event_batch_reader, metadata_reader, filters)
+        }
+    }
+
+    fn read_filtered_standard<R: Read + Seek>(
+        &self,
+        event_batch_reader: &mut R,
+        metadata_reader: &mut R,
+        filters: &ReadFilters,
+    ) -> io::Result<ReadResult> {
+        internal_read_filtered_standard(event_batch_reader, metadata_reader, filters)
+    }
+}
+
+fn internal_read_filtered_standard<R: Read + Seek>(
+    event_batch_reader: &mut R,
+    metadata_reader: &mut R,
+    filters: &ReadFilters,
+) -> io::Result<ReadResult> {
+    Ok(ReadResult {
+        event_batches: vec![],
+        next_server_id: Some(0),
+    })
+}
+
+fn internal_read_filtered_io_uring<R: Read + Seek + AsRawFd>(
     event_batch_reader: &mut R,
     metadata_reader: &mut R,
     filters: &ReadFilters,
@@ -46,7 +159,8 @@ pub fn filtered_read<R: Read + Seek + AsRawFd>(
     // Calculate how many metadata entries we can read
     let remaining_metadata_bytes =
         file_len_metadata.saturating_sub(start_reading_metadata_from_offset_position);
-    let max_metadata_entries = (remaining_metadata_bytes / METADATA_BATCH_SIZE_BYTES as u64) as usize;
+    let max_metadata_entries =
+        (remaining_metadata_bytes / METADATA_BATCH_SIZE_BYTES as u64) as usize;
 
     // Handle scenario where client requests server_id that hasn't been written yet
     if max_metadata_entries == 0 {
@@ -72,7 +186,8 @@ pub fn filtered_read<R: Read + Seek + AsRawFd>(
 
     calculate_absolute_positions(file_len_event_batch, &mut batches);
 
-    let next_server_id: Option<u64> = trim_end_if_exceeds_max_bytes(&mut batches, filters.max_bytes);
+    let next_server_id: Option<u64> =
+        trim_end_if_exceeds_max_bytes(&mut batches, filters.max_bytes);
 
     if batches.is_empty() {
         return Ok(ReadResult {
@@ -93,6 +208,20 @@ pub fn filtered_read<R: Read + Seek + AsRawFd>(
         event_batches,
         next_server_id,
     })
+}
+
+fn bloom_filter_from_bytes(bloom_bytes: &[u8; BLOOM_BYTES], num_hashes: u32) -> BloomFilter {
+    // Convert bytes back to Vec<u64>
+    let mut u64_vec = Vec::with_capacity(BLOOM_BYTES / 8); // eg. 128 bytes = 16 u64s
+
+    for chunk in bloom_bytes.chunks_exact(8) {
+        let u64_val = u64::from_le_bytes([
+            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+        ]);
+        u64_vec.push(u64_val);
+    }
+
+    BloomFilter::from_vec(u64_vec).hashes(num_hashes)
 }
 
 fn trim_end_if_exceeds_max_bytes(
@@ -120,7 +249,7 @@ fn trim_end_if_exceeds_max_bytes(
     // Batches are sorted by server_id (ascending)
     for (index, batch) in batches.iter().enumerate() {
         cumulative_size += batch.compressed_size;
-        
+
         // If we exceed the max_bytes limit, store this index as the cut point
         if cumulative_size > max_bytes {
             cut_index = Some(index);
@@ -139,7 +268,7 @@ fn trim_end_if_exceeds_max_bytes(
 
         // Keep only the batches that fit within the max_bytes limit
         batches.truncate(index);
-        
+
         next_server_id
     } else {
         // No trimming needed, all batches fit within the limit
@@ -160,7 +289,15 @@ struct MetadataBatchInfo {
 
 impl Default for MetadataBatchInfo {
     fn default() -> Self {
-        Self { server_id: 0, uncompressed_size: 0, compressed_size: 0, compression_type: 0, events_crc: 0, file_offset: 0, include: false }
+        Self {
+            server_id: 0,
+            uncompressed_size: 0,
+            compressed_size: 0,
+            compression_type: 0,
+            events_crc: 0,
+            file_offset: 0,
+            include: false,
+        }
     }
 }
 
@@ -219,12 +356,10 @@ fn read_metadata_entries_with_uring<R: Read + Seek + AsRawFd>(
             return Err(io::Error::other(format!("Read error: {}", bytes_read)));
         }
 
-        let metadata: EventBatchMetadata = bincode::decode_from_slice(
-            &buffer_pool[buffer_index],
-            BINCODE_CONFIG_FIXED,
-        )
-        .map_err(|e| io::Error::other(e.to_string()))?
-        .0;
+        let metadata: EventBatchMetadata =
+            bincode::decode_from_slice(&buffer_pool[buffer_index], BINCODE_CONFIG_FIXED)
+                .map_err(|e| io::Error::other(e.to_string()))?
+                .0;
 
         batch_entries[buffer_index].include = is_include_batch(&metadata, filters);
         batch_entries[buffer_index].server_id = metadata.server_id;
@@ -242,65 +377,107 @@ fn is_include_batch(metadata: &EventBatchMetadata, filters: &ReadFilters) -> boo
         return false;
     }
 
-    if filters.to_server_id.map_or(false, |to_server_id| metadata.server_id > to_server_id) {
+    if filters
+        .to_server_id
+        .map_or(false, |to_server_id| metadata.server_id > to_server_id)
+    {
         return false;
     }
 
-    if filters.before_server_time.map_or(false, |before_server_time| metadata.server_time < before_server_time) {
+    if filters
+        .before_server_time
+        .map_or(false, |before_server_time| {
+            metadata.server_time < before_server_time
+        })
+    {
         return false;
     }
 
-    if filters.after_server_time.map_or(false, |after_server_time| metadata.server_time > after_server_time) {
+    if filters
+        .after_server_time
+        .map_or(false, |after_server_time| {
+            metadata.server_time > after_server_time
+        })
+    {
         return false;
     }
 
-    if filters.exclude_client_id.map_or(false, |exclude_client_id| metadata.client_id == exclude_client_id) {
+    if filters
+        .exclude_client_id
+        .map_or(false, |exclude_client_id| {
+            metadata.client_id == exclude_client_id
+        })
+    {
         return false;
     }
 
-    if filters.include_client_id.map_or(false, |include_client_id| metadata.client_id != include_client_id) {
+    if filters
+        .include_client_id
+        .map_or(false, |include_client_id| {
+            metadata.client_id != include_client_id
+        })
+    {
         return false;
     }
 
-    if filters.exclude_user_id.map_or(false, |exclude_user_id| metadata.user_id == exclude_user_id) {
+    if filters
+        .exclude_user_id
+        .map_or(false, |exclude_user_id| metadata.user_id == exclude_user_id)
+    {
         return false;
     }
 
-    if filters.include_user_id.map_or(false, |include_user_id| metadata.user_id != include_user_id) {
+    if filters
+        .include_user_id
+        .map_or(false, |include_user_id| metadata.user_id != include_user_id)
+    {
         return false;
     }
 
-    if filters.min_local_index.map_or(false, |min_index| metadata.max_local_index < min_index) {
+    if filters
+        .min_local_index
+        .map_or(false, |min_index| metadata.max_local_index < min_index)
+    {
         return false;
     }
 
-    if filters.max_local_index.map_or(false, |max_index| metadata.min_local_index > max_index) {
+    if filters
+        .max_local_index
+        .map_or(false, |max_index| metadata.min_local_index > max_index)
+    {
         return false;
     }
 
-    if filters.min_event_time.map_or(false, |min_time| metadata.max_event_time < min_time) {
+    if filters
+        .min_event_time
+        .map_or(false, |min_time| metadata.max_event_time < min_time)
+    {
         return false;
     }
 
-    if filters.max_event_time.map_or(false, |max_time| metadata.min_event_time > max_time) {
+    if filters
+        .max_event_time
+        .map_or(false, |max_time| metadata.min_event_time > max_time)
+    {
         return false;
     }
 
-    if filters.include_event_types.map_or(false, |include_event_types| {
-        //Is there at least one of the include_event_types in the event batch? If not, return true to skip
-        let at_least_one_match = check_event_types_match(&metadata.event_types_data, include_event_types);
-        !at_least_one_match
-    }) {
+    if filters
+        .include_event_types
+        .map_or(false, |include_event_types| {
+            //Is there at least one of the include_event_types in the event batch? If not, return true to skip
+            let at_least_one_match =
+                check_event_types_match(&metadata.event_types_data, include_event_types);
+            !at_least_one_match
+        })
+    {
         return false;
     }
 
     true
 }
 
-fn calculate_absolute_positions(
-    event_batches_file_len: u64,
-    batches: &mut [MetadataBatchInfo],
-) {
+fn calculate_absolute_positions(event_batches_file_len: u64, batches: &mut [MetadataBatchInfo]) {
     let mut current_offset = 0u64;
 
     for batch in batches.iter_mut().rev() {
@@ -314,15 +491,21 @@ fn check_event_types_match(event_types_data: &EventTypesData, include_event_type
         EventTypesData::Direct(event_types) => {
             // Check if any of the required types are in the direct array
             if event_types.len() < include_event_types.len() {
-                event_types.iter().any(|&batch_type| include_event_types.contains(&batch_type))
+                event_types
+                    .iter()
+                    .any(|&batch_type| include_event_types.contains(&batch_type))
             } else {
-                include_event_types.iter().any(|&include_event_type| event_types.contains(&include_event_type))
+                include_event_types
+                    .iter()
+                    .any(|&include_event_type| event_types.contains(&include_event_type))
             }
         }
         EventTypesData::Bloom(bloom_bytes) => {
             // Create bloom filter and test each required type
             let bloom = bloom_filter_from_bytes(bloom_bytes, BLOOM_HASH_COUNT);
-            include_event_types.iter().any(|&include_event_type| bloom.contains(&include_event_type))
+            include_event_types
+                .iter()
+                .any(|&include_event_type| bloom.contains(&include_event_type))
         }
     }
 }
@@ -332,7 +515,8 @@ fn read_event_batches_with_uring<R: Read + Seek + AsRawFd>(
     batch_info: &[MetadataBatchInfo],
     filters: &ReadFilters,
 ) -> io::Result<Vec<EventBatchItem>> {
-    let included_batches: Vec<&MetadataBatchInfo> = batch_info.iter().filter(|b| b.include).collect();
+    let included_batches: Vec<&MetadataBatchInfo> =
+        batch_info.iter().filter(|b| b.include).collect();
 
     if included_batches.is_empty() {
         return Ok(Vec::new());
@@ -478,53 +662,4 @@ fn get_minimum_available_server_id<R: Read + Seek>(
     }
 
     Ok(first_metadata.server_id)
-}
-
-/// Get the most recent server id used when storing events.
-///
-/// # Arguments
-/// * `reader` - Any readable and seekable source (File, Cursor<Vec<u8>>, etc.)
-///
-/// # Returns
-/// * Server id (u64) for the last event batch save
-pub fn last_server_id<R: Read + Seek>(reader: &mut R) -> io::Result<u64> {
-    Ok(0)
-}
-
-/// For a provided client, get the most recent local id they used when storing events.
-///
-/// # Arguments
-/// * `reader` - Any readable and seekable source (File, Cursor<Vec<u8>>, etc.)
-///
-/// # Returns
-/// * None if the client never saved any event batches
-/// * Local id (u64) for the last event batch save that the client used
-pub fn last_local_id<R: Read + Seek>(reader: &mut R) -> io::Result<Option<u64>> {
-    Ok(None)
-}
-
-/// Find the first position in the file where the data is corrupt.
-///
-/// # Arguments
-/// * `reader` - Any readable and seekable source (File, Cursor<Vec<u8>>, etc.)
-///
-/// # Returns
-/// * None if the file is not corrupt
-/// * File position where the data in the file is beginning to be corrupt
-pub fn detect_corruption<R: Read + Seek>(reader: &mut R) -> io::Result<Option<u64>> {
-    Ok(None)
-}
-
-fn bloom_filter_from_bytes(bloom_bytes: &[u8; BLOOM_BYTES], num_hashes: u32) -> BloomFilter {
-    // Convert bytes back to Vec<u64>
-    let mut u64_vec = Vec::with_capacity(BLOOM_BYTES / 8); // eg. 128 bytes = 16 u64s
-
-    for chunk in bloom_bytes.chunks_exact(8) {
-        let u64_val = u64::from_le_bytes([
-            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-        ]);
-        u64_vec.push(u64_val);
-    }
-
-    BloomFilter::from_vec(u64_vec).hashes(num_hashes)
 }
