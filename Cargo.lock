@@ -123,6 +123,7 @@ dependencies = [
  "fastbloom",
  "flate2",
  "io-uring",
+ "rand",
  "serde",
  "snap",
  "tempfile",
