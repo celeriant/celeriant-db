@@ -2,9 +2,9 @@
 #[derive(Debug, Default)]
 pub struct ReadFilters<'a> {
     /// Starting server ID to begin reading from (inclusive). Will error if not found in stream.
-    pub from_server_id: u64,
+    pub from_event_batch_index: u64,
     /// End reading event batches at this server id (inclusive). Will error if reached end of stream before this ID.
-    pub to_server_id: Option<u64>,
+    pub to_event_batch_index: Option<u64>,
     /// Optional limit on the total response size in bytes to prevent large responses
     pub max_bytes: Option<usize>,
     /// Optional whitelist of event types to include in results
@@ -18,29 +18,33 @@ pub struct ReadFilters<'a> {
     /// Only get events for this user
     pub include_user_id: Option<u128>,
     /// Optional timestamp filter, only include batches after this time (exclusive)
-    pub after_server_time: Option<u64>,
+    pub after_server_timestamp: Option<u64>,
     /// Optional timestamp filter, only include batches before this time (exclusive)
-    pub before_server_time: Option<u64>,
+    pub before_server_timestamp: Option<u64>,
     /// Only include batches with max_local_index greater than or equal to this value
-    pub min_local_index: Option<u64>,
+    pub min_client_event_index: Option<u64>,
     /// Only include batches with min_local_index less than or equal to this value
-    pub max_local_index: Option<u64>,
+    pub max_client_event_index: Option<u64>,
     /// Only include batches with max_event_time greater than or equal to this value
-    pub min_event_time: Option<u64>,
+    pub min_event_timestamp: Option<u64>,
     /// Only include batches with min_event_time less than or equal to this value
-    pub max_event_time: Option<u64>,
+    pub max_event_timestamp: Option<u64>,
+    /// Only include batches with event_index greater than or equal to this value
+    pub min_event_index: Option<u64>,
+    /// Only include batches with event_index less than or equal to this value
+    pub max_event_index: Option<u64>,
 }
 
 impl<'a> ReadFilters<'a> {
-    pub fn new(from_server_id: u64) -> Self {
+    pub fn new(from_event_batch_index: u64) -> Self {
         Self {
-            from_server_id,
+            from_event_batch_index,
             ..Default::default()
         }
     }
 
-    pub fn to_server_id(mut self, id: u64) -> Self {
-        self.to_server_id = Some(id);
+    pub fn to_event_batch_index(mut self, event_batch_index: u64) -> Self {
+        self.to_event_batch_index = Some(event_batch_index);
         self
     }
 
@@ -74,51 +78,67 @@ impl<'a> ReadFilters<'a> {
         self
     }
 
-    pub fn after_server_time(mut self, timestamp: u64) -> Self {
-        self.after_server_time = Some(timestamp);
+    pub fn after_server_timestamp(mut self, timestamp: u64) -> Self {
+        self.after_server_timestamp = Some(timestamp);
         self
     }
 
-    pub fn before_server_time(mut self, timestamp: u64) -> Self {
-        self.before_server_time = Some(timestamp);
+    pub fn before_server_timestamp(mut self, timestamp: u64) -> Self {
+        self.before_server_timestamp = Some(timestamp);
         self
     }
 
     pub fn time_range(mut self, after: u64, before: u64) -> Self {
-        self.after_server_time = Some(after);
-        self.before_server_time = Some(before);
+        self.after_server_timestamp = Some(after);
+        self.before_server_timestamp = Some(before);
         self
     }
 
-    pub fn min_local_index(mut self, index: u64) -> Self {
-        self.min_local_index = Some(index);
+    pub fn min_client_event_index(mut self, index: u64) -> Self {
+        self.min_client_event_index = Some(index);
         self
     }
 
-    pub fn max_local_index(mut self, index: u64) -> Self {
-        self.max_local_index = Some(index);
+    pub fn max_client_event_index(mut self, index: u64) -> Self {
+        self.max_client_event_index = Some(index);
         self
     }
 
-    pub fn local_index_range(mut self, min: u64, max: u64) -> Self {
-        self.min_local_index = Some(min);
-        self.max_local_index = Some(max);
+    pub fn client_event_index_range(mut self, min: u64, max: u64) -> Self {
+        self.min_client_event_index = Some(min);
+        self.max_client_event_index = Some(max);
         self
     }
 
-    pub fn min_event_time(mut self, time: u64) -> Self {
-        self.min_event_time = Some(time);
+    pub fn min_event_timestamp(mut self, time: u64) -> Self {
+        self.min_event_timestamp = Some(time);
         self
     }
 
-    pub fn max_event_time(mut self, time: u64) -> Self {
-        self.max_event_time = Some(time);
+    pub fn max_event_timestamp(mut self, time: u64) -> Self {
+        self.max_event_timestamp = Some(time);
         self
     }
 
     pub fn event_time_range(mut self, min: u64, max: u64) -> Self {
-        self.min_event_time = Some(min);
-        self.max_event_time = Some(max);
+        self.min_event_timestamp = Some(min);
+        self.max_event_timestamp = Some(max);
+        self
+    }
+
+    pub fn min_event_index(mut self, event_index: u64) -> Self {
+        self.min_event_index = Some(event_index);
+        self
+    }
+
+    pub fn max_event_index(mut self, event_index: u64) -> Self {
+        self.max_event_index = Some(event_index);
+        self
+    }
+
+    pub fn event_index_range(mut self, min_event_index: u64, max_event_index: u64) -> Self {
+        self.min_event_index = Some(min_event_index);
+        self.max_event_index = Some(max_event_index);
         self
     }
 }

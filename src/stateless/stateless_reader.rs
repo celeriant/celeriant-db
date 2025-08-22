@@ -140,7 +140,7 @@ impl StatelessReader for StatelessEngine {
                 .map_err(|e| io::Error::other(e.to_string()))?
                 .0;
 
-        Ok(metadata.server_id)
+        Ok(metadata.event_batch_index)
     }
 
     fn last_local_index<R: Read + Seek>(&self, metadata_reader: &mut R) -> io::Result<u64> {
@@ -174,7 +174,7 @@ impl StatelessReader for StatelessEngine {
                 .map_err(|e| io::Error::other(e.to_string()))?
                 .0;
 
-        Ok(metadata.max_local_index)
+        Ok(metadata.max_client_event_index)
     }
 
     fn detect_corruption<R: Read + Seek>(
@@ -335,11 +335,11 @@ fn internal_read_filtered_io_uring<R: Read + Seek + AsRawFd>(
     // Read first metadata entry at start of metadata file. Find our minimum server_id.
     // If we don't have the required server_ids (file was trimmed), error back to caller. They need to pull from S3 instead perhaps.
     let minimum_available_server_id =
-        get_minimum_available_server_id(metadata_reader, filters.from_server_id)?;
+        get_minimum_available_server_id(metadata_reader, filters.from_event_batch_index)?;
 
     // Calculate the offset in the metadata file to start reading metadata chunks
     let start_reading_metadata_from_offset_position =
-        (filters.from_server_id - minimum_available_server_id) * METADATA_BATCH_SIZE_BYTES as u64;
+        (filters.from_event_batch_index - minimum_available_server_id) * METADATA_BATCH_SIZE_BYTES as u64;
 
     // Calculate how many metadata entries we can read
     let remaining_metadata_bytes =
@@ -550,7 +550,7 @@ fn read_metadata_entries_with_uring<R: Read + Seek + AsRawFd>(
                 .0;
 
         batch_entries[buffer_index].include = is_include_batch(&metadata, filters);
-        batch_entries[buffer_index].server_id = metadata.server_id;
+        batch_entries[buffer_index].server_id = metadata.event_batch_index;
         batch_entries[buffer_index].uncompressed_size = metadata.uncompressed_size;
         batch_entries[buffer_index].compressed_size = metadata.compressed_size;
         batch_entries[buffer_index].compression_type = metadata.compression_type;
@@ -561,30 +561,30 @@ fn read_metadata_entries_with_uring<R: Read + Seek + AsRawFd>(
 }
 
 fn is_include_batch(metadata: &EventBatchMetadata, filters: &ReadFilters) -> bool {
-    if metadata.server_id < filters.from_server_id {
+    if metadata.event_batch_index < filters.from_event_batch_index {
         return false;
     }
 
     if filters
-        .to_server_id
-        .map_or(false, |to_server_id| metadata.server_id > to_server_id)
+        .to_event_batch_index
+        .map_or(false, |to_server_id| metadata.event_batch_index > to_server_id)
     {
         return false;
     }
 
     if filters
-        .before_server_time
+        .before_server_timestamp
         .map_or(false, |before_server_time| {
-            metadata.server_time < before_server_time
+            metadata.server_timestamp < before_server_time
         })
     {
         return false;
     }
 
     if filters
-        .after_server_time
+        .after_server_timestamp
         .map_or(false, |after_server_time| {
-            metadata.server_time > after_server_time
+            metadata.server_timestamp > after_server_time
         })
     {
         return false;
@@ -623,29 +623,43 @@ fn is_include_batch(metadata: &EventBatchMetadata, filters: &ReadFilters) -> boo
     }
 
     if filters
-        .min_local_index
-        .map_or(false, |min_index| metadata.max_local_index < min_index)
+        .min_client_event_index
+        .map_or(false, |min_index| metadata.max_client_event_index < min_index)
     {
         return false;
     }
 
     if filters
-        .max_local_index
-        .map_or(false, |max_index| metadata.min_local_index > max_index)
+        .max_client_event_index
+        .map_or(false, |max_index| metadata.min_client_event_index > max_index)
     {
         return false;
     }
 
     if filters
-        .min_event_time
-        .map_or(false, |min_time| metadata.max_event_time < min_time)
+        .min_event_timestamp
+        .map_or(false, |min_time| metadata.max_event_timestamp < min_time)
     {
         return false;
     }
 
     if filters
-        .max_event_time
-        .map_or(false, |max_time| metadata.min_event_time > max_time)
+        .max_event_timestamp
+        .map_or(false, |max_time| metadata.min_event_timestamp > max_time)
+    {
+        return false;
+    }
+
+    if filters
+        .min_event_index
+        .map_or(false, |min_index| metadata.max_event_index < min_index)
+    {
+        return false;
+    }
+
+    if filters
+        .max_event_index
+        .map_or(false, |max_index| metadata.min_event_index > max_index)
     {
         return false;
     }
@@ -786,29 +800,42 @@ fn read_event_batches_with_uring<R: Read + Seek + AsRawFd>(
         }
 
         // Final filtering for local_index
-        if let Some(min_local_index) = filters.min_local_index {
+        if let Some(min_local_index) = filters.min_client_event_index {
             event_batch
                 .events
-                .retain(|event| event.local_index >= min_local_index);
+                .retain(|event| event.client_event_index >= min_local_index);
         }
 
-        if let Some(max_local_index) = filters.max_local_index {
+        if let Some(max_local_index) = filters.max_client_event_index {
             event_batch
                 .events
-                .retain(|event| event.local_index <= max_local_index);
+                .retain(|event| event.client_event_index <= max_local_index);
         }
 
         // Final filtering for event_time
-        if let Some(min_event_time) = filters.min_event_time {
+        if let Some(min_event_time) = filters.min_event_timestamp {
             event_batch
                 .events
-                .retain(|event| event.event_time >= min_event_time);
+                .retain(|event| event.event_timestamp >= min_event_time);
         }
 
-        if let Some(max_event_time) = filters.max_event_time {
+        if let Some(max_event_time) = filters.max_event_timestamp {
             event_batch
                 .events
-                .retain(|event| event.event_time <= max_event_time);
+                .retain(|event| event.event_timestamp <= max_event_time);
+        }
+
+        // Final filtering for event index
+        if let Some(min_client_event_index) = filters.min_client_event_index {
+            event_batch
+                .events
+                .retain(|event| event.client_event_index >= min_client_event_index);
+        }
+
+        if let Some(max_client_event_index) = filters.max_client_event_index {
+            event_batch
+                .events
+                .retain(|event| event.client_event_index <= max_client_event_index);
         }
 
         if !event_batch.events.is_empty() {
@@ -817,7 +844,7 @@ fn read_event_batches_with_uring<R: Read + Seek + AsRawFd>(
     }
 
     // Sort by server_id to maintain order
-    event_batches.sort_by_key(|batch| batch.server_id);
+    event_batches.sort_by_key(|batch| batch.event_batch_index);
 
     Ok(event_batches)
 }
@@ -841,17 +868,17 @@ fn get_minimum_available_server_id<R: Read + Seek>(
             .map_err(|e| io::Error::other(e.to_string()))?
             .0;
 
-    if first_metadata.server_id > requested_server_id {
+    if first_metadata.event_batch_index > requested_server_id {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!(
                 "Requested server_id {} is not available, minimum is {}",
-                requested_server_id, first_metadata.server_id
+                requested_server_id, first_metadata.event_batch_index
             ),
         ));
     }
 
-    Ok(first_metadata.server_id)
+    Ok(first_metadata.event_batch_index)
 }
 
 fn internal_read_filtered_standard<R: Read + Seek>(
@@ -865,11 +892,11 @@ fn internal_read_filtered_standard<R: Read + Seek>(
     // Read first metadata entry at start of metadata file. Find our minimum server_id.
     // If we don't have the required server_ids (file was trimmed), error back to caller. They need to pull from S3 instead perhaps.
     let minimum_available_server_id =
-        get_minimum_available_server_id(metadata_reader, filters.from_server_id)?;
+        get_minimum_available_server_id(metadata_reader, filters.from_event_batch_index)?;
 
     // Calculate the offset in the metadata file to start reading metadata chunks
     let start_reading_metadata_from_offset_position =
-        (filters.from_server_id - minimum_available_server_id) * METADATA_BATCH_SIZE_BYTES as u64;
+        (filters.from_event_batch_index - minimum_available_server_id) * METADATA_BATCH_SIZE_BYTES as u64;
 
     // Calculate how many metadata entries we can read
     let remaining_metadata_bytes =
@@ -939,7 +966,7 @@ fn read_metadata_entries_standard<R: Read + Seek>(
 
         let batch_info = MetadataBatchInfo {
             include: is_include_batch(&metadata, filters),
-            server_id: metadata.server_id,
+            server_id: metadata.event_batch_index,
             uncompressed_size: metadata.uncompressed_size,
             compressed_size: metadata.compressed_size,
             compression_type: metadata.compression_type,
@@ -1004,29 +1031,29 @@ fn read_event_batches_standard<R: Read + Seek>(
         }
 
         // Final filtering for local_index
-        if let Some(min_local_index) = filters.min_local_index {
+        if let Some(min_local_index) = filters.min_client_event_index {
             event_batch
                 .events
-                .retain(|event| event.local_index >= min_local_index);
+                .retain(|event| event.client_event_index >= min_local_index);
         }
 
-        if let Some(max_local_index) = filters.max_local_index {
+        if let Some(max_local_index) = filters.max_client_event_index {
             event_batch
                 .events
-                .retain(|event| event.local_index <= max_local_index);
+                .retain(|event| event.client_event_index <= max_local_index);
         }
 
         // Final filtering for event_time
-        if let Some(min_event_time) = filters.min_event_time {
+        if let Some(min_event_time) = filters.min_event_timestamp {
             event_batch
                 .events
-                .retain(|event| event.event_time >= min_event_time);
+                .retain(|event| event.event_timestamp >= min_event_time);
         }
 
-        if let Some(max_event_time) = filters.max_event_time {
+        if let Some(max_event_time) = filters.max_event_timestamp {
             event_batch
                 .events
-                .retain(|event| event.event_time <= max_event_time);
+                .retain(|event| event.event_timestamp <= max_event_time);
         }
 
         if !event_batch.events.is_empty() {
@@ -1035,7 +1062,7 @@ fn read_event_batches_standard<R: Read + Seek>(
     }
 
     // Sort by server_id to maintain order
-    event_batches.sort_by_key(|batch| batch.server_id);
+    event_batches.sort_by_key(|batch| batch.event_batch_index);
 
     Ok(event_batches)
 }

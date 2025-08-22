@@ -21,7 +21,7 @@ impl StatelessEngine {
                     Ok(_) => {
                         IoUringStatus::Available
                     }
-                    Err(e) => {
+                    Err(_)=> {
                         IoUringStatus::Unavailable
                     }
                 }
@@ -117,13 +117,14 @@ mod tests {
         // Create test data
         let event1 = EventItem::new(
             3,                             // local_index
+            1,
             1000,                          // event_time
             42,                            // event_type_major
             1,                             // event_type_minor
             b"test event data 1".to_vec(), // value
         );
 
-        let event2 = EventItem::new(4, 1050, 42, 1, b"test event data 2".to_vec());
+        let event2 = EventItem::new(4, 2, 1050, 42, 1, b"test event data 2".to_vec());
 
         let batch = EventBatchItem::new(
             2,                    // server_id
@@ -191,7 +192,7 @@ mod tests {
         );
 
         let read_batch = &read_result.event_batches[0];
-        assert_eq!(read_batch.server_id, 2, "Server ID should match");
+        assert_eq!(read_batch.event_batch_index, 2, "Server ID should match");
         assert_eq!(read_batch.client_id, 123456789, "Client ID should match");
         assert_eq!(read_batch.client_id, 123456789, "Client ID should match");
         assert_eq!(read_batch.user_id, Some(987654321), "User ID should match");
@@ -200,7 +201,7 @@ mod tests {
         // Check individual events
         let read_event1 = &read_batch.events[0];
         assert_eq!(
-            read_event1.local_index, 3,
+            read_event1.client_event_index, 3,
             "Event 1 local_index should match"
         );
         assert_eq!(
@@ -210,7 +211,7 @@ mod tests {
 
         let read_event2 = &read_batch.events[1];
         assert_eq!(
-            read_event2.local_index, 4,
+            read_event2.client_event_index, 4,
             "Event 2 local_index should match"
         );
 

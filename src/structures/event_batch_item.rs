@@ -12,12 +12,12 @@ use crate::serde_u128_base64;
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct EventBatchItem {
     /// Unique, incremented integer assigned to each event batch when persisted on the server
-    #[serde(rename = "si")]
-    pub server_id: u64,
+    #[serde(rename = "bi")]
+    pub event_batch_index: u64,
 
     /// Server side Unix timestamp in milliseconds when the event batch was persisted on the server
     #[serde(rename = "st")]
-    pub server_time: u64,
+    pub server_timestamp: u64,
 
     /// Unique identifyer of the machine that produced these events. Typically the truncated SHA256 of the clients' public key
     #[serde(with = "serde_u128_base64", rename = "ci")]
@@ -38,15 +38,15 @@ pub struct EventBatchItem {
 
 impl EventBatchItem {
     pub fn new(
-        server_id: u64,
+        event_batch_index: u64,
         server_time: u64,
         client_id: u128,
         user_id: Option<u128>,
         events: Vec<EventItem>,
     ) -> Self {
         Self {
-            server_id,
-            server_time,
+            event_batch_index,
+            server_timestamp: server_time,
             client_id,
             user_id,
             events,

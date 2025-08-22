@@ -37,7 +37,7 @@ mod tests {
 
         let engine = StatelessEngine::builder().build();
 
-        let event = EventItem::new(1, 1000, 1, 1, b"test event".to_vec());
+        let event = EventItem::new(1, 1, 1000, 1, 1, b"test event".to_vec());
         let batch = EventBatchItem::new(1, 1600000000000, 123456789, Some(987654321), vec![event]);
 
         let mut event_batch_writer = BufWriter::new(File::create(&event_batch_path)?);
@@ -55,7 +55,7 @@ mod tests {
             &batch,
         )?;
 
-        assert_eq!(metadata.server_id, 1);
+        assert_eq!(metadata.event_batch_index, 1);
         Ok(())
     }
 
@@ -67,7 +67,7 @@ mod tests {
 
         let engine = StatelessEngine::builder().build();
 
-        let event = EventItem::new(1, 1000, 1, 1, b"test event".to_vec());
+        let event = EventItem::new(1, 1, 1000, 1, 1, b"test event".to_vec());
 
         let mut event_batch_writer = BufWriter::new(File::create(&event_batch_path)?);
         let mut metadata_writer = BufWriter::new(File::create(&metadata_path)?);
@@ -174,7 +174,7 @@ mod tests {
 
         let mut events = Vec::new();
         for i in 0..1001 {
-            let event = EventItem::new(i, 1000 + i as u64, 1, 1, b"test event".to_vec());
+            let event = EventItem::new(i, i, 1000 + i as u64, 1, 1, b"test event".to_vec());
             events.push(event);
         }
         let batch = EventBatchItem::new(1, 1600000000000, 123456789, Some(987654321), events);
@@ -216,8 +216,8 @@ mod tests {
         let unicode_data = "你好世界".to_string().into_bytes();
         let binary_data = vec![0u8, 1u8, 2u8, 255u8];
 
-        let event1 = EventItem::new(1, 1000, 1, 1, unicode_data);
-        let event2 = EventItem::new(2, 1000, 2, 1, binary_data);
+        let event1 = EventItem::new(1, 1, 1000, 1, 1, unicode_data);
+        let event2 = EventItem::new(2, 2, 1000, 2, 1, binary_data);
 
         let batch = EventBatchItem::new(
             1,
@@ -254,10 +254,10 @@ mod tests {
         let read_batch = &read_result.event_batches[0];
 
         assert_eq!(
-            read_batch.events[0].value,
+            read_batch.events[0].event_value,
             "你好世界".to_string().into_bytes()
         );
-        assert_eq!(read_batch.events[1].value, vec![0u8, 1u8, 2u8, 255u8]);
+        assert_eq!(read_batch.events[1].event_value, vec![0u8, 1u8, 2u8, 255u8]);
 
         Ok(())
     }
@@ -272,7 +272,7 @@ mod tests {
 
         let engine = StatelessEngine::builder().build();
 
-        let event = EventItem::new(1, 1000, 1, 1, b"test event".to_vec());
+        let event = EventItem::new(1, 1, 1000, 1, 1, b"test event".to_vec());
         let batch = EventBatchItem::new(1, 1600000000000, 123456789, Some(987654321), vec![event]);
 
         let compression_types = vec![
@@ -318,7 +318,7 @@ mod tests {
 
         let engine = StatelessEngine::builder().build();
 
-        let event = EventItem::new(1, 1000, 1, 1, b"test event".to_vec());
+        let event = EventItem::new(1, 1, 1000, 1, 1, b"test event".to_vec());
         let batch = EventBatchItem::new(1, 1600000000000, 123456789, Some(987654321), vec![event]);
 
         let levels = vec![1, 3, 6, 9];
@@ -372,7 +372,7 @@ mod tests {
         let engine = StatelessEngine::builder().build();
 
         let repetitive_data = "A".repeat(1024).into_bytes(); // Highly repetitive data
-        let event = EventItem::new(1, 1000, 1, 1, repetitive_data);
+        let event = EventItem::new(1, 1, 1000, 1, 1, repetitive_data);
         let batch = EventBatchItem::new(1, 1600000000000, 123456789, Some(987654321), vec![event]);
 
         let compression_types = vec![
@@ -422,7 +422,7 @@ mod tests {
         let mut random_data = vec![0u8; 1024];
 
         rng.fill(&mut random_data[..]);
-        let event = EventItem::new(1, 1000, 1, 1, random_data);
+        let event = EventItem::new(1, 1, 1000, 1, 1, random_data);
         let batch = EventBatchItem::new(1, 1600000000000, 123456789, Some(987654321), vec![event]);
 
         let compression_types = vec![
@@ -468,7 +468,7 @@ mod tests {
 
         let mut events = Vec::new();
         for i in 1..=4 {
-            let event = EventItem::new(i, 1000, i, 1, b"test event".to_vec());
+            let event = EventItem::new(i, i, 1000, i, 1, b"test event".to_vec());
             events.push(event);
         }
         let batch = EventBatchItem::new(1, 1600000000000, 123456789, Some(987654321), events);
@@ -509,7 +509,7 @@ mod tests {
 
         let mut events = Vec::new();
         for i in 1..=5 {
-            let event = EventItem::new(i, 1000, i, 1, b"test event".to_vec());
+            let event = EventItem::new(i, i, 1000, i, 1, b"test event".to_vec());
             events.push(event);
         }
         let batch = EventBatchItem::new(1, 1600000000000, 123456789, Some(987654321), events);
@@ -549,9 +549,9 @@ mod tests {
         let engine = StatelessEngine::builder().build();
 
         let events = vec![
-            EventItem::new(1, 1000, 1, 1, b"test event".to_vec()),
-            EventItem::new(2, 1000, 1, 1, b"test event".to_vec()),
-            EventItem::new(3, 1000, 2, 1, b"test event".to_vec()),
+            EventItem::new(1, 1, 1000, 1, 1, b"test event".to_vec()),
+            EventItem::new(2, 2, 1000, 1, 1, b"test event".to_vec()),
+            EventItem::new(3, 3, 1000, 2, 1, b"test event".to_vec()),
         ];
         let batch = EventBatchItem::new(1, 1600000000000, 123456789, Some(987654321), events);
 
@@ -588,7 +588,7 @@ mod tests {
         // Test with exactly 4 event types
         let mut events1 = Vec::new();
         for i in 1..=4 {
-            let event = EventItem::new(i, 1000, i, 1, b"test event".to_vec());
+            let event = EventItem::new(i, i, 1000, i, 1, b"test event".to_vec());
             events1.push(event);
         }
         let batch1 = EventBatchItem::new(1, 1600000000000, 123456789, Some(987654321), events1);
@@ -618,7 +618,7 @@ mod tests {
         // Add one more event with a new type
         let mut events2 = Vec::new();
         for i in 1..=5 {
-            let event = EventItem::new(i, 1000, i, 1, b"test event".to_vec());
+            let event = EventItem::new(i, i, 1000, i, 1, b"test event".to_vec());
             events2.push(event);
         }
         let batch2 = EventBatchItem::new(2, 1600000000000, 123456789, Some(987654321), events2);
@@ -651,7 +651,7 @@ mod tests {
 
         let engine = StatelessEngine::builder().build();
 
-        let event = EventItem::new(1, 1000, 1, 1, b"test event".to_vec());
+        let event = EventItem::new(1, 1, 1000, 1, 1, b"test event".to_vec());
         let batch1 = EventBatchItem::new(
             1,
             1600000000000,
@@ -714,9 +714,9 @@ mod tests {
             engine.read_filtered(&mut event_batch_reader, &mut metadata_reader, &filters)?;
 
         assert_eq!(read_result.event_batches.len(), 3);
-        assert_eq!(read_result.event_batches[0].server_id, 1);
-        assert_eq!(read_result.event_batches[1].server_id, 2);
-        assert_eq!(read_result.event_batches[2].server_id, 3);
+        assert_eq!(read_result.event_batches[0].event_batch_index, 1);
+        assert_eq!(read_result.event_batches[1].event_batch_index, 2);
+        assert_eq!(read_result.event_batches[2].event_batch_index, 3);
         assert_eq!(read_result.next_server_id, None);
 
         Ok(())
