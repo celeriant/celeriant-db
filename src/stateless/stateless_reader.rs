@@ -106,8 +106,8 @@ pub trait StatelessReader {
 }
 
 pub struct CorruptPositions {
-    metadata_position: u64,
-    event_batch_position: u64,
+    pub metadata_position: u64,
+    pub event_batch_position: u64,
 }
 
 impl StatelessReader for StatelessEngine {
@@ -293,6 +293,7 @@ impl StatelessReader for StatelessEngine {
                     event_batch_reader,
                     metadata_reader,
                     filters,
+                    self.io_uring_queue_depth
                 );
             }
         }
@@ -326,6 +327,7 @@ fn internal_read_filtered_io_uring<R: Read + Seek + AsRawFd>(
     event_batch_reader: &mut R,
     metadata_reader: &mut R,
     filters: &ReadFilters,
+    io_uring_queue_depth: u32,
 ) -> io::Result<ReadResult> {
     let file_len_event_batch = event_batch_reader.seek(SeekFrom::End(0))?;
     let file_len_metadata = metadata_reader.seek(SeekFrom::End(0))?;
@@ -365,6 +367,7 @@ fn internal_read_filtered_io_uring<R: Read + Seek + AsRawFd>(
         start_reading_metadata_from_offset_position,
         max_metadata_entries,
         filters,
+        io_uring_queue_depth
     )?;
 
     calculate_absolute_positions(file_len_event_batch, &mut batches);
@@ -385,7 +388,7 @@ fn internal_read_filtered_io_uring<R: Read + Seek + AsRawFd>(
     // The bloom filter is not 100% accurate and metadata only stores 'in' types, not exclusive
 
     // Phase 3: Read event batches using io_uring
-    let event_batches = read_event_batches_with_uring(event_batch_reader, &batches, filters)?;
+    let event_batches = read_event_batches_with_uring(event_batch_reader, &batches, filters, io_uring_queue_depth)?;
 
     Ok(ReadResult {
         event_batches,
@@ -490,8 +493,9 @@ fn read_metadata_entries_with_uring<R: Read + Seek + AsRawFd>(
     start_offset: u64,
     max_entries: usize,
     filters: &ReadFilters,
+    io_uring_queue_depth: u32,
 ) -> io::Result<Vec<MetadataBatchInfo>> {
-    let mut ring = IoUring::new(32)?;
+    let mut ring = IoUring::new(io_uring_queue_depth)?;
     let fd = types::Fd(metadata_reader.as_raw_fd());
 
     // Prepare buffers for metadata entries
@@ -699,6 +703,7 @@ fn read_event_batches_with_uring<R: Read + Seek + AsRawFd>(
     event_batch_reader: &mut R,
     batch_info: &[MetadataBatchInfo],
     filters: &ReadFilters,
+    io_uring_queue_depth: u32,
 ) -> io::Result<Vec<EventBatchItem>> {
     let included_batches: Vec<&MetadataBatchInfo> =
         batch_info.iter().filter(|b| b.include).collect();
@@ -707,7 +712,7 @@ fn read_event_batches_with_uring<R: Read + Seek + AsRawFd>(
         return Ok(Vec::new());
     }
 
-    let mut ring = IoUring::new(32)?;
+    let mut ring = IoUring::new(io_uring_queue_depth)?;
     let fd = types::Fd(event_batch_reader.as_raw_fd());
 
     // Prepare buffers
