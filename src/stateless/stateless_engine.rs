@@ -90,6 +90,7 @@ mod tests {
     use crate::stateless::stateless_engine::StatelessEngine;
     use crate::stateless::stateless_reader::StatelessReader;
     use crate::stateless::stateless_writer::StatelessWriter;
+    use crate::structures::constants::BLOOM_HASH_SEED;
     use crate::structures::{
         compression_type::CompressionType,
         constants::{BLOOM_BYTES, BLOOM_HASH_COUNT},
@@ -139,7 +140,7 @@ mod tests {
         let mut metadata_writer = File::create(&metadata_path)?;
 
         // Setup bloom filter with proper constants
-        let mut bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8).hashes(BLOOM_HASH_COUNT);
+        let mut bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8).seed(&BLOOM_HASH_SEED).hashes(BLOOM_HASH_COUNT);
         let mut event_type_dedup = HashSet::new();
 
         // Write the batch using the trait method
@@ -168,7 +169,7 @@ mod tests {
             "Should not detect any corruption in the written files"
         );
 
-        let last_server_id = engine.last_server_id(&mut metadata_reader)?;
+        let last_server_id = engine.last_event_batch_index(&mut metadata_reader)?;
         assert_eq!(last_server_id, 2, "Last server ID should be 2");
 
         let last_local_index = engine.last_local_index(&mut metadata_reader)?;
@@ -187,7 +188,7 @@ mod tests {
             "Should read 1 event batch"
         );
         assert_eq!(
-            read_result.next_server_id, None,
+            read_result.next_event_batch_index, None,
             "Should have next_server_id of None"
         );
 
@@ -226,7 +227,7 @@ mod tests {
             "Should read 0 event batches"
         );
         assert_eq!(
-            read_result.next_server_id, None,
+            read_result.next_event_batch_index, None,
             "Should have next_server_id of None"
         );
 

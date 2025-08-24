@@ -18,9 +18,9 @@ pub struct ReadFilters<'a> {
     /// Only get events for this user
     pub include_user_id: Option<u128>,
     /// Optional timestamp filter, only include batches after this time (exclusive)
-    pub after_server_timestamp: Option<u64>,
+    pub min_server_timestamp: Option<u64>,
     /// Optional timestamp filter, only include batches before this time (exclusive)
-    pub before_server_timestamp: Option<u64>,
+    pub max_server_timestamp: Option<u64>,
     /// Only include batches with max_local_index greater than or equal to this value
     pub min_client_event_index: Option<u64>,
     /// Only include batches with min_local_index less than or equal to this value
@@ -78,19 +78,19 @@ impl<'a> ReadFilters<'a> {
         self
     }
 
-    pub fn after_server_timestamp(mut self, timestamp: u64) -> Self {
-        self.after_server_timestamp = Some(timestamp);
+    pub fn min_server_timestamp(mut self, timestamp: u64) -> Self {
+        self.min_server_timestamp = Some(timestamp);
         self
     }
 
-    pub fn before_server_timestamp(mut self, timestamp: u64) -> Self {
-        self.before_server_timestamp = Some(timestamp);
+    pub fn max_server_timestamp(mut self, timestamp: u64) -> Self {
+        self.max_server_timestamp = Some(timestamp);
         self
     }
 
     pub fn time_range(mut self, after: u64, before: u64) -> Self {
-        self.after_server_timestamp = Some(after);
-        self.before_server_timestamp = Some(before);
+        self.min_server_timestamp = Some(after);
+        self.max_server_timestamp = Some(before);
         self
     }
 

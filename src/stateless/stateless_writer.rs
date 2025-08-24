@@ -115,9 +115,7 @@ fn create_bloom_filter_bytes(
     filter: &mut BloomFilter,
     event_type_dedup: &mut HashSet<u64>,
     events: &[EventItem],
-) -> [u8; BLOOM_BYTES] {
-    let mut bloom_bytes = [0u8; BLOOM_BYTES];
-
+) -> [u64; BLOOM_BYTES / 8] {
     // Populate bloom filter with multiple event types
     filter.clear();
     event_type_dedup.clear();
@@ -130,19 +128,5 @@ fn create_bloom_filter_bytes(
         filter.insert(&event_type.to_le_bytes());
     }
 
-    // Get filter bytes
-    let filter_slice = filter.as_slice(); // Returns &[u64]
-    let filter_bytes = unsafe {
-        core::slice::from_raw_parts(
-            filter_slice.as_ptr() as *const u8,
-            BLOOM_BYTES, // Convert u64 count to byte count
-        )
-    };
-    if filter_bytes.len() >= BLOOM_BYTES {
-        bloom_bytes.copy_from_slice(&filter_bytes[..BLOOM_BYTES]);
-    } else {
-        bloom_bytes[..filter_bytes.len()].copy_from_slice(filter_bytes);
-    }
-
-    bloom_bytes
+    filter.as_slice().try_into().expect("Conversion failed")    
 }

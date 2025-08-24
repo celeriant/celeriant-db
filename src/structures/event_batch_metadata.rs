@@ -57,9 +57,9 @@ impl Default for EventBatchMetadata {
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub enum EventTypesData {
     /// Bloom filter bytes (when more than 4 unique event types)
-    Bloom([u8; crate::structures::constants::BLOOM_BYTES]),
+    Bloom([u64; crate::structures::constants::BLOOM_BYTES/8]),
     /// Direct event type array (when 4 or fewer unique event types)
-    Direct([u64; 4]),
+    Direct([u64; crate::structures::constants::BLOOM_BYTES/8]),
 }
 
 impl EventBatchMetadata {

@@ -13,7 +13,7 @@ use std::os::windows::io::AsRawHandle;
 
 use crate::stateless::stateless_engine::StatelessEngine;
 use crate::structures::compression_type::CompressionType;
-use crate::structures::constants::{BINCODE_CONFIG_FIXED, BLOOM_HASH_COUNT};
+use crate::structures::constants::{BINCODE_CONFIG_FIXED, BLOOM_HASH_COUNT, BLOOM_HASH_SEED};
 use crate::structures::event_batch_item::EventBatchItem;
 use crate::structures::event_batch_metadata::EventTypesData;
 use crate::structures::{
@@ -78,7 +78,7 @@ pub trait StatelessReader {
     ///
     /// # Returns
     /// * Server id (u64) for the last event batch save
-    fn last_server_id<R: Read + Seek>(&self, metadata_reader: &mut R) -> io::Result<u64>;
+    fn last_event_batch_index<R: Read + Seek>(&self, metadata_reader: &mut R) -> io::Result<u64>;
 
     /// For a provided client, get the most recent local id they used when storing events.
     ///
@@ -111,7 +111,7 @@ pub struct CorruptPositions {
 }
 
 impl StatelessReader for StatelessEngine {
-    fn last_server_id<R: Read + Seek>(&self, metadata_reader: &mut R) -> io::Result<u64> {
+    fn last_event_batch_index<R: Read + Seek>(&self, metadata_reader: &mut R) -> io::Result<u64> {
         // Get file length to find the last metadata entry
         let file_len = metadata_reader.seek(SeekFrom::End(0))?;
 
@@ -351,7 +351,7 @@ fn internal_read_filtered_io_uring<R: Read + Seek + AsRawFd>(
     if max_metadata_entries == 0 {
         return Ok(ReadResult {
             event_batches: Vec::new(),
-            next_server_id: None,
+            next_event_batch_index: None,
         });
     }
 
@@ -378,7 +378,7 @@ fn internal_read_filtered_io_uring<R: Read + Seek + AsRawFd>(
     if batches.is_empty() {
         return Ok(ReadResult {
             event_batches: Vec::new(),
-            next_server_id: None,
+            next_event_batch_index: None,
         });
     }
 
@@ -392,36 +392,27 @@ fn internal_read_filtered_io_uring<R: Read + Seek + AsRawFd>(
 
     Ok(ReadResult {
         event_batches,
-        next_server_id,
+        next_event_batch_index: next_server_id,
     })
 }
 
-fn bloom_filter_from_bytes(bloom_bytes: &[u8; BLOOM_BYTES], num_hashes: u32) -> BloomFilter {
-    // Convert bytes back to Vec<u64>
-    let mut u64_vec = Vec::with_capacity(BLOOM_BYTES / 8); // eg. 128 bytes = 16 u64s
-
-    for chunk in bloom_bytes.chunks_exact(8) {
-        let u64_val = u64::from_le_bytes([
-            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-        ]);
-        u64_vec.push(u64_val);
-    }
-
-    BloomFilter::from_vec(u64_vec).hashes(num_hashes)
+fn bloom_filter_from_bytes(bloom_bytes: &[u64; BLOOM_BYTES/8]) -> BloomFilter {
+    BloomFilter::from_vec(bloom_bytes.to_vec()).seed(&BLOOM_HASH_SEED).hashes(BLOOM_HASH_COUNT)
 }
 
 fn trim_end_if_exceeds_max_bytes(
     batches: &mut Vec<MetadataBatchInfo>,
     max_bytes: Option<usize>,
 ) -> Option<u64> {
+
+    // Only keep batches where include is true
+    batches.retain(|batch| batch.include);
+
     // If no max_bytes limit is specified, we don't need to trim
     let max_bytes = match max_bytes {
         Some(limit) => limit as u64,
         None => return None,
     };
-
-    // Only keep batches where include is true
-    batches.retain(|batch| batch.include);
 
     // If after filtering we don't have any batches, return None
     if batches.is_empty() {
@@ -573,7 +564,7 @@ fn is_include_batch(metadata: &EventBatchMetadata, filters: &ReadFilters) -> boo
     }
 
     if filters
-        .before_server_timestamp
+        .min_server_timestamp
         .map_or(false, |before_server_time| {
             metadata.server_timestamp < before_server_time
         })
@@ -582,7 +573,7 @@ fn is_include_batch(metadata: &EventBatchMetadata, filters: &ReadFilters) -> boo
     }
 
     if filters
-        .after_server_timestamp
+        .max_server_timestamp
         .map_or(false, |after_server_time| {
             metadata.server_timestamp > after_server_time
         })
@@ -704,10 +695,10 @@ fn check_event_types_match(event_types_data: &EventTypesData, include_event_type
         }
         EventTypesData::Bloom(bloom_bytes) => {
             // Create bloom filter and test each required type
-            let bloom = bloom_filter_from_bytes(bloom_bytes, BLOOM_HASH_COUNT);
+            let bloom = bloom_filter_from_bytes(bloom_bytes);
             include_event_types
                 .iter()
-                .any(|&include_event_type| bloom.contains(&include_event_type))
+                .any(|&include_event_type| bloom.contains(&include_event_type.to_le_bytes()))
         }
     }
 }
@@ -908,7 +899,7 @@ fn internal_read_filtered_standard<R: Read + Seek>(
     if max_metadata_entries == 0 {
         return Ok(ReadResult {
             event_batches: Vec::new(),
-            next_server_id: None,
+            next_event_batch_index: None,
         });
     }
 
@@ -928,7 +919,7 @@ fn internal_read_filtered_standard<R: Read + Seek>(
     if batches.is_empty() {
         return Ok(ReadResult {
             event_batches: Vec::new(),
-            next_server_id: None,
+            next_event_batch_index: None,
         });
     }
 
@@ -937,7 +928,7 @@ fn internal_read_filtered_standard<R: Read + Seek>(
 
     Ok(ReadResult {
         event_batches,
-        next_server_id,
+        next_event_batch_index: next_server_id,
     })
 }
 

@@ -11,5 +11,5 @@ pub struct ReadResult {
 
     /// If present, not all event batches were read, this is the server id of the next event batch to continue reading
     #[serde(rename = "si")]
-    pub next_server_id: Option<u64>,
+    pub next_event_batch_index: Option<u64>,
 }

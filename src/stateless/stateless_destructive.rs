@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File},
-    io::{self, BufReader, BufWriter, Seek, SeekFrom, Write},
+    io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::Path,
 };
 
@@ -17,12 +17,12 @@ pub trait StatelessDestructive {
     ) -> io::Result<()>;
 
     /// Truncate the start of the file at a specific position (typically after those chunks have been moved to object storage)
-    fn trim_start(
+    fn trim_start<R: Read + Seek>(
         &self,
-        event_batch_reader: &mut BufReader<File>,
+        event_batch_reader: &mut R,
         event_batch_keep_from_position: u64,
         event_batch_file_path: &str,
-        metadata_reader: &mut BufReader<File>,
+        metadata_reader: &mut R,
         metadata_keep_from_position: u64,
         metadata_file_path: &str,
     ) -> io::Result<()>;
@@ -58,12 +58,12 @@ impl StatelessDestructive for StatelessEngine {
         Ok(())
     }
 
-    fn trim_start(
+    fn trim_start<R: Read + Seek>(
         &self,
-        event_batch_reader: &mut BufReader<File>,
+        event_batch_reader: &mut R,
         event_batch_keep_from_position: u64,
         event_batch_file_path: &str,
-        metadata_reader: &mut BufReader<File>,
+        metadata_reader: &mut R,
         metadata_keep_from_position: u64,
         metadata_file_path: &str,
     ) -> io::Result<()> {
