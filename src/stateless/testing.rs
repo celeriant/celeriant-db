@@ -968,4 +968,360 @@ mod tests {
         assert_eq!(read_result.event_batches.len(), 1);
         Ok(())
     }
+
+    // 6. Pagination Testing
+
+    #[test]
+    fn test_max_bytes_pagination() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Create batches with known sizes
+        let events = vec![
+            fixture.create_event_with_data(1, vec![0u8; 1000]), // ~1KB events
+            fixture.create_event_with_data(2, vec![0u8; 1000]),
+            fixture.create_event_with_data(3, vec![0u8; 1000]),
+        ];
+
+        let batch1 = fixture.create_simple_batch(1, events.clone());
+        let batch2 = fixture.create_simple_batch(2, events.clone());
+        let batch3 = fixture.create_simple_batch(3, events);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch1)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch2)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch3)?;
+
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+
+        // Set max_bytes to approximately fit only the first batch
+        let mut filters = ReadFilters::new(1);
+        filters.max_bytes = Some(58); // Should fit only first batch
+        let read_result =
+            fixture.read_filtered(&mut event_batch_reader, &mut metadata_reader, &filters)?;
+
+        assert_eq!(read_result.event_batches.len(), 1);
+        assert_eq!(read_result.event_batches[0].event_batch_index, 1);
+        assert_eq!(read_result.next_event_batch_index, Some(2));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_exact_boundary_pagination() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Create events with known data sizes
+        let event1 = fixture.create_event_with_data(1, vec![0u8; 500]);
+        let event2 = fixture.create_event_with_data(2, vec![0u8; 500]);
+        let event3 = fixture.create_event_with_data(3, vec![0u8; 500]);
+
+        let batch1 = fixture.create_simple_batch(1, vec![event1]);
+        let batch2 = fixture.create_simple_batch(2, vec![event2]);
+        let batch3 = fixture.create_simple_batch(3, vec![event3]);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        let metadata1 =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch1)?;
+        let metadata2 =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch2)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch3)?;
+
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+
+        // Set max_bytes to exactly fit the first two batches
+        let mut filters = ReadFilters::new(1);
+        filters.max_bytes = Some((metadata1.compressed_size + metadata2.compressed_size) as usize);
+        let read_result =
+            fixture.read_filtered(&mut event_batch_reader, &mut metadata_reader, &filters)?;
+
+        assert_eq!(read_result.event_batches.len(), 2);
+        assert_eq!(read_result.event_batches[0].event_batch_index, 1);
+        assert_eq!(read_result.event_batches[1].event_batch_index, 2);
+        assert_eq!(read_result.next_event_batch_index, Some(3));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_single_byte_under_boundary() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        let event1 = fixture.create_event_with_data(1, vec![0u8; 500]);
+        let event2 = fixture.create_event_with_data(2, vec![0u8; 500]);
+        let event3 = fixture.create_event_with_data(3, vec![0u8; 500]);
+
+        let batch1 = fixture.create_simple_batch(1, vec![event1]);
+        let batch2 = fixture.create_simple_batch(2, vec![event2]);
+        let batch3 = fixture.create_simple_batch(3, vec![event3]);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        let metadata1 =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch1)?;
+        let metadata2 =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch2)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch3)?;
+
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+
+        // Set max_bytes to 1 byte under the exact boundary for two batches
+        let mut filters = ReadFilters::new(1);
+        filters.max_bytes =
+            Some((metadata1.compressed_size + metadata2.compressed_size - 1) as usize);
+        let read_result =
+            fixture.read_filtered(&mut event_batch_reader, &mut metadata_reader, &filters)?;
+
+        // Should only include the first batch since adding the second would exceed the limit
+        assert_eq!(read_result.event_batches.len(), 1);
+        assert_eq!(read_result.event_batches[0].event_batch_index, 1);
+        assert_eq!(read_result.next_event_batch_index, Some(2));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_single_byte_over_boundary() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        let event1 = fixture.create_event_with_data(1, vec![0u8; 500]);
+        let event2 = fixture.create_event_with_data(2, vec![0u8; 500]);
+        let event3 = fixture.create_event_with_data(3, vec![0u8; 500]);
+
+        let batch1 = fixture.create_simple_batch(1, vec![event1]);
+        let batch2 = fixture.create_simple_batch(2, vec![event2]);
+        let batch3 = fixture.create_simple_batch(3, vec![event3]);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        let metadata1 =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch1)?;
+        let metadata2 =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch2)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch3)?;
+
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+
+        // Set max_bytes to 1 byte over the exact boundary for two batches
+        let mut filters = ReadFilters::new(1);
+        filters.max_bytes =
+            Some((metadata1.compressed_size + metadata2.compressed_size + 1) as usize);
+        let read_result =
+            fixture.read_filtered(&mut event_batch_reader, &mut metadata_reader, &filters)?;
+
+        // Should include both batches since we have enough space
+        assert_eq!(read_result.event_batches.len(), 2);
+        assert_eq!(read_result.event_batches[0].event_batch_index, 1);
+        assert_eq!(read_result.event_batches[1].event_batch_index, 2);
+        assert_eq!(read_result.next_event_batch_index, Some(3));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_pagination_with_filtering() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Create batches with different client IDs
+        let events = vec![fixture.create_event_with_data(1, vec![0u8; 1000])];
+        let batch1 = EventBatchItem::new(1, 1600000000000, 111, Some(987654321), events.clone());
+        let batch2 = EventBatchItem::new(2, 1600000000000, 222, Some(987654321), events.clone());
+        let batch3 = EventBatchItem::new(3, 1600000000000, 111, Some(987654321), events.clone());
+        let batch4 = EventBatchItem::new(4, 1600000000000, 222, Some(987654321), events);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch1)?;
+        let metadata2 =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch2)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch3)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch4)?;
+
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+
+        // Filter by client_id 111 with max_bytes that should fit only one batch
+        let mut filters = ReadFilters::new(1);
+        filters.include_client_id = Some(111);
+        filters.max_bytes = Some(metadata2.compressed_size as usize); // Roughly one batch worth
+        let read_result =
+            fixture.read_filtered(&mut event_batch_reader, &mut metadata_reader, &filters)?;
+
+        // Should only get one batch (batch1) and next_server_id should point to batch3 (next matching batch)
+        assert_eq!(read_result.event_batches.len(), 1);
+        assert_eq!(read_result.event_batches[0].event_batch_index, 1);
+        assert_eq!(read_result.event_batches[0].client_id, 111);
+        assert_eq!(read_result.next_event_batch_index, Some(3));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_pagination_no_limit() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        let events = vec![fixture.create_event_with_data(1, vec![0u8; 1000])];
+        let batch1 = fixture.create_simple_batch(1, events.clone());
+        let batch2 = fixture.create_simple_batch(2, events.clone());
+        let batch3 = fixture.create_simple_batch(3, events);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch1)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch2)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch3)?;
+
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+
+        // No max_bytes limit should return all batches
+        let filters = ReadFilters::new(1);
+        let read_result =
+            fixture.read_filtered(&mut event_batch_reader, &mut metadata_reader, &filters)?;
+
+        assert_eq!(read_result.event_batches.len(), 3);
+        assert_eq!(read_result.next_event_batch_index, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_pagination_very_small_limit() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        let events = vec![fixture.create_event_with_data(1, vec![0u8; 1000])];
+        let batch1 = fixture.create_simple_batch(1, events);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch1)?;
+
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+
+        // Set max_bytes to a very small value that won't fit even one batch
+        let mut filters = ReadFilters::new(1);
+        filters.max_bytes = Some(10);
+        let read_result =
+            fixture.read_filtered(&mut event_batch_reader, &mut metadata_reader, &filters);
+
+        // Should have error
+        assert!(read_result.is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_pagination_continue_from_next() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        let events = vec![fixture.create_event_with_data(1, vec![0u8; 1000])];
+        let batch1 = fixture.create_simple_batch(1, events.clone());
+        let batch2 = fixture.create_simple_batch(2, events.clone());
+        let batch3 = fixture.create_simple_batch(3, events.clone());
+        let batch4 = fixture.create_simple_batch(4, events);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        let metadata1 =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch1)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch2)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch3)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch4)?;
+
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+
+        // First page - limit to approximately one batch
+        let mut filters = ReadFilters::new(1);
+        filters.max_bytes = Some(metadata1.compressed_size as usize);
+        let read_result1 =
+            fixture.read_filtered(&mut event_batch_reader, &mut metadata_reader, &filters)?;
+
+        assert_eq!(read_result1.event_batches.len(), 1);
+        assert_eq!(read_result1.event_batches[0].event_batch_index, 1);
+        assert_eq!(read_result1.next_event_batch_index, Some(2));
+
+        // Second page - continue from next_server_id
+        let mut filters2 = ReadFilters::new(2);
+        filters2.max_bytes = Some(metadata1.compressed_size as usize);
+        let read_result2 =
+            fixture.read_filtered(&mut event_batch_reader, &mut metadata_reader, &filters2)?;
+
+        assert_eq!(read_result2.event_batches.len(), 1);
+        assert_eq!(read_result2.event_batches[0].event_batch_index, 2);
+        assert_eq!(read_result2.next_event_batch_index, Some(3));
+
+        // Third page
+        let mut filters3 = ReadFilters::new(3);
+        filters3.max_bytes = Some((metadata1.compressed_size * 2) as usize); // Allow two batches
+        let read_result3 =
+            fixture.read_filtered(&mut event_batch_reader, &mut metadata_reader, &filters3)?;
+
+        assert_eq!(read_result3.event_batches.len(), 2);
+        assert_eq!(read_result3.event_batches[0].event_batch_index, 3);
+        assert_eq!(read_result3.event_batches[1].event_batch_index, 4);
+        assert_eq!(read_result3.next_event_batch_index, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_pagination_with_large_batch() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Create one very large batch and one small batch
+        let large_events = vec![
+            fixture.create_event_with_data(1, vec![0u8; 5000]),
+            fixture.create_event_with_data(2, vec![0u8; 5000]),
+        ];
+        let small_events = vec![fixture.create_event_with_data(3, vec![0u8; 100])];
+
+        let large_batch = fixture.create_simple_batch(1, large_events);
+        let small_batch = fixture.create_simple_batch(2, small_events);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &large_batch)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &small_batch)?;
+
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+
+        // Set max_bytes smaller than the large batch
+        let mut filters = ReadFilters::new(1);
+        filters.max_bytes = Some(60);
+        let read_result =
+            fixture.read_filtered(&mut event_batch_reader, &mut metadata_reader, &filters)?;
+
+        assert_eq!(read_result.event_batches.len(), 1);
+        assert_eq!(read_result.next_event_batch_index, Some(2));
+
+        let mut filters = ReadFilters::new(1);
+        filters.max_bytes = Some(60);
+        filters.from_event_batch_index = read_result.next_event_batch_index.unwrap();
+        let read_result =
+            fixture.read_filtered(&mut event_batch_reader, &mut metadata_reader, &filters)?;
+
+        assert_eq!(read_result.event_batches.len(), 1);
+        assert_eq!(read_result.event_batches[0].event_batch_index, 2);
+        assert_eq!(read_result.next_event_batch_index, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_pagination_empty_after_filtering() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        let events = vec![fixture.create_event_with_data(1, vec![0u8; 1000])];
+        let batch1 = EventBatchItem::new(1, 1600000000000, 111, Some(987654321), events.clone());
+        let batch2 = EventBatchItem::new(2, 1600000000000, 222, Some(987654321), events);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch1)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch2)?;
+
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+
+        // Filter by client_id that doesn't exist
+        let mut filters = ReadFilters::new(1);
+        filters.include_client_id = Some(99989);
+        filters.max_bytes = Some(5000);
+        let read_result =
+            fixture.read_filtered(&mut event_batch_reader, &mut metadata_reader, &filters)?;
+
+        // Should return empty result
+        assert_eq!(read_result.event_batches.len(), 0);
+        assert_eq!(read_result.next_event_batch_index, None);
+
+        Ok(())
+    }
 }

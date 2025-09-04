@@ -373,15 +373,15 @@ fn internal_read_filtered_io_uring<R: Read + Seek + AsRawFd>(
 
     calculate_absolute_positions(file_len_event_batch, &mut batches);
 
-    let next_server_id: Option<u64> =
-        trim_end_if_exceeds_max_bytes(&mut batches, filters.max_bytes);
-
     if batches.is_empty() {
         return Ok(ReadResult {
             event_batches: Vec::new(),
             next_event_batch_index: None,
         });
     }
+
+    let next_server_id: Option<u64> =
+        trim_end_if_exceeds_max_bytes(&mut batches, filters.max_bytes)?;
 
     // Now we know which event batches to pull, and where they are in the file, and their size in bytes. Pull them all into memory using io_uring
     // Decompress and deserialize within the collect phase of io_uring.
@@ -407,19 +407,19 @@ fn bloom_filter_from_bytes(bloom_bytes: &[u64; BLOOM_BYTES / 8]) -> BloomFilter 
 fn trim_end_if_exceeds_max_bytes(
     batches: &mut Vec<MetadataBatchInfo>,
     max_bytes: Option<usize>,
-) -> Option<u64> {
+) -> io::Result<Option<u64>> {
     // Only keep batches where include is true
     batches.retain(|batch| batch.include);
 
     // If no max_bytes limit is specified, we don't need to trim
     let max_bytes = match max_bytes {
         Some(limit) => limit as u64,
-        None => return None,
+        None => return Ok(None),
     };
 
     // If after filtering we don't have any batches, return None
     if batches.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     // Calculate cumulative compressed size
@@ -449,10 +449,17 @@ fn trim_end_if_exceeds_max_bytes(
         // Keep only the batches that fit within the max_bytes limit
         batches.truncate(index);
 
-        next_server_id
+        if batches.is_empty() {
+            // Throw an error as max bytes was too small to return any event batches
+            return Err(io::Error::other(
+                "max_bytes filter is too small to return any event batches",
+            ));
+        }
+
+        Ok(next_server_id)
     } else {
         // No trimming needed, all batches fit within the limit
-        None
+        Ok(None)
     }
 }
 
@@ -914,15 +921,16 @@ fn internal_read_filtered_standard<R: Read + Seek>(
 
     calculate_absolute_positions(file_len_event_batch, &mut batches);
 
-    let next_server_id: Option<u64> =
-        trim_end_if_exceeds_max_bytes(&mut batches, filters.max_bytes);
-
+    // Nothing to read after filtering
     if batches.is_empty() {
         return Ok(ReadResult {
             event_batches: Vec::new(),
             next_event_batch_index: None,
         });
     }
+
+    let next_server_id: Option<u64> =
+        trim_end_if_exceeds_max_bytes(&mut batches, filters.max_bytes)?;
 
     // Phase 2: Read event batches using standard I/O
     let event_batches = read_event_batches_standard(event_batch_reader, &batches, filters)?;
