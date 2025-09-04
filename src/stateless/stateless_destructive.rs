@@ -107,6 +107,27 @@ impl StatelessDestructive for StatelessEngine {
         event_batch_file_path: P,
         metadata_file_path: P,
     ) -> io::Result<()> {
+        // Ensure files exist before attempting to delete
+        if !event_batch_file_path.as_ref().exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "Event batch file not found: {}",
+                    event_batch_file_path.as_ref().display()
+                ),
+            ));
+        }
+
+        if !metadata_file_path.as_ref().exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "Metadata file not found: {}",
+                    metadata_file_path.as_ref().display()
+                ),
+            ));
+        }
+
         // Delete event batch file
         fs::remove_file(event_batch_file_path)?;
 

@@ -2186,4 +2186,665 @@ mod tests {
 
         Ok(())
     }
+
+    // 9. Destructive Operations
+
+    #[test]
+    fn test_trim_end_operation() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Write multiple batches
+        let events = vec![fixture.create_event_with_data(1, vec![0u8; 100])];
+        let batch1 = fixture.create_simple_batch(1, events.clone());
+        let batch2 = fixture.create_simple_batch(2, events.clone());
+        let batch3 = fixture.create_simple_batch(3, events);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        let metadata1 =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch1)?;
+        let metadata2 =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch2)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch3)?;
+
+        // Calculate trim positions to remove the last batch
+        let event_batch_trim_position = metadata1.compressed_size + metadata2.compressed_size;
+        let metadata_trim_position = 2 * METADATA_BATCH_SIZE_BYTES as u64;
+
+        // Perform trim_end
+        let mut event_batch_writer = std::io::BufWriter::new(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(fixture._temp_dir.path().join("event_batches.bin"))?,
+        );
+        let mut metadata_writer = std::io::BufWriter::new(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(fixture._temp_dir.path().join("metadata.bin"))?,
+        );
+
+        fixture.engine.trim_end(
+            &mut event_batch_writer,
+            event_batch_trim_position,
+            &mut metadata_writer,
+            metadata_trim_position,
+        )?;
+
+        drop(event_batch_writer);
+        drop(metadata_writer);
+
+        // Verify only first two batches remain
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+        let read_result = fixture.read_filtered(
+            &mut event_batch_reader,
+            &mut metadata_reader,
+            &ReadFilters::new(1),
+        )?;
+
+        assert_eq!(read_result.event_batches.len(), 2);
+        assert_eq!(read_result.event_batches[0].event_batch_index, 1);
+        assert_eq!(read_result.event_batches[1].event_batch_index, 2);
+
+        // Verify no corruption detected
+        let corruption =
+            fixture.detect_corruption(&mut event_batch_reader, &mut metadata_reader)?;
+        assert!(corruption.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_trim_end_at_file_boundaries() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Write exactly 3 batches
+        let events = vec![fixture.create_event_with_data(1, vec![0u8; 200])];
+        let batch1 = fixture.create_simple_batch(1, events.clone());
+        let batch2 = fixture.create_simple_batch(2, events.clone());
+        let batch3 = fixture.create_simple_batch(3, events);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        let metadata1 =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch1)?;
+        let metadata2 =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch2)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch3)?;
+
+        // Trim at exact end of batch 2
+        let event_batch_trim_position = metadata1.compressed_size + metadata2.compressed_size;
+        let metadata_trim_position = 2 * METADATA_BATCH_SIZE_BYTES as u64;
+
+        let mut event_batch_writer = std::io::BufWriter::new(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(fixture._temp_dir.path().join("event_batches.bin"))?,
+        );
+        let mut metadata_writer = std::io::BufWriter::new(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(fixture._temp_dir.path().join("metadata.bin"))?,
+        );
+
+        fixture.engine.trim_end(
+            &mut event_batch_writer,
+            event_batch_trim_position,
+            &mut metadata_writer,
+            metadata_trim_position,
+        )?;
+
+        drop(event_batch_writer);
+        drop(metadata_writer);
+
+        // Should have exactly 2 batches remaining
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+        let read_result = fixture.read_filtered(
+            &mut event_batch_reader,
+            &mut metadata_reader,
+            &ReadFilters::new(1),
+        )?;
+
+        assert_eq!(read_result.event_batches.len(), 2);
+        assert_eq!(read_result.event_batches[0].event_batch_index, 1);
+        assert_eq!(read_result.event_batches[1].event_batch_index, 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_trim_end_to_zero() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Write one batch
+        let events = vec![fixture.create_event_with_data(1, vec![0u8; 100])];
+        let batch1 = fixture.create_simple_batch(1, events);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch1)?;
+
+        // Trim to position 0 (remove everything)
+        let mut event_batch_writer = std::io::BufWriter::new(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(fixture._temp_dir.path().join("event_batches.bin"))?,
+        );
+        let mut metadata_writer = std::io::BufWriter::new(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(fixture._temp_dir.path().join("metadata.bin"))?,
+        );
+
+        fixture
+            .engine
+            .trim_end(&mut event_batch_writer, 0, &mut metadata_writer, 0)?;
+
+        drop(event_batch_writer);
+        drop(metadata_writer);
+
+        // Verify files are empty
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+
+        // Should detect corruption (empty files)
+        let corruption =
+            fixture.detect_corruption(&mut event_batch_reader, &mut metadata_reader)?;
+        assert!(corruption.is_some());
+
+        let corrupt_pos = corruption.unwrap();
+        assert_eq!(corrupt_pos.metadata_position, 0);
+        assert_eq!(corrupt_pos.event_batch_position, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_trim_start_operation() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Write 5 batches
+        let mut batches = Vec::new();
+        let mut total_event_size = 0u64;
+        let mut total_metadata_size = 0u64;
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+
+        for i in 1..=5 {
+            let events = vec![fixture.create_event_with_data(i, vec![0u8; 100])];
+            let batch = fixture.create_simple_batch(i, events);
+            let metadata =
+                fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch)?;
+
+            if i <= 2 {
+                total_event_size += metadata.compressed_size;
+                total_metadata_size += METADATA_BATCH_SIZE_BYTES as u64;
+            }
+
+            batches.push(batch);
+        }
+
+        drop(event_batch_writer);
+        drop(metadata_writer);
+
+        // Trim start to keep from batch 3 onwards
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+        fixture.trim_start(
+            &mut event_batch_reader,
+            total_event_size,
+            &mut metadata_reader,
+            total_metadata_size,
+        )?;
+
+        drop(event_batch_reader);
+        drop(metadata_reader);
+
+        // Verify only batches 3, 4, 5 remain
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+        let read_result = fixture.read_filtered(
+            &mut event_batch_reader,
+            &mut metadata_reader,
+            &ReadFilters::new(3),
+        )?;
+
+        assert_eq!(read_result.event_batches.len(), 3);
+        assert_eq!(read_result.event_batches[0].event_batch_index, 3);
+        assert_eq!(read_result.event_batches[1].event_batch_index, 4);
+        assert_eq!(read_result.event_batches[2].event_batch_index, 5);
+
+        // Verify no corruption detected
+        let corruption =
+            fixture.detect_corruption(&mut event_batch_reader, &mut metadata_reader)?;
+        assert!(corruption.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_trim_start_to_position_zero_rejection() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Write some batches
+        let events = vec![fixture.create_event_with_data(1, vec![0u8; 100])];
+        let batch = fixture.create_simple_batch(1, events);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch)?;
+
+        drop(event_batch_writer);
+        drop(metadata_writer);
+
+        // Attempt to trim to position 0
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+        let result = fixture.trim_start(&mut event_batch_reader, 0, &mut metadata_reader, 0);
+
+        // Should return error
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("Cannot trim to position 0"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_trim_start_with_temporary_files() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Write multiple batches
+        let events = vec![fixture.create_event_with_data(1, vec![0u8; 500])];
+        let batch1 = fixture.create_simple_batch(1, events.clone());
+        let batch2 = fixture.create_simple_batch(2, events.clone());
+        let batch3 = fixture.create_simple_batch(3, events);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        let metadata1 =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch1)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch2)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch3)?;
+
+        drop(event_batch_writer);
+        drop(metadata_writer);
+
+        // Trim start to keep from batch 2 onwards
+        let event_batch_trim_position = metadata1.compressed_size;
+        let metadata_trim_position = METADATA_BATCH_SIZE_BYTES as u64;
+
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+        fixture.trim_start(
+            &mut event_batch_reader,
+            event_batch_trim_position,
+            &mut metadata_reader,
+            metadata_trim_position,
+        )?;
+
+        drop(event_batch_reader);
+        drop(metadata_reader);
+
+        // Verify no temporary files remain
+        let event_batch_temp_path = fixture._temp_dir.path().join("event_batches.bin.tmp");
+        let metadata_temp_path = fixture._temp_dir.path().join("metadata.bin.tmp");
+
+        assert!(
+            !event_batch_temp_path.exists(),
+            "Event batch temp file should be cleaned up"
+        );
+        assert!(
+            !metadata_temp_path.exists(),
+            "Metadata temp file should be cleaned up"
+        );
+
+        // Verify operation succeeded
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+        let read_result = fixture.read_filtered(
+            &mut event_batch_reader,
+            &mut metadata_reader,
+            &ReadFilters::new(2),
+        )?;
+
+        assert_eq!(read_result.event_batches.len(), 2);
+        assert_eq!(read_result.event_batches[0].event_batch_index, 2);
+        assert_eq!(read_result.event_batches[1].event_batch_index, 3);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_trim_start_single_batch_remaining() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Write 3 batches
+        let events = vec![fixture.create_event_with_data(1, vec![0u8; 100])];
+        let batch1 = fixture.create_simple_batch(1, events.clone());
+        let batch2 = fixture.create_simple_batch(2, events.clone());
+        let batch3 = fixture.create_simple_batch(3, events);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        let metadata1 =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch1)?;
+        let metadata2 =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch2)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch3)?;
+
+        drop(event_batch_writer);
+        drop(metadata_writer);
+
+        // Trim start to keep only the last batch
+        let event_batch_trim_position = metadata1.compressed_size + metadata2.compressed_size;
+        let metadata_trim_position = 2 * METADATA_BATCH_SIZE_BYTES as u64;
+
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+        fixture.trim_start(
+            &mut event_batch_reader,
+            event_batch_trim_position,
+            &mut metadata_reader,
+            metadata_trim_position,
+        )?;
+
+        drop(event_batch_reader);
+        drop(metadata_reader);
+
+        // Verify only the last batch remains
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+        let read_result = fixture.read_filtered(
+            &mut event_batch_reader,
+            &mut metadata_reader,
+            &ReadFilters::new(3),
+        )?;
+
+        assert_eq!(read_result.event_batches.len(), 1);
+        assert_eq!(read_result.event_batches[0].event_batch_index, 3);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_trim_start_large_file() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Write many batches
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+
+        let num_batches = 100;
+        let trim_from_batch = 50;
+        let mut trim_event_position = 0u64;
+        let mut trim_metadata_position = 0u64;
+
+        for i in 1..=num_batches {
+            let events = vec![fixture.create_event_with_data(i, vec![0u8; 50])];
+            let batch = fixture.create_simple_batch(i, events);
+            let metadata =
+                fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch)?;
+
+            if i < trim_from_batch {
+                trim_event_position += metadata.compressed_size;
+                trim_metadata_position += METADATA_BATCH_SIZE_BYTES as u64;
+            }
+        }
+
+        drop(event_batch_writer);
+        drop(metadata_writer);
+
+        // Trim start to keep from batch 50 onwards
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+        fixture.trim_start(
+            &mut event_batch_reader,
+            trim_event_position,
+            &mut metadata_reader,
+            trim_metadata_position,
+        )?;
+
+        drop(event_batch_reader);
+        drop(metadata_reader);
+
+        // Verify batches 50-100 remain
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+        let read_result = fixture.read_filtered(
+            &mut event_batch_reader,
+            &mut metadata_reader,
+            &ReadFilters::new(trim_from_batch),
+        )?;
+
+        assert_eq!(
+            read_result.event_batches.len(),
+            (num_batches - trim_from_batch + 1) as usize
+        );
+        assert_eq!(
+            read_result.event_batches[0].event_batch_index,
+            trim_from_batch
+        );
+        assert_eq!(
+            read_result.event_batches.last().unwrap().event_batch_index,
+            num_batches
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_file_deletion_operation() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Write some data
+        let events = vec![fixture.create_simple_event(1)];
+        let batch = fixture.create_simple_batch(1, events);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch)?;
+
+        drop(event_batch_writer);
+        drop(metadata_writer);
+
+        // Verify files exist
+        let event_batch_path = fixture._temp_dir.path().join("event_batches.bin");
+        let metadata_path = fixture._temp_dir.path().join("metadata.bin");
+        assert!(event_batch_path.exists());
+        assert!(metadata_path.exists());
+
+        // Delete files
+        fixture.engine.delete(&event_batch_path, &metadata_path)?;
+
+        // Verify files no longer exist
+        assert!(!event_batch_path.exists());
+        assert!(!metadata_path.exists());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_delete_non_existent_files() -> io::Result<()> {
+        let fixture = TestFixture::new()?;
+
+        let non_existent_event_path = fixture._temp_dir.path().join("non_existent_events.bin");
+        let non_existent_metadata_path = fixture._temp_dir.path().join("non_existent_metadata.bin");
+
+        // Attempt to delete non-existent files
+        let result = fixture
+            .engine
+            .delete(&non_existent_event_path, &non_existent_metadata_path);
+
+        // Should return error
+        assert!(result.is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_delete_partial_failure() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Create only the event batch file, not the metadata file
+        let events = vec![fixture.create_simple_event(1)];
+        let batch = fixture.create_simple_batch(1, events);
+
+        let (mut event_batch_writer, _) = fixture.create_writers()?;
+        // Note: we're not creating the metadata file, just the event batch file
+        fixture.write_batch(&mut event_batch_writer, &mut std::io::sink(), &batch)?;
+        drop(event_batch_writer);
+
+        let event_batch_path = fixture._temp_dir.path().join("event_batches.bin");
+        let metadata_path = fixture._temp_dir.path().join("metadata.bin");
+
+        //Delete metadata_path
+        std::fs::remove_file(&metadata_path).ok();
+
+        // Verify only event batch file exists
+        assert!(event_batch_path.exists());
+        assert!(!metadata_path.exists());
+
+        // Attempt to delete both files
+        let result = fixture.engine.delete(&event_batch_path, &metadata_path);
+
+        // Should fail because metadata file doesn't exist
+        assert!(result.is_err());
+
+        // Event batch file should still exist (deletion is not atomic across both files)
+        assert!(event_batch_path.exists());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_trim_operations_preserve_data_integrity() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Write batches with different data to ensure integrity after trim
+        let batch1_events = vec![
+            fixture.create_event_with_data(1, b"batch1_event1".to_vec()),
+            fixture.create_event_with_data(2, b"batch1_event2".to_vec()),
+        ];
+        let batch2_events = vec![fixture.create_event_with_data(3, b"batch2_event1".to_vec())];
+        let batch3_events = vec![
+            fixture.create_event_with_data(4, b"batch3_event1".to_vec()),
+            fixture.create_event_with_data(5, b"batch3_event2".to_vec()),
+            fixture.create_event_with_data(6, b"batch3_event3".to_vec()),
+        ];
+
+        let batch1 = fixture.create_simple_batch(1, batch1_events);
+        let batch2 = fixture.create_simple_batch(2, batch2_events);
+        let batch3 = fixture.create_simple_batch(3, batch3_events);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        let metadata1 =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch1)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch2)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch3)?;
+
+        drop(event_batch_writer);
+        drop(metadata_writer);
+
+        // First, trim end to remove batch3
+        let mut event_batch_writer = std::io::BufWriter::new(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(fixture._temp_dir.path().join("event_batches.bin"))?,
+        );
+        let mut metadata_writer = std::io::BufWriter::new(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(fixture._temp_dir.path().join("metadata.bin"))?,
+        );
+
+        let compressed_size = fixture
+            .write_batch(&mut std::io::sink(), &mut std::io::sink(), &batch2)?
+            .compressed_size;
+
+        fixture.engine.trim_end(
+            &mut event_batch_writer,
+            metadata1.compressed_size + compressed_size,
+            &mut metadata_writer,
+            2 * METADATA_BATCH_SIZE_BYTES as u64,
+        )?;
+
+        drop(event_batch_writer);
+        drop(metadata_writer);
+
+        // Now trim start to remove batch1
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+        fixture.trim_start(
+            &mut event_batch_reader,
+            metadata1.compressed_size,
+            &mut metadata_reader,
+            METADATA_BATCH_SIZE_BYTES as u64,
+        )?;
+
+        drop(event_batch_reader);
+        drop(metadata_reader);
+
+        // Verify only batch2 remains and data is intact
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+        let read_result = fixture.read_filtered(
+            &mut event_batch_reader,
+            &mut metadata_reader,
+            &ReadFilters::new(2),
+        )?;
+
+        assert_eq!(read_result.event_batches.len(), 1);
+        let remaining_batch = &read_result.event_batches[0];
+        assert_eq!(remaining_batch.event_batch_index, 2);
+        assert_eq!(remaining_batch.events.len(), 1);
+        assert_eq!(remaining_batch.events[0].event_value, b"batch2_event1");
+
+        // Verify no corruption
+        let corruption =
+            fixture.detect_corruption(&mut event_batch_reader, &mut metadata_reader)?;
+        assert!(corruption.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_trim_operations_with_different_compression() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Write batches with different compression types
+        let events = vec![fixture.create_event_with_data(1, vec![0u8; 1000])]; // Compressible data
+
+        let batch1 = fixture.create_simple_batch(1, events.clone());
+        let batch2 = fixture.create_simple_batch(2, events.clone());
+        let batch3 = fixture.create_simple_batch(3, events);
+
+        // Use different compression for each batch by creating separate fixtures
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+
+        // Write with Zstd compression (default)
+        let metadata1 =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch1)?;
+
+        // Change to Snappy compression
+        fixture.compression_type = CompressionType::Snappy;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch2)?;
+
+        // Change to Gzip compression
+        fixture.compression_type = CompressionType::Gzip { level: 6 };
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch3)?;
+
+        drop(event_batch_writer);
+        drop(metadata_writer);
+
+        // Trim start to remove first batch
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+        fixture.trim_start(
+            &mut event_batch_reader,
+            metadata1.compressed_size,
+            &mut metadata_reader,
+            METADATA_BATCH_SIZE_BYTES as u64,
+        )?;
+
+        drop(event_batch_reader);
+        drop(metadata_reader);
+
+        // Verify remaining batches with different compression types work correctly
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+        let read_result = fixture.read_filtered(
+            &mut event_batch_reader,
+            &mut metadata_reader,
+            &ReadFilters::new(2),
+        )?;
+
+        assert_eq!(read_result.event_batches.len(), 2);
+        assert_eq!(read_result.event_batches[0].event_batch_index, 2);
+        assert_eq!(read_result.event_batches[1].event_batch_index, 3);
+
+        // Verify no corruption
+        let corruption =
+            fixture.detect_corruption(&mut event_batch_reader, &mut metadata_reader)?;
+        assert!(corruption.is_none());
+
+        Ok(())
+    }
 }

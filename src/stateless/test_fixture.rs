@@ -37,7 +37,7 @@ pub mod tests {
         pub engine: StatelessEngine,
         bloom_filter: BloomFilter,
         event_type_dedup: HashSet<u64>,
-        compression_type: CompressionType,
+        pub compression_type: CompressionType,
     }
 
     impl TestFixture {
