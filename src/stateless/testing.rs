@@ -1324,4 +1324,866 @@ mod tests {
 
         Ok(())
     }
+
+    // 7. Corruption Detection
+
+    #[test]
+    fn test_no_corruption_detection() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Write some valid data
+        let events = vec![
+            fixture.create_simple_event(1),
+            fixture.create_simple_event(2),
+        ];
+        let batch1 = fixture.create_simple_batch(1, events.clone());
+        let batch2 = fixture.create_simple_batch(2, events);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch1)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch2)?;
+
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+        let corruption =
+            fixture.detect_corruption(&mut event_batch_reader, &mut metadata_reader)?;
+
+        // Should detect no corruption
+        assert!(
+            corruption.is_none(),
+            "Should not detect any corruption in valid files"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_truncated_metadata_file() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Write valid data first
+        let events = vec![fixture.create_simple_event(1)];
+        let batch1 = fixture.create_simple_batch(1, events.clone());
+        let batch2 = fixture.create_simple_batch(2, events);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch1)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch2)?;
+        drop(event_batch_writer);
+        drop(metadata_writer);
+
+        // Truncate metadata file mid-entry (corrupt the second metadata entry)
+        let metadata_path = fixture._temp_dir.path().join("metadata.bin");
+        let mut metadata_file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&metadata_path)?;
+
+        // Truncate to middle of second metadata entry
+        let truncate_position =
+            METADATA_BATCH_SIZE_BYTES as u64 + (METADATA_BATCH_SIZE_BYTES / 2) as u64;
+        metadata_file.set_len(truncate_position)?;
+        drop(metadata_file);
+
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+        let corruption =
+            fixture.detect_corruption(&mut event_batch_reader, &mut metadata_reader)?;
+
+        // Should detect corruption at the position of the first complete metadata entry
+        assert!(
+            corruption.is_some(),
+            "Should detect corruption due to truncated metadata"
+        );
+        let corrupt_pos = corruption.unwrap();
+        assert_eq!(
+            corrupt_pos.metadata_position,
+            METADATA_BATCH_SIZE_BYTES as u64
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_corrupted_metadata_deserialization() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Write valid data first
+        let events = vec![fixture.create_simple_event(1)];
+        let batch1 = fixture.create_simple_batch(1, events.clone());
+        let batch2 = fixture.create_simple_batch(2, events);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch1)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch2)?;
+        drop(event_batch_writer);
+        drop(metadata_writer);
+
+        // Corrupt metadata bytes directly
+        let metadata_path = fixture._temp_dir.path().join("metadata.bin");
+        let mut metadata_file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&metadata_path)?;
+
+        // Seek to middle of second metadata entry and corrupt some bytes
+        metadata_file.seek(SeekFrom::Start(METADATA_BATCH_SIZE_BYTES as u64 + 10))?;
+        metadata_file.write_all(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF])?; // Invalid data
+        drop(metadata_file);
+
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+        let corruption =
+            fixture.detect_corruption(&mut event_batch_reader, &mut metadata_reader)?;
+
+        // Should detect corruption at the position after the first valid metadata entry
+        assert!(
+            corruption.is_some(),
+            "Should detect corruption due to invalid metadata bytes"
+        );
+        let corrupt_pos = corruption.unwrap();
+        assert_eq!(
+            corrupt_pos.metadata_position,
+            METADATA_BATCH_SIZE_BYTES as u64
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_event_batch_file_too_short() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Write valid data first
+        let events = vec![fixture.create_simple_event(1)];
+        let batch1 = fixture.create_simple_batch(1, events.clone());
+        let batch2 = fixture.create_simple_batch(2, events);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        let metadata1 =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch1)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch2)?;
+        drop(event_batch_writer);
+        drop(metadata_writer);
+
+        // Truncate event batch file so it doesn't contain the second batch
+        let event_batch_path = fixture._temp_dir.path().join("event_batches.bin");
+        let mut event_batch_file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&event_batch_path)?;
+
+        // Truncate to only contain first batch minus a few bytes
+        let truncate_position = metadata1.compressed_size - 10;
+        event_batch_file.set_len(truncate_position)?;
+        drop(event_batch_file);
+
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+        let corruption =
+            fixture.detect_corruption(&mut event_batch_reader, &mut metadata_reader)?;
+
+        // Should detect corruption at position 0 (no valid batches)
+        assert!(
+            corruption.is_some(),
+            "Should detect corruption due to insufficient event batch data"
+        );
+        let corrupt_pos = corruption.unwrap();
+        assert_eq!(corrupt_pos.metadata_position, 0);
+        assert_eq!(corrupt_pos.event_batch_position, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_crc_mismatch_detection() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Write valid data first
+        let events = vec![fixture.create_simple_event(1)];
+        let batch1 = fixture.create_simple_batch(1, events.clone());
+        let batch2 = fixture.create_simple_batch(2, events);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        let metadata1 =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch1)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch2)?;
+        drop(event_batch_writer);
+        drop(metadata_writer);
+
+        // Corrupt event batch data to cause CRC mismatch
+        let event_batch_path = fixture._temp_dir.path().join("event_batches.bin");
+        let mut event_batch_file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&event_batch_path)?;
+
+        // Corrupt some bytes in the first batch
+        event_batch_file.seek(SeekFrom::Start(10))?;
+        event_batch_file.write_all(&[0xFF, 0xFF, 0xFF, 0xFF])?;
+        drop(event_batch_file);
+
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+        let corruption =
+            fixture.detect_corruption(&mut event_batch_reader, &mut metadata_reader)?;
+
+        // Should detect corruption at position 0 due to CRC mismatch in first batch
+        assert!(
+            corruption.is_some(),
+            "Should detect corruption due to CRC mismatch"
+        );
+        let corrupt_pos = corruption.unwrap();
+        assert_eq!(corrupt_pos.metadata_position, 0);
+        assert_eq!(corrupt_pos.event_batch_position, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_empty_file_corruption() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Create empty files
+        let (event_batch_writer, metadata_writer) = fixture.create_writers()?;
+        drop(event_batch_writer);
+        drop(metadata_writer);
+
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+        let corruption =
+            fixture.detect_corruption(&mut event_batch_reader, &mut metadata_reader)?;
+
+        // Should detect corruption at position 0 for empty files
+        assert!(
+            corruption.is_some(),
+            "Should detect corruption in empty files"
+        );
+        let corrupt_pos = corruption.unwrap();
+        assert_eq!(corrupt_pos.metadata_position, 0);
+        assert_eq!(corrupt_pos.event_batch_position, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_mismatched_file_lengths() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Write valid data first
+        let events = vec![fixture.create_simple_event(1)];
+        let batch1 = fixture.create_simple_batch(1, events.clone());
+        let batch2 = fixture.create_simple_batch(2, events);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        let metadata1 =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch1)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch2)?;
+        drop(event_batch_writer);
+        drop(metadata_writer);
+
+        // Truncate event batch file but leave metadata file intact
+        let event_batch_path = fixture._temp_dir.path().join("event_batches.bin");
+        let mut event_batch_file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&event_batch_path)?;
+
+        // Truncate to only contain first batch
+        event_batch_file.set_len(metadata1.compressed_size)?;
+        drop(event_batch_file);
+
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+        let corruption =
+            fixture.detect_corruption(&mut event_batch_reader, &mut metadata_reader)?;
+
+        // Should detect corruption after the first valid batch
+        assert!(
+            corruption.is_some(),
+            "Should detect corruption due to mismatched file lengths"
+        );
+        let corrupt_pos = corruption.unwrap();
+        assert_eq!(
+            corrupt_pos.metadata_position,
+            METADATA_BATCH_SIZE_BYTES as u64
+        );
+        assert_eq!(corrupt_pos.event_batch_position, metadata1.compressed_size);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_corruption_detection_with_multiple_valid_batches() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Write multiple valid batches
+        let events = vec![fixture.create_simple_event(1)];
+        let batch1 = fixture.create_simple_batch(1, events.clone());
+        let batch2 = fixture.create_simple_batch(2, events.clone());
+        let batch3 = fixture.create_simple_batch(3, events);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        let metadata1 =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch1)?;
+        let metadata2 =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch2)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch3)?;
+        drop(event_batch_writer);
+        drop(metadata_writer);
+
+        // Corrupt the third batch in event batch file
+        let event_batch_path = fixture._temp_dir.path().join("event_batches.bin");
+        let mut event_batch_file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&event_batch_path)?;
+
+        // Seek to third batch and corrupt it
+        let third_batch_position = metadata1.compressed_size + metadata2.compressed_size + 5;
+        event_batch_file.seek(SeekFrom::Start(third_batch_position))?;
+        event_batch_file.write_all(&[0xFF, 0xFF, 0xFF, 0xFF])?;
+        drop(event_batch_file);
+
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+        let corruption =
+            fixture.detect_corruption(&mut event_batch_reader, &mut metadata_reader)?;
+
+        // Should detect corruption after the second valid batch
+        assert!(
+            corruption.is_some(),
+            "Should detect corruption in third batch"
+        );
+        let corrupt_pos = corruption.unwrap();
+        assert_eq!(
+            corrupt_pos.metadata_position,
+            2 * METADATA_BATCH_SIZE_BYTES as u64
+        );
+        assert_eq!(
+            corrupt_pos.event_batch_position,
+            metadata1.compressed_size + metadata2.compressed_size
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_corruption_detection_insufficient_event_batch_bytes() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Write valid data first
+        let events = vec![fixture.create_simple_event(1)];
+        let batch1 = fixture.create_simple_batch(1, events.clone());
+        let batch2 = fixture.create_simple_batch(2, events);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        let metadata1 =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch1)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch2)?;
+        drop(event_batch_writer);
+        drop(metadata_writer);
+
+        // Truncate event batch file so second batch is incomplete
+        let event_batch_path = fixture._temp_dir.path().join("event_batches.bin");
+        let mut event_batch_file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&event_batch_path)?;
+
+        // Truncate to only partial second batch
+        let truncate_position = metadata1.compressed_size + 10;
+        event_batch_file.set_len(truncate_position)?;
+        drop(event_batch_file);
+
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+        let corruption =
+            fixture.detect_corruption(&mut event_batch_reader, &mut metadata_reader)?;
+
+        // Should detect corruption after the first valid batch
+        assert!(
+            corruption.is_some(),
+            "Should detect corruption due to insufficient bytes for second batch"
+        );
+        let corrupt_pos = corruption.unwrap();
+        assert_eq!(
+            corrupt_pos.metadata_position,
+            METADATA_BATCH_SIZE_BYTES as u64
+        );
+        assert_eq!(corrupt_pos.event_batch_position, metadata1.compressed_size);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_corruption_detection_partial_metadata_read() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Write valid data first
+        let events = vec![fixture.create_simple_event(1)];
+        let batch1 = fixture.create_simple_batch(1, events);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch1)?;
+        drop(event_batch_writer);
+        drop(metadata_writer);
+
+        // Append partial metadata entry (simulate interrupted write)
+        let metadata_path = fixture._temp_dir.path().join("metadata.bin");
+        let mut metadata_file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&metadata_path)?;
+
+        // Write partial metadata (less than METADATA_BATCH_SIZE_BYTES)
+        let partial_metadata = vec![0u8; METADATA_BATCH_SIZE_BYTES / 2];
+        metadata_file.write_all(&partial_metadata)?;
+        drop(metadata_file);
+
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+        let corruption =
+            fixture.detect_corruption(&mut event_batch_reader, &mut metadata_reader)?;
+
+        // Should detect corruption after the first valid batch
+        assert!(
+            corruption.is_some(),
+            "Should detect corruption due to partial metadata entry"
+        );
+        let corrupt_pos = corruption.unwrap();
+        assert_eq!(
+            corrupt_pos.metadata_position,
+            METADATA_BATCH_SIZE_BYTES as u64
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_corruption_detection_with_large_files() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Write many valid batches
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+
+        let mut last_metadata = None;
+        for i in 1..=100 {
+            let events = vec![fixture.create_simple_event(i)];
+            let batch = fixture.create_simple_batch(i, events);
+            last_metadata =
+                Some(fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch)?);
+        }
+        drop(event_batch_writer);
+        drop(metadata_writer);
+
+        // Corrupt the last batch
+        let event_batch_path = fixture._temp_dir.path().join("event_batches.bin");
+        let mut event_batch_file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&event_batch_path)?;
+
+        // Seek near end and corrupt
+        let file_len = event_batch_file.seek(SeekFrom::End(0))?;
+        event_batch_file.seek(SeekFrom::Start(file_len - 10))?;
+        event_batch_file.write_all(&[0xFF, 0xFF, 0xFF, 0xFF])?;
+        drop(event_batch_file);
+
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+        let corruption =
+            fixture.detect_corruption(&mut event_batch_reader, &mut metadata_reader)?;
+
+        // Should detect corruption in the last batch
+        assert!(
+            corruption.is_some(),
+            "Should detect corruption in large file"
+        );
+        let corrupt_pos = corruption.unwrap();
+        assert_eq!(
+            corrupt_pos.metadata_position,
+            99 * METADATA_BATCH_SIZE_BYTES as u64
+        );
+
+        Ok(())
+    }
+
+    // 8. Metadata Query Operations
+
+    #[test]
+    fn test_last_server_id_retrieval() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Write multiple batches
+        let events = vec![fixture.create_simple_event(1)];
+        let batch1 = fixture.create_simple_batch(5, events.clone()); // server_id 5
+        let batch2 = fixture.create_simple_batch(10, events.clone()); // server_id 10  
+        let batch3 = fixture.create_simple_batch(15, events); // server_id 15
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch1)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch2)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch3)?;
+
+        let (_, mut metadata_reader) = fixture.create_readers()?;
+        let last_server_id = fixture.last_event_batch_index(&mut metadata_reader)?;
+
+        assert_eq!(
+            last_server_id, 15,
+            "Should return the most recent server ID"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_last_server_id_single_batch() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        let events = vec![fixture.create_simple_event(1)];
+        let batch = fixture.create_simple_batch(42, events);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch)?;
+
+        let (_, mut metadata_reader) = fixture.create_readers()?;
+        let last_server_id = fixture.last_event_batch_index(&mut metadata_reader)?;
+
+        assert_eq!(last_server_id, 42, "Should return the single server ID");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_last_server_id_from_empty_file() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Create empty metadata file
+        let (_, metadata_writer) = fixture.create_writers()?;
+        drop(metadata_writer);
+
+        let (_, mut metadata_reader) = fixture.create_readers()?;
+        let result = fixture.last_event_batch_index(&mut metadata_reader);
+
+        assert!(
+            result.is_err(),
+            "Should return error for empty metadata file"
+        );
+
+        let error_msg = result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("too small to contain any entries"),
+            "Error should indicate insufficient data"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_last_server_id_with_partial_metadata() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Write one complete batch
+        let events = vec![fixture.create_simple_event(1)];
+        let batch = fixture.create_simple_batch(1, events);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch)?;
+        drop(event_batch_writer);
+        drop(metadata_writer);
+
+        // Append partial metadata to simulate corruption or incomplete write
+        let metadata_path = fixture._temp_dir.path().join("metadata.bin");
+        let mut metadata_file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&metadata_path)?;
+
+        let partial_data = vec![0u8; METADATA_BATCH_SIZE_BYTES / 2]; // Half a metadata entry
+        metadata_file.write_all(&partial_data)?;
+        drop(metadata_file);
+
+        let (_, mut metadata_reader) = fixture.create_readers()?;
+        let last_server_id = fixture.last_event_batch_index(&mut metadata_reader);
+
+        // Should still return the last complete entry
+        assert!(last_server_id.is_err(), "Should error due to corruption");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_last_local_index_retrieval() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Create events with different local indices
+        let mut event1 = fixture.create_simple_event(1);
+        event1.client_event_index = 10;
+        let mut event2 = fixture.create_simple_event(2);
+        event2.client_event_index = 25;
+        let mut event3 = fixture.create_simple_event(3);
+        event3.client_event_index = 15; // Not the highest in the batch
+
+        let batch1 = fixture.create_simple_batch(1, vec![event1, event2, event3]);
+
+        // Second batch with higher indices
+        let mut event4 = fixture.create_simple_event(4);
+        event4.client_event_index = 50;
+        let mut event5 = fixture.create_simple_event(5);
+        event5.client_event_index = 75; // This should be the highest overall
+
+        let batch2 = fixture.create_simple_batch(2, vec![event4, event5]);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch1)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch2)?;
+
+        let (_, mut metadata_reader) = fixture.create_readers()?;
+        let last_local_index = fixture.engine.last_local_index(&mut metadata_reader)?;
+
+        assert_eq!(
+            last_local_index, 75,
+            "Should return the highest local index from the last batch"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_last_local_index_single_event() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        let mut event = fixture.create_simple_event(1);
+        event.client_event_index = 42;
+        let batch = fixture.create_simple_batch(1, vec![event]);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch)?;
+
+        let (_, mut metadata_reader) = fixture.create_readers()?;
+        let last_local_index = fixture.engine.last_local_index(&mut metadata_reader)?;
+
+        assert_eq!(
+            last_local_index, 42,
+            "Should return the single event's local index"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_last_local_index_from_empty_file() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Create empty metadata file
+        let (_, metadata_writer) = fixture.create_writers()?;
+        drop(metadata_writer);
+
+        let (_, mut metadata_reader) = fixture.create_readers()?;
+        let result = fixture.engine.last_local_index(&mut metadata_reader);
+
+        assert!(
+            result.is_err(),
+            "Should return error for empty metadata file"
+        );
+
+        let error_msg = result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("too small to contain any entries"),
+            "Error should indicate insufficient data"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_last_local_index_with_zero_index() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        let mut event1 = fixture.create_simple_event(1);
+        event1.client_event_index = 0; // Zero is a valid local index
+        let mut event2 = fixture.create_simple_event(2);
+        event2.client_event_index = 5;
+
+        let batch = fixture.create_simple_batch(1, vec![event1, event2]);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch)?;
+
+        let (_, mut metadata_reader) = fixture.create_readers()?;
+        let last_local_index = fixture.engine.last_local_index(&mut metadata_reader)?;
+
+        assert_eq!(
+            last_local_index, 5,
+            "Should return the maximum local index, not necessarily the last event"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_last_local_index_multiple_batches() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // First batch with high indices
+        let mut event1 = fixture.create_simple_event(1);
+        event1.client_event_index = 100;
+        let batch1 = fixture.create_simple_batch(1, vec![event1]);
+
+        // Second batch with lower indices (but this is the "last" batch)
+        let mut event2 = fixture.create_simple_event(2);
+        event2.client_event_index = 50;
+        let mut event3 = fixture.create_simple_event(3);
+        event3.client_event_index = 75;
+        let batch2 = fixture.create_simple_batch(2, vec![event2, event3]);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch1)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch2)?;
+
+        let (_, mut metadata_reader) = fixture.create_readers()?;
+        let last_local_index = fixture.engine.last_local_index(&mut metadata_reader)?;
+
+        // Should return max from LAST batch, not the global maximum
+        assert_eq!(
+            last_local_index, 75,
+            "Should return highest local index from the most recent batch only"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_last_local_index_with_partial_metadata() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Write one complete batch
+        let mut event = fixture.create_simple_event(1);
+        event.client_event_index = 42;
+        let batch = fixture.create_simple_batch(1, vec![event]);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch)?;
+        drop(event_batch_writer);
+        drop(metadata_writer);
+
+        // Append partial metadata
+        let metadata_path = fixture._temp_dir.path().join("metadata.bin");
+        let mut metadata_file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&metadata_path)?;
+
+        let partial_data = vec![0u8; METADATA_BATCH_SIZE_BYTES / 2];
+        metadata_file.write_all(&partial_data)?;
+        drop(metadata_file);
+
+        let (_, mut metadata_reader) = fixture.create_readers()?;
+        let result = fixture.engine.last_local_index(&mut metadata_reader);
+
+        assert!(
+            result.is_err(),
+            "Should return error due to partial metadata"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_metadata_queries_with_large_file() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+
+        let num_batches = 1000;
+        let mut expected_last_server_id = 0;
+        let mut expected_last_local_index = 0;
+
+        for i in 1..=num_batches {
+            let mut event = fixture.create_simple_event(i);
+            event.client_event_index = i * 10; // Make local indices predictable
+
+            let batch = fixture.create_simple_batch(i, vec![event]);
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch)?;
+
+            expected_last_server_id = i;
+            expected_last_local_index = i * 10;
+        }
+
+        let (_, mut metadata_reader) = fixture.create_readers()?;
+
+        // Test last server ID
+        let last_server_id = fixture.last_event_batch_index(&mut metadata_reader)?;
+        assert_eq!(
+            last_server_id, expected_last_server_id,
+            "Should handle large files correctly for server ID"
+        );
+
+        // Test last local index
+        let last_local_index = fixture.engine.last_local_index(&mut metadata_reader)?;
+        assert_eq!(
+            last_local_index, expected_last_local_index,
+            "Should handle large files correctly for local index"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_metadata_queries_after_seek_operations() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        let mut event1 = fixture.create_simple_event(1);
+        event1.client_event_index = 100;
+        let batch1 = fixture.create_simple_batch(10, vec![event1]);
+
+        let mut event2 = fixture.create_simple_event(2);
+        event2.client_event_index = 200;
+        let batch2 = fixture.create_simple_batch(20, vec![event2]);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch1)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch2)?;
+
+        let (_, mut metadata_reader) = fixture.create_readers()?;
+
+        // Perform some seek operations to move the cursor
+        metadata_reader.seek(SeekFrom::Start(10))?;
+        metadata_reader.seek(SeekFrom::Current(20))?;
+
+        // The methods should still work correctly regardless of cursor position
+        let last_server_id = fixture.last_event_batch_index(&mut metadata_reader)?;
+        assert_eq!(last_server_id, 20, "Should work after seek operations");
+
+        // Seek again
+        metadata_reader.seek(SeekFrom::End(-50))?;
+
+        let last_local_index = fixture.engine.last_local_index(&mut metadata_reader)?;
+        assert_eq!(
+            last_local_index, 200,
+            "Should work after multiple seek operations"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_metadata_queries_consistency() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Create batches with specific patterns
+        let batches_data = vec![
+            (1, 10), // (server_id, max_local_index)
+            (5, 25),
+            (3, 15), // Out of order server_id but should still be considered "last" in file order
+            (10, 50),
+        ];
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+
+        for (server_id, local_idx) in &batches_data {
+            let mut event = fixture.create_simple_event(*local_idx);
+            event.client_event_index = *local_idx;
+
+            let batch = fixture.create_simple_batch(*server_id, vec![event]);
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch)?;
+        }
+
+        let (_, mut metadata_reader) = fixture.create_readers()?;
+
+        // Last server ID should be from the last written batch (server_id 10)
+        let last_server_id = fixture.last_event_batch_index(&mut metadata_reader)?;
+        assert_eq!(
+            last_server_id, 10,
+            "Should return server_id from last written batch"
+        );
+
+        // Last local index should be from the last written batch (local_index 50)
+        let last_local_index = fixture.engine.last_local_index(&mut metadata_reader)?;
+        assert_eq!(
+            last_local_index, 50,
+            "Should return local_index from last written batch"
+        );
+
+        Ok(())
+    }
 }

@@ -31,10 +31,10 @@ pub mod tests {
     use tempfile::tempdir;
 
     pub struct TestFixture {
-        _temp_dir: tempfile::TempDir, // Keep temp dir alive
+        pub _temp_dir: tempfile::TempDir, // Keep temp dir alive
         event_batch_path: std::path::PathBuf,
         metadata_path: std::path::PathBuf,
-        engine: StatelessEngine,
+        pub engine: StatelessEngine,
         bloom_filter: BloomFilter,
         event_type_dedup: HashSet<u64>,
         compression_type: CompressionType,
