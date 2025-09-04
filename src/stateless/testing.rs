@@ -1,10 +1,19 @@
 #[cfg(test)]
 mod tests {
+    // Platform-specific raw file descriptor traits
+    #[cfg(unix)]
+    use std::os::fd::AsRawFd;
+    #[cfg(windows)]
+    use std::os::windows::io::AsRawHandle;
+
     use crate::stateless::stateless_destructive::StatelessDestructive;
     use crate::stateless::stateless_engine::StatelessEngine;
-    use crate::stateless::stateless_reader::StatelessReader;
+    use crate::stateless::stateless_reader::{CorruptPositions, StatelessReader};
     use crate::stateless::stateless_writer::StatelessWriter;
-    use crate::structures::constants::{BINCODE_CONFIG_FIXED, BLOOM_HASH_SEED, METADATA_BATCH_SIZE_BYTES};
+    use crate::stateless::test_fixture::tests::TestFixture;
+    use crate::structures::constants::{
+        BINCODE_CONFIG_FIXED, BLOOM_HASH_SEED, METADATA_BATCH_SIZE_BYTES,
+    };
     use crate::structures::{
         compression_type::CompressionType,
         constants::{BLOOM_BYTES, BLOOM_HASH_COUNT},
@@ -21,197 +30,366 @@ mod tests {
     use std::path::Path;
     use tempfile::tempdir;
 
-    #[test]
-    fn test_basic_write_read_flow() -> io::Result<()> {
-        // ... existing test_basic_write_read_flow code ...
-        Ok(())
-    }
-
     // 1. Basic Write Operations
 
+    /// Test writing a single event in a single batch, checking all metadata and field values
     #[test]
     fn test_single_event_batch_write() -> io::Result<()> {
-        let temp_dir = tempdir()?;
-        let event_batch_path = temp_dir.path().join("event_batches.bin");
-        let metadata_path = temp_dir.path().join("metadata.bin");
+        let mut fixture = TestFixture::new()?;
 
-        let engine = StatelessEngine::builder().build();
+        let mut event = fixture.create_simple_event(0);
+        event.client_event_index = 33;
+        let batch = fixture.create_simple_batch(0, vec![event]);
 
-        let event = EventItem::new(1, 1, 1000, 1, 1, b"test event".to_vec());
-        let batch = EventBatchItem::new(1, 1600000000000, 123456789, Some(987654321), vec![event]);
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        let metadata =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch)?;
 
-        let mut event_batch_writer = BufWriter::new(File::create(&event_batch_path)?);
-        let mut metadata_writer = BufWriter::new(File::create(&metadata_path)?);
-        let mut bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8).seed(&BLOOM_HASH_SEED).hashes(BLOOM_HASH_COUNT);
-        let mut event_type_dedup = HashSet::new();
+        assert_eq!(metadata.server_timestamp, 1600000000000);
+        assert_eq!(metadata.event_batch_index, 0);
+        assert!(metadata.uncompressed_size > 0);
+        assert!(metadata.compressed_size > 0);
+        assert!(metadata.events_crc > 0);
+        assert_eq!(metadata.compression_type, 1);
+        assert_eq!(metadata.client_id, 123456789);
+        assert_eq!(metadata.user_id, 987654321);
+        assert_eq!(metadata.min_event_timestamp, 1000);
+        assert_eq!(metadata.max_event_timestamp, 1000);
+        assert_eq!(metadata.min_event_index, 0);
+        assert_eq!(metadata.max_event_index, 0);
+        assert_eq!(metadata.min_client_event_index, 33);
+        assert_eq!(metadata.max_client_event_index, 33);
+        match metadata.event_types_data {
+            crate::structures::event_batch_metadata::EventTypesData::Direct(ref types) => {
+                assert_eq!(types.len(), 4);
+                assert_eq!(types[0], 1);
+                assert_eq!(types[1], u64::MAX);
+                assert_eq!(types[2], u64::MAX);
+                assert_eq!(types[3], u64::MAX);
+            }
+            _ => panic!("Expected direct event type storage"),
+        }
 
-        let compression_type = CompressionType::Zstd { level: 3 };
-        let metadata = engine.append_event_batch(
-            &mut event_batch_writer,
-            &mut metadata_writer,
-            &mut bloom_filter,
-            &mut event_type_dedup,
-            compression_type,
-            &batch,
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+        let read_result = fixture.read_filtered(
+            &mut event_batch_reader,
+            &mut metadata_reader,
+            &crate::structures::read_filters::ReadFilters::default(),
         )?;
 
-        assert_eq!(metadata.event_batch_index, 1);
+        assert_eq!(read_result.next_event_batch_index, None);
+        assert_eq!(read_result.event_batches.len(), 1);
+        let event_batch_0 = &read_result.event_batches[0];
+
+        assert_eq!(event_batch_0.server_timestamp, 1600000000000);
+        assert_eq!(event_batch_0.event_batch_index, 0);
+        assert_eq!(event_batch_0.client_id, 123456789);
+        assert_eq!(event_batch_0.user_id, Some(987654321));
+
+        assert_eq!(event_batch_0.events.len(), 1);
+        assert_eq!(event_batch_0.events[0].event_index, 0);
+        assert_eq!(event_batch_0.events[0].event_timestamp, 1000);
+        assert_eq!(event_batch_0.events[0].client_event_index, 33);
+        assert_eq!(event_batch_0.events[0].event_type_major, 1);
+        assert_eq!(event_batch_0.events[0].event_type_minor, 1);
+        assert_eq!(event_batch_0.events[0].event_value, b"test event".to_vec());
+
         Ok(())
     }
 
+    /// Test writing multiple events in a single batch, checking all metadata and field values
+    #[test]
+    fn test_dual_event_batch_write() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        let mut event1 = fixture.create_simple_event(0);
+        event1.client_event_index = 33;
+
+        let mut event2 = fixture.create_simple_event(1);
+        event2.client_event_index = 34;
+        event2.event_index = 1;
+        event2.event_timestamp = 1550;
+        event2.event_type_major = 20;
+        event2.event_type_minor = 23;
+        event2.event_value = b"test event 2".to_vec();
+
+        let batch = fixture.create_simple_batch(0, vec![event1, event2]);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        let metadata =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch)?;
+
+        assert_eq!(metadata.server_timestamp, 1600000000000);
+        assert_eq!(metadata.event_batch_index, 0);
+        assert!(metadata.uncompressed_size > 0);
+        assert!(metadata.compressed_size > 0);
+        assert!(metadata.events_crc > 0);
+        assert_eq!(metadata.compression_type, 1);
+        assert_eq!(metadata.client_id, 123456789);
+        assert_eq!(metadata.user_id, 987654321);
+        assert_eq!(metadata.min_event_timestamp, 1000);
+        assert_eq!(metadata.max_event_timestamp, 1550);
+        assert_eq!(metadata.min_event_index, 0);
+        assert_eq!(metadata.max_event_index, 1);
+        assert_eq!(metadata.min_client_event_index, 33);
+        assert_eq!(metadata.max_client_event_index, 34);
+        match metadata.event_types_data {
+            crate::structures::event_batch_metadata::EventTypesData::Direct(ref types) => {
+                assert_eq!(types.len(), 4);
+                assert_eq!(types[0], 1);
+                assert_eq!(types[1], 20);
+                assert_eq!(types[2], u64::MAX);
+                assert_eq!(types[3], u64::MAX);
+            }
+            _ => panic!("Expected direct event type storage"),
+        }
+
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+        let read_result = fixture.read_filtered(
+            &mut event_batch_reader,
+            &mut metadata_reader,
+            &crate::structures::read_filters::ReadFilters::default(),
+        )?;
+
+        assert_eq!(read_result.next_event_batch_index, None);
+        assert_eq!(read_result.event_batches.len(), 1);
+        let event_batch_0 = &read_result.event_batches[0];
+
+        assert_eq!(event_batch_0.server_timestamp, 1600000000000);
+        assert_eq!(event_batch_0.event_batch_index, 0);
+        assert_eq!(event_batch_0.client_id, 123456789);
+        assert_eq!(event_batch_0.user_id, Some(987654321));
+
+        assert_eq!(event_batch_0.events.len(), 2);
+        assert_eq!(event_batch_0.events[0].event_index, 0);
+        assert_eq!(event_batch_0.events[0].event_timestamp, 1000);
+        assert_eq!(event_batch_0.events[0].client_event_index, 33);
+        assert_eq!(event_batch_0.events[0].event_type_major, 1);
+        assert_eq!(event_batch_0.events[0].event_type_minor, 1);
+        assert_eq!(event_batch_0.events[0].event_value, b"test event".to_vec());
+        assert_eq!(event_batch_0.events[1].event_index, 1);
+        assert_eq!(event_batch_0.events[1].event_timestamp, 1550);
+        assert_eq!(event_batch_0.events[1].client_event_index, 34);
+        assert_eq!(event_batch_0.events[1].event_type_major, 20);
+        assert_eq!(event_batch_0.events[1].event_type_minor, 23);
+        assert_eq!(
+            event_batch_0.events[1].event_value,
+            b"test event 2".to_vec()
+        );
+
+        Ok(())
+    }
+
+    /// Test writing multiple event batches and reading them back, checking all metadata and field values
     #[test]
     fn test_multiple_event_batch_write() -> io::Result<()> {
-        let temp_dir = tempdir()?;
-        let event_batch_path = temp_dir.path().join("event_batches.bin");
-        let metadata_path = temp_dir.path().join("metadata.bin");
+        let mut fixture = TestFixture::new()?;
 
-        let engine = StatelessEngine::builder().build();
+        let mut event1 = fixture.create_simple_event(0);
+        event1.client_event_index = 33;
 
-        let event = EventItem::new(1, 1, 1000, 1, 1, b"test event".to_vec());
+        let mut event2 = fixture.create_simple_event(1);
+        event2.client_event_index = 34;
+        event2.event_index = 1;
+        event2.event_timestamp = 1550;
+        event2.event_type_major = 20;
+        event2.event_type_minor = 23;
+        event2.event_value = b"test event 2".to_vec();
 
-        let mut event_batch_writer = BufWriter::new(File::create(&event_batch_path)?);
-        let mut metadata_writer = BufWriter::new(File::create(&metadata_path)?);
-        let mut bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8).seed(&BLOOM_HASH_SEED).hashes(BLOOM_HASH_COUNT);
-        let mut event_type_dedup = HashSet::new();
+        let batch = fixture.create_simple_batch(0, vec![event1, event2]);
 
-        let compression_type = CompressionType::Zstd { level: 3 };
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        let metadata =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch)?;
 
-        let batch1 = EventBatchItem::new(
-            1,
-            1600000000000,
-            123456789,
-            Some(987654321),
-            vec![event.clone()],
-        );
-        engine.append_event_batch(
-            &mut event_batch_writer,
-            &mut metadata_writer,
-            &mut bloom_filter,
-            &mut event_type_dedup,
-            compression_type,
-            &batch1,
+        assert_eq!(metadata.server_timestamp, 1600000000000);
+        assert_eq!(metadata.event_batch_index, 0);
+        assert!(metadata.uncompressed_size > 0);
+        assert!(metadata.compressed_size > 0);
+        assert!(metadata.events_crc > 0);
+        assert_eq!(metadata.compression_type, 1);
+        assert_eq!(metadata.client_id, 123456789);
+        assert_eq!(metadata.user_id, 987654321);
+        assert_eq!(metadata.min_event_timestamp, 1000);
+        assert_eq!(metadata.max_event_timestamp, 1550);
+        assert_eq!(metadata.min_event_index, 0);
+        assert_eq!(metadata.max_event_index, 1);
+        assert_eq!(metadata.min_client_event_index, 33);
+        assert_eq!(metadata.max_client_event_index, 34);
+        match metadata.event_types_data {
+            crate::structures::event_batch_metadata::EventTypesData::Direct(ref types) => {
+                assert_eq!(types.len(), 4);
+                assert_eq!(types[0], 1);
+                assert_eq!(types[1], 20);
+                assert_eq!(types[2], u64::MAX);
+                assert_eq!(types[3], u64::MAX);
+            }
+            _ => panic!("Expected direct event type storage"),
+        }
+
+        let mut event3 = fixture.create_simple_event(2);
+        event3.client_event_index = 35;
+        event3.event_timestamp = 1999;
+        event3.event_value = b"test event 3".to_vec();
+
+        let mut batch2 = fixture.create_simple_batch(1, vec![event3]);
+        batch2.client_id = 123456790;
+        batch2.user_id = Some(987654322);
+        batch2.server_timestamp = 1600000000001;
+
+        let metadata =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch2)?;
+
+        assert_eq!(metadata.server_timestamp, 1600000000001);
+        assert_eq!(metadata.event_batch_index, 1);
+        assert!(metadata.uncompressed_size > 0);
+        assert!(metadata.compressed_size > 0);
+        assert!(metadata.events_crc > 0);
+        assert_eq!(metadata.compression_type, 1);
+        assert_eq!(metadata.client_id, 123456790);
+        assert_eq!(metadata.user_id, 987654322);
+        assert_eq!(metadata.min_event_timestamp, 1999);
+        assert_eq!(metadata.max_event_timestamp, 1999);
+        assert_eq!(metadata.min_event_index, 2);
+        assert_eq!(metadata.max_event_index, 2);
+        assert_eq!(metadata.min_client_event_index, 35);
+        assert_eq!(metadata.max_client_event_index, 35);
+        match metadata.event_types_data {
+            crate::structures::event_batch_metadata::EventTypesData::Direct(ref types) => {
+                assert_eq!(types.len(), 4);
+                assert_eq!(types[0], 1);
+                assert_eq!(types[1], u64::MAX);
+                assert_eq!(types[2], u64::MAX);
+                assert_eq!(types[3], u64::MAX);
+            }
+            _ => panic!("Expected direct event type storage"),
+        }
+
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+        let read_result = fixture.read_filtered(
+            &mut event_batch_reader,
+            &mut metadata_reader,
+            &crate::structures::read_filters::ReadFilters::default(),
         )?;
 
-        let batch2 = EventBatchItem::new(
-            2,
-            1600000000000,
-            123456789,
-            Some(987654321),
-            vec![event.clone()],
+        assert_eq!(read_result.next_event_batch_index, None);
+        assert_eq!(read_result.event_batches.len(), 2);
+        let event_batch_0 = &read_result.event_batches[0];
+
+        assert_eq!(event_batch_0.server_timestamp, 1600000000000);
+        assert_eq!(event_batch_0.event_batch_index, 0);
+        assert_eq!(event_batch_0.client_id, 123456789);
+        assert_eq!(event_batch_0.user_id, Some(987654321));
+
+        assert_eq!(event_batch_0.events.len(), 2);
+        assert_eq!(event_batch_0.events[0].event_index, 0);
+        assert_eq!(event_batch_0.events[0].event_timestamp, 1000);
+        assert_eq!(event_batch_0.events[0].client_event_index, 33);
+        assert_eq!(event_batch_0.events[0].event_type_major, 1);
+        assert_eq!(event_batch_0.events[0].event_type_minor, 1);
+        assert_eq!(event_batch_0.events[0].event_value, b"test event".to_vec());
+        assert_eq!(event_batch_0.events[1].event_index, 1);
+        assert_eq!(event_batch_0.events[1].event_timestamp, 1550);
+        assert_eq!(event_batch_0.events[1].client_event_index, 34);
+        assert_eq!(event_batch_0.events[1].event_type_major, 20);
+        assert_eq!(event_batch_0.events[1].event_type_minor, 23);
+        assert_eq!(
+            event_batch_0.events[1].event_value,
+            b"test event 2".to_vec()
         );
-        engine.append_event_batch(
-            &mut event_batch_writer,
-            &mut metadata_writer,
-            &mut bloom_filter,
-            &mut event_type_dedup,
-            compression_type,
-            &batch2,
-        )?;
 
-        let batch3 = EventBatchItem::new(
-            3,
-            1600000000000,
-            123456789,
-            Some(987654321),
-            vec![event.clone()],
+        let event_batch_1 = &read_result.event_batches[1];
+        assert_eq!(event_batch_1.server_timestamp, 1600000000001);
+        assert_eq!(event_batch_1.event_batch_index, 1);
+        assert_eq!(event_batch_1.client_id, 123456790);
+        assert_eq!(event_batch_1.user_id, Some(987654322));
+
+        assert_eq!(event_batch_1.events.len(), 1);
+        assert_eq!(event_batch_1.events[0].event_index, 2);
+        assert_eq!(event_batch_1.events[0].event_timestamp, 1999);
+        assert_eq!(event_batch_1.events[0].client_event_index, 35);
+        assert_eq!(event_batch_1.events[0].event_type_major, 1);
+        assert_eq!(event_batch_1.events[0].event_type_minor, 1);
+        assert_eq!(
+            event_batch_1.events[0].event_value,
+            b"test event 3".to_vec()
         );
-        engine.append_event_batch(
-            &mut event_batch_writer,
-            &mut metadata_writer,
-            &mut bloom_filter,
-            &mut event_type_dedup,
-            compression_type,
-            &batch3,
-        )?;
-
-        event_batch_writer.flush()?;
-        metadata_writer.flush()?;
-
-        let mut metadata_reader = BufReader::new(File::open(&metadata_path)?);
-        let last_event_batch_index = engine.last_event_batch_index(&mut metadata_reader)?;
-        assert_eq!(last_event_batch_index, 3, "Last server ID should be 3");
 
         Ok(())
     }
 
+    /// Test that writing an empty event batch is rejected and does not create the file - read also should fail
     #[test]
     fn test_empty_event_batch_rejection() -> io::Result<()> {
-        let temp_dir = tempdir()?;
-        let event_batch_path = temp_dir.path().join("event_batches.bin");
-        let metadata_path = temp_dir.path().join("metadata.bin");
+        let mut fixture = TestFixture::new()?;
 
-        let engine = StatelessEngine::builder().build();
+        let batch = fixture.create_simple_batch(0, vec![]);
 
-        let batch = EventBatchItem::new(1, 1600000000000, 123456789, Some(987654321), vec![]);
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        let write_result =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch);
 
-        let mut event_batch_writer = BufWriter::new(File::create(&event_batch_path)?);
-        let mut metadata_writer = BufWriter::new(File::create(&metadata_path)?);
-        let mut bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8).seed(&BLOOM_HASH_SEED).hashes(BLOOM_HASH_COUNT);
-        let mut event_type_dedup = HashSet::new();
+        assert!(write_result.is_err());
 
-        let compression_type = CompressionType::Zstd { level: 3 };
-
-        let result = engine.append_event_batch(
-            &mut event_batch_writer,
-            &mut metadata_writer,
-            &mut bloom_filter,
-            &mut event_type_dedup,
-            compression_type,
-            &batch,
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+        let read_result = fixture.read_filtered(
+            &mut event_batch_reader,
+            &mut metadata_reader,
+            &crate::structures::read_filters::ReadFilters::default(),
         );
+        assert!(read_result.is_err());
 
-        assert!(result.is_err());
         Ok(())
     }
 
     #[test]
     fn test_large_event_batch_write() -> io::Result<()> {
-        let temp_dir = tempdir()?;
-        let event_batch_path = temp_dir.path().join("event_batches.bin");
-        let metadata_path = temp_dir.path().join("metadata.bin");
+        let mut fixture = TestFixture::new()?;
 
-        let engine = StatelessEngine::builder().build();
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
 
-        let mut events = Vec::new();
-        for i in 0..1001 {
-            let event = EventItem::new(i, i, 1000 + i as u64, 1, 1, b"test event".to_vec());
-            events.push(event);
+        let num_batches = 2001;
+        let num_events_per_batch = 501;
+
+        for batch_index in 0..num_batches {
+            let mut events = Vec::new();
+            for event_index_in_batch in 0..num_events_per_batch {
+                let global_event_index =
+                    (batch_index * num_events_per_batch + event_index_in_batch) as u64;
+                let event = fixture.create_simple_event(global_event_index);
+                events.push(event);
+            }
+
+            let batch = fixture.create_simple_batch(batch_index as u64, events);
+
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch)?;
         }
-        let batch = EventBatchItem::new(1, 1600000000000, 123456789, Some(987654321), events);
 
-        let mut event_batch_writer = BufWriter::new(File::create(&event_batch_path)?);
-        let mut metadata_writer = BufWriter::new(File::create(&metadata_path)?);
-        let mut bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8).seed(&BLOOM_HASH_SEED).hashes(BLOOM_HASH_COUNT);
-        let mut event_type_dedup = HashSet::new();
-
-        let compression_type = CompressionType::Zstd { level: 3 };
-        let metadata = engine.append_event_batch(
-            &mut event_batch_writer,
-            &mut metadata_writer,
-            &mut bloom_filter,
-            &mut event_type_dedup,
-            compression_type,
-            &batch,
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+        let read_result = fixture.read_filtered(
+            &mut event_batch_reader,
+            &mut metadata_reader,
+            &crate::structures::read_filters::ReadFilters::default(),
         )?;
 
-        assert!(metadata.compressed_size > 0);
+        assert_eq!(read_result.event_batches.len(), num_batches);
 
-        let mut event_batch_reader = BufReader::new(File::open(&event_batch_path)?);
-        let mut metadata_reader = BufReader::new(File::open(&metadata_path)?);
+        let number_events = read_result
+            .event_batches
+            .iter()
+            .map(|b| b.events.len())
+            .sum::<usize>();
 
-        let corruption = engine.detect_corruption(&mut event_batch_reader, &mut metadata_reader)?;
-        assert!(corruption.is_none());
+        assert_eq!(number_events, num_batches * num_events_per_batch);
 
         Ok(())
     }
 
     #[test]
     fn test_unicode_and_binary_data_handling() -> io::Result<()> {
-        let temp_dir = tempdir()?;
-        let event_batch_path = temp_dir.path().join("event_batches.bin");
-        let metadata_path = temp_dir.path().join("metadata.bin");
-
-        let engine = StatelessEngine::builder().build();
+        let mut fixture = TestFixture::new()?;
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
 
         let unicode_data = "你好世界".to_string().into_bytes();
         let binary_data = vec![0u8, 1u8, 2u8, 255u8];
@@ -227,28 +405,11 @@ mod tests {
             vec![event1.clone(), event2.clone()],
         );
 
-        let mut event_batch_writer = BufWriter::new(File::create(&event_batch_path)?);
-        let mut metadata_writer = BufWriter::new(File::create(&metadata_path)?);
-        let mut bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8).seed(&BLOOM_HASH_SEED).hashes(BLOOM_HASH_COUNT);
-        let mut event_type_dedup = HashSet::new();
-
-        let compression_type = CompressionType::Zstd { level: 3 };
-
-        engine.append_event_batch(
-            &mut event_batch_writer,
-            &mut metadata_writer,
-            &mut bloom_filter,
-            &mut event_type_dedup,
-            compression_type,
-            &batch,
-        )?;
-
-        let mut event_batch_reader = File::open(&event_batch_path)?;
-        let mut metadata_reader = File::open(&metadata_path)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch)?;
 
         let filters = ReadFilters::new(1);
         let read_result =
-            engine.read_filtered(&mut event_batch_reader, &mut metadata_reader, &filters)?;
+            fixture.read_filtered(&mut event_batch_reader, &mut metadata_reader, &filters)?;
 
         assert_eq!(read_result.event_batches.len(), 1);
         let read_batch = &read_result.event_batches[0];
@@ -288,8 +449,9 @@ mod tests {
         for compression_type in &compression_types {
             let mut event_batch_writer = BufWriter::new(File::create(&event_batch_path)?);
             let mut metadata_writer = BufWriter::new(File::create(&metadata_path)?);
-            let mut bloom_filter =
-                BloomFilter::with_num_bits(BLOOM_BYTES * 8).seed(&BLOOM_HASH_SEED).hashes(BLOOM_HASH_COUNT);
+            let mut bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8)
+                .seed(&BLOOM_HASH_SEED)
+                .hashes(BLOOM_HASH_COUNT);
             let mut event_type_dedup = HashSet::new();
 
             let metadata = engine.append_event_batch(
@@ -334,8 +496,9 @@ mod tests {
             for level in &levels {
                 let mut event_batch_writer = BufWriter::new(File::create(&event_batch_path)?);
                 let mut metadata_writer = BufWriter::new(File::create(&metadata_path)?);
-                let mut bloom_filter =
-                    BloomFilter::with_num_bits(BLOOM_BYTES * 8).seed(&BLOOM_HASH_SEED).hashes(BLOOM_HASH_COUNT);
+                let mut bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8)
+                    .seed(&BLOOM_HASH_SEED)
+                    .hashes(BLOOM_HASH_COUNT);
                 let mut event_type_dedup = HashSet::new();
 
                 let compression_type_with_level = match compression_type {
@@ -386,8 +549,9 @@ mod tests {
         for compression_type in &compression_types {
             let mut event_batch_writer = BufWriter::new(File::create(&event_batch_path)?);
             let mut metadata_writer = BufWriter::new(File::create(&metadata_path)?);
-            let mut bloom_filter =
-                BloomFilter::with_num_bits(BLOOM_BYTES * 8).seed(&BLOOM_HASH_SEED).hashes(BLOOM_HASH_COUNT);
+            let mut bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8)
+                .seed(&BLOOM_HASH_SEED)
+                .hashes(BLOOM_HASH_COUNT);
             let mut event_type_dedup = HashSet::new();
 
             let metadata = engine.append_event_batch(
@@ -407,64 +571,12 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_incompressible_data() -> io::Result<()> {
-        let temp_dir = tempdir()?;
-        let event_batch_path = temp_dir.path().join("event_batches.bin");
-        let metadata_path = temp_dir.path().join("metadata.bin");
-
-        let engine = StatelessEngine::builder().build();
-
-        let mut rng = rand::thread_rng();
-
-        // Generate 1024 random u8 values
-        let mut rng = rand::thread_rng();
-        let mut random_data = vec![0u8; 1024];
-
-        rng.fill(&mut random_data[..]);
-        let event = EventItem::new(1, 1, 1000, 1, 1, random_data);
-        let batch = EventBatchItem::new(1, 1600000000000, 123456789, Some(987654321), vec![event]);
-
-        let compression_types = vec![
-            CompressionType::None,
-            CompressionType::Zstd { level: 3 },
-            CompressionType::Snappy,
-            CompressionType::Brotli { level: 3 },
-            CompressionType::Gzip { level: 3 },
-        ];
-
-        for compression_type in &compression_types {
-            let mut event_batch_writer = BufWriter::new(File::create(&event_batch_path)?);
-            let mut metadata_writer = BufWriter::new(File::create(&metadata_path)?);
-            let mut bloom_filter =
-                BloomFilter::with_num_bits(BLOOM_BYTES * 8).seed(&BLOOM_HASH_SEED).hashes(BLOOM_HASH_COUNT);
-            let mut event_type_dedup = HashSet::new();
-
-            let metadata = engine.append_event_batch(
-                &mut event_batch_writer,
-                &mut metadata_writer,
-                &mut bloom_filter,
-                &mut event_type_dedup,
-                *compression_type,
-                &batch,
-            )?;
-
-            // Compressed size should be close to uncompressed size
-            assert!(metadata.compressed_size >= 750);
-        }
-
-        Ok(())
-    }
-
     // 3. Event Type Handling
 
     #[test]
     fn test_direct_event_type_storage() -> io::Result<()> {
-        let temp_dir = tempdir()?;
-        let event_batch_path = temp_dir.path().join("event_batches.bin");
-        let metadata_path = temp_dir.path().join("metadata.bin");
-
-        let engine = StatelessEngine::builder().build();
+        let mut fixture = TestFixture::new()?;
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
 
         let mut events = Vec::new();
         for i in 1..=4 {
@@ -473,21 +585,8 @@ mod tests {
         }
         let batch = EventBatchItem::new(1, 1600000000000, 123456789, Some(987654321), events);
 
-        let mut event_batch_writer = BufWriter::new(File::create(&event_batch_path)?);
-        let mut metadata_writer = BufWriter::new(File::create(&metadata_path)?);
-        let mut bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8).seed(&BLOOM_HASH_SEED).hashes(BLOOM_HASH_COUNT);
-        let mut event_type_dedup = HashSet::new();
-
-        let compression_type = CompressionType::Zstd { level: 3 };
-
-        let metadata = engine.append_event_batch(
-            &mut event_batch_writer,
-            &mut metadata_writer,
-            &mut bloom_filter,
-            &mut event_type_dedup,
-            compression_type,
-            &batch,
-        )?;
+        let metadata =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch)?;
 
         match metadata.event_types_data {
             crate::structures::event_batch_metadata::EventTypesData::Direct(_) => {
@@ -501,11 +600,8 @@ mod tests {
 
     #[test]
     fn test_bloom_filter_storage() -> io::Result<()> {
-        let temp_dir = tempdir()?;
-        let event_batch_path = temp_dir.path().join("event_batches.bin");
-        let metadata_path = temp_dir.path().join("metadata.bin");
-
-        let engine = StatelessEngine::builder().build();
+        let mut fixture = TestFixture::new()?;
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
 
         let mut events = Vec::new();
         for i in 1..=5 {
@@ -514,21 +610,8 @@ mod tests {
         }
         let batch = EventBatchItem::new(1, 1600000000000, 123456789, Some(987654321), events);
 
-        let mut event_batch_writer = BufWriter::new(File::create(&event_batch_path)?);
-        let mut metadata_writer = BufWriter::new(File::create(&metadata_path)?);
-        let mut bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8).seed(&BLOOM_HASH_SEED).hashes(BLOOM_HASH_COUNT);
-        let mut event_type_dedup = HashSet::new();
-
-        let compression_type = CompressionType::Zstd { level: 3 };
-
-        let metadata = engine.append_event_batch(
-            &mut event_batch_writer,
-            &mut metadata_writer,
-            &mut bloom_filter,
-            &mut event_type_dedup,
-            compression_type,
-            &batch,
-        )?;
+        let metadata =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch)?;
 
         match metadata.event_types_data {
             crate::structures::event_batch_metadata::EventTypesData::Bloom(_) => {
@@ -542,102 +625,30 @@ mod tests {
 
     #[test]
     fn test_event_type_deduplication() -> io::Result<()> {
-        let temp_dir = tempdir()?;
-        let event_batch_path = temp_dir.path().join("event_batches.bin");
-        let metadata_path = temp_dir.path().join("metadata.bin");
-
-        let engine = StatelessEngine::builder().build();
+        let mut fixture = TestFixture::new()?;
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        let mut event_type_dedup = HashSet::new();
 
         let events = vec![
             EventItem::new(1, 1, 1000, 1, 1, b"test event".to_vec()),
             EventItem::new(2, 2, 1000, 1, 1, b"test event".to_vec()),
             EventItem::new(3, 3, 1000, 2, 1, b"test event".to_vec()),
+            EventItem::new(4, 4, 1000, 2, 1, b"test event".to_vec()),
+            EventItem::new(5, 5, 1000, 4, 1, b"test event".to_vec()),
+            EventItem::new(6, 6, 1000, 5, 1, b"test event".to_vec()),
+            EventItem::new(7, 7, 1000, 6, 1, b"test event".to_vec()),
         ];
         let batch = EventBatchItem::new(1, 1600000000000, 123456789, Some(987654321), events);
 
-        let mut event_batch_writer = BufWriter::new(File::create(&event_batch_path)?);
-        let mut metadata_writer = BufWriter::new(File::create(&metadata_path)?);
-        let mut bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8).seed(&BLOOM_HASH_SEED).hashes(BLOOM_HASH_COUNT);
-        let mut event_type_dedup = HashSet::new();
-
-        let compression_type = CompressionType::Zstd { level: 3 };
-
-        engine.append_event_batch(
+        fixture.write_batch_with_dedup(
             &mut event_batch_writer,
             &mut metadata_writer,
-            &mut bloom_filter,
             &mut event_type_dedup,
-            compression_type,
             &batch,
         )?;
 
-        // Check size of the event_type_dedup is 2 since there is only two unique types
-        assert_eq!(event_type_dedup.len(), 0);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_event_type_boundary_testing() -> io::Result<()> {
-        let temp_dir = tempdir()?;
-        let event_batch_path = temp_dir.path().join("event_batches.bin");
-        let metadata_path = temp_dir.path().join("metadata.bin");
-
-        let engine = StatelessEngine::builder().build();
-
-        // Test with exactly 4 event types
-        let mut events1 = Vec::new();
-        for i in 1..=4 {
-            let event = EventItem::new(i, i, 1000, i, 1, b"test event".to_vec());
-            events1.push(event);
-        }
-        let batch1 = EventBatchItem::new(1, 1600000000000, 123456789, Some(987654321), events1);
-
-        let mut event_batch_writer = BufWriter::new(File::create(&event_batch_path)?);
-        let mut metadata_writer = BufWriter::new(File::create(&metadata_path)?);
-        let mut bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8).seed(&BLOOM_HASH_SEED).hashes(BLOOM_HASH_COUNT);
-        let mut event_type_dedup = HashSet::new();
-
-        let compression_type = CompressionType::Zstd { level: 3 };
-        let metadata1 = engine.append_event_batch(
-            &mut event_batch_writer,
-            &mut metadata_writer,
-            &mut bloom_filter,
-            &mut event_type_dedup,
-            compression_type,
-            &batch1,
-        )?;
-
-        match metadata1.event_types_data {
-            crate::structures::event_batch_metadata::EventTypesData::Direct(_) => {
-                // Success, direct storage used
-            }
-            _ => panic!("Expected direct event type storage"),
-        }
-
-        // Add one more event with a new type
-        let mut events2 = Vec::new();
-        for i in 1..=5 {
-            let event = EventItem::new(i, i, 1000, i, 1, b"test event".to_vec());
-            events2.push(event);
-        }
-        let batch2 = EventBatchItem::new(2, 1600000000000, 123456789, Some(987654321), events2);
-
-        let metadata2 = engine.append_event_batch(
-            &mut event_batch_writer,
-            &mut metadata_writer,
-            &mut bloom_filter,
-            &mut event_type_dedup,
-            compression_type,
-            &batch2,
-        )?;
-
-        match metadata2.event_types_data {
-            crate::structures::event_batch_metadata::EventTypesData::Bloom(_) => {
-                // Success, bloom filter used
-            }
-            _ => panic!("Expected bloom filter storage"),
-        }
+        // Check size of the event_type_dedup is 5 since there is only two unique types
+        assert_eq!(event_type_dedup.len(), 5);
 
         Ok(())
     }
@@ -645,11 +656,7 @@ mod tests {
     // 4. Basic Read Operations
     #[test]
     fn test_simple_read_all() -> io::Result<()> {
-        let temp_dir = tempdir()?;
-        let event_batch_path = temp_dir.path().join("event_batches.bin");
-        let metadata_path = temp_dir.path().join("metadata.bin");
-
-        let engine = StatelessEngine::builder().build();
+        let mut fixture = TestFixture::new()?;
 
         let event = EventItem::new(1, 1, 1000, 1, 1, b"test event".to_vec());
         let batch1 = EventBatchItem::new(
@@ -674,44 +681,17 @@ mod tests {
             vec![event.clone()],
         );
 
-        let mut event_batch_writer = BufWriter::new(File::create(&event_batch_path)?);
-        let mut metadata_writer = BufWriter::new(File::create(&metadata_path)?);
-        let mut bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8).seed(&BLOOM_HASH_SEED).hashes(BLOOM_HASH_COUNT);
-        let mut event_type_dedup = HashSet::new();
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
 
-        let compression_type = CompressionType::Zstd { level: 3 };
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch1)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch2)?;
+        fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch3)?;
 
-        engine.append_event_batch(
-            &mut event_batch_writer,
-            &mut metadata_writer,
-            &mut bloom_filter,
-            &mut event_type_dedup,
-            compression_type,
-            &batch1,
-        )?;
-        engine.append_event_batch(
-            &mut event_batch_writer,
-            &mut metadata_writer,
-            &mut bloom_filter,
-            &mut event_type_dedup,
-            compression_type,
-            &batch2,
-        )?;
-        engine.append_event_batch(
-            &mut event_batch_writer,
-            &mut metadata_writer,
-            &mut bloom_filter,
-            &mut event_type_dedup,
-            compression_type,
-            &batch3,
-        )?;
-
-        let mut event_batch_reader = File::open(&event_batch_path)?;
-        let mut metadata_reader = File::open(&metadata_path)?;
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
 
         let filters = ReadFilters::new(1);
         let read_result =
-            engine.read_filtered(&mut event_batch_reader, &mut metadata_reader, &filters)?;
+            fixture.read_filtered(&mut event_batch_reader, &mut metadata_reader, &filters)?;
 
         assert_eq!(read_result.event_batches.len(), 3);
         assert_eq!(read_result.event_batches[0].event_batch_index, 1);
@@ -723,592 +703,269 @@ mod tests {
     }
 
     #[test]
-    fn test_read_from_specific_event_batch_index() -> io::Result<()> {
-        let temp_dir = tempdir()?;
-        let event_batch_path = temp_dir.path().join("event_batches.bin");
-        let metadata_path = temp_dir.path().join("metadata.bin");
+    fn test_read_from_specific_server_id() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+        let batches = fixture.generate_test_batches();
 
-        let engine = StatelessEngine::builder().build();
+        let filters = ReadFilters::new(3); // Read from server_id 3
+        let read_result = fixture.write_and_read(&batches, &filters)?;
 
-        let event = EventItem::new(1, 1, 1000, 1, 1, b"test event".to_vec());
-
-        let batch1 = EventBatchItem::new(1, 1600000000000, 123456789, Some(987654321), vec![event.clone()]);
-        let batch2 = EventBatchItem::new(2, 1600000001000, 123456789, Some(987654321), vec![event.clone()]);
-        let batch3 = EventBatchItem::new(3, 1600000002000, 123456789, Some(987654321), vec![event]);
-
-        let mut event_batch_writer = BufWriter::new(File::create(&event_batch_path)?);
-        let mut metadata_writer = BufWriter::new(File::create(&metadata_path)?);
-        let mut bloom_filter = BloomFilter::with_num_bits(32 * 8).hashes(4);
-        let mut event_type_dedup = HashSet::new();
-        let compression_type = CompressionType::Zstd { level: 3 };
-
-        engine.append_event_batch(&mut event_batch_writer, &mut metadata_writer, &mut bloom_filter, &mut event_type_dedup, compression_type, &batch1)?;
-        engine.append_event_batch(&mut event_batch_writer, &mut metadata_writer, &mut bloom_filter, &mut event_type_dedup, compression_type, &batch2)?;
-        engine.append_event_batch(&mut event_batch_writer, &mut metadata_writer, &mut bloom_filter, &mut event_type_dedup, compression_type, &batch3)?;
-
-        let mut event_batch_reader = File::open(&event_batch_path)?;
-        let mut metadata_reader = File::open(&metadata_path)?;
-
-        let filters = ReadFilters::new(2); // Start from event_batch_index 2
-        let read_result = engine.read_filtered(&mut event_batch_reader, &mut metadata_reader, &filters)?;
-
-        assert_eq!(read_result.event_batches.len(), 2);
-        assert_eq!(read_result.event_batches[0].event_batch_index, 2);
-        assert_eq!(read_result.event_batches[1].event_batch_index, 3);
-        assert_eq!(read_result.next_event_batch_index, None);
-
+        assert_eq!(read_result.event_batches.len(), 6); // Batches 3 to 8
+        assert_eq!(read_result.event_batches[0].event_batch_index, 3);
         Ok(())
     }
 
     #[test]
-    fn test_read_non_existent_event_batch_index_future() -> io::Result<()> {
-        let temp_dir = tempdir()?;
-        let event_batch_path = temp_dir.path().join("event_batches.bin");
-        let metadata_path = temp_dir.path().join("metadata.bin");
+    fn test_read_non_existent_server_id_future() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+        let batches = fixture.generate_test_batches();
 
-        let engine = StatelessEngine::builder().build();
-
-        let event = EventItem::new(1, 1, 1000, 1, 1, b"test event".to_vec());
-        let batch = EventBatchItem::new(1, 1600000000000, 123456789, Some(987654321), vec![event.clone()]);
-
-        let mut event_batch_writer = File::create(&event_batch_path)?;
-        let mut metadata_writer = File::create(&metadata_path)?;
-        let mut bloom_filter = BloomFilter::with_num_bits(32 * 8).hashes(4);
-        let mut event_type_dedup = HashSet::new();
-        let compression_type = CompressionType::Zstd { level: 3 };
-
-        engine.append_event_batch(&mut event_batch_writer, &mut metadata_writer, &mut bloom_filter, &mut event_type_dedup, compression_type, &batch)?;
-
-        let mut event_batch_reader = File::open(&event_batch_path)?;
-        let mut metadata_reader = File::open(&metadata_path)?;
-
-        let filters = ReadFilters::new(10); // Request event_batch_index that hasn't been written yet
-        let read_result = engine.read_filtered(&mut event_batch_reader, &mut metadata_reader, &filters)?;
+        let filters = ReadFilters::new(10); // Read from server_id 10, which doesn't exist
+        let read_result = fixture.write_and_read(&batches, &filters)?;
 
         assert_eq!(read_result.event_batches.len(), 0);
         assert_eq!(read_result.next_event_batch_index, None);
-
-        Ok(())
-    }
-
-    //CHECKED OK
-    #[test]
-    fn test_read_non_existent_event_batch_index_past_trimmed() -> io::Result<()> {
-        let temp_dir = tempdir()?;
-        let event_batch_path = temp_dir.path().join("event_batches.bin");
-        let metadata_path = temp_dir.path().join("metadata.bin");
-
-        let engine = StatelessEngine::builder().build();
-
-        let event = EventItem::new(1, 1, 1000, 1, 1, b"test event".to_vec());
-
-        let batch1 = EventBatchItem::new(1, 1600000000000, 123456789, Some(987654321), vec![event.clone()]);
-        let batch2 = EventBatchItem::new(2, 1600000001000, 123456789, Some(987654321), vec![event.clone()]);
-        let batch3 = EventBatchItem::new(3, 1600000002000, 123456789, Some(987654321), vec![event.clone()]);
-
-        let mut event_batch_writer = BufWriter::new(File::create(&event_batch_path)?);
-        let mut metadata_writer = BufWriter::new(File::create(&metadata_path)?);
-        let mut bloom_filter = BloomFilter::with_num_bits(32 * 8).hashes(4);
-        let mut event_type_dedup = HashSet::new();
-        let compression_type = CompressionType::Zstd { level: 3 };
-
-        engine.append_event_batch(&mut event_batch_writer, &mut metadata_writer, &mut bloom_filter, &mut event_type_dedup, compression_type, &batch1)?;
-        let event_batch_keep_from_position = std::fs::metadata(&event_batch_path)?.len();
-        let metadata_keep_from_position = std::fs::metadata(&metadata_path)?.len();
-        engine.append_event_batch(&mut event_batch_writer, &mut metadata_writer, &mut bloom_filter, &mut event_type_dedup, compression_type, &batch2)?;
-        engine.append_event_batch(&mut event_batch_writer, &mut metadata_writer, &mut bloom_filter, &mut event_type_dedup, compression_type, &batch3)?;
-
-        // Assume trim has happened
-        let mut event_batch_reader = File::open(&event_batch_path)?;
-        let mut metadata_reader = File::open(&metadata_path)?;
-
-        engine.trim_start(&mut event_batch_reader, event_batch_keep_from_position, &event_batch_path.to_str().unwrap(), &mut metadata_reader, metadata_keep_from_position, &metadata_path.to_str().unwrap())?;
-
-        let mut event_batch_reader = File::open(&event_batch_path)?;
-        let mut metadata_reader = File::open(&metadata_path)?;
-
-        let filters = ReadFilters::new(1); // Request trimmed event_batch_index
-        let result = engine.read_filtered(&mut event_batch_reader, &mut metadata_reader, &filters);
-
-        assert!(result.is_err(), "Expected error for trimmed event_batch_index");
-
         Ok(())
     }
 
     #[test]
-    fn test_event_batch_index_range_filtering() -> io::Result<()> {
-        let temp_dir = tempdir()?;
-        let event_batch_path = temp_dir.path().join("event_batches.bin");
-        let metadata_path = temp_dir.path().join("metadata.bin");
+    fn test_server_id_range_filtering() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+        let batches = fixture.generate_test_batches();
 
-        let engine = StatelessEngine::builder().build();
+        let mut filters = ReadFilters::new(3);
+        filters.to_event_batch_index = Some(7); // Read from 3 to 7
+        let read_result = fixture.write_and_read(&batches, &filters)?;
 
-        let event = EventItem::new(1, 1, 1000, 1, 1, b"test event".to_vec());
-
-        // Write 10 batches
-        let mut event_batch_writer = File::create(&event_batch_path)?;
-        let mut metadata_writer = File::create(&metadata_path)?;
-        let mut bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8).seed(&BLOOM_HASH_SEED).hashes(BLOOM_HASH_COUNT);
-        let mut event_type_dedup = HashSet::new();
-        let compression_type = CompressionType::Zstd { level: 3 };
-
-        for i in 1..=10 {
-            let batch = EventBatchItem::new(i, 1600000000000 + i, 123456789, Some(987654321), vec![event.clone()]);
-            engine.append_event_batch(&mut event_batch_writer, &mut metadata_writer, &mut bloom_filter, &mut event_type_dedup, compression_type, &batch)?;
-        }
-
-        // Read from event_batch_index 3 to 7
-        let mut event_batch_reader = File::open(&event_batch_path)?;
-        let mut metadata_reader = File::open(&metadata_path)?;
-
-        let filters = ReadFilters::new(3).to_event_batch_index(7);
-        let read_result = engine.read_filtered(&mut event_batch_reader, &mut metadata_reader, &filters)?;
-
-        assert_eq!(read_result.event_batches.len(), 5);
-        for (i, batch) in read_result.event_batches.iter().enumerate() {
-            assert_eq!(batch.event_batch_index, (i + 3) as u64);
-        }
-        assert_eq!(read_result.next_event_batch_index, None);
-
+        assert_eq!(read_result.event_batches.len(), 5); // Batches 3, 4, 5, 6, 7
+        assert_eq!(read_result.event_batches[0].event_batch_index, 3);
+        assert_eq!(
+            read_result.event_batches.last().unwrap().event_batch_index,
+            7
+        );
         Ok(())
     }
 
     #[test]
     fn test_client_id_filtering_include() -> io::Result<()> {
-        let temp_dir = tempdir()?;
-        let event_batch_path = temp_dir.path().join("event_batches.bin");
-        let metadata_path = temp_dir.path().join("metadata.bin");
+        let mut fixture = TestFixture::new()?;
+        let batches = fixture.generate_test_batches();
 
-        let engine = StatelessEngine::builder().build();
+        let mut filters = ReadFilters::new(1);
+        filters.include_client_id = Some(12345); // Include client ID from batch 3
+        let read_result = fixture.write_and_read(&batches, &filters)?;
 
-        let event = EventItem::new(1, 1, 1000, 1, 1, b"test event".to_vec());
-
-        let client_id_1: u128 = 12345678901234567890123456789012;
-        let client_id_2: u128 = 98765432109876543210987654321098;
-
-        let batch1 = EventBatchItem::new(1, 1600000000000, client_id_1, Some(987654321), vec![event.clone()]);
-        let batch2 = EventBatchItem::new(2, 1600000001000, client_id_2, Some(987654321), vec![event.clone()]);
-        let batch3 = EventBatchItem::new(3, 1600000002000, client_id_1, Some(987654321), vec![event]);
-
-        let mut event_batch_writer = File::create(&event_batch_path)?;
-        let mut metadata_writer = File::create(&metadata_path)?;
-        let mut bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8).seed(&BLOOM_HASH_SEED).hashes(BLOOM_HASH_COUNT);
-        let mut event_type_dedup = HashSet::new();
-        let compression_type = CompressionType::Zstd { level: 3 };
-
-        engine.append_event_batch(&mut event_batch_writer, &mut metadata_writer, &mut bloom_filter, &mut event_type_dedup, compression_type, &batch1)?;
-        engine.append_event_batch(&mut event_batch_writer, &mut metadata_writer, &mut bloom_filter, &mut event_type_dedup, compression_type, &batch2)?;
-        engine.append_event_batch(&mut event_batch_writer, &mut metadata_writer, &mut bloom_filter, &mut event_type_dedup, compression_type, &batch3)?;
-
-        let mut event_batch_reader = File::open(&event_batch_path)?;
-        let mut metadata_reader = File::open(&metadata_path)?;
-
-        let filters = ReadFilters::new(1).include_client_id(client_id_1);
-        let read_result = engine.read_filtered(&mut event_batch_reader, &mut metadata_reader, &filters)?;
-
-        assert_eq!(read_result.event_batches.len(), 2);
-        assert_eq!(read_result.event_batches[0].client_id, client_id_1);
-        assert_eq!(read_result.event_batches[1].client_id, client_id_1);
-        assert_eq!(read_result.next_event_batch_index, None);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_user_id_filtering_include() -> io::Result<()> {
-        let temp_dir = tempdir()?;
-        let event_batch_path = temp_dir.path().join("event_batches.bin");
-        let metadata_path = temp_dir.path().join("metadata.bin");
-
-        let engine = StatelessEngine::builder().build();
-
-        let event = EventItem::new(1, 1, 1000, 1, 1, b"test event".to_vec());
-
-        let user_id_1: u128 = 12345678901234567890123456789012;
-        let user_id_2: u128 = 98765432109876543210987654321098;
-
-        let batch1 = EventBatchItem::new(1, 1600000000000, 123456789, Some(user_id_1), vec![event.clone()]);
-        let batch2 = EventBatchItem::new(2, 1600000001000, 123456789, Some(user_id_2), vec![event.clone()]);
-        let batch3 = EventBatchItem::new(3, 1600000002000, 123456789, None, vec![event]);
-
-        let mut event_batch_writer = File::create(&event_batch_path)?;
-        let mut metadata_writer = File::create(&metadata_path)?;
-        let mut bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8).seed(&BLOOM_HASH_SEED).hashes(BLOOM_HASH_COUNT);
-        let mut event_type_dedup = HashSet::new();
-        let compression_type = CompressionType::Zstd { level: 3 };
-
-        engine.append_event_batch(&mut event_batch_writer, &mut metadata_writer, &mut bloom_filter, &mut event_type_dedup, compression_type, &batch1)?;
-        engine.append_event_batch(&mut event_batch_writer, &mut metadata_writer, &mut bloom_filter, &mut event_type_dedup, compression_type, &batch2)?;
-        engine.append_event_batch(&mut event_batch_writer, &mut metadata_writer, &mut bloom_filter, &mut event_type_dedup, compression_type, &batch3)?;
-
-        let mut event_batch_reader = File::open(&event_batch_path)?;
-        let mut metadata_reader = File::open(&metadata_path)?;
-
-        let filters = ReadFilters::new(1).include_user_id(user_id_1);
-        let read_result = engine.read_filtered(&mut event_batch_reader, &mut metadata_reader, &filters)?;
-
-        assert_eq!(read_result.event_batches.len(), 1);
-        assert_eq!(read_result.event_batches[0].user_id, Some(user_id_1));
-        assert_eq!(read_result.next_event_batch_index, None);
-
+        assert_eq!(read_result.event_batches.len(), 1); // Only batch 3 matches
+        assert_eq!(read_result.event_batches[0].client_id, 12345);
         Ok(())
     }
 
     #[test]
     fn test_client_id_filtering_exclude() -> io::Result<()> {
-        let temp_dir = tempdir()?;
-        let event_batch_path = temp_dir.path().join("event_batches.bin");
-        let metadata_path = temp_dir.path().join("metadata.bin");
+        let mut fixture = TestFixture::new()?;
+        let batches = fixture.generate_test_batches();
 
-        let engine = StatelessEngine::builder().build();
+        let mut filters = ReadFilters::new(1);
+        filters.exclude_client_id = Some(12345); // Exclude client ID from batch 3
+        let read_result = fixture.write_and_read(&batches, &filters)?;
 
-        let event = EventItem::new(1, 1, 1000, 1, 1, b"test event".to_vec());
+        assert_eq!(read_result.event_batches.len(), 7); // All batches except 3
+        Ok(())
+    }
 
-        let client_id_1: u128 = 12345678901234567890123456789012;
-        let client_id_2: u128 = 98765432109876543210987654321098;
+    #[test]
+    fn test_user_id_filtering_include() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+        let batches = fixture.generate_test_batches();
 
-        let batch1 = EventBatchItem::new(1, 1600000000000, client_id_1, Some(987654321), vec![event.clone()]);
-        let batch2 = EventBatchItem::new(2, 1600000001000, client_id_2, Some(987654321), vec![event.clone()]);
-        let batch3 = EventBatchItem::new(3, 1600000002000, client_id_1, Some(987654321), vec![event]);
+        let mut filters = ReadFilters::new(1);
+        filters.include_user_id = Some(67890); // Include user ID from batch 4
+        let read_result = fixture.write_and_read(&batches, &filters)?;
 
-        let mut event_batch_writer = File::create(&event_batch_path)?;
-        let mut metadata_writer = File::create(&metadata_path)?;
-        let mut bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8).seed(&BLOOM_HASH_SEED).hashes(BLOOM_HASH_COUNT);
-        let mut event_type_dedup = HashSet::new();
-        let compression_type = CompressionType::Zstd { level: 3 };
-
-        engine.append_event_batch(&mut event_batch_writer, &mut metadata_writer, &mut bloom_filter, &mut event_type_dedup, compression_type, &batch1)?;
-        engine.append_event_batch(&mut event_batch_writer, &mut metadata_writer, &mut bloom_filter, &mut event_type_dedup, compression_type, &batch2)?;
-        engine.append_event_batch(&mut event_batch_writer, &mut metadata_writer, &mut bloom_filter, &mut event_type_dedup, compression_type, &batch3)?;
-
-        let mut event_batch_reader = File::open(&event_batch_path)?;
-        let mut metadata_reader = File::open(&metadata_path)?;
-
-        let filters = ReadFilters::new(1).exclude_client_id(client_id_1);
-        let read_result = engine.read_filtered(&mut event_batch_reader, &mut metadata_reader, &filters)?;
-
-        assert_eq!(read_result.event_batches.len(), 1);
-        assert_eq!(read_result.event_batches[0].client_id, client_id_2);
-        assert_eq!(read_result.next_event_batch_index, None);
-
+        assert_eq!(read_result.event_batches.len(), 1); // Only batch 4 matches
+        assert_eq!(read_result.event_batches[0].user_id, Some(67890));
         Ok(())
     }
 
     #[test]
     fn test_user_id_filtering_exclude() -> io::Result<()> {
-        let temp_dir = tempdir()?;
-        let event_batch_path = temp_dir.path().join("event_batches.bin");
-        let metadata_path = temp_dir.path().join("metadata.bin");
+        let mut fixture = TestFixture::new()?;
+        let batches = fixture.generate_test_batches();
 
-        let engine = StatelessEngine::builder().build();
+        let mut filters = ReadFilters::new(1);
+        filters.exclude_user_id = Some(67890); // Exclude user ID from batch 4
+        let read_result = fixture.write_and_read(&batches, &filters)?;
 
-        let event = EventItem::new(1, 1, 1000, 1, 1, b"test event".to_vec());
-
-        let user_id_1: u128 = 12345678901234567890123456789012;
-        let user_id_2: u128 = 98765432109876543210987654321098;
-
-        let batch1 = EventBatchItem::new(1, 1600000000000, 123456789, Some(user_id_1), vec![event.clone()]);
-        let batch2 = EventBatchItem::new(2, 1600000001000, 123456789, Some(user_id_2), vec![event.clone()]);
-        let batch3 = EventBatchItem::new(3, 1600000002000, 123456789, None, vec![event]);
-
-        let mut event_batch_writer = File::create(&event_batch_path)?;
-        let mut metadata_writer = File::create(&metadata_path)?;
-        let mut bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8).seed(&BLOOM_HASH_SEED).hashes(BLOOM_HASH_COUNT);
-        let mut event_type_dedup = HashSet::new();
-        let compression_type = CompressionType::Zstd { level: 3 };
-
-        engine.append_event_batch(&mut event_batch_writer, &mut metadata_writer, &mut bloom_filter, &mut event_type_dedup, compression_type, &batch1)?;
-        engine.append_event_batch(&mut event_batch_writer, &mut metadata_writer, &mut bloom_filter, &mut event_type_dedup, compression_type, &batch2)?;
-        engine.append_event_batch(&mut event_batch_writer, &mut metadata_writer, &mut bloom_filter, &mut event_type_dedup, compression_type, &batch3)?;
-
-        let mut event_batch_reader = File::open(&event_batch_path)?;
-        let mut metadata_reader = File::open(&metadata_path)?;
-
-        let filters = ReadFilters::new(1).exclude_user_id(user_id_1);
-        let read_result = engine.read_filtered(&mut event_batch_reader, &mut metadata_reader, &filters)?;
-
-        assert_eq!(read_result.event_batches.len(), 2);
-        assert_eq!(read_result.event_batches[0].user_id, Some(user_id_2));
-        assert_eq!(read_result.event_batches[1].user_id, None);
-        assert_eq!(read_result.next_event_batch_index, None);
-
+        assert_eq!(read_result.event_batches.len(), 7); // All batches except 4
         Ok(())
     }
 
     #[test]
     fn test_server_time_range_filtering() -> io::Result<()> {
-        let temp_dir = tempdir()?;
-        let event_batch_path = temp_dir.path().join("event_batches.bin");
-        let metadata_path = temp_dir.path().join("metadata.bin");
+        let mut fixture = TestFixture::new()?;
+        let batches = fixture.generate_test_batches();
 
-        let engine = StatelessEngine::builder().build();
+        let mut filters = ReadFilters::new(1);
+        filters.min_server_timestamp = Some(1640000000000);
+        filters.max_server_timestamp = Some(1650000000000); // Batch 5 is 1650000000000
+        let read_result = fixture.write_and_read(&batches, &filters)?;
 
-        let event = EventItem::new(1, 1, 1000, 1, 1, b"test event".to_vec());
-
-        let batch1 = EventBatchItem::new(1, 1600000000000, 123456789, Some(987654321), vec![event.clone()]);
-        let batch2 = EventBatchItem::new(2, 1600000001000, 123456789, Some(987654321), vec![event.clone()]);
-        let batch3 = EventBatchItem::new(3, 1600000002000, 123456789, Some(987654321), vec![event]);
-
-        let mut event_batch_writer = File::create(&event_batch_path)?;
-        let mut metadata_writer = File::create(&metadata_path)?;
-        let mut bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8).seed(&BLOOM_HASH_SEED).hashes(BLOOM_HASH_COUNT);
-        let mut event_type_dedup = HashSet::new();
-        let compression_type = CompressionType::Zstd { level: 3 };
-
-        engine.append_event_batch(&mut event_batch_writer, &mut metadata_writer, &mut bloom_filter, &mut event_type_dedup, compression_type, &batch1)?;
-        engine.append_event_batch(&mut event_batch_writer, &mut metadata_writer, &mut bloom_filter, &mut event_type_dedup, compression_type, &batch2)?;
-        engine.append_event_batch(&mut event_batch_writer, &mut metadata_writer, &mut bloom_filter, &mut event_type_dedup, compression_type, &batch3)?;
-
-        let mut event_batch_reader = File::open(&event_batch_path)?;
-        let mut metadata_reader = File::open(&metadata_path)?;
-
-        let filters = ReadFilters::new(1)
-            .min_server_timestamp(1600000000500)
-            .max_server_timestamp(1600000001500);
-        let read_result = engine.read_filtered(&mut event_batch_reader, &mut metadata_reader, &filters)?;
-
-        assert_eq!(read_result.event_batches.len(), 1);
-        assert_eq!(read_result.event_batches[0].server_timestamp, 1600000001000);
-        assert_eq!(read_result.next_event_batch_index, None);
-
+        assert_eq!(read_result.event_batches.len(), 2); // Only batch 5 and batch 7 matches
+        assert_eq!(read_result.event_batches[0].server_timestamp, 1650000000000);
+        assert_eq!(read_result.event_batches[1].server_timestamp, 1650000000000);
         Ok(())
     }
 
-    //CHECKED GOOD
     #[test]
     fn test_local_index_range_filtering() -> io::Result<()> {
-        let temp_dir = tempdir()?;
-        let event_batch_path = temp_dir.path().join("event_batches.bin");
-        let metadata_path = temp_dir.path().join("metadata.bin");
+        let mut fixture = TestFixture::new()?;
+        let batches = fixture.generate_test_batches();
 
-        let engine = StatelessEngine::builder().build();
+        let mut filters = ReadFilters::new(1);
+        filters.min_client_event_index = Some(1);
+        filters.max_client_event_index = Some(2); // Events in batch 1 have index 1 and 2
+        let read_result = fixture.write_and_read(&batches, &filters)?;
 
-        let mut event = EventItem::new(1, 1, 1000, 1, 1, b"test event".to_vec());
-
-        let batch1 = EventBatchItem::new(1, 1600000000000, 123456789, Some(987654321), vec![event.clone()]);
-        event.client_event_index = 2;
-        let batch2 = EventBatchItem::new(2, 1600000001000, 123456789, Some(987654321), vec![event.clone()]);
-        event.client_event_index = 3;
-        let mut b3event2 = event.clone();
-        b3event2.client_event_index = 4;
-        let batch3 = EventBatchItem::new(3, 1600000002000, 123456789, Some(987654321), vec![event.clone(), b3event2]);
-        event.client_event_index = 5;
-        let batch4 = EventBatchItem::new(3, 1600000002000, 123456789, Some(987654321), vec![event]);
-
-        // Set max_client_event_index = 5, min_client_event_index = 2
-        let mut event_batch_writer = File::create(&event_batch_path)?;
-        let mut metadata_writer = File::create(&metadata_path)?;
-        let mut bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8).seed(&BLOOM_HASH_SEED).hashes(BLOOM_HASH_COUNT);
-        let mut event_type_dedup = HashSet::new();
-        let compression_type = CompressionType::Zstd { level: 3 };
-
-        engine.append_event_batch(&mut event_batch_writer, &mut metadata_writer, &mut bloom_filter, &mut event_type_dedup, compression_type, &batch1)?;
-        engine.append_event_batch(&mut event_batch_writer, &mut metadata_writer, &mut bloom_filter, &mut event_type_dedup, compression_type, &batch2)?;
-        engine.append_event_batch(&mut event_batch_writer, &mut metadata_writer, &mut bloom_filter, &mut event_type_dedup, compression_type, &batch3)?;
-        engine.append_event_batch(&mut event_batch_writer, &mut metadata_writer, &mut bloom_filter, &mut event_type_dedup, compression_type, &batch4)?;
-
-        let mut event_batch_reader = File::open(&event_batch_path)?;
-        let mut metadata_reader = File::open(&metadata_path)?;
-
-        let filters = ReadFilters::new(1)
-            .min_client_event_index(2)
-            .max_client_event_index(3);
-        let read_result = engine.read_filtered(&mut event_batch_reader, &mut metadata_reader, &filters)?;
-
-        assert_eq!(read_result.event_batches.len(), 2);
-        assert_eq!(read_result.next_event_batch_index, None); //Even though there is batch4, we don't tell client they need it as it doesn't match the filter
-
-        assert_eq!(read_result.event_batches[0].event_batch_index, 2); //Skipping batch 1 and batch 4
-        assert_eq!(read_result.event_batches[1].event_batch_index, 3);
-
-        assert_eq!(read_result.event_batches[0].events.len(), 1);
-        assert_eq!(read_result.event_batches[1].events.len(), 1); // in-batch filter logic removes second event
-
-        assert_eq!(read_result.event_batches[0].events[0].client_event_index, 2);
-        assert_eq!(read_result.event_batches[1].events[0].client_event_index, 3);
-
+        assert_eq!(read_result.event_batches.len(), 8);
+        assert_eq!(read_result.event_batches[0].events.len(), 2); // Only events 1 and 2 remain
         Ok(())
     }
 
     #[test]
     fn test_event_time_range_filtering() -> io::Result<()> {
-        let temp_dir = tempdir()?;
-        let event_batch_path = temp_dir.path().join("event_batches.bin");
-        let metadata_path = temp_dir.path().join("metadata.bin");
+        let mut fixture = TestFixture::new()?;
+        let batches = fixture.generate_test_batches();
 
-        let engine = StatelessEngine::builder().build();
-
-        let event1 = EventItem::new(1, 1, 1000, 1, 1, b"test event".to_vec());
-        let event2 = EventItem::new(2, 2, 2000, 1, 1, b"test event".to_vec());
-        let event3 = EventItem::new(3, 3, 3000, 1, 1, b"test event".to_vec());
-
-        let batch = EventBatchItem::new(1, 1600000000000, 123456789, Some(987654321), vec![event1, event2, event3]);
-
-        let mut event_batch_writer = File::create(&event_batch_path)?;
-        let mut metadata_writer = File::create(&metadata_path)?;
-        let mut bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8).seed(&BLOOM_HASH_SEED).hashes(BLOOM_HASH_COUNT);
-        let mut event_type_dedup = HashSet::new();
-        let compression_type = CompressionType::Zstd { level: 3 };
-
-        engine.append_event_batch(&mut event_batch_writer, &mut metadata_writer, &mut bloom_filter, &mut event_type_dedup, compression_type, &batch)?;
-
-        let mut event_batch_reader = File::open(&event_batch_path)?;
-        let mut metadata_reader = File::open(&metadata_path)?;
-
-        let filters = ReadFilters::new(1).min_event_timestamp(1500).max_event_timestamp(2500);
-        let read_result = engine.read_filtered(&mut event_batch_reader, &mut metadata_reader, &filters)?;
+        let mut filters = ReadFilters::new(1);
+        filters.min_event_timestamp = Some(1640000000000);
+        filters.max_event_timestamp = Some(1660000000000); // Event in batch 7 is in range
+        let read_result = fixture.write_and_read(&batches, &filters)?;
 
         assert_eq!(read_result.event_batches.len(), 1);
-        // assert_eq!(read_result.event_batches[0].events.len(), 1);  //Should have one event after filtering
-
+        assert_eq!(read_result.event_batches[0].events.len(), 2); // Only 2 event remains
         Ok(())
     }
 
     #[test]
-    fn test_event_type_filtering_with_direct_storage() -> io::Result<()> {
-        let temp_dir = tempdir()?;
-        let event_batch_path = temp_dir.path().join("event_batches.bin");
-        let metadata_path = temp_dir.path().join("metadata.bin");
+    fn test_event_type_filtering_bloom_filter() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+        let batches = fixture.generate_test_batches();
 
-        let engine = StatelessEngine::builder().build();
+        let mut filters = ReadFilters::new(1);
+        let event_types = vec![10_u64, 80_u64];
+        filters.include_event_types = Some(event_types.as_slice()); // Batch 6 has types 10, 20, 30, 40, 50, 60, 70, 80
+        let read_result = fixture.write_and_read(&batches, &filters)?;
 
-        let event1 = EventItem::new(1, 1, 1000, 1, 1, b"test event".to_vec());
-        let event2 = EventItem::new(2, 2, 2000, 2, 1, b"test event".to_vec());
-        let event3 = EventItem::new(3, 3, 3000, 3, 1, b"test event".to_vec());
-
-        let batch = EventBatchItem::new(1, 1600000000000, 123456789, Some(987654321), vec![event1, event2, event3]);
-
-        let mut event_batch_writer = File::create(&event_batch_path)?;
-        let mut metadata_writer = File::create(&metadata_path)?;
-        let mut bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8).seed(&BLOOM_HASH_SEED).hashes(BLOOM_HASH_COUNT);
-        let mut event_type_dedup = HashSet::new();
-        let compression_type = CompressionType::Zstd { level: 3 };
-
-        engine.append_event_batch(&mut event_batch_writer, &mut metadata_writer, &mut bloom_filter, &mut event_type_dedup, compression_type, &batch)?;
-
-        let mut event_batch_reader = File::open(&event_batch_path)?;
-        let mut metadata_reader = File::open(&metadata_path)?;
-
-        let include_event_types: &[u64] = &[2];
-        let filters = ReadFilters::new(1).include_event_types(include_event_types);
-        let read_result = engine.read_filtered(&mut event_batch_reader, &mut metadata_reader, &filters)?;
-
-        assert_eq!(read_result.event_batches.len(), 1);
-        // assert_eq!(read_result.event_batches[0].events.len(), 1); // One event after filtering
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_simple_event_type_bloom() -> io::Result<()> {
-        let mut events = Vec::new();
-        events.push(EventItem::new(1,1,1,33,0,b"e1".to_vec()));
-        events.push(EventItem::new(1,1,1,44,0,b"e2".to_vec()));
-        events.push(EventItem::new(1,1,1,55,0,b"e3".to_vec()));
-        events.push(EventItem::new(1,1,1,66,0,b"e4".to_vec()));
-        events.push(EventItem::new(1,1,1,77,0,b"e5".to_vec()));
-        let batch = EventBatchItem::new(1, 1600000000000, 123456789, Some(987654321), events);
-
-        let temp_dir = tempdir()?;
-        let event_batch_path = temp_dir.path().join("event_batches.bin");
-        let metadata_path = temp_dir.path().join("metadata.bin");
-        let mut event_batch_writer = File::create(&event_batch_path)?;
-        let mut metadata_writer = File::create(&metadata_path)?;        
-        let mut bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8).seed(&BLOOM_HASH_SEED).hashes(BLOOM_HASH_COUNT);
-        let mut event_type_dedup = HashSet::new();
-        let compression_type = CompressionType::Zstd { level: 3 };
-
-        let engine = StatelessEngine::builder().build();
-        engine.append_event_batch(&mut event_batch_writer, &mut metadata_writer, &mut bloom_filter, &mut event_type_dedup, compression_type, &batch)?;
-
-        let mut event_batch_reader = File::open(&event_batch_path)?;
-        let mut metadata_reader = File::open(&metadata_path)?;
-        let filters = ReadFilters::new(1).include_event_types(&[55, 66]);
-
-        let read_result = engine.read_filtered(&mut event_batch_reader, &mut metadata_reader, &filters)?;
-
-        assert_eq!(read_result.event_batches.len(), 1);
-        assert_eq!(read_result.event_batches[0].events[0].event_type_major, 55);
-        assert_eq!(read_result.event_batches[0].events[1].event_type_major, 66);
-
-        Ok(())
-
-    }
-
-    #[test]
-    fn test_event_type_filtering_with_bloom_filter() -> io::Result<()> {
-        let temp_dir = tempdir()?;
-        let event_batch_path = temp_dir.path().join("event_batches.bin");
-        let metadata_path = temp_dir.path().join("metadata.bin");
-
-        let engine = StatelessEngine::builder().build();
-
-        // Create events with 5 different types to force bloom filter usage
-        let mut events = Vec::new();
-        for i in 1..=5 {
-            let event = EventItem::new(i, i, 1000 * i, i as u64, 1, b"test event".to_vec());
-            events.push(event);
-        }
-
-        let batch = EventBatchItem::new(1, 1600000000000, 123456789, Some(987654321), events);
-
-        let mut event_batch_writer = File::create(&event_batch_path)?;
-        let mut metadata_writer = File::create(&metadata_path)?;
-        
-        let mut bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8).seed(&BLOOM_HASH_SEED).hashes(BLOOM_HASH_COUNT);
-
-        let mut event_type_dedup = HashSet::new();
-        let compression_type = CompressionType::Zstd { level: 3 };
-
-        engine.append_event_batch(&mut event_batch_writer, &mut metadata_writer, &mut bloom_filter, &mut event_type_dedup, compression_type, &batch)?;
-
-        let mut event_batch_reader = File::open(&event_batch_path)?;
-        let mut metadata_reader = File::open(&metadata_path)?;
-
-        let include_event_types: &[u64] = &[2];
-        let filters = ReadFilters::new(1).include_event_types(include_event_types);
-        let read_result = engine.read_filtered(&mut event_batch_reader, &mut metadata_reader, &filters)?;
-
-        assert_eq!(read_result.event_batches.len(), 1);
-        // assert_eq!(read_result.event_batches[0].events.len(), 1); // One event after filtering
-
+        assert_eq!(read_result.event_batches.len(), 2);
+        assert_eq!(read_result.event_batches[0].events.len(), 1); // Only events of type 10
+        assert_eq!(read_result.event_batches[0].events[0].event_type_major, 10);
+        assert_eq!(read_result.event_batches[1].events.len(), 2); // Only events of type 10 and 80
+        assert_eq!(read_result.event_batches[1].events[0].event_type_major, 10);
+        assert_eq!(read_result.event_batches[1].events[1].event_type_major, 80);
+        assert_eq!(read_result.event_batches[0].event_batch_index, 2);
+        assert_eq!(read_result.event_batches[1].event_batch_index, 6);
         Ok(())
     }
 
     #[test]
     fn test_combined_filter_scenarios() -> io::Result<()> {
-        let temp_dir = tempdir()?;
-        let event_batch_path = temp_dir.path().join("event_batches.bin");
-        let metadata_path = temp_dir.path().join("metadata.bin");
+        let mut fixture = TestFixture::new()?;
+        let batches = fixture.generate_test_batches();
 
-        let engine = StatelessEngine::builder().build();
+        let mut filters = ReadFilters::new(1);
+        filters.include_client_id = Some(12345); // Batch 3 has this client ID
+        filters.min_server_timestamp = Some(1600000000000);
+        filters.max_server_timestamp = Some(1660000000000);
+        let event_types = vec![1_u64, 2_u64, 3_u64];
+        filters.include_event_types = Some(event_types.as_slice()); // Batch 3 has event type 1
+        let read_result = fixture.write_and_read(&batches, &filters)?;
 
-        let client_id_1: u128 = 12345678901234567890123456789012;
-        let event1 = EventItem::new(1, 1, 1000, 1, 1, b"test event".to_vec());
+        assert_eq!(read_result.event_batches.len(), 1); // Only batch 3 matches all criteria
+        assert_eq!(read_result.event_batches[0].client_id, 12345);
+        Ok(())
+    }
 
-        let batch = EventBatchItem::new(1, 1600000000000, client_id_1, Some(987654321), vec![event1]);
+    #[test]
+    fn test_client_id_filtering_include_and_exclude() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+        let batches = fixture.generate_test_batches();
 
-        let mut event_batch_writer = File::create(&event_batch_path)?;
-        let mut metadata_writer = File::create(&metadata_path)?;
-        let mut bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8).seed(&BLOOM_HASH_SEED).hashes(BLOOM_HASH_COUNT);
-        let mut event_type_dedup = HashSet::new();
-        let compression_type = CompressionType::Zstd { level: 3 };
+        let mut filters = ReadFilters::new(1);
+        filters.include_client_id = Some(12345); // Client ID from batch 3
+        filters.exclude_user_id = Some(67890); // User ID from batch 4
+        let read_result = fixture.write_and_read(&batches, &filters)?;
 
-        engine.append_event_batch(&mut event_batch_writer, &mut metadata_writer, &mut bloom_filter, &mut event_type_dedup, compression_type, &batch)?;
+        assert_eq!(read_result.event_batches.len(), 1); // Only batch 3 matches
+        assert_eq!(read_result.event_batches[0].client_id, 12345);
+        Ok(())
+    }
 
-        let mut event_batch_reader = File::open(&event_batch_path)?;
-        let mut metadata_reader = File::open(&metadata_path)?;
+    #[test]
+    fn test_server_time_and_event_type_filtering() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+        let batches = fixture.generate_test_batches();
 
-        let include_event_types: &[u64] = &[1];
-        let filters = ReadFilters::new(1)
-            .include_client_id(client_id_1)
-            .min_server_timestamp(1500000000500)
-            .include_event_types(include_event_types);
+        let mut filters = ReadFilters::new(1);
+        filters.min_server_timestamp = Some(1600000000000);
+        filters.max_server_timestamp = Some(1650000000000); // Batch 5 is 1650000000000
+        let event_types = vec![10_u64, 20_u64, 30_u64];
+        filters.include_event_types = Some(event_types.as_slice()); // Batch 2 has these types
+        let read_result = fixture.write_and_read(&batches, &filters)?;
 
-        let read_result = engine.read_filtered(&mut event_batch_reader, &mut metadata_reader, &filters)?;
+        //Batches 2, 5 match the filters criteria
+        assert_eq!(read_result.event_batches.len(), 2);
+        Ok(())
+    }
 
-        assert_eq!(read_result.event_batches.len(), 1); //Should have the event after filtering
-        assert_eq!(read_result.event_batches[0].client_id, client_id_1); //Client ID matches the included
+    #[test]
+    fn test_event_type_and_local_index_filtering() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+        let batches = fixture.generate_test_batches();
+
+        let mut filters = ReadFilters::new(1);
+        let event_types = vec![10_u64, 20_u64, 30_u64, 40_u64, 50_u64];
+        filters.include_event_types = Some(event_types.as_slice()); // Batch 2 has these types
+        filters.min_client_event_index = Some(1);
+        filters.max_client_event_index = Some(2);
+        let read_result = fixture.write_and_read(&batches, &filters)?;
+
+        //Batch 2 and 6 only match the filters criteria
+        assert_eq!(read_result.event_batches.len(), 2);
+        assert_eq!(read_result.event_batches[0].events.len(), 2); // Only events with index 1 and 2 remain
+        assert_eq!(read_result.event_batches[1].events.len(), 2); // Only events with index 1 and 2 remain
+        assert_eq!(read_result.event_batches[0].event_batch_index, 2);
+        assert_eq!(read_result.event_batches[1].event_batch_index, 6);
+        Ok(())
+    }
+
+    #[test]
+    fn test_min_max_server_timestamp_filtering() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+        let batches = fixture.generate_test_batches();
+
+        let mut filters = ReadFilters::new(1);
+        filters.min_server_timestamp = Some(1600000000000);
+        filters.max_server_timestamp = Some(1650000000000);
+        let read_result = fixture.write_and_read(&batches, &filters)?;
+
+        //Only batches within timestamp range should return
+        assert_eq!(read_result.event_batches.len(), 7); // Everything but the last batch is within the bounds
+        assert_eq!(read_result.event_batches[0].server_timestamp, 1600000000000);
+        assert_eq!(read_result.event_batches[6].server_timestamp, 1650000000000);
+        Ok(())
+    }
+
+    #[test]
+    fn test_min_max_event_timestamp_filtering() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+        let batches = fixture.generate_test_batches();
+
+        let mut filters = ReadFilters::new(1);
+        filters.min_event_timestamp = Some(1640000000000);
+        filters.max_event_timestamp = Some(1660000000000);
+        let read_result = fixture.write_and_read(&batches, &filters)?;
+
+        assert_eq!(read_result.event_batches.len(), 1);
         Ok(())
     }
 }

@@ -293,7 +293,7 @@ impl StatelessReader for StatelessEngine {
                     event_batch_reader,
                     metadata_reader,
                     filters,
-                    self.io_uring_queue_depth
+                    self.io_uring_queue_depth,
                 );
             }
         }
@@ -338,8 +338,9 @@ fn internal_read_filtered_io_uring<R: Read + Seek + AsRawFd>(
         get_minimum_available_server_id(metadata_reader, filters.from_event_batch_index)?;
 
     // Calculate the offset in the metadata file to start reading metadata chunks
-    let start_reading_metadata_from_offset_position =
-        (filters.from_event_batch_index - minimum_available_server_id) * METADATA_BATCH_SIZE_BYTES as u64;
+    let start_reading_metadata_from_offset_position = (filters.from_event_batch_index
+        - minimum_available_server_id)
+        * METADATA_BATCH_SIZE_BYTES as u64;
 
     // Calculate how many metadata entries we can read
     let remaining_metadata_bytes =
@@ -367,7 +368,7 @@ fn internal_read_filtered_io_uring<R: Read + Seek + AsRawFd>(
         start_reading_metadata_from_offset_position,
         max_metadata_entries,
         filters,
-        io_uring_queue_depth
+        io_uring_queue_depth,
     )?;
 
     calculate_absolute_positions(file_len_event_batch, &mut batches);
@@ -388,7 +389,8 @@ fn internal_read_filtered_io_uring<R: Read + Seek + AsRawFd>(
     // The bloom filter is not 100% accurate and metadata only stores 'in' types, not exclusive
 
     // Phase 3: Read event batches using io_uring
-    let event_batches = read_event_batches_with_uring(event_batch_reader, &batches, filters, io_uring_queue_depth)?;
+    let event_batches =
+        read_event_batches_with_uring(event_batch_reader, &batches, filters, io_uring_queue_depth)?;
 
     Ok(ReadResult {
         event_batches,
@@ -396,15 +398,16 @@ fn internal_read_filtered_io_uring<R: Read + Seek + AsRawFd>(
     })
 }
 
-fn bloom_filter_from_bytes(bloom_bytes: &[u64; BLOOM_BYTES/8]) -> BloomFilter {
-    BloomFilter::from_vec(bloom_bytes.to_vec()).seed(&BLOOM_HASH_SEED).hashes(BLOOM_HASH_COUNT)
+fn bloom_filter_from_bytes(bloom_bytes: &[u64; BLOOM_BYTES / 8]) -> BloomFilter {
+    BloomFilter::from_vec(bloom_bytes.to_vec())
+        .seed(&BLOOM_HASH_SEED)
+        .hashes(BLOOM_HASH_COUNT)
 }
 
 fn trim_end_if_exceeds_max_bytes(
     batches: &mut Vec<MetadataBatchInfo>,
     max_bytes: Option<usize>,
 ) -> Option<u64> {
-
     // Only keep batches where include is true
     batches.retain(|batch| batch.include);
 
@@ -556,10 +559,9 @@ fn is_include_batch(metadata: &EventBatchMetadata, filters: &ReadFilters) -> boo
         return false;
     }
 
-    if filters
-        .to_event_batch_index
-        .map_or(false, |to_server_id| metadata.event_batch_index > to_server_id)
-    {
+    if filters.to_event_batch_index.map_or(false, |to_server_id| {
+        metadata.event_batch_index > to_server_id
+    }) {
         return false;
     }
 
@@ -613,17 +615,15 @@ fn is_include_batch(metadata: &EventBatchMetadata, filters: &ReadFilters) -> boo
         return false;
     }
 
-    if filters
-        .min_client_event_index
-        .map_or(false, |min_index| metadata.max_client_event_index < min_index)
-    {
+    if filters.min_client_event_index.map_or(false, |min_index| {
+        metadata.max_client_event_index < min_index
+    }) {
         return false;
     }
 
-    if filters
-        .max_client_event_index
-        .map_or(false, |max_index| metadata.min_client_event_index > max_index)
-    {
+    if filters.max_client_event_index.map_or(false, |max_index| {
+        metadata.min_client_event_index > max_index
+    }) {
         return false;
     }
 
@@ -886,8 +886,9 @@ fn internal_read_filtered_standard<R: Read + Seek>(
         get_minimum_available_server_id(metadata_reader, filters.from_event_batch_index)?;
 
     // Calculate the offset in the metadata file to start reading metadata chunks
-    let start_reading_metadata_from_offset_position =
-        (filters.from_event_batch_index - minimum_available_server_id) * METADATA_BATCH_SIZE_BYTES as u64;
+    let start_reading_metadata_from_offset_position = (filters.from_event_batch_index
+        - minimum_available_server_id)
+        * METADATA_BATCH_SIZE_BYTES as u64;
 
     // Calculate how many metadata entries we can read
     let remaining_metadata_bytes =

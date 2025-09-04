@@ -44,11 +44,6 @@
 - **Sequence**: Create events with repetitive patterns → Write with different compression types
 - **Expected Output**: Significant compression achieved, data integrity maintained
 
-### 2.4 Incompressible Data
-- **Title**: Write random/encrypted data that doesn't compress well
-- **Sequence**: Create events with random binary data → Test all compression types
-- **Expected Output**: Minimal compression achieved, but no data corruption
-
 ## 3. Event Type Handling
 
 ### 3.1 Direct Event Type Storage (≤4 types)
@@ -65,11 +60,6 @@
 - **Title**: Write batch with duplicate event types
 - **Sequence**: Create batch with repeated event types → Verify deduplication in metadata
 - **Expected Output**: Only unique types stored in metadata
-
-### 3.4 Event Type Boundary Testing
-- **Title**: Test exact boundary between direct and bloom storage
-- **Sequence**: Write batch with exactly 4 types, then add 1 more event with new type
-- **Expected Output**: First uses Direct, second uses Bloom filter
 
 ## 4. Basic Read Operations
 
