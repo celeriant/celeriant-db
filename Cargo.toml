@@ -10,6 +10,7 @@ brotli = "8.0.2"
 crc32fast = "1.5.0"
 fastbloom = "0.14.0"
 flate2 = "1.1.2"
+lru = "0.16.0"
 serde = { version = "1.0.219", features = ["derive"] }
 snap = "1.1.1"
 tempfile = "3.21.0"
