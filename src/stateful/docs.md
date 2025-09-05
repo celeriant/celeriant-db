@@ -64,15 +64,11 @@ The stateful engine's job on write is to:
 - **Purpose**: Track the next available event batch index for each aggregate
 - **Key**: `aggregate_id: String`
 - **Value**: `u64` (next event batch index to assign)
-- **TTL**: 1 hour (configurable)
-- **Size Limit**: 10,000 entries
 
 #### Cache 2: Client Event Index Tracking (`client_event_index_cache`)
 - **Purpose**: Prevent duplicate event writes from clients (producer idempotency)
 - **Key**: `(aggregate_id: String, client_id: u128)`
 - **Value**: `u64` (highest client_event_index seen from this client)
-- **TTL**: 4 hours (configurable)
-- **Size Limit**: 50,000 entries
 
 #### Cache 3: Recent Event Batches (`recent_batches_cache`)
 - **Purpose**: Serve recent reads from memory without disk I/O
