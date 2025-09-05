@@ -499,66 +499,76 @@ fn read_metadata_entries_with_uring<R: Read + Seek + AsRawFd>(
     let mut ring = IoUring::new(io_uring_queue_depth)?;
     let fd = types::Fd(metadata_reader.as_raw_fd());
 
-    // Prepare buffers for metadata entries
-    let mut buffer_pool = Vec::with_capacity(max_entries);
-    for _ in 0..max_entries {
-        buffer_pool.push([0u8; METADATA_BATCH_SIZE_BYTES]);
-    }
+    let mut all_batch_entries = Vec::with_capacity(max_entries);
+    let chunk_size = io_uring_queue_depth as usize;
 
-    // Submit read operations
-    let mut submission_count = 0;
-    for (i, buffer) in buffer_pool.iter_mut().enumerate().take(max_entries) {
-        let offset = start_offset + (i as u64 * METADATA_BATCH_SIZE_BYTES as u64);
-        let read_op = opcode::Read::new(fd, buffer.as_mut_ptr(), buffer.len() as u32)
-            .offset(offset)
-            .build()
-            .user_data(i as u64);
+    // Process entries in chunks based on queue depth
+    for chunk_start in (0..max_entries).step_by(chunk_size) {
+        let chunk_end = std::cmp::min(chunk_start + chunk_size, max_entries);
+        let chunk_len = chunk_end - chunk_start;
 
-        unsafe {
-            if ring.submission().push(&read_op).is_err() {
-                break; // Queue full, submit what we have
+        // Prepare buffers for this chunk
+        let mut buffer_pool = Vec::with_capacity(chunk_len);
+        for _ in 0..chunk_len {
+            buffer_pool.push([0u8; METADATA_BATCH_SIZE_BYTES]);
+        }
+
+        // Submit read operations for this chunk
+        let mut submission_count = 0;
+        for (i, buffer) in buffer_pool.iter_mut().enumerate() {
+            let global_index = chunk_start + i;
+            let offset = start_offset + (global_index as u64 * METADATA_BATCH_SIZE_BYTES as u64);
+            let read_op = opcode::Read::new(fd, buffer.as_mut_ptr(), buffer.len() as u32)
+                .offset(offset)
+                .build()
+                .user_data(i as u64);
+
+            unsafe {
+                ring.submission().push(&read_op).expect("Queue should have space");
             }
-        }
-        submission_count += 1;
-    }
-
-    ring.submit_and_wait(submission_count)?;
-
-    // Pre-allocate the result vector with the exact size
-    let mut batch_entries = Vec::with_capacity(submission_count);
-    for _ in 0..submission_count {
-        // We'll create actual entries based on the order of completion
-        batch_entries.push(MetadataBatchInfo::default());
-    }
-
-    // Collect results
-    for _ in 0..submission_count {
-        let cqe = ring
-            .completion()
-            .next()
-            .ok_or_else(|| io::Error::other("Missing completion entry"))?;
-
-        let buffer_index = cqe.user_data() as usize;
-        let bytes_read = cqe.result();
-
-        if (bytes_read as usize) < METADATA_BATCH_SIZE_BYTES {
-            return Err(io::Error::other(format!("Read error: {}", bytes_read)));
+            submission_count += 1;
         }
 
-        let metadata: EventBatchMetadata =
-            bincode::decode_from_slice(&buffer_pool[buffer_index], BINCODE_CONFIG_FIXED)
-                .map_err(|e| io::Error::other(e.to_string()))?
-                .0;
+        ring.submit_and_wait(submission_count)?;
 
-        batch_entries[buffer_index].include = is_include_batch(&metadata, filters);
-        batch_entries[buffer_index].server_id = metadata.event_batch_index;
-        batch_entries[buffer_index].uncompressed_size = metadata.uncompressed_size;
-        batch_entries[buffer_index].compressed_size = metadata.compressed_size;
-        batch_entries[buffer_index].compression_type = metadata.compression_type;
-        batch_entries[buffer_index].events_crc = metadata.events_crc;
+        // Collect results for this chunk
+        let mut chunk_entries = Vec::with_capacity(chunk_len);
+        for _ in 0..submission_count {
+            // We'll create actual entries based on the order of completion
+            chunk_entries.push(MetadataBatchInfo::default());
+        }
+        
+        for _ in 0..submission_count {
+            let cqe = ring
+                .completion()
+                .next()
+                .ok_or_else(|| io::Error::other("Missing completion entry"))?;
+
+            let buffer_index = cqe.user_data() as usize;
+            let bytes_read = cqe.result();
+
+            if (bytes_read as usize) < METADATA_BATCH_SIZE_BYTES {
+                return Err(io::Error::other(format!("Read error: {}", bytes_read)));
+            }
+
+            let metadata: EventBatchMetadata =
+                bincode::decode_from_slice(&buffer_pool[buffer_index], BINCODE_CONFIG_FIXED)
+                    .map_err(|e| io::Error::other(e.to_string()))?
+                    .0;
+
+            chunk_entries[buffer_index].include = is_include_batch(&metadata, filters);
+            chunk_entries[buffer_index].server_id = metadata.event_batch_index;
+            chunk_entries[buffer_index].uncompressed_size = metadata.uncompressed_size;
+            chunk_entries[buffer_index].compressed_size = metadata.compressed_size;
+            chunk_entries[buffer_index].compression_type = metadata.compression_type;
+            chunk_entries[buffer_index].events_crc = metadata.events_crc;
+        }
+
+        // Add this chunk to the overall results
+        all_batch_entries.extend(chunk_entries);
     }
 
-    Ok(batch_entries)
+    Ok(all_batch_entries)
 }
 
 fn is_include_batch(metadata: &EventBatchMetadata, filters: &ReadFilters) -> bool {
@@ -726,125 +736,124 @@ fn read_event_batches_with_uring<R: Read + Seek + AsRawFd>(
 
     let mut ring = IoUring::new(io_uring_queue_depth)?;
     let fd = types::Fd(event_batch_reader.as_raw_fd());
+    
+    let mut all_event_batches = Vec::new();
+    let chunk_size = io_uring_queue_depth as usize;
 
-    // Prepare buffers
-    let mut buffers: Vec<Vec<u8>> = included_batches
-        .iter()
-        .map(|batch| vec![0u8; batch.compressed_size as usize])
-        .collect();
+    // Process batches in chunks based on queue depth
+    for chunk_start in (0..included_batches.len()).step_by(chunk_size) {
+        let chunk_end = std::cmp::min(chunk_start + chunk_size, included_batches.len());
+        let chunk_batches = &included_batches[chunk_start..chunk_end];
 
-    // Submit read operations
-    let mut submission_count = 0;
-    for (i, (buffer, batch)) in buffers.iter_mut().zip(&included_batches).enumerate() {
-        let read_op = opcode::Read::new(fd, buffer.as_mut_ptr(), buffer.len() as u32)
-            .offset(batch.file_offset)
-            .build()
-            .user_data(i as u64);
+        // Prepare buffers for this chunk
+        let mut buffers: Vec<Vec<u8>> = chunk_batches
+            .iter()
+            .map(|batch| vec![0u8; batch.compressed_size as usize])
+            .collect();
 
-        unsafe {
-            if ring.submission().push(&read_op).is_err() {
-                break;
+        // Submit read operations for this chunk
+        let mut submission_count = 0;
+        for (i, (buffer, batch)) in buffers.iter_mut().zip(chunk_batches).enumerate() {
+            let read_op = opcode::Read::new(fd, buffer.as_mut_ptr(), buffer.len() as u32)
+                .offset(batch.file_offset)
+                .build()
+                .user_data(i as u64);
+
+            unsafe {
+                ring.submission().push(&read_op).expect("Queue should have space");
             }
-        }
-        submission_count += 1;
-    }
-
-    ring.submit_and_wait(submission_count)?;
-
-    // Collect and decompress results
-    let mut event_batches = Vec::with_capacity(submission_count);
-    for _ in 0..submission_count {
-        let cqe = ring
-            .completion()
-            .next()
-            .ok_or_else(|| io::Error::other("Missing completion entry"))?;
-
-        let buffer_index = cqe.user_data() as usize;
-        let bytes_read = cqe.result();
-
-        if bytes_read < 0 {
-            return Err(io::Error::other(format!("Read error: {}", bytes_read)));
+            submission_count += 1;
         }
 
-        let batch = &included_batches[buffer_index];
-        let buffer = &buffers[buffer_index];
+        ring.submit_and_wait(submission_count)?;
 
-        // Verify CRC
-        let crc = crc32fast::hash(&buffer[..bytes_read as usize]);
-        if crc != batch.events_crc {
-            return Err(io::Error::other("CRC mismatch in event batch"));
-        }
+        // Collect and decompress results for this chunk
+        for _ in 0..submission_count {
+            let cqe = ring
+                .completion()
+                .next()
+                .ok_or_else(|| io::Error::other("Missing completion entry"))?;
 
-        // Decompress and deserialize
-        let compression_type = CompressionType::from_tuple(batch.compression_type, None);
-        let mut event_batch = EventBatchItem::from_wire_format(
-            &buffer[..bytes_read as usize],
-            compression_type,
-            batch.uncompressed_size as usize,
-        )?;
+            let buffer_index = cqe.user_data() as usize;
+            let bytes_read = cqe.result();
 
-        // Final event type filtering (bloom filter might have false positives)
-        if let Some(event_types) = filters.include_event_types {
-            event_batch
-                .events
-                .retain(|event| event_types.contains(&event.event_type_major));
-        }
+            if bytes_read < 0 {
+                return Err(io::Error::other(format!("Read error: {}", bytes_read)));
+            }
 
-        // Final filtering (metadata only contains min/max ranges)
-        if let Some(event_types) = filters.include_event_types {
-            event_batch
-                .events
-                .retain(|event| event_types.contains(&event.event_type_major));
-        }
+            let batch = chunk_batches[buffer_index];
+            let buffer = &buffers[buffer_index];
 
-        // Final filtering for local_index
-        if let Some(min_local_index) = filters.min_client_event_index {
-            event_batch
-                .events
-                .retain(|event| event.client_event_index >= min_local_index);
-        }
+            // Verify CRC
+            let crc = crc32fast::hash(&buffer[..bytes_read as usize]);
+            if crc != batch.events_crc {
+                return Err(io::Error::other("CRC mismatch in event batch"));
+            }
 
-        if let Some(max_local_index) = filters.max_client_event_index {
-            event_batch
-                .events
-                .retain(|event| event.client_event_index <= max_local_index);
-        }
+            // Decompress and deserialize
+            let compression_type = CompressionType::from_tuple(batch.compression_type, None);
+            let mut event_batch = EventBatchItem::from_wire_format(
+                &buffer[..bytes_read as usize],
+                compression_type,
+                batch.uncompressed_size as usize,
+            )?;
 
-        // Final filtering for event_time
-        if let Some(min_event_time) = filters.min_event_timestamp {
-            event_batch
-                .events
-                .retain(|event| event.event_timestamp >= min_event_time);
-        }
+            // Final event type filtering (bloom filter might have false positives)
+            if let Some(event_types) = filters.include_event_types {
+                event_batch
+                    .events
+                    .retain(|event| event_types.contains(&event.event_type_major));
+            }
 
-        if let Some(max_event_time) = filters.max_event_timestamp {
-            event_batch
-                .events
-                .retain(|event| event.event_timestamp <= max_event_time);
-        }
+            // Final filtering for local_index
+            if let Some(min_local_index) = filters.min_client_event_index {
+                event_batch
+                    .events
+                    .retain(|event| event.client_event_index >= min_local_index);
+            }
 
-        // Final filtering for event index
-        if let Some(min_client_event_index) = filters.min_client_event_index {
-            event_batch
-                .events
-                .retain(|event| event.client_event_index >= min_client_event_index);
-        }
+            if let Some(max_local_index) = filters.max_client_event_index {
+                event_batch
+                    .events
+                    .retain(|event| event.client_event_index <= max_local_index);
+            }
 
-        if let Some(max_client_event_index) = filters.max_client_event_index {
-            event_batch
-                .events
-                .retain(|event| event.client_event_index <= max_client_event_index);
-        }
+            // Final filtering for event_time
+            if let Some(min_event_time) = filters.min_event_timestamp {
+                event_batch
+                    .events
+                    .retain(|event| event.event_timestamp >= min_event_time);
+            }
 
-        if !event_batch.events.is_empty() {
-            event_batches.push(event_batch);
+            if let Some(max_event_time) = filters.max_event_timestamp {
+                event_batch
+                    .events
+                    .retain(|event| event.event_timestamp <= max_event_time);
+            }
+
+            // Final filtering for event index
+            if let Some(min_client_event_index) = filters.min_client_event_index {
+                event_batch
+                    .events
+                    .retain(|event| event.client_event_index >= min_client_event_index);
+            }
+
+            if let Some(max_client_event_index) = filters.max_client_event_index {
+                event_batch
+                    .events
+                    .retain(|event| event.client_event_index <= max_client_event_index);
+            }
+
+            if !event_batch.events.is_empty() {
+                all_event_batches.push(event_batch);
+            }
         }
     }
 
     // Sort by server_id to maintain order
-    event_batches.sort_by_key(|batch| batch.event_batch_index);
+    all_event_batches.sort_by_key(|batch| batch.event_batch_index);
 
-    Ok(event_batches)
+    Ok(all_event_batches)
 }
 
 fn get_minimum_available_server_id<R: Read + Seek>(

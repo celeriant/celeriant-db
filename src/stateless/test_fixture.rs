@@ -138,7 +138,19 @@ pub mod tests {
             Ok(results)
         }
 
+        #[cfg(windows)]
         pub fn read_filtered<R: Read + Seek + AsRawHandle>(
+            &self,
+            event_batch_reader: &mut R,
+            metadata_reader: &mut R,
+            filters: &ReadFilters,
+        ) -> io::Result<crate::structures::read_result::ReadResult> {
+            self.engine
+                .read_filtered(event_batch_reader, metadata_reader, filters)
+        }
+
+        #[cfg(unix)]
+        pub fn read_filtered<R: Read + Seek + AsRawFd>(
             &self,
             event_batch_reader: &mut R,
             metadata_reader: &mut R,
