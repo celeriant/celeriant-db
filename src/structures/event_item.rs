@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
@@ -25,7 +27,7 @@ pub struct EventItem {
 
     /// Serialized event data payload
     #[serde(rename = "ev")]
-    pub event_value: Vec<u8>,
+    pub event_value: Arc<Vec<u8>>,
 }
 
 impl EventItem {
@@ -37,6 +39,7 @@ impl EventItem {
         event_type_minor: u64,
         event_value: Vec<u8>,
     ) -> Self {
+        let event_value = Arc::new(event_value);
         Self {
             client_event_index,
             event_index,

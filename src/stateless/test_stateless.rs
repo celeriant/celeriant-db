@@ -5,6 +5,7 @@ mod tests {
     use std::os::fd::AsRawFd;
     #[cfg(windows)]
     use std::os::windows::io::AsRawHandle;
+    use std::sync::Arc;
 
     use crate::stateless::stateless_destructive::StatelessDestructive;
     use crate::stateless::stateless_engine::StatelessEngine;
@@ -92,7 +93,10 @@ mod tests {
         assert_eq!(event_batch_0.events[0].client_event_index, 33);
         assert_eq!(event_batch_0.events[0].event_type_major, 1);
         assert_eq!(event_batch_0.events[0].event_type_minor, 1);
-        assert_eq!(event_batch_0.events[0].event_value, b"test event".to_vec());
+        assert_eq!(
+            event_batch_0.events[0].event_value,
+            Arc::new(b"test event".to_vec())
+        );
 
         Ok(())
     }
@@ -111,7 +115,7 @@ mod tests {
         event2.event_timestamp = 1550;
         event2.event_type_major = 20;
         event2.event_type_minor = 23;
-        event2.event_value = b"test event 2".to_vec();
+        event2.event_value = Arc::new(b"test event 2".to_vec());
 
         let batch = fixture.create_simple_batch(0, vec![event1, event2]);
 
@@ -166,7 +170,10 @@ mod tests {
         assert_eq!(event_batch_0.events[0].client_event_index, 33);
         assert_eq!(event_batch_0.events[0].event_type_major, 1);
         assert_eq!(event_batch_0.events[0].event_type_minor, 1);
-        assert_eq!(event_batch_0.events[0].event_value, b"test event".to_vec());
+        assert_eq!(
+            event_batch_0.events[0].event_value,
+            Arc::new(b"test event".to_vec())
+        );
         assert_eq!(event_batch_0.events[1].event_index, 1);
         assert_eq!(event_batch_0.events[1].event_timestamp, 1550);
         assert_eq!(event_batch_0.events[1].client_event_index, 34);
@@ -174,7 +181,7 @@ mod tests {
         assert_eq!(event_batch_0.events[1].event_type_minor, 23);
         assert_eq!(
             event_batch_0.events[1].event_value,
-            b"test event 2".to_vec()
+            Arc::new(b"test event 2".to_vec())
         );
 
         Ok(())
@@ -194,7 +201,7 @@ mod tests {
         event2.event_timestamp = 1550;
         event2.event_type_major = 20;
         event2.event_type_minor = 23;
-        event2.event_value = b"test event 2".to_vec();
+        event2.event_value = Arc::new(b"test event 2".to_vec());
 
         let batch = fixture.create_simple_batch(0, vec![event1, event2]);
 
@@ -230,7 +237,7 @@ mod tests {
         let mut event3 = fixture.create_simple_event(2);
         event3.client_event_index = 35;
         event3.event_timestamp = 1999;
-        event3.event_value = b"test event 3".to_vec();
+        event3.event_value = Arc::new(b"test event 3".to_vec());
 
         let mut batch2 = fixture.create_simple_batch(1, vec![event3]);
         batch2.client_id = 123456790;
@@ -287,7 +294,10 @@ mod tests {
         assert_eq!(event_batch_0.events[0].client_event_index, 33);
         assert_eq!(event_batch_0.events[0].event_type_major, 1);
         assert_eq!(event_batch_0.events[0].event_type_minor, 1);
-        assert_eq!(event_batch_0.events[0].event_value, b"test event".to_vec());
+        assert_eq!(
+            event_batch_0.events[0].event_value,
+            Arc::new(b"test event".to_vec())
+        );
         assert_eq!(event_batch_0.events[1].event_index, 1);
         assert_eq!(event_batch_0.events[1].event_timestamp, 1550);
         assert_eq!(event_batch_0.events[1].client_event_index, 34);
@@ -295,7 +305,7 @@ mod tests {
         assert_eq!(event_batch_0.events[1].event_type_minor, 23);
         assert_eq!(
             event_batch_0.events[1].event_value,
-            b"test event 2".to_vec()
+            Arc::new(b"test event 2".to_vec())
         );
 
         let event_batch_1 = &read_result.event_batches[1];
@@ -312,7 +322,7 @@ mod tests {
         assert_eq!(event_batch_1.events[0].event_type_minor, 1);
         assert_eq!(
             event_batch_1.events[0].event_value,
-            b"test event 3".to_vec()
+            Arc::new(b"test event 3".to_vec())
         );
 
         Ok(())
@@ -416,9 +426,12 @@ mod tests {
 
         assert_eq!(
             read_batch.events[0].event_value,
-            "你好世界".to_string().into_bytes()
+            Arc::new("你好世界".to_string().into_bytes())
         );
-        assert_eq!(read_batch.events[1].event_value, vec![0u8, 1u8, 2u8, 255u8]);
+        assert_eq!(
+            read_batch.events[1].event_value,
+            Arc::new(vec![0u8, 1u8, 2u8, 255u8])
+        );
 
         Ok(())
     }
@@ -2777,7 +2790,10 @@ mod tests {
         let remaining_batch = &read_result.event_batches[0];
         assert_eq!(remaining_batch.event_batch_index, 2);
         assert_eq!(remaining_batch.events.len(), 1);
-        assert_eq!(remaining_batch.events[0].event_value, b"batch2_event1");
+        assert_eq!(
+            remaining_batch.events[0].event_value,
+            Arc::new(b"batch2_event1".to_vec())
+        );
 
         // Verify no corruption
         let corruption =
@@ -3054,7 +3070,7 @@ mod tests {
         assert_eq!(read_result.event_batches[0].events[0].client_event_index, 3);
         assert_eq!(
             read_result.event_batches[0].events[0].event_value,
-            vec![2u8; 300]
+            Arc::new(vec![2u8; 300])
         );
 
         // Verify positions for batch 13 after trim
