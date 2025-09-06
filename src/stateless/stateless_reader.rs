@@ -45,7 +45,7 @@ pub trait StatelessReader {
     ) -> io::Result<ReadResult>;
 
     #[cfg(windows)]
-    fn read_filtered<R: Read + Seek + AsRawHandle>(
+    fn read_filtered<R: Read + Seek>(
         &self,
         event_batch_reader: &mut R,
         metadata_reader: &mut R,
@@ -103,6 +103,41 @@ pub trait StatelessReader {
         event_batch_reader: &mut R,
         metadata_reader: &mut R,
     ) -> io::Result<Option<CorruptPositions>>;
+
+    /// Get metadata for a specific event batch index
+    ///
+    /// # Arguments
+    /// * `metadata_reader` - Any readable and seekable source (File, Cursor<Vec<u8>>, etc.) which contains all the metadata for each batch
+    /// * `event_batch_index` - The specific event batch index to retrieve metadata for
+    ///
+    /// # Returns
+    /// * `Some(EventBatchMetadata)` if found
+    /// * `None` if not found
+    fn metadata_at_event_batch_index<R: Read + Seek>(
+        &self,
+        metadata_reader: &mut R,
+        event_batch_index: u64,
+    ) -> io::Result<Option<EventBatchMetadata>>;
+
+    /// Get the file positions for a specific event batch index
+    ///
+    /// # Arguments
+    /// * `metadata_reader` - Any readable and seekable source (File, Cursor<Vec<u8>>, etc.) which contains all the metadata for each batch
+    /// * `event_batch_index` - The specific event batch index to get positions for
+    ///
+    /// # Returns
+    /// * `Some(EventBatchPositions)` if found
+    /// * `None` if not found
+    fn positions_for_event_batch_index<R: Read + Seek>(
+        &self,
+        metadata_reader: &mut R,
+        event_batch_index: u64,
+    ) -> io::Result<Option<EventBatchPositions>>;
+}
+
+pub struct EventBatchPositions {
+    pub metadata_position: u64,
+    pub event_batch_position: u64,
 }
 
 pub struct CorruptPositions {
@@ -111,6 +146,144 @@ pub struct CorruptPositions {
 }
 
 impl StatelessReader for StatelessEngine {
+    fn positions_for_event_batch_index<R: Read + Seek>(
+        &self,
+        metadata_reader: &mut R,
+        event_batch_index: u64,
+    ) -> io::Result<Option<EventBatchPositions>> {
+        // Get file length to check if we have any metadata entries
+        let file_len = metadata_reader.seek(SeekFrom::End(0))?;
+
+        // Check if file has at least one metadata entry
+        if file_len < METADATA_BATCH_SIZE_BYTES as u64 {
+            return Ok(None);
+        }
+
+        // Get the first metadata entry to find the starting event_batch_index
+        metadata_reader.seek(SeekFrom::Start(0))?;
+        let mut buffer = [0u8; METADATA_BATCH_SIZE_BYTES];
+        let bytes_read = metadata_reader.read(&mut buffer)?;
+
+        if bytes_read < METADATA_BATCH_SIZE_BYTES {
+            return Ok(None);
+        }
+
+        let first_metadata: EventBatchMetadata =
+            bincode::decode_from_slice(&buffer, BINCODE_CONFIG_FIXED)
+                .map_err(|e| io::Error::other(e.to_string()))?
+                .0;
+
+        let first_event_batch_index = first_metadata.event_batch_index;
+
+        // Check if the requested index is before the first available index
+        if event_batch_index < first_event_batch_index {
+            return Ok(None);
+        }
+
+        // Calculate the metadata position for the requested event_batch_index
+        let offset_index = event_batch_index - first_event_batch_index;
+        let metadata_position = offset_index * METADATA_BATCH_SIZE_BYTES as u64;
+
+        // Check if the calculated offset is within the file bounds
+        if metadata_position + METADATA_BATCH_SIZE_BYTES as u64 > file_len {
+            return Ok(None);
+        }
+
+        // Now we need to calculate the event batch position by reading all metadata entries
+        // from the beginning up to the requested index to sum up the compressed sizes
+        metadata_reader.seek(SeekFrom::Start(0))?;
+        let mut event_batch_position = 0u64;
+        let entries_to_read = offset_index as usize;
+
+        // Read and sum compressed sizes for all entries before the target
+        for _ in 0..entries_to_read {
+            let bytes_read = metadata_reader.read(&mut buffer)?;
+
+            if bytes_read < METADATA_BATCH_SIZE_BYTES {
+                return Ok(None);
+            }
+
+            let metadata: EventBatchMetadata =
+                bincode::decode_from_slice(&buffer, BINCODE_CONFIG_FIXED)
+                    .map_err(|e| io::Error::other(e.to_string()))?
+                    .0;
+
+            event_batch_position += metadata.compressed_size;
+        }
+
+        Ok(Some(EventBatchPositions {
+            metadata_position,
+            event_batch_position,
+        }))
+    }
+
+    fn metadata_at_event_batch_index<R: Read + Seek>(
+        &self,
+        metadata_reader: &mut R,
+        event_batch_index: u64,
+    ) -> io::Result<Option<EventBatchMetadata>> {
+        // Get file length to check if we have any metadata entries
+        let file_len = metadata_reader.seek(SeekFrom::End(0))?;
+
+        // Check if file has at least one metadata entry
+        if file_len < METADATA_BATCH_SIZE_BYTES as u64 {
+            return Ok(None);
+        }
+
+        // Get the first metadata entry to find the starting event_batch_index
+        metadata_reader.seek(SeekFrom::Start(0))?;
+        let mut buffer = [0u8; METADATA_BATCH_SIZE_BYTES];
+        let bytes_read = metadata_reader.read(&mut buffer)?;
+
+        if bytes_read < METADATA_BATCH_SIZE_BYTES {
+            return Ok(None);
+        }
+
+        let first_metadata: EventBatchMetadata =
+            bincode::decode_from_slice(&buffer, BINCODE_CONFIG_FIXED)
+                .map_err(|e| io::Error::other(e.to_string()))?
+                .0;
+
+        let first_event_batch_index = first_metadata.event_batch_index;
+
+        // Check if the requested index is before the first available index
+        if event_batch_index < first_event_batch_index {
+            return Ok(None);
+        }
+
+        // Calculate the offset for the requested event_batch_index
+        let offset_index = event_batch_index - first_event_batch_index;
+        let byte_offset = offset_index * METADATA_BATCH_SIZE_BYTES as u64;
+
+        // Check if the calculated offset is within the file bounds
+        if byte_offset + METADATA_BATCH_SIZE_BYTES as u64 > file_len {
+            return Ok(None);
+        }
+
+        // Seek to the calculated position
+        metadata_reader.seek(SeekFrom::Start(byte_offset))?;
+
+        // Read the metadata entry
+        let bytes_read = metadata_reader.read(&mut buffer)?;
+
+        if bytes_read < METADATA_BATCH_SIZE_BYTES {
+            return Ok(None);
+        }
+
+        // Deserialize the metadata
+        let metadata: EventBatchMetadata =
+            bincode::decode_from_slice(&buffer, BINCODE_CONFIG_FIXED)
+                .map_err(|e| io::Error::other(e.to_string()))?
+                .0;
+
+        // Verify that we got the correct event_batch_index
+        if metadata.event_batch_index == event_batch_index {
+            Ok(Some(metadata))
+        } else {
+            Ok(None)
+        }
+    }
+
     fn last_event_batch_index<R: Read + Seek>(&self, metadata_reader: &mut R) -> io::Result<u64> {
         // Get file length to find the last metadata entry
         let file_len = metadata_reader.seek(SeekFrom::End(0))?;
@@ -302,7 +475,7 @@ impl StatelessReader for StatelessEngine {
     }
 
     #[cfg(windows)]
-    fn read_filtered<R: Read + Seek + AsRawHandle>(
+    fn read_filtered<R: Read + Seek>(
         &self,
         event_batch_reader: &mut R,
         metadata_reader: &mut R,
@@ -524,7 +697,9 @@ fn read_metadata_entries_with_uring<R: Read + Seek + AsRawFd>(
                 .user_data(i as u64);
 
             unsafe {
-                ring.submission().push(&read_op).expect("Queue should have space");
+                ring.submission()
+                    .push(&read_op)
+                    .expect("Queue should have space");
             }
             submission_count += 1;
         }
@@ -537,7 +712,7 @@ fn read_metadata_entries_with_uring<R: Read + Seek + AsRawFd>(
             // We'll create actual entries based on the order of completion
             chunk_entries.push(MetadataBatchInfo::default());
         }
-        
+
         for _ in 0..submission_count {
             let cqe = ring
                 .completion()
@@ -736,7 +911,7 @@ fn read_event_batches_with_uring<R: Read + Seek + AsRawFd>(
 
     let mut ring = IoUring::new(io_uring_queue_depth)?;
     let fd = types::Fd(event_batch_reader.as_raw_fd());
-    
+
     let mut all_event_batches = Vec::new();
     let chunk_size = io_uring_queue_depth as usize;
 
@@ -760,7 +935,9 @@ fn read_event_batches_with_uring<R: Read + Seek + AsRawFd>(
                 .user_data(i as u64);
 
             unsafe {
-                ring.submission().push(&read_op).expect("Queue should have space");
+                ring.submission()
+                    .push(&read_op)
+                    .expect("Queue should have space");
             }
             submission_count += 1;
         }

@@ -2847,4 +2847,243 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn test_positions_for_event_batch_index() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Create test batches with different sizes
+        let events1 = vec![fixture.create_event_with_data(1, vec![0u8; 100])];
+        let events2 = vec![fixture.create_event_with_data(2, vec![1u8; 200])];
+        let events3 = vec![fixture.create_event_with_data(3, vec![2u8; 300])];
+
+        let batch1 = fixture.create_simple_batch(10, events1); // Start from index 10
+        let batch2 = fixture.create_simple_batch(11, events2);
+        let batch3 = fixture.create_simple_batch(12, events3);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+
+        // Write batches and capture metadata to know compressed sizes
+        let metadata1 =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch1)?;
+        let metadata2 =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch2)?;
+        let metadata3 =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch3)?;
+
+        drop(event_batch_writer);
+        drop(metadata_writer);
+
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+
+        // Test getting positions for first batch (index 10)
+        let positions = fixture
+            .engine
+            .positions_for_event_batch_index(&mut metadata_reader, 10)?;
+        assert!(positions.is_some());
+        let pos = positions.unwrap();
+        assert_eq!(pos.metadata_position, 0); // First metadata entry
+        assert_eq!(pos.event_batch_position, 0); // First event batch
+
+        // Test getting positions for second batch (index 11)
+        let positions = fixture
+            .engine
+            .positions_for_event_batch_index(&mut metadata_reader, 11)?;
+        assert!(positions.is_some());
+        let pos = positions.unwrap();
+        assert_eq!(pos.metadata_position, METADATA_BATCH_SIZE_BYTES as u64); // Second metadata entry
+        assert_eq!(pos.event_batch_position, metadata1.compressed_size); // After first batch
+
+        // Test getting positions for third batch (index 12)
+        let positions = fixture
+            .engine
+            .positions_for_event_batch_index(&mut metadata_reader, 12)?;
+        assert!(positions.is_some());
+        let pos = positions.unwrap();
+        assert_eq!(pos.metadata_position, 2 * METADATA_BATCH_SIZE_BYTES as u64); // Third metadata entry
+        assert_eq!(
+            pos.event_batch_position,
+            metadata1.compressed_size + metadata2.compressed_size
+        ); // After first two batches
+
+        // Test getting positions for non-existent batch (too low)
+        let positions = fixture
+            .engine
+            .positions_for_event_batch_index(&mut metadata_reader, 9)?;
+        assert!(positions.is_none());
+
+        // Test getting positions for non-existent batch (too high)
+        let positions = fixture
+            .engine
+            .positions_for_event_batch_index(&mut metadata_reader, 15)?;
+        assert!(positions.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_positions_for_event_batch_index_single_batch() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Create single batch starting from a high index
+        let events = vec![fixture.create_event_with_data(1, vec![0u8; 500])];
+        let batch = fixture.create_simple_batch(100, events);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+        let metadata =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch)?;
+
+        drop(event_batch_writer);
+        drop(metadata_writer);
+
+        let (mut _event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+
+        // Test getting positions for the single batch
+        let positions = fixture
+            .engine
+            .positions_for_event_batch_index(&mut metadata_reader, 100)?;
+        assert!(positions.is_some());
+        let pos = positions.unwrap();
+        assert_eq!(pos.metadata_position, 0);
+        assert_eq!(pos.event_batch_position, 0);
+
+        // Test positions for indices before the available range
+        let positions = fixture
+            .engine
+            .positions_for_event_batch_index(&mut metadata_reader, 99)?;
+        assert!(positions.is_none());
+
+        // Test positions for indices after the available range
+        let positions = fixture
+            .engine
+            .positions_for_event_batch_index(&mut metadata_reader, 101)?;
+        assert!(positions.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_positions_after_trim_start_and_read() -> io::Result<()> {
+        let mut fixture = TestFixture::new()?;
+
+        // Create test batches with different sizes
+        let events1 = vec![fixture.create_event_with_data(1, vec![0u8; 100])];
+        let events2 = vec![fixture.create_event_with_data(2, vec![1u8; 200])];
+        let events3 = vec![fixture.create_event_with_data(3, vec![2u8; 300])];
+        let events4 = vec![fixture.create_event_with_data(4, vec![3u8; 400])];
+
+        let batch1 = fixture.create_simple_batch(10, events1);
+        let batch2 = fixture.create_simple_batch(11, events2);
+        let batch3 = fixture.create_simple_batch(12, events3);
+        let batch4 = fixture.create_simple_batch(13, events4);
+
+        let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
+
+        // Write batches and capture metadata
+        let metadata1 =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch1)?;
+        let metadata2 =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch2)?;
+        let metadata3 =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch3)?;
+        let metadata4 =
+            fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch4)?;
+
+        drop(event_batch_writer);
+        drop(metadata_writer);
+
+        // Get positions for batch 12 before trim
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+        let positions_before_trim = fixture
+            .engine
+            .positions_for_event_batch_index(&mut metadata_reader, 12)?;
+        assert!(positions_before_trim.is_some());
+        let pos_before = positions_before_trim.unwrap();
+
+        // Expected positions before trim:
+        // - Metadata position: 2 * METADATA_BATCH_SIZE_BYTES (third entry, index 12)
+        // - Event batch position: metadata1.compressed_size + metadata2.compressed_size
+        assert_eq!(
+            pos_before.metadata_position,
+            2 * METADATA_BATCH_SIZE_BYTES as u64
+        );
+        assert_eq!(
+            pos_before.event_batch_position,
+            metadata1.compressed_size + metadata2.compressed_size
+        );
+
+        // Trim start to remove first two batches (keep from batch 12 onwards)
+        let trim_event_batch_position = metadata1.compressed_size + metadata2.compressed_size;
+        let trim_metadata_position = 2 * METADATA_BATCH_SIZE_BYTES as u64;
+
+        fixture.trim_start(
+            &mut event_batch_reader,
+            trim_event_batch_position,
+            &mut metadata_reader,
+            trim_metadata_position,
+        )?;
+
+        drop(event_batch_reader);
+        drop(metadata_reader);
+
+        // Get positions for batch 12 after trim
+        let (mut event_batch_reader, mut metadata_reader) = fixture.create_readers()?;
+        let positions_after_trim = fixture
+            .engine
+            .positions_for_event_batch_index(&mut metadata_reader, 12)?;
+        assert!(positions_after_trim.is_some());
+        let pos_after = positions_after_trim.unwrap();
+
+        // After trim, batch 12 should now be at the beginning of both files
+        assert_eq!(pos_after.metadata_position, 0);
+        assert_eq!(pos_after.event_batch_position, 0);
+
+        // Verify we can still read from event_batch_index 12 after trim
+        let read_result = fixture.read_filtered(
+            &mut event_batch_reader,
+            &mut metadata_reader,
+            &ReadFilters::new(12),
+        )?;
+
+        assert_eq!(read_result.event_batches.len(), 2); // Should have batches 12 and 13
+        assert_eq!(read_result.event_batches[0].event_batch_index, 12);
+        assert_eq!(read_result.event_batches[1].event_batch_index, 13);
+
+        // Verify the content of batch 12 is correct
+        assert_eq!(read_result.event_batches[0].events.len(), 1);
+        assert_eq!(read_result.event_batches[0].events[0].client_event_index, 3);
+        assert_eq!(
+            read_result.event_batches[0].events[0].event_value,
+            vec![2u8; 300]
+        );
+
+        // Verify positions for batch 13 after trim
+        let positions_batch_13 = fixture
+            .engine
+            .positions_for_event_batch_index(&mut metadata_reader, 13)?;
+        assert!(positions_batch_13.is_some());
+        let pos_13 = positions_batch_13.unwrap();
+
+        // Batch 13 should be at the second position after trim
+        assert_eq!(pos_13.metadata_position, METADATA_BATCH_SIZE_BYTES as u64);
+        assert_eq!(pos_13.event_batch_position, metadata3.compressed_size);
+
+        // Verify trimmed batches are no longer accessible
+        let positions_batch_10 = fixture
+            .engine
+            .positions_for_event_batch_index(&mut metadata_reader, 10)?;
+        assert!(positions_batch_10.is_none());
+
+        let positions_batch_11 = fixture
+            .engine
+            .positions_for_event_batch_index(&mut metadata_reader, 11)?;
+        assert!(positions_batch_11.is_none());
+
+        // Verify no corruption after trim
+        let corruption =
+            fixture.detect_corruption(&mut event_batch_reader, &mut metadata_reader)?;
+        assert!(corruption.is_none());
+
+        Ok(())
+    }
 }
