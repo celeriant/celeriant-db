@@ -1,14 +1,16 @@
-
-use std::io;
-use std::io::{Write};
+use eventplanedb_storage_structures::compression_type::CompressionType;
+use eventplanedb_storage_structures::constants::{BINCODE_CONFIG_FIXED, BLOOM_BYTES};
+use eventplanedb_storage_structures::event_batch_item::EventBatchItem;
+use eventplanedb_storage_structures::event_batch_metadata::EventBatchMetadata;
+use eventplanedb_storage_structures::event_item::EventItem;
 use fastbloom::BloomFilter;
-use crate::stateless::stateless_engine::StatelessEngine;
-use crate::structures::compression_type::CompressionType;
-use crate::structures::constants::{BINCODE_CONFIG_FIXED, BLOOM_BYTES};
-use crate::structures::event_batch_item::EventBatchItem;
-use crate::structures::event_item::EventItem;
-use crate::structures::event_batch_metadata::EventBatchMetadata;
+
 use std::collections::HashSet;
+use std::io;
+use std::io::Write;
+
+use crate::stateless_engine::StatelessEngine;
+use crate::wire_format::to_wire_format_variable;
 
 pub trait StatelessWriter {
     fn append_event_batch<W: Write, M: Write>(
@@ -35,24 +37,28 @@ impl StatelessWriter for StatelessEngine {
         if event_batch_item.events.is_empty() {
             return Err(io::Error::other("Cannot write empty event batch"));
         }
-    
+
         // Serialize and compress the event data
         let (uncompressed_size, compressed_event_batch_item) =
-            event_batch_item.to_wire_format(compression_type)?;
+            to_wire_format_variable(&event_batch_item, compression_type)?;
         let events_crc = crc32fast::hash(&compressed_event_batch_item);
-    
+
         // Determine event types data (bloom filter or direct array)
         let (event_types, use_bloom) = extract_unique_event_types(&event_batch_item.events);
         let event_types_data = if use_bloom {
             let bloom_bytes =
                 create_bloom_filter_bytes(bloom_filter, event_type_dedup, &event_batch_item.events);
-            crate::structures::event_batch_metadata::EventTypesData::Bloom(bloom_bytes)
+            eventplanedb_storage_structures::event_batch_metadata::EventTypesData::Bloom(
+                bloom_bytes,
+            )
         } else {
-            crate::structures::event_batch_metadata::EventTypesData::Direct(event_types)
+            eventplanedb_storage_structures::event_batch_metadata::EventTypesData::Direct(
+                event_types,
+            )
         };
-    
+
         // Create and serialise metadata
-        let metadata = crate::structures::event_batch_metadata::EventBatchMetadata::from_batch_item(
+        let metadata = eventplanedb_storage_structures::event_batch_metadata::EventBatchMetadata::from_batch_item(
             event_batch_item,
             uncompressed_size as u64,
             compressed_event_batch_item.len() as u64,
@@ -60,20 +66,19 @@ impl StatelessWriter for StatelessEngine {
             event_types_data,
             events_crc,
         );
-    
+
         let metadata_bytes = bincode::encode_to_vec(&metadata, BINCODE_CONFIG_FIXED)
             .map_err(|e| io::Error::other(e.to_string()))?;
-    
+
         // Write data to disk
         event_batch_writer.write_all(&compressed_event_batch_item)?;
         metadata_writer.write_all(&metadata_bytes)?;
-    
+
         event_batch_writer.flush()?;
         metadata_writer.flush()?;
-    
+
         Ok(metadata)
     }
-
 }
 
 fn extract_unique_event_types(events: &[EventItem]) -> ([u64; 4], bool) {
@@ -128,5 +133,5 @@ fn create_bloom_filter_bytes(
         filter.insert(&event_type.to_le_bytes());
     }
 
-    filter.as_slice().try_into().expect("Conversion failed")    
+    filter.as_slice().try_into().expect("Conversion failed")
 }

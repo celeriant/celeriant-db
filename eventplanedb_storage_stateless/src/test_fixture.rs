@@ -6,15 +6,11 @@ pub mod tests {
     #[cfg(windows)]
     use std::os::windows::io::AsRawHandle;
 
-    use crate::stateless::stateless_destructive::StatelessDestructive;
-    use crate::stateless::stateless_engine::StatelessEngine;
-    use crate::stateless::stateless_reader::{CorruptPositions, StatelessReader};
-    use crate::stateless::stateless_writer::StatelessWriter;
-    use crate::structures::constants::{
-        BINCODE_CONFIG_FIXED, BLOOM_HASH_SEED, METADATA_BATCH_SIZE_BYTES,
-    };
-    use crate::structures::event_batch_metadata::EventBatchMetadata;
-    use crate::structures::{
+    use eventplanedb_storage_structures::constants::BLOOM_HASH_SEED;
+    use eventplanedb_storage_structures::event_batch_metadata::EventBatchMetadata;
+    #[cfg(windows)]
+    use eventplanedb_storage_structures::read_result::ReadResult;
+    use eventplanedb_storage_structures::{
         compression_type::CompressionType,
         constants::{BLOOM_BYTES, BLOOM_HASH_COUNT},
         event_batch_item::EventBatchItem,
@@ -22,13 +18,18 @@ pub mod tests {
         read_filters::ReadFilters,
     };
     use fastbloom::BloomFilter;
-    use rand::Rng;
     use std::collections::HashSet;
     use std::fs::File;
     use std::io;
-    use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-    use std::path::Path;
+    use std::io::{Read, Seek, Write};
     use tempfile::tempdir;
+
+    use crate::{
+        stateless_destructive::StatelessDestructive,
+        stateless_engine::StatelessEngine,
+        stateless_reader::{CorruptPositions, StatelessReader},
+        stateless_writer::StatelessWriter,
+    };
 
     pub struct TestFixture {
         pub _temp_dir: tempfile::TempDir, // Keep temp dir alive
@@ -113,7 +114,7 @@ pub mod tests {
             event_batch_writer: &mut impl Write,
             metadata_writer: &mut impl Write,
             batch: &EventBatchItem,
-        ) -> io::Result<crate::structures::event_batch_metadata::EventBatchMetadata> {
+        ) -> io::Result<EventBatchMetadata> {
             self.engine.append_event_batch(
                 event_batch_writer,
                 metadata_writer,
@@ -129,7 +130,7 @@ pub mod tests {
             event_batch_writer: &mut impl Write,
             metadata_writer: &mut impl Write,
             batches: &[EventBatchItem],
-        ) -> io::Result<Vec<crate::structures::event_batch_metadata::EventBatchMetadata>> {
+        ) -> io::Result<Vec<EventBatchMetadata>> {
             let mut results = Vec::new();
             for batch in batches {
                 let metadata = self.write_batch(event_batch_writer, metadata_writer, batch)?;
@@ -144,7 +145,9 @@ pub mod tests {
             event_batch_reader: &mut R,
             metadata_reader: &mut R,
             filters: &ReadFilters,
-        ) -> io::Result<crate::structures::read_result::ReadResult> {
+        ) -> io::Result<ReadResult> {
+            use crate::stateless_reader::StatelessReader;
+
             self.engine
                 .read_filtered(event_batch_reader, metadata_reader, filters)
         }
@@ -277,7 +280,7 @@ pub mod tests {
             &mut self,
             batches: &[EventBatchItem],
             filters: &ReadFilters,
-        ) -> io::Result<crate::structures::read_result::ReadResult> {
+        ) -> io::Result<ReadResult> {
             let (mut event_batch_writer, mut metadata_writer) = self.create_writers()?;
             self.write_batches(&mut event_batch_writer, &mut metadata_writer, batches)?;
 

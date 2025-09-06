@@ -8,7 +8,7 @@ where
     match value {
         Some(v) => {
             let bytes = v.to_le_bytes();
-            let encoded = general_purpose::STANDARD.encode(&bytes);
+            let encoded = general_purpose::STANDARD.encode(bytes);
             Some(encoded).serialize(serializer)
         }
         None => None::<String>.serialize(serializer),

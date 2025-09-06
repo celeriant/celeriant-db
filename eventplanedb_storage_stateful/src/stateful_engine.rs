@@ -5,20 +5,20 @@ use std::{
     time::Duration,
 };
 
-use crate::{
-    stateless::{
-        stateless_destructive::StatelessDestructive, stateless_engine::StatelessEngine,
-        stateless_reader::StatelessReader, stateless_writer::StatelessWriter,
-    },
-    structures::{
-        compression_type::CompressionType,
-        constants::{BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED},
-        event_batch_item::EventBatchItem,
-        event_batch_metadata::EventBatchMetadata,
-        event_item::EventItem,
-        read_filters::ReadFilters,
-        read_result::ReadResult,
-    },
+//TODO: Setting event_index correctly
+
+use eventplanedb_storage_stateless::{
+    stateless_destructive::StatelessDestructive, stateless_engine::StatelessEngine,
+    stateless_reader::StatelessReader, stateless_writer::StatelessWriter,
+};
+use eventplanedb_storage_structures::{
+    compression_type::CompressionType,
+    constants::{BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED},
+    event_batch_item::EventBatchItem,
+    event_batch_metadata::EventBatchMetadata,
+    event_item::EventItem,
+    read_filters::ReadFilters,
+    read_result::ReadResult,
 };
 use fastbloom::BloomFilter;
 use std::collections::HashSet;
@@ -28,6 +28,7 @@ use super::{
     file_cache::FileCache, memory_cache::LruMemoryCache,
 };
 
+#[derive(Debug, Clone)]
 pub struct StatefulEngineConfig {
     // Cache configurations
     pub last_event_batch_cache_size: usize, // default: 10,000
@@ -368,7 +369,7 @@ impl StatefulEngine {
 
     fn apply_event_filters(batch: &mut EventBatchItem, filters: &ReadFilters) {
         // Filter by event types
-        if let Some(include_types) = filters.include_event_types {
+        if let Some(include_types) = filters.include_event_types.as_deref() {
             batch
                 .events
                 .retain(|event| include_types.contains(&event.event_type_major));
@@ -676,11 +677,6 @@ impl StatefulDestructive for StatefulEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        stateful::stateful_engine::{StatefulEngine, StatefulEngineConfig},
-        structures::{event_item::EventItem, read_filters::ReadFilters},
-    };
-    use rand::rand_core::le;
     use std::{fs, io, path::PathBuf};
     use tempfile::TempDir;
 
@@ -1662,7 +1658,7 @@ mod tests {
 
         // Filter by event types
         let mut filters = ReadFilters::new(0);
-        filters.include_event_types = Some(&[42, 44]);
+        filters.include_event_types = Some((&[42, 44]).to_vec());
 
         let result = fixture.engine.read_filtered("test_aggregate", &filters)?;
         assert_eq!(result.event_batches.len(), 1);
@@ -1951,7 +1947,7 @@ mod tests {
         // Complex filter: specific client, event type, and timestamp range
         let mut filters = ReadFilters::new(0);
         filters.include_client_id = Some(100);
-        filters.include_event_types = Some(&[42, 43]);
+        filters.include_event_types = Some([42, 43].to_vec());
         filters.min_event_timestamp = Some(1500);
 
         let result = fixture.engine.read_filtered("test_aggregate", &filters)?;

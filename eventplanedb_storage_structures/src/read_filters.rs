@@ -1,6 +1,6 @@
 /// Filters and pagination options for reading event batches
 #[derive(Debug, Default)]
-pub struct ReadFilters<'a> {
+pub struct ReadFilters {
     /// Starting server ID to begin reading from (inclusive). Will error if not found in stream.
     pub from_event_batch_index: u64,
     /// End reading event batches at this server id (inclusive). Will error if reached end of stream before this ID.
@@ -8,7 +8,7 @@ pub struct ReadFilters<'a> {
     /// Optional limit on the total response size in bytes to prevent large responses
     pub max_bytes: Option<usize>,
     /// Optional whitelist of event types to include in results
-    pub include_event_types: Option<&'a [u64]>,
+    pub include_event_types: Option<Vec<u64>>,
     /// Skip events created by this client
     pub exclude_client_id: Option<u128>,
     /// Only get events for this client
@@ -35,7 +35,7 @@ pub struct ReadFilters<'a> {
     pub max_event_index: Option<u64>,
 }
 
-impl<'a> ReadFilters<'a> {
+impl ReadFilters {
     pub fn new(from_event_batch_index: u64) -> Self {
         Self {
             from_event_batch_index,
@@ -53,7 +53,7 @@ impl<'a> ReadFilters<'a> {
         self
     }
 
-    pub fn include_event_types(mut self, event_types: &'a [u64]) -> Self {
+    pub fn include_event_types(mut self, event_types: Vec<u64>) -> Self {
         self.include_event_types = Some(event_types);
         self
     }

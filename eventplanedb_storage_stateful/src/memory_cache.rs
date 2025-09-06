@@ -1,8 +1,8 @@
 use lru::LruCache;
 use std::num::NonZeroUsize;
 
-use crate::structures::event_batch_item::EventBatchItem;
-use crate::structures::event_batch_metadata::EventBatchMetadata;
+use eventplanedb_storage_structures::event_batch_item::EventBatchItem;
+use eventplanedb_storage_structures::event_batch_metadata::EventBatchMetadata;
 
 /// High-performance memory cache using LRU eviction
 /// Each aggregate stores a vector of (EventBatchItem, EventBatchMetadata) pairs
@@ -292,7 +292,7 @@ impl LruMemoryCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::structures::event_item::EventItem;
+    use eventplanedb_storage_structures::event_item::EventItem;
 
     #[test]
     fn test_gap_detection() {

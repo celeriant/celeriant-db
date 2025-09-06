@@ -1,5 +1,6 @@
 use std::sync::OnceLock;
 
+#[derive(Debug, Clone)]
 pub struct StatelessEngine {
     pub io_uring_queue_depth: u32,
     pub io_uring_status: IoUringStatus,
@@ -82,11 +83,11 @@ pub enum IoUringStatus {
 
 #[cfg(test)]
 mod tests {
-    use crate::stateless::stateless_engine::StatelessEngine;
-    use crate::stateless::stateless_reader::StatelessReader;
-    use crate::stateless::stateless_writer::StatelessWriter;
-    use crate::structures::constants::BLOOM_HASH_SEED;
-    use crate::structures::{
+    use crate::stateless_engine::StatelessEngine;
+    use crate::stateless_reader::StatelessReader;
+    use crate::stateless_writer::StatelessWriter;
+    use eventplanedb_storage_structures::constants::BLOOM_HASH_SEED;
+    use eventplanedb_storage_structures::{
         compression_type::CompressionType,
         constants::{BLOOM_BYTES, BLOOM_HASH_COUNT},
         event_batch_item::EventBatchItem,

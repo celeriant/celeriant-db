@@ -7,15 +7,15 @@ mod tests {
     use std::os::windows::io::AsRawHandle;
     use std::sync::Arc;
 
-    use crate::stateless::stateless_destructive::StatelessDestructive;
-    use crate::stateless::stateless_engine::StatelessEngine;
-    use crate::stateless::stateless_reader::{CorruptPositions, StatelessReader};
-    use crate::stateless::stateless_writer::StatelessWriter;
-    use crate::stateless::test_fixture::tests::TestFixture;
-    use crate::structures::constants::{
+    use crate::stateless_destructive::StatelessDestructive;
+    use crate::stateless_engine::StatelessEngine;
+    use crate::stateless_reader::{CorruptPositions, StatelessReader};
+    use crate::stateless_writer::StatelessWriter;
+    use crate::test_fixture::tests::TestFixture;
+    use eventplanedb_storage_structures::constants::{
         BINCODE_CONFIG_FIXED, BLOOM_HASH_SEED, METADATA_BATCH_SIZE_BYTES,
     };
-    use crate::structures::{
+    use eventplanedb_storage_structures::{
         compression_type::CompressionType,
         constants::{BLOOM_BYTES, BLOOM_HASH_COUNT},
         event_batch_item::EventBatchItem,
@@ -61,7 +61,9 @@ mod tests {
         assert_eq!(metadata.min_client_event_index, 33);
         assert_eq!(metadata.max_client_event_index, 33);
         match metadata.event_types_data {
-            crate::structures::event_batch_metadata::EventTypesData::Direct(ref types) => {
+            eventplanedb_storage_structures::event_batch_metadata::EventTypesData::Direct(
+                ref types,
+            ) => {
                 assert_eq!(types.len(), 4);
                 assert_eq!(types[0], 1);
                 assert_eq!(types[1], u64::MAX);
@@ -75,7 +77,7 @@ mod tests {
         let read_result = fixture.read_filtered(
             &mut event_batch_reader,
             &mut metadata_reader,
-            &crate::structures::read_filters::ReadFilters::default(),
+            &eventplanedb_storage_structures::read_filters::ReadFilters::default(),
         )?;
 
         assert_eq!(read_result.next_event_batch_index, None);
@@ -138,7 +140,9 @@ mod tests {
         assert_eq!(metadata.min_client_event_index, 33);
         assert_eq!(metadata.max_client_event_index, 34);
         match metadata.event_types_data {
-            crate::structures::event_batch_metadata::EventTypesData::Direct(ref types) => {
+            eventplanedb_storage_structures::event_batch_metadata::EventTypesData::Direct(
+                ref types,
+            ) => {
                 assert_eq!(types.len(), 4);
                 assert_eq!(types[0], 1);
                 assert_eq!(types[1], 20);
@@ -152,7 +156,7 @@ mod tests {
         let read_result = fixture.read_filtered(
             &mut event_batch_reader,
             &mut metadata_reader,
-            &crate::structures::read_filters::ReadFilters::default(),
+            &eventplanedb_storage_structures::read_filters::ReadFilters::default(),
         )?;
 
         assert_eq!(read_result.next_event_batch_index, None);
@@ -224,7 +228,9 @@ mod tests {
         assert_eq!(metadata.min_client_event_index, 33);
         assert_eq!(metadata.max_client_event_index, 34);
         match metadata.event_types_data {
-            crate::structures::event_batch_metadata::EventTypesData::Direct(ref types) => {
+            eventplanedb_storage_structures::event_batch_metadata::EventTypesData::Direct(
+                ref types,
+            ) => {
                 assert_eq!(types.len(), 4);
                 assert_eq!(types[0], 1);
                 assert_eq!(types[1], 20);
@@ -262,7 +268,9 @@ mod tests {
         assert_eq!(metadata.min_client_event_index, 35);
         assert_eq!(metadata.max_client_event_index, 35);
         match metadata.event_types_data {
-            crate::structures::event_batch_metadata::EventTypesData::Direct(ref types) => {
+            eventplanedb_storage_structures::event_batch_metadata::EventTypesData::Direct(
+                ref types,
+            ) => {
                 assert_eq!(types.len(), 4);
                 assert_eq!(types[0], 1);
                 assert_eq!(types[1], u64::MAX);
@@ -276,7 +284,7 @@ mod tests {
         let read_result = fixture.read_filtered(
             &mut event_batch_reader,
             &mut metadata_reader,
-            &crate::structures::read_filters::ReadFilters::default(),
+            &eventplanedb_storage_structures::read_filters::ReadFilters::default(),
         )?;
 
         assert_eq!(read_result.next_event_batch_index, None);
@@ -345,7 +353,7 @@ mod tests {
         let read_result = fixture.read_filtered(
             &mut event_batch_reader,
             &mut metadata_reader,
-            &crate::structures::read_filters::ReadFilters::default(),
+            &eventplanedb_storage_structures::read_filters::ReadFilters::default(),
         );
         assert!(read_result.is_err());
 
@@ -379,7 +387,7 @@ mod tests {
         let read_result = fixture.read_filtered(
             &mut event_batch_reader,
             &mut metadata_reader,
-            &crate::structures::read_filters::ReadFilters::default(),
+            &eventplanedb_storage_structures::read_filters::ReadFilters::default(),
         )?;
 
         assert_eq!(read_result.event_batches.len(), num_batches);
@@ -602,7 +610,7 @@ mod tests {
             fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch)?;
 
         match metadata.event_types_data {
-            crate::structures::event_batch_metadata::EventTypesData::Direct(_) => {
+            eventplanedb_storage_structures::event_batch_metadata::EventTypesData::Direct(_) => {
                 // Success, direct storage used
             }
             _ => panic!("Expected direct event type storage"),
@@ -627,7 +635,7 @@ mod tests {
             fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch)?;
 
         match metadata.event_types_data {
-            crate::structures::event_batch_metadata::EventTypesData::Bloom(_) => {
+            eventplanedb_storage_structures::event_batch_metadata::EventTypesData::Bloom(_) => {
                 // Success, bloom filter used
             }
             _ => panic!("Expected bloom filter storage"),
@@ -866,7 +874,7 @@ mod tests {
 
         let mut filters = ReadFilters::new(1);
         let event_types = vec![10_u64, 80_u64];
-        filters.include_event_types = Some(event_types.as_slice()); // Batch 6 has types 10, 20, 30, 40, 50, 60, 70, 80
+        filters.include_event_types = Some(event_types); // Batch 6 has types 10, 20, 30, 40, 50, 60, 70, 80
         let read_result = fixture.write_and_read(&batches, &filters)?;
 
         assert_eq!(read_result.event_batches.len(), 2);
@@ -890,7 +898,7 @@ mod tests {
         filters.min_server_timestamp = Some(1600000000000);
         filters.max_server_timestamp = Some(1660000000000);
         let event_types = vec![1_u64, 2_u64, 3_u64];
-        filters.include_event_types = Some(event_types.as_slice()); // Batch 3 has event type 1
+        filters.include_event_types = Some(event_types); // Batch 3 has event type 1
         let read_result = fixture.write_and_read(&batches, &filters)?;
 
         assert_eq!(read_result.event_batches.len(), 1); // Only batch 3 matches all criteria
@@ -922,7 +930,7 @@ mod tests {
         filters.min_server_timestamp = Some(1600000000000);
         filters.max_server_timestamp = Some(1650000000000); // Batch 5 is 1650000000000
         let event_types = vec![10_u64, 20_u64, 30_u64];
-        filters.include_event_types = Some(event_types.as_slice()); // Batch 2 has these types
+        filters.include_event_types = Some(event_types); // Batch 2 has these types
         let read_result = fixture.write_and_read(&batches, &filters)?;
 
         //Batches 2, 5 match the filters criteria
@@ -937,7 +945,7 @@ mod tests {
 
         let mut filters = ReadFilters::new(1);
         let event_types = vec![10_u64, 20_u64, 30_u64, 40_u64, 50_u64];
-        filters.include_event_types = Some(event_types.as_slice()); // Batch 2 has these types
+        filters.include_event_types = Some(event_types); // Batch 2 has these types
         filters.min_client_event_index = Some(1);
         filters.max_client_event_index = Some(2);
         let read_result = fixture.write_and_read(&batches, &filters)?;

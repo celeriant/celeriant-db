@@ -1,0 +1,23 @@
+[package]
+name = "eventplanedb_storage_stateless"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eventplanedb_storage_structures = { path = "../eventplanedb_storage_structures" }
+fastbloom.workspace = true
+crc32fast.workspace = true
+bincode.workspace = true
+zstd.workspace = true
+brotli.workspace = true
+flate2.workspace = true
+snap.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+rand.workspace = true

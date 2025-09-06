@@ -1,10 +1,10 @@
 use std::{
     fs::{self, File},
-    io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    io::{self, BufWriter, Read, Seek, SeekFrom, Write},
     path::Path,
 };
 
-use crate::stateless::stateless_engine::StatelessEngine;
+use crate::stateless_engine::StatelessEngine;
 
 pub trait StatelessDestructive {
     /// Truncate the end of the file at a specific position (potentially due to corruption)

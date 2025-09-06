@@ -1,0 +1,15 @@
+[package]
+name = "eventplanedb_storage_stateful"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eventplanedb_storage_structures = { path = "../eventplanedb_storage_structures" }
+eventplanedb_storage_stateless = { path = "../eventplanedb_storage_stateless" }
+fastbloom.workspace = true
+lru.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

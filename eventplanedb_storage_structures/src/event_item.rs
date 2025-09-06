@@ -10,7 +10,7 @@ pub struct EventItem {
     pub client_event_index: u64,
 
     /// A server-side incremented index for each event
-    #[serde(rename = "ei")]
+    #[serde(rename = "ex")]
     pub event_index: u64,
 
     /// Client derived Unix timestamp in milliseconds when the event occurred

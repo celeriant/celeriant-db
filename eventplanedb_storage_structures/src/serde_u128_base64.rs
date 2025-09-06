@@ -1,12 +1,12 @@
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use base64::{Engine as _, engine::general_purpose};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub fn serialize<S>(value: &u128, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
     let bytes = value.to_le_bytes();
-    let encoded = general_purpose::STANDARD.encode(&bytes);
+    let encoded = general_purpose::STANDARD.encode(bytes);
     encoded.serialize(serializer)
 }
 
@@ -15,7 +15,9 @@ where
     D: Deserializer<'de>,
 {
     let s = String::deserialize(deserializer)?;
-    let bytes = general_purpose::STANDARD.decode(&s).map_err(serde::de::Error::custom)?;
+    let bytes = general_purpose::STANDARD
+        .decode(&s)
+        .map_err(serde::de::Error::custom)?;
     if bytes.len() != 16 {
         return Err(serde::de::Error::custom("Invalid base64 length for u128"));
     }

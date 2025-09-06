@@ -1,9 +1,20 @@
-[package]
-name = "event-sourcing-storage"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+members = [
+    "eventplanedb_storage_structures",
+    "eventplanedb_storage_stateless",
+    "eventplanedb_storage_stateful",
+    "eventplanedb_storage_threaded",
+]
 
-[dependencies]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+authors = ["UtilityDelta"]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
 base64 = "0.22.1"
 bincode = "2.0.1"
 brotli = "8.0.2"
@@ -15,9 +26,11 @@ serde = { version = "1.0.219", features = ["derive", "rc"] }
 snap = "1.1.1"
 tempfile = "3.21.0"
 zstd = "0.13.3"
-
-[target.'cfg(target_os = "linux")'.dependencies]
-io-uring = "0.7.9"
-
-[dev-dependencies]
 rand = "0.9.2"
+io-uring = "0.7.9"
+core_affinity = "0.8.3"
+crossbeam = "0.8.4"
+ahash = "0.8.12"
+tokio = { version = "1.46.0", features = ["full"] }
+futures = "0.3.31"
+thiserror = "2.0.12"

@@ -11,17 +11,21 @@ use std::os::fd::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 
-use crate::stateless::stateless_engine::StatelessEngine;
-use crate::structures::compression_type::CompressionType;
-use crate::structures::constants::{BINCODE_CONFIG_FIXED, BLOOM_HASH_COUNT, BLOOM_HASH_SEED};
-use crate::structures::event_batch_item::EventBatchItem;
-use crate::structures::event_batch_metadata::EventTypesData;
-use crate::structures::{
+use eventplanedb_storage_structures::compression_type::CompressionType;
+use eventplanedb_storage_structures::constants::{
+    BINCODE_CONFIG_FIXED, BLOOM_HASH_COUNT, BLOOM_HASH_SEED,
+};
+use eventplanedb_storage_structures::event_batch_item::EventBatchItem;
+use eventplanedb_storage_structures::event_batch_metadata::EventTypesData;
+use eventplanedb_storage_structures::{
     constants::{BLOOM_BYTES, METADATA_BATCH_SIZE_BYTES},
     event_batch_metadata::EventBatchMetadata,
     read_filters::ReadFilters,
     read_result::ReadResult,
 };
+
+use crate::stateless_engine::StatelessEngine;
+use crate::wire_format::from_wire_format_variable;
 
 pub trait StatelessReader {
     /// Reads event batches from a binary stream with filtering and pagination support
@@ -849,10 +853,11 @@ fn is_include_batch(metadata: &EventBatchMetadata, filters: &ReadFilters) -> boo
 
     if filters
         .include_event_types
+        .as_ref()
         .map_or(false, |include_event_types| {
             //Is there at least one of the include_event_types in the event batch? If not, return true to skip
             let at_least_one_match =
-                check_event_types_match(&metadata.event_types_data, include_event_types);
+                check_event_types_match(&metadata.event_types_data, &include_event_types);
             !at_least_one_match
         })
     {
@@ -1203,14 +1208,14 @@ fn read_event_batches_standard<R: Read + Seek>(
 
         // Decompress and deserialize
         let compression_type = CompressionType::from_tuple(batch.compression_type, None);
-        let mut event_batch = EventBatchItem::from_wire_format(
+        let mut event_batch = from_wire_format_variable::<EventBatchItem>(
             &buffer,
             compression_type,
             batch.uncompressed_size as usize,
         )?;
 
         // Final event type filtering (bloom filter might have false positives)
-        if let Some(event_types) = filters.include_event_types {
+        if let Some(event_types) = filters.include_event_types.as_deref() {
             event_batch
                 .events
                 .retain(|event| event_types.contains(&event.event_type_major));
