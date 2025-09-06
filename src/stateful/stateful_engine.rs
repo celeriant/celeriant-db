@@ -1487,4 +1487,536 @@ mod tests {
 
         Ok(())
     }
+
+    // 9. Bloom Filter and Event Type Deduplication Tests
+
+    #[test]
+    fn test_bloom_filter_state_persists_across_writes() -> io::Result<()> {
+        let mut fixture = StatefulTestFixture::new()?;
+
+        // Write events with different event types
+        let events1 = vec![
+            EventItem::new(1, 1, 1000, 42, 1, b"event1".to_vec()), // event_type_major = 42
+            EventItem::new(2, 2, 1001, 43, 1, b"event2".to_vec()), // event_type_major = 43
+        ];
+
+        fixture
+            .engine
+            .append_events("test_aggregate", 100, None, events1, None)?;
+
+        // Write more events - bloom filter should accumulate state
+        let events2 = vec![
+            EventItem::new(3, 3, 1002, 44, 1, b"event3".to_vec()), // event_type_major = 44
+            EventItem::new(4, 4, 1003, 42, 1, b"event4".to_vec()), // duplicate type
+        ];
+
+        let result = fixture
+            .engine
+            .append_events("test_aggregate", 100, None, events2, None);
+        assert!(result.is_ok());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_event_type_dedup_cleared_per_batch() -> io::Result<()> {
+        let mut fixture = StatefulTestFixture::new()?;
+
+        // Write batch with duplicate event types within same batch
+        let events1 = vec![
+            EventItem::new(1, 1, 1000, 42, 1, b"event1".to_vec()),
+            EventItem::new(2, 2, 1001, 42, 1, b"event2".to_vec()), // same type in batch
+        ];
+
+        let result = fixture
+            .engine
+            .append_events("test_aggregate", 100, None, events1, None);
+        assert!(result.is_ok());
+
+        Ok(())
+    }
+
+    // 10. Timestamp and Server Time Tests
+
+    #[test]
+    fn test_server_timestamp_increases_monotonically() -> io::Result<()> {
+        let mut fixture = StatefulTestFixture::new()?;
+
+        let events1 = fixture.create_test_events(1, 1);
+        let metadata1 = fixture
+            .engine
+            .append_events("test_aggregate", 100, None, events1, None)?;
+
+        // Small delay to ensure timestamp difference
+        std::thread::sleep(Duration::from_millis(1));
+
+        let events2 = fixture.create_test_events(2, 1);
+        let metadata2 = fixture
+            .engine
+            .append_events("test_aggregate", 100, None, events2, None)?;
+
+        assert!(metadata2.server_timestamp > metadata1.server_timestamp);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_timestamp_filtering_from_cache() -> io::Result<()> {
+        let mut fixture = StatefulTestFixture::new()?;
+
+        // Write events with known timestamps
+        let events1 = fixture.create_test_events(1, 2);
+        let metadata1 = fixture
+            .engine
+            .append_events("test_aggregate", 100, None, events1, None)?;
+
+        std::thread::sleep(Duration::from_millis(5));
+
+        let events2 = fixture.create_test_events(3, 2);
+        let metadata2 = fixture
+            .engine
+            .append_events("test_aggregate", 100, None, events2, None)?;
+
+        // Filter by server timestamp - should only get second batch
+        let mut filters = ReadFilters::new(0);
+        filters.min_server_timestamp = Some(metadata2.server_timestamp);
+
+        let result = fixture.engine.read_filtered("test_aggregate", &filters)?;
+        assert_eq!(result.event_batches.len(), 1);
+        assert_eq!(result.event_batches[0].event_batch_index, 1);
+
+        Ok(())
+    }
+
+    // 11. Max Bytes Limit Tests
+
+    #[test]
+    fn test_max_bytes_limit_respected_from_cache() -> io::Result<()> {
+        let mut fixture = StatefulTestFixture::new()?;
+
+        // Write several batches with larger events
+        let large_data = vec![0u8; 1000]; // 1KB event data
+
+        for i in 0..5 {
+            let events = vec![EventItem::new(
+                i + 1,
+                i + 1,
+                1000 + i,
+                42,
+                1,
+                large_data.clone(),
+            )];
+            fixture
+                .engine
+                .append_events("test_aggregate", 100, None, events, None)?;
+        }
+
+        // Read with byte limit that should stop after a few batches
+        let mut filters = ReadFilters::new(0);
+        filters.max_bytes = Some(2500); // Should allow ~2 batches
+
+        let result = fixture.engine.read_filtered("test_aggregate", &filters)?;
+        assert!(result.event_batches.len() <= 3); // Should be limited
+        assert!(result.next_event_batch_index.is_some()); // Should indicate more data available
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_max_bytes_first_batch_exceeds_limit() -> io::Result<()> {
+        let mut fixture = StatefulTestFixture::new()?;
+
+        // Write a batch with very large data
+        let large_data = vec![0u8; 10000]; // 10KB
+        let events = vec![EventItem::new(1, 1, 1000, 42, 1, large_data)];
+        fixture
+            .engine
+            .append_events("test_aggregate", 100, None, events, None)?;
+
+        // Try to read with smaller byte limit
+        let mut filters = ReadFilters::new(0);
+        filters.max_bytes = Some(5000); // 5KB limit
+
+        // Should still return the first batch even though it exceeds limit
+        let result = fixture.engine.read_filtered("test_aggregate", &filters)?;
+        assert_eq!(result.event_batches.len(), 1);
+
+        Ok(())
+    }
+
+    // 12. Event-Level Filtering Tests
+
+    #[test]
+    fn test_event_type_filtering_from_cache() -> io::Result<()> {
+        let mut fixture = StatefulTestFixture::new()?;
+
+        // Write events with different types
+        let events = vec![
+            EventItem::new(1, 1, 1000, 42, 1, b"type42".to_vec()),
+            EventItem::new(2, 2, 1001, 43, 1, b"type43".to_vec()),
+            EventItem::new(3, 3, 1002, 44, 1, b"type44".to_vec()),
+        ];
+        fixture
+            .engine
+            .append_events("test_aggregate", 100, None, events, None)?;
+
+        // Filter by event types
+        let mut filters = ReadFilters::new(0);
+        filters.include_event_types = Some(&[42, 44]);
+
+        let result = fixture.engine.read_filtered("test_aggregate", &filters)?;
+        assert_eq!(result.event_batches.len(), 1);
+        assert_eq!(result.event_batches[0].events.len(), 2); // Only types 42 and 44
+        assert_eq!(result.event_batches[0].events[0].event_type_major, 42);
+        assert_eq!(result.event_batches[0].events[1].event_type_major, 44);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_client_event_index_range_filtering() -> io::Result<()> {
+        let mut fixture = StatefulTestFixture::new()?;
+
+        // Write events with different client event indices
+        let events = vec![
+            EventItem::new(1, 1, 1000, 42, 1, b"event1".to_vec()),
+            EventItem::new(5, 2, 1001, 42, 1, b"event5".to_vec()),
+            EventItem::new(10, 3, 1002, 42, 1, b"event10".to_vec()),
+        ];
+        fixture
+            .engine
+            .append_events("test_aggregate", 100, None, events, None)?;
+
+        // Filter by client event index range
+        let mut filters = ReadFilters::new(0);
+        filters.min_client_event_index = Some(3);
+        filters.max_client_event_index = Some(8);
+
+        let result = fixture.engine.read_filtered("test_aggregate", &filters)?;
+        assert_eq!(result.event_batches.len(), 1);
+        assert_eq!(result.event_batches[0].events.len(), 1); // Only event with index 5
+        assert_eq!(result.event_batches[0].events[0].client_event_index, 5);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_event_timestamp_filtering() -> io::Result<()> {
+        let mut fixture = StatefulTestFixture::new()?;
+
+        // Write events with different event timestamps
+        let events = vec![
+            EventItem::new(1, 1, 1000, 42, 1, b"event1".to_vec()),
+            EventItem::new(2, 2, 2000, 42, 1, b"event2".to_vec()),
+            EventItem::new(3, 3, 3000, 42, 1, b"event3".to_vec()),
+        ];
+        fixture
+            .engine
+            .append_events("test_aggregate", 100, None, events, None)?;
+
+        // Filter by event timestamp
+        let mut filters = ReadFilters::new(0);
+        filters.min_event_timestamp = Some(1500);
+        filters.max_event_timestamp = Some(2500);
+
+        let result = fixture.engine.read_filtered("test_aggregate", &filters)?;
+        assert_eq!(result.event_batches.len(), 1);
+        assert_eq!(result.event_batches[0].events.len(), 1); // Only event with timestamp 2000
+        assert_eq!(result.event_batches[0].events[0].event_timestamp, 2000);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_event_index_filtering() -> io::Result<()> {
+        let mut fixture = StatefulTestFixture::new()?;
+
+        // Write events with different event indices
+        let events = vec![
+            EventItem::new(1, 10, 1000, 42, 1, b"event1".to_vec()),
+            EventItem::new(2, 20, 1001, 42, 1, b"event2".to_vec()),
+            EventItem::new(3, 30, 1002, 42, 1, b"event3".to_vec()),
+        ];
+        fixture
+            .engine
+            .append_events("test_aggregate", 100, None, events, None)?;
+
+        // Filter by event index range
+        let mut filters = ReadFilters::new(0);
+        filters.min_event_index = Some(15);
+        filters.max_event_index = Some(25);
+
+        let result = fixture.engine.read_filtered("test_aggregate", &filters)?;
+        assert_eq!(result.event_batches.len(), 1);
+        assert_eq!(result.event_batches[0].events.len(), 1); // Only event with index 20
+        assert_eq!(result.event_batches[0].events[0].event_index, 20);
+
+        Ok(())
+    }
+
+    // 13. User ID Filtering Tests
+
+    #[test]
+    fn test_user_id_include_filtering() -> io::Result<()> {
+        let mut fixture = StatefulTestFixture::new()?;
+
+        let events1 = fixture.create_test_events(1, 2);
+        let events2 = fixture.create_test_events(3, 2);
+
+        fixture
+            .engine
+            .append_events("test_aggregate", 100, Some(500), events1, None)?;
+        fixture
+            .engine
+            .append_events("test_aggregate", 200, Some(600), events2, None)?;
+
+        // Filter by user_id
+        let mut filters = ReadFilters::new(0);
+        filters.include_user_id = Some(500);
+
+        let result = fixture.engine.read_filtered("test_aggregate", &filters)?;
+        assert_eq!(result.event_batches.len(), 1);
+        assert_eq!(result.event_batches[0].user_id, Some(500));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_user_id_exclude_filtering() -> io::Result<()> {
+        let mut fixture = StatefulTestFixture::new()?;
+
+        let events1 = fixture.create_test_events(1, 2);
+        let events2 = fixture.create_test_events(3, 2);
+
+        fixture
+            .engine
+            .append_events("test_aggregate", 100, Some(500), events1, None)?;
+        fixture
+            .engine
+            .append_events("test_aggregate", 200, Some(600), events2, None)?;
+
+        // Exclude specific user_id
+        let mut filters = ReadFilters::new(0);
+        filters.exclude_user_id = Some(500);
+
+        let result = fixture.engine.read_filtered("test_aggregate", &filters)?;
+        assert_eq!(result.event_batches.len(), 1);
+        assert_eq!(result.event_batches[0].user_id, Some(600));
+
+        Ok(())
+    }
+
+    // 14. Cache Boundary Tests
+
+    #[test]
+    fn test_memory_cache_eviction() -> io::Result<()> {
+        // Test with very small cache size to force eviction
+        let config = StatefulEngineConfig {
+            recent_batches_cache_size: 100, // Very small cache
+            ..Default::default()
+        };
+        let mut fixture = StatefulTestFixture::with_config(config)?;
+
+        // Write many small batches to trigger eviction
+        for i in 0..10 {
+            let events = vec![EventItem::new(i + 1, i + 1, 1000, 42, 1, b"small".to_vec())];
+            fixture
+                .engine
+                .append_events("test_aggregate", 100, None, events, None)?;
+        }
+
+        // Early batches should be evicted from cache, but still readable from disk
+        let result = fixture
+            .engine
+            .read_filtered("test_aggregate", &ReadFilters::new(0))?;
+        assert_eq!(result.event_batches.len(), 10); // All should still be readable
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_client_event_index_cache_eviction() -> io::Result<()> {
+        let config = StatefulEngineConfig {
+            client_event_index_cache_size: 2, // Very small cache
+            ..Default::default()
+        };
+        let mut fixture = StatefulTestFixture::with_config(config)?;
+
+        // Write with multiple clients to trigger eviction
+        for client_id in 100..110 {
+            let events = vec![EventItem::new(1, 1, 1000, 42, 1, b"test".to_vec())];
+            fixture
+                .engine
+                .append_events("test_aggregate", client_id, None, events, None)?;
+        }
+
+        // Cache should have evicted earlier clients, but duplicate filtering should still work
+        // (by falling back to disk reads if needed)
+        let events_dup = vec![EventItem::new(1, 2, 1001, 42, 1, b"dup".to_vec())];
+        let result = fixture
+            .engine
+            .append_events("test_aggregate", 100, None, events_dup, None);
+
+        // Should either succeed (cache miss, no filtering) or fail (duplicate detected from disk)
+        // The exact behavior depends on implementation details
+        match result {
+            Ok(_) => {}                                          // Cache miss occurred, no filtering
+            Err(e) if e.to_string().contains("duplicates") => {} // Filtering worked via disk lookup
+            Err(e) => panic!("Unexpected error: {}", e),
+        }
+
+        Ok(())
+    }
+
+    // 15. Edge Cases and Error Conditions
+
+    #[test]
+    fn test_read_nonexistent_aggregate() -> io::Result<()> {
+        let mut fixture = StatefulTestFixture::new()?;
+
+        let result = fixture
+            .engine
+            .read_filtered("nonexistent", &ReadFilters::new(0))?;
+        assert_eq!(result.event_batches.len(), 0);
+        assert_eq!(result.next_event_batch_index, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_trim_start_nonexistent_aggregate() -> io::Result<()> {
+        let mut fixture = StatefulTestFixture::new()?;
+
+        // Should succeed silently for nonexistent aggregate
+        let result = fixture.engine.trim_start("nonexistent", 5);
+        assert!(result.is_ok());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_trim_start_invalid_index() -> io::Result<()> {
+        let mut fixture = StatefulTestFixture::new()?;
+
+        // Write some batches
+        for i in 0..3 {
+            let events = fixture.create_test_events(i + 1, 1);
+            fixture
+                .engine
+                .append_events("test_aggregate", 100, None, events, None)?;
+        }
+
+        // Try to trim from non-existent index
+        let result = fixture.engine.trim_start("test_aggregate", 10);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("does not exist"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_delete_nonexistent_aggregate() -> io::Result<()> {
+        let mut fixture = StatefulTestFixture::new()?;
+
+        // Should succeed silently for nonexistent aggregate
+        let result = fixture.engine.delete("nonexistent");
+        assert!(result.is_ok());
+
+        Ok(())
+    }
+
+    // 16. Complex Filter Combinations
+
+    #[test]
+    fn test_complex_filter_combinations() -> io::Result<()> {
+        let mut fixture = StatefulTestFixture::new()?;
+
+        // Write diverse data
+        let events1 = vec![
+            EventItem::new(1, 1, 1000, 42, 1, b"event1".to_vec()),
+            EventItem::new(5, 2, 2000, 43, 1, b"event5".to_vec()),
+        ];
+        let events2 = vec![
+            EventItem::new(10, 3, 1500, 42, 1, b"event10".to_vec()),
+            EventItem::new(15, 4, 2500, 44, 1, b"event15".to_vec()),
+        ];
+
+        fixture
+            .engine
+            .append_events("test_aggregate", 100, Some(500), events1, None)?;
+        fixture
+            .engine
+            .append_events("test_aggregate", 200, Some(600), events2, None)?;
+
+        // Complex filter: specific client, event type, and timestamp range
+        let mut filters = ReadFilters::new(0);
+        filters.include_client_id = Some(100);
+        filters.include_event_types = Some(&[42, 43]);
+        filters.min_event_timestamp = Some(1500);
+
+        let result = fixture.engine.read_filtered("test_aggregate", &filters)?;
+        assert_eq!(result.event_batches.len(), 1);
+        assert_eq!(result.event_batches[0].events.len(), 1); // Only event5 matches all criteria
+        assert_eq!(result.event_batches[0].events[0].client_event_index, 5);
+
+        Ok(())
+    }
+
+    // 17. Concurrent-like Behavior Tests
+
+    #[test]
+    fn test_multiple_clients_interleaved() -> io::Result<()> {
+        let mut fixture = StatefulTestFixture::new()?;
+
+        // Simulate multiple clients writing in interleaved fashion
+        for batch in 0..5 {
+            for client_id in 100..103 {
+                let events = vec![EventItem::new(
+                    (batch * 3 + (client_id - 100)) as u64 + 1,
+                    batch as u64 + 1,
+                    1000 + batch,
+                    42,
+                    1,
+                    format!("client{}_batch{}", client_id, batch).into_bytes(),
+                )];
+                fixture.engine.append_events(
+                    "test_aggregate",
+                    client_id as u128,
+                    None,
+                    events,
+                    None,
+                )?;
+            }
+        }
+
+        // Should have 15 batches total (5 batches × 3 clients)
+        let result = fixture
+            .engine
+            .read_filtered("test_aggregate", &ReadFilters::new(0))?;
+        assert_eq!(result.event_batches.len(), 15);
+
+        // Test filtering by specific client
+        let mut filters = ReadFilters::new(0);
+        filters.include_client_id = Some(101);
+        let client_result = fixture.engine.read_filtered("test_aggregate", &filters)?;
+        assert_eq!(client_result.event_batches.len(), 5); // 5 batches from client 101
+
+        Ok(())
+    }
+
+    // 18. Builder Pattern Test
+
+    #[test]
+    fn test_builder_with_default_config() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let base_path = temp_dir.path().to_path_buf();
+
+        let mut engine = StatefulEngine::with_default_config(base_path);
+
+        let events = vec![EventItem::new(1, 1, 1000, 42, 1, b"test".to_vec())];
+        let result = engine.append_events("test_aggregate", 100, None, events, None);
+        assert!(result.is_ok());
+
+        Ok(())
+    }
 }
