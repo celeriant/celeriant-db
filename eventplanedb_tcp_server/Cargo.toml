@@ -1,0 +1,20 @@
+[package]
+name = "eventplanedb_tcp_server"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eventplanedb_storage_structures = { path = "../eventplanedb_storage_structures" }
+eventplanedb_storage_stateful = { path = "../eventplanedb_storage_stateful" }
+eventplanedb_storage_stateless = { path = "../eventplanedb_storage_stateless" }
+bincode.workspace = true
+glommio.workspace = true
+ahash.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+futures-lite.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

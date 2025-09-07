@@ -4,6 +4,7 @@ members = [
     "eventplanedb_storage_stateless",
     "eventplanedb_storage_stateful",
     "eventplanedb_storage_threaded",
+    "eventplanedb_tcp_server",
 ]
 
 resolver = "2"
@@ -34,3 +35,5 @@ ahash = "0.8.12"
 tokio = { version = "1.46.0", features = ["full"] }
 futures = "0.3.31"
 thiserror = "2.0.12"
+glommio = "0.9"
+futures-lite = "2.6.1"
