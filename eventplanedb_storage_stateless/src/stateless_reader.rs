@@ -974,14 +974,14 @@ fn read_event_batches_with_uring<R: Read + Seek + AsRawFd>(
 
             // Decompress and deserialize
             let compression_type = CompressionType::from_tuple(batch.compression_type, None);
-            let mut event_batch = EventBatchItem::from_wire_format(
+            let mut event_batch = from_wire_format_variable::<EventBatchItem>(
                 &buffer[..bytes_read as usize],
                 compression_type,
                 batch.uncompressed_size as usize,
             )?;
 
             // Final event type filtering (bloom filter might have false positives)
-            if let Some(event_types) = filters.include_event_types {
+            if let Some(event_types) = filters.include_event_types.as_deref() {
                 event_batch
                     .events
                     .retain(|event| event_types.contains(&event.event_type_major));

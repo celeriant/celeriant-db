@@ -1,5 +1,8 @@
+use bincode::{Decode, Encode};
+use serde::{Deserialize, Serialize};
+
 /// Filters and pagination options for reading event batches
-#[derive(Debug, Default)]
+#[derive(Default, Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct ReadFilters {
     /// Starting server ID to begin reading from (inclusive). Will error if not found in stream.
     pub from_event_batch_index: u64,

@@ -85,6 +85,17 @@ impl FileCache {
         Ok(rc_buf)
     }
 
+
+    #[cfg(unix)]
+    pub fn create_reader(&mut self, file_path: &str) -> io::Result<File> {
+        // For cases where we need AsRawFd, return the raw File
+        let file = OpenOptions::new()
+            .read(true)
+            .open(file_path)?;
+        Ok(file)
+    }
+
+    #[cfg(windows)]
     pub fn create_reader(&mut self, file_path: &str) -> io::Result<Rc<RefCell<BufReader<File>>>> {
         self.evict();
         
