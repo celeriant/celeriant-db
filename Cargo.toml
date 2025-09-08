@@ -5,6 +5,7 @@ members = [
     "eventplanedb_storage_stateful",
     "eventplanedb_storage_threaded",
     "eventplanedb_tcp_server",
+    "eventplanedb_glommio",
 ]
 
 resolver = "2"
@@ -37,3 +38,4 @@ futures = "0.3.31"
 thiserror = "2.0.12"
 glommio = "0.9"
 futures-lite = "2.6.1"
+clap = { version = "4.5.47", features = ["derive"] }
