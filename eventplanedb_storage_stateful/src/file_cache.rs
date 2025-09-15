@@ -86,7 +86,7 @@ impl FileCache {
     }
 
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     pub fn create_reader(&mut self, file_path: &str) -> io::Result<File> {
         // For cases where we need AsRawFd, return the raw File
         let file = OpenOptions::new()
@@ -95,7 +95,7 @@ impl FileCache {
         Ok(file)
     }
 
-    #[cfg(windows)]
+    #[cfg(not(target_os = "linux"))]
     pub fn create_reader(&mut self, file_path: &str) -> io::Result<Rc<RefCell<BufReader<File>>>> {
         self.evict();
         

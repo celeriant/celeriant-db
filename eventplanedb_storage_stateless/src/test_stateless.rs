@@ -1,9 +1,7 @@
 #[cfg(test)]
 mod tests {
     // Platform-specific raw file descriptor traits
-    #[cfg(unix)]
-    use std::os::fd::AsRawFd;
-    #[cfg(windows)]
+    #[cfg(target_os = "windows")]
     use std::os::windows::io::AsRawHandle;
     use std::sync::Arc;
 

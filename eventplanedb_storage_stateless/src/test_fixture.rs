@@ -1,14 +1,14 @@
 #[cfg(test)]
 pub mod tests {
     // Platform-specific raw file descriptor traits
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::os::fd::AsRawFd;
-    #[cfg(windows)]
+    #[cfg(target_os = "windows")]
     use std::os::windows::io::AsRawHandle;
 
     use eventplanedb_storage_structures::constants::BLOOM_HASH_SEED;
     use eventplanedb_storage_structures::event_batch_metadata::EventBatchMetadata;
-    #[cfg(windows)]
+    #[cfg(not(target_os = "linux"))]
     use eventplanedb_storage_structures::read_result::ReadResult;
     use eventplanedb_storage_structures::{
         compression_type::CompressionType,
@@ -139,7 +139,7 @@ pub mod tests {
             Ok(results)
         }
 
-        #[cfg(windows)]
+        #[cfg(target_os = "windows")]
         pub fn read_filtered<R: Read + Seek + AsRawHandle>(
             &self,
             event_batch_reader: &mut R,
@@ -152,13 +152,13 @@ pub mod tests {
                 .read_filtered(event_batch_reader, metadata_reader, filters)
         }
 
-        #[cfg(unix)]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         pub fn read_filtered<R: Read + Seek + AsRawFd>(
             &self,
             event_batch_reader: &mut R,
             metadata_reader: &mut R,
             filters: &ReadFilters,
-        ) -> io::Result<crate::structures::read_result::ReadResult> {
+        ) -> io::Result<ReadResult> {
             self.engine
                 .read_filtered(event_batch_reader, metadata_reader, filters)
         }

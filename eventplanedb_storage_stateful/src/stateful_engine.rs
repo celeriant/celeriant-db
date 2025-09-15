@@ -141,9 +141,9 @@ impl StatefulEngine {
             .config
             .stateless_engine
             .last_event_batch_index(
-                #[cfg(unix)]
+                #[cfg(target_os = "linux")]
                 &mut metadata_reader,
-                #[cfg(windows)]
+                #[cfg(not(target_os = "linux"))]
                 &mut *metadata_reader.borrow_mut()
             )
         {
@@ -159,9 +159,9 @@ impl StatefulEngine {
                 self.config
                     .stateless_engine
                     .last_event_batch_index(
-                        #[cfg(unix)]
+                        #[cfg(target_os = "linux")]
                         &mut metadata_reader,
-                        #[cfg(windows)]
+                        #[cfg(not(target_os = "linux"))]
                         &mut *metadata_reader.borrow_mut()
                     )?
             }
@@ -187,13 +187,13 @@ impl StatefulEngine {
             .create_reader(metadata_path.to_str().unwrap())?;
 
         if let Some(corrupt_positions) = self.config.stateless_engine.detect_corruption(
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             &mut event_batch_reader,
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             &mut metadata_reader,
-            #[cfg(windows)]
+            #[cfg(not(target_os = "linux"))]
             &mut *event_batch_reader.borrow_mut(),
-            #[cfg(windows)]
+            #[cfg(not(target_os = "linux"))]
             &mut *metadata_reader.borrow_mut(),
         )? {
             // Clear caches for this aggregate
@@ -573,23 +573,23 @@ impl StatefulReader for StatefulEngine {
             .create_reader(metadata_path.to_str().unwrap())?;
 
         // Attempt recovery if corruption is detected
-        #[cfg(windows)]
+        #[cfg(not(target_os = "linux"))]
         let mut mut_event_batch_reader = event_batch_reader.borrow_mut();
-        #[cfg(windows)]
+        #[cfg(not(target_os = "linux"))]
         let mut mut_metadata_reader = metadata_reader.borrow_mut();
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         let mut mut_event_batch_reader = event_batch_reader;
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         let mut mut_metadata_reader = metadata_reader;
 
         match self.config.stateless_engine.read_filtered(
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             &mut mut_event_batch_reader,
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             &mut mut_metadata_reader,
-            #[cfg(windows)]
+            #[cfg(not(target_os = "linux"))]
             &mut *mut_event_batch_reader,
-            #[cfg(windows)]
+            #[cfg(not(target_os = "linux"))]
             &mut *mut_metadata_reader,
             filters,
         ) {
@@ -609,23 +609,23 @@ impl StatefulReader for StatefulEngine {
                     .file_cache
                     .create_reader(metadata_path.to_str().unwrap())?;
 
-                #[cfg(windows)]
+                #[cfg(not(target_os = "linux"))]
                 let mut mut_event_batch_reader = event_batch_reader.borrow_mut();
-                #[cfg(windows)]
+                #[cfg(not(target_os = "linux"))]
                 let mut mut_metadata_reader = metadata_reader.borrow_mut();
-                #[cfg(unix)]
+                #[cfg(target_os = "linux")]
                 let mut mut_event_batch_reader = event_batch_reader;
-                #[cfg(unix)]
+                #[cfg(target_os = "linux")]
                 let mut mut_metadata_reader = metadata_reader;
                 
                 self.config.stateless_engine.read_filtered(
-                    #[cfg(unix)]
+                    #[cfg(target_os = "linux")]
                     &mut mut_event_batch_reader,
-                    #[cfg(unix)]
+                    #[cfg(target_os = "linux")]
                     &mut mut_metadata_reader,
-                    #[cfg(windows)]
+                    #[cfg(not(target_os = "linux"))]
                     &mut *mut_event_batch_reader,
-                    #[cfg(windows)]
+                    #[cfg(not(target_os = "linux"))]
                     &mut *mut_metadata_reader,
                     filters,
                 )
@@ -664,9 +664,9 @@ impl StatefulDestructive for StatefulEngine {
             .config
             .stateless_engine
             .positions_for_event_batch_index(
-                #[cfg(unix)]
+                #[cfg(target_os = "linux")]
                 &mut metadata_reader,
-                #[cfg(windows)]
+                #[cfg(not(target_os = "linux"))]
                 &mut *metadata_reader.borrow_mut(),
                 keep_from_event_batch_index,
             )?;
@@ -684,15 +684,15 @@ impl StatefulDestructive for StatefulEngine {
         let event_batch_positions = event_batch_positions.unwrap();
 
         self.config.stateless_engine.trim_start(
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             &mut event_batch_reader,
-            #[cfg(windows)]
+            #[cfg(not(target_os = "linux"))]
             &mut *event_batch_reader.borrow_mut(),
             event_batch_positions.event_batch_position,
             event_batch_path.to_str().unwrap(),
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             &mut metadata_reader,
-            #[cfg(windows)]
+            #[cfg(not(target_os = "linux"))]
             &mut *metadata_reader.borrow_mut(),
             event_batch_positions.metadata_position,
             metadata_path.to_str().unwrap(),

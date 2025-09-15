@@ -3,9 +3,7 @@ members = [
     "eventplanedb_storage_structures",
     "eventplanedb_storage_stateless",
     "eventplanedb_storage_stateful",
-    "eventplanedb_storage_threaded",
-    "eventplanedb_tcp_server",
-    "eventplanedb_glommio",
+    "eventplanedb_storage_threaded"
 ]
 
 resolver = "2"

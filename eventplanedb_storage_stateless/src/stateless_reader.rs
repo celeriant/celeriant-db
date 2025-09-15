@@ -1,15 +1,6 @@
 use fastbloom::BloomFilter;
 
-#[cfg(target_os = "linux")]
-use io_uring::{IoUring, opcode, types};
-
 use std::io::{self, Read, Seek, SeekFrom};
-
-// Platform-specific raw file descriptor traits
-#[cfg(unix)]
-use std::os::fd::AsRawFd;
-#[cfg(windows)]
-use std::os::windows::io::AsRawHandle;
 
 use eventplanedb_storage_structures::compression_type::CompressionType;
 use eventplanedb_storage_structures::constants::{
@@ -40,7 +31,7 @@ pub trait StatelessReader {
     ///
     /// # Errors
     /// If corruption is detected, an error is raised.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn read_filtered<R: Read + Seek + AsRawFd>(
         &self,
         event_batch_reader: &mut R,
@@ -48,7 +39,7 @@ pub trait StatelessReader {
         filters: &ReadFilters,
     ) -> io::Result<ReadResult>;
 
-    #[cfg(windows)]
+    #[cfg(not(target_os = "linux"))]
     fn read_filtered<R: Read + Seek>(
         &self,
         event_batch_reader: &mut R,
@@ -456,7 +447,7 @@ impl StatelessReader for StatelessEngine {
         Ok(None)
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn read_filtered<R: Read + Seek + AsRawFd>(
         &self,
         event_batch_reader: &mut R,
@@ -478,7 +469,7 @@ impl StatelessReader for StatelessEngine {
         self.read_filtered_standard(event_batch_reader, metadata_reader, filters)
     }
 
-    #[cfg(windows)]
+    #[cfg(not(target_os = "linux"))]
     fn read_filtered<R: Read + Seek>(
         &self,
         event_batch_reader: &mut R,
