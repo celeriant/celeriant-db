@@ -7,15 +7,15 @@ use std::num::NonZeroUsize;
 /// Optimized for hashing and comparison operations
 #[derive(Clone, PartialEq, Eq)]
 pub struct ClientKey {
-    aggregate_id: String,
+    aggregate_id: u128,
     client_id: u128,
     // Pre-computed hash for better performance
     hash: u64,
 }
 
 impl ClientKey {
-    pub fn new(aggregate_id: String, client_id: u128) -> Self {
-        let hash = Self::compute_hash(&aggregate_id, client_id);
+    pub fn new(aggregate_id: u128, client_id: u128) -> Self {
+        let hash = Self::compute_hash(aggregate_id, client_id);
         Self {
             aggregate_id,
             client_id,
@@ -23,7 +23,7 @@ impl ClientKey {
         }
     }
 
-    fn compute_hash(aggregate_id: &str, client_id: u128) -> u64 {
+    fn compute_hash(aggregate_id: u128, client_id: u128) -> u64 {
         use std::collections::hash_map::DefaultHasher;
         let mut hasher = DefaultHasher::new();
         aggregate_id.hash(&mut hasher);
@@ -31,8 +31,8 @@ impl ClientKey {
         hasher.finish()
     }
 
-    pub fn aggregate_id(&self) -> &str {
-        &self.aggregate_id
+    pub fn aggregate_id(&self) -> u128 {
+        self.aggregate_id
     }
 
     pub fn client_id(&self) -> u128 {
@@ -76,8 +76,8 @@ impl ClientEventIndexCache {
 
     /// Get the highest client_event_index seen for a specific client in an aggregate
     /// Returns None if this client hasn't written to this aggregate before
-    pub fn get(&mut self, aggregate_id: &str, client_id: u128) -> Option<u64> {
-        let key = ClientKey::new(aggregate_id.to_string(), client_id);
+    pub fn get(&mut self, aggregate_id: u128, client_id: u128) -> Option<u64> {
+        let key = ClientKey::new(aggregate_id, client_id);
         self.cache.get(&key).copied()
     }
 
@@ -85,11 +85,11 @@ impl ClientEventIndexCache {
     /// Returns the previous value if it existed
     pub fn set(
         &mut self,
-        aggregate_id: &str,
+        aggregate_id: u128,
         client_id: u128,
         client_event_index: u64,
     ) -> Option<u64> {
-        let key = ClientKey::new(aggregate_id.to_string(), client_id);
+        let key = ClientKey::new(aggregate_id, client_id);
         self.cache.put(key, client_event_index)
     }
 
@@ -97,11 +97,11 @@ impl ClientEventIndexCache {
     /// Returns true if the value was updated, false if the existing value was higher or equal
     pub fn update_if_higher(
         &mut self,
-        aggregate_id: &str,
+        aggregate_id: u128,
         client_id: u128,
         client_event_index: u64,
     ) -> bool {
-        let key = ClientKey::new(aggregate_id.to_string(), client_id);
+        let key = ClientKey::new(aggregate_id, client_id);
 
         match self.cache.get(&key) {
             Some(&existing_index) if existing_index >= client_event_index => {
@@ -118,14 +118,14 @@ impl ClientEventIndexCache {
 
     /// Remove a specific client from an aggregate
     /// Returns the previous value if it existed
-    pub fn remove_client(&mut self, aggregate_id: &str, client_id: u128) -> Option<u64> {
-        let key = ClientKey::new(aggregate_id.to_string(), client_id);
+    pub fn remove_client(&mut self, aggregate_id: u128, client_id: u128) -> Option<u64> {
+        let key = ClientKey::new(aggregate_id, client_id);
         self.cache.pop(&key)
     }
 
     /// Remove all clients for a specific aggregate
     /// Returns the number of clients that were removed
-    pub fn remove_aggregate(&mut self, aggregate_id: &str) -> usize {
+    pub fn remove_aggregate(&mut self, aggregate_id: u128) -> usize {
         let keys_to_remove: Vec<ClientKey> = self
             .cache
             .iter()
@@ -141,14 +141,14 @@ impl ClientEventIndexCache {
     }
 
     /// Check if a client exists in the cache for a specific aggregate without affecting LRU order
-    pub fn contains_client(&self, aggregate_id: &str, client_id: u128) -> bool {
-        let key = ClientKey::new(aggregate_id.to_string(), client_id);
+    pub fn contains_client(&self, aggregate_id: u128, client_id: u128) -> bool {
+        let key = ClientKey::new(aggregate_id, client_id);
         self.cache.contains(&key)
     }
 
     /// Get all clients for a specific aggregate
     /// Returns a vector of (client_id, highest_client_event_index) pairs
-    pub fn get_clients_for_aggregate(&mut self, aggregate_id: &str) -> Vec<(u128, u64)> {
+    pub fn get_clients_for_aggregate(&mut self, aggregate_id: u128) -> Vec<(u128, u64)> {
         self.cache
             .iter()
             .filter(|(key, _)| key.aggregate_id == aggregate_id)
@@ -177,15 +177,15 @@ impl ClientEventIndexCache {
     }
 
     /// Peek at the least recently used entry without affecting LRU order
-    pub fn peek_lru(&self) -> Option<(&str, u128, u64)> {
+    pub fn peek_lru(&self) -> Option<(u128, u128, u64)> {
         self.cache
             .peek_lru()
-            .map(|(key, &value)| (key.aggregate_id.as_str(), key.client_id, value))
+            .map(|(key, &value)| (key.aggregate_id, key.client_id, value))
     }
 
     /// Force eviction of the least recently used entry
     /// Returns the evicted (aggregate_id, client_id, client_event_index) if any
-    pub fn force_evict_lru(&mut self) -> Option<(String, u128, u64)> {
+    pub fn force_evict_lru(&mut self) -> Option<(u128, u128, u64)> {
         self.cache
             .pop_lru()
             .map(|(key, value)| (key.aggregate_id, key.client_id, value))
@@ -201,24 +201,24 @@ mod tests {
         let mut cache = ClientEventIndexCache::new(100);
 
         // Test set and get
-        assert_eq!(cache.set("aggregate1", 123, 5), None);
-        assert_eq!(cache.get("aggregate1", 123), Some(5));
-        assert_eq!(cache.get("aggregate1", 456), None);
-        assert_eq!(cache.get("aggregate2", 123), None);
+        assert_eq!(cache.set(111, 123, 5), None);
+        assert_eq!(cache.get(111, 123), Some(5));
+        assert_eq!(cache.get(111, 456), None);
+        assert_eq!(cache.get(222, 123), None);
 
         // Test update
-        assert_eq!(cache.set("aggregate1", 123, 10), Some(5));
-        assert_eq!(cache.get("aggregate1", 123), Some(10));
+        assert_eq!(cache.set(111, 123, 10), Some(5));
+        assert_eq!(cache.get(111, 123), Some(10));
 
         // Test different client same aggregate
-        assert_eq!(cache.set("aggregate1", 456, 3), None);
-        assert_eq!(cache.get("aggregate1", 456), Some(3));
-        assert_eq!(cache.get("aggregate1", 123), Some(10)); // Should still exist
+        assert_eq!(cache.set(111, 456, 3), None);
+        assert_eq!(cache.get(111, 456), Some(3));
+        assert_eq!(cache.get(111, 123), Some(10)); // Should still exist
 
         // Test same client different aggregate
-        assert_eq!(cache.set("aggregate2", 123, 7), None);
-        assert_eq!(cache.get("aggregate2", 123), Some(7));
-        assert_eq!(cache.get("aggregate1", 123), Some(10)); // Should still exist
+        assert_eq!(cache.set(222, 123, 7), None);
+        assert_eq!(cache.get(222, 123), Some(7));
+        assert_eq!(cache.get(111, 123), Some(10)); // Should still exist
     }
 
     #[test]
@@ -226,24 +226,24 @@ mod tests {
         let mut cache = ClientEventIndexCache::new(100);
 
         // First update should succeed (no existing value)
-        assert!(cache.update_if_higher("aggregate1", 123, 5));
-        assert_eq!(cache.get("aggregate1", 123), Some(5));
+        assert!(cache.update_if_higher(111, 123, 5));
+        assert_eq!(cache.get(111, 123), Some(5));
 
         // Higher value should update
-        assert!(cache.update_if_higher("aggregate1", 123, 10));
-        assert_eq!(cache.get("aggregate1", 123), Some(10));
+        assert!(cache.update_if_higher(111, 123, 10));
+        assert_eq!(cache.get(111, 123), Some(10));
 
         // Lower value should not update
-        assert!(!cache.update_if_higher("aggregate1", 123, 7));
-        assert_eq!(cache.get("aggregate1", 123), Some(10));
+        assert!(!cache.update_if_higher(111, 123, 7));
+        assert_eq!(cache.get(111, 123), Some(10));
 
         // Equal value should not update
-        assert!(!cache.update_if_higher("aggregate1", 123, 10));
-        assert_eq!(cache.get("aggregate1", 123), Some(10));
+        assert!(!cache.update_if_higher(111, 123, 10));
+        assert_eq!(cache.get(111, 123), Some(10));
 
         // Higher value should update again
-        assert!(cache.update_if_higher("aggregate1", 123, 15));
-        assert_eq!(cache.get("aggregate1", 123), Some(15));
+        assert!(cache.update_if_higher(111, 123, 15));
+        assert_eq!(cache.get(111, 123), Some(15));
     }
 
     #[test]
@@ -251,34 +251,34 @@ mod tests {
         let mut cache = ClientEventIndexCache::new(100);
 
         // Setup test data
-        cache.set("aggregate1", 123, 5);
-        cache.set("aggregate1", 456, 3);
-        cache.set("aggregate2", 123, 7);
-        cache.set("aggregate2", 789, 9);
+        cache.set(111, 123, 5);
+        cache.set(111, 456, 3);
+        cache.set(222, 123, 7);
+        cache.set(222, 789, 9);
 
         // Test remove client
-        assert_eq!(cache.remove_client("aggregate1", 123), Some(5));
-        assert_eq!(cache.remove_client("aggregate1", 123), None);
-        assert_eq!(cache.get("aggregate1", 456), Some(3)); // Should still exist
+        assert_eq!(cache.remove_client(111, 123), Some(5));
+        assert_eq!(cache.remove_client(111, 123), None);
+        assert_eq!(cache.get(111, 456), Some(3)); // Should still exist
 
         // Test remove aggregate
-        let removed_count = cache.remove_aggregate("aggregate2");
+        let removed_count = cache.remove_aggregate(222);
         assert_eq!(removed_count, 2);
-        assert_eq!(cache.get("aggregate2", 123), None);
-        assert_eq!(cache.get("aggregate2", 789), None);
-        assert_eq!(cache.get("aggregate1", 456), Some(3)); // Should still exist
+        assert_eq!(cache.get(222, 123), None);
+        assert_eq!(cache.get(222, 789), None);
+        assert_eq!(cache.get(111, 456), Some(3)); // Should still exist
     }
 
     #[test]
     fn test_get_clients_for_aggregate() {
         let mut cache = ClientEventIndexCache::new(100);
 
-        cache.set("aggregate1", 123, 5);
-        cache.set("aggregate1", 456, 3);
-        cache.set("aggregate1", 789, 8);
-        cache.set("aggregate2", 123, 7);
+        cache.set(111, 123, 5);
+        cache.set(111, 456, 3);
+        cache.set(111, 789, 8);
+        cache.set(222, 123, 7);
 
-        let mut clients = cache.get_clients_for_aggregate("aggregate1");
+        let mut clients = cache.get_clients_for_aggregate(111);
         clients.sort_by_key(|(client_id, _)| *client_id);
 
         assert_eq!(clients.len(), 3);
@@ -286,11 +286,11 @@ mod tests {
         assert_eq!(clients[1], (456, 3));
         assert_eq!(clients[2], (789, 8));
 
-        let clients2 = cache.get_clients_for_aggregate("aggregate2");
+        let clients2 = cache.get_clients_for_aggregate(222);
         assert_eq!(clients2.len(), 1);
         assert_eq!(clients2[0], (123, 7));
 
-        let clients3 = cache.get_clients_for_aggregate("nonexistent");
+        let clients3 = cache.get_clients_for_aggregate(765);
         assert_eq!(clients3.len(), 0);
     }
 
@@ -299,39 +299,39 @@ mod tests {
         let mut cache = ClientEventIndexCache::new(2);
 
         // Fill cache to capacity
-        cache.set("aggregate1", 123, 1);
-        cache.set("aggregate1", 456, 2);
+        cache.set(111, 123, 1);
+        cache.set(111, 456, 2);
 
         // Access first entry to make it most recently used
-        cache.get("aggregate1", 123);
+        cache.get(111, 123);
 
         // Add another entry - should evict (aggregate1, 456)
-        cache.set("aggregate2", 789, 3);
+        cache.set(222, 789, 3);
 
         // Check that LRU was evicted
-        assert_eq!(cache.get("aggregate1", 123), Some(1)); // Should still exist
-        assert_eq!(cache.get("aggregate1", 456), None); // Should be evicted
-        assert_eq!(cache.get("aggregate2", 789), Some(3)); // Should exist
+        assert_eq!(cache.get(111, 123), Some(1)); // Should still exist
+        assert_eq!(cache.get(111, 456), None); // Should be evicted
+        assert_eq!(cache.get(222, 789), Some(3)); // Should exist
     }
 
     #[test]
     fn test_contains_client() {
         let mut cache = ClientEventIndexCache::new(100);
 
-        assert!(!cache.contains_client("aggregate1", 123));
+        assert!(!cache.contains_client(111, 123));
 
-        cache.set("aggregate1", 123, 5);
-        assert!(cache.contains_client("aggregate1", 123));
-        assert!(!cache.contains_client("aggregate1", 456));
-        assert!(!cache.contains_client("aggregate2", 123));
+        cache.set(111, 123, 5);
+        assert!(cache.contains_client(111, 123));
+        assert!(!cache.contains_client(111, 456));
+        assert!(!cache.contains_client(222, 123));
     }
 
     #[test]
     fn test_client_key_equality_and_hashing() {
-        let key1 = ClientKey::new("aggregate1".to_string(), 123);
-        let key2 = ClientKey::new("aggregate1".to_string(), 123);
-        let key3 = ClientKey::new("aggregate1".to_string(), 456);
-        let key4 = ClientKey::new("aggregate2".to_string(), 123);
+        let key1 = ClientKey::new(111, 123);
+        let key2 = ClientKey::new(111, 123);
+        let key3 = ClientKey::new(111, 456);
+        let key4 = ClientKey::new(222, 123);
 
         // Test equality
         assert_eq!(key1, key2);
@@ -358,7 +358,7 @@ mod tests {
         assert!(cache.is_empty());
         assert_eq!(cache.capacity(), 100);
 
-        cache.set("aggregate1", 123, 5);
+        cache.set(111, 123, 5);
         assert_eq!(cache.len(), 1);
         assert!(!cache.is_empty());
 
@@ -371,24 +371,24 @@ mod tests {
     fn test_force_evict_lru() {
         let mut cache = ClientEventIndexCache::new(3);
 
-        cache.set("aggregate1", 123, 1);
-        cache.set("aggregate1", 456, 2);
-        cache.set("aggregate2", 789, 3);
+        cache.set(111, 123, 1);
+        cache.set(111, 456, 2);
+        cache.set(222, 789, 3);
 
         // Access middle entry to change LRU order
-        cache.get("aggregate1", 456);
+        cache.get(111, 456);
 
         // Force evict should remove LRU entry
         let evicted = cache.force_evict_lru();
         assert!(evicted.is_some());
         let (aggregate_id, client_id, index) = evicted.unwrap();
         assert_eq!(
-            (aggregate_id.as_str(), client_id, index),
-            ("aggregate1", 123, 1)
+            (aggregate_id, client_id, index),
+            (111, 123, 1)
         );
 
         // Verify it was actually removed
-        assert_eq!(cache.get("aggregate1", 123), None);
+        assert_eq!(cache.get(111, 123), None);
         assert_eq!(cache.len(), 2);
     }
 }

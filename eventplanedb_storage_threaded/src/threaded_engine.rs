@@ -32,7 +32,7 @@ pub struct ThreadedEngine {
 impl ThreadedEngine {
     async fn execute_command<T, F>(
         &self,
-        aggregate_id: &str,
+        aggregate_id: u128,
         command_builder: F,
     ) -> ThreadedResult<T>
     where
@@ -116,7 +116,7 @@ impl ThreadedEngine {
     }
 
     /// Get the worker thread index for a given aggregate_id
-    fn get_worker_index(&self, aggregate_id: &str) -> usize {
+    fn get_worker_index(&self, aggregate_id: u128) -> usize {
         let hash = hash_aggregate_id(aggregate_id);
         (hash as usize) % self.thread_count
     }
@@ -124,14 +124,14 @@ impl ThreadedEngine {
     /// Append events to an aggregate
     pub async fn append_events(
         &self,
-        aggregate_id: &str,
+        aggregate_id: u128,
         client_id: u128,
         user_id: Option<u128>,
         events: Vec<EventItem>,
         expected_event_batch_index: Option<u64>,
     ) -> ThreadedResult<EventBatchMetadata> {
         self.execute_command(aggregate_id, |response_tx| WorkerCommand::AppendEvents {
-            aggregate_id: aggregate_id.to_string(),
+            aggregate_id,
             client_id,
             user_id,
             events,
@@ -144,11 +144,11 @@ impl ThreadedEngine {
     /// Read filtered events from an aggregate
     pub async fn read_filtered(
         &self,
-        aggregate_id: &str,
+        aggregate_id: u128,
         filters: ReadFilters,
     ) -> ThreadedResult<ReadResult> {
         self.execute_command(aggregate_id, |response_tx| WorkerCommand::ReadFiltered {
-            aggregate_id: aggregate_id.to_string(),
+            aggregate_id,
             filters,
             response_tx,
         })
@@ -156,9 +156,9 @@ impl ThreadedEngine {
     }
 
     /// Check if an aggregate exists
-    pub async fn exists(&self, aggregate_id: &str) -> ThreadedResult<bool> {
+    pub async fn exists(&self, aggregate_id: u128) -> ThreadedResult<bool> {
         self.execute_command(aggregate_id, |response_tx| WorkerCommand::Exists {
-            aggregate_id: aggregate_id.to_string(),
+            aggregate_id,
             response_tx,
         })
         .await
@@ -167,11 +167,11 @@ impl ThreadedEngine {
     /// Trim events from the start of an aggregate
     pub async fn trim_start(
         &self,
-        aggregate_id: &str,
+        aggregate_id: u128,
         keep_from_event_batch_index: u64,
     ) -> ThreadedResult<()> {
         self.execute_command(aggregate_id, |response_tx| WorkerCommand::TrimStart {
-            aggregate_id: aggregate_id.to_string(),
+            aggregate_id,
             keep_from_event_batch_index,
             response_tx,
         })
@@ -179,9 +179,9 @@ impl ThreadedEngine {
     }
 
     /// Delete an aggregate
-    pub async fn delete(&self, aggregate_id: &str) -> ThreadedResult<()> {
+    pub async fn delete(&self, aggregate_id: u128) -> ThreadedResult<()> {
         self.execute_command(aggregate_id, |response_tx| WorkerCommand::Delete {
-            aggregate_id: aggregate_id.to_string(),
+            aggregate_id,
             response_tx,
         })
         .await
@@ -280,10 +280,10 @@ mod tests {
         for i in 0..1000 {
             let engine_clone = engine.clone();
             let handle = tokio::spawn(async move {
-                let aggregate_id = format!("aggregate_{}", i % 100); // 100 different aggregates
+                let aggregate_id = (i % 100) as u128; // 100 different aggregates
                 let events = create_test_events(i, 1);
                 engine_clone
-                    .append_events(&aggregate_id, 100, None, events, None)
+                    .append_events(aggregate_id, 100, None, events, None)
                     .await
             });
             handles.push(handle);
@@ -302,7 +302,7 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let mut engine = ThreadedEngine::with_default_config(temp_dir.path().to_path_buf())?;
 
-        let aggregate_id = "test_aggregate";
+        let aggregate_id = 123;
         let client_id = 100u128;
         let events = create_test_events(1, 3);
 
@@ -338,11 +338,11 @@ mod tests {
 
         for i in 0..10 {
             let engine_clone = engine.clone();
-            let aggregate_id = format!("aggregate_{}", i);
+            let aggregate_id = i as u128;
             let handle = tokio::spawn(async move {
                 let events = create_test_events(1, 2);
                 engine_clone
-                    .append_events(&aggregate_id, 100, None, events, None)
+                    .append_events(aggregate_id, 100, None, events, None)
                     .await
             });
             handles.push(handle);
@@ -356,8 +356,8 @@ mod tests {
 
         // Verify all aggregates exist
         for i in 0..10 {
-            let aggregate_id = format!("aggregate_{}", i);
-            let exists = engine.exists(&aggregate_id).await?;
+            let aggregate_id = i as u128;
+            let exists = engine.exists(aggregate_id).await?;
             assert!(exists);
         }
 
@@ -371,18 +371,17 @@ mod tests {
             temp_dir.path().to_path_buf(),
         )?);
 
-        let aggregate_id = "test_aggregate";
+        let aggregate_id = 123;
 
         // Create multiple concurrent operations on the same aggregate
         let mut handles = Vec::new();
 
         for i in 0..5 {
             let engine_clone = engine.clone();
-            let aggregate_id = aggregate_id.to_string();
             let handle = tokio::spawn(async move {
                 let events = create_test_events(i * 10 + 1, 2);
                 engine_clone
-                    .append_events(&aggregate_id, 100, None, events, None)
+                    .append_events(aggregate_id, 100, None, events, None)
                     .await
             });
             handles.push(handle);
@@ -415,7 +414,7 @@ mod tests {
         let mut engine = ThreadedEngine::new(config)?;
 
         // Same aggregate should always get assigned to the same thread
-        let aggregate_id = "consistent_aggregate";
+        let aggregate_id = 54321;
         let worker_index1 = engine.get_worker_index(aggregate_id);
         let worker_index2 = engine.get_worker_index(aggregate_id);
         let worker_index3 = engine.get_worker_index(aggregate_id);
@@ -436,7 +435,7 @@ mod tests {
 
         let events = create_test_events(1, 1000); // Large number of events
         let result = engine
-            .append_events("test_aggregate", 100, None, events, None)
+            .append_events(123, 100, None, events, None)
             .await;
 
         // Should either succeed (if fast enough) or timeout
@@ -455,7 +454,7 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let mut engine = ThreadedEngine::with_default_config(temp_dir.path().to_path_buf())?;
 
-        let aggregate_id = "test_destructive";
+        let aggregate_id = 99999;
 
         // Write multiple batches
         for i in 0..5 {
@@ -495,7 +494,7 @@ mod tests {
         // Test basic operation still works
         let events = create_test_events(1, 1);
         let result = engine
-            .append_events("test", 100, None, events, None)
+            .append_events(9876, 100, None, events, None)
             .await?;
         assert_eq!(result.event_batch_index, 0);
 
@@ -508,7 +507,7 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let mut engine = ThreadedEngine::with_default_config(temp_dir.path().to_path_buf())?;
 
-        let aggregate_id = "filter_test";
+        let aggregate_id = 777777;
 
         // Write events with different types and clients
         let events1 = vec![EventItem::new(1, 1, 1000, 42, 1, b"type42".to_vec())];

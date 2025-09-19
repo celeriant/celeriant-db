@@ -8,6 +8,8 @@ pub mod tests {
 
     use eventplanedb_storage_structures::constants::BLOOM_HASH_SEED;
     use eventplanedb_storage_structures::event_batch_metadata::EventBatchMetadata;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+use eventplanedb_storage_structures::read_result::ReadResult;
     #[cfg(not(target_os = "linux"))]
     use eventplanedb_storage_structures::read_result::ReadResult;
     use eventplanedb_storage_structures::{

@@ -1,6 +1,12 @@
 use fastbloom::BloomFilter;
 
 use std::io::{self, Read, Seek, SeekFrom};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use io_uring::{
+    IoUring, opcode, types
+};
 
 use eventplanedb_storage_structures::compression_type::CompressionType;
 use eventplanedb_storage_structures::constants::{
@@ -664,6 +670,7 @@ fn read_metadata_entries_with_uring<R: Read + Seek + AsRawFd>(
     filters: &ReadFilters,
     io_uring_queue_depth: u32,
 ) -> io::Result<Vec<MetadataBatchInfo>> {
+
     let mut ring = IoUring::new(io_uring_queue_depth)?;
     let fd = types::Fd(metadata_reader.as_raw_fd());
 
@@ -684,6 +691,7 @@ fn read_metadata_entries_with_uring<R: Read + Seek + AsRawFd>(
         // Submit read operations for this chunk
         let mut submission_count = 0;
         for (i, buffer) in buffer_pool.iter_mut().enumerate() {
+            
             let global_index = chunk_start + i;
             let offset = start_offset + (global_index as u64 * METADATA_BATCH_SIZE_BYTES as u64);
             let read_op = opcode::Read::new(fd, buffer.as_mut_ptr(), buffer.len() as u32)

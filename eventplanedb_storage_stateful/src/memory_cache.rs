@@ -8,7 +8,7 @@ use eventplanedb_storage_structures::event_batch_metadata::EventBatchMetadata;
 /// Each aggregate stores a vector of (EventBatchItem, EventBatchMetadata) pairs
 /// Uses uncompressed_size for memory-based eviction with manual size tracking
 pub struct LruMemoryCache {
-    cache: LruCache<String, Vec<(EventBatchItem, EventBatchMetadata)>>,
+    cache: LruCache<u128, Vec<(EventBatchItem, EventBatchMetadata)>>,
     max_memory_bytes: u64,
     current_memory_bytes: u64,
 }
@@ -51,7 +51,7 @@ impl LruMemoryCache {
     /// This is highly optimized to avoid cloning when possible
     pub fn add(
         &mut self,
-        aggregate_id: &str,
+        aggregate_id: u128,
         event_batch_item: EventBatchItem,
         event_batch_metadata: EventBatchMetadata,
     ) {
@@ -59,7 +59,7 @@ impl LruMemoryCache {
         let new_batch_index = event_batch_item.event_batch_index;
 
         // Try to get mutable reference to existing batches
-        if let Some(batches) = self.cache.get_mut(aggregate_id) {
+        if let Some(batches) = self.cache.get_mut(&aggregate_id) {
             // Validate sequence continuity
             if !batches.is_empty() {
                 let last_batch_index = batches.last().unwrap().0.event_batch_index;
@@ -75,7 +75,7 @@ impl LruMemoryCache {
         } else {
             // Create new entry
             let new_batches = vec![(event_batch_item, event_batch_metadata)];
-            self.cache.put(aggregate_id.to_string(), new_batches);
+            self.cache.put(aggregate_id, new_batches);
             self.current_memory_bytes += batch_size;
         }
 
@@ -86,13 +86,13 @@ impl LruMemoryCache {
     /// Add multiple batches at once for better performance
     pub fn add_batches(
         &mut self,
-        aggregate_id: &str,
+        aggregate_id: u128,
         mut new_batches: Vec<(EventBatchItem, EventBatchMetadata)>,
     ) {
         let batch_total_size = Self::calculate_memory_usage(&new_batches);
         let new_batch_index = new_batches.first().unwrap().0.event_batch_index;
 
-        if let Some(existing_batches) = self.cache.get_mut(aggregate_id) {
+        if let Some(existing_batches) = self.cache.get_mut(&aggregate_id) {
             // Validate sequence continuity
             if !existing_batches.is_empty() {
                 let last_batch_index = existing_batches.last().unwrap().0.event_batch_index;
@@ -107,7 +107,7 @@ impl LruMemoryCache {
             self.current_memory_bytes += batch_total_size;
         } else {
             // Create new entry
-            self.cache.put(aggregate_id.to_string(), new_batches);
+            self.cache.put(aggregate_id, new_batches);
             self.current_memory_bytes += batch_total_size;
         }
 
@@ -117,8 +117,8 @@ impl LruMemoryCache {
 
     /// Get the array index position for a given event batch index
     /// Returns None if the event batch index is not found in cache
-    pub fn get_pos(&mut self, aggregate_id: &str, from_event_batch_index: u64) -> Option<usize> {
-        let batches = self.cache.get(aggregate_id)?;
+    pub fn get_pos(&mut self, aggregate_id: u128, from_event_batch_index: u64) -> Option<usize> {
+        let batches = self.cache.get(&aggregate_id)?;
 
         if batches.is_empty() {
             return None;
@@ -146,8 +146,8 @@ impl LruMemoryCache {
 
     /// Get an event batch item at the specified array index position
     /// Returns None if the aggregate or index doesn't exist
-    pub fn get_batch(&mut self, aggregate_id: &str, index_pos: usize) -> Option<&EventBatchItem> {
-        let batches = self.cache.get(aggregate_id)?;
+    pub fn get_batch(&mut self, aggregate_id: u128, index_pos: usize) -> Option<&EventBatchItem> {
+        let batches = self.cache.get(&aggregate_id)?;
         batches.get(index_pos).map(|(batch, _)| batch)
     }
 
@@ -155,40 +155,40 @@ impl LruMemoryCache {
     /// Returns None if the aggregate or index doesn't exist
     pub fn get_meta(
         &mut self,
-        aggregate_id: &str,
+        aggregate_id: u128,
         index_pos: usize,
     ) -> Option<&EventBatchMetadata> {
-        let batches = self.cache.get(aggregate_id)?;
+        let batches = self.cache.get(&aggregate_id)?;
         batches.get(index_pos).map(|(_, metadata)| metadata)
     }
 
     /// Get mutable reference to event batch item - enables in-place modifications
     pub fn get_batch_mut(
         &mut self,
-        aggregate_id: &str,
+        aggregate_id: u128,
         index_pos: usize,
     ) -> Option<&mut EventBatchItem> {
-        let batches = self.cache.get_mut(aggregate_id)?;
+        let batches = self.cache.get_mut(&aggregate_id)?;
         batches.get_mut(index_pos).map(|(batch, _)| batch)
     }
 
     /// Get mutable reference to event batch metadata - enables in-place modifications
     pub fn get_meta_mut(
         &mut self,
-        aggregate_id: &str,
+        aggregate_id: u128,
         index_pos: usize,
     ) -> Option<&mut EventBatchMetadata> {
-        let batches = self.cache.get_mut(aggregate_id)?;
+        let batches = self.cache.get_mut(&aggregate_id)?;
         batches.get_mut(index_pos).map(|(_, metadata)| metadata)
     }
 
     /// Get both batch and metadata as mutable references
     pub fn get_batch_and_meta_mut(
         &mut self,
-        aggregate_id: &str,
+        aggregate_id: u128,
         index_pos: usize,
     ) -> Option<(&mut EventBatchItem, &mut EventBatchMetadata)> {
-        let batches = self.cache.get_mut(aggregate_id)?;
+        let batches = self.cache.get_mut(&aggregate_id)?;
         batches
             .get_mut(index_pos)
             .map(|(batch, metadata)| (batch, metadata))
@@ -197,22 +197,22 @@ impl LruMemoryCache {
     /// Get immutable reference to all batches for an aggregate
     pub fn get_all_batches(
         &mut self,
-        aggregate_id: &str,
+        aggregate_id: u128,
     ) -> Option<&[(EventBatchItem, EventBatchMetadata)]> {
-        self.cache.get(aggregate_id).map(|v| v.as_slice())
+        self.cache.get(&aggregate_id).map(|v| v.as_slice())
     }
 
     /// Get mutable reference to all batches for an aggregate
     pub fn get_all_batches_mut(
         &mut self,
-        aggregate_id: &str,
+        aggregate_id: u128,
     ) -> Option<&mut Vec<(EventBatchItem, EventBatchMetadata)>> {
-        self.cache.get_mut(aggregate_id)
+        self.cache.get_mut(&aggregate_id)
     }
 
     /// Clear all cached data for a specific aggregate and update memory tracking
-    pub fn clear_aggregate(&mut self, aggregate_id: &str) {
-        if let Some(removed_batches) = self.cache.pop(aggregate_id) {
+    pub fn clear_aggregate(&mut self, aggregate_id: u128) {
+        if let Some(removed_batches) = self.cache.pop(&aggregate_id) {
             let removed_size = Self::calculate_memory_usage(&removed_batches);
             self.current_memory_bytes = self.current_memory_bytes.saturating_sub(removed_size);
         }
@@ -225,13 +225,13 @@ impl LruMemoryCache {
     }
 
     /// Check if we have any cached data for an aggregate (doesn't affect LRU order)
-    pub fn contains_aggregate(&self, aggregate_id: &str) -> bool {
-        self.cache.contains(aggregate_id)
+    pub fn contains_aggregate(&self, aggregate_id: u128) -> bool {
+        self.cache.contains(&aggregate_id)
     }
 
     /// Promote an aggregate to most recently used without accessing data
-    pub fn touch_aggregate(&mut self, aggregate_id: &str) -> bool {
-        self.cache.promote(aggregate_id)
+    pub fn touch_aggregate(&mut self, aggregate_id: u128) -> bool {
+        self.cache.promote(&aggregate_id)
     }
 
     /// Get the number of aggregates currently cached
@@ -265,12 +265,12 @@ impl LruMemoryCache {
     }
 
     /// Peek at the least recently used aggregate without affecting LRU order
-    pub fn peek_lru(&self) -> Option<(&String, &Vec<(EventBatchItem, EventBatchMetadata)>)> {
+    pub fn peek_lru(&self) -> Option<(&u128, &Vec<(EventBatchItem, EventBatchMetadata)>)> {
         self.cache.peek_lru()
     }
 
     /// Peek at the most recently used aggregate without affecting LRU order
-    pub fn peek_mru(&self) -> Option<(&String, &Vec<(EventBatchItem, EventBatchMetadata)>)> {
+    pub fn peek_mru(&self) -> Option<(&u128, &Vec<(EventBatchItem, EventBatchMetadata)>)> {
         self.cache.peek_mru()
     }
 
@@ -278,7 +278,7 @@ impl LruMemoryCache {
     /// Returns the evicted aggregate ID and its batches, if any
     pub fn force_evict_lru(
         &mut self,
-    ) -> Option<(String, Vec<(EventBatchItem, EventBatchMetadata)>)> {
+    ) -> Option<(u128, Vec<(EventBatchItem, EventBatchMetadata)>)> {
         if let Some((aggregate_id, batches)) = self.cache.pop_lru() {
             let removed_size = Self::calculate_memory_usage(&batches);
             self.current_memory_bytes = self.current_memory_bytes.saturating_sub(removed_size);
@@ -307,7 +307,7 @@ mod tests {
             compressed_size: 500,
             ..Default::default()
         };
-        cache.add("test_aggregate", batch1, metadata1);
+        cache.add(123, batch1, metadata1);
 
         // Try to add batch with gap (index 3 instead of 2)
         let event3 = EventItem::new(3, 3, 1000, 42, 1, b"test3".to_vec());
@@ -318,14 +318,14 @@ mod tests {
             compressed_size: 500,
             ..Default::default()
         };
-        cache.add("test_aggregate", batch3, metadata3);
+        cache.add(123, batch3, metadata3);
 
         // Should only have 1 batch (the gap batch should be rejected)
-        assert_eq!(cache.get_all_batches("test_aggregate").unwrap().len(), 1);
+        assert_eq!(cache.get_all_batches(123).unwrap().len(), 1);
         assert_eq!(cache.memory_usage_bytes(), 1000); // Only first batch
 
         // Should not be able to find batch index 3
-        assert!(cache.get_pos("test_aggregate", 3).is_none());
+        assert!(cache.get_pos(123, 3).is_none());
 
         // Now add correct sequential batch (index 2)
         let event2 = EventItem::new(2, 2, 1000, 42, 1, b"test2".to_vec());
@@ -336,12 +336,12 @@ mod tests {
             compressed_size: 500,
             ..Default::default()
         };
-        cache.add("test_aggregate", batch2, metadata2);
+        cache.add(123, batch2, metadata2);
 
         // Now should have 2 batches
-        assert_eq!(cache.get_all_batches("test_aggregate").unwrap().len(), 2);
+        assert_eq!(cache.get_all_batches(123).unwrap().len(), 2);
         assert_eq!(cache.memory_usage_bytes(), 2000);
-        assert_eq!(cache.get_pos("test_aggregate", 2), Some(1));
+        assert_eq!(cache.get_pos(123, 2), Some(1));
     }
 
     #[test]
@@ -357,10 +357,10 @@ mod tests {
             ..Default::default()
         };
 
-        cache.add("test_aggregate", batch, metadata);
+        cache.add(123, batch, metadata);
 
         // Should find the batch at index 5
-        assert_eq!(cache.get_pos("test_aggregate", 5), Some(0));
+        assert_eq!(cache.get_pos(123, 5), Some(0));
         assert_eq!(cache.memory_usage_bytes(), 1000);
         assert_eq!(cache.aggregate_count(), 1);
     }
@@ -379,13 +379,13 @@ mod tests {
                 compressed_size: 250,
                 ..Default::default()
             };
-            cache.add("test_aggregate", batch, metadata);
+            cache.add(123, batch, metadata);
         }
 
         // All batches should be present
-        assert_eq!(cache.get_pos("test_aggregate", 1), Some(0));
-        assert_eq!(cache.get_pos("test_aggregate", 2), Some(1));
-        assert_eq!(cache.get_pos("test_aggregate", 3), Some(2));
+        assert_eq!(cache.get_pos(123, 1), Some(0));
+        assert_eq!(cache.get_pos(123, 2), Some(1));
+        assert_eq!(cache.get_pos(123, 3), Some(2));
 
         // Memory usage should be accurate
         assert_eq!(cache.memory_usage_bytes(), 1500); // 3 * 500
@@ -405,7 +405,7 @@ mod tests {
             compressed_size: 500,
             ..Default::default()
         };
-        cache.add("aggregate1", batch1, metadata1);
+        cache.add(111, batch1, metadata1);
 
         // Add second aggregate with 1KB (total: 2KB, at limit)
         let event2 = EventItem::new(1, 1, 1000, 42, 1, b"test2".to_vec());
@@ -416,7 +416,7 @@ mod tests {
             compressed_size: 500,
             ..Default::default()
         };
-        cache.add("aggregate2", batch2, metadata2);
+        cache.add(222, batch2, metadata2);
 
         assert_eq!(cache.memory_usage_bytes(), 2000);
         assert_eq!(cache.aggregate_count(), 2);
@@ -430,12 +430,12 @@ mod tests {
             compressed_size: 500,
             ..Default::default()
         };
-        cache.add("aggregate3", batch3, metadata3);
+        cache.add(333, batch3, metadata3);
 
         // Should have evicted aggregate1 (LRU)
-        assert!(!cache.contains_aggregate("aggregate1"));
-        assert!(cache.contains_aggregate("aggregate2"));
-        assert!(cache.contains_aggregate("aggregate3"));
+        assert!(!cache.contains_aggregate(111));
+        assert!(cache.contains_aggregate(222));
+        assert!(cache.contains_aggregate(333));
         assert_eq!(cache.memory_usage_bytes(), 2000);
         assert_eq!(cache.aggregate_count(), 2);
     }
@@ -453,15 +453,15 @@ mod tests {
             ..Default::default()
         };
 
-        cache.add("test_aggregate", batch, metadata);
+        cache.add(123, batch, metadata);
 
         // Test mutable access
-        if let Some(batch_mut) = cache.get_batch_mut("test_aggregate", 0) {
+        if let Some(batch_mut) = cache.get_batch_mut(123, 0) {
             batch_mut.event_batch_index = 99;
         }
 
         // Verify the change
-        if let Some(batch) = cache.get_batch("test_aggregate", 0) {
+        if let Some(batch) = cache.get_batch(123, 0) {
             assert_eq!(batch.event_batch_index, 99);
         }
     }
@@ -483,12 +483,12 @@ mod tests {
             batches.push((batch, metadata));
         }
 
-        cache.add_batches("test_aggregate", batches);
+        cache.add_batches(123, batches);
 
         assert_eq!(cache.aggregate_count(), 1);
         assert_eq!(cache.memory_usage_bytes(), 1500); // 3 * 500
-        assert_eq!(cache.get_pos("test_aggregate", 1), Some(0));
-        assert_eq!(cache.get_pos("test_aggregate", 2), Some(1));
-        assert_eq!(cache.get_pos("test_aggregate", 3), Some(2));
+        assert_eq!(cache.get_pos(123, 1), Some(0));
+        assert_eq!(cache.get_pos(123, 2), Some(1));
+        assert_eq!(cache.get_pos(123, 3), Some(2));
     }
 }

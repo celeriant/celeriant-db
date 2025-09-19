@@ -14,6 +14,8 @@ struct FileHandle {
 pub struct FileCache {
     readers: HashMap<String, Rc<RefCell<BufReader<File>>>>,
     writers: HashMap<String, Rc<RefCell<BufWriter<File>>>>,
+    #[cfg(target_os = "linux")]
+    raw_readers: HashMap<String, Rc<RefCell<File>>>,
     handle_queue: VecDeque<FileHandle>,
     max_handles: usize,
 }
@@ -23,19 +25,30 @@ impl FileCache {
         Self {
             readers: HashMap::new(),
             writers: HashMap::new(),
+            #[cfg(target_os = "linux")]
+            raw_readers: HashMap::new(),
             handle_queue: VecDeque::new(),
             max_handles,
         }
     }
 
     fn evict(&mut self) {
-        while self.readers.len() + self.writers.len() >= self.max_handles {
+        #[cfg(target_os = "linux")]
+        let mut total_handles = self.readers.len() + self.writers.len() + self.raw_readers.len();
+        #[cfg(not(target_os = "linux"))]
+        let mut total_handles = self.readers.len() + self.writers.len();
+
+        while total_handles >= self.max_handles {
             if let Some(handle) = self.handle_queue.pop_front() {
                 if handle.is_reader {
+                    #[cfg(target_os = "linux")]
+                    self.raw_readers.remove(&handle.file_path);
+                    #[cfg(not(target_os = "linux"))]
                     self.readers.remove(&handle.file_path);
                 } else {
                     self.writers.remove(&handle.file_path);
                 }
+                total_handles = total_handles - 1;
             } else {
                 // Queue is empty, but we're still over the limit. This shouldn't happen,
                 // but we need a way to avoid an infinite loop.  Possibly log an error.
@@ -85,14 +98,24 @@ impl FileCache {
         Ok(rc_buf)
     }
 
-
     #[cfg(target_os = "linux")]
-    pub fn create_reader(&mut self, file_path: &str) -> io::Result<File> {
-        // For cases where we need AsRawFd, return the raw File
+    pub fn create_reader(&mut self, file_path: &str) -> io::Result<Rc<RefCell<File>>> {
+        self.evict();
+        
+        // Check if exists and clone the Rc in a separate scope
+        if let Some(existing) = self.raw_readers.get(file_path).cloned() {
+            self.track_handle(file_path.to_string(), true);
+            return Ok(existing);
+        }
+        
         let file = OpenOptions::new()
             .read(true)
             .open(file_path)?;
-        Ok(file)
+        let rc_file = Rc::new(RefCell::new(file));
+        self.raw_readers.insert(file_path.to_string(), Rc::clone(&rc_file));
+        
+        self.track_handle(file_path.to_string(), true);
+        Ok(rc_file)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -116,6 +139,8 @@ impl FileCache {
     pub fn remove(&mut self, file_path: &str) {
         self.writers.remove(file_path);
         self.readers.remove(file_path);
+        #[cfg(target_os = "linux")]
+        self.raw_readers.remove(file_path);
         self.handle_queue.retain(|handle| handle.file_path != file_path);
     }
 }
@@ -172,26 +197,58 @@ mod tests {
 
         // Add first reader - should not trigger eviction
         cache.create_reader(file1_str).unwrap();
-        assert_eq!(cache.readers.len(), 1);
-        assert_eq!(cache.writers.len(), 0);
-        assert_eq!(cache.handle_queue.len(), 1);
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(cache.raw_readers.len(), 1);
+            assert_eq!(cache.writers.len(), 0);
+            assert_eq!(cache.handle_queue.len(), 1);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(cache.readers.len(), 1);
+            assert_eq!(cache.writers.len(), 0);
+            assert_eq!(cache.handle_queue.len(), 1);
+        }
 
         // Add second reader - should not trigger eviction (at limit)
         cache.create_reader(file2_str).unwrap();
-        assert_eq!(cache.readers.len(), 2);
-        assert_eq!(cache.writers.len(), 0);
-        assert_eq!(cache.handle_queue.len(), 2);
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(cache.raw_readers.len(), 2);
+            assert_eq!(cache.writers.len(), 0);
+            assert_eq!(cache.handle_queue.len(), 2);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(cache.readers.len(), 2);
+            assert_eq!(cache.writers.len(), 0);
+            assert_eq!(cache.handle_queue.len(), 2);
+        }
 
         // Add third reader - should trigger eviction of first reader
         cache.create_reader(file3_str).unwrap();
-        assert_eq!(cache.readers.len(), 2);
-        assert_eq!(cache.writers.len(), 0);
-        assert_eq!(cache.handle_queue.len(), 2);
-        
-        // file1 should be evicted, file2 and file3 should remain
-        assert!(!cache.readers.contains_key(file1_str));
-        assert!(cache.readers.contains_key(file2_str));
-        assert!(cache.readers.contains_key(file3_str));
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(cache.raw_readers.len(), 2);
+            assert_eq!(cache.writers.len(), 0);
+            assert_eq!(cache.handle_queue.len(), 2);
+            
+            // file1 should be evicted, file2 and file3 should remain
+            assert!(!cache.raw_readers.contains_key(file1_str));
+            assert!(cache.raw_readers.contains_key(file2_str));
+            assert!(cache.raw_readers.contains_key(file3_str));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(cache.readers.len(), 2);
+            assert_eq!(cache.writers.len(), 0);
+            assert_eq!(cache.handle_queue.len(), 2);
+            
+            // file1 should be evicted, file2 and file3 should remain
+            assert!(!cache.readers.contains_key(file1_str));
+            assert!(cache.readers.contains_key(file2_str));
+            assert!(cache.readers.contains_key(file3_str));
+        }
     }
 
     #[test]
@@ -217,19 +274,36 @@ mod tests {
         fs::write(&file3, "test3").unwrap();
         cache.create_reader(file3_str).unwrap();
 
+        #[cfg(target_os = "linux")]
+        assert_eq!(cache.raw_readers.len() + cache.writers.len(), 3);
+        #[cfg(not(target_os = "linux"))]
         assert_eq!(cache.readers.len() + cache.writers.len(), 3);
 
         // Add fourth handle - should evict the first (oldest) handle
         cache.create_append_writer(file4_str).unwrap();
         
-        assert_eq!(cache.readers.len() + cache.writers.len(), 3);
-        assert_eq!(cache.handle_queue.len(), 3);
-        
-        // file1 (first reader) should be evicted
-        assert!(!cache.readers.contains_key(file1_str));
-        assert!(cache.writers.contains_key(file2_str));
-        assert!(cache.readers.contains_key(file3_str));
-        assert!(cache.writers.contains_key(file4_str));
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(cache.raw_readers.len() + cache.writers.len(), 3);
+            assert_eq!(cache.handle_queue.len(), 3);
+            
+            // file1 (first reader) should be evicted
+            assert!(!cache.raw_readers.contains_key(file1_str));
+            assert!(cache.writers.contains_key(file2_str));
+            assert!(cache.raw_readers.contains_key(file3_str));
+            assert!(cache.writers.contains_key(file4_str));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(cache.readers.len() + cache.writers.len(), 3);
+            assert_eq!(cache.handle_queue.len(), 3);
+            
+            // file1 (first reader) should be evicted
+            assert!(!cache.readers.contains_key(file1_str));
+            assert!(cache.writers.contains_key(file2_str));
+            assert!(cache.readers.contains_key(file3_str));
+            assert!(cache.writers.contains_key(file4_str));
+        }
     }
 
     #[test]
@@ -250,12 +324,25 @@ mod tests {
         cache.create_reader(file1_str).unwrap();
         cache.create_append_writer(file2_str).unwrap();
 
-        assert_eq!(cache.readers.len(), 1);
-        assert_eq!(cache.writers.len(), 1);
-        assert_eq!(cache.handle_queue.len(), 2);
-        
-        // Both should still be present
-        assert!(cache.readers.contains_key(file1_str));
-        assert!(cache.writers.contains_key(file2_str));
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(cache.raw_readers.len(), 1);
+            assert_eq!(cache.writers.len(), 1);
+            assert_eq!(cache.handle_queue.len(), 2);
+            
+            // Both should still be present
+            assert!(cache.raw_readers.contains_key(file1_str));
+            assert!(cache.writers.contains_key(file2_str));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(cache.readers.len(), 1);
+            assert_eq!(cache.writers.len(), 1);
+            assert_eq!(cache.handle_queue.len(), 2);
+            
+            // Both should still be present
+            assert!(cache.readers.contains_key(file1_str));
+            assert!(cache.writers.contains_key(file2_str));
+        }
     }
 }

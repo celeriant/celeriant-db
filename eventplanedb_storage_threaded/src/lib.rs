@@ -37,7 +37,7 @@ type ThreadedResult<T> = Result<T, ThreadedError>;
 #[allow(clippy::large_enum_variant)]
 enum WorkerCommand {
     AppendEvents {
-        aggregate_id: String,
+        aggregate_id: u128,
         client_id: u128,
         user_id: Option<u128>,
         events: Vec<EventItem>,
@@ -45,21 +45,21 @@ enum WorkerCommand {
         response_tx: oneshot::Sender<ThreadedResult<EventBatchMetadata>>,
     },
     ReadFiltered {
-        aggregate_id: String,
+        aggregate_id: u128,
         filters: ReadFilters,
         response_tx: oneshot::Sender<ThreadedResult<ReadResult>>,
     },
     Exists {
-        aggregate_id: String,
+        aggregate_id: u128,
         response_tx: oneshot::Sender<ThreadedResult<bool>>,
     },
     TrimStart {
-        aggregate_id: String,
+        aggregate_id: u128,
         keep_from_event_batch_index: u64,
         response_tx: oneshot::Sender<ThreadedResult<()>>,
     },
     Delete {
-        aggregate_id: String,
+        aggregate_id: u128,
         response_tx: oneshot::Sender<ThreadedResult<()>>,
     },
     Shutdown,
@@ -117,7 +117,7 @@ impl ThreadedEngineConfig {
 }
 
 /// Hash function for aggregate_id to determine thread assignment
-fn hash_aggregate_id(aggregate_id: &str) -> u64 {
+fn hash_aggregate_id(aggregate_id: u128) -> u64 {
     let mut hasher = AHasher::default();
     aggregate_id.hash(&mut hasher);
     hasher.finish()
@@ -169,7 +169,7 @@ impl Worker {
                 response_tx,
             } => {
                 let result = engine.append_events(
-                    &aggregate_id,
+                    aggregate_id,
                     client_id,
                     user_id,
                     events,
@@ -184,7 +184,7 @@ impl Worker {
                 filters,
                 response_tx,
             } => {
-                let result = engine.read_filtered(&aggregate_id, &filters);
+                let result = engine.read_filtered(aggregate_id, &filters);
                 let threaded_result = result.map_err(ThreadedError::from);
                 let _ = response_tx.send(threaded_result);
                 true
@@ -193,7 +193,7 @@ impl Worker {
                 aggregate_id,
                 response_tx,
             } => {
-                let result = engine.exists(&aggregate_id);
+                let result = engine.exists(aggregate_id);
                 let threaded_result = result.map_err(ThreadedError::from);
                 let _ = response_tx.send(threaded_result);
                 true
@@ -203,7 +203,7 @@ impl Worker {
                 keep_from_event_batch_index,
                 response_tx,
             } => {
-                let result = engine.trim_start(&aggregate_id, keep_from_event_batch_index);
+                let result = engine.trim_start(aggregate_id, keep_from_event_batch_index);
                 let threaded_result = result.map_err(ThreadedError::from);
                 let _ = response_tx.send(threaded_result);
                 true
@@ -212,7 +212,7 @@ impl Worker {
                 aggregate_id,
                 response_tx,
             } => {
-                let result = engine.delete(&aggregate_id);
+                let result = engine.delete(aggregate_id);
                 let threaded_result = result.map_err(ThreadedError::from);
                 let _ = response_tx.send(threaded_result);
                 true

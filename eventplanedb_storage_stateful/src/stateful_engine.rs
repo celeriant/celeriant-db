@@ -105,19 +105,20 @@ impl StatefulEngine {
         Self::new(config)
     }
 
-    fn get_aggregate_paths(&self, aggregate_id: &str) -> (PathBuf, PathBuf) {
-        let aggregate_dir = self.config.base_path.join(aggregate_id);
+    fn get_aggregate_paths(&self, aggregate_id: u128) -> (PathBuf, PathBuf) {
+        let aggregate_dir_name = aggregate_id.to_string();
+        let aggregate_dir = self.config.base_path.join(aggregate_dir_name);
         let event_batch_path = aggregate_dir.join("event_batches.bin");
         let metadata_path = aggregate_dir.join("metadata.bin");
         (event_batch_path, metadata_path)
     }
 
-    fn ensure_aggregate_directory(&self, aggregate_id: &str) -> io::Result<()> {
-        let aggregate_dir = self.config.base_path.join(aggregate_id);
+    fn ensure_aggregate_directory(&self, aggregate_id: u128) -> io::Result<()> {
+        let aggregate_dir = self.config.base_path.join(aggregate_id.to_string());
         std::fs::create_dir_all(aggregate_dir)
     }
 
-    fn get_next_event_batch_index(&mut self, aggregate_id: &str) -> io::Result<u64> {
+    fn get_next_event_batch_index(&mut self, aggregate_id: u128) -> io::Result<u64> {
         // Check cache first
         if let Some(cached_index) = self.event_batch_index_cache.get(aggregate_id) {
             return Ok(cached_index + 1);
@@ -132,7 +133,7 @@ impl StatefulEngine {
             return Ok(0);
         }
 
-        let mut metadata_reader = self
+        let metadata_reader = self
             .file_cache
             .create_reader(metadata_path.to_str().unwrap())?;
 
@@ -142,7 +143,7 @@ impl StatefulEngine {
             .stateless_engine
             .last_event_batch_index(
                 #[cfg(target_os = "linux")]
-                &mut metadata_reader,
+                &mut *metadata_reader.borrow_mut(),
                 #[cfg(not(target_os = "linux"))]
                 &mut *metadata_reader.borrow_mut()
             )
@@ -153,14 +154,14 @@ impl StatefulEngine {
                 self.recover_from_corruption(aggregate_id)?;
 
                 // Retry after recovery
-                let mut metadata_reader = self
+                let metadata_reader = self
                     .file_cache
                     .create_reader(metadata_path.to_str().unwrap())?;
                 self.config
                     .stateless_engine
                     .last_event_batch_index(
                         #[cfg(target_os = "linux")]
-                        &mut metadata_reader,
+                        &mut *metadata_reader.borrow_mut(),
                         #[cfg(not(target_os = "linux"))]
                         &mut *metadata_reader.borrow_mut()
                     )?
@@ -172,25 +173,25 @@ impl StatefulEngine {
         Ok(last_index + 1)
     }
 
-    fn recover_from_corruption(&mut self, aggregate_id: &str) -> io::Result<()> {
+    fn recover_from_corruption(&mut self, aggregate_id: u128) -> io::Result<()> {
         let (event_batch_path, metadata_path) = self.get_aggregate_paths(aggregate_id);
 
         if !event_batch_path.exists() || !metadata_path.exists() {
             return Ok(()); // Nothing to recover
         }
 
-        let mut event_batch_reader = self
+        let event_batch_reader = self
             .file_cache
             .create_reader(event_batch_path.to_str().unwrap())?;
-        let mut metadata_reader = self
+        let metadata_reader = self
             .file_cache
             .create_reader(metadata_path.to_str().unwrap())?;
 
         if let Some(corrupt_positions) = self.config.stateless_engine.detect_corruption(
             #[cfg(target_os = "linux")]
-            &mut event_batch_reader,
+            &mut *event_batch_reader.borrow_mut(),
             #[cfg(target_os = "linux")]
-            &mut metadata_reader,
+            &mut *metadata_reader.borrow_mut(),
             #[cfg(not(target_os = "linux"))]
             &mut *event_batch_reader.borrow_mut(),
             #[cfg(not(target_os = "linux"))]
@@ -221,7 +222,7 @@ impl StatefulEngine {
 
     fn filter_duplicate_events(
         &mut self,
-        aggregate_id: &str,
+        aggregate_id: u128,
         client_id: u128,
         events: &mut Vec<EventItem>,
     ) -> io::Result<()> {
@@ -237,7 +238,7 @@ impl StatefulEngine {
 
     fn update_client_event_index_cache(
         &mut self,
-        aggregate_id: &str,
+        aggregate_id: u128,
         client_id: u128,
         events: &[EventItem],
     ) -> io::Result<()> {
@@ -257,7 +258,7 @@ impl StatefulEngine {
         Ok(())
     }
 
-    fn clear_aggregate_caches(&mut self, aggregate_id: &str) {
+    fn clear_aggregate_caches(&mut self, aggregate_id: u128) {
         self.event_batch_index_cache.remove(aggregate_id);
         self.memory_cache.clear_aggregate(aggregate_id);
 
@@ -269,7 +270,7 @@ impl StatefulEngine {
 
     fn try_read_from_memory_cache(
         &mut self,
-        aggregate_id: &str,
+        aggregate_id: u128,
         filters: &ReadFilters,
     ) -> Option<ReadResult> {
         // Check if we have the requested starting batch in cache
@@ -431,7 +432,7 @@ impl StatefulEngine {
 pub trait StatefulWriter {
     fn append_events(
         &mut self,
-        aggregate_id: &str,
+        aggregate_id: u128,
         client_id: u128,
         user_id: Option<u128>,
         events: Vec<EventItem>,
@@ -442,27 +443,27 @@ pub trait StatefulWriter {
 pub trait StatefulReader {
     fn read_filtered(
         &mut self,
-        aggregate_id: &str,
+        aggregate_id: u128,
         filters: &ReadFilters,
     ) -> io::Result<ReadResult>;
 
-    fn exists(&mut self, aggregate_id: &str) -> io::Result<bool>;
+    fn exists(&mut self, aggregate_id: u128) -> io::Result<bool>;
 }
 
 pub trait StatefulDestructive {
     fn trim_start(
         &mut self,
-        aggregate_id: &str,
+        aggregate_id: u128,
         keep_from_event_batch_index: u64,
     ) -> io::Result<()>;
 
-    fn delete(&mut self, aggregate_id: &str) -> io::Result<()>;
+    fn delete(&mut self, aggregate_id: u128) -> io::Result<()>;
 }
 
 impl StatefulWriter for StatefulEngine {
     fn append_events(
         &mut self,
-        aggregate_id: &str,
+        aggregate_id: u128,
         client_id: u128,
         user_id: Option<u128>,
         mut events: Vec<EventItem>,
@@ -547,7 +548,7 @@ impl StatefulWriter for StatefulEngine {
 impl StatefulReader for StatefulEngine {
     fn read_filtered(
         &mut self,
-        aggregate_id: &str,
+        aggregate_id: u128,
         filters: &ReadFilters,
     ) -> io::Result<ReadResult> {
         // Try to read from memory cache first
@@ -578,15 +579,15 @@ impl StatefulReader for StatefulEngine {
         #[cfg(not(target_os = "linux"))]
         let mut mut_metadata_reader = metadata_reader.borrow_mut();
         #[cfg(target_os = "linux")]
-        let mut mut_event_batch_reader = event_batch_reader;
+        let mut mut_event_batch_reader = event_batch_reader.borrow_mut();
         #[cfg(target_os = "linux")]
-        let mut mut_metadata_reader = metadata_reader;
+        let mut mut_metadata_reader = metadata_reader.borrow_mut();
 
         match self.config.stateless_engine.read_filtered(
             #[cfg(target_os = "linux")]
-            &mut mut_event_batch_reader,
+            &mut *mut_event_batch_reader,
             #[cfg(target_os = "linux")]
-            &mut mut_metadata_reader,
+            &mut *mut_metadata_reader,
             #[cfg(not(target_os = "linux"))]
             &mut *mut_event_batch_reader,
             #[cfg(not(target_os = "linux"))]
@@ -602,10 +603,10 @@ impl StatefulReader for StatefulEngine {
                 self.recover_from_corruption(aggregate_id)?;
 
                 // Retry after recovery
-                let mut event_batch_reader = self
+                let event_batch_reader = self
                     .file_cache
                     .create_reader(event_batch_path.to_str().unwrap())?;
-                let mut metadata_reader = self
+                let metadata_reader = self
                     .file_cache
                     .create_reader(metadata_path.to_str().unwrap())?;
 
@@ -614,15 +615,15 @@ impl StatefulReader for StatefulEngine {
                 #[cfg(not(target_os = "linux"))]
                 let mut mut_metadata_reader = metadata_reader.borrow_mut();
                 #[cfg(target_os = "linux")]
-                let mut mut_event_batch_reader = event_batch_reader;
+                let mut mut_event_batch_reader = event_batch_reader.borrow_mut();
                 #[cfg(target_os = "linux")]
-                let mut mut_metadata_reader = metadata_reader;
+                let mut mut_metadata_reader = metadata_reader.borrow_mut();
                 
                 self.config.stateless_engine.read_filtered(
                     #[cfg(target_os = "linux")]
-                    &mut mut_event_batch_reader,
+                    &mut *mut_event_batch_reader,
                     #[cfg(target_os = "linux")]
-                    &mut mut_metadata_reader,
+                    &mut *mut_metadata_reader,
                     #[cfg(not(target_os = "linux"))]
                     &mut *mut_event_batch_reader,
                     #[cfg(not(target_os = "linux"))]
@@ -633,7 +634,7 @@ impl StatefulReader for StatefulEngine {
         }
     }
 
-    fn exists(&mut self, aggregate_id: &str) -> io::Result<bool> {
+    fn exists(&mut self, aggregate_id: u128) -> io::Result<bool> {
         let (event_batch_path, metadata_path) = self.get_aggregate_paths(aggregate_id);
         Ok(event_batch_path.exists() && metadata_path.exists())
     }
@@ -642,7 +643,7 @@ impl StatefulReader for StatefulEngine {
 impl StatefulDestructive for StatefulEngine {
     fn trim_start(
         &mut self,
-        aggregate_id: &str,
+        aggregate_id: u128,
         keep_from_event_batch_index: u64,
     ) -> io::Result<()> {
         let (event_batch_path, metadata_path) = self.get_aggregate_paths(aggregate_id);
@@ -665,7 +666,7 @@ impl StatefulDestructive for StatefulEngine {
             .stateless_engine
             .positions_for_event_batch_index(
                 #[cfg(target_os = "linux")]
-                &mut metadata_reader,
+                &mut *metadata_reader.borrow_mut(),
                 #[cfg(not(target_os = "linux"))]
                 &mut *metadata_reader.borrow_mut(),
                 keep_from_event_batch_index,
@@ -685,13 +686,13 @@ impl StatefulDestructive for StatefulEngine {
 
         self.config.stateless_engine.trim_start(
             #[cfg(target_os = "linux")]
-            &mut event_batch_reader,
+            &mut *event_batch_reader.borrow_mut(),
             #[cfg(not(target_os = "linux"))]
             &mut *event_batch_reader.borrow_mut(),
             event_batch_positions.event_batch_position,
             event_batch_path.to_str().unwrap(),
             #[cfg(target_os = "linux")]
-            &mut metadata_reader,
+            &mut *metadata_reader.borrow_mut(),
             #[cfg(not(target_os = "linux"))]
             &mut *metadata_reader.borrow_mut(),
             event_batch_positions.metadata_position,
@@ -704,7 +705,7 @@ impl StatefulDestructive for StatefulEngine {
         Ok(())
     }
 
-    fn delete(&mut self, aggregate_id: &str) -> io::Result<()> {
+    fn delete(&mut self, aggregate_id: u128) -> io::Result<()> {
         let (event_batch_path, metadata_path) = self.get_aggregate_paths(aggregate_id);
 
         if event_batch_path.exists() && metadata_path.exists() {
@@ -717,7 +718,7 @@ impl StatefulDestructive for StatefulEngine {
         self.clear_aggregate_caches(aggregate_id);
 
         // Remove the aggregate directory if it's empty
-        let aggregate_dir = self.config.base_path.join(aggregate_id);
+        let aggregate_dir = self.config.base_path.join(aggregate_id.to_string());
         if aggregate_dir.exists() {
             std::fs::remove_dir(&aggregate_dir).ok(); // Ignore errors if directory is not empty
         }
@@ -729,7 +730,7 @@ impl StatefulDestructive for StatefulEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, io, path::PathBuf};
+    use std::{fs, io, path::PathBuf, u128};
     use tempfile::TempDir;
 
     struct StatefulTestFixture {
@@ -813,21 +814,21 @@ mod tests {
         let metadata1 =
             fixture
                 .engine
-                .append_events("test_aggregate", 100, Some(200), events1, None)?;
+                .append_events(123, 100, Some(200), events1, None)?;
         assert_eq!(metadata1.event_batch_index, 0);
 
         // Second write should get event_batch_index 1
         let metadata2 =
             fixture
                 .engine
-                .append_events("test_aggregate", 100, Some(200), events2, None)?;
+                .append_events(123, 100, Some(200), events2, None)?;
         assert_eq!(metadata2.event_batch_index, 1);
 
         // Third write should get event_batch_index 2
         let metadata3 =
             fixture
                 .engine
-                .append_events("test_aggregate", 100, Some(200), events3, None)?;
+                .append_events(123, 100, Some(200), events3, None)?;
         assert_eq!(metadata3.event_batch_index, 2);
 
         Ok(())
@@ -844,14 +845,14 @@ mod tests {
         let metadata1 =
             fixture
                 .engine
-                .append_events("aggregate1", 100, Some(200), events1.clone(), None)?;
+                .append_events(111, 100, Some(200), events1.clone(), None)?;
         assert_eq!(metadata1.event_batch_index, 0);
 
         // Second aggregate also gets index 0 (separate sequence)
         let metadata2 =
             fixture
                 .engine
-                .append_events("aggregate2", 100, Some(200), events2.clone(), None)?;
+                .append_events(222, 100, Some(200), events2.clone(), None)?;
         assert_eq!(metadata2.event_batch_index, 0);
 
         // Second write to first aggregate gets index 1
@@ -859,7 +860,7 @@ mod tests {
         let metadata3 =
             fixture
                 .engine
-                .append_events("aggregate1", 100, Some(200), events3, None)?;
+                .append_events(111, 100, Some(200), events3, None)?;
         assert_eq!(metadata3.event_batch_index, 1);
 
         Ok(())
@@ -881,11 +882,11 @@ mod tests {
             let events = vec![EventItem::new(1, 1, 1000, 42, 1, b"test".to_vec())];
 
             let metadata1 =
-                engine.append_events("test_aggregate", 100, None, events.clone(), None)?;
+                engine.append_events(123, 100, None, events.clone(), None)?;
             assert_eq!(metadata1.event_batch_index, 0);
 
             let events2 = vec![EventItem::new(2, 2, 1000, 42, 1, b"test".to_vec())];
-            let metadata2 = engine.append_events("test_aggregate", 100, None, events2, None)?;
+            let metadata2 = engine.append_events(123, 100, None, events2, None)?;
             assert_eq!(metadata2.event_batch_index, 1);
         }
 
@@ -900,7 +901,7 @@ mod tests {
             let events = vec![EventItem::new(3, 3, 1000, 42, 1, b"test".to_vec())];
 
             // Should continue from index 2
-            let metadata3 = engine.append_events("test_aggregate", 100, None, events, None)?;
+            let metadata3 = engine.append_events(123, 100, None, events, None)?;
             assert_eq!(metadata3.event_batch_index, 2);
         }
 
@@ -922,7 +923,7 @@ mod tests {
 
         fixture
             .engine
-            .append_events("test_aggregate", 100, None, events1, None)?;
+            .append_events(123, 100, None, events1, None)?;
 
         // Second write with overlapping client_event_index (2, 3, 4, 5)
         // Only events with index 4 and 5 should be written
@@ -935,12 +936,12 @@ mod tests {
 
         let metadata2 = fixture
             .engine
-            .append_events("test_aggregate", 100, None, events2, None)?;
+            .append_events(123, 100, None, events2, None)?;
 
         // Read back and verify only new events were written
         let result = fixture
             .engine
-            .read_filtered("test_aggregate", &ReadFilters::new(1))?;
+            .read_filtered(123, &ReadFilters::new(1))?;
         assert_eq!(result.event_batches.len(), 1);
         assert_eq!(result.event_batches[0].events.len(), 2); // Only events 4 and 5
         assert_eq!(result.event_batches[0].events[0].client_event_index, 4);
@@ -961,7 +962,7 @@ mod tests {
 
         fixture
             .engine
-            .append_events("test_aggregate", 100, None, events1, None)?;
+            .append_events(123, 100, None, events1, None)?;
 
         // Client 200 writes events with same client_event_index 1, 2
         // These should NOT be filtered since they're from a different client
@@ -972,12 +973,12 @@ mod tests {
 
         fixture
             .engine
-            .append_events("test_aggregate", 200, None, events2, None)?;
+            .append_events(123, 200, None, events2, None)?;
 
         // Read back and verify both clients' events are present
         let result = fixture
             .engine
-            .read_filtered("test_aggregate", &ReadFilters::new(0))?;
+            .read_filtered(123, &ReadFilters::new(0))?;
         assert_eq!(result.event_batches.len(), 2);
         assert_eq!(result.event_batches[0].events.len(), 2); // Client 100 events
         assert_eq!(result.event_batches[1].events.len(), 2); // Client 200 events
@@ -997,7 +998,7 @@ mod tests {
 
         fixture
             .engine
-            .append_events("test_aggregate", 100, None, events1, None)?;
+            .append_events(123, 100, None, events1, None)?;
 
         // Second write with same client_event_indices - all should be filtered out
         let events2 = vec![
@@ -1007,7 +1008,7 @@ mod tests {
 
         let result = fixture
             .engine
-            .append_events("test_aggregate", 100, None, events2, None);
+            .append_events(123, 100, None, events2, None);
         assert!(result.is_err());
         assert!(
             result
@@ -1027,14 +1028,14 @@ mod tests {
         let events1 = vec![EventItem::new(1, 1, 1000, 42, 1, b"test".to_vec())];
         fixture
             .engine
-            .append_events("aggregate1", 100, None, events1, None)?;
+            .append_events(111, 100, None, events1, None)?;
 
         // Same client writes to aggregate2 with same client_event_index
         // Should NOT be filtered since it's a different aggregate
         let events2 = vec![EventItem::new(1, 2, 1001, 42, 1, b"test".to_vec())];
         let result = fixture
             .engine
-            .append_events("aggregate2", 100, None, events2, None);
+            .append_events(222, 100, None, events2, None);
         assert!(result.is_ok());
 
         Ok(())
@@ -1050,13 +1051,13 @@ mod tests {
         let events1 = fixture.create_test_events(1, 1);
         fixture
             .engine
-            .append_events("test_aggregate", 100, None, events1, None)?;
+            .append_events(123, 100, None, events1, None)?;
 
         // Second write with correct expected index
         let events2 = fixture.create_test_events(2, 1);
         let result = fixture
             .engine
-            .append_events("test_aggregate", 100, None, events2, Some(1));
+            .append_events(123, 100, None, events2, Some(1));
         assert!(result.is_ok());
         assert_eq!(result.unwrap().event_batch_index, 1);
 
@@ -1071,13 +1072,13 @@ mod tests {
         let events1 = fixture.create_test_events(1, 1);
         fixture
             .engine
-            .append_events("test_aggregate", 100, None, events1, None)?;
+            .append_events(123, 100, None, events1, None)?;
 
         // Second write with incorrect expected index
         let events2 = fixture.create_test_events(2, 1);
         let result = fixture
             .engine
-            .append_events("test_aggregate", 100, None, events2, Some(5));
+            .append_events(123, 100, None, events2, Some(5));
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -1095,7 +1096,7 @@ mod tests {
         let events = fixture.create_test_events(1, 1);
         let result = fixture
             .engine
-            .append_events("new_aggregate", 100, None, events, Some(0));
+            .append_events(999, 100, None, events, Some(0));
         assert!(result.is_ok());
         assert_eq!(result.unwrap().event_batch_index, 0);
 
@@ -1111,13 +1112,13 @@ mod tests {
         let events = fixture.create_test_events(1, 2);
         fixture
             .engine
-            .append_events("test_aggregate", 100, None, events, None)?;
+            .append_events(123, 100, None, events, None)?;
 
         // Verify cache is populated by checking internal state
         // Since we can't directly access the cache, we'll test by reading from cache
         let result = fixture
             .engine
-            .read_filtered("test_aggregate", &ReadFilters::new(0))?;
+            .read_filtered(123, &ReadFilters::new(0))?;
         assert_eq!(result.event_batches.len(), 1);
         assert_eq!(result.event_batches[0].events.len(), 2);
 
@@ -1134,21 +1135,21 @@ mod tests {
 
         fixture
             .engine
-            .append_events("test_aggregate", 100, None, events1, None)?;
+            .append_events(123, 100, None, events1, None)?;
         fixture
             .engine
-            .append_events("test_aggregate", 100, None, events2, None)?;
+            .append_events(123, 100, None, events2, None)?;
 
         // Read from cache (should hit memory cache)
         let result1 = fixture
             .engine
-            .read_filtered("test_aggregate", &ReadFilters::new(0))?;
+            .read_filtered(123, &ReadFilters::new(0))?;
         assert_eq!(result1.event_batches.len(), 2);
 
         // Read again from cache with different starting point
         let result2 = fixture
             .engine
-            .read_filtered("test_aggregate", &ReadFilters::new(1))?;
+            .read_filtered(123, &ReadFilters::new(1))?;
         assert_eq!(result2.event_batches.len(), 1);
         assert_eq!(result2.event_batches[0].event_batch_index, 1);
 
@@ -1163,7 +1164,7 @@ mod tests {
         let events = fixture.create_test_events(1, 2);
         fixture
             .engine
-            .append_events("test_aggregate", 100, None, events, None)?;
+            .append_events(123, 100, None, events, None)?;
 
         // Clear memory cache by creating new engine instance
         let config = StatefulEngineConfig {
@@ -1173,7 +1174,7 @@ mod tests {
         let mut new_engine = StatefulEngine::new(config);
 
         // Read should still work (falling back to disk)
-        let result = new_engine.read_filtered("test_aggregate", &ReadFilters::new(0))?;
+        let result = new_engine.read_filtered(123, &ReadFilters::new(0))?;
         assert_eq!(result.event_batches.len(), 1);
         assert_eq!(result.event_batches[0].events.len(), 2);
 
@@ -1190,16 +1191,16 @@ mod tests {
 
         fixture
             .engine
-            .append_events("test_aggregate", 100, None, events1, None)?;
+            .append_events(123, 100, None, events1, None)?;
         fixture
             .engine
-            .append_events("test_aggregate", 200, None, events2, None)?;
+            .append_events(123, 200, None, events2, None)?;
 
         // Read with client_id filter
         let mut filters = ReadFilters::new(0);
         filters.include_client_id = Some(100);
 
-        let result = fixture.engine.read_filtered("test_aggregate", &filters)?;
+        let result = fixture.engine.read_filtered(123, &filters)?;
         assert_eq!(result.event_batches.len(), 1);
         assert_eq!(result.event_batches[0].client_id, 100);
 
@@ -1224,13 +1225,13 @@ mod tests {
             )];
             fixture
                 .engine
-                .append_events("test_aggregate", 100, None, events, None)?;
+                .append_events(123, 100, None, events, None)?;
         }
 
         // Verify all writes succeeded (indirectly tests handle reuse)
         let result = fixture
             .engine
-            .read_filtered("test_aggregate", &ReadFilters::new(0))?;
+            .read_filtered(123, &ReadFilters::new(0))?;
         assert_eq!(result.event_batches.len(), 5);
 
         Ok(())
@@ -1241,20 +1242,18 @@ mod tests {
         let mut fixture = StatefulTestFixture::new()?;
 
         // Write to multiple aggregates
-        for i in 0..3 {
-            let events = fixture.create_test_events(i + 1, 1);
-            let aggregate_name = format!("aggregate_{}", i);
+        for i in 0..3u128 {
+            let events = fixture.create_test_events((i + 1) as u64, 1);
             fixture
                 .engine
-                .append_events(&aggregate_name, 100, None, events, None)?;
+                .append_events(i, 100, None, events, None)?;
         }
 
         // Verify all aggregates have their data
-        for i in 0..3 {
-            let aggregate_name = format!("aggregate_{}", i);
+        for i in 0..3u128 {
             let result = fixture
                 .engine
-                .read_filtered(&aggregate_name, &ReadFilters::new(0))?;
+                .read_filtered(i, &ReadFilters::new(0))?;
             assert_eq!(result.event_batches.len(), 1);
         }
 
@@ -1273,14 +1272,14 @@ mod tests {
 
         fixture
             .engine
-            .append_events("test_aggregate", 100, None, events1, None)?;
+            .append_events(123, 100, None, events1, None)?;
         fixture
             .engine
-            .append_events("test_aggregate", 100, None, events2, None)?;
+            .append_events(123, 100, None, events2, None)?;
 
         // Corrupt the files by truncating them
         let (event_batch_path, metadata_path) =
-            fixture.engine.get_aggregate_paths("test_aggregate");
+            fixture.engine.get_aggregate_paths(123);
 
         // Truncate files to simulate corruption
         fs::OpenOptions::new()
@@ -1301,7 +1300,7 @@ mod tests {
         // Since we completely corrupted the files, it should end up with empty result
         let result = fixture
             .engine
-            .read_filtered("test_aggregate", &ReadFilters::new(0));
+            .read_filtered(123, &ReadFilters::new(0));
         assert!(result.is_err());
 
         Ok(())
@@ -1315,10 +1314,10 @@ mod tests {
         let events1 = fixture.create_test_events(1, 2);
         fixture
             .engine
-            .append_events("test_aggregate", 100, None, events1, None)?;
+            .append_events(123, 100, None, events1, None)?;
 
         // Corrupt the metadata file
-        let (_, metadata_path) = fixture.engine.get_aggregate_paths("test_aggregate");
+        let (_, metadata_path) = fixture.engine.get_aggregate_paths(123);
         fs::OpenOptions::new()
             .write(true)
             .truncate(true)
@@ -1329,7 +1328,7 @@ mod tests {
         let events2 = fixture.create_test_events(3, 1);
         let result = fixture
             .engine
-            .append_events("test_aggregate", 100, None, events2, None);
+            .append_events(123, 100, None, events2, None);
 
         // The exact behavior depends on recovery implementation, but it shouldn't panic
         // We're mainly testing that corruption detection is triggered
@@ -1351,21 +1350,21 @@ mod tests {
         let events = fixture.create_test_events(1, 2);
         fixture
             .engine
-            .append_events("test_aggregate", 100, None, events, None)?;
+            .append_events(123, 100, None, events, None)?;
 
         // Verify data exists
-        assert!(fixture.engine.exists("test_aggregate")?);
+        assert!(fixture.engine.exists(123)?);
 
         // Delete the aggregate
-        fixture.engine.delete("test_aggregate")?;
+        fixture.engine.delete(123)?;
 
         // Verify aggregate no longer exists
-        assert!(!fixture.engine.exists("test_aggregate")?);
+        assert!(!fixture.engine.exists(123)?);
 
         // Verify read returns empty results
         let result = fixture
             .engine
-            .read_filtered("test_aggregate", &ReadFilters::new(0))?;
+            .read_filtered(123, &ReadFilters::new(0))?;
         assert_eq!(result.event_batches.len(), 0);
 
         Ok(())
@@ -1387,30 +1386,30 @@ mod tests {
             )];
             fixture
                 .engine
-                .append_events("test_aggregate", 100, None, events, None)?;
+                .append_events(123, 100, None, events, None)?;
         }
 
         fixture.reset();
         // Verify all batches exist
         let result_before = fixture
             .engine
-            .read_filtered("test_aggregate", &ReadFilters::new(0))?;
+            .read_filtered(123, &ReadFilters::new(0))?;
         assert_eq!(result_before.event_batches.len(), 5);
 
         // Trim start to keep only last 2 batches
-        fixture.engine.trim_start("test_aggregate", 3)?;
+        fixture.engine.trim_start(123, 3)?;
 
         // Verify only remaining batches are accessible
         let result_after = fixture
             .engine
-            .read_filtered("test_aggregate", &ReadFilters::new(3))?;
+            .read_filtered(123, &ReadFilters::new(3))?;
         assert_eq!(result_after.event_batches.len(), 2);
         assert_eq!(result_after.event_batches[0].event_batch_index, 3);
 
         // Verify cache was cleared - trying to read from beginning should find nothing
         let result_trimmed = fixture
             .engine
-            .read_filtered("test_aggregate", &ReadFilters::new(0));
+            .read_filtered(123, &ReadFilters::new(0));
         assert!(result_trimmed.is_err());
 
         Ok(())
@@ -1424,7 +1423,7 @@ mod tests {
 
         let result = fixture
             .engine
-            .append_events("test_aggregate", 100, None, vec![], None);
+            .append_events(123, 100, None, vec![], None);
         assert!(result.is_err());
         assert!(
             result
@@ -1453,7 +1452,7 @@ mod tests {
         let events = fixture.create_test_events(1, 1);
         let result = fixture
             .engine
-            .append_events("test_aggregate", 100, None, events, None);
+            .append_events(123, 100, None, events, None);
         assert!(result.is_ok());
 
         Ok(())
@@ -1464,14 +1463,14 @@ mod tests {
         let mut fixture = StatefulTestFixture::new()?;
 
         // Aggregate directory shouldn't exist yet
-        let aggregate_dir = fixture.base_path.join("new_aggregate");
+        let aggregate_dir = fixture.base_path.join(999.to_string());
         assert!(!aggregate_dir.exists());
 
         // Writing should create the directory
         let events = fixture.create_test_events(1, 1);
         fixture
             .engine
-            .append_events("new_aggregate", 100, None, events, None)?;
+            .append_events(999, 100, None, events, None)?;
 
         // Directory should now exist
         assert!(aggregate_dir.exists());
@@ -1498,7 +1497,7 @@ mod tests {
                 )];
 
                 fixture.engine.append_events(
-                    &format!("aggregate_{}", aggregate_idx),
+                    aggregate_idx as u128,
                     client_id as u128,
                     None,
                     events,
@@ -1509,29 +1508,28 @@ mod tests {
 
         // Read from each aggregate with different filters
         for aggregate_idx in 0..3 {
-            let aggregate_name = format!("aggregate_{}", aggregate_idx);
 
             // Read all
             let result_all = fixture
                 .engine
-                .read_filtered(&aggregate_name, &ReadFilters::new(0))?;
+                .read_filtered(aggregate_idx as u128, &ReadFilters::new(0))?;
             assert_eq!(result_all.event_batches.len(), 3); // 3 clients per aggregate
 
             // Read with client filter
             let mut filters = ReadFilters::new(0);
             filters.include_client_id = Some(101);
-            let result_filtered = fixture.engine.read_filtered(&aggregate_name, &filters)?;
+            let result_filtered = fixture.engine.read_filtered(aggregate_idx as u128, &filters)?;
             assert_eq!(result_filtered.event_batches.len(), 1);
             assert_eq!(result_filtered.event_batches[0].client_id, 101);
         }
 
         // Delete one aggregate
-        fixture.engine.delete("aggregate_1")?;
-        assert!(!fixture.engine.exists("aggregate_1")?);
+        fixture.engine.delete(1)?;
+        assert!(!fixture.engine.exists(1)?);
 
         // Other aggregates should still exist
-        assert!(fixture.engine.exists("aggregate_0")?);
-        assert!(fixture.engine.exists("aggregate_2")?);
+        assert!(fixture.engine.exists(0)?);
+        assert!(fixture.engine.exists(2)?);
 
         Ok(())
     }
@@ -1550,7 +1548,7 @@ mod tests {
 
         fixture
             .engine
-            .append_events("test_aggregate", 100, None, events1, None)?;
+            .append_events(123, 100, None, events1, None)?;
 
         // Write more events - bloom filter should accumulate state
         let events2 = vec![
@@ -1560,7 +1558,7 @@ mod tests {
 
         let result = fixture
             .engine
-            .append_events("test_aggregate", 100, None, events2, None);
+            .append_events(123, 100, None, events2, None);
         assert!(result.is_ok());
 
         Ok(())
@@ -1578,7 +1576,7 @@ mod tests {
 
         let result = fixture
             .engine
-            .append_events("test_aggregate", 100, None, events1, None);
+            .append_events(123, 100, None, events1, None);
         assert!(result.is_ok());
 
         Ok(())
@@ -1593,7 +1591,7 @@ mod tests {
         let events1 = fixture.create_test_events(1, 1);
         let metadata1 = fixture
             .engine
-            .append_events("test_aggregate", 100, None, events1, None)?;
+            .append_events(123, 100, None, events1, None)?;
 
         // Small delay to ensure timestamp difference
         std::thread::sleep(Duration::from_millis(1));
@@ -1601,7 +1599,7 @@ mod tests {
         let events2 = fixture.create_test_events(2, 1);
         let metadata2 = fixture
             .engine
-            .append_events("test_aggregate", 100, None, events2, None)?;
+            .append_events(123, 100, None, events2, None)?;
 
         assert!(metadata2.server_timestamp > metadata1.server_timestamp);
 
@@ -1616,20 +1614,20 @@ mod tests {
         let events1 = fixture.create_test_events(1, 2);
         let metadata1 = fixture
             .engine
-            .append_events("test_aggregate", 100, None, events1, None)?;
+            .append_events(123, 100, None, events1, None)?;
 
         std::thread::sleep(Duration::from_millis(5));
 
         let events2 = fixture.create_test_events(3, 2);
         let metadata2 = fixture
             .engine
-            .append_events("test_aggregate", 100, None, events2, None)?;
+            .append_events(123, 100, None, events2, None)?;
 
         // Filter by server timestamp - should only get second batch
         let mut filters = ReadFilters::new(0);
         filters.min_server_timestamp = Some(metadata2.server_timestamp);
 
-        let result = fixture.engine.read_filtered("test_aggregate", &filters)?;
+        let result = fixture.engine.read_filtered(123, &filters)?;
         assert_eq!(result.event_batches.len(), 1);
         assert_eq!(result.event_batches[0].event_batch_index, 1);
 
@@ -1656,14 +1654,14 @@ mod tests {
             )];
             fixture
                 .engine
-                .append_events("test_aggregate", 100, None, events, None)?;
+                .append_events(123, 100, None, events, None)?;
         }
 
         // Read with byte limit that should stop after a few batches
         let mut filters = ReadFilters::new(0);
         filters.max_bytes = Some(2500); // Should allow ~2 batches
 
-        let result = fixture.engine.read_filtered("test_aggregate", &filters)?;
+        let result = fixture.engine.read_filtered(123, &filters)?;
         assert!(result.event_batches.len() <= 3); // Should be limited
         assert!(result.next_event_batch_index.is_some()); // Should indicate more data available
 
@@ -1679,14 +1677,14 @@ mod tests {
         let events = vec![EventItem::new(1, 1, 1000, 42, 1, large_data)];
         fixture
             .engine
-            .append_events("test_aggregate", 100, None, events, None)?;
+            .append_events(123, 100, None, events, None)?;
 
         // Try to read with smaller byte limit
         let mut filters = ReadFilters::new(0);
         filters.max_bytes = Some(5000); // 5KB limit
 
         // Should still return the first batch even though it exceeds limit
-        let result = fixture.engine.read_filtered("test_aggregate", &filters)?;
+        let result = fixture.engine.read_filtered(123, &filters)?;
         assert_eq!(result.event_batches.len(), 1);
 
         Ok(())
@@ -1706,13 +1704,13 @@ mod tests {
         ];
         fixture
             .engine
-            .append_events("test_aggregate", 100, None, events, None)?;
+            .append_events(123, 100, None, events, None)?;
 
         // Filter by event types
         let mut filters = ReadFilters::new(0);
         filters.include_event_types = Some((&[42, 44]).to_vec());
 
-        let result = fixture.engine.read_filtered("test_aggregate", &filters)?;
+        let result = fixture.engine.read_filtered(123, &filters)?;
         assert_eq!(result.event_batches.len(), 1);
         assert_eq!(result.event_batches[0].events.len(), 2); // Only types 42 and 44
         assert_eq!(result.event_batches[0].events[0].event_type_major, 42);
@@ -1733,14 +1731,14 @@ mod tests {
         ];
         fixture
             .engine
-            .append_events("test_aggregate", 100, None, events, None)?;
+            .append_events(123, 100, None, events, None)?;
 
         // Filter by client event index range
         let mut filters = ReadFilters::new(0);
         filters.min_client_event_index = Some(3);
         filters.max_client_event_index = Some(8);
 
-        let result = fixture.engine.read_filtered("test_aggregate", &filters)?;
+        let result = fixture.engine.read_filtered(123, &filters)?;
         assert_eq!(result.event_batches.len(), 1);
         assert_eq!(result.event_batches[0].events.len(), 1); // Only event with index 5
         assert_eq!(result.event_batches[0].events[0].client_event_index, 5);
@@ -1760,14 +1758,14 @@ mod tests {
         ];
         fixture
             .engine
-            .append_events("test_aggregate", 100, None, events, None)?;
+            .append_events(123, 100, None, events, None)?;
 
         // Filter by event timestamp
         let mut filters = ReadFilters::new(0);
         filters.min_event_timestamp = Some(1500);
         filters.max_event_timestamp = Some(2500);
 
-        let result = fixture.engine.read_filtered("test_aggregate", &filters)?;
+        let result = fixture.engine.read_filtered(123, &filters)?;
         assert_eq!(result.event_batches.len(), 1);
         assert_eq!(result.event_batches[0].events.len(), 1); // Only event with timestamp 2000
         assert_eq!(result.event_batches[0].events[0].event_timestamp, 2000);
@@ -1787,14 +1785,14 @@ mod tests {
         ];
         fixture
             .engine
-            .append_events("test_aggregate", 100, None, events, None)?;
+            .append_events(123, 100, None, events, None)?;
 
         // Filter by event index range
         let mut filters = ReadFilters::new(0);
         filters.min_event_index = Some(15);
         filters.max_event_index = Some(25);
 
-        let result = fixture.engine.read_filtered("test_aggregate", &filters)?;
+        let result = fixture.engine.read_filtered(123, &filters)?;
         assert_eq!(result.event_batches.len(), 1);
         assert_eq!(result.event_batches[0].events.len(), 1); // Only event with index 20
         assert_eq!(result.event_batches[0].events[0].event_index, 20);
@@ -1813,16 +1811,16 @@ mod tests {
 
         fixture
             .engine
-            .append_events("test_aggregate", 100, Some(500), events1, None)?;
+            .append_events(123, 100, Some(500), events1, None)?;
         fixture
             .engine
-            .append_events("test_aggregate", 200, Some(600), events2, None)?;
+            .append_events(123, 200, Some(600), events2, None)?;
 
         // Filter by user_id
         let mut filters = ReadFilters::new(0);
         filters.include_user_id = Some(500);
 
-        let result = fixture.engine.read_filtered("test_aggregate", &filters)?;
+        let result = fixture.engine.read_filtered(123, &filters)?;
         assert_eq!(result.event_batches.len(), 1);
         assert_eq!(result.event_batches[0].user_id, Some(500));
 
@@ -1838,16 +1836,16 @@ mod tests {
 
         fixture
             .engine
-            .append_events("test_aggregate", 100, Some(500), events1, None)?;
+            .append_events(123, 100, Some(500), events1, None)?;
         fixture
             .engine
-            .append_events("test_aggregate", 200, Some(600), events2, None)?;
+            .append_events(123, 200, Some(600), events2, None)?;
 
         // Exclude specific user_id
         let mut filters = ReadFilters::new(0);
         filters.exclude_user_id = Some(500);
 
-        let result = fixture.engine.read_filtered("test_aggregate", &filters)?;
+        let result = fixture.engine.read_filtered(123, &filters)?;
         assert_eq!(result.event_batches.len(), 1);
         assert_eq!(result.event_batches[0].user_id, Some(600));
 
@@ -1870,13 +1868,13 @@ mod tests {
             let events = vec![EventItem::new(i + 1, i + 1, 1000, 42, 1, b"small".to_vec())];
             fixture
                 .engine
-                .append_events("test_aggregate", 100, None, events, None)?;
+                .append_events(123, 100, None, events, None)?;
         }
 
         // Early batches should be evicted from cache, but still readable from disk
         let result = fixture
             .engine
-            .read_filtered("test_aggregate", &ReadFilters::new(0))?;
+            .read_filtered(123, &ReadFilters::new(0))?;
         assert_eq!(result.event_batches.len(), 10); // All should still be readable
 
         Ok(())
@@ -1895,7 +1893,7 @@ mod tests {
             let events = vec![EventItem::new(1, 1, 1000, 42, 1, b"test".to_vec())];
             fixture
                 .engine
-                .append_events("test_aggregate", client_id, None, events, None)?;
+                .append_events(123, client_id, None, events, None)?;
         }
 
         // Cache should have evicted earlier clients, but duplicate filtering should still work
@@ -1903,7 +1901,7 @@ mod tests {
         let events_dup = vec![EventItem::new(1, 2, 1001, 42, 1, b"dup".to_vec())];
         let result = fixture
             .engine
-            .append_events("test_aggregate", 100, None, events_dup, None);
+            .append_events(123, 100, None, events_dup, None);
 
         // Should either succeed (cache miss, no filtering) or fail (duplicate detected from disk)
         // The exact behavior depends on implementation details
@@ -1924,7 +1922,7 @@ mod tests {
 
         let result = fixture
             .engine
-            .read_filtered("nonexistent", &ReadFilters::new(0))?;
+            .read_filtered(765, &ReadFilters::new(0))?;
         assert_eq!(result.event_batches.len(), 0);
         assert_eq!(result.next_event_batch_index, None);
 
@@ -1936,7 +1934,7 @@ mod tests {
         let mut fixture = StatefulTestFixture::new()?;
 
         // Should succeed silently for nonexistent aggregate
-        let result = fixture.engine.trim_start("nonexistent", 5);
+        let result = fixture.engine.trim_start(765, 5);
         assert!(result.is_ok());
 
         Ok(())
@@ -1951,11 +1949,11 @@ mod tests {
             let events = fixture.create_test_events(i + 1, 1);
             fixture
                 .engine
-                .append_events("test_aggregate", 100, None, events, None)?;
+                .append_events(123, 100, None, events, None)?;
         }
 
         // Try to trim from non-existent index
-        let result = fixture.engine.trim_start("test_aggregate", 10);
+        let result = fixture.engine.trim_start(123, 10);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("does not exist"));
 
@@ -1967,7 +1965,7 @@ mod tests {
         let mut fixture = StatefulTestFixture::new()?;
 
         // Should succeed silently for nonexistent aggregate
-        let result = fixture.engine.delete("nonexistent");
+        let result = fixture.engine.delete(765);
         assert!(result.is_ok());
 
         Ok(())
@@ -1991,10 +1989,10 @@ mod tests {
 
         fixture
             .engine
-            .append_events("test_aggregate", 100, Some(500), events1, None)?;
+            .append_events(123, 100, Some(500), events1, None)?;
         fixture
             .engine
-            .append_events("test_aggregate", 200, Some(600), events2, None)?;
+            .append_events(123, 200, Some(600), events2, None)?;
 
         // Complex filter: specific client, event type, and timestamp range
         let mut filters = ReadFilters::new(0);
@@ -2002,7 +2000,7 @@ mod tests {
         filters.include_event_types = Some([42, 43].to_vec());
         filters.min_event_timestamp = Some(1500);
 
-        let result = fixture.engine.read_filtered("test_aggregate", &filters)?;
+        let result = fixture.engine.read_filtered(123, &filters)?;
         assert_eq!(result.event_batches.len(), 1);
         assert_eq!(result.event_batches[0].events.len(), 1); // Only event5 matches all criteria
         assert_eq!(result.event_batches[0].events[0].client_event_index, 5);
@@ -2028,7 +2026,7 @@ mod tests {
                     format!("client{}_batch{}", client_id, batch).into_bytes(),
                 )];
                 fixture.engine.append_events(
-                    "test_aggregate",
+                    123,
                     client_id as u128,
                     None,
                     events,
@@ -2040,13 +2038,13 @@ mod tests {
         // Should have 15 batches total (5 batches × 3 clients)
         let result = fixture
             .engine
-            .read_filtered("test_aggregate", &ReadFilters::new(0))?;
+            .read_filtered(123, &ReadFilters::new(0))?;
         assert_eq!(result.event_batches.len(), 15);
 
         // Test filtering by specific client
         let mut filters = ReadFilters::new(0);
         filters.include_client_id = Some(101);
-        let client_result = fixture.engine.read_filtered("test_aggregate", &filters)?;
+        let client_result = fixture.engine.read_filtered(123, &filters)?;
         assert_eq!(client_result.event_batches.len(), 5); // 5 batches from client 101
 
         Ok(())
@@ -2062,7 +2060,7 @@ mod tests {
         let mut engine = StatefulEngine::with_default_config(base_path);
 
         let events = vec![EventItem::new(1, 1, 1000, 42, 1, b"test".to_vec())];
-        let result = engine.append_events("test_aggregate", 100, None, events, None);
+        let result = engine.append_events(123, 100, None, events, None);
         assert!(result.is_ok());
 
         Ok(())

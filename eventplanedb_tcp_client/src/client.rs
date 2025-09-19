@@ -49,7 +49,7 @@ fn main() -> GlommioResult<()> {
         // Test append events
         let events = create_test_events(1, 100);
         let request = Request::AppendEvents {
-            aggregate_id: "test_aggregate".to_string(),
+            aggregate_id: 123.to_string(),
             client_id: 100,
             user_id: None,
             events,
@@ -75,7 +75,7 @@ fn main() -> GlommioResult<()> {
 
         // Test read events
         let request = Request::ReadFiltered {
-            aggregate_id: "test_aggregate".to_string(),
+            aggregate_id: 123.to_string(),
             filters: ReadFilters::new(0),
         };
 
@@ -100,7 +100,7 @@ fn main() -> GlommioResult<()> {
 
         // Test exists
         let request = Request::Exists {
-            aggregate_id: "test_aggregate".to_string(),
+            aggregate_id: 123.to_string(),
         };
 
         let response = client.send_request(request).await?;
