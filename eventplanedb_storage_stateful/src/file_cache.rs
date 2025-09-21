@@ -1,9 +1,9 @@
 use std::{
+    cell::RefCell,
     collections::{HashMap, VecDeque},
     fs::{File, OpenOptions},
     io::{self, BufReader, BufWriter},
     rc::Rc,
-    cell::RefCell,
 };
 
 struct FileHandle {
@@ -42,13 +42,18 @@ impl FileCache {
             if let Some(handle) = self.handle_queue.pop_front() {
                 if handle.is_reader {
                     #[cfg(target_os = "linux")]
-                    self.raw_readers.remove(&handle.file_path);
+                    if self.raw_readers.remove(&handle.file_path).is_some() {
+                        total_handles -= 1;
+                    }
                     #[cfg(not(target_os = "linux"))]
-                    self.readers.remove(&handle.file_path);
+                    if self.readers.remove(&handle.file_path).is_some() {
+                        total_handles -= 1;
+                    }
                 } else {
-                    self.writers.remove(&handle.file_path);
+                    if self.writers.remove(&handle.file_path).is_some() {
+                        total_handles -= 1;
+                    }
                 }
-                total_handles = total_handles - 1;
             } else {
                 // Queue is empty, but we're still over the limit. This shouldn't happen,
                 // but we need a way to avoid an infinite loop.  Possibly log an error.
@@ -64,36 +69,44 @@ impl FileCache {
         });
     }
 
-    pub fn create_overwrite_writer(&mut self, file_path: &str) -> io::Result<Rc<RefCell<BufWriter<File>>>> {
+    pub fn create_overwrite_writer(
+        &mut self,
+        file_path: &str,
+    ) -> io::Result<Rc<RefCell<BufWriter<File>>>> {
         self.evict();
-        
+
         // Check if exists and clone the Rc in a separate scope
         if let Some(existing) = self.writers.get(file_path).cloned() {
             self.track_handle(file_path.to_string(), false);
             return Ok(existing);
         }
-        
+
         let buf = create_overwrite_writer(file_path)?;
         let rc_buf = Rc::new(RefCell::new(buf));
-        self.writers.insert(file_path.to_string(), Rc::clone(&rc_buf));
-        
+        self.writers
+            .insert(file_path.to_string(), Rc::clone(&rc_buf));
+
         self.track_handle(file_path.to_string(), false);
         Ok(rc_buf)
     }
 
-    pub fn create_append_writer(&mut self, file_path: &str) -> io::Result<Rc<RefCell<BufWriter<File>>>> {
+    pub fn create_append_writer(
+        &mut self,
+        file_path: &str,
+    ) -> io::Result<Rc<RefCell<BufWriter<File>>>> {
         self.evict();
-        
+
         // Check if exists and clone the Rc in a separate scope
         if let Some(existing) = self.writers.get(file_path).cloned() {
             self.track_handle(file_path.to_string(), false);
             return Ok(existing);
         }
-        
+
         let buf = create_append_writer(file_path)?;
         let rc_buf = Rc::new(RefCell::new(buf));
-        self.writers.insert(file_path.to_string(), Rc::clone(&rc_buf));
-        
+        self.writers
+            .insert(file_path.to_string(), Rc::clone(&rc_buf));
+
         self.track_handle(file_path.to_string(), false);
         Ok(rc_buf)
     }
@@ -101,19 +114,18 @@ impl FileCache {
     #[cfg(target_os = "linux")]
     pub fn create_reader(&mut self, file_path: &str) -> io::Result<Rc<RefCell<File>>> {
         self.evict();
-        
+
         // Check if exists and clone the Rc in a separate scope
         if let Some(existing) = self.raw_readers.get(file_path).cloned() {
             self.track_handle(file_path.to_string(), true);
             return Ok(existing);
         }
-        
-        let file = OpenOptions::new()
-            .read(true)
-            .open(file_path)?;
+
+        let file = OpenOptions::new().read(true).open(file_path)?;
         let rc_file = Rc::new(RefCell::new(file));
-        self.raw_readers.insert(file_path.to_string(), Rc::clone(&rc_file));
-        
+        self.raw_readers
+            .insert(file_path.to_string(), Rc::clone(&rc_file));
+
         self.track_handle(file_path.to_string(), true);
         Ok(rc_file)
     }
@@ -121,17 +133,18 @@ impl FileCache {
     #[cfg(not(target_os = "linux"))]
     pub fn create_reader(&mut self, file_path: &str) -> io::Result<Rc<RefCell<BufReader<File>>>> {
         self.evict();
-        
+
         // Check if exists and clone the Rc in a separate scope
         if let Some(existing) = self.readers.get(file_path).cloned() {
             self.track_handle(file_path.to_string(), true);
             return Ok(existing);
         }
-        
+
         let buf = create_reader(file_path)?;
         let rc_buf = Rc::new(RefCell::new(buf));
-        self.readers.insert(file_path.to_string(), Rc::clone(&rc_buf));
-        
+        self.readers
+            .insert(file_path.to_string(), Rc::clone(&rc_buf));
+
         self.track_handle(file_path.to_string(), true);
         Ok(rc_buf)
     }
@@ -141,7 +154,8 @@ impl FileCache {
         self.readers.remove(file_path);
         #[cfg(target_os = "linux")]
         self.raw_readers.remove(file_path);
-        self.handle_queue.retain(|handle| handle.file_path != file_path);
+        self.handle_queue
+            .retain(|handle| handle.file_path != file_path);
     }
 }
 
@@ -163,12 +177,9 @@ pub fn create_append_writer(file_path: &str) -> io::Result<BufWriter<File>> {
 }
 
 pub fn create_reader(file_path: &str) -> io::Result<BufReader<File>> {
-    let file = OpenOptions::new()
-        .read(true)
-        .open(file_path)?;
+    let file = OpenOptions::new().read(true).open(file_path)?;
     Ok(BufReader::new(file))
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -185,7 +196,7 @@ mod tests {
         let file1 = temp_dir.path().join("test1.txt");
         let file2 = temp_dir.path().join("test2.txt");
         let file3 = temp_dir.path().join("test3.txt");
-        
+
         // Create files
         fs::write(&file1, "test1").unwrap();
         fs::write(&file2, "test2").unwrap();
@@ -232,7 +243,7 @@ mod tests {
             assert_eq!(cache.raw_readers.len(), 2);
             assert_eq!(cache.writers.len(), 0);
             assert_eq!(cache.handle_queue.len(), 2);
-            
+
             // file1 should be evicted, file2 and file3 should remain
             assert!(!cache.raw_readers.contains_key(file1_str));
             assert!(cache.raw_readers.contains_key(file2_str));
@@ -243,7 +254,7 @@ mod tests {
             assert_eq!(cache.readers.len(), 2);
             assert_eq!(cache.writers.len(), 0);
             assert_eq!(cache.handle_queue.len(), 2);
-            
+
             // file1 should be evicted, file2 and file3 should remain
             assert!(!cache.readers.contains_key(file1_str));
             assert!(cache.readers.contains_key(file2_str));
@@ -270,7 +281,7 @@ mod tests {
         fs::write(&file1, "test1").unwrap();
         cache.create_reader(file1_str).unwrap();
         cache.create_overwrite_writer(file2_str).unwrap();
-        
+
         fs::write(&file3, "test3").unwrap();
         cache.create_reader(file3_str).unwrap();
 
@@ -281,12 +292,12 @@ mod tests {
 
         // Add fourth handle - should evict the first (oldest) handle
         cache.create_append_writer(file4_str).unwrap();
-        
+
         #[cfg(target_os = "linux")]
         {
             assert_eq!(cache.raw_readers.len() + cache.writers.len(), 3);
             assert_eq!(cache.handle_queue.len(), 3);
-            
+
             // file1 (first reader) should be evicted
             assert!(!cache.raw_readers.contains_key(file1_str));
             assert!(cache.writers.contains_key(file2_str));
@@ -297,7 +308,7 @@ mod tests {
         {
             assert_eq!(cache.readers.len() + cache.writers.len(), 3);
             assert_eq!(cache.handle_queue.len(), 3);
-            
+
             // file1 (first reader) should be evicted
             assert!(!cache.readers.contains_key(file1_str));
             assert!(cache.writers.contains_key(file2_str));
@@ -313,7 +324,7 @@ mod tests {
 
         let file1 = temp_dir.path().join("test1.txt");
         let file2 = temp_dir.path().join("test2.txt");
-        
+
         fs::write(&file1, "test1").unwrap();
         fs::write(&file2, "test2").unwrap();
 
@@ -329,7 +340,7 @@ mod tests {
             assert_eq!(cache.raw_readers.len(), 1);
             assert_eq!(cache.writers.len(), 1);
             assert_eq!(cache.handle_queue.len(), 2);
-            
+
             // Both should still be present
             assert!(cache.raw_readers.contains_key(file1_str));
             assert!(cache.writers.contains_key(file2_str));
@@ -339,7 +350,7 @@ mod tests {
             assert_eq!(cache.readers.len(), 1);
             assert_eq!(cache.writers.len(), 1);
             assert_eq!(cache.handle_queue.len(), 2);
-            
+
             // Both should still be present
             assert!(cache.readers.contains_key(file1_str));
             assert!(cache.writers.contains_key(file2_str));

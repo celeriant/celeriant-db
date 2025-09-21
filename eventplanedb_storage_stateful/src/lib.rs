@@ -1,3 +1,5 @@
+pub mod aggregate_client_key;
+pub mod aggregate_key;
 pub mod client_event_index_cache;
 pub mod event_batch_index_cache;
 pub mod file_cache;

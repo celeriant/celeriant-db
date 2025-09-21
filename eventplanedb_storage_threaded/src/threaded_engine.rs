@@ -124,6 +124,8 @@ impl ThreadedEngine {
     /// Append events to an aggregate
     pub async fn append_events(
         &self,
+        org_id: u128,
+        aggregate_type_id: u128,
         aggregate_id: u128,
         client_id: u128,
         user_id: Option<u128>,
@@ -131,6 +133,8 @@ impl ThreadedEngine {
         expected_event_batch_index: Option<u64>,
     ) -> ThreadedResult<EventBatchMetadata> {
         self.execute_command(aggregate_id, |response_tx| WorkerCommand::AppendEvents {
+            org_id,
+            aggregate_type_id,
             aggregate_id,
             client_id,
             user_id,
@@ -144,10 +148,14 @@ impl ThreadedEngine {
     /// Read filtered events from an aggregate
     pub async fn read_filtered(
         &self,
+        org_id: u128,
+        aggregate_type_id: u128,
         aggregate_id: u128,
         filters: ReadFilters,
     ) -> ThreadedResult<ReadResult> {
         self.execute_command(aggregate_id, |response_tx| WorkerCommand::ReadFiltered {
+            org_id,
+            aggregate_type_id,
             aggregate_id,
             filters,
             response_tx,
@@ -156,8 +164,15 @@ impl ThreadedEngine {
     }
 
     /// Check if an aggregate exists
-    pub async fn exists(&self, aggregate_id: u128) -> ThreadedResult<bool> {
+    pub async fn exists(
+        &self,
+        org_id: u128,
+        aggregate_type_id: u128,
+        aggregate_id: u128,
+    ) -> ThreadedResult<bool> {
         self.execute_command(aggregate_id, |response_tx| WorkerCommand::Exists {
+            org_id,
+            aggregate_type_id,
             aggregate_id,
             response_tx,
         })
@@ -167,10 +182,14 @@ impl ThreadedEngine {
     /// Trim events from the start of an aggregate
     pub async fn trim_start(
         &self,
+        org_id: u128,
+        aggregate_type_id: u128,
         aggregate_id: u128,
         keep_from_event_batch_index: u64,
     ) -> ThreadedResult<()> {
         self.execute_command(aggregate_id, |response_tx| WorkerCommand::TrimStart {
+            org_id,
+            aggregate_type_id,
             aggregate_id,
             keep_from_event_batch_index,
             response_tx,
@@ -179,8 +198,15 @@ impl ThreadedEngine {
     }
 
     /// Delete an aggregate
-    pub async fn delete(&self, aggregate_id: u128) -> ThreadedResult<()> {
+    pub async fn delete(
+        &self,
+        org_id: u128,
+        aggregate_type_id: u128,
+        aggregate_id: u128,
+    ) -> ThreadedResult<()> {
         self.execute_command(aggregate_id, |response_tx| WorkerCommand::Delete {
+            org_id,
+            aggregate_type_id,
             aggregate_id,
             response_tx,
         })
@@ -283,7 +309,7 @@ mod tests {
                 let aggregate_id = (i % 100) as u128; // 100 different aggregates
                 let events = create_test_events(i, 1);
                 engine_clone
-                    .append_events(aggregate_id, 100, None, events, None)
+                    .append_events(544, 655, aggregate_id, 100, None, events, None)
                     .await
             });
             handles.push(handle);
@@ -308,17 +334,19 @@ mod tests {
 
         // Test append
         let metadata = engine
-            .append_events(aggregate_id, client_id, None, events, None)
+            .append_events(544, 655, aggregate_id, client_id, None, events, None)
             .await?;
         assert_eq!(metadata.event_batch_index, 0);
 
         // Test exists
-        let exists = engine.exists(aggregate_id).await?;
+        let exists = engine.exists(544, 655, aggregate_id).await?;
         assert!(exists);
 
         // Test read
         let filters = ReadFilters::new(0);
-        let result = engine.read_filtered(aggregate_id, filters).await?;
+        let result = engine
+            .read_filtered(544, 655, aggregate_id, filters)
+            .await?;
         assert_eq!(result.event_batches.len(), 1);
         assert_eq!(result.event_batches[0].events.len(), 3);
 
@@ -342,7 +370,7 @@ mod tests {
             let handle = tokio::spawn(async move {
                 let events = create_test_events(1, 2);
                 engine_clone
-                    .append_events(aggregate_id, 100, None, events, None)
+                    .append_events(544, 655, aggregate_id, 100, None, events, None)
                     .await
             });
             handles.push(handle);
@@ -357,7 +385,7 @@ mod tests {
         // Verify all aggregates exist
         for i in 0..10 {
             let aggregate_id = i as u128;
-            let exists = engine.exists(aggregate_id).await?;
+            let exists = engine.exists(544, 655, aggregate_id).await?;
             assert!(exists);
         }
 
@@ -381,7 +409,7 @@ mod tests {
             let handle = tokio::spawn(async move {
                 let events = create_test_events(i * 10 + 1, 2);
                 engine_clone
-                    .append_events(aggregate_id, 100, None, events, None)
+                    .append_events(544, 655, aggregate_id, 100, None, events, None)
                     .await
             });
             handles.push(handle);
@@ -400,7 +428,9 @@ mod tests {
 
         // Verify we can read all batches
         let filters = ReadFilters::new(0);
-        let result = engine.read_filtered(aggregate_id, filters).await?;
+        let result = engine
+            .read_filtered(544, 655, aggregate_id, filters)
+            .await?;
         assert_eq!(result.event_batches.len(), 5);
 
         Ok(())
@@ -435,7 +465,7 @@ mod tests {
 
         let events = create_test_events(1, 1000); // Large number of events
         let result = engine
-            .append_events(123, 100, None, events, None)
+            .append_events(544, 655, 123, 100, None, events, None)
             .await;
 
         // Should either succeed (if fast enough) or timeout
@@ -460,21 +490,23 @@ mod tests {
         for i in 0..5 {
             let events = create_test_events(i * 10 + 1, 2);
             engine
-                .append_events(aggregate_id, 100, None, events, None)
+                .append_events(544, 655, aggregate_id, 100, None, events, None)
                 .await?;
         }
 
         // Test trim_start
-        engine.trim_start(aggregate_id, 2).await?;
+        engine.trim_start(544, 655, aggregate_id, 2).await?;
 
         // Should only be able to read from batch index 2 onwards
         let filters = ReadFilters::new(2);
-        let result = engine.read_filtered(aggregate_id, filters).await?;
+        let result = engine
+            .read_filtered(544, 655, aggregate_id, filters)
+            .await?;
         assert_eq!(result.event_batches.len(), 3); // Batches 2, 3, 4
 
         // Test delete
-        engine.delete(aggregate_id).await?;
-        let exists = engine.exists(aggregate_id).await?;
+        engine.delete(544, 655, aggregate_id).await?;
+        let exists = engine.exists(544, 655, aggregate_id).await?;
         assert!(!exists);
 
         engine.shutdown_with_timeout(Duration::from_secs(3)).await?;
@@ -494,7 +526,7 @@ mod tests {
         // Test basic operation still works
         let events = create_test_events(1, 1);
         let result = engine
-            .append_events(9876, 100, None, events, None)
+            .append_events(544, 655, 9876, 100, None, events, None)
             .await?;
         assert_eq!(result.event_batch_index, 0);
 
@@ -514,22 +546,26 @@ mod tests {
         let events2 = vec![EventItem::new(1, 2, 1001, 43, 1, b"type43".to_vec())];
 
         engine
-            .append_events(aggregate_id, 100, None, events1, None)
+            .append_events(544, 655, aggregate_id, 100, None, events1, None)
             .await?;
         engine
-            .append_events(aggregate_id, 200, None, events2, None)
+            .append_events(544, 655, aggregate_id, 200, None, events2, None)
             .await?;
 
         // Test client filtering
         let filters = ReadFilters::new(0).include_client_id(100);
-        let result = engine.read_filtered(aggregate_id, filters).await?;
+        let result = engine
+            .read_filtered(544, 655, aggregate_id, filters)
+            .await?;
         assert_eq!(result.event_batches.len(), 1);
         assert_eq!(result.event_batches[0].client_id, 100);
 
         // Test event type filtering
         let event_types = vec![42u64];
         let filters = ReadFilters::new(0).include_event_types(event_types);
-        let result = engine.read_filtered(aggregate_id, filters).await?;
+        let result = engine
+            .read_filtered(544, 655, aggregate_id, filters)
+            .await?;
         assert_eq!(result.event_batches.len(), 1);
         assert_eq!(result.event_batches[0].events.len(), 1);
         assert_eq!(result.event_batches[0].events[0].event_type_major, 42);

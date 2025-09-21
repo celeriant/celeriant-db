@@ -37,6 +37,8 @@ type ThreadedResult<T> = Result<T, ThreadedError>;
 #[allow(clippy::large_enum_variant)]
 enum WorkerCommand {
     AppendEvents {
+        org_id: u128,
+        aggregate_type_id: u128,
         aggregate_id: u128,
         client_id: u128,
         user_id: Option<u128>,
@@ -45,20 +47,28 @@ enum WorkerCommand {
         response_tx: oneshot::Sender<ThreadedResult<EventBatchMetadata>>,
     },
     ReadFiltered {
+        org_id: u128,
+        aggregate_type_id: u128,
         aggregate_id: u128,
         filters: ReadFilters,
         response_tx: oneshot::Sender<ThreadedResult<ReadResult>>,
     },
     Exists {
+        org_id: u128,
+        aggregate_type_id: u128,
         aggregate_id: u128,
         response_tx: oneshot::Sender<ThreadedResult<bool>>,
     },
     TrimStart {
+        org_id: u128,
+        aggregate_type_id: u128,
         aggregate_id: u128,
         keep_from_event_batch_index: u64,
         response_tx: oneshot::Sender<ThreadedResult<()>>,
     },
     Delete {
+        org_id: u128,
+        aggregate_type_id: u128,
         aggregate_id: u128,
         response_tx: oneshot::Sender<ThreadedResult<()>>,
     },
@@ -161,6 +171,8 @@ impl Worker {
     fn handle_command(engine: &mut StatefulEngine, command: WorkerCommand) -> bool {
         match command {
             WorkerCommand::AppendEvents {
+                org_id,
+                aggregate_type_id,
                 aggregate_id,
                 client_id,
                 user_id,
@@ -169,6 +181,8 @@ impl Worker {
                 response_tx,
             } => {
                 let result = engine.append_events(
+                    org_id,
+                    aggregate_type_id,
                     aggregate_id,
                     client_id,
                     user_id,
@@ -180,39 +194,53 @@ impl Worker {
                 true
             }
             WorkerCommand::ReadFiltered {
+                org_id,
+                aggregate_type_id,
                 aggregate_id,
                 filters,
                 response_tx,
             } => {
-                let result = engine.read_filtered(aggregate_id, &filters);
+                let result =
+                    engine.read_filtered(org_id, aggregate_type_id, aggregate_id, &filters);
                 let threaded_result = result.map_err(ThreadedError::from);
                 let _ = response_tx.send(threaded_result);
                 true
             }
             WorkerCommand::Exists {
+                org_id,
+                aggregate_type_id,
                 aggregate_id,
                 response_tx,
             } => {
-                let result = engine.exists(aggregate_id);
+                let result = engine.exists(org_id, aggregate_type_id, aggregate_id);
                 let threaded_result = result.map_err(ThreadedError::from);
                 let _ = response_tx.send(threaded_result);
                 true
             }
             WorkerCommand::TrimStart {
+                org_id,
+                aggregate_type_id,
                 aggregate_id,
                 keep_from_event_batch_index,
                 response_tx,
             } => {
-                let result = engine.trim_start(aggregate_id, keep_from_event_batch_index);
+                let result = engine.trim_start(
+                    org_id,
+                    aggregate_type_id,
+                    aggregate_id,
+                    keep_from_event_batch_index,
+                );
                 let threaded_result = result.map_err(ThreadedError::from);
                 let _ = response_tx.send(threaded_result);
                 true
             }
             WorkerCommand::Delete {
+                org_id,
+                aggregate_type_id,
                 aggregate_id,
                 response_tx,
             } => {
-                let result = engine.delete(aggregate_id);
+                let result = engine.delete(org_id, aggregate_type_id, aggregate_id);
                 let threaded_result = result.map_err(ThreadedError::from);
                 let _ = response_tx.send(threaded_result);
                 true
