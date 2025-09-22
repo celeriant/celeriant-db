@@ -9,7 +9,7 @@ struct Args {
     #[arg(short, long, default_value = "./data")]
     base_path: PathBuf,
 
-    #[arg(short, long, default_value = "127.0.0.1:8080")]
+    #[arg(short('a'), long, default_value = "127.0.0.1:8080")]
     bind_addr: SocketAddr,
 
     #[arg(short, long)]

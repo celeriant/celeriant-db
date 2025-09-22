@@ -1,0 +1,13 @@
+[package]
+name = "eventplanedb_client"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+rmp-serde = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "1.0"
+eventplanedb_storage_structures = { path = "../eventplanedb_storage_structures" }

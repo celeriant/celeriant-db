@@ -31,7 +31,7 @@ impl GlommioServer {
 
         let mut worker_senders = Vec::new();
         let mut worker_receivers = Vec::new();
-        for _ in 0..shard_count {
+        for _ in 0..shard_count-1 {
             let (tx, rx) = shared_channel::new_bounded::<WorkItem>(128);
             worker_senders.push(tx);
             worker_receivers.push(rx);

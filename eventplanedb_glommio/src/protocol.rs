@@ -2,6 +2,7 @@ use bincode::{Decode, Encode};
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use rmp_serde::{encode::to_vec_named, decode::from_slice};
 
 use eventplanedb_storage_structures::{
     event_batch_metadata::EventBatchMetadata, event_item::EventItem, read_filters::ReadFilters,
@@ -85,38 +86,38 @@ const PROTOCOL_VERSION: u8 = 1;
 /// Message framing: [version: u8][length: u32 LE][payload: bytes]
 pub async fn write_message<T, W>(writer: &mut W, message: &T) -> Result<(), ProtocolError>
 where
-    T: Encode,
+    T: Serialize,
     W: AsyncWriteExt + Unpin,
 {
-    let encoded = bincode::encode_to_vec(message, bincode::config::standard())
-        .map_err(|_| ProtocolError::InvalidFormat)?;
-    
+    // Serialize to MessagePack using rmp-serde
+    let encoded = to_vec_named(message).map_err(|_| ProtocolError::InvalidFormat)?;
+
     if encoded.len() > MAX_MESSAGE_SIZE as usize {
         return Err(ProtocolError::MessageTooLarge(encoded.len() as u32));
     }
 
     // Write version
     writer.write_all(&[PROTOCOL_VERSION]).await?;
-    
+
     // Write length
     let length = encoded.len() as u32;
     writer.write_all(&length.to_le_bytes()).await?;
-    
+
     // Write payload
     writer.write_all(&encoded).await?;
-    
+
     Ok(())
 }
 
 pub async fn read_message<T, R>(reader: &mut R) -> Result<T, ProtocolError>
 where
-    T: Decode<()>,
+    T: for<'de> Deserialize<'de>,
     R: AsyncReadExt + Unpin,
 {
     // Read version
     let mut version_buf = [0u8; 1];
     reader.read_exact(&mut version_buf).await?;
-    
+
     if version_buf[0] != PROTOCOL_VERSION {
         return Err(ProtocolError::InvalidFormat);
     }
@@ -124,7 +125,7 @@ where
     // Read length
     let mut length_buf = [0u8; 4];
     reader.read_exact(&mut length_buf).await?;
-    
+
     let length = u32::from_le_bytes(length_buf);
     if length > MAX_MESSAGE_SIZE {
         return Err(ProtocolError::MessageTooLarge(length));
@@ -134,9 +135,8 @@ where
     let mut payload = vec![0u8; length as usize];
     reader.read_exact(&mut payload).await?;
 
-    // Decode message
-    let (message, _) = bincode::decode_from_slice(&payload, bincode::config::standard())
-        .map_err(|_| ProtocolError::InvalidFormat)?;
+    // Deserialize from MessagePack using rmp-serde
+    let message = from_slice(&payload).map_err(|_| ProtocolError::InvalidFormat)?;
 
     Ok(message)
 }
