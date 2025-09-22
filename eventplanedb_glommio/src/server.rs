@@ -1,89 +1,20 @@
-use futures_lite::StreamExt;
 use glommio::{
-    channels::sharding::{Handler, HandlerResult, Sharded},
-    net::{TcpListener, TcpStream},
-    prelude::*,
-    CpuSet, LocalExecutorPoolBuilder, PoolPlacement,
+    channels::shared_channel,
+    net::TcpListener,
+    LocalExecutorBuilder, Placement, spawn_local,
 };
-
 use crate::{
     hash_aggregate_id, protocol::{read_message, write_message, Request, Response},
     GlommioResult, GlommioServerConfig,
 };
+use eventplanedb_storage_stateful::stateful_engine::{StatefulDestructive, StatefulEngine, StatefulReader, StatefulWriter};
+use std::{cell::RefCell, os::fd::{AsRawFd, FromRawFd}, rc::Rc};
 
-use eventplanedb_storage_stateful::stateful_engine::{StatefulEngine, StatefulWriter};
-
-/// Message handler for processing requests on shards
-#[derive(Clone)]
-pub struct RequestHandler {
-    engine: StatefulEngine,
+enum WorkItem {
+    Connection(i32, Request), // fd and first request
+    Shutdown,
 }
 
-impl RequestHandler {
-    fn new(config: &GlommioServerConfig) -> Self {
-        let engine = StatefulEngine::new(config.stateful_config.clone());
-        Self { engine }
-    }
-
-    fn process_request(&mut self, request: Request) -> Response {
-        match request {
-            Request::AppendEvents {
-                aggregate_id,
-                client_id,
-                user_id,
-                events,
-                expected_event_batch_index,
-            } => {
-                let result = self.engine.append_events(
-                    &aggregate_id,
-                    client_id,
-                    user_id,
-                    events,
-                    expected_event_batch_index,
-                );
-                Response::AppendEventsResult(result.map_err(|e| format!("{:?}", e)))
-            }
-            Request::ReadFiltered { aggregate_id, filters } => {
-                let result = self.engine.read_filtered(&aggregate_id, &filters);
-                Response::ReadFilteredResult(result.map_err(|e| format!("{:?}", e)))
-            }
-            Request::Exists { aggregate_id } => {
-                let result = self.engine.exists(&aggregate_id);
-                Response::ExistsResult(result.map_err(|e| format!("{:?}", e)))
-            }
-            Request::TrimStart {
-                aggregate_id,
-                keep_from_event_batch_index,
-            } => {
-                let result = self.engine.trim_start(&aggregate_id, keep_from_event_batch_index);
-                Response::TrimStartResult(result.map_err(|e| format!("{:?}", e)))
-            }
-            Request::Delete { aggregate_id } => {
-                let result = self.engine.delete(&aggregate_id);
-                Response::DeleteResult(result.map_err(|e| format!("{:?}", e)))
-            }
-        }
-    }
-}
-
-impl Handler<(Request, TcpStream)> for RequestHandler {
-    fn handle(
-        &mut self,
-        (request, mut stream): (Request, TcpStream),
-        _src_shard: usize,
-        _cur_shard: usize,
-    ) -> HandlerResult {
-        async move {
-            let response = self.process_request(request);
-            if let Err(e) = write_message(&mut stream, &response).await {
-                eprintln!("Failed to write response: {:?}", e);
-            }
-            let _ = stream.close().await;
-        }.boxed_local()
-    }
-}
-
-/// The main Glommio server
 pub struct GlommioServer {
     config: GlommioServerConfig,
 }
@@ -95,104 +26,170 @@ impl GlommioServer {
 
     pub fn run(self) -> GlommioResult<()> {
         let shard_count = self.config.shard_count.unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|p| p.get())
-                .unwrap_or(1)
+            std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1)
         });
 
-        let bind_addr = self.config.bind_addr;
-        let config = self.config;
-
-        // Determine shard assignment for requests
-        fn get_shard_for(req: &(Request, TcpStream), nr_shards: usize) -> usize {
-            let hash = hash_aggregate_id(req.0.aggregate_id());
-            (hash as usize) % nr_shards
+        let mut worker_senders = Vec::new();
+        let mut worker_receivers = Vec::new();
+        for _ in 0..shard_count {
+            let (tx, rx) = shared_channel::new_bounded::<WorkItem>(128);
+            worker_senders.push(tx);
+            worker_receivers.push(rx);
         }
 
-        println!("Starting EventPlane Glommio server on {} with {} shards", bind_addr, shard_count);
-
-        // Use the proper LocalExecutorPoolBuilder pattern from examples
-        LocalExecutorPoolBuilder::new(PoolPlacement::MaxSpread(shard_count, CpuSet::online().ok()))
-            .on_all_shards(move || {
+        // Spawn worker threads
+        let config = self.config.clone();
+        let handles: Vec<_> = worker_receivers
+            .into_iter()
+            .enumerate()
+            .map(|(worker_id, rx)| {
                 let config = config.clone();
-                let bind_addr = bind_addr;
-                
-                async move {
-                    let shard_id = glommio::executor().id();
-                    println!("Starting shard {}", shard_id);
-
-                    // Create the mesh for sharding
-                    let mesh = glommio::channels::channel_mesh::MeshBuilder::full(shard_count, 1024);
-                    
-                    // Create the request handler for this shard
-                    let handler = RequestHandler::new(&config);
-                    
-                    // Create the sharded system
-                    let mut sharded = Sharded::new(mesh, get_shard_for, handler)
-                        .await
-                        .expect("Failed to create sharded system");
-
-                    // Only shard 0 listens for connections
-                    if shard_id == 0 {
-                        let listener = TcpListener::bind(bind_addr)
-                            .expect("Failed to bind listener");
-                        
-                        println!("Listening on {}", listener.local_addr().unwrap());
-
-                        let mut incoming = listener.incoming();
-                        while let Some(stream) = incoming.next().await {
-                            match stream {
-                                Ok(stream) => {
-                                    // Spawn a task to handle this connection
-                                    glommio::spawn_local(handle_connection(stream, &mut sharded)).detach();
-                                }
-                                Err(e) => {
-                                    eprintln!("Failed to accept connection: {:?}", e);
-                                }
-                            }
-                        }
-                    } else {
-                        // Worker shards just process their queue
-                        sharded.handle(futures_lite::stream::pending::<(Request, TcpStream)>()).unwrap();
-                    }
-
-                    sharded.close().await;
-                }
+                LocalExecutorBuilder::new(Placement::Fixed(worker_id + 1))
+                    .name(&format!("worker-{}", worker_id))
+                    .spawn(move || worker_main(worker_id, rx, config))
+                    .expect("Failed to spawn worker executor")
             })
-            .unwrap()
-            .join_all();
+            .collect();
 
+        // Main acceptor thread
+        let acceptor_handle = {
+            let config = self.config.clone();
+            LocalExecutorBuilder::new(Placement::Fixed(0))
+                .name("acceptor")
+                .spawn(move || accept_main(worker_senders, config))
+                .expect("Failed to spawn acceptor executor")
+        };
+
+        acceptor_handle.join().unwrap();
+        for handle in handles {
+            let _ = handle.join();
+        }
         Ok(())
     }
 }
 
-async fn handle_connection(
-    mut stream: TcpStream, 
-    sharded: &mut Sharded<(Request, TcpStream), RequestHandler>
-) -> GlommioResult<()> {
-    println!("New connection from {:?}", stream.peer_addr());
+async fn accept_main(
+    worker_senders: Vec<shared_channel::SharedSender<WorkItem>>,
+    config: GlommioServerConfig,
+) {
+    let mut connected_senders = Vec::new();
+    for sender in worker_senders {
+        connected_senders.push(sender.connect().await);
+    }
+
+    let listener = TcpListener::bind(config.bind_addr).unwrap();
+    println!("Listening on {}", config.bind_addr);
 
     loop {
-        // Read request
-        let request: Request = match read_message(&mut stream).await {
-            Ok(req) => req,
-            Err(crate::protocol::ProtocolError::ConnectionClosed) => {
-                println!("Connection closed");
+        match listener.accept().await {
+            Ok(mut stream) => {
+                // Read the first request to get aggregate_id
+                let request: Request = match read_message(&mut stream).await {
+                    Ok(req) => req,
+                    Err(e) => {
+                        eprintln!("Failed to read request: {:?}", e);
+                        continue;
+                    }
+                };
+                let agg_id = request.aggregate_id();
+                let hash = hash_aggregate_id(agg_id);
+                let worker_idx = (hash as usize) % connected_senders.len();
+
+                let fd = stream.as_raw_fd();
+                std::mem::forget(stream); // Don't close fd
+
+                let work_item = WorkItem::Connection(fd, request);
+                if let Err(e) = connected_senders[worker_idx].try_send(work_item) {
+                    eprintln!("Failed to send to worker {}: {}", worker_idx, e);
+                    unsafe { libc::close(fd); }
+                }
+            }
+            Err(e) => {
+                eprintln!("Accept failed: {}", e);
                 break;
             }
+        }
+    }
+
+    // Shutdown all workers
+    for sender in connected_senders {
+        let _ = sender.try_send(WorkItem::Shutdown);
+    }
+}
+
+async fn worker_main(
+    worker_id: usize,
+    work_rx: shared_channel::SharedReceiver<WorkItem>,
+    config: GlommioServerConfig,
+) {
+    let connected_receiver = work_rx.connect().await;
+    let mut work_stream = connected_receiver;
+    let engine = Rc::new(RefCell::new(StatefulEngine::new(config.stateful_config)));
+
+    while let Some(work) = work_stream.recv().await {
+        match work {
+            WorkItem::Connection(fd, first_request) => {
+                let stream = unsafe { glommio::net::TcpStream::from_raw_fd(fd) };
+                let engine = engine.clone();
+                spawn_local(async move {
+                    handle_connection(stream, first_request, engine).await;
+                }).detach();
+            }
+            WorkItem::Shutdown => {
+                println!("Worker {} received shutdown", worker_id);
+                break;
+            }
+        }
+    }
+    println!("Worker {} exiting", worker_id);
+}
+
+async fn handle_connection(
+    mut stream: glommio::net::TcpStream,
+    mut request: Request,
+    engine: Rc<RefCell<StatefulEngine>>,
+) {
+    loop {
+        let response = process_request(&mut engine.borrow_mut(), request);
+        if let Err(e) = write_message(&mut stream, &response).await {
+            eprintln!("Failed to write response: {:?}", e);
+            break;
+        }
+        // Try to read next request (if client supports pipelining)
+        match read_message(&mut stream).await {
+            Ok(req) => request = req,
+            Err(crate::protocol::ProtocolError::ConnectionClosed) => break,
             Err(e) => {
                 eprintln!("Protocol error: {:?}", e);
                 break;
             }
-        };
-
-        // Send the request and stream to the appropriate shard
-        // The sharded system will handle routing based on aggregate_id
-        if let Err(e) = sharded.send((request, stream.clone())).await {
-            eprintln!("Failed to send request to shard: {:?}", e);
-            break;
         }
     }
+}
 
-    Ok(())
+fn process_request(engine: &mut StatefulEngine, request: Request) -> Response {
+    match request {
+        Request::AppendEvents { org_id, aggregate_type_id, aggregate_id, client_id, user_id, events, expected_event_batch_index } => {
+            let result = engine.append_events(
+                org_id, aggregate_type_id, aggregate_id, client_id, user_id, events, expected_event_batch_index,
+            );
+            Response::AppendEventsResult(result.map_err(|e| format!("{:?}", e)))
+        }
+        Request::ReadFiltered { org_id, aggregate_type_id, aggregate_id, filters } => {
+            let result = engine.read_filtered(org_id, aggregate_type_id, aggregate_id, &filters);
+            Response::ReadFilteredResult(result.map_err(|e| format!("{:?}", e)))
+        }
+        Request::Exists { org_id, aggregate_type_id, aggregate_id } => {
+            let result = engine.exists(org_id, aggregate_type_id, aggregate_id);
+            Response::ExistsResult(result.map_err(|e| format!("{:?}", e)))
+        }
+        Request::TrimStart { org_id, aggregate_type_id, aggregate_id, keep_from_event_batch_index } => {
+            let result = engine.trim_start(org_id, aggregate_type_id, aggregate_id, keep_from_event_batch_index);
+            Response::TrimStartResult(result.map_err(|e| format!("{:?}", e)))
+        }
+        Request::Delete { org_id, aggregate_type_id, aggregate_id } => {
+            let result = engine.delete(org_id, aggregate_type_id, aggregate_id);
+            Response::DeleteResult(result.map_err(|e| format!("{:?}", e)))
+        }
+    }
 }

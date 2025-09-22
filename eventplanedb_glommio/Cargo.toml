@@ -16,6 +16,7 @@ serde.workspace = true
 thiserror.workspace = true
 futures-lite.workspace = true
 clap.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

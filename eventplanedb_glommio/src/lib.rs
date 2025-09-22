@@ -25,7 +25,7 @@ pub enum GlommioError {
 type GlommioResult<T> = Result<T, GlommioError>;
 
 /// Hash function for aggregate_id to determine shard assignment
-pub fn hash_aggregate_id(aggregate_id: u128) -> u64 {
+pub fn hash_aggregate_id(aggregate_id: &u128) -> u64 {
     let mut hasher = AHasher::default();
     aggregate_id.hash(&mut hasher);
     hasher.finish()

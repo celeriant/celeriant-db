@@ -399,6 +399,7 @@ dependencies = [
  "eventplanedb_storage_structures",
  "futures-lite 2.6.1",
  "glommio",
+ "libc",
  "serde",
  "tempfile",
  "thiserror",

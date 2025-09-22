@@ -24,25 +24,35 @@ pub enum ProtocolError {
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub enum Request {
     AppendEvents {
-        aggregate_id: String,
+        org_id: u128,
+        aggregate_type_id: u128,
+        aggregate_id: u128,
         client_id: u128,
         user_id: Option<u128>,
         events: Vec<EventItem>,
         expected_event_batch_index: Option<u64>,
     },
     ReadFiltered {
-        aggregate_id: String,
+        org_id: u128,
+        aggregate_type_id: u128,
+        aggregate_id: u128,
         filters: ReadFilters,
     },
     Exists {
-        aggregate_id: String,
+        org_id: u128,
+        aggregate_type_id: u128,
+        aggregate_id: u128,
     },
     TrimStart {
-        aggregate_id: String,
+        org_id: u128,
+        aggregate_type_id: u128,
+        aggregate_id: u128,
         keep_from_event_batch_index: u64,
     },
     Delete {
-        aggregate_id: String,
+        org_id: u128,
+        aggregate_type_id: u128,
+        aggregate_id: u128,
     },
 }
 
@@ -57,13 +67,13 @@ pub enum Response {
 }
 
 impl Request {
-    pub fn aggregate_id(&self) -> &str {
+    pub fn aggregate_id(&self) -> &u128 {
         match self {
             Request::AppendEvents { aggregate_id, .. } => aggregate_id,
             Request::ReadFiltered { aggregate_id, .. } => aggregate_id,
-            Request::Exists { aggregate_id } => aggregate_id,
+            Request::Exists { aggregate_id, ..} => aggregate_id,
             Request::TrimStart { aggregate_id, .. } => aggregate_id,
-            Request::Delete { aggregate_id } => aggregate_id,
+            Request::Delete { aggregate_id, .. } => aggregate_id,
         }
     }
 }

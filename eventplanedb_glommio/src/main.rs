@@ -1,7 +1,6 @@
 use clap::Parser;
+use eventplanedb_glommio::{GlommioServer, GlommioServerConfig};
 use std::{net::SocketAddr, path::PathBuf};
-
-use eventplanedb_storage_glommio::{GlommioServer, GlommioServerConfig};
 
 #[derive(Parser)]
 #[command(name = "eventplane-glommio-server")]
@@ -36,5 +35,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Shards: {:?}", config.shard_count);
 
     let server = GlommioServer::new(config);
-    server.run()
+    server.run()?;
+    Ok(())
 }
