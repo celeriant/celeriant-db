@@ -11,7 +11,7 @@ use crate::{
     GlommioResult, GlommioServerConfig,
 };
 
-use eventplanedb_storage_stateful::stateful_engine::StatefulEngine;
+use eventplanedb_storage_stateful::stateful_engine::{StatefulEngine, StatefulWriter};
 
 /// Message handler for processing requests on shards
 #[derive(Clone)]

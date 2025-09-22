@@ -100,14 +100,12 @@ where
 
 pub async fn read_message<T, R>(reader: &mut R) -> Result<T, ProtocolError>
 where
-    T: Decode,
+    T: Decode<()>,
     R: AsyncReadExt + Unpin,
 {
     // Read version
     let mut version_buf = [0u8; 1];
-    if reader.read_exact(&mut version_buf).await? == 0 {
-        return Err(ProtocolError::ConnectionClosed);
-    }
+    reader.read_exact(&mut version_buf).await?;
     
     if version_buf[0] != PROTOCOL_VERSION {
         return Err(ProtocolError::InvalidFormat);

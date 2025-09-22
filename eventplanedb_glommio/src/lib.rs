@@ -5,16 +5,12 @@ use std::hash::{Hash, Hasher};
 use thiserror::Error;
 
 use eventplanedb_storage_stateful::stateful_engine::StatefulEngineConfig;
-use eventplanedb_storage_structures::{
-    event_batch_metadata::EventBatchMetadata, event_item::EventItem, read_filters::ReadFilters,
-    read_result::ReadResult,
-};
 
 pub mod protocol;
 pub mod server;
 
 pub use protocol::{ProtocolError, Request, Response};
-pub use server::{GlommioServer, GlommioServerConfig};
+pub use server::{GlommioServer};
 
 #[derive(Error, Debug)]
 pub enum GlommioError {
@@ -22,8 +18,6 @@ pub enum GlommioError {
     Io(#[from] io::Error),
     #[error("Protocol error: {0}")]
     Protocol(#[from] ProtocolError),
-    #[error("Bincode error: {0}")]
-    Bincode(#[from] bincode::Error),
     #[error("Server error: {0}")]
     Server(String),
 }
