@@ -8,7 +8,7 @@ use crate::{
     GlommioResult, GlommioServerConfig,
 };
 use eventplanedb_storage_stateful::stateful_engine::{StatefulDestructive, StatefulEngine, StatefulReader, StatefulWriter};
-use std::{cell::RefCell, os::fd::{AsRawFd, FromRawFd}, rc::Rc};
+use std::{cell::RefCell, os::fd::{AsRawFd, FromRawFd}, rc::Rc, time::Duration};
 
 enum WorkItem {
     Connection(i32, Request), // fd and first request
@@ -123,10 +123,9 @@ async fn worker_main(
     config: GlommioServerConfig,
 ) {
     let connected_receiver = work_rx.connect().await;
-    let mut work_stream = connected_receiver;
     let engine = Rc::new(RefCell::new(StatefulEngine::new(config.stateful_config)));
 
-    while let Some(work) = work_stream.recv().await {
+    while let Some(work) = connected_receiver.recv().await {
         match work {
             WorkItem::Connection(fd, first_request) => {
                 let stream = unsafe { glommio::net::TcpStream::from_raw_fd(fd) };
@@ -149,21 +148,9 @@ async fn handle_connection(
     mut request: Request,
     engine: Rc<RefCell<StatefulEngine>>,
 ) {
-    loop {
-        let response = process_request(&mut engine.borrow_mut(), request);
-        if let Err(e) = write_message(&mut stream, &response).await {
-            eprintln!("Failed to write response: {:?}", e);
-            break;
-        }
-        // Try to read next request (if client supports pipelining)
-        match read_message(&mut stream).await {
-            Ok(req) => request = req,
-            Err(crate::protocol::ProtocolError::ConnectionClosed) => break,
-            Err(e) => {
-                eprintln!("Protocol error: {:?}", e);
-                break;
-            }
-        }
+    let response = process_request(&mut engine.borrow_mut(), request);
+    if let Err(e) = write_message(&mut stream, &response).await {
+        eprintln!("Failed to write response: {:?}", e);
     }
 }
 

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use rmp_serde::{encode::to_vec_named, decode::from_slice};
 use thiserror::Error;
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Serialize, Deserialize)]
 pub enum ProtocolError {
     #[error("Serialization error")]
     SerializationError,
