@@ -25,6 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let report_interval = 100; // Print stats every 100 events
 
         let mut aggregate_id_offset = 0;
+        let mut stream = tokio::net::TcpStream::connect(server_address).await.expect("Failed to connect");
         loop {
             // Create a sample EventItem
             let event = EventItem::new(
@@ -35,38 +36,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 0,                // event_type_minor
                 b"hello world".to_vec(), // event_value
             );
-            let event2 = EventItem::new(
-                client_event_index + 1,                // client_event_index
-                0,                // event_index (server will likely overwrite)
-                0, // event_timestamp (ms)
-                1,                // event_type_major
-                0,                // event_type_minor
-                b"To Him is your return all together. Allah's promise is 'always' true. Indeed, He originates the creation then resurrects it so that He may justly reward those who believe and do good. But those who disbelieve will have a boiling drink and a painful punishment for their disbelief.".to_vec(), // event_value
-            );
-            let event3 = EventItem::new(
-                client_event_index + 2,                // client_event_index
-                0,                // event_index (server will likely overwrite)
-                0, // event_timestamp (ms)
-                1,                // event_type_major
-                0,                // event_type_minor
-                b"Is it astonishing to people that We have sent revelation to a man from among themselves, instructing him, Warn humanity and give good news to the believers that they will have an honourable status with their Lord.? Yet the disbelievers said, Indeed, this man is clearly a magician!".to_vec(), // event_value
-            );
 
             let request = Request::AppendEvents {
-                org_id: 33,
-                aggregate_type_id: 22,
-                aggregate_id: 12 + aggregate_id_offset,
+                org_id: 43,
+                aggregate_type_id: 23,
+                aggregate_id: 122 + aggregate_id_offset,
                 client_id: 44,
                 user_id: None,
-                events: vec![event, event2, event3],
+                events: vec![event],
                 expected_event_batch_index: None,
             };
+            // let request = Request::Exists { org_id: 43, aggregate_type_id: 23, aggregate_id: 12 + aggregate_id_offset };
             aggregate_id_offset += 1;
             if aggregate_id_offset > 5 {
                 aggregate_id_offset = 0;
             }
 
-            let mut stream = tokio::net::TcpStream::connect(server_address).await.expect("Failed to connect");
             write_message(&mut stream, &request).await?;
             let response: Response = read_message(&mut stream).await?;
             match response {
@@ -75,7 +60,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Ok(_) => (), // Success
                         Err(error_message) => eprintln!("Error: {}", error_message),
                     }
-                }
+                },
+                Response::ExistsResult(result) => {
+                    match result {
+                        Ok(exists) => (), // Success
+                        Err(error_message) => eprintln!("Error: {}", error_message),
+                    }
+                },
+                _ => eprintln!("Unexpected response type"),
             }
             // stream.shutdown().await;
             client_event_index += 3;

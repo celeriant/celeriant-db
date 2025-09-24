@@ -20,6 +20,9 @@ libc.workspace = true
 serde_json.workspace = true
 rmp-serde.workspace = true
 rmpv.workspace = true
+num_cpus.workspace = true
+env_logger.workspace = true
+log.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

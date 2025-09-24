@@ -1,4 +1,4 @@
-use eventplanedb_storage_structures::{event_batch_metadata::EventBatchMetadata, event_item::EventItem, read_filters::ReadFilters};
+use eventplanedb_storage_structures::{event_batch_metadata::EventBatchMetadata, event_item::EventItem, read_filters::ReadFilters, read_result::ReadResult};
 use serde::{Deserialize, Serialize};
 use rmp_serde::{encode::to_vec_named, decode::from_slice};
 use thiserror::Error;
@@ -58,6 +58,10 @@ pub enum Request {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Response {
     AppendEventsResult(Result<EventBatchMetadata, String>),
+    ReadFilteredResult(Result<ReadResult, String>),
+    ExistsResult(Result<bool, String>),
+    TrimStartResult(Result<(), String>),
+    DeleteResult(Result<(), String>),
 }
 
 pub async fn write_message<T, W>(writer: &mut W, message: &T) -> Result<(), ProtocolError>

@@ -17,6 +17,10 @@ struct Args {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::Builder::from_default_env()
+        .filter_level(log::LevelFilter::Info) // Set default level
+        .init();
+
     let args = Args::parse();
 
     let config = GlommioServerConfig::default()
