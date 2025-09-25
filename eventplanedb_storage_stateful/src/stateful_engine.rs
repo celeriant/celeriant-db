@@ -572,6 +572,7 @@ impl StatefulWriter for StatefulEngine {
         }
 
         // Filter out duplicate events based on client event index
+        //TODO: Reintroduce filter_duplicate_events
         // self.filter_duplicate_events(
         //     org_id,
         //     aggregate_type_id,
