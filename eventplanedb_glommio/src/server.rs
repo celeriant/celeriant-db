@@ -1,6 +1,6 @@
 use crate::{
     hash_aggregate_id, protocol::{read_message, write_message, Request, Response},
-    GlommioResult, GlommioServerConfig,
+    GlommioResult, GlommioServerConfig, ProtocolError,
 };
 use bincode::enc::write;
 use eventplanedb_storage_stateful::stateful_engine::{StatefulDestructive, StatefulEngine, StatefulReader, StatefulWriter};
@@ -230,6 +230,9 @@ async fn write_to_tcp_stream(response: &Response, tcp_stream: &mut glommio::net:
     }
 }
 
+const MAX_MESSAGE_SIZE: u32 = 64 * 1024 * 1024; // 64MB max message size
+const PROTOCOL_VERSION: u8 = 1;
+
 /// Read all available bytes on the TCP stream
 /// Return None if the connection is closed or no data is read
 /// Otherwise return the parsed u64 value
@@ -237,21 +240,43 @@ async fn write_to_tcp_stream(response: &Response, tcp_stream: &mut glommio::net:
 /// tasks can proceed while we wait for data
 async fn read_from_tcp_stream(shard_id: usize, tcp_stream: &mut glommio::net::TcpStream) -> Option<Request> {
     
-    // return Some(Request::Exists { org_id: 43, aggregate_type_id: 23, aggregate_id: 12 });
+    let mut header = [0u8; 5];
+    tcp_stream.read_exact(&mut header).await.ok()?;
+
+    // let version = header[0];
+    // if version != PROTOCOL_VERSION {
+    //     return None;
+    // }
+
+    // let length = u32::from_le_bytes([header[1], header[2], header[3], header[4]]);
+    // if length > MAX_MESSAGE_SIZE {
+    //     return None;
+    // }
+
+    // Read payload
+    // let mut payload = [0u8; 9999];
+    // let start = std::time::Instant::now();
+    // let bytes_read = tcp_stream.read(&mut payload).await.ok()?;
+    // let duration = start.elapsed();
+
+    // println!("Slow read: {} bytes in {:?}", bytes_read, duration);
+
     
     //TODO: THis is SUPER slow
-    match read_message(tcp_stream).await {
-        Ok(request) => Some(request),
-        Err(e) => {
-            match e {
-                crate::protocol::ProtocolError::ConnectionClosed => {
-                    debug!("Shard {shard_id} client connection closed gracefully");
-                }
-                _ => {
-                    error!("Shard {shard_id} failed to read from TCP stream: {e}");
-                }
-            }
-            None
-        }
-    }
+    // match read_message::<Request, glommio::net::TcpStream>(tcp_stream).await {
+    //     Ok(request) => Some(request),
+    //     Err(e) => {
+    //         match e {
+    //             crate::protocol::ProtocolError::ConnectionClosed => {
+    //                 debug!("Shard {shard_id} client connection closed gracefully");
+    //             }
+    //             _ => {
+    //                 error!("Shard {shard_id} failed to read from TCP stream: {e}");
+    //             }
+    //         }
+    //         None
+    //     }
+    // };
+
+    return Some(Request::Exists { org_id: 43, aggregate_type_id: 23, aggregate_id: 12 });
 }

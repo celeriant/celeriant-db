@@ -23,6 +23,7 @@ rmpv.workspace = true
 num_cpus.workspace = true
 env_logger.workspace = true
 log.workspace = true
+mimalloc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

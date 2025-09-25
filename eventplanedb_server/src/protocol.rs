@@ -1,8 +1,6 @@
 use bincode::{Decode, Encode};
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use rmp_serde::{encode::to_vec_named, decode::from_slice};
 
 use eventplanedb_storage_structures::{
     constants::BINCODE_CONFIG_VARIABLE, event_batch_metadata::EventBatchMetadata, event_item::EventItem, read_filters::ReadFilters, read_result::ReadResult
@@ -21,7 +19,7 @@ pub enum ProtocolError {
 }
 
 /// Wire protocol requests
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub enum Request {
     AppendEvents {
         org_id: u128,
@@ -57,7 +55,7 @@ pub enum Request {
 }
 
 /// Wire protocol responses
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub enum Response {
     AppendEventsResult(Result<EventBatchMetadata, String>),
     ReadFilteredResult(Result<ReadResult, String>),
@@ -88,53 +86,21 @@ where
     T: Encode,
     W: AsyncWriteExt + Unpin,
 {
-    // Serialize to bincode
+
+    // let mut tcp_buffer_2 = vec![0u8; 1024*1024/8]; // 1MB buffer
+    // let bytes = bincode::encode_into_slice(message, &mut tcp_buffer_2, BINCODE_CONFIG_VARIABLE)
+    //     .map_err(|_| ProtocolError::InvalidFormat)?;
+    // writer.write_all(&tcp_buffer_2).await?;
+
+    //Serialize to bincode - heap based
     let encoded = bincode::encode_to_vec(message, BINCODE_CONFIG_VARIABLE)
         .map_err(|_| ProtocolError::InvalidFormat)?;
 
     if encoded.len() > MAX_MESSAGE_SIZE as usize {
         return Err(ProtocolError::MessageTooLarge(encoded.len() as u32));
     }
-
-    // Write version
-    writer.write_all(&[PROTOCOL_VERSION]).await?;
-
-    // Write length
-    let length = encoded.len() as u32;
-    writer.write_all(&length.to_le_bytes()).await?;
-
-    // Write payload
+    
     writer.write_all(&encoded).await?;
 
     Ok(())
-}
-
-pub async fn read_message<T, R>(reader: &mut R) -> Result<T, ProtocolError>
-where
-    T: Decode<()>,
-    R: AsyncReadExt + Unpin,
-{
-    // Read header (version + length) in one call
-    let mut header = [0u8; 5];
-    reader.read_exact(&mut header).await?;
-
-    let version = header[0];
-    if version != PROTOCOL_VERSION {
-        return Err(ProtocolError::InvalidFormat);
-    }
-
-    let length = u32::from_le_bytes([header[1], header[2], header[3], header[4]]);
-    if length > MAX_MESSAGE_SIZE {
-        return Err(ProtocolError::MessageTooLarge(length));
-    }
-
-    // Read payload
-    let mut payload = vec![0u8; length as usize];
-    reader.read_exact(&mut payload).await?;
-
-    // Deserialize from bincode
-    let (message, _) = bincode::decode_from_slice(&payload, BINCODE_CONFIG_VARIABLE)
-        .map_err(|_| ProtocolError::InvalidFormat)?;
-
-    Ok(message)
 }

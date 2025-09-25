@@ -13,6 +13,8 @@ pub struct EventItem {
     #[serde(rename = "ex")]
     pub event_index: u64,
 
+    //TODO: event UUID
+
     /// Client derived Unix timestamp in milliseconds when the event occurred
     #[serde(rename = "et")]
     pub event_timestamp: u64,

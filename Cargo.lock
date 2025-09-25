@@ -429,11 +429,9 @@ dependencies = [
 name = "eventplanedb_client"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "eventplanedb_storage_structures",
- "rmp-serde",
- "serde",
- "thiserror 1.0.69",
- "tokio",
+ "rand",
 ]
 
 [[package]]
@@ -451,13 +449,34 @@ dependencies = [
  "glommio",
  "libc",
  "log",
+ "mimalloc",
  "num_cpus",
  "rmp-serde",
  "rmpv",
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.16",
+ "thiserror",
+]
+
+[[package]]
+name = "eventplanedb_server"
+version = "0.1.0"
+dependencies = [
+ "ahash 0.8.12",
+ "bincode",
+ "env_logger",
+ "eventplanedb_storage_stateful",
+ "eventplanedb_storage_stateless",
+ "eventplanedb_storage_structures",
+ "fastrand 2.3.0",
+ "futures-lite 2.6.1",
+ "glommio",
+ "log",
+ "lru",
+ "mimalloc",
+ "num_cpus",
+ "thiserror",
 ]
 
 [[package]]
@@ -509,7 +528,7 @@ dependencies = [
  "eventplanedb_storage_structures",
  "futures",
  "tempfile",
- "thiserror 2.0.16",
+ "thiserror",
  "tokio",
 ]
 
@@ -885,6 +904,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9fbbcab51052fe104eb5e5d351cf728d30a5be1fe14d9be8a3b097481fb97de"
 
 [[package]]
+name = "libmimalloc-sys"
+version = "0.1.44"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "667f4fec20f29dfc6bc7357c582d91796c169ad7e2fce709468aefeb2c099870"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -917,9 +946,9 @@ checksum = "34080505efa8e45a4b816c349525ebe327ceaa8559756f0356cba97ef3bf7432"
 
 [[package]]
 name = "lru"
-version = "0.16.0"
+version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86ea4e65087ff52f3862caff188d489f1fab49a0cb09e01b2e3f1a617b10aaed"
+checksum = "bfe949189f46fabb938b3a9a0be30fdd93fd8a09260da863399a8cf3db756ec8"
 dependencies = [
  "hashbrown",
 ]
@@ -937,6 +966,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "mimalloc"
+version = "0.1.48"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1ee66a4b64c74f4ef288bcbb9192ad9c3feaad75193129ac8509af543894fd8"
+dependencies = [
+ "libmimalloc-sys",
 ]
 
 [[package]]
@@ -1451,31 +1489,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "1.0.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
-dependencies = [
- "thiserror-impl 1.0.69",
-]
-
-[[package]]
-name = "thiserror"
 version = "2.0.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3467d614147380f2e4e374161426ff399c91084acd2363eaf549172b3d5e60c0"
 dependencies = [
- "thiserror-impl 2.0.16",
-]
-
-[[package]]
-name = "thiserror-impl"
-version = "1.0.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
+ "thiserror-impl",
 ]
 
 [[package]]

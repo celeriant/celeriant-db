@@ -1,6 +1,10 @@
 use clap::Parser;
 use eventplanedb_glommio::{GlommioServer, GlommioServerConfig};
 use std::{net::SocketAddr, path::PathBuf};
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Parser)]
 #[command(name = "eventplane-glommio-server")]

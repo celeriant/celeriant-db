@@ -1,5 +1,5 @@
 [package]
-name = "eventplanedb_tcp_server"
+name = "eventplanedb_server"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -9,12 +9,14 @@ license.workspace = true
 eventplanedb_storage_structures = { path = "../eventplanedb_storage_structures" }
 eventplanedb_storage_stateful = { path = "../eventplanedb_storage_stateful" }
 eventplanedb_storage_stateless = { path = "../eventplanedb_storage_stateless" }
+env_logger = "0.11.8"
+fastrand = "2.3.0"
+futures-lite = "2.6.1"
+glommio = "0.9.0"
+log = "0.4.28"
+lru = "0.16.1"
+num_cpus = "1.17.0"
 bincode.workspace = true
-glommio.workspace = true
-ahash.workspace = true
-serde.workspace = true
 thiserror.workspace = true
-futures-lite.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
+ahash.workspace = true
+mimalloc.workspace = true

@@ -572,13 +572,13 @@ impl StatefulWriter for StatefulEngine {
         }
 
         // Filter out duplicate events based on client event index
-        self.filter_duplicate_events(
-            org_id,
-            aggregate_type_id,
-            aggregate_id,
-            client_id,
-            &mut events,
-        )?;
+        // self.filter_duplicate_events(
+        //     org_id,
+        //     aggregate_type_id,
+        //     aggregate_id,
+        //     client_id,
+        //     &mut events,
+        // )?;
 
         if events.is_empty() {
             return Err(io::Error::other(

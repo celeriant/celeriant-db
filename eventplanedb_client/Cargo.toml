@@ -6,8 +6,6 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
-rmp-serde = "1.0"
-serde = { version = "1.0", features = ["derive"] }
-thiserror = "1.0"
+rand = "0.9.2"
+bincode.workspace = true
 eventplanedb_storage_structures = { path = "../eventplanedb_storage_structures" }
