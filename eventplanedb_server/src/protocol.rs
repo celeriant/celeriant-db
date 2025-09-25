@@ -87,20 +87,20 @@ where
     W: AsyncWriteExt + Unpin,
 {
 
-    // let mut tcp_buffer_2 = vec![0u8; 1024*1024/8]; // 1MB buffer
-    // let bytes = bincode::encode_into_slice(message, &mut tcp_buffer_2, BINCODE_CONFIG_VARIABLE)
-    //     .map_err(|_| ProtocolError::InvalidFormat)?;
-    // writer.write_all(&tcp_buffer_2).await?;
+    let mut tcp_buffer_2 = [0u8; 200]; // 200 bytes buffer
+    let bytes = bincode::encode_into_slice(message, &mut tcp_buffer_2, BINCODE_CONFIG_VARIABLE)
+        .map_err(|_| ProtocolError::InvalidFormat)?;
+    writer.write_all(&tcp_buffer_2[..bytes]).await?;
 
     //Serialize to bincode - heap based
-    let encoded = bincode::encode_to_vec(message, BINCODE_CONFIG_VARIABLE)
-        .map_err(|_| ProtocolError::InvalidFormat)?;
+    // let encoded = bincode::encode_to_vec(message, BINCODE_CONFIG_VARIABLE)
+    //     .map_err(|_| ProtocolError::InvalidFormat)?;
 
-    if encoded.len() > MAX_MESSAGE_SIZE as usize {
-        return Err(ProtocolError::MessageTooLarge(encoded.len() as u32));
-    }
+    // if encoded.len() > MAX_MESSAGE_SIZE as usize {
+    //     return Err(ProtocolError::MessageTooLarge(encoded.len() as u32));
+    // }
     
-    writer.write_all(&encoded).await?;
+    // writer.write_all(&encoded).await?;
 
     Ok(())
 }

@@ -230,7 +230,7 @@ fn run_client_connection(
         let mut rng = rand::thread_rng();
 
         let events = (0..3).map(|_| {
-            let repeat_count = rng.gen_range(1..=300);
+            let repeat_count = rng.gen_range(1..=3);
             let event_value = "hello_world".repeat(repeat_count).into_bytes();
             
             EventItem::new(

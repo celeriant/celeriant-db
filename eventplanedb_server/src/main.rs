@@ -246,7 +246,7 @@ async fn write_to_tcp_stream(response: Response, tcp_stream: &mut glommio::net::
 /// tasks can proceed while we wait for data
 async fn read_from_tcp_stream(shard_id: usize, tcp_stream: &mut glommio::net::TcpStream) -> Option<Request> {
     // let mut tcp_buffer = [0u8; 1024*1024/8]; // 1/8th of 1MB buffer
-    let mut tcp_buffer = vec![0u8; 1024*1024];
+    let mut tcp_buffer = [0u8; 200];
     let n = match tcp_stream.read(&mut tcp_buffer).await {
         Ok(bytes_read) => bytes_read,
         Err(e) => {
