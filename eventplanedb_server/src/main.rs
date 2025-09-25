@@ -86,7 +86,8 @@ fn main() {
                     // Reconstruct TcpStream from raw fd
                     // Ensure to use a glommio TcpStream
                     // We can do this because the sender has forgotten the fd keeping it open
-                    let mut tcp_stream = unsafe { glommio::net::TcpStream::from_raw_fd(msg.fd) };
+                    let tcp_stream = unsafe { glommio::net::TcpStream::from_raw_fd(msg.fd) };
+                    let mut tcp_stream = tcp_stream.buffered();
 
                     // Other shard has accepted and already read the request data.
                     // So we can process it immediately and write the response back
@@ -115,7 +116,7 @@ fn main() {
                         Ok(addr) => debug!("Shard {shard_id} accepted connection from {addr}"),
                         Err(_) => error!("Shard {shard_id} accepted connection from unknown address"),
                     }
-                    process_tcp_stream(shard_id, nbr_shards, tcp_stream, sender.clone(), stateful_engine.clone()).await;
+                    process_tcp_stream(shard_id, nbr_shards, tcp_stream.buffered(), sender.clone(), stateful_engine.clone()).await;
                 }
                 Err(e) => {
                     error!("Shard {shard_id} failed to accept connection: {e}");
@@ -140,7 +141,7 @@ fn hash_aggregate_id(aggregate_id: &u128) -> u64 {
 async fn process_tcp_stream(
     shard_id: usize, 
     nbr_shards: usize, 
-    mut tcp_stream: glommio::net::TcpStream, 
+    mut tcp_stream: glommio::net::TcpStream<glommio::net::Preallocated>, 
     sender: Rc<RefCell<Senders<Msg>>>,
     stateful_engine: Rc<RefCell<StatefulEngine>>) {
     // It's critical to spawn local here as this allows accepting of new connections
@@ -229,10 +230,11 @@ fn process_synchronously_on_shard(
 
 /// Write the response back to the TCP stream
 /// Note we can be async here as we have already completed our syncronous 'work'
-async fn write_to_tcp_stream(response: Response, tcp_stream: &mut glommio::net::TcpStream) {
+async fn write_to_tcp_stream(response: Response, tcp_stream: &mut glommio::net::TcpStream<glommio::net::Preallocated>) {
     // if let Err(e) = tcp_stream.write_all("worked!".as_bytes()).await {
     //     error!("Failed to write to TCP stream: {e}");
     // }
+    //TODO: Read and write timeouts
     if let Err(e) = write_message(tcp_stream, &response).await {
         error!("Failed to write response to TCP stream: {e}");
         // Connection will be dropped when tcp_stream goes out of scope
@@ -244,24 +246,35 @@ async fn write_to_tcp_stream(response: Response, tcp_stream: &mut glommio::net::
 /// Otherwise return the parsed u64 value
 /// Note we can be async here as we are just reading from the TCP stream and other 
 /// tasks can proceed while we wait for data
-async fn read_from_tcp_stream(shard_id: usize, tcp_stream: &mut glommio::net::TcpStream) -> Option<Request> {
-    // let mut tcp_buffer = [0u8; 1024*1024/8]; // 1/8th of 1MB buffer
-    let mut tcp_buffer = [0u8; 200];
-    let n = match tcp_stream.read(&mut tcp_buffer).await {
-        Ok(bytes_read) => bytes_read,
-        Err(e) => {
-            error!("Shard {shard_id} failed to read from TCP stream: {e}");
-            return None;
-        }
-    };
-    if n == 0 {
-        // Connection was closed
-        debug!("Shard {shard_id} connection closed by peer");
-        return None;
-    }
+async fn read_from_tcp_stream(shard_id: usize, tcp_stream: &mut glommio::net::TcpStream<glommio::net::Preallocated>) -> Option<Request> {
+    
+    //TODO: Read and write timeouts
 
-    let (message, _) = bincode::decode_from_slice(&tcp_buffer[..n], BINCODE_CONFIG_VARIABLE)
-        .map_err(|_| ProtocolError::InvalidFormat).ok()?;
+    // Read message version first (4 bytes)
+    let mut version_buffer = [0u8; 4];
+    tcp_stream.read_exact(&mut version_buffer).await.ok()?;
+    let message_version = u32::from_be_bytes(version_buffer);
+
+    // Read message length first (4 bytes)
+    let mut length_buffer = [0u8; 4];
+    tcp_stream.read_exact(&mut length_buffer).await.ok()?;
+    let message_length = u32::from_be_bytes(length_buffer) as usize;
+
+    // Use stack allocation for small messages, heap for larger ones
+    const STACK_BUFFER_SIZE: usize = 20 * 1024; // 20KB
+    
+    let message = if message_length <= STACK_BUFFER_SIZE {
+        let mut stack_buffer = [0u8; STACK_BUFFER_SIZE];
+        tcp_stream.read_exact(&mut stack_buffer[..message_length]).await.ok()?;
+        bincode::decode_from_slice(&stack_buffer[..message_length], BINCODE_CONFIG_VARIABLE)
+            .map_err(|_| ProtocolError::InvalidFormat).ok()?.0
+    } else {
+        let mut heap_buffer = vec![0u8; message_length];
+        tcp_stream.read_exact(&mut heap_buffer).await.ok()?;
+        bincode::decode_from_slice(&heap_buffer, BINCODE_CONFIG_VARIABLE)
+            .map_err(|_| ProtocolError::InvalidFormat).ok()?.0
+    };
 
     Some(message)
+
 }

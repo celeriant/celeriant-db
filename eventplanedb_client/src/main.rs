@@ -254,7 +254,21 @@ fn run_client_connection(
             expected_event_batch_index: None };
 
         //TODO: Compression on read/write
-        if let Err(e) = stream.write_all(bincode::encode_to_vec(&request, bincode::config::standard()).unwrap().as_slice()) {
+        let encoded_request = bincode::encode_to_vec(&request, bincode::config::standard()).unwrap();
+        let message_length = (encoded_request.len() as u32).to_be_bytes();
+        let message_version = (66 as u32).to_be_bytes();
+
+        if let Err(e) = stream.write_all(&message_version) {
+            eprintln!("Connection {}: Failed to send request version: {}", connection_id, e);
+            break;
+        }
+
+        if let Err(e) = stream.write_all(&message_length) {
+            eprintln!("Connection {}: Failed to send request length: {}", connection_id, e);
+            break;
+        }
+
+        if let Err(e) = stream.write_all(&encoded_request) {
             eprintln!("Connection {}: Failed to send request: {}", connection_id, e);
             break;
         }
