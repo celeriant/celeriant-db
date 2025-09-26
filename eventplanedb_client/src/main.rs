@@ -253,6 +253,8 @@ fn run_client_connection(
             events, 
             expected_event_batch_index: None };
 
+        // let request = Request::Exists { org_id: 1, aggregate_type_id: 1, aggregate_id: fib_input as u128 };
+
         //TODO: Compression on read/write
         let encoded_request = bincode::encode_to_vec(&request, bincode::config::standard()).unwrap();
         let message_length = (encoded_request.len() as u32).to_be_bytes();

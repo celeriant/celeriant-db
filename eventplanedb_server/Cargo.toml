@@ -12,7 +12,7 @@ eventplanedb_storage_stateless = { path = "../eventplanedb_storage_stateless" }
 env_logger = "0.11.8"
 fastrand = "2.3.0"
 futures-lite = "2.6.1"
-glommio = "0.9.0"
+glommio = { path = "../glommio" }
 log = "0.4.28"
 lru = "0.16.1"
 num_cpus = "1.17.0"

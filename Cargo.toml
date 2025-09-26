@@ -4,9 +4,9 @@ members = [
     "eventplanedb_storage_stateless",
     "eventplanedb_storage_stateful",
     "eventplanedb_storage_threaded",
-    "eventplanedb_glommio",
     "eventplanedb_client",
     "eventplanedb_server",
+    "glommio",
 ]
 
 resolver = "2"
@@ -37,7 +37,6 @@ ahash = "0.8.12"
 tokio = { version = "1.46.0", features = ["full"] }
 futures = "0.3.31"
 thiserror = "2.0.12"
-glommio = "0.9"
 futures-lite = "2.6.1"
 libc = "0.2.175"
 clap = { version = "4.5.47", features = ["derive"] }

@@ -1,10 +1,10 @@
 use core::fmt;
-use std::{cell::RefCell, num::NonZeroUsize, os::fd::{AsRawFd, FromRawFd}, rc::Rc, vec};
+use std::{cell::RefCell, num::NonZeroUsize, os::fd::{AsRawFd, IntoRawFd, FromRawFd}, rc::Rc, vec};
 
 use ahash::AHasher;
 use std::hash::{Hash, Hasher};
 use eventplanedb_storage_stateful::stateful_engine::{StatefulDestructive, StatefulEngine, StatefulEngineConfig, StatefulReader, StatefulWriter};
-use eventplanedb_storage_structures::constants::BINCODE_CONFIG_VARIABLE;
+use eventplanedb_storage_structures::{constants::BINCODE_CONFIG_VARIABLE, event_batch_metadata::{EventBatchMetadata, EventTypesData}};
 use glommio::{channels::channel_mesh::{Full, MeshBuilder, Senders}, enclose, net::TcpListener, spawn_local, CpuSet, LocalExecutorPoolBuilder, PoolPlacement};
 use futures_lite::AsyncReadExt;
 use futures_lite::AsyncWriteExt;
@@ -146,7 +146,7 @@ async fn process_tcp_stream(
     stateful_engine: Rc<RefCell<StatefulEngine>>) {
     // It's critical to spawn local here as this allows accepting of new connections
     // It also allows processing messages sent from other shards 
-    // Both of these can happen with spawn local while still listening to an open TCP connection
+    // Both of these can happen with spawn local while still listening to an open TCP connection    
     spawn_local(async move {
         loop {
             let request = match read_from_tcp_stream(shard_id, &mut tcp_stream).await {
@@ -163,18 +163,22 @@ async fn process_tcp_stream(
             if idx != shard_id {
                 // Leave the TCP connection from the client open
                 // This effectively transfers the connection to another shard
-                let msg = Msg { value: request, fd: tcp_stream.as_raw_fd()};
+                let fd = tcp_stream.into_raw_fd();
+                let msg = Msg { value: request, fd };
                 
                 // Try to send the message to the target shard
                 match sender.borrow().try_send_to(idx, msg) {
                     Ok(()) => {
                         // Successfully sent, forget the TCP stream so it transfers to the other shard
-                        std::mem::forget(tcp_stream);
+                        // std::mem::forget(tcp_stream);
                         break;
                     }
                     Err(_) => {
                         // Channel is full or other error occurred
                         error!("Shard {shard_id} failed to forward message to shard {idx}: channel full or unavailable. Closing connection.");
+                        
+                        // Reconstruct the stream to properly close it
+                        let mut tcp_stream = unsafe { glommio::net::TcpStream::from_raw_fd(fd) };
                         
                         // Write an error response to the client before closing
                         let error_response = "Server is overwhelmed. Please try again later.\n";
@@ -182,7 +186,7 @@ async fn process_tcp_stream(
                             error!("Failed to write error response: {e}");
                         }
                         
-                        // Close the connection by returning from the loop
+                        // The tcp_stream will be properly dropped here, closing the connection
                         return;
                     }
                 }
@@ -201,6 +205,8 @@ fn process_synchronously_on_shard(
     stateful_engine: &Rc<RefCell<StatefulEngine>>) -> Response {
 
     let mut engine = stateful_engine.borrow_mut();
+
+    // return Response::ExistsResult(Ok(true));
 
     match request {
         Request::AppendEvents { org_id, aggregate_type_id, aggregate_id, client_id, user_id, events, expected_event_batch_index } => {

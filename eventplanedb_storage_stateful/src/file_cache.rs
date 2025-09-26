@@ -77,7 +77,6 @@ impl FileCache {
 
         // Check if exists and clone the Rc in a separate scope
         if let Some(existing) = self.writers.get(file_path).cloned() {
-            self.track_handle(file_path.to_string(), false);
             return Ok(existing);
         }
 
@@ -98,7 +97,6 @@ impl FileCache {
 
         // Check if exists and clone the Rc in a separate scope
         if let Some(existing) = self.writers.get(file_path).cloned() {
-            self.track_handle(file_path.to_string(), false);
             return Ok(existing);
         }
 
@@ -117,7 +115,6 @@ impl FileCache {
 
         // Check if exists and clone the Rc in a separate scope
         if let Some(existing) = self.raw_readers.get(file_path).cloned() {
-            self.track_handle(file_path.to_string(), true);
             return Ok(existing);
         }
 
@@ -136,7 +133,6 @@ impl FileCache {
 
         // Check if exists and clone the Rc in a separate scope
         if let Some(existing) = self.readers.get(file_path).cloned() {
-            self.track_handle(file_path.to_string(), true);
             return Ok(existing);
         }
 
