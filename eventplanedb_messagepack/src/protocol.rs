@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use bincode::{Encode, Decode};
 use eventplanedb_storage_structures::{
     event_batch_metadata::EventBatchMetadata, 
     event_item::EventItem, 
@@ -8,7 +7,7 @@ use eventplanedb_storage_structures::{
 };
 
 /// Wire protocol requests
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
     AppendEvents {
         org_id: u128,
@@ -44,7 +43,7 @@ pub enum Request {
 }
 
 /// Wire protocol responses
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Response {
     AppendEventsResult(Result<EventBatchMetadata, String>),
     ReadFilteredResult(Result<ReadResult, String>),

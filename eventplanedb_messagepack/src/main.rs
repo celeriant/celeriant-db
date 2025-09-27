@@ -10,51 +10,8 @@ use eventplanedb_storage_structures::read_filters::ReadFilters;
 use eventplanedb_storage_structures::read_result::ReadResult;
 use rand::Rng;
 
-/// Wire protocol responses
-#[derive(Debug, Clone, Encode, Decode)]
-pub enum Response {
-    AppendEventsResult(Result<EventBatchMetadata, String>),
-    ReadFilteredResult(Result<ReadResult, String>),
-    ExistsResult(Result<bool, String>),
-    TrimStartResult(Result<(), String>),
-    DeleteResult(Result<(), String>),
-}
-
-/// Wire protocol requests
-#[derive(Debug, Clone, Encode, Decode)]
-pub enum Request {
-    AppendEvents {
-        org_id: u128,
-        aggregate_type_id: u128,
-        aggregate_id: u128,
-        client_id: u128,
-        user_id: Option<u128>,
-        events: Vec<EventItem>,
-        expected_event_batch_index: Option<u64>,
-    },
-    ReadFiltered {
-        org_id: u128,
-        aggregate_type_id: u128,
-        aggregate_id: u128,
-        filters: ReadFilters,
-    },
-    Exists {
-        org_id: u128,
-        aggregate_type_id: u128,
-        aggregate_id: u128,
-    },
-    TrimStart {
-        org_id: u128,
-        aggregate_type_id: u128,
-        aggregate_id: u128,
-        keep_from_event_batch_index: u64,
-    },
-    Delete {
-        org_id: u128,
-        aggregate_type_id: u128,
-        aggregate_id: u128,
-    },
-}
+mod protocol;
+use protocol::{Request, Response};
 
 struct BenchmarkStats {
     total_requests: u64,
@@ -213,7 +170,6 @@ fn run_client_connection(
     let start_time = Instant::now();
     let mut request_count = 0u64;
     let mut buffer = vec![0u8; 4096]; // Larger buffer
-    let mut version_buffer = [0u8; 4];
 
     println!("Connection {}: Connected, starting requests", connection_id);
 
@@ -257,13 +213,12 @@ fn run_client_connection(
         // let request = Request::Exists { org_id: 1, aggregate_type_id: 1, aggregate_id: fib_input as u128 };
 
         //TODO: Compression on read/write
-        
-        let encoded_request = bincode::encode_to_vec(&request, bincode::config::standard()).unwrap();
+        let encoded_request = rmp_serde::to_vec(&request).unwrap();
         
         // Combine all writes into a single buffer
         let header_size = 8; // 4 bytes version + 4 bytes length
         let mut combined_request = Vec::with_capacity(header_size + encoded_request.len());
-        combined_request.extend_from_slice(&(2u32).to_be_bytes()); // version
+        combined_request.extend_from_slice(&(1u32).to_be_bytes()); // version
         combined_request.extend_from_slice(&(encoded_request.len() as u32).to_be_bytes()); // length
         combined_request.extend_from_slice(&encoded_request); // payload
 
@@ -273,72 +228,68 @@ fn run_client_connection(
             break;
         }
         
+        
         // Read response following wire protocol: version + length + payload
         // Read version (4 bytes)
+        let mut version_buffer = [0u8; 4];
         if let Err(e) = stream.read_exact(&mut version_buffer) {
             eprintln!("Connection {}: Failed to read response version: {}", connection_id, e);
             break;
         }
         let response_version = u32::from_be_bytes(version_buffer);
         
-        if response_version != 2 {
+        if response_version != 1 {
             eprintln!("Connection {}: Unsupported response version: {}", connection_id, response_version);
             break;
         }
 
         // Read length (4 bytes)
-        if let Err(e) = stream.read_exact(&mut version_buffer) {
+        let mut length_buffer = [0u8; 4];
+        if let Err(e) = stream.read_exact(&mut length_buffer) {
             eprintln!("Connection {}: Failed to read response length: {}", connection_id, e);
             break;
         }
-        let response_length = u32::from_be_bytes(version_buffer);
+        let response_length = u32::from_be_bytes(length_buffer);
+
+        // Read payload (exact length)
+        let mut payload = vec![0u8; response_length as usize];
+        if let Err(e) = stream.read_exact(&mut payload) {
+            eprintln!("Connection {}: Failed to read response payload: {}", connection_id, e);
+            break;
+        }
+
+        let request_duration = request_start.elapsed();
         
-        // Read response
-        match stream.read(&mut buffer) {
-            Ok(bytes_read) => {
-                if bytes_read == 0 {
-                    println!("Connection {}: Server closed connection after {} requests", connection_id, request_count);
-                    break;
+        // Deserialize response from payload
+        match rmp_serde::from_slice::<Response>(&payload) {
+            Ok(response) => {
+                let output = match response {
+                    Response::AppendEventsResult(Ok(metadata)) => {
+                        format!("Success: batch_index={}, compressed_size={}", 
+                               metadata.event_batch_index, metadata.compressed_size)
+                    }
+                    Response::AppendEventsResult(Err(e)) => format!("Error: {}", e),
+                    Response::ExistsResult(Ok(exists)) => exists.to_string(),
+                    Response::ExistsResult(Err(e)) => format!("Error: {}", e),
+                    _ => "Unexpected response type".to_string(),
+                };
+                
+                // Update statistics (minimize lock time)
+                {
+                    let mut stats_guard = stats.lock().unwrap();
+                    stats_guard.add_request(request_duration);
                 }
                 
-                let request_duration = request_start.elapsed();
+                request_count += 1;
                 
-                // Deserialize response using bincode
-                match bincode::decode_from_slice::<Response, _>(&buffer[..bytes_read], bincode::config::standard()) {
-                    Ok((response, _)) => {
-                        let output = match response {
-                            Response::AppendEventsResult(Ok(metadata)) => {
-                                format!("Success: batch_index={}, compressed_size={}", 
-                                       metadata.event_batch_index, metadata.compressed_size)
-                            }
-                            Response::AppendEventsResult(Err(e)) => format!("Error: {}", e),
-                            Response::ExistsResult(Ok(exists)) => exists.to_string(),
-                            Response::ExistsResult(Err(e)) => format!("Error: {}", e),
-                            _ => "Unexpected response type".to_string(),
-                        };
-                        
-                        // Update statistics (minimize lock time)
-                        {
-                            let mut stats_guard = stats.lock().unwrap();
-                            stats_guard.add_request(request_duration);
-                        }
-                        
-                        request_count += 1;
-                        
-                        // Print occasional responses for verification
-                        if request_count % 1000 == 0 {
-                            println!("Connection {}: Request {}, Input: {}, Response: {}", 
-                                    connection_id, request_count, fib_input, output);
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Connection {}: Failed to deserialize response: {}", connection_id, e);
-                        break;
-                    }
+                // Print occasional responses for verification
+                if request_count % 1000 == 0 {
+                    println!("Connection {}: Request {}, Input: {}, Response: {}", 
+                            connection_id, request_count, fib_input, output);
                 }
             }
             Err(e) => {
-                eprintln!("Connection {}: Failed to read response: {}", connection_id, e);
+                eprintln!("Connection {}: Failed to deserialize response: {}", connection_id, e);
                 break;
             }
         }

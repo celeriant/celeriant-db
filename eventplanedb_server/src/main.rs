@@ -13,8 +13,13 @@ use log::{debug, error, info};
 mod protocol;
 use protocol::{Request, Response};
 
-use crate::protocol::{write_message, ProtocolError};
+mod wire_format;
+use wire_format::WireError;
+use wire_format::read_message;
+use wire_format::write_message;
+
 use mimalloc::MiMalloc;
+
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -22,6 +27,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 struct Msg {
     fd: i32,
     value: Request,
+    is_bincode: bool,
 }
 
 impl fmt::Display for Msg {
@@ -92,7 +98,7 @@ fn main() {
                     // Other shard has accepted and already read the request data.
                     // So we can process it immediately and write the response back
                     let response = process_synchronously_on_shard(msg.value, &stateful_engine_clone);
-                    write_to_tcp_stream(response, &mut tcp_stream).await;
+                    write_to_tcp_stream(response, &mut tcp_stream, msg.is_bincode).await;
 
                     // Continue on the tcp connection to read more data from the client
                     // Note that we might still have to forward it on to the right shard again
@@ -149,8 +155,8 @@ async fn process_tcp_stream(
     // Both of these can happen with spawn local while still listening to an open TCP connection    
     spawn_local(async move {
         loop {
-            let request = match read_from_tcp_stream(shard_id, &mut tcp_stream).await {
-                Some(num) => num,
+            let (request, is_bincode) = match read_from_tcp_stream(shard_id, &mut tcp_stream).await {
+                Some((num, is_bincode)) => (num, is_bincode),
                 None => return,
             };
 
@@ -164,7 +170,7 @@ async fn process_tcp_stream(
                 // Leave the TCP connection from the client open
                 // This effectively transfers the connection to another shard
                 let fd = tcp_stream.into_raw_fd();
-                let msg = Msg { value: request, fd };
+                let msg = Msg { value: request, fd, is_bincode };
                 
                 // Try to send the message to the target shard
                 match sender.borrow().try_send_to(idx, msg) {
@@ -192,7 +198,7 @@ async fn process_tcp_stream(
                 }
             } else {
                 let response = process_synchronously_on_shard(request, &stateful_engine);
-                write_to_tcp_stream(response, &mut tcp_stream).await;
+                write_to_tcp_stream(response, &mut tcp_stream, is_bincode).await;
             }
         }
     }).detach();
@@ -235,52 +241,24 @@ fn process_synchronously_on_shard(
 }
 
 /// Write the response back to the TCP stream
-/// Note we can be async here as we have already completed our syncronous 'work'
-async fn write_to_tcp_stream(response: Response, tcp_stream: &mut glommio::net::TcpStream<glommio::net::Preallocated>) {
-    // if let Err(e) = tcp_stream.write_all("worked!".as_bytes()).await {
-    //     error!("Failed to write to TCP stream: {e}");
-    // }
-    //TODO: Read and write timeouts
-    if let Err(e) = write_message(tcp_stream, &response).await {
+async fn write_to_tcp_stream(response: Response, tcp_stream: &mut glommio::net::TcpStream<glommio::net::Preallocated>, use_v2: bool) {
+    if let Err(e) = write_message(tcp_stream, &response, use_v2).await {
         error!("Failed to write response to TCP stream: {e}");
         // Connection will be dropped when tcp_stream goes out of scope
     }
 }
 
-/// Read all available bytes on the TCP stream, up to 1024 bytes
-/// Return None if the connection is closed or no data is read
-/// Otherwise return the parsed u64 value
-/// Note we can be async here as we are just reading from the TCP stream and other 
-/// tasks can proceed while we wait for data
-async fn read_from_tcp_stream(shard_id: usize, tcp_stream: &mut glommio::net::TcpStream<glommio::net::Preallocated>) -> Option<Request> {
-    
-    //TODO: Read and write timeouts
-
-    // Read message version first (4 bytes)
-    let mut version_buffer = [0u8; 4];
-    tcp_stream.read_exact(&mut version_buffer).await.ok()?;
-    let message_version = u32::from_be_bytes(version_buffer);
-
-    // Read message length first (4 bytes)
-    let mut length_buffer = [0u8; 4];
-    tcp_stream.read_exact(&mut length_buffer).await.ok()?;
-    let message_length = u32::from_be_bytes(length_buffer) as usize;
-
-    // Use stack allocation for small messages, heap for larger ones
-    const STACK_BUFFER_SIZE: usize = 20 * 1024; // 20KB
-    
-    let message = if message_length <= STACK_BUFFER_SIZE {
-        let mut stack_buffer = [0u8; STACK_BUFFER_SIZE];
-        tcp_stream.read_exact(&mut stack_buffer[..message_length]).await.ok()?;
-        bincode::decode_from_slice(&stack_buffer[..message_length], BINCODE_CONFIG_VARIABLE)
-            .map_err(|_| ProtocolError::InvalidFormat).ok()?.0
-    } else {
-        let mut heap_buffer = vec![0u8; message_length];
-        tcp_stream.read_exact(&mut heap_buffer).await.ok()?;
-        bincode::decode_from_slice(&heap_buffer, BINCODE_CONFIG_VARIABLE)
-            .map_err(|_| ProtocolError::InvalidFormat).ok()?.0
-    };
-
-    Some(message)
-
+/// Read a request from the TCP stream
+async fn read_from_tcp_stream(shard_id: usize, tcp_stream: &mut glommio::net::TcpStream<glommio::net::Preallocated>) -> Option<(Request, bool)> {
+    match read_message(tcp_stream).await {
+        Ok((request, is_bincode)) => Some((request, is_bincode)),
+        Err(WireError::Io(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            debug!("Shard {shard_id} client disconnected");
+            None
+        }
+        Err(e) => {
+            error!("Shard {shard_id} failed to read request: {e}");
+            None
+        }
+    }
 }

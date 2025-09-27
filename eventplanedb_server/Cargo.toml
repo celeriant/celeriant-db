@@ -20,3 +20,5 @@ bincode.workspace = true
 thiserror.workspace = true
 ahash.workspace = true
 mimalloc.workspace = true
+serde.workspace = true
+rmp-serde.workspace = true

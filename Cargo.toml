@@ -5,6 +5,7 @@ members = [
     "eventplanedb_storage_stateful",
     "eventplanedb_storage_threaded",
     "eventplanedb_client",
+    "eventplanedb_messagepack",
     "eventplanedb_server",
     "glommio",
 ]
