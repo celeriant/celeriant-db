@@ -20,6 +20,7 @@ pub struct FileCache {
     max_handles: usize,
 }
 
+//TODO: Is the file cache really necessary?  Would OS caching be sufficient?
 impl FileCache {
     pub fn new(max_handles: usize) -> Self {
         Self {

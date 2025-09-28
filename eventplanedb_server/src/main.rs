@@ -20,14 +20,14 @@ use wire_format::write_message;
 
 use mimalloc::MiMalloc;
 
-
+//TODO: Compare with default allocator in benchmarks
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
 struct Msg {
     fd: i32,
     value: Request,
-    is_bincode: bool,
+    is_bincode: bool, //TODO: Change to 'message_version' instead
 }
 
 impl fmt::Display for Msg {
@@ -41,9 +41,10 @@ fn main() {
         .filter_level(log::LevelFilter::Info) // Set default level
         .init();
     
-    info!("Hello, world! Starting sharded TCP server using Glommio...");
+    info!("Starting EventPlaneDb TCP Server...");
     
     // Take advantage of all available CPUs
+    //TODO: Server configuration via cli parameters or config file
     let nbr_shards = num_cpus::get();
     let online_cpus = CpuSet::online().ok();
     info!("Number of CPUs: {nbr_shards}, Online CPUs: {online_cpus:?}");
@@ -76,6 +77,7 @@ fn main() {
 
         // Our stateful storage engine, pinned per shard
         // Each shard has its own instance of the engine
+        //TODO: Included in server configuration
         let stateful_engine = Rc::new(RefCell::new(StatefulEngine::new(StatefulEngineConfig::default())));
 
         // There is a receiver for each other shard that we must listen to
@@ -110,6 +112,7 @@ fn main() {
 
         // Now that we have setup our listeners for other shards, we can start accepting TCP connections from clients
         // We will accept connections on port 10000 on localhost
+        //TODO: Include in server configuration
         let listener = TcpListener::bind("0.0.0.0:10000").unwrap();
         info!("Shard {shard_id} listening on {}", listener.local_addr().unwrap());
 
@@ -138,6 +141,7 @@ fn main() {
 }
 
 /// Hash function for aggregate_id to determine shard assignment
+///TODO: Compare with murmur3 as dbeel uses that
 fn hash_aggregate_id(aggregate_id: &u128) -> u64 {
     let mut hasher = AHasher::default();
     aggregate_id.hash(&mut hasher);
@@ -175,8 +179,7 @@ async fn process_tcp_stream(
                 // Try to send the message to the target shard
                 match sender.borrow().try_send_to(idx, msg) {
                     Ok(()) => {
-                        // Successfully sent, forget the TCP stream so it transfers to the other shard
-                        // std::mem::forget(tcp_stream);
+                        // Successfully sent to other shard
                         break;
                     }
                     Err(_) => {
@@ -211,8 +214,6 @@ fn process_synchronously_on_shard(
     stateful_engine: &Rc<RefCell<StatefulEngine>>) -> Response {
 
     let mut engine = stateful_engine.borrow_mut();
-
-    // return Response::ExistsResult(Ok(true));
 
     match request {
         Request::AppendEvents { org_id, aggregate_type_id, aggregate_id, client_id, user_id, events, expected_event_batch_index } => {

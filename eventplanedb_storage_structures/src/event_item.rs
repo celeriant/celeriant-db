@@ -14,7 +14,6 @@ pub struct EventItem {
     pub event_index: u64,
 
     //TODO: event UUID
-
     /// Client derived Unix timestamp in milliseconds when the event occurred
     #[serde(rename = "et")]
     pub event_timestamp: u64,
@@ -28,6 +27,7 @@ pub struct EventItem {
     pub event_type_minor: u64,
 
     /// Serialized event data payload
+    ///TODO: Does this need to be wrapped in an Arc still?
     #[serde(rename = "ev")]
     pub event_value: Arc<Vec<u8>>,
 }

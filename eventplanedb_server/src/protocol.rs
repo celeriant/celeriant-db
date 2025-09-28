@@ -1,11 +1,9 @@
-use serde::{Deserialize, Serialize};
-use bincode::{Encode, Decode};
+use bincode::{Decode, Encode};
 use eventplanedb_storage_structures::{
-    event_batch_metadata::EventBatchMetadata, 
-    event_item::EventItem, 
-    read_filters::ReadFilters, 
-    read_result::ReadResult
+    event_batch_metadata::EventBatchMetadata, event_item::EventItem, read_filters::ReadFilters,
+    read_result::ReadResult,
 };
+use serde::{Deserialize, Serialize};
 
 /// Wire protocol requests
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
@@ -58,7 +56,7 @@ impl Request {
         match self {
             Request::AppendEvents { aggregate_id, .. } => aggregate_id,
             Request::ReadFiltered { aggregate_id, .. } => aggregate_id,
-            Request::Exists { aggregate_id, ..} => aggregate_id,
+            Request::Exists { aggregate_id, .. } => aggregate_id,
             Request::TrimStart { aggregate_id, .. } => aggregate_id,
             Request::Delete { aggregate_id, .. } => aggregate_id,
         }

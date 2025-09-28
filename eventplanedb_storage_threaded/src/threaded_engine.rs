@@ -10,6 +10,8 @@ use eventplanedb_storage_structures::{
 use std::{sync::Arc, thread, time::Duration, usize};
 use tokio::sync::oneshot;
 
+//TODO: Do we still need this? Whats the use case - like sqlite with multiple threads as part of another app?
+
 /// Thread-safe, async wrapper around StatefulEngine
 ///
 /// Routes operations to specific worker threads based on aggregate_id hash,

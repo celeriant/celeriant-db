@@ -1,0 +1,4 @@
+- handle errors from server
+- glommio based client? what's the performance difference?
+- ability to spin up client instance with a config
+- compression over tcp

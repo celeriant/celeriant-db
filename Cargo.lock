@@ -414,17 +414,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "eventplanedb_messagepack"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "eventplanedb_storage_structures",
- "rand",
- "rmp-serde",
- "serde",
-]
-
-[[package]]
 name = "eventplanedb_server"
 version = "0.1.0"
 dependencies = [

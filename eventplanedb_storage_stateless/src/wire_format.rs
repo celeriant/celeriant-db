@@ -12,6 +12,7 @@ pub fn to_wire_format_variable<T>(
 where
     T: Encode,
 {
+    //TODO: There are two heap allocations here. Can we use some kind of vec pool instead?
     let serialized = bincode::encode_to_vec(item, BINCODE_CONFIG_VARIABLE)
         .map_err(|e| io::Error::other(e.to_string()))?;
     let uncompressed_size = serialized.len();

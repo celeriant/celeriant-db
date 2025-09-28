@@ -49,10 +49,10 @@ pub struct StatefulEngineConfig {
 impl Default for StatefulEngineConfig {
     fn default() -> Self {
         Self {
-            last_event_batch_cache_size: 10_000,
-            client_event_index_cache_size: 50_000,
-            recent_batches_cache_size: 16 * 1024 * 1024, // 16MB
-            max_file_handles: 100,
+            last_event_batch_cache_size: 100_000,
+            client_event_index_cache_size: 500_000,
+            recent_batches_cache_size: 1024 * 1024 * 1024, // 1GB
+            max_file_handles: 1000,
             base_path: PathBuf::from("./data"),
             compression_type: CompressionType::Zstd { level: 3 },
             stateless_engine: StatelessEngine::builder().build(),
