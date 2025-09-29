@@ -74,6 +74,10 @@ impl StatelessWriter for StatelessEngine {
         event_batch_writer.write_all(&compressed_event_batch_item)?;
         metadata_writer.write_all(&metadata_bytes)?;
 
+        //TODO: Configurable fsync or fdatasync options
+        //TODO: Test for file corruption - pull out USB stick and see if corrupt, and if we can repair
+        //TODO: Test performance impact of fsync vs fdatasync vs no sync
+        //TODO: Preallocate files (fallocate) for aggregates to avoid metadata cost during writes.
         event_batch_writer.flush()?;
         metadata_writer.flush()?;
 
