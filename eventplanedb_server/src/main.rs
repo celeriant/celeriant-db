@@ -36,6 +36,7 @@ impl fmt::Display for Msg {
     }
 }
 
+//TODO: Graceful shutdown handling with signal handling (SIGINT, SIGTERM)
 fn main() {
     env_logger::Builder::from_default_env()
         .filter_level(log::LevelFilter::Info) // Set default level
