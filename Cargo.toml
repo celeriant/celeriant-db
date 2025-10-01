@@ -6,7 +6,6 @@ members = [
     "eventplanedb_storage_threaded",
     "eventplanedb_client",
     "eventplanedb_server",
-    "glommio",
 ]
 
 resolver = "2"
@@ -47,3 +46,4 @@ num_cpus = "1.17.0"
 env_logger = "0.11.8"
 log = "0.4.28"
 mimalloc = "0.1.48"
+glommio = { git = "https://github.com/utilitydelta/glommio", branch = "tcp-into-raw-fd-support" }
