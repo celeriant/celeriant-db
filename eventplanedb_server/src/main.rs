@@ -217,9 +217,9 @@ fn process_synchronously_on_shard(
     let mut engine = stateful_engine.borrow_mut();
 
     match request {
-        Request::AppendEvents { org_id, aggregate_type_id, aggregate_id, client_id, user_id, events, expected_event_batch_index } => {
+        Request::AppendEvents { org_id, aggregate_type_id, aggregate_id, client_id, user_id, events, expected_event_batch_index, filter_duplicate_client_events } => {
             let result = engine.append_events(
-                org_id, aggregate_type_id, aggregate_id, client_id, user_id, events, expected_event_batch_index,
+                org_id, aggregate_type_id, aggregate_id, client_id, user_id, events, expected_event_batch_index, filter_duplicate_client_events
             );
             Response::AppendEventsResult(result.map_err(|e| format!("{:?}", e)))
         }

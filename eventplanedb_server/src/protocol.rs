@@ -16,6 +16,7 @@ pub enum Request {
         user_id: Option<u128>,
         events: Vec<EventItem>,
         expected_event_batch_index: Option<u64>,
+        filter_duplicate_client_events: bool,
     },
     ReadFiltered {
         org_id: u128,

@@ -466,8 +466,8 @@ mod tests {
         let mut compressed_sizes = Vec::new();
 
         for compression_type in &compression_types {
-            let mut event_batch_writer = BufWriter::new(File::create(&event_batch_path)?);
-            let mut metadata_writer = BufWriter::new(File::create(&metadata_path)?);
+            let mut event_batch_writer = File::create(&event_batch_path)?;
+            let mut metadata_writer = File::create(&metadata_path)?;
             let mut bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8)
                 .seed(&BLOOM_HASH_SEED)
                 .hashes(BLOOM_HASH_COUNT);
@@ -513,8 +513,8 @@ mod tests {
             let mut compressed_sizes = Vec::new();
 
             for level in &levels {
-                let mut event_batch_writer = BufWriter::new(File::create(&event_batch_path)?);
-                let mut metadata_writer = BufWriter::new(File::create(&metadata_path)?);
+                let mut event_batch_writer = File::create(&event_batch_path)?;
+                let mut metadata_writer = File::create(&metadata_path)?;
                 let mut bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8)
                     .seed(&BLOOM_HASH_SEED)
                     .hashes(BLOOM_HASH_COUNT);
@@ -566,8 +566,8 @@ mod tests {
         ];
 
         for compression_type in &compression_types {
-            let mut event_batch_writer = BufWriter::new(File::create(&event_batch_path)?);
-            let mut metadata_writer = BufWriter::new(File::create(&metadata_path)?);
+            let mut event_batch_writer = File::create(&event_batch_path)?;
+            let mut metadata_writer = File::create(&metadata_path)?;
             let mut bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8)
                 .seed(&BLOOM_HASH_SEED)
                 .hashes(BLOOM_HASH_COUNT);
@@ -2230,16 +2230,16 @@ mod tests {
         let metadata_trim_position = 2 * METADATA_BATCH_SIZE_BYTES as u64;
 
         // Perform trim_end
-        let mut event_batch_writer = std::io::BufWriter::new(
+        let mut event_batch_writer  =
             std::fs::OpenOptions::new()
                 .write(true)
-                .open(fixture._temp_dir.path().join("event_batches.bin"))?,
-        );
-        let mut metadata_writer = std::io::BufWriter::new(
+                .open(fixture._temp_dir.path().join("event_batches.bin"),
+        )?;
+        let mut metadata_writer = 
             std::fs::OpenOptions::new()
                 .write(true)
-                .open(fixture._temp_dir.path().join("metadata.bin"))?,
-        );
+                .open(fixture._temp_dir.path().join("metadata.bin"),
+        )?;
 
         fixture.engine.trim_end(
             &mut event_batch_writer,
@@ -2292,16 +2292,16 @@ mod tests {
         let event_batch_trim_position = metadata1.compressed_size + metadata2.compressed_size;
         let metadata_trim_position = 2 * METADATA_BATCH_SIZE_BYTES as u64;
 
-        let mut event_batch_writer = std::io::BufWriter::new(
+        let mut event_batch_writer = 
             std::fs::OpenOptions::new()
                 .write(true)
-                .open(fixture._temp_dir.path().join("event_batches.bin"))?,
-        );
-        let mut metadata_writer = std::io::BufWriter::new(
+                .open(fixture._temp_dir.path().join("event_batches.bin"),
+        )?;
+        let mut metadata_writer = 
             std::fs::OpenOptions::new()
                 .write(true)
-                .open(fixture._temp_dir.path().join("metadata.bin"))?,
-        );
+                .open(fixture._temp_dir.path().join("metadata.bin"),
+        )?;
 
         fixture.engine.trim_end(
             &mut event_batch_writer,
@@ -2340,16 +2340,16 @@ mod tests {
         fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch1)?;
 
         // Trim to position 0 (remove everything)
-        let mut event_batch_writer = std::io::BufWriter::new(
+        let mut event_batch_writer = 
             std::fs::OpenOptions::new()
                 .write(true)
-                .open(fixture._temp_dir.path().join("event_batches.bin"))?,
-        );
-        let mut metadata_writer = std::io::BufWriter::new(
+                .open(fixture._temp_dir.path().join("event_batches.bin"),
+        )?;
+        let mut metadata_writer = 
             std::fs::OpenOptions::new()
                 .write(true)
-                .open(fixture._temp_dir.path().join("metadata.bin"))?,
-        );
+                .open(fixture._temp_dir.path().join("metadata.bin"),
+        )?;
 
         fixture
             .engine
@@ -2691,9 +2691,13 @@ mod tests {
         let batch = fixture.create_simple_batch(1, events);
 
         let (mut event_batch_writer, _) = fixture.create_writers()?;
-        // Note: we're not creating the metadata file, just the event batch file
-        fixture.write_batch(&mut event_batch_writer, &mut std::io::sink(), &batch)?;
+        // Create a temporary metadata file for writing, but we'll delete it later
+        let temp_metadata_file = std::fs::File::create(fixture._temp_dir.path().join("temp_metadata.bin"))?;
+        let mut temp_metadata_writer = temp_metadata_file;
+        
+        fixture.write_batch(&mut event_batch_writer, &mut temp_metadata_writer, &batch)?;
         drop(event_batch_writer);
+        drop(temp_metadata_writer);
 
         let event_batch_path = fixture._temp_dir.path().join("event_batches.bin");
         let metadata_path = fixture._temp_dir.path().join("metadata.bin");
@@ -2747,20 +2751,29 @@ mod tests {
         drop(metadata_writer);
 
         // First, trim end to remove batch3
-        let mut event_batch_writer = std::io::BufWriter::new(
+        let mut event_batch_writer = 
             std::fs::OpenOptions::new()
                 .write(true)
-                .open(fixture._temp_dir.path().join("event_batches.bin"))?,
-        );
-        let mut metadata_writer = std::io::BufWriter::new(
+                .open(fixture._temp_dir.path().join("event_batches.bin"),
+        )?;
+        let mut metadata_writer = 
             std::fs::OpenOptions::new()
                 .write(true)
-                .open(fixture._temp_dir.path().join("metadata.bin"))?,
-        );
+                .open(fixture._temp_dir.path().join("metadata.bin"),
+        )?;
+
+        // Create temporary files to calculate compressed size
+        let temp_event_file = std::fs::File::create(fixture._temp_dir.path().join("temp_events.bin"))?;
+        let temp_metadata_file = std::fs::File::create(fixture._temp_dir.path().join("temp_metadata.bin"))?;
+        let mut temp_event_writer = temp_event_file;
+        let mut temp_metadata_writer = temp_metadata_file;
 
         let compressed_size = fixture
-            .write_batch(&mut std::io::sink(), &mut std::io::sink(), &batch2)?
+            .write_batch(&mut temp_event_writer, &mut temp_metadata_writer, &batch2)?
             .compressed_size;
+
+        drop(temp_event_writer);
+        drop(temp_metadata_writer);
 
         fixture.engine.trim_end(
             &mut event_batch_writer,

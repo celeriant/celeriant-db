@@ -12,8 +12,8 @@ struct FileHandle {
 }
 
 pub struct FileCache {
-    readers: HashMap<String, Rc<RefCell<BufReader<File>>>>,
-    writers: HashMap<String, Rc<RefCell<BufWriter<File>>>>,
+    readers: HashMap<String, Rc<RefCell<File>>>,
+    writers: HashMap<String, Rc<RefCell<File>>>,
     #[cfg(target_os = "linux")]
     raw_readers: HashMap<String, Rc<RefCell<File>>>,
     handle_queue: VecDeque<FileHandle>,
@@ -73,7 +73,7 @@ impl FileCache {
     pub fn create_overwrite_writer(
         &mut self,
         file_path: &str,
-    ) -> io::Result<Rc<RefCell<BufWriter<File>>>> {
+    ) -> io::Result<Rc<RefCell<File>>> {
         self.evict();
 
         // Check if exists and clone the Rc in a separate scope
@@ -93,7 +93,7 @@ impl FileCache {
     pub fn create_append_writer(
         &mut self,
         file_path: &str,
-    ) -> io::Result<Rc<RefCell<BufWriter<File>>>> {
+    ) -> io::Result<Rc<RefCell<File>>> {
         self.evict();
 
         // Check if exists and clone the Rc in a separate scope
@@ -156,21 +156,21 @@ impl FileCache {
     }
 }
 
-pub fn create_overwrite_writer(file_path: &str) -> io::Result<BufWriter<File>> {
+pub fn create_overwrite_writer(file_path: &str) -> io::Result<File> {
     let file = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
         .open(file_path)?;
-    Ok(BufWriter::new(file))
+    Ok(file)
 }
 
-pub fn create_append_writer(file_path: &str) -> io::Result<BufWriter<File>> {
+pub fn create_append_writer(file_path: &str) -> io::Result<File> {
     let file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(file_path)?;
-    Ok(BufWriter::new(file))
+    Ok(file)
 }
 
 pub fn create_reader(file_path: &str) -> io::Result<BufReader<File>> {

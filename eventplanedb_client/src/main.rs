@@ -34,6 +34,7 @@ pub enum Request {
         user_id: Option<u128>,
         events: Vec<EventItem>,
         expected_event_batch_index: Option<u64>,
+        filter_duplicate_client_events: bool,
     },
     ReadFiltered {
         org_id: u128,
@@ -103,7 +104,7 @@ fn main() {
 
     // Updated configuration for higher throughput
     let server_addr = "127.0.0.1:10000";
-    let num_connections = 100; // Increased concurrent connections
+    let num_connections = 50; // Increased concurrent connections
     let test_duration = Duration::from_secs(30); // Run for 30 seconds
 
     println!("Configuration:");
@@ -265,6 +266,7 @@ fn run_client_connection(
             user_id: None,
             events,
             expected_event_batch_index: None,
+            filter_duplicate_client_events: false,
         };
 
         // let request = Request::Exists { org_id: 1, aggregate_type_id: 1, aggregate_id: fib_input as u128 };

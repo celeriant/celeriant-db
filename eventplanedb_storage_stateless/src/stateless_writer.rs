@@ -6,17 +6,18 @@ use eventplanedb_storage_structures::event_item::EventItem;
 use fastbloom::BloomFilter;
 
 use std::collections::HashSet;
-use std::io;
+use std::fs::File;
+use std::io::{self, BufWriter};
 use std::io::Write;
 
 use crate::stateless_engine::StatelessEngine;
 use crate::wire_format::to_wire_format_variable;
 
 pub trait StatelessWriter {
-    fn append_event_batch<W: Write, M: Write>(
+    fn append_event_batch(
         &self,
-        event_batch_writer: &mut W,
-        metadata_writer: &mut M,
+        event_batch_writer: &mut File,
+        metadata_writer: &mut File,
         bloom_filter: &mut BloomFilter,
         event_type_dedup: &mut HashSet<u64>,
         compression_type: CompressionType,
@@ -25,10 +26,10 @@ pub trait StatelessWriter {
 }
 
 impl StatelessWriter for StatelessEngine {
-    fn append_event_batch<W: Write, M: Write>(
+    fn append_event_batch(
         &self,
-        event_batch_writer: &mut W,
-        metadata_writer: &mut M,
+        event_batch_writer: &mut File,
+        metadata_writer: &mut File,
         bloom_filter: &mut BloomFilter,
         event_type_dedup: &mut HashSet<u64>,
         compression_type: CompressionType,
@@ -74,10 +75,7 @@ impl StatelessWriter for StatelessEngine {
         event_batch_writer.write_all(&compressed_event_batch_item)?;
         metadata_writer.write_all(&metadata_bytes)?;
 
-        //TODO: Configurable fsync or fdatasync options
         //TODO: Test for file corruption - pull out USB stick and see if corrupt, and if we can repair
-        //TODO: Test performance impact of fsync vs fdatasync vs no sync
-        //TODO: Preallocate files (fallocate) for aggregates to avoid metadata cost during writes.
         event_batch_writer.flush()?;
         metadata_writer.flush()?;
 

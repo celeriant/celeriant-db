@@ -133,6 +133,7 @@ impl ThreadedEngine {
         user_id: Option<u128>,
         events: Vec<EventItem>,
         expected_event_batch_index: Option<u64>,
+        filter_duplicate_client_events: bool,
     ) -> ThreadedResult<EventBatchMetadata> {
         self.execute_command(aggregate_id, |response_tx| WorkerCommand::AppendEvents {
             org_id,
@@ -142,6 +143,7 @@ impl ThreadedEngine {
             user_id,
             events,
             expected_event_batch_index,
+            filter_duplicate_client_events,
             response_tx,
         })
         .await
@@ -311,7 +313,7 @@ mod tests {
                 let aggregate_id = (i % 100) as u128; // 100 different aggregates
                 let events = create_test_events(i, 1);
                 engine_clone
-                    .append_events(544, 655, aggregate_id, 100, None, events, None)
+                    .append_events(544, 655, aggregate_id, 100, None, events, None, true)
                     .await
             });
             handles.push(handle);
@@ -336,7 +338,7 @@ mod tests {
 
         // Test append
         let metadata = engine
-            .append_events(544, 655, aggregate_id, client_id, None, events, None)
+            .append_events(544, 655, aggregate_id, client_id, None, events, None, true)
             .await?;
         assert_eq!(metadata.event_batch_index, 0);
 
@@ -372,7 +374,7 @@ mod tests {
             let handle = tokio::spawn(async move {
                 let events = create_test_events(1, 2);
                 engine_clone
-                    .append_events(544, 655, aggregate_id, 100, None, events, None)
+                    .append_events(544, 655, aggregate_id, 100, None, events, None, true)
                     .await
             });
             handles.push(handle);
@@ -411,7 +413,7 @@ mod tests {
             let handle = tokio::spawn(async move {
                 let events = create_test_events(i * 10 + 1, 2);
                 engine_clone
-                    .append_events(544, 655, aggregate_id, 100, None, events, None)
+                    .append_events(544, 655, aggregate_id, 100, None, events, None, true)
                     .await
             });
             handles.push(handle);
@@ -467,7 +469,7 @@ mod tests {
 
         let events = create_test_events(1, 1000); // Large number of events
         let result = engine
-            .append_events(544, 655, 123, 100, None, events, None)
+            .append_events(544, 655, 123, 100, None, events, None, true)
             .await;
 
         // Should either succeed (if fast enough) or timeout
@@ -492,7 +494,7 @@ mod tests {
         for i in 0..5 {
             let events = create_test_events(i * 10 + 1, 2);
             engine
-                .append_events(544, 655, aggregate_id, 100, None, events, None)
+                .append_events(544, 655, aggregate_id, 100, None, events, None, true)
                 .await?;
         }
 
@@ -528,7 +530,7 @@ mod tests {
         // Test basic operation still works
         let events = create_test_events(1, 1);
         let result = engine
-            .append_events(544, 655, 9876, 100, None, events, None)
+            .append_events(544, 655, 9876, 100, None, events, None, true)
             .await?;
         assert_eq!(result.event_batch_index, 0);
 
@@ -548,10 +550,10 @@ mod tests {
         let events2 = vec![EventItem::new(1, 2, 1001, 43, 1, b"type43".to_vec())];
 
         engine
-            .append_events(544, 655, aggregate_id, 100, None, events1, None)
+            .append_events(544, 655, aggregate_id, 100, None, events1, None, true)
             .await?;
         engine
-            .append_events(544, 655, aggregate_id, 200, None, events2, None)
+            .append_events(544, 655, aggregate_id, 200, None, events2, None, true)
             .await?;
 
         // Test client filtering

@@ -74,8 +74,8 @@ use eventplanedb_storage_structures::read_result::ReadResult;
 
         pub fn write_batch_with_dedup(
             &mut self,
-            event_batch_writer: &mut impl Write,
-            metadata_writer: &mut impl Write,
+            event_batch_writer: &mut File,
+            metadata_writer: &mut File,
             event_type_dedup: &mut HashSet<u64>,
             batch: &EventBatchItem,
         ) -> io::Result<EventBatchMetadata> {
@@ -113,8 +113,8 @@ use eventplanedb_storage_structures::read_result::ReadResult;
 
         pub fn write_batch(
             &mut self,
-            event_batch_writer: &mut impl Write,
-            metadata_writer: &mut impl Write,
+            event_batch_writer: &mut File,
+            metadata_writer: &mut File,
             batch: &EventBatchItem,
         ) -> io::Result<EventBatchMetadata> {
             self.engine.append_event_batch(
@@ -129,8 +129,8 @@ use eventplanedb_storage_structures::read_result::ReadResult;
 
         pub fn write_batches(
             &mut self,
-            event_batch_writer: &mut impl Write,
-            metadata_writer: &mut impl Write,
+            event_batch_writer: &mut File,
+            metadata_writer: &mut File,
             batches: &[EventBatchItem],
         ) -> io::Result<Vec<EventBatchMetadata>> {
             let mut results = Vec::new();

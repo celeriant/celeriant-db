@@ -44,6 +44,7 @@ enum WorkerCommand {
         user_id: Option<u128>,
         events: Vec<EventItem>,
         expected_event_batch_index: Option<u64>,
+        filter_duplicate_client_events: bool,
         response_tx: oneshot::Sender<ThreadedResult<EventBatchMetadata>>,
     },
     ReadFiltered {
@@ -178,6 +179,7 @@ impl Worker {
                 user_id,
                 events,
                 expected_event_batch_index,
+                filter_duplicate_client_events,
                 response_tx,
             } => {
                 let result = engine.append_events(
@@ -188,6 +190,7 @@ impl Worker {
                     user_id,
                     events,
                     expected_event_batch_index,
+                    filter_duplicate_client_events,
                 );
                 let threaded_result = result.map_err(ThreadedError::from);
                 let _ = response_tx.send(threaded_result);
