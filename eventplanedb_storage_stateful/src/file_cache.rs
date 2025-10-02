@@ -70,10 +70,7 @@ impl FileCache {
         });
     }
 
-    pub fn create_overwrite_writer(
-        &mut self,
-        file_path: &str,
-    ) -> io::Result<Rc<RefCell<File>>> {
+    pub fn create_overwrite_writer(&mut self, file_path: &str) -> io::Result<Rc<RefCell<File>>> {
         self.evict();
 
         // Check if exists and clone the Rc in a separate scope
@@ -90,10 +87,7 @@ impl FileCache {
         Ok(rc_buf)
     }
 
-    pub fn create_append_writer(
-        &mut self,
-        file_path: &str,
-    ) -> io::Result<Rc<RefCell<File>>> {
+    pub fn create_append_writer(&mut self, file_path: &str) -> io::Result<Rc<RefCell<File>>> {
         self.evict();
 
         // Check if exists and clone the Rc in a separate scope
@@ -129,7 +123,7 @@ impl FileCache {
     }
 
     #[cfg(not(target_os = "linux"))]
-    pub fn create_reader(&mut self, file_path: &str) -> io::Result<Rc<RefCell<BufReader<File>>>> {
+    pub fn create_reader(&mut self, file_path: &str) -> io::Result<Rc<RefCell<File>>> {
         self.evict();
 
         // Check if exists and clone the Rc in a separate scope
@@ -173,9 +167,9 @@ pub fn create_append_writer(file_path: &str) -> io::Result<File> {
     Ok(file)
 }
 
-pub fn create_reader(file_path: &str) -> io::Result<BufReader<File>> {
+pub fn create_reader(file_path: &str) -> io::Result<File> {
     let file = OpenOptions::new().read(true).open(file_path)?;
-    Ok(BufReader::new(file))
+    Ok(file)
 }
 
 #[cfg(test)]
