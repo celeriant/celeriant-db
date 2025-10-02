@@ -1,0 +1,50 @@
+[workspace]
+members = [
+    "eventplanedb_localfirst_server",
+    "eventplanedb_crypto",
+    "eventplanedb_storage_threaded",
+    "eventplanedb_oauth",
+]
+
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+authors = ["UtilityDelta"]
+edition = "2024"
+license = "CUSTOM"
+
+[workspace.dependencies]
+eventplanedb_storage_structures = { git = "https://github.com/utilitydelta-io/eventplanedb-storage", branch = "main" }
+eventplanedb_storage_stateful = { git = "https://github.com/utilitydelta-io/eventplanedb-storage", branch = "main" }
+eventplanedb_storage_stateless = { git = "https://github.com/utilitydelta-io/eventplanedb-storage", branch = "main" }
+eventplanedb_crypto = { path = "../eventplanedb_crypto" }
+eventplanedb_thread_worker = { path = "../eventplanedb_thread_worker" }
+serde = { version = "1.0.219", features = ["derive", "rc"] }
+simd-json = "0.15.1"
+rand = "0.8.0"
+nanoid = "0.4.0"
+tempfile = "3.20.0"
+criterion = "0.6.0"
+core_affinity = "0.8.3"
+crossbeam = "0.8.4"
+ahash = "0.8.12"
+tokio = { version = "1.46.0", features = ["full"] }
+futures = "0.3.31"
+axum = "0.8.4"
+chrono = "0.4.41"
+tower-http = { version = "0.6.6", features = ["cors", "compression-br", "compression-gzip", "limit"] }
+rsa = { version = "0.9.8", features = ["sha2", "pem"] }
+sha2 = "0.10.9"
+base64 = "0.22.1"
+thiserror = "2.0.12"
+spki = "0.7"
+serde_json = "1.0.140"
+jsonwebtoken = "9.3.1"
+reqwest = { version = "0.12.22", features = ["json"] }
+mimalloc = "0.1.47"
+axum-prometheus = "0.8.0"
+tracing = "0.1.41"
+uuid = { version = "1.10.0", features = ["v4"] }
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json", "fmt"] }
+tracing-appender = "0.2.3"

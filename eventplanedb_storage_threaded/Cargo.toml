@@ -1,0 +1,20 @@
+[package]
+name = "eventplanedb_storage_threaded"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eventplanedb_storage_structures.workspace = true
+eventplanedb_storage_stateful.workspace = true
+eventplanedb_storage_stateless.workspace = true
+tokio.workspace = true
+crossbeam.workspace = true
+ahash.workspace = true
+core_affinity.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
