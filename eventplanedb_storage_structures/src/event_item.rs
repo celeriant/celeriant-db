@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::serde_arc_vec_u8_base64;
 use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
@@ -27,8 +28,8 @@ pub struct EventItem {
     pub event_type_minor: u64,
 
     /// Serialized event data payload
-    ///TODO: Does this need to be wrapped in an Arc still?
-    #[serde(rename = "ev")]
+    /// Needs to be wrapped in an ARC so we don't copy these bytes across thread boundaries
+    #[serde(with = "serde_arc_vec_u8_base64", rename = "ev")]
     pub event_value: Arc<Vec<u8>>,
 }
 
