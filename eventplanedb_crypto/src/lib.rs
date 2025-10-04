@@ -55,7 +55,9 @@ impl Crypto {
             .map_err(|_| CryptoError::KeyDecodingFailed("Invalid client ID format".to_string()))?;
 
         if bytes.len() != 16 {
-            return Err(CryptoError::KeyDecodingFailed("Invalid client ID length".to_string()));
+            return Err(CryptoError::KeyDecodingFailed(
+                "Invalid client ID length".to_string(),
+            ));
         }
 
         let mut array = [0u8; 16];
@@ -69,17 +71,22 @@ impl Crypto {
         let mut rng = rand::thread_rng();
 
         // Generate private key
-        let private_key = RsaPrivateKey::new(&mut rng, bits).map_err(|e| CryptoError::KeyGenerationFailed(e.to_string()))?;
+        let private_key = RsaPrivateKey::new(&mut rng, bits)
+            .map_err(|e| CryptoError::KeyGenerationFailed(e.to_string()))?;
 
         // Get public key from private key
         let public_key = private_key.to_public_key();
 
         // Encode private key to DER format and then base64
-        let private_key_der = private_key.to_pkcs8_der().map_err(|e| CryptoError::KeyEncodingFailed(e.to_string()))?;
+        let private_key_der = private_key
+            .to_pkcs8_der()
+            .map_err(|e| CryptoError::KeyEncodingFailed(e.to_string()))?;
         let private_key_base64 = general_purpose::STANDARD.encode(private_key_der.as_bytes());
 
         // Encode public key to DER format and then base64
-        let public_key_der = public_key.to_public_key_der().map_err(|e| CryptoError::KeyEncodingFailed(e.to_string()))?;
+        let public_key_der = public_key
+            .to_public_key_der()
+            .map_err(|e| CryptoError::KeyEncodingFailed(e.to_string()))?;
         let public_key_base64 = general_purpose::STANDARD.encode(public_key_der.as_bytes());
 
         Ok(KeyPair {
@@ -106,7 +113,8 @@ impl Crypto {
             .map_err(|e| CryptoError::KeyDecodingFailed(e.to_string()))?;
 
         // Decode the RSA private key from DER format
-        let private_key = RsaPrivateKey::from_pkcs8_der(&private_key_bytes).map_err(|e| CryptoError::KeyDecodingFailed(e.to_string()))?;
+        let private_key = RsaPrivateKey::from_pkcs8_der(&private_key_bytes)
+            .map_err(|e| CryptoError::KeyDecodingFailed(e.to_string()))?;
 
         // Create signing key
         let mut signing_key = rsa::pkcs1v15::SigningKey::<Sha256>::new(private_key);
@@ -129,7 +137,11 @@ impl Crypto {
     }
 
     /// Validate a signature and nonce with a public key, returning the client identity
-    pub fn validate_with_public_key(public_key: &str, nonce: &str, signature: &str) -> Result<u128, CryptoError> {
+    pub fn validate_with_public_key(
+        public_key: &str,
+        nonce: &str,
+        signature: &str,
+    ) -> Result<u128, CryptoError> {
         Self::validate_nonce(nonce)?;
         Self::validate_signature(public_key, nonce, signature)?;
         let client_identity = Self::generate_short_client_identity(public_key.as_bytes());
@@ -137,25 +149,37 @@ impl Crypto {
     }
 
     /// Validate a signature against a nonce using a public key
-    pub fn validate_signature(public_key: &str, nonce: &str, signature: &str) -> Result<(), CryptoError> {
+    pub fn validate_signature(
+        public_key: &str,
+        nonce: &str,
+        signature: &str,
+    ) -> Result<(), CryptoError> {
         // Decode the base64 encoded public key
-        let public_key_bytes = general_purpose::STANDARD.decode(public_key).map_err(|_| CryptoError::InvalidSignature)?;
+        let public_key_bytes = general_purpose::STANDARD
+            .decode(public_key)
+            .map_err(|_| CryptoError::InvalidSignature)?;
 
         // Decode the RSA public key from DER format
-        let rsa_public_key = RsaPublicKey::from_public_key_der(&public_key_bytes).map_err(|_| CryptoError::InvalidSignature)?;
+        let rsa_public_key = RsaPublicKey::from_public_key_der(&public_key_bytes)
+            .map_err(|_| CryptoError::InvalidSignature)?;
 
         // Create a VerifyingKey for RSASSA-PKCS1-v1_5 with SHA-256
         let verifying_key = rsa::pkcs1v15::VerifyingKey::<Sha256>::new(rsa_public_key);
 
         // Prepare data for verification
         let nonce_data = nonce.as_bytes();
-        let signature_data = general_purpose::STANDARD.decode(signature).map_err(|_| CryptoError::InvalidSignature)?;
+        let signature_data = general_purpose::STANDARD
+            .decode(signature)
+            .map_err(|_| CryptoError::InvalidSignature)?;
 
         // Create a Signature from the decoded signature bytes
-        let sig = Signature::try_from(signature_data.as_slice()).map_err(|_| CryptoError::InvalidSignature)?;
+        let sig = Signature::try_from(signature_data.as_slice())
+            .map_err(|_| CryptoError::InvalidSignature)?;
 
         // Verify the signature
-        verifying_key.verify(nonce_data, &sig).map_err(|_| CryptoError::InvalidSignature)?;
+        verifying_key
+            .verify(nonce_data, &sig)
+            .map_err(|_| CryptoError::InvalidSignature)?;
 
         Ok(())
     }
@@ -163,10 +187,15 @@ impl Crypto {
     /// Validate that a nonce is within the acceptable time window
     pub fn validate_nonce(nonce: &str) -> Result<(), CryptoError> {
         // Parse nonce as Unix timestamp in milliseconds
-        let nonce_timestamp = nonce.parse::<u64>().map_err(|_| CryptoError::InvalidNonce)?;
+        let nonce_timestamp = nonce
+            .parse::<u64>()
+            .map_err(|_| CryptoError::InvalidNonce)?;
 
         // Get current time in milliseconds
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| CryptoError::InvalidNonce)?.as_millis() as u64;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| CryptoError::InvalidNonce)?
+            .as_millis() as u64;
 
         // Allow for clock skew - e.g., 60 seconds (60,000 ms)
         const CLOCK_SKEW_TOLERANCE_MS: u64 = 60_000;
@@ -236,7 +265,9 @@ mod tests {
         let signature = Crypto::sign_nonce(&keypair.private_key_base64, &nonce).unwrap();
 
         // Validate with public key
-        let client_identity = Crypto::validate_with_public_key(&keypair.public_key_base64, &nonce, &signature).unwrap();
+        let client_identity =
+            Crypto::validate_with_public_key(&keypair.public_key_base64, &nonce, &signature)
+                .unwrap();
         assert!(client_identity > 0);
     }
 
@@ -248,20 +279,32 @@ mod tests {
 
     #[test]
     fn test_validate_nonce_expired() {
-        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
         let expired_time_ms = now_ms - (3 * 60 * 1000); // 3 minutes ago
         let nonce = expired_time_ms.to_string();
 
-        assert!(matches!(Crypto::validate_nonce(&nonce), Err(CryptoError::InvalidNonce)));
+        assert!(matches!(
+            Crypto::validate_nonce(&nonce),
+            Err(CryptoError::InvalidNonce)
+        ));
     }
 
     #[test]
     fn test_validate_nonce_future() {
-        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
         let future_time_ms = now_ms + (5 * 60 * 1000); // 5 minutes in the future
         let nonce = future_time_ms.to_string();
 
-        assert!(matches!(Crypto::validate_nonce(&nonce), Err(CryptoError::InvalidNonce)));
+        assert!(matches!(
+            Crypto::validate_nonce(&nonce),
+            Err(CryptoError::InvalidNonce)
+        ));
     }
 
     #[test]

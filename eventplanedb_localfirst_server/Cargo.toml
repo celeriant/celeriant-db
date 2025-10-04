@@ -19,6 +19,8 @@ tempfile.workspace = true
 eventplanedb_crypto = { path = "../eventplanedb_crypto" }
 eventplanedb_oauth = { path = "../eventplanedb_oauth" }
 eventplanedb_storage_threaded = { path = "../eventplanedb_storage_threaded" }
+eventplanedb_storage_structures.workspace = true
+eventplanedb_storage_stateful.workspace = true
 rand.workspace = true
 futures.workspace = true
 axum.workspace = true
@@ -40,6 +42,7 @@ tracing.workspace = true
 uuid.workspace = true
 tracing-subscriber.workspace = true
 tracing-appender.workspace = true
+base-x.workspace = true
 
 [dev-dependencies]
 rand.workspace = true

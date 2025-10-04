@@ -19,11 +19,11 @@ use tracing_subscriber::{EnvFilter, FmtSubscriber, layer::SubscriberExt, util::S
 use crate::{
     app_state::AppState,
     correlation_id::correlation_id_middleware,
-    // routes::{
-    //     delete::delete, disable_client::disable_client, disable_share::disable_share,
-    //     disable_user::disable_user, read::read_events, share::share, subscribe::subscribe_events,
-    //     write::write_events,
-    // },
+    routes::{
+        delete::delete, disable_client::disable_client, disable_share::disable_share,
+        disable_user::disable_user, read::read_events, share::share, subscribe::subscribe_events,
+        write::write_events,
+    },
 };
 
 use mimalloc::MiMalloc;
@@ -33,13 +33,135 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 mod app_state;
 mod correlation_id;
+mod error_response;
+mod event_notifier;
 mod job_context;
 mod job_error;
-// mod error_response;
-// mod internal_aggregates;
 mod json_formatter;
-// mod routes;
+mod routes;
+mod wrap_nanoid;
 
-fn main() {
-    println!("Hello, world!");
+async fn health_check() -> impl IntoResponse {
+    StatusCode::OK
+}
+
+#[tokio::main]
+async fn main() {
+    let log_level = env::var("LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
+    let log_file_path = env::var("LOG_FILE_PATH").unwrap_or_else(|_| "./logs".to_string());
+
+    let file_appender = tracing_appender::rolling::hourly(&log_file_path, "eventplanedb.log");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                format!(
+                    "{}={},tower_http=info,axum::rejection=info",
+                    env!("CARGO_CRATE_NAME"),
+                    log_level
+                )
+                .into()
+            }),
+        )
+        .with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(non_blocking),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
+    // Get base path from environment variable or use default
+    let base_path = env::var("DATA_PATH").unwrap_or_else(|_| "./data".to_string());
+    info!(path = %base_path, "Using data directory");
+
+    // Create data directory if it doesn't exist
+    std::fs::create_dir_all(&base_path).expect("Failed to create data directory");
+
+    // Create application state
+    let app_state = AppState::new(base_path);
+
+    //TODO: Rate limiting
+
+    // Create the router and metrics handler
+    let (app, metrics_app) = create_router(app_state);
+
+    // Get port from environment or use default
+    let port = env::var("PORT").unwrap_or_else(|_| "5198".to_string());
+    let addr = format!("0.0.0.0:{port}");
+
+    // Get metrics port from environment or use default
+    let metrics_port = env::var("METRICS_PORT").unwrap_or_else(|_| "9101".to_string());
+    let metrics_addr = format!("0.0.0.0:{metrics_port}");
+
+    info!(addr = %addr, "Starting EventPlaneDB server");
+    info!(metrics_addr = %metrics_addr, "Starting metrics server");
+
+    // Start both servers concurrently
+    tokio::join!(
+        async {
+            let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+            axum::serve(listener, app).await.unwrap();
+        },
+        async {
+            let metrics_listener = tokio::net::TcpListener::bind(&metrics_addr).await.unwrap();
+            axum::serve(metrics_listener, metrics_app).await.unwrap();
+        }
+    );
+}
+
+pub fn create_router(state: AppState) -> (Router, Router) {
+    let cors = CorsLayer::new()
+        .allow_origin([
+            "http://localhost:5174".parse::<HeaderValue>().unwrap(),
+            "https://colorsquare.org".parse::<HeaderValue>().unwrap(),
+        ])
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers(Any)
+        .max_age(Duration::from_secs(86400)); // 24 hours
+
+    let (prometheus_layer, metric_handle) = PrometheusMetricLayerBuilder::new()
+        .enable_response_body_size(true)
+        .with_endpoint_label_type(EndpointLabel::MatchedPath)
+        .with_default_metrics()
+        .build_pair();
+
+    let api_v1 = Router::new()
+        .route("/aggregate/{id}/read", get(read_events))
+        .route("/aggregate/{id}/subscribe", get(subscribe_events))
+        .route("/aggregate/{id}/write", post(write_events))
+        .route("/aggregate/{id}/delete", post(delete))
+        .route(
+            "/aggregate/{id}/disableshare/{share_hash}",
+            post(disable_share),
+        )
+        .route(
+            "/aggregate/{id}/disableuser/{user_hash}",
+            post(disable_user),
+        )
+        .route(
+            "/aggregate/{id}/disableclient/{client_id}",
+            post(disable_client),
+        )
+        .route("/aggregate/{id}/share", post(share))
+        .layer(prometheus_layer);
+
+    // Create a separate router just for metrics
+    let metrics_router =
+        Router::new().route("/metrics", get(|| async move { metric_handle.render() }));
+
+    //Enforce maximum upload size (512 KB)
+    let size_limit = RequestBodyLimitLayer::new(512 * 1024);
+
+    let main_router = Router::new()
+        .nest("/api/v1", api_v1)
+        .route("/health", get(health_check)) // Add health endpoint at the root level
+        .layer(size_limit) // Add the size limit middleware
+        .layer(from_fn(correlation_id_middleware))
+        .layer(CompressionLayer::new())
+        .layer(cors)
+        .with_state(state);
+
+    (main_router, metrics_router)
 }

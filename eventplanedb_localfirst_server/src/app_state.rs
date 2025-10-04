@@ -2,7 +2,7 @@ use eventplanedb_crypto::Crypto;
 use eventplanedb_storage_threaded::{ThreadedEngine, ThreadedEngineConfig};
 use std::sync::Arc;
 
-use crate::{job_context::JobContext, job_error::JobError};
+use crate::{event_notifier::EventNotifier, job_context::JobContext, job_error::JobError};
 use eventplanedb_oauth::{
     claims::Claims,
     jwks_client::JwksClient,
@@ -13,6 +13,7 @@ use eventplanedb_oauth::{
 #[derive(Clone)]
 pub struct AppState {
     pub threaded_engine: Arc<ThreadedEngine>,
+    pub event_notifier: EventNotifier,
     pub base_path: String,
     pub read_max_bytes: usize,
     pub subscribe_cooldown_period_ms: u64,
@@ -24,12 +25,13 @@ impl AppState {
     pub fn new(base_path: String) -> Self {
         let config = ThreadedEngineConfig::with_base_path(base_path.clone().into());
         let threaded_engine = ThreadedEngine::new(config).expect("Failed to create ThreadedEngine");
-
+        let event_notifier = EventNotifier::new();
         let oauth_config = OAuthConfig::from_env();
         let jwks_client = Arc::new(JwksClient::new(oauth_config.jwks_url.clone()));
 
         Self {
             threaded_engine: Arc::new(threaded_engine),
+            event_notifier,
             base_path,
             read_max_bytes: 1024 * 1024, // 1MB
             subscribe_cooldown_period_ms: 300,

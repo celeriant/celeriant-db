@@ -194,6 +194,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "base-x"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cbbc9d0964165b47557570cce6c952866c2678457aca742aafc9fb771d30270"
+
+[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -634,6 +640,7 @@ dependencies = [
  "ahash",
  "axum",
  "axum-prometheus",
+ "base-x",
  "base64",
  "chrono",
  "core_affinity",
@@ -641,6 +648,8 @@ dependencies = [
  "crossbeam",
  "eventplanedb_crypto",
  "eventplanedb_oauth",
+ "eventplanedb_storage_stateful",
+ "eventplanedb_storage_structures",
  "eventplanedb_storage_threaded",
  "futures",
  "jsonwebtoken",
@@ -679,7 +688,7 @@ dependencies = [
 [[package]]
 name = "eventplanedb_storage_stateful"
 version = "0.1.0"
-source = "git+https://github.com/utilitydelta-io/eventplanedb-storage?branch=main#355264f979d16b84688ebbb006626f58b91e21b8"
+source = "git+https://github.com/utilitydelta-io/eventplanedb-storage?branch=main#5771720bf29c171e56f0cd3a671d45621f8b80ad"
 dependencies = [
  "eventplanedb_storage_stateless",
  "eventplanedb_storage_structures",
@@ -690,7 +699,7 @@ dependencies = [
 [[package]]
 name = "eventplanedb_storage_stateless"
 version = "0.1.0"
-source = "git+https://github.com/utilitydelta-io/eventplanedb-storage?branch=main#355264f979d16b84688ebbb006626f58b91e21b8"
+source = "git+https://github.com/utilitydelta-io/eventplanedb-storage?branch=main#5771720bf29c171e56f0cd3a671d45621f8b80ad"
 dependencies = [
  "bincode",
  "brotli",
@@ -706,7 +715,7 @@ dependencies = [
 [[package]]
 name = "eventplanedb_storage_structures"
 version = "0.1.0"
-source = "git+https://github.com/utilitydelta-io/eventplanedb-storage?branch=main#355264f979d16b84688ebbb006626f58b91e21b8"
+source = "git+https://github.com/utilitydelta-io/eventplanedb-storage?branch=main#5771720bf29c171e56f0cd3a671d45621f8b80ad"
 dependencies = [
  "base64",
  "bincode",
