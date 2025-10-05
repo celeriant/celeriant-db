@@ -39,7 +39,12 @@ pub struct ReadFilters {
 }
 
 impl ReadFilters {
-    pub fn new(from_event_batch_index: u64) -> Self {
+    pub fn new(mut from_event_batch_index: u64) -> Self {
+        // We never have batch '0' as we are 1 based
+        // Still allow clients to use this as 'give me everything'
+        if from_event_batch_index == 0 {
+            from_event_batch_index = 1;
+        }
         Self {
             from_event_batch_index,
             ..Default::default()

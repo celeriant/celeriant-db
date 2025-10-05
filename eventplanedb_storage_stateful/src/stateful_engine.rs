@@ -159,10 +159,10 @@ impl StatefulEngine {
         let (_, metadata_path) = self.get_aggregate_paths(org_id, aggregate_type_id, aggregate_id);
 
         if !metadata_path.exists() {
-            // New aggregate, start with index 0
+            // New aggregate, start with index 1
             self.event_batch_index_cache
-                .set(org_id, aggregate_type_id, aggregate_id, 0);
-            return Ok(0);
+                .set(org_id, aggregate_type_id, aggregate_id, 1);
+            return Ok(1);
         }
 
         let metadata_reader = self
@@ -933,26 +933,26 @@ mod tests {
         let events2 = fixture.create_test_events(3, 2);
         let events3 = fixture.create_test_events(5, 2);
 
-        // First write should get event_batch_index 0
+        // First write should get event_batch_index 1
         let metadata1 =
             fixture
                 .engine
                 .append_events(544, 655, 123, 100, Some(200), events1, None, true)?;
-        assert_eq!(metadata1.event_batch_index, 0);
+        assert_eq!(metadata1.event_batch_index, 1);
 
-        // Second write should get event_batch_index 1
+        // Second write should get event_batch_index 2
         let metadata2 =
             fixture
                 .engine
                 .append_events(544, 655, 123, 100, Some(200), events2, None, true)?;
-        assert_eq!(metadata2.event_batch_index, 1);
+        assert_eq!(metadata2.event_batch_index, 2);
 
-        // Third write should get event_batch_index 2
+        // Third write should get event_batch_index 3
         let metadata3 =
             fixture
                 .engine
                 .append_events(544, 655, 123, 100, Some(200), events3, None, true)?;
-        assert_eq!(metadata3.event_batch_index, 2);
+        assert_eq!(metadata3.event_batch_index, 3);
 
         Ok(())
     }
@@ -975,7 +975,7 @@ mod tests {
             None,
             true,
         )?;
-        assert_eq!(metadata1.event_batch_index, 0);
+        assert_eq!(metadata1.event_batch_index, 1);
 
         // Second aggregate also gets index 0 (separate sequence)
         let metadata2 = fixture.engine.append_events(
@@ -988,7 +988,7 @@ mod tests {
             None,
             true,
         )?;
-        assert_eq!(metadata2.event_batch_index, 0);
+        assert_eq!(metadata2.event_batch_index, 1);
 
         // Second write to first aggregate gets index 1
         let events3 = fixture.create_test_events(2, 1);
@@ -996,7 +996,7 @@ mod tests {
             fixture
                 .engine
                 .append_events(544, 655, 111, 100, Some(200), events3, None, true)?;
-        assert_eq!(metadata3.event_batch_index, 1);
+        assert_eq!(metadata3.event_batch_index, 2);
 
         Ok(())
     }
@@ -1018,11 +1018,11 @@ mod tests {
 
             let metadata1 =
                 engine.append_events(544, 655, 123, 100, None, events.clone(), None, true)?;
-            assert_eq!(metadata1.event_batch_index, 0);
+            assert_eq!(metadata1.event_batch_index, 1);
 
             let events2 = vec![EventItem::new(2, 2, 1000, 42, 1, b"test".to_vec())];
             let metadata2 = engine.append_events(544, 655, 123, 100, None, events2, None, true)?;
-            assert_eq!(metadata2.event_batch_index, 1);
+            assert_eq!(metadata2.event_batch_index, 2);
         }
 
         // Second engine instance (simulating restart)
@@ -1037,7 +1037,7 @@ mod tests {
 
             // Should continue from index 2
             let metadata3 = engine.append_events(544, 655, 123, 100, None, events, None, true)?;
-            assert_eq!(metadata3.event_batch_index, 2);
+            assert_eq!(metadata3.event_batch_index, 3);
         }
 
         Ok(())
@@ -1076,7 +1076,7 @@ mod tests {
         // Read back and verify only new events were written
         let result = fixture
             .engine
-            .read_filtered(544, 655, 123, &ReadFilters::new(1))?;
+            .read_filtered(544, 655, 123, &ReadFilters::new(2))?;
         assert_eq!(result.event_batches.len(), 1);
         assert_eq!(result.event_batches[0].events.len(), 2); // Only events 4 and 5
         assert_eq!(result.event_batches[0].events[0].client_event_index, 4);
@@ -1192,9 +1192,9 @@ mod tests {
         let events2 = fixture.create_test_events(2, 1);
         let result = fixture
             .engine
-            .append_events(544, 655, 123, 100, None, events2, Some(1), true);
+            .append_events(544, 655, 123, 100, None, events2, Some(2), true);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap().event_batch_index, 1);
+        assert_eq!(result.unwrap().event_batch_index, 2);
 
         Ok(())
     }
@@ -1218,7 +1218,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Optimistic concurrency check failed"));
-        assert!(err.contains("expected batch index 5, but next is 1"));
+        assert!(err.contains("expected batch index 5, but next is 2"));
 
         Ok(())
     }
@@ -1231,9 +1231,9 @@ mod tests {
         let events = fixture.create_test_events(1, 1);
         let result = fixture
             .engine
-            .append_events(544, 655, 999, 100, None, events, Some(0), true);
+            .append_events(544, 655, 999, 100, None, events, Some(1), true);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap().event_batch_index, 0);
+        assert_eq!(result.unwrap().event_batch_index, 1);
 
         Ok(())
     }
@@ -1284,9 +1284,9 @@ mod tests {
         // Read again from cache with different starting point
         let result2 = fixture
             .engine
-            .read_filtered(544, 655, 123, &ReadFilters::new(1))?;
+            .read_filtered(544, 655, 123, &ReadFilters::new(2))?;
         assert_eq!(result2.event_batches.len(), 1);
-        assert_eq!(result2.event_batches[0].event_batch_index, 1);
+        assert_eq!(result2.event_batches[0].event_batch_index, 2);
 
         Ok(())
     }
@@ -1531,14 +1531,14 @@ mod tests {
         assert_eq!(result_before.event_batches.len(), 5);
 
         // Trim start to keep only last 2 batches
-        fixture.engine.trim_start(544, 655, 123, 3)?;
+        fixture.engine.trim_start(544, 655, 123, 5)?;
 
         // Verify only remaining batches are accessible
         let result_after = fixture
             .engine
-            .read_filtered(544, 655, 123, &ReadFilters::new(3))?;
-        assert_eq!(result_after.event_batches.len(), 2);
-        assert_eq!(result_after.event_batches[0].event_batch_index, 3);
+            .read_filtered(544, 655, 123, &ReadFilters::new(5))?;
+        assert_eq!(result_after.event_batches.len(), 1);
+        assert_eq!(result_after.event_batches[0].event_batch_index, 5);
 
         // Verify cache was cleared - trying to read from beginning should find nothing
         let result_trimmed = fixture
@@ -1775,7 +1775,7 @@ mod tests {
 
         let result = fixture.engine.read_filtered(544, 655, 123, &filters)?;
         assert_eq!(result.event_batches.len(), 1);
-        assert_eq!(result.event_batches[0].event_batch_index, 1);
+        assert_eq!(result.event_batches[0].event_batch_index, 2);
 
         Ok(())
     }
@@ -2235,10 +2235,10 @@ mod tests {
                 .engine
                 .append_events(102, 200, 300, 400, None, events.clone(), None, true)?;
 
-        // Each org should start with event_batch_index 0
-        assert_eq!(metadata1.event_batch_index, 0);
-        assert_eq!(metadata2.event_batch_index, 0);
-        assert_eq!(metadata3.event_batch_index, 0);
+        // Each org should start with event_batch_index 1
+        assert_eq!(metadata1.event_batch_index, 1);
+        assert_eq!(metadata2.event_batch_index, 1);
+        assert_eq!(metadata3.event_batch_index, 1);
 
         // Second writes should increment independently
         let events2 = fixture.create_test_events(2, 1);
@@ -2251,8 +2251,8 @@ mod tests {
                 .engine
                 .append_events(101, 200, 300, 400, None, events2.clone(), None, true)?;
 
-        assert_eq!(metadata4.event_batch_index, 1);
-        assert_eq!(metadata5.event_batch_index, 1);
+        assert_eq!(metadata4.event_batch_index, 2);
+        assert_eq!(metadata5.event_batch_index, 2);
 
         Ok(())
     }
@@ -2407,9 +2407,9 @@ mod tests {
                 .append_events(100, 202, 300, 400, None, events.clone(), None, true)?;
 
         // Each aggregate type should start with event_batch_index 0
-        assert_eq!(metadata1.event_batch_index, 0);
-        assert_eq!(metadata2.event_batch_index, 0);
-        assert_eq!(metadata3.event_batch_index, 0);
+        assert_eq!(metadata1.event_batch_index, 1);
+        assert_eq!(metadata2.event_batch_index, 1);
+        assert_eq!(metadata3.event_batch_index, 1);
 
         Ok(())
     }
@@ -2739,9 +2739,9 @@ mod tests {
                 .engine
                 .append_events(100, 200, 302, 400, None, events2.clone(), None, true)?;
 
-        assert_eq!(metadata1.event_batch_index, 1);
-        assert_eq!(metadata2.event_batch_index, 1);
-        assert_eq!(metadata3.event_batch_index, 1);
+        assert_eq!(metadata1.event_batch_index, 2);
+        assert_eq!(metadata2.event_batch_index, 2);
+        assert_eq!(metadata3.event_batch_index, 2);
 
         Ok(())
     }
@@ -2955,16 +2955,16 @@ mod tests {
         let result1 =
             fixture
                 .engine
-                .append_events(100, 200, 300, 400, None, events3, Some(1), true);
+                .append_events(100, 200, 300, 400, None, events3, Some(2), true);
         let result2 =
             fixture
                 .engine
-                .append_events(100, 200, 301, 400, None, events4, Some(1), true);
+                .append_events(100, 200, 301, 400, None, events4, Some(2), true);
 
         assert!(result1.is_ok());
         assert!(result2.is_ok());
-        assert_eq!(result1.unwrap().event_batch_index, 1);
-        assert_eq!(result2.unwrap().event_batch_index, 1);
+        assert_eq!(result1.unwrap().event_batch_index, 2);
+        assert_eq!(result2.unwrap().event_batch_index, 2);
 
         Ok(())
     }
@@ -3020,12 +3020,12 @@ mod tests {
             .append_events(544, 655, 123, 100, None, events2, None, false)?; // filter_duplicate_client_events = false
 
         // Should succeed and create a new batch
-        assert_eq!(metadata2.event_batch_index, 1);
+        assert_eq!(metadata2.event_batch_index, 2);
 
         // Read back and verify all events from both batches are present
         let result = fixture
             .engine
-            .read_filtered(544, 655, 123, &ReadFilters::new(0))?;
+            .read_filtered(544, 655, 123, &ReadFilters::new(1))?;
 
         assert_eq!(result.event_batches.len(), 2);
 
