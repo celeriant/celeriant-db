@@ -1807,9 +1807,18 @@ mod tests {
         let mut fixture = TestFixture::new()?;
 
         // Write multiple batches
-        let events = vec![fixture.create_simple_event(1)];
+        let mut events = vec![fixture.create_simple_event(1)];
+        events[0].event_index = 3;
         let batch1 = fixture.create_simple_batch(5, events.clone()); // server_id 5
+        events[0].event_index = 4;
         let batch2 = fixture.create_simple_batch(10, events.clone()); // server_id 10  
+
+        let mut events = vec![
+            fixture.create_simple_event(2),
+            fixture.create_simple_event(3),
+        ];
+        events[0].event_index = 5;
+        events[1].event_index = 6;
         let batch3 = fixture.create_simple_batch(15, events); // server_id 15
 
         let (mut event_batch_writer, mut metadata_writer) = fixture.create_writers()?;
@@ -1823,6 +1832,13 @@ mod tests {
         assert_eq!(
             last_server_id, 15,
             "Should return the most recent server ID"
+        );
+
+        let last_last_event_index = fixture.last_event_index(&mut metadata_reader)?;
+
+        assert_eq!(
+            last_last_event_index, 6,
+            "Should return the most recent last_last_event_index"
         );
 
         Ok(())
@@ -1866,6 +1882,12 @@ mod tests {
         assert!(
             error_msg.contains("too small to contain any entries"),
             "Error should indicate insufficient data"
+        );
+
+        let result = fixture.last_event_index(&mut metadata_reader);
+        assert!(
+            result.is_err(),
+            "Should return error for empty metadata file"
         );
 
         Ok(())

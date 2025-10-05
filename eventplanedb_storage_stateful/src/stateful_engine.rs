@@ -3,8 +3,6 @@ use std::{
     path::PathBuf,
 };
 
-//TODO: Setting event_index correctly
-
 use eventplanedb_storage_stateless::{
     stateless_destructive::StatelessDestructive, stateless_engine::StatelessEngine,
     stateless_reader::StatelessReader, stateless_writer::StatelessWriter,
@@ -21,6 +19,8 @@ use eventplanedb_storage_structures::{
 use fastbloom::BloomFilter;
 use std::collections::HashSet;
 
+use crate::event_index_cache::EventIndexCache;
+
 use super::{
     client_event_index_cache::ClientEventIndexCache, event_batch_index_cache::EventBatchIndexCache,
     file_cache::FileCache, memory_cache::LruMemoryCache,
@@ -29,9 +29,10 @@ use super::{
 #[derive(Debug, Clone)]
 pub struct StatefulEngineConfig {
     // Cache configurations
-    pub last_event_batch_cache_size: usize, // default: 10,000
-    pub client_event_index_cache_size: usize, // default: 50,000
-    pub recent_batches_cache_size: u64,     // default: 16MB
+    pub event_index_cache_size: usize,
+    pub last_event_batch_cache_size: usize,
+    pub client_event_index_cache_size: usize,
+    pub recent_batches_cache_size: u64,
 
     // Handle management
     pub max_file_handles: usize, // default: 100
@@ -47,6 +48,7 @@ pub struct StatefulEngineConfig {
 impl Default for StatefulEngineConfig {
     fn default() -> Self {
         Self {
+            event_index_cache_size: 500_000,
             last_event_batch_cache_size: 100_000,
             client_event_index_cache_size: 500_000,
             recent_batches_cache_size: 1024 * 1024 * 1024, // 1GB
@@ -62,6 +64,7 @@ pub struct StatefulEngine {
     config: StatefulEngineConfig,
 
     // Caches
+    event_index_cache: EventIndexCache,
     event_batch_index_cache: EventBatchIndexCache,
     client_event_index_cache: ClientEventIndexCache,
     memory_cache: LruMemoryCache,
@@ -76,6 +79,7 @@ pub struct StatefulEngine {
 
 impl StatefulEngine {
     pub fn new(config: StatefulEngineConfig) -> Self {
+        let event_index_cache = EventIndexCache::new(config.event_index_cache_size);
         let event_batch_index_cache = EventBatchIndexCache::new(config.last_event_batch_cache_size);
         let client_event_index_cache =
             ClientEventIndexCache::new(config.client_event_index_cache_size);
@@ -88,6 +92,7 @@ impl StatefulEngine {
 
         Self {
             config,
+            event_index_cache,
             event_batch_index_cache,
             client_event_index_cache,
             memory_cache,
@@ -301,6 +306,92 @@ impl StatefulEngine {
         Ok(())
     }
 
+    fn get_next_event_indices(
+        &mut self,
+        org_id: u128,
+        aggregate_type_id: u128,
+        aggregate_id: u128,
+        count: usize,
+    ) -> io::Result<u64> {
+        // Check cache first
+        if let Some(cached_index) =
+            self.event_index_cache
+                .get(org_id, aggregate_type_id, aggregate_id)
+        {
+            return Ok(cached_index + 1);
+        }
+
+        // Cache miss - read from disk
+        let (_, metadata_path) = self.get_aggregate_paths(org_id, aggregate_type_id, aggregate_id);
+
+        if !metadata_path.exists() {
+            // New aggregate, start with index 1
+            self.event_index_cache
+                .set(org_id, aggregate_type_id, aggregate_id, count as u64);
+            return Ok(1);
+        }
+
+        let metadata_reader = self
+            .file_cache
+            .create_reader(metadata_path.to_str().unwrap())?;
+
+        // Attempt to recover from corruption if detected
+        let last_index = match self.config.stateless_engine.last_event_index(
+            #[cfg(target_os = "linux")]
+            &mut *metadata_reader.borrow_mut(),
+            #[cfg(not(target_os = "linux"))]
+            &mut *metadata_reader.borrow_mut(),
+        ) {
+            Ok(index) => index,
+            Err(_) => {
+                // Try to recover from corruption
+                self.recover_from_corruption(org_id, aggregate_type_id, aggregate_id)?;
+
+                // Retry after recovery
+                let metadata_reader = self
+                    .file_cache
+                    .create_reader(metadata_path.to_str().unwrap())?;
+                self.config.stateless_engine.last_event_index(
+                    #[cfg(target_os = "linux")]
+                    &mut *metadata_reader.borrow_mut(),
+                    #[cfg(not(target_os = "linux"))]
+                    &mut *metadata_reader.borrow_mut(),
+                )?
+            }
+        };
+
+        // Cache the result (after assigning to all events in this batch)
+        self.event_index_cache.set(
+            org_id,
+            aggregate_type_id,
+            aggregate_id,
+            last_index + count as u64,
+        );
+        Ok(last_index + 1)
+    }
+
+    fn assign_event_indices(
+        &mut self,
+        org_id: u128,
+        aggregate_type_id: u128,
+        aggregate_id: u128,
+        events: &mut [EventItem],
+    ) -> io::Result<Option<u64>> {
+        if events.is_empty() {
+            return Ok(None);
+        }
+
+        let start_index =
+            self.get_next_event_indices(org_id, aggregate_type_id, aggregate_id, events.len())?;
+
+        // Assign sequential event indices to all events
+        for (i, event) in events.iter_mut().enumerate() {
+            event.event_index = start_index + i as u64;
+        }
+
+        Ok(Some(events[events.len() - 1].event_index))
+    }
+
     fn clear_aggregate_caches(
         &mut self,
         org_id: u128,
@@ -308,6 +399,8 @@ impl StatefulEngine {
         aggregate_id: u128,
     ) {
         self.event_batch_index_cache
+            .remove(org_id, aggregate_type_id, aggregate_id);
+        self.event_index_cache
             .remove(org_id, aggregate_type_id, aggregate_id);
         self.memory_cache
             .clear_aggregate(org_id, aggregate_type_id, aggregate_id);
@@ -588,6 +681,11 @@ impl StatefulWriter for StatefulEngine {
             ));
         }
 
+        // Assign server-side event indices
+        let final_event_index = self
+            .assign_event_indices(org_id, aggregate_type_id, aggregate_id, &mut events)?
+            .unwrap();
+
         // Create event batch
         let server_timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -643,6 +741,8 @@ impl StatefulWriter for StatefulEngine {
             event_batch,
             metadata.clone(),
         );
+        self.event_index_cache
+            .set(org_id, aggregate_type_id, aggregate_id, final_event_index);
 
         Ok(metadata)
     }
@@ -1924,6 +2024,7 @@ mod tests {
         let mut fixture = StatefulTestFixture::new()?;
 
         // Write events with different event indices
+        // We set 10, 20, 30 here but they are overwritten by the server logic. This is intentional!
         let events = vec![
             EventItem::new(1, 10, 1000, 42, 1, b"event1".to_vec()),
             EventItem::new(2, 20, 1001, 42, 1, b"event2".to_vec()),
@@ -1935,13 +2036,32 @@ mod tests {
 
         // Filter by event index range
         let mut filters = ReadFilters::new(0);
-        filters.min_event_index = Some(15);
-        filters.max_event_index = Some(25);
+        filters.min_event_index = Some(2);
+        filters.max_event_index = Some(2);
 
         let result = fixture.engine.read_filtered(544, 655, 123, &filters)?;
         assert_eq!(result.event_batches.len(), 1);
-        assert_eq!(result.event_batches[0].events.len(), 1); // Only event with index 20
-        assert_eq!(result.event_batches[0].events[0].event_index, 20);
+        assert_eq!(result.event_batches[0].events.len(), 1); // Only event with index 2
+        assert_eq!(result.event_batches[0].events[0].event_index, 2);
+
+        // Filter by event index range
+        let mut filters = ReadFilters::new(0);
+        filters.min_event_index = Some(2);
+        filters.max_event_index = Some(3);
+
+        let result = fixture.engine.read_filtered(544, 655, 123, &filters)?;
+        assert_eq!(result.event_batches.len(), 1);
+        assert_eq!(result.event_batches[0].events.len(), 2); // Only event with index 2 and 3
+        assert_eq!(result.event_batches[0].events[0].event_index, 2);
+        assert_eq!(result.event_batches[0].events[1].event_index, 3);
+
+        // Filter by event index range
+        let mut filters = ReadFilters::new(2);
+        filters.min_event_index = Some(2);
+        filters.max_event_index = Some(3);
+
+        let result = fixture.engine.read_filtered(544, 655, 123, &filters)?;
+        assert_eq!(result.event_batches.len(), 0); //From batch index excludes the first batch
 
         Ok(())
     }
@@ -3051,6 +3171,100 @@ mod tests {
             result.event_batches[1].events[1].event_value,
             std::sync::Arc::new(b"event2_second".to_vec())
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_event_index_assignment_with_and_without_cache() -> io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let base_path = temp_dir.path().to_path_buf();
+
+        // First engine instance - will build up cache
+        {
+            let config = StatefulEngineConfig {
+                base_path: base_path.clone(),
+                ..Default::default()
+            };
+            let mut engine = StatefulEngine::new(config);
+
+            // First write - should get event indices 1, 2
+            let events1 = vec![
+                EventItem::new(1, 0, 1000, 42, 1, b"event1".to_vec()),
+                EventItem::new(2, 0, 1001, 43, 1, b"event2".to_vec()),
+            ];
+            let metadata1 = engine.append_events(100, 200, 300, 400, None, events1, None, true)?;
+            assert_eq!(metadata1.event_batch_index, 1);
+            assert_eq!(metadata1.min_event_index, 1);
+            assert_eq!(metadata1.max_event_index, 2);
+
+            // Second write - should use cache and get event indices 3, 4, 5
+            let events2 = vec![
+                EventItem::new(3, 0, 1002, 44, 1, b"event3".to_vec()),
+                EventItem::new(4, 0, 1003, 45, 1, b"event4".to_vec()),
+                EventItem::new(5, 0, 1004, 46, 1, b"event5".to_vec()),
+            ];
+            let metadata2 = engine.append_events(100, 200, 300, 400, None, events2, None, true)?;
+            assert_eq!(metadata2.event_batch_index, 2);
+            assert_eq!(metadata2.min_event_index, 3);
+            assert_eq!(metadata2.max_event_index, 5);
+
+            // Verify the second batch has correct event indices by reading back
+            let result = engine.read_filtered(100, 200, 300, &ReadFilters::new(2))?;
+            assert_eq!(result.event_batches.len(), 1);
+            assert_eq!(result.event_batches[0].events.len(), 3);
+            assert_eq!(result.event_batches[0].events[0].event_index, 3);
+            assert_eq!(result.event_batches[0].events[1].event_index, 4);
+            assert_eq!(result.event_batches[0].events[2].event_index, 5);
+        }
+
+        // Second engine instance - cache is cleared, must read from disk
+        {
+            let config = StatefulEngineConfig {
+                base_path: base_path.clone(),
+                ..Default::default()
+            };
+            let mut engine = StatefulEngine::new(config);
+
+            // Third write - should read last index from disk and continue with 6, 7
+            let events3 = vec![
+                EventItem::new(6, 0, 1005, 47, 1, b"event6".to_vec()),
+                EventItem::new(7, 0, 1006, 48, 1, b"event7".to_vec()),
+            ];
+            let metadata3 = engine.append_events(100, 200, 300, 400, None, events3, None, true)?;
+            assert_eq!(metadata3.event_batch_index, 3);
+            assert_eq!(metadata3.min_event_index, 6);
+            assert_eq!(metadata3.max_event_index, 7);
+
+            // Read back ALL events to verify complete sequence
+            let result = engine.read_filtered(100, 200, 300, &ReadFilters::new(1))?;
+            assert_eq!(result.event_batches.len(), 3);
+
+            // Verify first batch: event indices 1, 2
+            assert_eq!(result.event_batches[0].events.len(), 2);
+            assert_eq!(result.event_batches[0].events[0].event_index, 1);
+            assert_eq!(result.event_batches[0].events[1].event_index, 2);
+
+            // Verify second batch: event indices 3, 4, 5
+            assert_eq!(result.event_batches[1].events.len(), 3);
+            assert_eq!(result.event_batches[1].events[0].event_index, 3);
+            assert_eq!(result.event_batches[1].events[1].event_index, 4);
+            assert_eq!(result.event_batches[1].events[2].event_index, 5);
+
+            // Verify third batch: event indices 6, 7
+            assert_eq!(result.event_batches[2].events.len(), 2);
+            assert_eq!(result.event_batches[2].events[0].event_index, 6);
+            assert_eq!(result.event_batches[2].events[1].event_index, 7);
+
+            // Verify event indices are sequential across all batches
+            let all_indices: Vec<u64> = result
+                .event_batches
+                .iter()
+                .flat_map(|batch| batch.events.iter())
+                .map(|event| event.event_index)
+                .collect();
+            assert_eq!(all_indices, vec![1, 2, 3, 4, 5, 6, 7]);
+        }
 
         Ok(())
     }

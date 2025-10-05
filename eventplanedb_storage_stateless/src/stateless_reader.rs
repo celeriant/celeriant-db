@@ -1,12 +1,10 @@
 use fastbloom::BloomFilter;
 
+#[cfg(target_os = "linux")]
+use io_uring::{IoUring, opcode, types};
 use std::io::{self, Read, Seek, SeekFrom};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
-#[cfg(target_os = "linux")]
-use io_uring::{
-    IoUring, opcode, types
-};
 
 use eventplanedb_storage_structures::compression_type::CompressionType;
 use eventplanedb_storage_structures::constants::{
@@ -80,6 +78,15 @@ pub trait StatelessReader {
     /// # Returns
     /// * Server id (u64) for the last event batch save
     fn last_event_batch_index<R: Read + Seek>(&self, metadata_reader: &mut R) -> io::Result<u64>;
+
+    /// Get the most recent event index used when storing events.
+    ///
+    /// # Arguments
+    /// * `metadata_reader` - Any readable and seekable source (File, Cursor<Vec<u8>>, etc.)
+    ///
+    /// # Returns
+    /// * Event index (u64) for the last event stored
+    fn last_event_index<R: Read + Seek>(&self, metadata_reader: &mut R) -> io::Result<u64>;
 
     /// For a provided client, get the most recent local id they used when storing events.
     ///
@@ -315,6 +322,38 @@ impl StatelessReader for StatelessEngine {
                 .0;
 
         Ok(metadata.event_batch_index)
+    }
+
+    fn last_event_index<R: Read + Seek>(&self, metadata_reader: &mut R) -> io::Result<u64> {
+        // Get file length to find the last metadata entry
+        let file_len = metadata_reader.seek(SeekFrom::End(0))?;
+
+        // Check if file has at least one metadata entry
+        if file_len < METADATA_BATCH_SIZE_BYTES as u64 {
+            return Err(io::Error::other(
+                "Metadata file is too small to contain any entries",
+            ));
+        }
+
+        // Seek to the start of the last metadata entry
+        let last_entry_offset = file_len - METADATA_BATCH_SIZE_BYTES as u64;
+        metadata_reader.seek(SeekFrom::Start(last_entry_offset))?;
+
+        // Read the last metadata entry
+        let mut buffer = [0u8; METADATA_BATCH_SIZE_BYTES];
+        let bytes_read = metadata_reader.read(&mut buffer)?;
+
+        if bytes_read < METADATA_BATCH_SIZE_BYTES {
+            return Err(io::Error::other("Failed to read complete metadata entry"));
+        }
+
+        // Deserialize the metadata
+        let metadata: EventBatchMetadata =
+            bincode::decode_from_slice(&buffer, BINCODE_CONFIG_FIXED)
+                .map_err(|e| io::Error::other(e.to_string()))?
+                .0;
+
+        Ok(metadata.max_event_index)
     }
 
     fn last_local_index<R: Read + Seek>(&self, metadata_reader: &mut R) -> io::Result<u64> {
@@ -670,7 +709,6 @@ fn read_metadata_entries_with_uring<R: Read + Seek + AsRawFd>(
     filters: &ReadFilters,
     io_uring_queue_depth: u32,
 ) -> io::Result<Vec<MetadataBatchInfo>> {
-
     let mut ring = IoUring::new(io_uring_queue_depth)?;
     let fd = types::Fd(metadata_reader.as_raw_fd());
 
@@ -691,7 +729,6 @@ fn read_metadata_entries_with_uring<R: Read + Seek + AsRawFd>(
         // Submit read operations for this chunk
         let mut submission_count = 0;
         for (i, buffer) in buffer_pool.iter_mut().enumerate() {
-            
             let global_index = chunk_start + i;
             let offset = start_offset + (global_index as u64 * METADATA_BATCH_SIZE_BYTES as u64);
             let read_op = opcode::Read::new(fd, buffer.as_mut_ptr(), buffer.len() as u32)

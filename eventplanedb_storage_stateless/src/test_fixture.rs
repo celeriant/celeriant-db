@@ -169,6 +169,10 @@ pub mod tests {
                 .detect_corruption(event_batch_reader, metadata_reader)
         }
 
+        pub fn last_event_index<R: Read + Seek>(&self, metadata_reader: &mut R) -> io::Result<u64> {
+            self.engine.last_event_index(metadata_reader)
+        }
+
         pub fn last_event_batch_index<R: Read + Seek>(
             &self,
             metadata_reader: &mut R,
