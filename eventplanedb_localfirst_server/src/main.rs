@@ -128,23 +128,26 @@ pub fn create_router(state: AppState) -> (Router, Router) {
         .build_pair();
 
     let api_v1 = Router::new()
-        .route("/aggregate/{id}/read", get(read_events))
-        .route("/aggregate/{id}/subscribe", get(subscribe_events))
-        .route("/aggregate/{id}/write", post(write_events))
-        .route("/aggregate/{id}/delete", post(delete))
+        .route("/{aggregate_type}/{aggregate_id}/read", get(read_events))
         .route(
-            "/aggregate/{id}/disableshare/{share_hash}",
+            "/{aggregate_type}/{aggregate_id}/subscribe",
+            get(subscribe_events),
+        )
+        .route("/{aggregate_type}/{aggregate_id}/write", post(write_events))
+        .route("/{aggregate_type}/{aggregate_id}/delete", post(delete))
+        .route(
+            "/{aggregate_type}/{aggregate_id}/disableshare/{share_hash}",
             post(disable_share),
         )
         .route(
-            "/aggregate/{id}/disableuser/{user_hash}",
+            "/{aggregate_type}/{aggregate_id}/disableuser/{user_hash}",
             post(disable_user),
         )
         .route(
-            "/aggregate/{id}/disableclient/{client_id}",
+            "/{aggregate_type}/{aggregate_id}/disableclient/{client_hash}",
             post(disable_client),
         )
-        .route("/aggregate/{id}/share", post(share))
+        .route("/{aggregate_type}/{aggregate_id}/share", post(share))
         .layer(prometheus_layer);
 
     // Create a separate router just for metrics

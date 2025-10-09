@@ -20,14 +20,16 @@ pub struct DisableShareResponse {
     )
 )]
 pub async fn disable_share(
-    Path((aggregate_id, for_share_id)): Path<(String, String)>,
+    Path((aggregate_type_id, aggregate_id, for_share_id)): Path<(String, String, String)>,
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: HeaderMap,
 ) -> Result<CompactJson<DisableShareResponse>, RouteError> {
+    let aggregate_type_id = wrap_nanoid::nanoid_to_u128(&aggregate_type_id)
+        .map_err(|e| RouteError::BadRequest(format!("Invalid aggregate type ID: {e}")))?;
     let aggregate_id = wrap_nanoid::nanoid_to_u128(&aggregate_id)
         .map_err(|e| RouteError::BadRequest(format!("Invalid aggregate ID: {e}")))?;
     // Establish the request context from headers and aggregate ID
-    let context = state.create_job_context(aggregate_id, &headers).await?;
+    let context = state.create_job_context(aggregate_type_id, aggregate_id, &headers).await?;
     record_span_fields(&context);
 
     // Send the job context and additional parameters to the worker for processing

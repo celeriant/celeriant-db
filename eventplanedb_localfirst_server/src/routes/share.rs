@@ -27,16 +27,18 @@ pub struct ShareResponse {
     )
 )]
 pub async fn share(
-    Path(aggregate_id): Path<String>,
+    Path((aggregate_type_id, aggregate_id)): Path<(String, String)>,
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: HeaderMap,
     Json(share_body): Json<ShareQuery>,
 ) -> Result<CompactJson<ShareResponse>, RouteError> {
 
     // Establish the request context from headers and aggregate ID
+    let aggregate_type_id = wrap_nanoid::nanoid_to_u128(&aggregate_type_id)
+        .map_err(|e| RouteError::BadRequest(format!("Invalid aggregate type ID: {e}")))?;
     let aggregate_id = wrap_nanoid::nanoid_to_u128(&aggregate_id)
         .map_err(|e| RouteError::BadRequest(format!("Invalid aggregate ID: {e}")))?;
-    let context = state.create_job_context(aggregate_id, &headers).await?;
+    let context = state.create_job_context(aggregate_type_id, aggregate_id, &headers).await?;
     record_span_fields(&context);
 
     // Send the job context and additional parameters to the worker for processing

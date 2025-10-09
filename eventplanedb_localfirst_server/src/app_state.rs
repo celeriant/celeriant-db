@@ -42,6 +42,7 @@ impl AppState {
 
     pub async fn create_job_context(
         &self,
+        aggregate_type_id: u128,
         aggregate_id: u128,
         headers: &axum::http::HeaderMap,
     ) -> Result<JobContext, JobError> {
@@ -60,7 +61,7 @@ impl AppState {
 
         let context = JobContext {
             org_id,
-            aggregate_type_id: 1,
+            aggregate_type_id,
             aggregate_id,
             client_id: self.get_client_id(headers)?,
             user_id,
