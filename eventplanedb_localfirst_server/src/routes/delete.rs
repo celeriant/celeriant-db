@@ -1,4 +1,4 @@
-use crate::{app_state::AppState, error_response::RouteError, json_formatter::CompactJson, routes::utils::record_span_fields, wrap_nanoid};
+use crate::{app_state::{AppState, OWNER_ACCESS_LEVEL}, error_response::RouteError, json_formatter::CompactJson, routes::utils::record_span_fields, wrap_nanoid};
 use axum::{extract::Path, http::HeaderMap};
 use eventplanedb_crypto::Crypto;
 use eventplanedb_storage_stateful::aggregate_key::AggregateKey;
@@ -38,7 +38,10 @@ pub async fn delete(
     info!("Processing delete request");
     let server_time = context.server_time;
 
-    //TODO: Delete the aggregate if the requester has access to do so
+    state.check_access(&context, OWNER_ACCESS_LEVEL, None).await?;
+
+    //TODO: Implement in metadata state
+    
     state.threaded_engine.delete(context.org_id, context.aggregate_type_id, aggregate_id).await?;
 
     let aggregate_key = AggregateKey::new(context.org_id, context.aggregate_type_id, aggregate_id);

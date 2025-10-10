@@ -1,4 +1,4 @@
-use crate::{app_state::AppState, error_response::RouteError, json_formatter::CompactJson, routes::utils::record_span_fields, wrap_nanoid};
+use crate::{app_state::{AppState, READ_ACCESS_LEVEL}, error_response::RouteError, job_error::JobError, json_formatter::CompactJson, routes::utils::record_span_fields, wrap_nanoid};
 use axum::{
     extract::{Path, Query},
     http::{HeaderMap},
@@ -6,7 +6,7 @@ use axum::{
 use eventplanedb_crypto::Crypto;
 use eventplanedb_storage_structures::{event_batch_item::EventBatchItem, read_filters::ReadFilters};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, instrument};
+use tracing::{debug, error, instrument, warn};
 
 #[derive(Debug, Deserialize)]
 pub struct ReadQuery {
@@ -59,11 +59,13 @@ pub async fn read_events(
         Some(s) => Some(Crypto::decode_base64_u128_from_path(s.as_ref())?),
         None => None,
     };
+
+    state.check_access(&context, READ_ACCESS_LEVEL, share_id).await?;
+    
     let mut filters = ReadFilters::new(from_server_id);
     if !include_own_events {
         filters = filters.exclude_client_id(context.client_id);
     }
-    //TODO: Permissions checking
     let result = state.threaded_engine.read_filtered(
         context.org_id,
         context.aggregate_type_id,

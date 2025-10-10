@@ -27,6 +27,12 @@ impl From<JobError> for RouteError {
     }
 }
 
+impl From<eventplanedb_metadata::MetadataError> for RouteError {
+    fn from(e: eventplanedb_metadata::MetadataError) -> Self {
+        RouteError::Other(format!("Metadata error: {}", e))
+    }
+}
+
 impl From<eventplanedb_storage_threaded::ThreadedError> for RouteError {
     fn from(e: eventplanedb_storage_threaded::ThreadedError) -> Self {
         RouteError::Other(format!("Storage error: {}", e))

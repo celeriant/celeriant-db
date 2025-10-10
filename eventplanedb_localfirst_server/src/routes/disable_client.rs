@@ -1,4 +1,4 @@
-use crate::{app_state::AppState, error_response::RouteError, json_formatter::CompactJson, routes::utils::record_span_fields, wrap_nanoid};
+use crate::{app_state::{AppState, OWNER_ACCESS_LEVEL}, error_response::RouteError, json_formatter::CompactJson, routes::utils::record_span_fields, wrap_nanoid};
 use axum::{extract::Path, http::HeaderMap};
 use eventplanedb_crypto::Crypto;
 use serde::{Deserialize, Serialize};
@@ -36,7 +36,9 @@ pub async fn disable_client(
     let for_client_id = Crypto::decode_base64_u128_from_path(&for_client_id)?;
     info!(for_client_id = for_client_id, "Processing disable_client request");
     
-    //TODO: Disable the client if the requester has access to do so
+    state.check_access(&context, OWNER_ACCESS_LEVEL, None).await?;
+
+    //TODO: Implement in metadata state
 
     // Log completion and return the response to the client
     info!(

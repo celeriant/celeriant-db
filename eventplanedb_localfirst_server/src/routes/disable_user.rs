@@ -1,4 +1,4 @@
-use crate::{app_state::AppState, error_response::RouteError, json_formatter::CompactJson, routes::utils::record_span_fields, wrap_nanoid};
+use crate::{app_state::{AppState, OWNER_ACCESS_LEVEL}, error_response::RouteError, json_formatter::CompactJson, routes::utils::record_span_fields, wrap_nanoid};
 use axum::{extract::Path, http::HeaderMap};
 use serde::{Deserialize, Serialize};
 use tracing::{info, instrument};
@@ -34,7 +34,9 @@ pub async fn disable_user(
     // Send the job context and additional parameters to the worker for processing
     info!(for_user_id = &for_user_id, "Processing disable_user request");
     
-    //TODO: Disable the user if the requester has access to do so
+    state.check_access(&context, OWNER_ACCESS_LEVEL, None).await?;
+
+    //TODO: Implement in metadata state
 
     // Log completion and return the response to the client
     info!(

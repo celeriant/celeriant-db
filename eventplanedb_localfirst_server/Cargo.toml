@@ -19,6 +19,7 @@ tempfile.workspace = true
 eventplanedb_crypto = { path = "../eventplanedb_crypto" }
 eventplanedb_oauth = { path = "../eventplanedb_oauth" }
 eventplanedb_storage_threaded = { path = "../eventplanedb_storage_threaded" }
+eventplanedb_metadata = { path = "../eventplanedb_metadata" }
 eventplanedb_storage_structures.workspace = true
 eventplanedb_storage_stateful.workspace = true
 rand.workspace = true

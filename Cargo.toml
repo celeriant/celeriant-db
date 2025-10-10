@@ -4,6 +4,7 @@ members = [
     "eventplanedb_crypto",
     "eventplanedb_storage_threaded",
     "eventplanedb_oauth",
+    "eventplanedb_metadata",
 ]
 
 resolver = "2"
@@ -49,3 +50,4 @@ uuid = { version = "1.10.0", features = ["v4"] }
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json", "fmt"] }
 tracing-appender = "0.2.3"
 base-x = "0.2.11"
+turso = "0.2.2"

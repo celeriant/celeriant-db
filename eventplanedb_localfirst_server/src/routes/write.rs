@@ -1,4 +1,4 @@
-use crate::{app_state::AppState, error_response::RouteError, job_error::JobError, json_formatter::CompactJson, routes::utils::record_span_fields, wrap_nanoid};
+use crate::{app_state::{AppState, CONTRIBUTOR_ACCESS_LEVEL}, error_response::RouteError, job_error::JobError, json_formatter::CompactJson, routes::utils::record_span_fields, wrap_nanoid};
 use eventplanedb_crypto::Crypto;
 use eventplanedb_storage_stateful::aggregate_key::AggregateKey;
 use tower_http::follow_redirect::policy::PolicyExt;
@@ -59,7 +59,22 @@ pub async fn write_events(
     debug!("Processing write request with {} events", events.len());
     let create_if_not_exist = params.create_if_not_exist.unwrap_or(false);
 
-    //TODO: Permissions, create_if_not_exist handling
+    if create_if_not_exist {
+        let exists_check = state.threaded_engine.exists(
+            context.org_id, 
+            context.aggregate_type_id,
+            aggregate_id).await?;
+        if !exists_check {
+            state.metadata_store.give_owner_access_for_new_aggregate(
+                context.client_id,
+                context.user_id,
+                context.org_id, 
+                context.aggregate_type_id,
+                aggregate_id).await?;
+        }
+    }
+
+    state.check_access(&context, CONTRIBUTOR_ACCESS_LEVEL, None).await?;
     
     let result = state.threaded_engine.append_events(
         context.org_id, 

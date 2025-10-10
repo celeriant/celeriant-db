@@ -1,0 +1,13 @@
+[package]
+name = "eventplanedb_metadata"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+turso.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,4 +1,4 @@
-use crate::{app_state::AppState, error_response::RouteError, json_formatter::CompactJson, routes::utils::record_span_fields, wrap_nanoid};
+use crate::{app_state::{AppState, OWNER_ACCESS_LEVEL}, error_response::RouteError, json_formatter::CompactJson, routes::utils::record_span_fields, wrap_nanoid};
 use axum::{Json, extract::Path, http::HeaderMap};
 use serde::{Deserialize, Serialize};
 use tracing::{info, instrument};
@@ -50,7 +50,9 @@ pub async fn share(
     );
     let share_key = nanoid::nanoid!();
 
-    //TODO: Create the share link if the requester has access to do so
+    state.check_access(&context, OWNER_ACCESS_LEVEL, None).await?;
+
+    //TODO: Implement in metadata state
 
     // Log completion and return the response to the client
     info!("Completed share operation");
