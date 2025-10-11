@@ -818,7 +818,7 @@ dependencies = [
 [[package]]
 name = "eventplanedb_storage_stateful"
 version = "0.1.0"
-source = "git+https://github.com/utilitydelta-io/eventplanedb-storage?branch=main#e1594243128dd6755205f8818fe825db600df6dc"
+source = "git+https://github.com/utilitydelta-io/eventplanedb-storage?branch=main#4aca2ec68ad463a3bf4fd44bbb00e8ce434c6366"
 dependencies = [
  "eventplanedb_storage_stateless",
  "eventplanedb_storage_structures",
@@ -829,7 +829,7 @@ dependencies = [
 [[package]]
 name = "eventplanedb_storage_stateless"
 version = "0.1.0"
-source = "git+https://github.com/utilitydelta-io/eventplanedb-storage?branch=main#e1594243128dd6755205f8818fe825db600df6dc"
+source = "git+https://github.com/utilitydelta-io/eventplanedb-storage?branch=main#4aca2ec68ad463a3bf4fd44bbb00e8ce434c6366"
 dependencies = [
  "bincode",
  "brotli",
@@ -845,7 +845,7 @@ dependencies = [
 [[package]]
 name = "eventplanedb_storage_structures"
 version = "0.1.0"
-source = "git+https://github.com/utilitydelta-io/eventplanedb-storage?branch=main#e1594243128dd6755205f8818fe825db600df6dc"
+source = "git+https://github.com/utilitydelta-io/eventplanedb-storage?branch=main#4aca2ec68ad463a3bf4fd44bbb00e8ce434c6366"
 dependencies = [
  "base64",
  "bincode",
