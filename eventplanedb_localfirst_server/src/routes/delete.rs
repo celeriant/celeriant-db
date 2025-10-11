@@ -40,9 +40,22 @@ pub async fn delete(
 
     state.check_access(&context, OWNER_ACCESS_LEVEL, None).await?;
 
-    //TODO: Implement in metadata state
+    // Delete metadata first (clean up access control data in user/org databases)
+    state.metadata_store.delete_aggregate_metadata(
+        context.org_id, 
+        context.aggregate_type_id, 
+        aggregate_id
+    ).await.map_err(|e| RouteError::Other(format!("Failed to delete metadata: {e}")))?;
     
+    // Delete the aggregate data
     state.threaded_engine.delete(context.org_id, context.aggregate_type_id, aggregate_id).await?;
+    
+    // Delete the metadata database file
+    state.metadata_store.delete_aggregate_database(
+        context.org_id, 
+        context.aggregate_type_id, 
+        aggregate_id
+    ).await.map_err(|e| RouteError::Other(format!("Failed to delete metadata database: {e}")))?;
 
     let aggregate_key = AggregateKey::new(context.org_id, context.aggregate_type_id, aggregate_id);
     state.event_notifier.notify(&aggregate_key, context.client_id);

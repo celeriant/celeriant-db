@@ -1,5 +1,6 @@
 use crate::{app_state::{AppState, OWNER_ACCESS_LEVEL}, error_response::RouteError, json_formatter::CompactJson, routes::utils::record_span_fields, wrap_nanoid};
 use axum::{Json, extract::Path, http::HeaderMap};
+use eventplanedb_crypto::Crypto;
 use serde::{Deserialize, Serialize};
 use tracing::{info, instrument};
 
@@ -49,10 +50,23 @@ pub async fn share(
         "Processing share request",
     );
     let share_key = nanoid::nanoid!();
+    let share_id = Crypto::generate_short_client_identity(share_key.as_bytes());
 
     state.check_access(&context, OWNER_ACCESS_LEVEL, None).await?;
 
-    //TODO: Implement in metadata state
+    // Create the share link in the metadata store
+    state.metadata_store.create_share_link(
+        context.client_id,
+        context.user_id,
+        context.org_id,
+        aggregate_type_id,
+        aggregate_id,
+        share_id,
+        share_body.access_level as u8,
+        if share_body.expires_on > 0 { Some(share_body.expires_on) } else { None },
+        share_body.is_single_use,
+    ).await.map_err(|e| RouteError::BadRequest(format!("Failed to create share link: {e}")))?;
+
 
     // Log completion and return the response to the client
     info!("Completed share operation");

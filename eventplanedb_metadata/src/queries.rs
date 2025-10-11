@@ -167,6 +167,197 @@ impl MetadataStore {
         Ok(true)
     }
 
+    pub async fn disable_share_link(
+        &self,
+        client_id: u128,
+        user_id: Option<u128>,
+        org_id: u128,
+        aggregate_type_id: u128,
+        aggregate_id: u128,
+        share_id: u128,
+    ) -> Result<bool, MetadataError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let conn_aggregate = self
+            .open_aggregate_connection(org_id, aggregate_type_id, aggregate_id)
+            .await?;
+
+        // Check if share link exists and is not already disabled
+        let mut stmt = conn_aggregate
+            .prepare("SELECT id FROM share_links WHERE id = ? AND disabled_at IS NULL")
+            .await?;
+        let mut rows = stmt.query([share_id.to_le_bytes().as_slice()]).await?;
+
+        if rows.next().await?.is_none() {
+            return Ok(false); // Share link doesn't exist or is already disabled
+        }
+
+        // Disable the share link
+        let mut stmt = conn_aggregate
+            .prepare(
+                "UPDATE share_links 
+                 SET disabled_at = ?, disabled_by_client_id = ?, disabled_by_user_id = ?
+                 WHERE id = ?",
+            )
+            .await?;
+
+        stmt.execute((
+            now,
+            client_id.to_le_bytes().as_slice(),
+            user_id.map(|id| id.to_le_bytes().to_vec()),
+            share_id.to_le_bytes().as_slice(),
+        ))
+        .await?;
+
+        Ok(true)
+    }
+
+    pub async fn disable_client(
+        &self,
+        org_id: u128,
+        aggregate_type_id: u128,
+        aggregate_id: u128,
+        for_client_id: u128,
+    ) -> Result<bool, MetadataError> {
+        let conn_aggregate = self
+            .open_aggregate_connection(org_id, aggregate_type_id, aggregate_id)
+            .await?;
+
+        // Check if client exists and is not a user
+        let mut stmt = conn_aggregate
+            .prepare("SELECT id FROM users_and_clients WHERE id = ? AND is_user = 0")
+            .await?;
+        let mut rows = stmt.query([for_client_id.to_le_bytes().as_slice()]).await?;
+
+        if rows.next().await?.is_none() {
+            return Ok(false); // Client doesn't exist
+        }
+
+        // Remove the client's access by deleting the record
+        let mut stmt = conn_aggregate
+            .prepare("DELETE FROM users_and_clients WHERE id = ? AND is_user = 0")
+            .await?;
+
+        let rows_affected = stmt
+            .execute([for_client_id.to_le_bytes().as_slice()])
+            .await?;
+
+        Ok(rows_affected > 0)
+    }
+
+    pub async fn disable_user(
+        &self,
+        org_id: u128,
+        aggregate_type_id: u128,
+        aggregate_id: u128,
+        for_user_id: u128,
+    ) -> Result<bool, MetadataError> {
+        let conn_aggregate = self
+            .open_aggregate_connection(org_id, aggregate_type_id, aggregate_id)
+            .await?;
+
+        // Check if user exists
+        let mut stmt = conn_aggregate
+            .prepare("SELECT id FROM users_and_clients WHERE id = ? AND is_user = 1")
+            .await?;
+        let mut rows = stmt.query([for_user_id.to_le_bytes().as_slice()]).await?;
+
+        if rows.next().await?.is_none() {
+            return Ok(false); // User doesn't exist in this aggregate
+        }
+
+        // Remove the user's access from the aggregate database
+        let mut stmt = conn_aggregate
+            .prepare("DELETE FROM users_and_clients WHERE id = ? AND is_user = 1")
+            .await?;
+        let rows_affected = stmt.execute([for_user_id.to_le_bytes().as_slice()]).await?;
+
+        if rows_affected == 0 {
+            return Ok(false);
+        }
+
+        // Also remove from user database if it exists
+        if let Ok(conn_user) = self.open_user_connection(for_user_id).await {
+            let mut stmt = conn_user
+                .prepare(
+                    "DELETE FROM user_aggregate_access 
+                 WHERE org_id = ? AND aggregate_type_id = ? AND aggregate_id = ?",
+                )
+                .await?;
+            stmt.execute((
+                org_id.to_le_bytes().as_slice(),
+                aggregate_type_id.to_le_bytes().as_slice(),
+                aggregate_id.to_le_bytes().as_slice(),
+            ))
+            .await?;
+        }
+
+        // Also remove from org database
+        let conn_org = self.open_org_connection(org_id).await?;
+        let mut stmt = conn_org
+            .prepare(
+                "DELETE FROM user_aggregate_access 
+             WHERE user_id = ? AND aggregate_type_id = ? AND aggregate_id = ?",
+            )
+            .await?;
+        stmt.execute((
+            for_user_id.to_le_bytes().as_slice(),
+            aggregate_type_id.to_le_bytes().as_slice(),
+            aggregate_id.to_le_bytes().as_slice(),
+        ))
+        .await?;
+
+        Ok(true)
+    }
+
+    pub async fn create_share_link(
+        &self,
+        client_id: u128,
+        user_id: Option<u128>,
+        org_id: u128,
+        aggregate_type_id: u128,
+        aggregate_id: u128,
+        share_id: u128,
+        access_level: u8,
+        expires_on: Option<u64>,
+        is_single_use: bool,
+    ) -> Result<(), MetadataError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let conn_aggregate = self
+            .open_aggregate_connection(org_id, aggregate_type_id, aggregate_id)
+            .await?;
+
+        let expires_at = expires_on.map(|e| e as i64);
+
+        let mut stmt = conn_aggregate
+            .prepare(
+                "INSERT INTO share_links 
+                 (id, created_by_client_id, created_by_user_id, created_at, access_level, expires_at, is_single_use, use_count, disabled_at, disabled_by_client_id, disabled_by_user_id)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL)",
+            )
+            .await?;
+
+        stmt.execute((
+            share_id.to_le_bytes().as_slice(),
+            client_id.to_le_bytes().as_slice(),
+            user_id.map(|id| id.to_le_bytes().to_vec()),
+            now,
+            access_level,
+            expires_at,
+            is_single_use,
+        ))
+        .await?;
+
+        Ok(())
+    }
+
     pub async fn give_owner_access_for_new_aggregate(
         &self,
         client_id: u128,
@@ -260,6 +451,72 @@ impl MetadataStore {
             ))
             .await?;
         }
+
+        Ok(())
+    }
+
+    pub async fn delete_aggregate_metadata(
+        &self,
+        org_id: u128,
+        aggregate_type_id: u128,
+        aggregate_id: u128,
+    ) -> Result<(), MetadataError> {
+        // Get aggregate connection to access the metadata
+        let conn_aggregate = self
+            .open_aggregate_connection(org_id, aggregate_type_id, aggregate_id)
+            .await?;
+
+        // First, get all users who have access to this aggregate so we can clean up their user databases
+        let mut stmt = conn_aggregate
+            .prepare("SELECT id FROM users_and_clients WHERE is_user = 1")
+            .await?;
+        let mut rows = stmt.query(()).await?;
+        let mut user_ids = Vec::new();
+
+        while let Some(row) = rows.next().await? {
+            let user_id_bytes: Vec<u8> = row.get(0)?;
+            if user_id_bytes.len() == 16 {
+                let mut bytes = [0u8; 16];
+                bytes.copy_from_slice(&user_id_bytes);
+                let user_id = u128::from_le_bytes(bytes);
+                user_ids.push(user_id);
+            }
+        }
+
+        // Clean up user databases - remove entries for this aggregate
+        for user_id in user_ids {
+            if let Ok(conn_user) = self.open_user_connection(user_id).await {
+                let mut stmt = conn_user
+                    .prepare(
+                        "DELETE FROM user_aggregate_access 
+                         WHERE org_id = ? AND aggregate_type_id = ? AND aggregate_id = ?",
+                    )
+                    .await?;
+                stmt.execute((
+                    org_id.to_le_bytes().as_slice(),
+                    aggregate_type_id.to_le_bytes().as_slice(),
+                    aggregate_id.to_le_bytes().as_slice(),
+                ))
+                .await?;
+            }
+        }
+
+        // Clean up org database - remove entries for this aggregate
+        let conn_org = self.open_org_connection(org_id).await?;
+        let mut stmt = conn_org
+            .prepare(
+                "DELETE FROM user_aggregate_access 
+                 WHERE aggregate_type_id = ? AND aggregate_id = ?",
+            )
+            .await?;
+        stmt.execute((
+            aggregate_type_id.to_le_bytes().as_slice(),
+            aggregate_id.to_le_bytes().as_slice(),
+        ))
+        .await?;
+
+        // Note: We don't need to explicitly clean up the aggregate database itself
+        // as the entire database file will be deleted when the aggregate is deleted
 
         Ok(())
     }

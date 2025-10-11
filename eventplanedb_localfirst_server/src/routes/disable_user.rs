@@ -1,5 +1,6 @@
-use crate::{app_state::{AppState, OWNER_ACCESS_LEVEL}, error_response::RouteError, json_formatter::CompactJson, routes::utils::record_span_fields, wrap_nanoid};
+use crate::{app_state::{AppState, OWNER_ACCESS_LEVEL}, error_response::RouteError, job_error::JobError, json_formatter::CompactJson, routes::utils::record_span_fields, wrap_nanoid};
 use axum::{extract::Path, http::HeaderMap};
+use eventplanedb_crypto::Crypto;
 use serde::{Deserialize, Serialize};
 use tracing::{info, instrument};
 
@@ -36,7 +37,21 @@ pub async fn disable_user(
     
     state.check_access(&context, OWNER_ACCESS_LEVEL, None).await?;
 
-    //TODO: Implement in metadata state
+    let for_user_id = Crypto::generate_short_client_identity(for_user_id.as_bytes());
+
+    // Disable the client
+    let disabled = state.metadata_store
+        .disable_user(
+            context.org_id,
+            aggregate_type_id,
+            aggregate_id,
+            for_user_id,
+        )
+        .await?;
+
+    if !disabled {
+        return Err(RouteError::JobError(JobError::NotFound("Client not found or already disabled".to_string())));
+    }
 
     // Log completion and return the response to the client
     info!(

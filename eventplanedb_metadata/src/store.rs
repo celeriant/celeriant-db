@@ -13,26 +13,17 @@ use turso::{Builder, Connection, Database};
 pub struct MetadataStore {
     pub test: u64,
     config: MetadataConfig,
-    org_schema_version_initialized: Arc<Mutex<bool>>,
-    user_schema_version_initialized: Arc<Mutex<bool>>,
-    aggregate_schema_version_initialized: Arc<Mutex<bool>>,
 }
 
 impl MetadataStore {
     pub fn new(config: MetadataConfig) -> Self {
         // Ensure base directories exist
         std::fs::create_dir_all(&config.base_path).ok();
-        std::fs::create_dir_all(&config.base_path.join("orgs")).ok();
-        std::fs::create_dir_all(&config.base_path.join("users")).ok();
-        std::fs::create_dir_all(&config.base_path.join("aggregates")).ok();
+        std::fs::create_dir_all(config.base_path.join("orgs")).ok();
+        std::fs::create_dir_all(config.base_path.join("users")).ok();
+        std::fs::create_dir_all(config.base_path.join("aggregates")).ok();
 
-        Self {
-            test: 99,
-            config,
-            org_schema_version_initialized: Arc::new(Mutex::new(false)),
-            user_schema_version_initialized: Arc::new(Mutex::new(false)),
-            aggregate_schema_version_initialized: Arc::new(Mutex::new(false)),
-        }
+        Self { test: 99, config }
     }
 
     async fn get_database(&self, db_path: &str) -> MetadataResult<Database> {
@@ -40,7 +31,7 @@ impl MetadataStore {
         let db = builder
             .build()
             .await
-            .map_err(|e| MetadataError::DatabaseError(e))?;
+            .map_err(MetadataError::DatabaseError)?;
         Ok(db)
     }
 
@@ -52,12 +43,31 @@ impl MetadataStore {
             .to_string_lossy()
             .to_string();
         let db = self.get_database(&db_path).await?;
-        let conn = db.connect().map_err(|e| MetadataError::DatabaseError(e))?;
+        let conn = db.connect().map_err(MetadataError::DatabaseError)?;
 
         // Run schema migration every time - ensure_schema should be idempotent
         MigrationManager::ensure_schema(&conn, DatabaseType::Org).await?;
 
         Ok(conn)
+    }
+
+    /// Deletes the aggregate metadata database file
+    pub async fn delete_aggregate_database(
+        &self,
+        org_id: u128,
+        aggregate_type_id: u128,
+        aggregate_id: u128,
+    ) -> MetadataResult<()> {
+        let db_path = self
+            .config
+            .aggregate_db_path(org_id, aggregate_type_id, aggregate_id);
+
+        // Remove the database file if it exists
+        if db_path.exists() {
+            std::fs::remove_file(&db_path).map_err(MetadataError::IoError)?;
+        }
+
+        Ok(())
     }
 
     /// Opens a connection to the user metadata store and ensures the schema is up to date
@@ -68,7 +78,7 @@ impl MetadataStore {
             .to_string_lossy()
             .to_string();
         let db = self.get_database(&db_path).await?;
-        let conn = db.connect().map_err(|e| MetadataError::DatabaseError(e))?;
+        let conn = db.connect().map_err(MetadataError::DatabaseError)?;
 
         // Run schema migration every time - ensure_schema should be idempotent
         MigrationManager::ensure_schema(&conn, DatabaseType::User).await?;
@@ -89,7 +99,7 @@ impl MetadataStore {
             .to_string_lossy()
             .to_string();
         let db = self.get_database(&db_path).await?;
-        let conn = db.connect().map_err(|e| MetadataError::DatabaseError(e))?;
+        let conn = db.connect().map_err(MetadataError::DatabaseError)?;
 
         // Run schema migration every time - ensure_schema should be idempotent
         MigrationManager::ensure_schema(&conn, DatabaseType::Aggregate).await?;
