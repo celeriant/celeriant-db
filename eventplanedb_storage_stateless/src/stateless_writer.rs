@@ -13,6 +13,12 @@ use std::io::{self};
 use crate::stateless_engine::StatelessEngine;
 use crate::wire_format::to_wire_format_variable;
 
+//TODO: Can we do file preallocation that won't break EOF logic?
+//fallocate(fd, FALLOC_FL_KEEP_SIZE, ...)
+
+//TODO: Should the writer be using Direct I/O on linux to skip the page cache?
+//https://transactional.blog/how-to-learn/disk-io
+
 pub trait StatelessWriter {
     fn append_event_batch(
         &self,
