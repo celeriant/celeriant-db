@@ -38,7 +38,8 @@ pub struct EventItem {
     #[serde(
         with = "serde_fixed_u8_array_base64",
         rename = "iv",
-        skip_serializing_if = "Option::is_none"
+        skip_serializing_if = "Option::is_none",
+        default
     )]
     pub iv: Option<[u8; 12]>,
 }
