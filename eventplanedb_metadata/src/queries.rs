@@ -1,4 +1,5 @@
 use crate::{MetadataError, store::MetadataStore};
+use async_sqlite::{JournalMode, Pool, rusqlite::params};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 impl MetadataStore {
@@ -26,24 +27,42 @@ impl MetadataStore {
 
         if let Some(user_id) = user_id {
             // Check if user has direct access
-            let mut stmt = conn_aggregate
-                .prepare("SELECT access_level FROM users_and_clients WHERE id = ? AND is_user = 1")
-                .await?;
-            let mut rows = stmt.query([user_id.to_le_bytes().as_slice()]).await?;
+            existing_access_level = conn_aggregate
+                .conn(move |conn| {
+                    let mut stmt = conn.prepare(
+                        "SELECT access_level FROM users_and_clients WHERE id = ? AND is_user = 1",
+                    )?;
+                    let mut rows = stmt
+                        .query_map(params![user_id.to_le_bytes().as_slice()], |row| {
+                            Ok(row.get::<_, i64>(0)? as u8)
+                        })?;
 
-            if let Some(row) = rows.next().await? {
-                existing_access_level = Some(row.get::<i64>(0)? as u8);
-            }
+                    if let Some(access_level) = rows.next().transpose()? {
+                        Ok(Some(access_level))
+                    } else {
+                        Ok(None)
+                    }
+                })
+                .await?;
         } else {
             // Check if client has direct access
-            let mut stmt = conn_aggregate
-                .prepare("SELECT access_level FROM users_and_clients WHERE id = ? AND is_user = 0")
-                .await?;
-            let mut rows = stmt.query([client_id.to_le_bytes().as_slice()]).await?;
+            existing_access_level = conn_aggregate
+                .conn(move |conn| {
+                    let mut stmt = conn.prepare(
+                        "SELECT access_level FROM users_and_clients WHERE id = ? AND is_user = 0",
+                    )?;
+                    let mut rows = stmt
+                        .query_map(params![client_id.to_le_bytes().as_slice()], |row| {
+                            Ok(row.get::<_, i64>(0)? as u8)
+                        })?;
 
-            if let Some(row) = rows.next().await? {
-                existing_access_level = Some(row.get::<i64>(0)? as u8);
-            }
+                    if let Some(access_level) = rows.next().transpose()? {
+                        Ok(Some(access_level))
+                    } else {
+                        Ok(None)
+                    }
+                })
+                .await?;
         }
 
         // Check if existing access is sufficient (lower number = higher access)
@@ -59,24 +78,37 @@ impl MetadataStore {
         };
 
         // Validate the share link
-        let mut stmt = conn_aggregate
-            .prepare(
-                "SELECT access_level, expires_at, is_single_use, use_count, disabled_at 
-             FROM share_links 
-             WHERE id = ?",
-            )
-            .await?;
-        let mut rows = stmt.query([share_id.to_le_bytes().as_slice()]).await?;
+        let share_data = conn_aggregate
+            .conn(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT access_level, expires_at, is_single_use, use_count, disabled_at 
+                     FROM share_links 
+                     WHERE id = ?",
+                )?;
+                let mut rows =
+                    stmt.query_map(params![share_id.to_le_bytes().as_slice()], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)? as u8,   // access_level
+                            row.get::<_, Option<i64>>(1)?, // expires_at
+                            row.get::<_, i64>(2)? != 0,    // is_single_use
+                            row.get::<_, i64>(3)?,         // use_count
+                            row.get::<_, Option<i64>>(4)?, // disabled_at
+                        ))
+                    })?;
 
-        let Some(row) = rows.next().await? else {
+                if let Some(data) = rows.next().transpose()? {
+                    Ok(Some(data))
+                } else {
+                    Ok(None)
+                }
+            })
+            .await?;
+
+        let Some((share_access_level, expires_at, is_single_use, use_count, disabled_at)) =
+            share_data
+        else {
             return Ok(false); // Share link doesn't exist
         };
-
-        let share_access_level = row.get::<i64>(0)? as u8;
-        let expires_at: Option<i64> = row.get(1)?;
-        let is_single_use: bool = row.get::<i64>(2)? != 0;
-        let use_count: i64 = row.get(3)?;
-        let disabled_at: Option<i64> = row.get(4)?;
 
         // Check if share link is valid
         if disabled_at.is_some() {
@@ -99,69 +131,83 @@ impl MetadataStore {
 
         // Share link is valid and provides sufficient access, use it
         // Update usage count
-        let mut stmt = conn_aggregate
-            .prepare("UPDATE share_links SET use_count = use_count + 1 WHERE id = ?")
+        conn_aggregate
+            .conn(move |conn| {
+                let mut stmt =
+                    conn.prepare("UPDATE share_links SET use_count = use_count + 1 WHERE id = ?")?;
+                stmt.execute(params![share_id.to_le_bytes().as_slice()])?;
+                Ok(())
+            })
             .await?;
-        stmt.execute([share_id.to_le_bytes().as_slice()]).await?;
 
         // Grant access to the user/client
         let is_user = user_id.is_some();
         let entity_id = user_id.unwrap_or(client_id);
 
-        let mut stmt = conn_aggregate
-            .prepare(
-                "INSERT INTO users_and_clients 
-             (id, is_user, access_level, created_at, modified_at, granted_from_share_id)
-             VALUES (?, ?, ?, ?, ?, ?)",
-            )
+        conn_aggregate
+            .conn(move |conn| {
+                let mut stmt = conn.prepare(
+                    "INSERT INTO users_and_clients 
+                     (id, is_user, access_level, created_at, modified_at, granted_from_share_id)
+                     VALUES (?, ?, ?, ?, ?, ?)",
+                )?;
+                stmt.execute(params![
+                    entity_id.to_le_bytes().as_slice(),
+                    is_user,
+                    share_access_level,
+                    now,
+                    now,
+                    share_id.to_le_bytes().as_slice(),
+                ])?;
+                Ok(())
+            })
             .await?;
-        stmt.execute((
-            entity_id.to_le_bytes().as_slice(),
-            is_user,
-            share_access_level,
-            now,
-            now,
-            share_id.to_le_bytes().as_slice(),
-        ))
-        .await?;
 
         // If user is logged in, also update user and org databases
         if let Some(user_id) = user_id {
             // Update user database
             let conn_user = self.open_user_connection(user_id).await?;
-            let mut stmt = conn_user.prepare(
-                "INSERT INTO user_aggregate_access 
-                 (org_id, aggregate_type_id, aggregate_id, access_level, created_at, modified_at, granted_from_share_id)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)"
-            ).await?;
-            stmt.execute((
-                org_id.to_le_bytes().as_slice(),
-                aggregate_type_id.to_le_bytes().as_slice(),
-                aggregate_id.to_le_bytes().as_slice(),
-                share_access_level,
-                now,
-                now,
-                share_id.to_le_bytes().as_slice(),
-            ))
-            .await?;
+            conn_user
+                .conn(move |conn| {
+                    let mut stmt = conn.prepare(
+                        "INSERT INTO user_aggregate_access 
+                         (org_id, aggregate_type_id, aggregate_id, access_level, created_at, modified_at, granted_from_share_id)
+                         VALUES (?, ?, ?, ?, ?, ?, ?)"
+                    )?;
+                    stmt.execute(params![
+                        org_id.to_le_bytes().as_slice(),
+                        aggregate_type_id.to_le_bytes().as_slice(),
+                        aggregate_id.to_le_bytes().as_slice(),
+                        share_access_level,
+                        now,
+                        now,
+                        share_id.to_le_bytes().as_slice(),
+                    ])?;
+                    Ok(())
+                })
+                .await?;
 
             // Update org database
             let conn_org = self.open_org_connection(org_id).await?;
-            let mut stmt = conn_org.prepare(
-                "INSERT INTO user_aggregate_access 
-                 (user_id, aggregate_type_id, aggregate_id, access_level, created_at, modified_at, granted_from_share_id)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)"
-            ).await?;
-            stmt.execute((
-                user_id.to_le_bytes().as_slice(),
-                aggregate_type_id.to_le_bytes().as_slice(),
-                aggregate_id.to_le_bytes().as_slice(),
-                share_access_level,
-                now,
-                now,
-                share_id.to_le_bytes().as_slice(),
-            ))
-            .await?;
+            conn_org
+                .conn(move |conn| {
+                    let mut stmt = conn.prepare(
+                        "INSERT INTO user_aggregate_access 
+                         (user_id, aggregate_type_id, aggregate_id, access_level, created_at, modified_at, granted_from_share_id)
+                         VALUES (?, ?, ?, ?, ?, ?, ?)"
+                    )?;
+                    stmt.execute(params![
+                        user_id.to_le_bytes().as_slice(),
+                        aggregate_type_id.to_le_bytes().as_slice(),
+                        aggregate_id.to_le_bytes().as_slice(),
+                        share_access_level,
+                        now,
+                        now,
+                        share_id.to_le_bytes().as_slice(),
+                    ])?;
+                    Ok(())
+                })
+                .await?;
         }
 
         Ok(true)
@@ -185,34 +231,38 @@ impl MetadataStore {
             .open_aggregate_connection(org_id, aggregate_type_id, aggregate_id)
             .await?;
 
-        // Check if share link exists and is not already disabled
-        let mut stmt = conn_aggregate
-            .prepare("SELECT id FROM share_links WHERE id = ? AND disabled_at IS NULL")
+        // Check if share link exists and is not already disabled, then disable it
+        let rows_affected = conn_aggregate
+            .conn(move |conn| {
+                // Check if exists and not disabled
+                let mut stmt = conn
+                    .prepare("SELECT id FROM share_links WHERE id = ? AND disabled_at IS NULL")?;
+                let mut rows =
+                    stmt.query_map(params![share_id.to_le_bytes().as_slice()], |_| Ok(()))?;
+
+                if rows.next().is_none() {
+                    return Ok(0); // Share link doesn't exist or is already disabled
+                }
+
+                // Disable the share link
+                let mut stmt = conn.prepare(
+                    "UPDATE share_links 
+                     SET disabled_at = ?, disabled_by_client_id = ?, disabled_by_user_id = ?
+                     WHERE id = ?",
+                )?;
+
+                let affected = stmt.execute(params![
+                    now,
+                    client_id.to_le_bytes().as_slice(),
+                    user_id.map(|id| id.to_le_bytes().to_vec()),
+                    share_id.to_le_bytes().as_slice(),
+                ])?;
+
+                Ok(affected)
+            })
             .await?;
-        let mut rows = stmt.query([share_id.to_le_bytes().as_slice()]).await?;
 
-        if rows.next().await?.is_none() {
-            return Ok(false); // Share link doesn't exist or is already disabled
-        }
-
-        // Disable the share link
-        let mut stmt = conn_aggregate
-            .prepare(
-                "UPDATE share_links 
-                 SET disabled_at = ?, disabled_by_client_id = ?, disabled_by_user_id = ?
-                 WHERE id = ?",
-            )
-            .await?;
-
-        stmt.execute((
-            now,
-            client_id.to_le_bytes().as_slice(),
-            user_id.map(|id| id.to_le_bytes().to_vec()),
-            share_id.to_le_bytes().as_slice(),
-        ))
-        .await?;
-
-        Ok(true)
+        Ok(rows_affected > 0)
     }
 
     pub async fn disable_client(
@@ -226,23 +276,24 @@ impl MetadataStore {
             .open_aggregate_connection(org_id, aggregate_type_id, aggregate_id)
             .await?;
 
-        // Check if client exists and is not a user
-        let mut stmt = conn_aggregate
-            .prepare("SELECT id FROM users_and_clients WHERE id = ? AND is_user = 0")
-            .await?;
-        let mut rows = stmt.query([for_client_id.to_le_bytes().as_slice()]).await?;
+        let rows_affected = conn_aggregate
+            .conn(move |conn| {
+                // Check if client exists and is not a user
+                let mut stmt =
+                    conn.prepare("SELECT id FROM users_and_clients WHERE id = ? AND is_user = 0")?;
+                let mut rows =
+                    stmt.query_map(params![for_client_id.to_le_bytes().as_slice()], |_| Ok(()))?;
 
-        if rows.next().await?.is_none() {
-            return Ok(false); // Client doesn't exist
-        }
+                if rows.next().is_none() {
+                    return Ok(0); // Client doesn't exist
+                }
 
-        // Remove the client's access by deleting the record
-        let mut stmt = conn_aggregate
-            .prepare("DELETE FROM users_and_clients WHERE id = ? AND is_user = 0")
-            .await?;
-
-        let rows_affected = stmt
-            .execute([for_client_id.to_le_bytes().as_slice()])
+                // Remove the client's access by deleting the record
+                let mut stmt =
+                    conn.prepare("DELETE FROM users_and_clients WHERE id = ? AND is_user = 0")?;
+                let affected = stmt.execute(params![for_client_id.to_le_bytes().as_slice()])?;
+                Ok(affected)
+            })
             .await?;
 
         Ok(rows_affected > 0)
@@ -259,21 +310,25 @@ impl MetadataStore {
             .open_aggregate_connection(org_id, aggregate_type_id, aggregate_id)
             .await?;
 
-        // Check if user exists
-        let mut stmt = conn_aggregate
-            .prepare("SELECT id FROM users_and_clients WHERE id = ? AND is_user = 1")
-            .await?;
-        let mut rows = stmt.query([for_user_id.to_le_bytes().as_slice()]).await?;
-
-        if rows.next().await?.is_none() {
-            return Ok(false); // User doesn't exist in this aggregate
-        }
-
         // Remove the user's access from the aggregate database
-        let mut stmt = conn_aggregate
-            .prepare("DELETE FROM users_and_clients WHERE id = ? AND is_user = 1")
+        let rows_affected = conn_aggregate
+            .conn(move |conn| {
+                // Check if user exists
+                let mut stmt =
+                    conn.prepare("SELECT id FROM users_and_clients WHERE id = ? AND is_user = 1")?;
+                let mut rows =
+                    stmt.query_map(params![for_user_id.to_le_bytes().as_slice()], |_| Ok(()))?;
+
+                if rows.next().is_none() {
+                    return Ok(0); // User doesn't exist in this aggregate
+                }
+
+                let mut stmt =
+                    conn.prepare("DELETE FROM users_and_clients WHERE id = ? AND is_user = 1")?;
+                let affected = stmt.execute(params![for_user_id.to_le_bytes().as_slice()])?;
+                Ok(affected)
+            })
             .await?;
-        let rows_affected = stmt.execute([for_user_id.to_le_bytes().as_slice()]).await?;
 
         if rows_affected == 0 {
             return Ok(false);
@@ -281,34 +336,38 @@ impl MetadataStore {
 
         // Also remove from user database if it exists
         if let Ok(conn_user) = self.open_user_connection(for_user_id).await {
-            let mut stmt = conn_user
-                .prepare(
-                    "DELETE FROM user_aggregate_access 
-                 WHERE org_id = ? AND aggregate_type_id = ? AND aggregate_id = ?",
-                )
+            conn_user
+                .conn(move |conn| {
+                    let mut stmt = conn.prepare(
+                        "DELETE FROM user_aggregate_access 
+                         WHERE org_id = ? AND aggregate_type_id = ? AND aggregate_id = ?",
+                    )?;
+                    stmt.execute(params![
+                        org_id.to_le_bytes().as_slice(),
+                        aggregate_type_id.to_le_bytes().as_slice(),
+                        aggregate_id.to_le_bytes().as_slice(),
+                    ])?;
+                    Ok(())
+                })
                 .await?;
-            stmt.execute((
-                org_id.to_le_bytes().as_slice(),
-                aggregate_type_id.to_le_bytes().as_slice(),
-                aggregate_id.to_le_bytes().as_slice(),
-            ))
-            .await?;
         }
 
         // Also remove from org database
         let conn_org = self.open_org_connection(org_id).await?;
-        let mut stmt = conn_org
-            .prepare(
-                "DELETE FROM user_aggregate_access 
-             WHERE user_id = ? AND aggregate_type_id = ? AND aggregate_id = ?",
-            )
+        conn_org
+            .conn(move |conn| {
+                let mut stmt = conn.prepare(
+                    "DELETE FROM user_aggregate_access 
+                     WHERE user_id = ? AND aggregate_type_id = ? AND aggregate_id = ?",
+                )?;
+                stmt.execute(params![
+                    for_user_id.to_le_bytes().as_slice(),
+                    aggregate_type_id.to_le_bytes().as_slice(),
+                    aggregate_id.to_le_bytes().as_slice(),
+                ])?;
+                Ok(())
+            })
             .await?;
-        stmt.execute((
-            for_user_id.to_le_bytes().as_slice(),
-            aggregate_type_id.to_le_bytes().as_slice(),
-            aggregate_id.to_le_bytes().as_slice(),
-        ))
-        .await?;
 
         Ok(true)
     }
@@ -336,24 +395,26 @@ impl MetadataStore {
 
         let expires_at = expires_on.map(|e| e as i64);
 
-        let mut stmt = conn_aggregate
-            .prepare(
-                "INSERT INTO share_links 
-                 (id, created_by_client_id, created_by_user_id, created_at, access_level, expires_at, is_single_use, use_count, disabled_at, disabled_by_client_id, disabled_by_user_id)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL)",
-            )
-            .await?;
+        conn_aggregate
+            .conn(move |conn| {
+                let mut stmt = conn.prepare(
+                    "INSERT INTO share_links 
+                     (id, created_by_client_id, created_by_user_id, created_at, access_level, expires_at, is_single_use, use_count, disabled_at, disabled_by_client_id, disabled_by_user_id)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL)",
+                )?;
 
-        stmt.execute((
-            share_id.to_le_bytes().as_slice(),
-            client_id.to_le_bytes().as_slice(),
-            user_id.map(|id| id.to_le_bytes().to_vec()),
-            now,
-            access_level,
-            expires_at,
-            is_single_use,
-        ))
-        .await?;
+                stmt.execute(params![
+                    share_id.to_le_bytes().as_slice(),
+                    client_id.to_le_bytes().as_slice(),
+                    user_id.map(|id| id.to_le_bytes().to_vec()),
+                    now,
+                    access_level,
+                    expires_at,
+                    is_single_use,
+                ])?;
+                Ok(())
+            })
+            .await?;
 
         Ok(())
     }
@@ -380,76 +441,84 @@ impl MetadataStore {
         // If user is logged in, also grant them owner access and update cross-reference tables
         if let Some(user_id) = user_id {
             // Grant owner access to the user in the aggregate database
-            let mut stmt = conn_aggregate
-                .prepare(
-                    "INSERT INTO users_and_clients 
-                     (id, is_user, access_level, created_at, modified_at)
-                     VALUES (?, ?, ?, ?, ?)",
-                )
+            conn_aggregate
+                .conn(move |conn| {
+                    let mut stmt = conn.prepare(
+                        "INSERT INTO users_and_clients 
+                         (id, is_user, access_level, created_at, modified_at)
+                         VALUES (?, ?, ?, ?, ?)",
+                    )?;
+                    stmt.execute(params![
+                        user_id.to_le_bytes().as_slice(),
+                        1i64, // is_user = true
+                        OWNER_ACCESS_LEVEL,
+                        now,
+                        now,
+                    ])?;
+                    Ok(())
+                })
                 .await?;
-            stmt.execute((
-                user_id.to_le_bytes().as_slice(),
-                1i64, // is_user = true
-                OWNER_ACCESS_LEVEL,
-                now,
-                now,
-            ))
-            .await?;
 
             // Update user database
             let conn_user = self.open_user_connection(user_id).await?;
-            let mut stmt = conn_user
-                .prepare(
-                    "INSERT INTO user_aggregate_access 
-                 (org_id, aggregate_type_id, aggregate_id, access_level, created_at, modified_at)
-                 VALUES (?, ?, ?, ?, ?, ?)",
-                )
+            conn_user
+                .conn(move |conn| {
+                    let mut stmt = conn.prepare(
+                        "INSERT INTO user_aggregate_access 
+                         (org_id, aggregate_type_id, aggregate_id, access_level, created_at, modified_at)
+                         VALUES (?, ?, ?, ?, ?, ?)",
+                    )?;
+                    stmt.execute(params![
+                        org_id.to_le_bytes().as_slice(),
+                        aggregate_type_id.to_le_bytes().as_slice(),
+                        aggregate_id.to_le_bytes().as_slice(),
+                        OWNER_ACCESS_LEVEL,
+                        now,
+                        now,
+                    ])?;
+                    Ok(())
+                })
                 .await?;
-            stmt.execute((
-                org_id.to_le_bytes().as_slice(),
-                aggregate_type_id.to_le_bytes().as_slice(),
-                aggregate_id.to_le_bytes().as_slice(),
-                OWNER_ACCESS_LEVEL,
-                now,
-                now,
-            ))
-            .await?;
 
             // Update org database
             let conn_org = self.open_org_connection(org_id).await?;
-            let mut stmt = conn_org
-                .prepare(
-                    "INSERT INTO user_aggregate_access 
-                 (user_id, aggregate_type_id, aggregate_id, access_level, created_at, modified_at)
-                 VALUES (?, ?, ?, ?, ?, ?)",
-                )
+            conn_org
+                .conn(move |conn| {
+                    let mut stmt = conn.prepare(
+                        "INSERT INTO user_aggregate_access 
+                         (user_id, aggregate_type_id, aggregate_id, access_level, created_at, modified_at)
+                         VALUES (?, ?, ?, ?, ?, ?)",
+                    )?;
+                    stmt.execute(params![
+                        user_id.to_le_bytes().as_slice(),
+                        aggregate_type_id.to_le_bytes().as_slice(),
+                        aggregate_id.to_le_bytes().as_slice(),
+                        OWNER_ACCESS_LEVEL,
+                        now,
+                        now,
+                    ])?;
+                    Ok(())
+                })
                 .await?;
-            stmt.execute((
-                user_id.to_le_bytes().as_slice(),
-                aggregate_type_id.to_le_bytes().as_slice(),
-                aggregate_id.to_le_bytes().as_slice(),
-                OWNER_ACCESS_LEVEL,
-                now,
-                now,
-            ))
-            .await?;
         } else {
             // Grant owner access to the client in the aggregate database
-            let mut stmt = conn_aggregate
-                .prepare(
-                    "INSERT INTO users_and_clients 
-                 (id, is_user, access_level, created_at, modified_at)
-                 VALUES (?, ?, ?, ?, ?)",
-                )
+            conn_aggregate
+                .conn(move |conn| {
+                    let mut stmt = conn.prepare(
+                        "INSERT INTO users_and_clients 
+                         (id, is_user, access_level, created_at, modified_at)
+                         VALUES (?, ?, ?, ?, ?)",
+                    )?;
+                    stmt.execute(params![
+                        client_id.to_le_bytes().as_slice(),
+                        0i64, // is_user = false for client
+                        OWNER_ACCESS_LEVEL,
+                        now,
+                        now,
+                    ])?;
+                    Ok(())
+                })
                 .await?;
-            stmt.execute((
-                client_id.to_le_bytes().as_slice(),
-                0i64, // is_user = false for client
-                OWNER_ACCESS_LEVEL,
-                now,
-                now,
-            ))
-            .await?;
         }
 
         Ok(())
@@ -467,53 +536,66 @@ impl MetadataStore {
             .await?;
 
         // First, get all users who have access to this aggregate so we can clean up their user databases
-        let mut stmt = conn_aggregate
-            .prepare("SELECT id FROM users_and_clients WHERE is_user = 1")
-            .await?;
-        let mut rows = stmt.query(()).await?;
-        let mut user_ids = Vec::new();
+        let user_ids = conn_aggregate
+            .conn(|conn| {
+                let mut stmt =
+                    conn.prepare("SELECT id FROM users_and_clients WHERE is_user = 1")?;
+                let mut rows = stmt.query_map(params![], |row| {
+                    let user_id_bytes: Vec<u8> = row.get(0)?;
+                    if user_id_bytes.len() == 16 {
+                        let mut bytes = [0u8; 16];
+                        bytes.copy_from_slice(&user_id_bytes);
+                        Ok(Some(u128::from_le_bytes(bytes)))
+                    } else {
+                        Ok(None)
+                    }
+                })?;
 
-        while let Some(row) = rows.next().await? {
-            let user_id_bytes: Vec<u8> = row.get(0)?;
-            if user_id_bytes.len() == 16 {
-                let mut bytes = [0u8; 16];
-                bytes.copy_from_slice(&user_id_bytes);
-                let user_id = u128::from_le_bytes(bytes);
-                user_ids.push(user_id);
-            }
-        }
+                let mut user_ids = Vec::new();
+                for row in rows {
+                    if let Some(user_id) = row? {
+                        user_ids.push(user_id);
+                    }
+                }
+                Ok(user_ids)
+            })
+            .await?;
 
         // Clean up user databases - remove entries for this aggregate
         for user_id in user_ids {
             if let Ok(conn_user) = self.open_user_connection(user_id).await {
-                let mut stmt = conn_user
-                    .prepare(
-                        "DELETE FROM user_aggregate_access 
-                         WHERE org_id = ? AND aggregate_type_id = ? AND aggregate_id = ?",
-                    )
+                conn_user
+                    .conn(move |conn| {
+                        let mut stmt = conn.prepare(
+                            "DELETE FROM user_aggregate_access 
+                             WHERE org_id = ? AND aggregate_type_id = ? AND aggregate_id = ?",
+                        )?;
+                        stmt.execute(params![
+                            org_id.to_le_bytes().as_slice(),
+                            aggregate_type_id.to_le_bytes().as_slice(),
+                            aggregate_id.to_le_bytes().as_slice(),
+                        ])?;
+                        Ok(())
+                    })
                     .await?;
-                stmt.execute((
-                    org_id.to_le_bytes().as_slice(),
-                    aggregate_type_id.to_le_bytes().as_slice(),
-                    aggregate_id.to_le_bytes().as_slice(),
-                ))
-                .await?;
             }
         }
 
         // Clean up org database - remove entries for this aggregate
         let conn_org = self.open_org_connection(org_id).await?;
-        let mut stmt = conn_org
-            .prepare(
-                "DELETE FROM user_aggregate_access 
-                 WHERE aggregate_type_id = ? AND aggregate_id = ?",
-            )
+        conn_org
+            .conn(move |conn| {
+                let mut stmt = conn.prepare(
+                    "DELETE FROM user_aggregate_access 
+                     WHERE aggregate_type_id = ? AND aggregate_id = ?",
+                )?;
+                stmt.execute(params![
+                    aggregate_type_id.to_le_bytes().as_slice(),
+                    aggregate_id.to_le_bytes().as_slice(),
+                ])?;
+                Ok(())
+            })
             .await?;
-        stmt.execute((
-            aggregate_type_id.to_le_bytes().as_slice(),
-            aggregate_id.to_le_bytes().as_slice(),
-        ))
-        .await?;
 
         // Note: We don't need to explicitly clean up the aggregate database itself
         // as the entire database file will be deleted when the aggregate is deleted

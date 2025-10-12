@@ -6,8 +6,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-turso.workspace = true
+async-sqlite.workspace = true
 tokio.workspace = true
+rusqlite.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

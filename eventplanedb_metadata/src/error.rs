@@ -3,7 +3,7 @@ use std::fmt;
 #[derive(Debug)]
 pub enum MetadataError {
     /// Database connection or execution error
-    DatabaseError(turso::Error),
+    DatabaseError(async_sqlite::Error),
     /// Query preparation or execution failed
     QueryError(String),
     /// Row parsing or type conversion error
@@ -66,9 +66,8 @@ impl std::error::Error for MetadataError {
     }
 }
 
-// Conversion from turso::Error
-impl From<turso::Error> for MetadataError {
-    fn from(err: turso::Error) -> Self {
+impl From<async_sqlite::Error> for MetadataError {
+    fn from(err: async_sqlite::Error) -> Self {
         MetadataError::DatabaseError(err)
     }
 }
