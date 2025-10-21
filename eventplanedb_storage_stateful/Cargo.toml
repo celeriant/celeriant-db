@@ -10,6 +10,8 @@ eventplanedb_storage_structures = { path = "../eventplanedb_storage_structures" 
 eventplanedb_storage_stateless = { path = "../eventplanedb_storage_stateless" }
 fastbloom.workspace = true
 lru.workspace = true
+glommio.workspace = true
+async-trait.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

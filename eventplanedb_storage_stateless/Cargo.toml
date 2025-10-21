@@ -14,6 +14,8 @@ zstd.workspace = true
 brotli.workspace = true
 flate2.workspace = true
 snap.workspace = true
+glommio.workspace = true
+futures-lite.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring.workspace = true
