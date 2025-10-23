@@ -6,3 +6,4 @@ pub mod event_index_cache;
 pub mod file_cache;
 pub mod memory_cache;
 pub mod stateful_engine;
+pub mod  dma_file_cache;

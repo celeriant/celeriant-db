@@ -12,6 +12,7 @@ fastbloom.workspace = true
 lru.workspace = true
 glommio.workspace = true
 async-trait.workspace = true
+futures-lite.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

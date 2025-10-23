@@ -280,6 +280,7 @@ dependencies = [
  "eventplanedb_storage_stateless",
  "eventplanedb_storage_structures",
  "fastbloom",
+ "futures-lite 2.6.1",
  "glommio",
  "lru",
  "tempfile",

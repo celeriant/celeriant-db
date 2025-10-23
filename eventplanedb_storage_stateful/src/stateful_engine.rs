@@ -22,7 +22,7 @@ use eventplanedb_storage_structures::{
 use fastbloom::BloomFilter;
 use std::collections::HashSet;
 
-use crate::event_index_cache::EventIndexCache;
+use crate::{dma_file_cache::DmaFileCache, event_index_cache::EventIndexCache};
 
 use super::{
     client_event_index_cache::ClientEventIndexCache, event_batch_index_cache::EventBatchIndexCache,
@@ -74,6 +74,7 @@ pub struct StatefulEngine {
 
     // File handle management
     file_cache: FileCache,
+    dma_file_cache: DmaFileCache,
 
     // Shared resources for writing
     bloom_filter: BloomFilter,
@@ -88,6 +89,7 @@ impl StatefulEngine {
             ClientEventIndexCache::new(config.client_event_index_cache_size);
         let memory_cache = LruMemoryCache::new(config.recent_batches_cache_size);
         let file_cache = FileCache::new(config.max_file_handles);
+        let dma_file_cache = DmaFileCache::new(config.max_file_handles);
 
         let bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8)
             .seed(&BLOOM_HASH_SEED)
@@ -100,6 +102,7 @@ impl StatefulEngine {
             client_event_index_cache,
             memory_cache,
             file_cache,
+            dma_file_cache,
             bloom_filter,
             event_type_dedup: HashSet::new(),
         }
@@ -413,6 +416,8 @@ impl StatefulEngine {
             self.get_aggregate_paths(org_id, aggregate_type_id, aggregate_id);
         self.file_cache.remove(event_batch_path.to_str().unwrap());
         self.file_cache.remove(metadata_path.to_str().unwrap());
+        self.dma_file_cache.remove(event_batch_path.to_str().unwrap());
+        self.dma_file_cache.remove(metadata_path.to_str().unwrap());
     }
 
     fn try_read_from_memory_cache(
@@ -652,6 +657,7 @@ pub trait StatefulReaderAsync {
     ) -> io::Result<bool>;
 }
 
+
 #[async_trait::async_trait(?Send)]
 impl StatefulWriterAsync for StatefulEngine {
     async fn append_events_async(
@@ -725,33 +731,27 @@ impl StatefulWriterAsync for StatefulEngine {
             events,
         );
 
-        // Update caches that relate to indexing optimistically in case we have interleaved writers
-        self.event_batch_index_cache.set(
-            org_id,
-            aggregate_type_id,
-            aggregate_id,
-            next_event_batch_index,
-        );
-        self.event_index_cache
-            .set(org_id, aggregate_type_id, aggregate_id, final_event_index);
+        // Get file paths and writers
+        let (event_batch_path, metadata_path) =
+            self.get_aggregate_paths(org_id, aggregate_type_id, aggregate_id);
+        let event_batch_writer = self
+            .dma_file_cache
+            .create_append_writer(event_batch_path.to_str().unwrap()).await?;
+        let metadata_writer = self
+            .dma_file_cache
+            .create_append_writer(metadata_path.to_str().unwrap()).await?;
 
-        // Create DMA files for async writing
-        let (event_batch_file, metadata_file) =
-            self.create_dma_files_for_append(org_id, aggregate_type_id, aggregate_id).await?;
+        // Write to disk using stateless engine
+        let metadata = self.config.stateless_engine.append_event_batch_async(
+            &mut *event_batch_writer.borrow_mut(),
+            &mut *metadata_writer.borrow_mut(),
+            &mut self.bloom_filter,
+            &mut self.event_type_dedup,
+            self.config.compression_type,
+            &event_batch,
+        ).await?;
 
-        // Write to disk using async stateless engine
-        let metadata = self.config.stateless_engine
-            .append_event_batch_async(
-                &event_batch_file,
-                &metadata_file,
-                &mut self.bloom_filter,
-                &mut self.event_type_dedup,
-                self.config.compression_type,
-                &event_batch,
-            )
-            .await?;
-
-        // Update caches that relate to data after successful write
+        // Update caches
         self.update_client_event_index_cache(
             org_id,
             aggregate_type_id,
@@ -759,6 +759,12 @@ impl StatefulWriterAsync for StatefulEngine {
             client_id,
             &event_batch.events,
         )?;
+        self.event_batch_index_cache.set(
+            org_id,
+            aggregate_type_id,
+            aggregate_id,
+            next_event_batch_index,
+        );
         self.memory_cache.add(
             org_id,
             aggregate_type_id,
@@ -766,6 +772,8 @@ impl StatefulWriterAsync for StatefulEngine {
             event_batch,
             metadata.clone(),
         );
+        self.event_index_cache
+            .set(org_id, aggregate_type_id, aggregate_id, final_event_index);
 
         Ok(metadata)
     }
