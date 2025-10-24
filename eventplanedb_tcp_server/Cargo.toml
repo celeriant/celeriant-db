@@ -1,0 +1,24 @@
+[package]
+name = "eventplanedb_tcp_server"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eventplanedb_structures = { path = "../eventplanedb_structures" }
+eventplanedb_core = { path = "../eventplanedb_core" }
+env_logger.workspace = true
+fastrand.workspace = true
+futures-lite.workspace = true
+glommio.workspace = true
+log.workspace = true
+lru.workspace = true
+num_cpus.workspace = true
+bincode.workspace = true
+thiserror.workspace = true
+ahash.workspace = true
+mimalloc.workspace = true
+serde.workspace = true
+rmp-serde.workspace = true
+tempfile.workspace = true

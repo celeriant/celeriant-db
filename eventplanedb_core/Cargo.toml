@@ -1,0 +1,19 @@
+[package]
+name = "eventplanedb_core"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eventplanedb_structures = { path = "../eventplanedb_structures" }
+fastbloom.workspace = true
+lru.workspace = true
+glommio.workspace = true
+async-trait.workspace = true
+futures-lite.workspace = true
+bincode.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

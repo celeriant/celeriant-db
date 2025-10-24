@@ -1,7 +1,14 @@
 use std::{collections::HashMap, path::Path};
 
-use eventplanedb_storage_structures::{batch_metadata_item_pair::BatchMetadataItemPair, constants::METADATA_BATCH_SIZE_BYTES, event_item::EventItem, read_filters::ReadFilters};
+use eventplanedb_structures::{constants::METADATA_BATCH_SIZE_BYTES, event_batch_item::EventBatchItem, event_batch_metadata::EventBatchMetadata, event_item::EventItem};
 use glommio::{io::{DmaFile, DmaStreamWriter, DmaStreamWriterBuilder, OpenOptions}, GlommioError};
+
+use crate::files::read_filters::ReadFilters;
+
+pub struct BatchMetadataItemPair {
+    pub metadata: EventBatchMetadata,
+    pub item: EventBatchItem,
+}
 
 #[derive(Debug)]
 pub enum AppendError {
@@ -50,7 +57,7 @@ pub struct AppendOptions {
     pub server_timestamp_millis: u64,
 }
 
-pub struct AggregateWriteFileOperations {
+pub struct WriteOperations {
     metadata_stream_writer: DmaStreamWriter,
     event_batches_stream_writer: DmaStreamWriter,
     data_cache: Vec<BatchMetadataItemPair>,
@@ -83,7 +90,7 @@ fn stream_writer(dma_file: DmaFile, buffer_size: usize, write_behind: usize) -> 
 /// Also caches recent events and indexes in memory for fast read access
 /// If cached read fails, you should fall back to the AggregateReadFileOperations struct
 /// This struct never reads from disk, only appends. So it requires cache data on initialization.
-impl AggregateWriteFileOperations {
+impl WriteOperations {
 
     pub async fn open<P: AsRef<Path>>(
         path_metadata: P, 
@@ -93,7 +100,7 @@ impl AggregateWriteFileOperations {
         next_event_batch_index: u64, 
         client_event_indexes: HashMap<u128, u64>,
         aggregate_write_config: AggregateWriteConfig,
-        ) -> Result<AggregateWriteFileOperations, GlommioError<()>> {
+        ) -> Result<WriteOperations, GlommioError<()>> {
 
         let metadata_dma_file = append_only_file(path_metadata).await?;
         let metadata_stream_writer = stream_writer(
@@ -103,7 +110,7 @@ impl AggregateWriteFileOperations {
         let event_batches_stream_writer = stream_writer(
             event_batches_dma_file, aggregate_write_config.event_batches_buffer_size_bytes, aggregate_write_config.event_batches_write_behind_count);
 
-        Ok(AggregateWriteFileOperations {
+        Ok(WriteOperations {
             metadata_stream_writer, 
             event_batches_stream_writer, 
             data_cache, 
@@ -167,8 +174,8 @@ mod tests {
         std::fs::File::create(event_batches_path).unwrap();
     }
 
-    async fn empty_aggregate_write_file_operations(folder: &str) -> Result<AggregateWriteFileOperations, GlommioError<()>> {
-       let service = AggregateWriteFileOperations::open(
+    async fn empty_aggregate_write_file_operations(folder: &str) -> Result<WriteOperations, GlommioError<()>> {
+       let service = WriteOperations::open(
         format!("{}/metadata.bin", folder),
         format!("{}/event_batches.bin", folder),
             vec![],
