@@ -1,8 +1,6 @@
 use bincode::{Decode, Encode};
-use eventplanedb_core::files::{read_filters::ReadFilters, read_result::ReadResult};
-use eventplanedb_structures::{
-    event_batch_metadata::EventBatchMetadata, event_item::EventItem
-};
+use eventplanedb_structures::{read_filters::ReadFilters, read_result::ReadResult, append_result::AppendResult};
+use eventplanedb_structures::{event_item::EventItem};
 use serde::{Deserialize, Serialize};
 
 /// Wire protocol requests
@@ -45,7 +43,7 @@ pub enum Request {
 /// Wire protocol responses
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub enum Response {
-    AppendEventsResult(Result<EventBatchMetadata, String>),
+    AppendEventsResult(Result<AppendResult, String>),
     ReadFilteredResult(Result<ReadResult, String>),
     ExistsResult(Result<bool, String>),
     TrimStartResult(Result<(), String>),

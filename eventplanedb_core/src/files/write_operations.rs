@@ -1,9 +1,9 @@
-use std::{collections::HashMap, path::Path};
+use std::{collections::HashMap, path::Path, rc::Rc};
 
-use eventplanedb_structures::{constants::METADATA_BATCH_SIZE_BYTES, event_batch_item::EventBatchItem, event_batch_metadata::EventBatchMetadata, event_item::EventItem};
+use bincode::{Decode, Encode};
+use eventplanedb_structures::{append_result::AppendResult, constants::METADATA_BATCH_SIZE_BYTES, event_batch_item::EventBatchItem, event_batch_metadata::EventBatchMetadata, event_item::EventItem, read_filters::ReadFilters};
 use glommio::{io::{DmaFile, DmaStreamWriter, DmaStreamWriterBuilder, OpenOptions}, GlommioError};
-
-use crate::files::read_filters::ReadFilters;
+use serde::{Deserialize, Serialize};
 
 pub struct BatchMetadataItemPair {
     pub metadata: EventBatchMetadata,
@@ -35,13 +35,6 @@ impl From<GlommioError<()>> for AppendError {
     }
 }
 
-#[derive(Debug)]
-pub struct AppendResult {
-    pub event_indexes: Vec<u64>,
-    pub event_batch_index: u64,
-    pub events_written: usize,
-}
-
 pub struct AggregateWriteConfig {
     pub event_batches_buffer_size_bytes: usize,
     pub event_batches_write_behind_count: usize,
@@ -65,6 +58,7 @@ pub struct WriteOperations {
     next_event_batch_index: u64,
     client_event_indexes: HashMap<u128, u64>,
     max_data_cache_size_bytes: usize,
+    write_semaphore: Rc<glommio::sync::Semaphore>,
 }
 
 async fn append_only_file<P: AsRef<Path>>(path: P) -> Result<DmaFile, GlommioError<()>> {
@@ -118,7 +112,12 @@ impl WriteOperations {
             next_event_index, 
             client_event_indexes,
             max_data_cache_size_bytes: aggregate_write_config.max_data_cache_size_bytes,
+            write_semaphore: Rc::new(glommio::sync::Semaphore::new(1)),
         })
+    }
+
+    pub fn clone_write_semaphore(&self) -> Rc<glommio::sync::Semaphore> {
+        self.write_semaphore.clone()
     }
 
     pub async fn sync(&mut self) -> Result<(), GlommioError<()>> {

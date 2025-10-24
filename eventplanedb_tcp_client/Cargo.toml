@@ -1,0 +1,11 @@
+[package]
+name = "eventplanedb_tcp_client"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rand.workspace = true
+bincode.workspace = true
+eventplanedb_structures = { path = "../eventplanedb_structures" }

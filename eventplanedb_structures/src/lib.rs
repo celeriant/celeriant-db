@@ -4,3 +4,7 @@ pub mod event_item;
 pub mod compression_type;
 pub mod constants;
 pub mod serde;
+pub mod read_filters;
+pub mod read_result;
+pub mod append_result;
+pub mod aggregate_key;

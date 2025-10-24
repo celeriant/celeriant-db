@@ -1,6 +1,7 @@
 use bincode::{Decode, Encode};
-use eventplanedb_structures::event_batch_item::EventBatchItem;
 use serde::{Deserialize, Serialize};
+
+use crate::event_batch_item::EventBatchItem;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct ReadResult {

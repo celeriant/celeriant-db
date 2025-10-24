@@ -2,7 +2,8 @@ use core::fmt;
 use std::{cell::RefCell, collections::HashMap, os::fd::{IntoRawFd, FromRawFd}, rc::Rc};
 
 use ahash::AHasher;
-use eventplanedb_core::{aggregate_key::AggregateKey, files::write_operations::{self, AppendOptions, WriteOperations}};
+use eventplanedb_core::{files::write_operations::{AggregateWriteConfig, AppendOptions, WriteOperations}};
+use eventplanedb_structures::aggregate_key::AggregateKey;
 use std::hash::{Hash, Hasher};
 use glommio::{channels::channel_mesh::{Full, MeshBuilder, Senders}, enclose, net::TcpListener, spawn_local, CpuSet, LocalExecutorPoolBuilder, PoolPlacement};
 use futures_lite::AsyncWriteExt;
@@ -77,7 +78,7 @@ fn main() {
         // Our stateful storage engine, pinned per shard
         // Each shard has its own instance of the engine
         //TODO: Included in server configuration
-        let write_operations = Rc::new(RefCell::new(HashMap::new()));
+        let write_operations = Rc::new(RefCell::new(HashMap::<AggregateKey, Rc<RefCell<WriteOperations>>>::new()));
 
         // There is a receiver for each other shard that we must listen to
         // So we can spin up a thread for each of these, to allow concurrent processing from other shards
@@ -85,7 +86,7 @@ fn main() {
         // This is because we allow clients to have a persistent TCP connection to the server (pipelining)
         for (src_shard, stream) in receivers.streams() {
             let sender_clone = sender.clone();
-            let stateful_engine_clone = write_operations.clone();
+            let write_operations_clone = write_operations.clone();
             spawn_local(async move {
                 while let Some(msg) = stream.recv().await {
                     debug!("Shard {shard_id} received message from {src_shard} with value: {msg}");
@@ -98,13 +99,13 @@ fn main() {
 
                     // Other shard has accepted and already read the request data.
                     // So we can process it immediately and write the response back
-                    let response = process_on_shard_async(msg.value, &stateful_engine_clone).await;
+                    let response = process_on_shard_async(msg.value, &write_operations_clone).await;
                     write_to_tcp_stream(response, &mut tcp_stream, msg.is_bincode).await;
 
                     // Continue on the tcp connection to read more data from the client
                     // Note that we might still have to forward it on to the right shard again
                     // We need to clone sender again here as inside is a spawn local
-                    process_tcp_stream(shard_id, nbr_shards, tcp_stream, sender_clone.clone(), stateful_engine_clone.clone()).await;
+                    process_tcp_stream(shard_id, nbr_shards, tcp_stream, sender_clone.clone(), write_operations_clone.clone()).await;
                 }
             }).detach();
         }
@@ -152,7 +153,7 @@ async fn process_tcp_stream(
     nbr_shards: usize, 
     mut tcp_stream: glommio::net::TcpStream<glommio::net::Preallocated>, 
     sender: Rc<RefCell<Senders<Msg>>>,
-    write_operations: Rc<RefCell<HashMap<AggregateKey, WriteOperations>>>) {
+    write_operations: Rc<RefCell<HashMap<AggregateKey, Rc<RefCell<WriteOperations>>>>>) {
     // It's critical to spawn local here as this allows accepting of new connections
     // It also allows processing messages sent from other shards 
     // Both of these can happen with spawn local while still listening to an open TCP connection    
@@ -220,40 +221,72 @@ fn write_config() -> AggregateWriteConfig {
 /// It is called on the shard that is responsible for the given value
 async fn process_on_shard_async(
     request: Request,
-    write_operations: Rc<RefCell<HashMap<AggregateKey, WriteOperations>>>,
+    write_operations: &Rc<RefCell<HashMap<AggregateKey, Rc<RefCell<WriteOperations>>>>>,
 ) -> Response {
     
 
     match request {
         Request::AppendEvents { org_id, aggregate_type_id, aggregate_id, client_id, user_id, events, expected_event_batch_index, filter_duplicate_client_events } => {
 
-            let aggregate_key = AggregateKey::new(org_id, aggregate_type_id, aggregate_id);
-
-            if !write_operations.borrow().contains_key(&aggregate_key) {
-                let mut write_operations_borrow = write_operations.borrow_mut();
-                let write_operation = WriteOperations::open(
-                    "data/metadata.bin",
-                    "data/event_batches.bin",
-                    vec![],
-                    1,
-                    1,
-                    HashMap::new(),
-                    write_config(),
-                ).await.unwrap();
-                write_operations_borrow.insert(aggregate_key.clone(), write_operation);
+            // If "data/metadata.bin" doesn't exist, create it
+            // If "data/event_batches.bin" doesn't exist, create it
+            std::fs::create_dir_all("data").unwrap();
+            let metadata_path = "data/metadata.bin";
+            let event_batches_path = "data/event_batches.bin";
+            if !std::path::Path::new(metadata_path).exists() {
+                std::fs::File::create(metadata_path).unwrap();
+            }
+            if !std::path::Path::new(event_batches_path).exists() {
+                std::fs::File::create(event_batches_path).unwrap();
             }
 
-            let mut write_operation = write_operations.borrow().get_mut(&aggregate_key).unwrap();
-            
+            let aggregate_key = AggregateKey::new(org_id, aggregate_type_id, aggregate_id);
+
+            // try read-only access to get an Rc to the entry (no mutable borrow of the whole map)
+            let entry_rc = {
+                let map_ref = write_operations.borrow();
+                map_ref.get(&aggregate_key).cloned()
+            };
+
+            let entry_rc = match entry_rc {
+                Some(rc) => rc,
+                None => {
+                    // create outside of any borrow (open is async)
+                    let new_wo = WriteOperations::open(
+                        "data/metadata.bin",
+                        "data/event_batches.bin",
+                        vec![],
+                        1,
+                        1,
+                        HashMap::new(),
+                        write_config(),
+                    ).await.unwrap();
+                    let rc = Rc::new(RefCell::new(new_wo));
+                    // insert with a short-lived mutable borrow of the map
+                    write_operations.borrow_mut().insert(aggregate_key.clone(), rc.clone());
+                    rc
+                }
+            };
+
+            // now borrow_mut the single WriteOperations entry
+            let mut wo = entry_rc.borrow_mut();
             let append_options = AppendOptions {
-                    client_id,
-                    user_id,
-                    expected_event_batch_index,
-                    enforce_client_idempotency: filter_duplicate_client_events,
-                    server_timestamp_millis: 0
-                };
-            let result = write_operation.append_events(events, &append_options).await;
-            Response::AppendEventsResult(result.map_err(|e| format!("{:?}", e)))
+                client_id,
+                user_id,
+                expected_event_batch_index,
+                enforce_client_idempotency: filter_duplicate_client_events,
+                server_timestamp_millis: 0,
+            };
+
+            {
+                let write_semaphore = wo.clone_write_semaphore();
+                let _permit = write_semaphore.acquire_permit(1).await.unwrap();
+                let result = wo.append_events(events, &append_options).await.unwrap();
+                Response::AppendEventsResult(Ok(result))
+            }
+
+            //TODO: Handle errors properly
+            // Response::AppendEventsResult(result.map_err(|e| format!("{:?}", e)))
         }
         Request::ReadFiltered { org_id, aggregate_type_id, aggregate_id, filters } => todo!(),
         Request::Exists { org_id, aggregate_type_id, aggregate_id } => todo!(),
