@@ -9,3 +9,7 @@ license.workspace = true
 bincode.workspace = true
 serde.workspace = true
 base64.workspace = true
+zstd.workspace = true
+brotli.workspace = true
+flate2.workspace = true
+snap.workspace = true

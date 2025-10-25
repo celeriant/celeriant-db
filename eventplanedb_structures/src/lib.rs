@@ -8,3 +8,4 @@ pub mod read_filters;
 pub mod read_result;
 pub mod append_result;
 pub mod aggregate_key;
+pub mod wire_format;

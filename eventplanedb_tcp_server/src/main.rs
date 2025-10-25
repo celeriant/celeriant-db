@@ -1,11 +1,11 @@
 use core::fmt;
-use std::{cell::RefCell, collections::HashMap, os::fd::{IntoRawFd, FromRawFd}, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, fmt::format, os::fd::{FromRawFd, IntoRawFd}, path, rc::Rc};
 
 use ahash::AHasher;
 use eventplanedb_core::{files::write_operations::{AggregateWriteConfig, AppendOptions, WriteOperations}};
-use eventplanedb_structures::aggregate_key::AggregateKey;
+use eventplanedb_structures::{aggregate_key::AggregateKey, compression_type::CompressionType};
 use std::hash::{Hash, Hasher};
-use glommio::{channels::channel_mesh::{Full, MeshBuilder, Senders}, enclose, net::TcpListener, spawn_local, CpuSet, LocalExecutorPoolBuilder, PoolPlacement};
+use glommio::{channels::channel_mesh::{Full, MeshBuilder, Senders}, enclose, net::TcpListener, spawn_local, sync::Semaphore, CpuSet, LocalExecutorPoolBuilder, PoolPlacement};
 use futures_lite::AsyncWriteExt;
 use log::{debug, error, info};
 
@@ -78,7 +78,8 @@ fn main() {
         // Our stateful storage engine, pinned per shard
         // Each shard has its own instance of the engine
         //TODO: Included in server configuration
-        let write_operations = Rc::new(RefCell::new(HashMap::<AggregateKey, Rc<RefCell<WriteOperations>>>::new()));
+        let write_operations = Rc::new(RefCell::new(HashMap::<AggregateKey, Rc<RefCell<WriteOperations>>>::new()));        
+        let semaphores = Rc::new(RefCell::new(HashMap::<AggregateKey, Rc<Semaphore>>::new()));
 
         // There is a receiver for each other shard that we must listen to
         // So we can spin up a thread for each of these, to allow concurrent processing from other shards
@@ -87,6 +88,7 @@ fn main() {
         for (src_shard, stream) in receivers.streams() {
             let sender_clone = sender.clone();
             let write_operations_clone = write_operations.clone();
+            let semaphores = semaphores.clone();
             spawn_local(async move {
                 while let Some(msg) = stream.recv().await {
                     debug!("Shard {shard_id} received message from {src_shard} with value: {msg}");
@@ -99,13 +101,13 @@ fn main() {
 
                     // Other shard has accepted and already read the request data.
                     // So we can process it immediately and write the response back
-                    let response = process_on_shard_async(msg.value, &write_operations_clone).await;
+                    let response = process_on_shard_async(msg.value, &write_operations_clone, &semaphores).await;
                     write_to_tcp_stream(response, &mut tcp_stream, msg.is_bincode).await;
 
                     // Continue on the tcp connection to read more data from the client
                     // Note that we might still have to forward it on to the right shard again
                     // We need to clone sender again here as inside is a spawn local
-                    process_tcp_stream(shard_id, nbr_shards, tcp_stream, sender_clone.clone(), write_operations_clone.clone()).await;
+                    process_tcp_stream(shard_id, nbr_shards, tcp_stream, sender_clone.clone(), write_operations_clone.clone(), semaphores.clone()).await;
                 }
             }).detach();
         }
@@ -125,7 +127,7 @@ fn main() {
                         Ok(addr) => debug!("Shard {shard_id} accepted connection from {addr}"),
                         Err(_) => error!("Shard {shard_id} accepted connection from unknown address"),
                     }
-                    process_tcp_stream(shard_id, nbr_shards, tcp_stream.buffered(), sender.clone(), write_operations.clone()).await;
+                    process_tcp_stream(shard_id, nbr_shards, tcp_stream.buffered(), sender.clone(), write_operations.clone(), semaphores.clone()).await;
                 }
                 Err(e) => {
                     error!("Shard {shard_id} failed to accept connection: {e}");
@@ -153,7 +155,9 @@ async fn process_tcp_stream(
     nbr_shards: usize, 
     mut tcp_stream: glommio::net::TcpStream<glommio::net::Preallocated>, 
     sender: Rc<RefCell<Senders<Msg>>>,
-    write_operations: Rc<RefCell<HashMap<AggregateKey, Rc<RefCell<WriteOperations>>>>>) {
+    write_operations: Rc<RefCell<HashMap<AggregateKey, Rc<RefCell<WriteOperations>>>>>,
+    semaphores: Rc<RefCell<HashMap<AggregateKey, Rc<Semaphore>>>>,
+) {
     // It's critical to spawn local here as this allows accepting of new connections
     // It also allows processing messages sent from other shards 
     // Both of these can happen with spawn local while still listening to an open TCP connection    
@@ -200,7 +204,7 @@ async fn process_tcp_stream(
                     }
                 }
             } else {
-                let response = process_on_shard_async(request, &write_operations).await;
+                let response = process_on_shard_async(request, &write_operations, &semaphores).await;
                 write_to_tcp_stream(response, &mut tcp_stream, is_bincode).await;
             }
         }
@@ -222,22 +226,29 @@ fn write_config() -> AggregateWriteConfig {
 async fn process_on_shard_async(
     request: Request,
     write_operations: &Rc<RefCell<HashMap<AggregateKey, Rc<RefCell<WriteOperations>>>>>,
+    semaphores: &Rc<RefCell<HashMap<AggregateKey, Rc<Semaphore>>>>,
 ) -> Response {
     
 
     match request {
         Request::AppendEvents { org_id, aggregate_type_id, aggregate_id, client_id, user_id, events, expected_event_batch_index, filter_duplicate_client_events } => {
 
-            // If "data/metadata.bin" doesn't exist, create it
-            // If "data/event_batches.bin" doesn't exist, create it
-            std::fs::create_dir_all("data").unwrap();
-            let metadata_path = "data/metadata.bin";
-            let event_batches_path = "data/event_batches.bin";
-            if !std::path::Path::new(metadata_path).exists() {
-                std::fs::File::create(metadata_path).unwrap();
+            let base_folder = format!("data/{org_id}/{aggregate_type_id}/{aggregate_id}");
+            if let Err(e) = std::fs::create_dir_all(&base_folder) {
+                return Response::AppendEventsResult(Err(format!("Failed to create directory structure: {}", e)));
             }
-            if !std::path::Path::new(event_batches_path).exists() {
-                std::fs::File::create(event_batches_path).unwrap();
+
+            // Create metadata and event batch files in the aggregate folder
+            let path_metadata = format!("{}/metadata.bin", base_folder);
+            let path_event_batches = format!("{}/event_batches.bin", base_folder);
+
+            // Create files if they don't exist
+            for path in [&path_metadata, &path_event_batches] {
+                if !std::path::Path::new(path).exists() {
+                    if let Err(e) = std::fs::File::create(path) {
+                        return Response::AppendEventsResult(Err(format!("Failed to create file {}: {}", path, e)));
+                    }
+                }
             }
 
             let aggregate_key = AggregateKey::new(org_id, aggregate_type_id, aggregate_id);
@@ -253,8 +264,8 @@ async fn process_on_shard_async(
                 None => {
                     // create outside of any borrow (open is async)
                     let new_wo = WriteOperations::open(
-                        "data/metadata.bin",
-                        "data/event_batches.bin",
+                        &path_metadata,
+                        &path_event_batches,
                         vec![],
                         1,
                         1,
@@ -268,25 +279,47 @@ async fn process_on_shard_async(
                 }
             };
 
-            // now borrow_mut the single WriteOperations entry
-            let mut wo = entry_rc.borrow_mut();
-            let append_options = AppendOptions {
-                client_id,
-                user_id,
-                expected_event_batch_index,
-                enforce_client_idempotency: filter_duplicate_client_events,
-                server_timestamp_millis: 0,
+            // TODO: In a similar way, we need to create or get a semaphore for this aggregate_key
+            let sem_entry_rc = {
+                let map_ref = semaphores.borrow();
+                map_ref.get(&aggregate_key).cloned()
             };
 
-            {
-                let write_semaphore = wo.clone_write_semaphore();
-                let _permit = write_semaphore.acquire_permit(1).await.unwrap();
-                let result = wo.append_events(events, &append_options).await.unwrap();
-                Response::AppendEventsResult(Ok(result))
-            }
+            let sem_entry_rc = match sem_entry_rc {
+                Some(rc) => rc,
+                None => {
+                    let rc = Rc::new(Semaphore::new(1));
+                    // insert with a short-lived mutable borrow of the map
+                    semaphores.borrow_mut().insert(aggregate_key.clone(), rc.clone());
+                    rc
+                }
+            };
+            
+            match sem_entry_rc.acquire_permit(1).await {
+                    Ok(_permit) => {
 
-            //TODO: Handle errors properly
-            // Response::AppendEventsResult(result.map_err(|e| format!("{:?}", e)))
+                        // now borrow_mut the single WriteOperations entry
+                        let mut wo = entry_rc.borrow_mut();
+                        let append_options = AppendOptions {
+                            client_id,
+                            user_id,
+                            expected_event_batch_index,
+                            enforce_client_idempotency: filter_duplicate_client_events,
+                            server_timestamp_millis: 0,
+                            compression_type: CompressionType::Zstd { level: 3 }
+                        };
+
+                        // Use a block to ensure write_semaphore is released
+                        let result = match wo.append_events(events, &append_options).await {
+                                        Ok(result) => Response::AppendEventsResult(Ok(result)),
+                                        Err(e) => Response::AppendEventsResult(Err(format!("Failed to append events: {:?}", e))),
+                                    };
+
+                        result
+                    
+                    },
+                    Err(e) => Response::AppendEventsResult(Err(format!("Failed to acquire write lock: {}", e))),
+                }
         }
         Request::ReadFiltered { org_id, aggregate_type_id, aggregate_id, filters } => todo!(),
         Request::Exists { org_id, aggregate_type_id, aggregate_id } => todo!(),
