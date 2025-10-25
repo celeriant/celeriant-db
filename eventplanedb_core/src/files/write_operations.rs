@@ -1,9 +1,20 @@
-use std::{collections::{HashMap, HashSet}, path::Path, rc::Rc};
+use std::{collections::{HashMap, HashSet}, path::Path};
 
 use eventplanedb_structures::{append_result::AppendResult, compression_type::CompressionType, constants::{BINCODE_CONFIG_FIXED, BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED, METADATA_BATCH_SIZE_BYTES}, event_batch_item::EventBatchItem, event_batch_metadata::{EventBatchMetadata, EventTypesData}, event_item::EventItem, read_filters::ReadFilters, wire_format::to_wire_format_variable};
 use fastbloom::BloomFilter;
 use futures_lite::AsyncWriteExt;
 use glommio::{io::{DmaFile, DmaStreamWriter, DmaStreamWriterBuilder, OpenOptions}, GlommioError};
+
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    time::Duration,
+};
+use glommio::{
+    timer::sleep,
+};
+
+use crate::local_event::LocalEvent;
 
 pub struct BatchMetadataItemPair {
     pub metadata: EventBatchMetadata,
@@ -59,6 +70,7 @@ pub struct AggregateWriteConfig {
     pub event_batches_write_behind_count: usize,
     pub metadata_write_behind_count: usize,
     pub max_data_cache_size_bytes: usize,
+    pub wal_sync_delay_micros: u64,
 }
 
 pub struct AppendOptions {
@@ -78,9 +90,10 @@ pub struct WriteOperations {
     next_event_batch_index: u64,
     client_event_indexes: HashMap<u128, u64>,
     max_data_cache_size_bytes: usize,
-    write_semaphore: Rc<glommio::sync::Semaphore>,
     bloom_filter: BloomFilter,
     event_type_dedup: HashSet<u64>,
+    wal_sync_delay: Duration,
+    wal_sync_event: RefCell<Option<Rc<LocalEvent>>>,
 }
 
 async fn append_only_file<P: AsRef<Path>>(path: P) -> Result<DmaFile, GlommioError<()>> {
@@ -173,20 +186,51 @@ impl WriteOperations {
             next_event_index, 
             client_event_indexes,
             max_data_cache_size_bytes: aggregate_write_config.max_data_cache_size_bytes,
-            write_semaphore: Rc::new(glommio::sync::Semaphore::new(1)),
             bloom_filter,
             event_type_dedup: HashSet::new(),
+            wal_sync_delay: Duration::from_micros(aggregate_write_config.wal_sync_delay_micros),
+            wal_sync_event: RefCell::new(None),
         })
     }
 
-    pub fn clone_write_semaphore(&self) -> Rc<glommio::sync::Semaphore> {
-        self.write_semaphore.clone()
+    pub async fn sync(&mut self) -> Result<(), AppendError> {
+
+        self.event_batches_stream_writer.sync().await
+            .map_err(|e| AppendError::WriteError { 
+                message: format!("Failed to flush event batch writer: {e}")
+            })?;
+        self.metadata_stream_writer.sync().await
+            .map_err(|e| AppendError::WriteError { 
+                message: format!("Failed to flush event batch writer: {e}")
+            })?;
+        Ok(())
     }
 
-    pub async fn sync(&mut self) -> Result<(), GlommioError<()>> {
-        self.metadata_stream_writer.sync().await?;
-        self.event_batches_stream_writer.sync().await?;
-
+    async fn sync_with_delay(&mut self) -> Result<(), AppendError> {
+        // Check if there's already a sync in progress
+        let maybe_event = self.wal_sync_event.borrow().as_ref().cloned();
+        
+        if let Some(event) = maybe_event {
+            // A sync is already scheduled, wait for it
+            event.listen().await;
+        } else {
+            // No sync scheduled, create new event and schedule one
+            let event = Rc::new(LocalEvent::new());
+            self.wal_sync_event.replace(Some(event.clone()));
+            
+            // Sleep for the delay period
+            sleep(self.wal_sync_delay).await;
+            
+            // Clear the event before sync
+            self.wal_sync_event.replace(None);
+            
+            // Do the actual sync
+            self.sync().await?;
+            
+            // Notify waiters
+            event.notify();
+        }
+        
         Ok(())
     }
 
@@ -318,9 +362,17 @@ impl WriteOperations {
                 message: format!("Failed to write metadata: {e}")
             })?;
 
-        self.sync().await?;
+        // If we sync on every append, we kill thoughput. But we don't want to return ack to clients until data is safely on disk.
+        // So we must do a periodic sync (eg. every 20ms) and force all writes to wait.
+        // If can sync now (haven't synced for > 20ms), do it
+        // else, wait until either the remaining delay time has passed then sync;
+        // or another task (same glommio executor thread) for this aggregate beats us to the sync
+
+        // Schedule sync and wait for it to complete
+        self.sync_with_delay().await?;
         
         // Update in-memory cache with new batch and metadata
+        // TODO: enforce max cache size by evicting oldest entries if needed using max_data_cache_size_bytes
         self.data_cache.push(BatchMetadataItemPair {
             metadata: event_batch_metadata,
             item: event_batch_item,

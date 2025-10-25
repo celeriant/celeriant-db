@@ -106,7 +106,7 @@ fn main() {
 
     // Updated configuration for higher throughput
     let server_addr = "127.0.0.1:10000";
-    let num_connections = 50; // Increased concurrent connections
+    let num_connections = 500; // Increased concurrent connections
     let test_duration = Duration::from_secs(30); // Run for 30 seconds
 
     println!("Configuration:");

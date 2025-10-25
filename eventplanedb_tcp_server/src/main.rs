@@ -214,10 +214,11 @@ async fn process_tcp_stream(
 //TODO: Remove write config hardcoded
 fn write_config() -> AggregateWriteConfig {
     AggregateWriteConfig {
-        event_batches_buffer_size_bytes: 1024 * 1024,
+        event_batches_buffer_size_bytes: 1024,
         event_batches_write_behind_count: 4,
         metadata_write_behind_count: 4,
         max_data_cache_size_bytes: 10 * 1024 * 1024,
+        wal_sync_delay_micros: 20,
     }
 }
 
@@ -279,7 +280,6 @@ async fn process_on_shard_async(
                 }
             };
 
-            // TODO: In a similar way, we need to create or get a semaphore for this aggregate_key
             let sem_entry_rc = {
                 let map_ref = semaphores.borrow();
                 map_ref.get(&aggregate_key).cloned()
@@ -306,7 +306,7 @@ async fn process_on_shard_async(
                             expected_event_batch_index,
                             enforce_client_idempotency: filter_duplicate_client_events,
                             server_timestamp_millis: 0,
-                            compression_type: CompressionType::Zstd { level: 3 }
+                            compression_type: CompressionType::Brotli { level: 6 }
                         };
 
                         // Use a block to ensure write_semaphore is released
