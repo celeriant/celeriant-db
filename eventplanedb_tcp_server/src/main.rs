@@ -1,11 +1,11 @@
 use core::fmt;
-use std::{cell::RefCell, collections::HashMap, fmt::format, os::fd::{FromRawFd, IntoRawFd}, path, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, fmt::format, os::fd::{FromRawFd, IntoRawFd}, path, rc::Rc, time::Duration};
 
 use ahash::AHasher;
-use eventplanedb_core::{files::write_operations::{AggregateWriteConfig, AppendOptions, WriteOperations}};
+use eventplanedb_core::{files::write_operations::{AggregateWriteConfig, AppendError, AppendOptions, WriteOperations}, local_event::LocalEvent};
 use eventplanedb_structures::{aggregate_key::AggregateKey, compression_type::CompressionType};
 use std::hash::{Hash, Hasher};
-use glommio::{channels::channel_mesh::{Full, MeshBuilder, Senders}, enclose, net::TcpListener, spawn_local, sync::Semaphore, CpuSet, LocalExecutorPoolBuilder, PoolPlacement};
+use glommio::{channels::channel_mesh::{Full, MeshBuilder, Senders}, enclose, net::TcpListener, spawn_local, sync::Semaphore, timer::sleep, CpuSet, LocalExecutorPoolBuilder, PoolPlacement};
 use futures_lite::AsyncWriteExt;
 use log::{debug, error, info};
 
@@ -78,7 +78,8 @@ fn main() {
         // Our stateful storage engine, pinned per shard
         // Each shard has its own instance of the engine
         //TODO: Included in server configuration
-        let write_operations = Rc::new(RefCell::new(HashMap::<AggregateKey, Rc<RefCell<WriteOperations>>>::new()));        
+        let write_operations = Rc::new(RefCell::new(HashMap::<AggregateKey, Rc<RefCell<WriteOperations>>>::new()));
+        let wal_sync_events = Rc::new(RefCell::new(HashMap::<AggregateKey, Rc<RefCell<Option<Rc<LocalEvent>>>>>::new()));
         let semaphores = Rc::new(RefCell::new(HashMap::<AggregateKey, Rc<Semaphore>>::new()));
 
         // There is a receiver for each other shard that we must listen to
@@ -88,6 +89,7 @@ fn main() {
         for (src_shard, stream) in receivers.streams() {
             let sender_clone = sender.clone();
             let write_operations_clone = write_operations.clone();
+            let wal_sync_events = wal_sync_events.clone();
             let semaphores = semaphores.clone();
             spawn_local(async move {
                 while let Some(msg) = stream.recv().await {
@@ -101,13 +103,13 @@ fn main() {
 
                     // Other shard has accepted and already read the request data.
                     // So we can process it immediately and write the response back
-                    let response = process_on_shard_async(msg.value, &write_operations_clone, &semaphores).await;
+                    let response = process_on_shard_async(msg.value, &write_operations_clone, &wal_sync_events, &semaphores).await;
                     write_to_tcp_stream(response, &mut tcp_stream, msg.is_bincode).await;
 
                     // Continue on the tcp connection to read more data from the client
                     // Note that we might still have to forward it on to the right shard again
                     // We need to clone sender again here as inside is a spawn local
-                    process_tcp_stream(shard_id, nbr_shards, tcp_stream, sender_clone.clone(), write_operations_clone.clone(), semaphores.clone()).await;
+                    process_tcp_stream(shard_id, nbr_shards, tcp_stream, sender_clone.clone(), write_operations_clone.clone(), wal_sync_events.clone(), semaphores.clone()).await;
                 }
             }).detach();
         }
@@ -127,7 +129,7 @@ fn main() {
                         Ok(addr) => debug!("Shard {shard_id} accepted connection from {addr}"),
                         Err(_) => error!("Shard {shard_id} accepted connection from unknown address"),
                     }
-                    process_tcp_stream(shard_id, nbr_shards, tcp_stream.buffered(), sender.clone(), write_operations.clone(), semaphores.clone()).await;
+                    process_tcp_stream(shard_id, nbr_shards, tcp_stream.buffered(), sender.clone(), write_operations.clone(), wal_sync_events.clone(), semaphores.clone()).await;
                 }
                 Err(e) => {
                     error!("Shard {shard_id} failed to accept connection: {e}");
@@ -156,6 +158,7 @@ async fn process_tcp_stream(
     mut tcp_stream: glommio::net::TcpStream<glommio::net::Preallocated>, 
     sender: Rc<RefCell<Senders<Msg>>>,
     write_operations: Rc<RefCell<HashMap<AggregateKey, Rc<RefCell<WriteOperations>>>>>,
+    wal_sync_events: Rc<RefCell<HashMap<AggregateKey, Rc<RefCell<Option<Rc<LocalEvent>>>>>>>,
     semaphores: Rc<RefCell<HashMap<AggregateKey, Rc<Semaphore>>>>,
 ) {
     // It's critical to spawn local here as this allows accepting of new connections
@@ -204,7 +207,7 @@ async fn process_tcp_stream(
                     }
                 }
             } else {
-                let response = process_on_shard_async(request, &write_operations, &semaphores).await;
+                let response = process_on_shard_async(request, &write_operations, &wal_sync_events, &semaphores).await;
                 write_to_tcp_stream(response, &mut tcp_stream, is_bincode).await;
             }
         }
@@ -214,12 +217,50 @@ async fn process_tcp_stream(
 //TODO: Remove write config hardcoded
 fn write_config() -> AggregateWriteConfig {
     AggregateWriteConfig {
-        event_batches_buffer_size_bytes: 1024,
-        event_batches_write_behind_count: 4,
-        metadata_write_behind_count: 4,
         max_data_cache_size_bytes: 10 * 1024 * 1024,
-        wal_sync_delay_micros: 20,
     }
+}
+
+
+async fn sync_with_delay(write_operations: &Rc<RefCell<WriteOperations>>, wal_sync_event: Rc<RefCell<Option<Rc<LocalEvent>>>>, wal_sync_delay: Duration, sem_entry_rc: Rc<Semaphore>) -> Result<(), Response> {
+    // Check if there's already a sync in progress
+    let maybe_event = wal_sync_event.borrow().as_ref().cloned();
+    
+    if let Some(event) = maybe_event {
+        // A sync is already scheduled, wait for it
+        //TODO: Not propogating errors from the sync here
+        event.listen().await;
+    } else {
+        // No sync scheduled, create new event and schedule one
+        let event = Rc::new(LocalEvent::new());
+        wal_sync_event.replace(Some(event.clone()));
+        
+        // Sleep for the delay period
+        sleep(wal_sync_delay).await;
+        
+        // Clear the event before sync
+        wal_sync_event.replace(None);
+        
+        // Do the actual sync
+        {
+            let try_permit = sem_entry_rc.acquire_permit(1).await;
+            if try_permit.is_err() {
+                return Err(Response::AppendEventsResult(Err("Failed to acquire write lock for sync".to_string())));
+            }
+
+            let mut write_operations = write_operations.borrow_mut();
+            let try_sync = write_operations.sync_with_rollback().await;
+            if try_sync.is_err() {
+                let err = try_sync.err().unwrap();
+                return Err(Response::AppendEventsResult(Err(format!("Failed to sync events to disk: {:?}", err))));
+            }
+        }
+        
+        // Notify waiters
+        event.notify();
+    }
+    
+    Ok(())
 }
 
 /// This is a synchronous function that blocks the current thread
@@ -227,6 +268,7 @@ fn write_config() -> AggregateWriteConfig {
 async fn process_on_shard_async(
     request: Request,
     write_operations: &Rc<RefCell<HashMap<AggregateKey, Rc<RefCell<WriteOperations>>>>>,
+    wal_sync_events: &Rc<RefCell<HashMap<AggregateKey, Rc<RefCell<Option<Rc<LocalEvent>>>>>>>,
     semaphores: &Rc<RefCell<HashMap<AggregateKey, Rc<Semaphore>>>>,
 ) -> Response {
     
@@ -294,32 +336,49 @@ async fn process_on_shard_async(
                     rc
                 }
             };
-            
-            match sem_entry_rc.acquire_permit(1).await {
-                    Ok(_permit) => {
 
-                        // now borrow_mut the single WriteOperations entry
-                        let mut wo = entry_rc.borrow_mut();
-                        let append_options = AppendOptions {
-                            client_id,
-                            user_id,
-                            expected_event_batch_index,
-                            enforce_client_idempotency: filter_duplicate_client_events,
-                            server_timestamp_millis: 0,
-                            compression_type: CompressionType::Brotli { level: 6 }
-                        };
-
-                        // Use a block to ensure write_semaphore is released
-                        let result = match wo.append_events(events, &append_options).await {
-                                        Ok(result) => Response::AppendEventsResult(Ok(result)),
-                                        Err(e) => Response::AppendEventsResult(Err(format!("Failed to append events: {:?}", e))),
-                                    };
-
-                        result
-                    
-                    },
-                    Err(e) => Response::AppendEventsResult(Err(format!("Failed to acquire write lock: {}", e))),
+            let result: Response;
+            {
+                let try_permit = sem_entry_rc.acquire_permit(1).await;
+                if try_permit.is_err() {
+                    Response::AppendEventsResult(Err("Failed to acquire write lock for sync".to_string()));
                 }
+
+                let mut wo = entry_rc.borrow_mut();
+                let append_options = AppendOptions {
+                    client_id,
+                    user_id,
+                    expected_event_batch_index,
+                    enforce_client_idempotency: filter_duplicate_client_events,
+                    server_timestamp_millis: 0,
+                    compression_type: CompressionType::Snappy
+                };
+                result = match wo.queue_events_in_memory(events, &append_options) {
+                    Ok(result) => Response::AppendEventsResult(Ok(result)),
+                    Err(e) => Response::AppendEventsResult(Err(format!("Failed to append events: {:?}", e))),
+                };
+            }
+
+            let wal_sync_event = {
+                let map_ref = wal_sync_events.borrow();
+                map_ref.get(&aggregate_key).cloned()
+            };
+
+            let wal_sync_event = match wal_sync_event {
+                Some(rc) => rc,
+                None => {
+                    let rc: Rc<RefCell<Option<Rc<LocalEvent>>>> = Rc::new(RefCell::new(None));
+                    // insert with a short-lived mutable borrow of the map
+                    wal_sync_events.borrow_mut().insert(aggregate_key.clone(), rc.clone());
+                    rc
+                }
+            };
+
+            // // Have dropped mutable borrow, so now wait for write to disk
+            match sync_with_delay(&entry_rc, wal_sync_event, Duration::from_micros(10), sem_entry_rc).await {
+                Ok(_) => result,
+                Err(e) => e,
+            }
         }
         Request::ReadFiltered { org_id, aggregate_type_id, aggregate_id, filters } => todo!(),
         Request::Exists { org_id, aggregate_type_id, aggregate_id } => todo!(),

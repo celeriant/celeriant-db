@@ -66,11 +66,7 @@ impl From<GlommioError<()>> for AppendError {
 }
 
 pub struct AggregateWriteConfig {
-    pub event_batches_buffer_size_bytes: usize,
-    pub event_batches_write_behind_count: usize,
-    pub metadata_write_behind_count: usize,
     pub max_data_cache_size_bytes: usize,
-    pub wal_sync_delay_micros: u64,
 }
 
 pub struct AppendOptions {
@@ -83,8 +79,8 @@ pub struct AppendOptions {
 }
 
 pub struct WriteOperations {
-    metadata_stream_writer: DmaStreamWriter,
-    event_batches_stream_writer: DmaStreamWriter,
+    metadata_dma_file: DmaFile,
+    event_batches_dma_file: DmaFile,
     data_cache: Vec<BatchMetadataItemPair>,
     next_event_index: u64,
     next_event_batch_index: u64,
@@ -92,8 +88,7 @@ pub struct WriteOperations {
     max_data_cache_size_bytes: usize,
     bloom_filter: BloomFilter,
     event_type_dedup: HashSet<u64>,
-    wal_sync_delay: Duration,
-    wal_sync_event: RefCell<Option<Rc<LocalEvent>>>,
+    append_event_batch_queue: Vec<AppendEventBatchQueueItem>,
 }
 
 async fn append_only_file<P: AsRef<Path>>(path: P) -> Result<DmaFile, GlommioError<()>> {
@@ -106,13 +101,6 @@ async fn append_only_file<P: AsRef<Path>>(path: P) -> Result<DmaFile, GlommioErr
         .await?;
 
     Ok(dma_file)
-}
-
-fn stream_writer(dma_file: DmaFile, buffer_size: usize, write_behind: usize) -> DmaStreamWriter {
-    DmaStreamWriterBuilder::new(dma_file)
-        .with_buffer_size(buffer_size)
-        .with_write_behind(write_behind)
-        .build()
 }
 
 fn extract_unique_event_types(events: &[EventItem]) -> ([u64; 4], bool) {
@@ -150,6 +138,13 @@ fn extract_unique_event_types(events: &[EventItem]) -> ([u64; 4], bool) {
     (bloom_or_event_types, use_bloom)
 }
 
+struct AppendEventBatchQueueItem {
+    compressed_event_batch_item: Vec<u8>,
+    event_batch_item: EventBatchItem,
+    metadata_bytes: Vec<u8>,
+    event_batch_metadata: EventBatchMetadata,
+}
+
 /// Allows appending new events for an aggregate. Note this doesn't handle fdatasync.
 /// Also caches recent events and indexes in memory for fast read access
 /// If cached read fails, you should fall back to the AggregateReadFileOperations struct
@@ -167,20 +162,15 @@ impl WriteOperations {
         ) -> Result<WriteOperations, GlommioError<()>> {
 
         let metadata_dma_file = append_only_file(path_metadata).await?;
-        let metadata_stream_writer = stream_writer(
-            metadata_dma_file, METADATA_BATCH_SIZE_BYTES, aggregate_write_config.metadata_write_behind_count);
-
         let event_batches_dma_file = append_only_file(path_event_batches).await?;
-        let event_batches_stream_writer = stream_writer(
-            event_batches_dma_file, aggregate_write_config.event_batches_buffer_size_bytes, aggregate_write_config.event_batches_write_behind_count);
 
         let bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8)
             .seed(&BLOOM_HASH_SEED)
             .hashes(BLOOM_HASH_COUNT);
         
         Ok(WriteOperations {
-            metadata_stream_writer, 
-            event_batches_stream_writer, 
+            metadata_dma_file, 
+            event_batches_dma_file, 
             data_cache, 
             next_event_batch_index, 
             next_event_index, 
@@ -188,50 +178,8 @@ impl WriteOperations {
             max_data_cache_size_bytes: aggregate_write_config.max_data_cache_size_bytes,
             bloom_filter,
             event_type_dedup: HashSet::new(),
-            wal_sync_delay: Duration::from_micros(aggregate_write_config.wal_sync_delay_micros),
-            wal_sync_event: RefCell::new(None),
+            append_event_batch_queue: vec![],
         })
-    }
-
-    pub async fn sync(&mut self) -> Result<(), AppendError> {
-
-        self.event_batches_stream_writer.sync().await
-            .map_err(|e| AppendError::WriteError { 
-                message: format!("Failed to flush event batch writer: {e}")
-            })?;
-        self.metadata_stream_writer.sync().await
-            .map_err(|e| AppendError::WriteError { 
-                message: format!("Failed to flush event batch writer: {e}")
-            })?;
-        Ok(())
-    }
-
-    async fn sync_with_delay(&mut self) -> Result<(), AppendError> {
-        // Check if there's already a sync in progress
-        let maybe_event = self.wal_sync_event.borrow().as_ref().cloned();
-        
-        if let Some(event) = maybe_event {
-            // A sync is already scheduled, wait for it
-            event.listen().await;
-        } else {
-            // No sync scheduled, create new event and schedule one
-            let event = Rc::new(LocalEvent::new());
-            self.wal_sync_event.replace(Some(event.clone()));
-            
-            // Sleep for the delay period
-            sleep(self.wal_sync_delay).await;
-            
-            // Clear the event before sync
-            self.wal_sync_event.replace(None);
-            
-            // Do the actual sync
-            self.sync().await?;
-            
-            // Notify waiters
-            event.notify();
-        }
-        
-        Ok(())
     }
 
     fn create_bloom_filter_bytes(
@@ -253,9 +201,77 @@ impl WriteOperations {
         self.bloom_filter.as_slice().try_into().expect("Conversion failed")
     }
 
+    async fn sync(&mut self) -> Result<(), AppendError> {
+
+        let total_metadata_size: usize = self.append_event_batch_queue.iter()
+            .map(|item| item.metadata_bytes.len())
+            .sum();
+        let total_event_batch_size: usize = self.append_event_batch_queue.iter()
+            .map(|item| item.compressed_event_batch_item.len())
+            .sum();
+        
+        let total_metadata_size = self.metadata_dma_file.align_up(total_metadata_size as u64) as usize;
+        let total_event_batch_size = self.event_batches_dma_file.align_up(total_event_batch_size as u64) as usize;
+
+        let mut writer_metadata = DmaStreamWriterBuilder::new(self.metadata_dma_file.dup()?)
+            .with_buffer_size(total_metadata_size)
+            .with_write_behind(1)
+            .build();
+
+        let mut writer_event_batch = DmaStreamWriterBuilder::new(self.event_batches_dma_file.dup()?)
+            .with_buffer_size(total_event_batch_size)
+            .with_write_behind(1)
+            .build();
+
+        for item in self.append_event_batch_queue.iter() {
+            writer_event_batch.write(&item.compressed_event_batch_item).await
+                .map_err(|e| AppendError::WriteError { message: format!("event batch write failed: {}", e) })?;
+            writer_metadata.write(&item.metadata_bytes).await
+                .map_err(|e| AppendError::WriteError { message: format!("metadata write failed: {}", e) })?;
+        }
+        writer_event_batch.close().await
+            .map_err(|e| AppendError::WriteError { message: format!("event batch close failed: {}", e) })?;
+        writer_metadata.close().await
+            .map_err(|e| AppendError::WriteError { message: format!("metadata close failed: {}", e) })?;
+
+        for item in self.append_event_batch_queue.drain(..){
+            self.data_cache.push(BatchMetadataItemPair {
+                metadata: item.event_batch_metadata,
+                item: item.event_batch_item,
+            });
+        }
+
+        Ok(())
+    }
+    
+    // In case of failure during sync, we need to roll back the in-memory state
+    pub async fn sync_with_rollback(&mut self) -> Result<(), AppendError> {
+        match self.sync().await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+
+                //Pop off items from append_event_batch_queue, inspect metadata to rollback
+                while let Some(item) = self.append_event_batch_queue.pop() {
+                    
+                    self.client_event_indexes
+                        .entry(item.event_batch_item.client_id)
+                        .and_modify(|e| {
+                            *e = item.event_batch_metadata.min_client_event_index.saturating_sub(1);
+                        });
+
+                    self.next_event_index = item.event_batch_metadata.min_event_index;
+                    self.next_event_batch_index = item.event_batch_metadata.event_batch_index;
+                }
+
+                //Still must error out so we notify clients of failure to write
+                Err(e)
+            }
+        }
+    }
+
     /// We require the ownership of the events to be transferred, as they will be stored in the in-memory cache
     /// The events are also mutable as we need to filter out events for client idempotency requirements
-    pub async fn append_events(&mut self, mut events: Vec<EventItem>, append_options: &AppendOptions) -> Result<AppendResult, AppendError> {
+    pub fn queue_events_in_memory(&mut self, mut events: Vec<EventItem>, append_options: &AppendOptions) -> Result<AppendResult, AppendError> {
         // Requires mutable write buffer access
         // Requires mutable access to cache data (events, indexes)
 
@@ -307,8 +323,6 @@ impl WriteOperations {
             events,
         );
 
-        // Serialize and write event batch and metadata
-
         // Serialize and compress the event data
         let (uncompressed_size, compressed_event_batch_item) =
             to_wire_format_variable(&event_batch_item, append_options.compression_type)
@@ -331,8 +345,6 @@ impl WriteOperations {
             )
         };
 
-        let events_written = event_batch_item.events.len();
-
         // Create and serialize metadata
         let event_batch_metadata = EventBatchMetadata::from_batch_item(
             &event_batch_item,
@@ -350,35 +362,12 @@ impl WriteOperations {
                 message: format!("Failed to serialize metadata: {}", e) 
             })?;
 
-        // Write event batch first, because readers use metadata to find event batch locations in the file
-        self.event_batches_stream_writer.write_all(&compressed_event_batch_item).await
-            .map_err(|e| AppendError::WriteError { 
-                message: format!("Failed to write event batch: {e}")
-            })?;
-
-        // Write metadata
-        self.metadata_stream_writer.write_all(&metadata_bytes).await
-            .map_err(|e| AppendError::WriteError { 
-                message: format!("Failed to write metadata: {e}")
-            })?;
-
-        // If we sync on every append, we kill thoughput. But we don't want to return ack to clients until data is safely on disk.
-        // So we must do a periodic sync (eg. every 20ms) and force all writes to wait.
-        // If can sync now (haven't synced for > 20ms), do it
-        // else, wait until either the remaining delay time has passed then sync;
-        // or another task (same glommio executor thread) for this aggregate beats us to the sync
-
-        // Schedule sync and wait for it to complete
-        self.sync_with_delay().await?;
-        
-        // Update in-memory cache with new batch and metadata
-        // TODO: enforce max cache size by evicting oldest entries if needed using max_data_cache_size_bytes
-        self.data_cache.push(BatchMetadataItemPair {
-            metadata: event_batch_metadata,
-            item: event_batch_item,
+        self.append_event_batch_queue.push(AppendEventBatchQueueItem {
+            compressed_event_batch_item,
+            event_batch_item,
+            metadata_bytes,
+            event_batch_metadata,
         });
-
-        let event_batch_index = self.next_event_batch_index;
 
         // Update next event index, next event batch index, client event indexes
         self.next_event_index = next_event_index;
@@ -387,8 +376,7 @@ impl WriteOperations {
             .insert(append_options.client_id, latest_client_event_index);
 
         Ok(AppendResult {
-            event_batch_index,
-            events_written,
+            event_batch_index: self.next_event_batch_index,
         })
     }
 
@@ -410,9 +398,6 @@ mod tests {
 
     fn write_config() -> AggregateWriteConfig {
         AggregateWriteConfig {
-            event_batches_buffer_size_bytes: 1024 * 1024,
-            event_batches_write_behind_count: 4,
-            metadata_write_behind_count: 4,
             max_data_cache_size_bytes: 10 * 1024 * 1024,
         }
     }

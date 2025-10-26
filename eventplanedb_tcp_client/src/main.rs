@@ -106,7 +106,7 @@ fn main() {
 
     // Updated configuration for higher throughput
     let server_addr = "127.0.0.1:10000";
-    let num_connections = 500; // Increased concurrent connections
+    let num_connections = 100; // Increased concurrent connections
     let test_duration = Duration::from_secs(30); // Run for 30 seconds
 
     println!("Configuration:");
@@ -250,10 +250,10 @@ fn run_client_connection(
 
         let mut rng = rand::thread_rng();
 
-        let events = (0..3)
+        let events = (0..1)
             .map(|_| {
-                let repeat_count = rng.gen_range(1..=3);
-                let event_value = "hello_world".repeat(repeat_count).into_bytes();
+                let repeat_count = rng.gen_range(1..=1);
+                let event_value = "h".repeat(repeat_count).into_bytes();
 
                 EventItem::new(0, 0, None, 0, 1, 0, event_value)
             })
