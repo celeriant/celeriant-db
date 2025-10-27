@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub enum Request {
     AppendEvents {
+        sync_delay_us: u64,
         org_id: u128,
         aggregate_type_id: u128,
         aggregate_id: u128,

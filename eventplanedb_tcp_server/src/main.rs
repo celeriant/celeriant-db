@@ -279,7 +279,7 @@ async fn process_on_shard_async(
     
 
     match request {
-        Request::AppendEvents { org_id, aggregate_type_id, aggregate_id, client_id, user_id, events, expected_event_batch_index, filter_duplicate_client_events } => {
+        Request::AppendEvents { sync_delay_us, org_id, aggregate_type_id, aggregate_id, client_id, user_id, events, expected_event_batch_index, filter_duplicate_client_events } => {
 
             let base_folder = format!("data/{org_id}/{aggregate_type_id}/{aggregate_id}");
             if let Err(e) = std::fs::create_dir_all(&base_folder) {
@@ -386,7 +386,7 @@ async fn process_on_shard_async(
 
             // // Have dropped mutable borrow, so now wait for write to disk
             //TODO: Need better metrics around wal sync time
-            match sync_with_delay(&entry_rc, wal_sync_event, Duration::from_micros(15), sem_entry_rc).await {
+            match sync_with_delay(&entry_rc, wal_sync_event, Duration::from_micros(sync_delay_us), sem_entry_rc).await {
                 Ok(_) => result,
                 Err(e) => e,
             }

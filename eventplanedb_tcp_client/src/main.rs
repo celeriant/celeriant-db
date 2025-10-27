@@ -29,6 +29,7 @@ pub enum Response {
 #[derive(Debug, Clone, Encode, Decode)]
 pub enum Request {
     AppendEvents {
+        sync_delay_us: u64,
         org_id: u128,
         aggregate_type_id: u128,
         aggregate_id: u128,
@@ -261,6 +262,7 @@ fn run_client_connection(
 
         // Send request
         let request = Request::AppendEvents {
+            sync_delay_us: 100,
             org_id: 1,
             aggregate_type_id: 1,
             aggregate_id: fib_input as u128,

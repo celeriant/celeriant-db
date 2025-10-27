@@ -208,29 +208,44 @@ impl WriteOperations {
         let event_batches_file_size = self.event_batches_dma_file.file_size().await
             .map_err(|e| AppendError::WriteError { message: format!("event batches file size failed: {}", e) })?;
 
-        // Track offsets for appending
-        let mut metadata_offset = metadata_file_size;
-        let mut event_batch_offset = event_batches_file_size;
+        // Calculate total sizes
+        let total_event_batches_size: usize = self.append_event_batch_queue.iter()
+            .map(|item| item.compressed_event_batch_item.len())
+            .sum();
+        let total_metadata_size: usize = self.append_event_batch_queue.iter()
+            .map(|item| item.metadata_bytes.len())
+            .sum();
 
-        //TODO: Could be improved by combining byte arrays in memory?
+        // Allocate contiguous buffers
+        let mut event_buf = self.event_batches_dma_file.alloc_dma_buffer(total_event_batches_size);
+        let mut meta_buf = self.metadata_dma_file.alloc_dma_buffer(total_metadata_size);
+
+        // Copy event batches into buffer
+        let mut event_offset = 0;
         for item in self.append_event_batch_queue.iter() {
-            // Write event batch
-            let mut event_buf = self.event_batches_dma_file.alloc_dma_buffer(item.compressed_event_batch_item.len());
-            event_buf.as_bytes_mut().copy_from_slice(&item.compressed_event_batch_item);
-            self.event_batches_dma_file.write_at(event_buf, event_batch_offset).await
-                .map_err(|e| AppendError::WriteError { message: format!("event batch write failed: {}", e) })?;
-            event_batch_offset += item.compressed_event_batch_item.len() as u64;
-
-            // Write metadata
-            let mut meta_buf = self.metadata_dma_file.alloc_dma_buffer(item.metadata_bytes.len());
-            meta_buf.as_bytes_mut().copy_from_slice(&item.metadata_bytes);
-            self.metadata_dma_file.write_at(meta_buf, metadata_offset).await
-                .map_err(|e| AppendError::WriteError { message: format!("metadata write failed: {}", e) })?;
-            metadata_offset += item.metadata_bytes.len() as u64;
+            let len = item.compressed_event_batch_item.len();
+            event_buf.as_bytes_mut()[event_offset..event_offset+len]
+                .copy_from_slice(&item.compressed_event_batch_item);
+            event_offset += len;
         }
 
+        // Copy metadata into buffer
+        let mut meta_offset = 0;
+        for item in self.append_event_batch_queue.iter() {
+            let len = item.metadata_bytes.len();
+            meta_buf.as_bytes_mut()[meta_offset..meta_offset+len]
+                .copy_from_slice(&item.metadata_bytes);
+            meta_offset += len;
+        }
+
+        // Single write_at per file
+        self.event_batches_dma_file.write_at(event_buf, event_batches_file_size).await
+            .map_err(|e| AppendError::WriteError { message: format!("event batch write failed: {}", e) })?;
         self.metadata_dma_file.fdatasync().await
             .map_err(|e| AppendError::WriteError { message: format!("metadata_dma_file fdatasync failed: {}", e) })?;
+
+        self.metadata_dma_file.write_at(meta_buf, metadata_file_size).await
+            .map_err(|e| AppendError::WriteError { message: format!("metadata write failed: {}", e) })?;
         self.event_batches_dma_file.fdatasync().await
             .map_err(|e| AppendError::WriteError { message: format!("event_batches_dma_file fdatasync failed: {}", e) })?;
 
