@@ -1,5 +1,5 @@
 [package]
-name = "eventplanedb_storage_stateful"
+name = "eventplanedb_sync_stateful"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true

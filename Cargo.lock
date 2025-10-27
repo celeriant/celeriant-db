@@ -396,19 +396,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "eventplanedb_storage_stateful"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "eventplanedb_structures",
- "eventplanedb_sync_stateless",
- "fastbloom",
- "futures-lite",
- "lru",
- "tempfile",
-]
-
-[[package]]
 name = "eventplanedb_structures"
 version = "0.1.0"
 dependencies = [
@@ -419,6 +406,19 @@ dependencies = [
  "serde",
  "snap",
  "zstd",
+]
+
+[[package]]
+name = "eventplanedb_sync_stateful"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "eventplanedb_structures",
+ "eventplanedb_sync_stateless",
+ "fastbloom",
+ "futures-lite",
+ "lru",
+ "tempfile",
 ]
 
 [[package]]
@@ -457,6 +457,7 @@ dependencies = [
  "env_logger",
  "eventplanedb_core",
  "eventplanedb_structures",
+ "eventplanedb_sync_stateful",
  "fastrand",
  "futures-lite",
  "glommio",

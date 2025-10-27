@@ -202,38 +202,37 @@ impl WriteOperations {
     }
 
     async fn sync(&mut self) -> Result<(), AppendError> {
+        // Get current file sizes
+        let metadata_file_size = self.metadata_dma_file.file_size().await
+            .map_err(|e| AppendError::WriteError { message: format!("metadata file size failed: {}", e) })?;
+        let event_batches_file_size = self.event_batches_dma_file.file_size().await
+            .map_err(|e| AppendError::WriteError { message: format!("event batches file size failed: {}", e) })?;
 
-        let total_metadata_size: usize = self.append_event_batch_queue.iter()
-            .map(|item| item.metadata_bytes.len())
-            .sum();
-        let total_event_batch_size: usize = self.append_event_batch_queue.iter()
-            .map(|item| item.compressed_event_batch_item.len())
-            .sum();
-        
-        let total_metadata_size = self.metadata_dma_file.align_up(total_metadata_size as u64) as usize;
-        let total_event_batch_size = self.event_batches_dma_file.align_up(total_event_batch_size as u64) as usize;
+        // Track offsets for appending
+        let mut metadata_offset = metadata_file_size;
+        let mut event_batch_offset = event_batches_file_size;
 
-        let mut writer_metadata = DmaStreamWriterBuilder::new(self.metadata_dma_file.dup()?)
-            .with_buffer_size(total_metadata_size)
-            .with_write_behind(1)
-            .build();
-
-        let mut writer_event_batch = DmaStreamWriterBuilder::new(self.event_batches_dma_file.dup()?)
-            .with_buffer_size(total_event_batch_size)
-            .with_write_behind(1)
-            .build();
-
+        //TODO: Could be improved by combining byte arrays in memory?
         for item in self.append_event_batch_queue.iter() {
-            writer_event_batch.write(&item.compressed_event_batch_item).await
+            // Write event batch
+            let mut event_buf = self.event_batches_dma_file.alloc_dma_buffer(item.compressed_event_batch_item.len());
+            event_buf.as_bytes_mut().copy_from_slice(&item.compressed_event_batch_item);
+            self.event_batches_dma_file.write_at(event_buf, event_batch_offset).await
                 .map_err(|e| AppendError::WriteError { message: format!("event batch write failed: {}", e) })?;
-            writer_metadata.write(&item.metadata_bytes).await
+            event_batch_offset += item.compressed_event_batch_item.len() as u64;
+
+            // Write metadata
+            let mut meta_buf = self.metadata_dma_file.alloc_dma_buffer(item.metadata_bytes.len());
+            meta_buf.as_bytes_mut().copy_from_slice(&item.metadata_bytes);
+            self.metadata_dma_file.write_at(meta_buf, metadata_offset).await
                 .map_err(|e| AppendError::WriteError { message: format!("metadata write failed: {}", e) })?;
+            metadata_offset += item.metadata_bytes.len() as u64;
         }
-        
-        writer_event_batch.close().await
-            .map_err(|e| AppendError::WriteError { message: format!("event batch close failed: {}", e) })?;
-        writer_metadata.close().await
-            .map_err(|e| AppendError::WriteError { message: format!("metadata close failed: {}", e) })?;
+
+        self.metadata_dma_file.fdatasync().await
+            .map_err(|e| AppendError::WriteError { message: format!("metadata_dma_file fdatasync failed: {}", e) })?;
+        self.event_batches_dma_file.fdatasync().await
+            .map_err(|e| AppendError::WriteError { message: format!("event_batches_dma_file fdatasync failed: {}", e) })?;
 
         for item in self.append_event_batch_queue.drain(..){
             self.data_cache.push(BatchMetadataItemPair {

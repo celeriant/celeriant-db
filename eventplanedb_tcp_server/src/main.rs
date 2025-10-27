@@ -4,6 +4,7 @@ use std::{cell::RefCell, collections::HashMap, fmt::format, os::fd::{FromRawFd, 
 use ahash::AHasher;
 use eventplanedb_core::{files::write_operations::{AggregateWriteConfig, AppendError, AppendOptions, WriteOperations}, local_event::LocalEvent};
 use eventplanedb_structures::{aggregate_key::AggregateKey, compression_type::CompressionType};
+use eventplanedb_sync_stateful::stateful_engine::{StatefulDestructive, StatefulEngine, StatefulEngineConfig, StatefulReader};
 use std::hash::{Hash, Hasher};
 use glommio::{channels::channel_mesh::{Full, MeshBuilder, Senders}, enclose, net::TcpListener, spawn_local, sync::Semaphore, timer::sleep, CpuSet, LocalExecutorPoolBuilder, PoolPlacement};
 use futures_lite::AsyncWriteExt;
@@ -81,6 +82,7 @@ fn main() {
         let write_operations = Rc::new(RefCell::new(HashMap::<AggregateKey, Rc<RefCell<WriteOperations>>>::new()));
         let wal_sync_events = Rc::new(RefCell::new(HashMap::<AggregateKey, Rc<RefCell<Option<Rc<LocalEvent>>>>>::new()));
         let semaphores = Rc::new(RefCell::new(HashMap::<AggregateKey, Rc<Semaphore>>::new()));
+        let stateful_engine = Rc::new(RefCell::new(StatefulEngine::new(StatefulEngineConfig::default())));
 
         // There is a receiver for each other shard that we must listen to
         // So we can spin up a thread for each of these, to allow concurrent processing from other shards
@@ -91,6 +93,7 @@ fn main() {
             let write_operations_clone = write_operations.clone();
             let wal_sync_events = wal_sync_events.clone();
             let semaphores = semaphores.clone();
+            let stateful_engine = stateful_engine.clone();
             spawn_local(async move {
                 while let Some(msg) = stream.recv().await {
                     debug!("Shard {shard_id} received message from {src_shard} with value: {msg}");
@@ -103,13 +106,13 @@ fn main() {
 
                     // Other shard has accepted and already read the request data.
                     // So we can process it immediately and write the response back
-                    let response = process_on_shard_async(msg.value, &write_operations_clone, &wal_sync_events, &semaphores).await;
+                    let response = process_on_shard_async(msg.value, &stateful_engine, &write_operations_clone, &wal_sync_events, &semaphores).await;
                     write_to_tcp_stream(response, &mut tcp_stream, msg.is_bincode).await;
 
                     // Continue on the tcp connection to read more data from the client
                     // Note that we might still have to forward it on to the right shard again
                     // We need to clone sender again here as inside is a spawn local
-                    process_tcp_stream(shard_id, nbr_shards, tcp_stream, sender_clone.clone(), write_operations_clone.clone(), wal_sync_events.clone(), semaphores.clone()).await;
+                    process_tcp_stream(shard_id, nbr_shards, tcp_stream, sender_clone.clone(), write_operations_clone.clone(), wal_sync_events.clone(), semaphores.clone(), stateful_engine.clone()).await;
                 }
             }).detach();
         }
@@ -129,7 +132,7 @@ fn main() {
                         Ok(addr) => debug!("Shard {shard_id} accepted connection from {addr}"),
                         Err(_) => error!("Shard {shard_id} accepted connection from unknown address"),
                     }
-                    process_tcp_stream(shard_id, nbr_shards, tcp_stream.buffered(), sender.clone(), write_operations.clone(), wal_sync_events.clone(), semaphores.clone()).await;
+                    process_tcp_stream(shard_id, nbr_shards, tcp_stream.buffered(), sender.clone(), write_operations.clone(), wal_sync_events.clone(), semaphores.clone(), stateful_engine.clone()).await;
                 }
                 Err(e) => {
                     error!("Shard {shard_id} failed to accept connection: {e}");
@@ -160,6 +163,7 @@ async fn process_tcp_stream(
     write_operations: Rc<RefCell<HashMap<AggregateKey, Rc<RefCell<WriteOperations>>>>>,
     wal_sync_events: Rc<RefCell<HashMap<AggregateKey, Rc<RefCell<Option<Rc<LocalEvent>>>>>>>,
     semaphores: Rc<RefCell<HashMap<AggregateKey, Rc<Semaphore>>>>,
+    stateful_engine: Rc<RefCell<StatefulEngine>>,
 ) {
     // It's critical to spawn local here as this allows accepting of new connections
     // It also allows processing messages sent from other shards 
@@ -207,7 +211,7 @@ async fn process_tcp_stream(
                     }
                 }
             } else {
-                let response = process_on_shard_async(request, &write_operations, &wal_sync_events, &semaphores).await;
+                let response = process_on_shard_async(request, &stateful_engine, &write_operations, &wal_sync_events, &semaphores).await;
                 write_to_tcp_stream(response, &mut tcp_stream, is_bincode).await;
             }
         }
@@ -267,6 +271,7 @@ async fn sync_with_delay(write_operations: &Rc<RefCell<WriteOperations>>, wal_sy
 /// It is called on the shard that is responsible for the given value
 async fn process_on_shard_async(
     request: Request,
+    engine: &Rc<RefCell<StatefulEngine>>,
     write_operations: &Rc<RefCell<HashMap<AggregateKey, Rc<RefCell<WriteOperations>>>>>,
     wal_sync_events: &Rc<RefCell<HashMap<AggregateKey, Rc<RefCell<Option<Rc<LocalEvent>>>>>>>,
     semaphores: &Rc<RefCell<HashMap<AggregateKey, Rc<Semaphore>>>>,
@@ -344,13 +349,18 @@ async fn process_on_shard_async(
                     Response::AppendEventsResult(Err("Failed to acquire write lock for sync".to_string()));
                 }
 
+                let server_timestamp_millis = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+
                 let mut wo = entry_rc.borrow_mut();
                 let append_options = AppendOptions {
                     client_id,
                     user_id,
                     expected_event_batch_index,
                     enforce_client_idempotency: filter_duplicate_client_events,
-                    server_timestamp_millis: 0,
+                    server_timestamp_millis,
                     compression_type: CompressionType::Snappy
                 };
                 result = match wo.queue_events_in_memory(events, &append_options) {
@@ -375,15 +385,28 @@ async fn process_on_shard_async(
             };
 
             // // Have dropped mutable borrow, so now wait for write to disk
-            match sync_with_delay(&entry_rc, wal_sync_event, Duration::from_micros(10), sem_entry_rc).await {
+            //TODO: Need better metrics around wal sync time
+            match sync_with_delay(&entry_rc, wal_sync_event, Duration::from_micros(15), sem_entry_rc).await {
                 Ok(_) => result,
                 Err(e) => e,
             }
         }
-        Request::ReadFiltered { org_id, aggregate_type_id, aggregate_id, filters } => todo!(),
-        Request::Exists { org_id, aggregate_type_id, aggregate_id } => todo!(),
-        Request::TrimStart { org_id, aggregate_type_id, aggregate_id, keep_from_event_batch_index } => todo!(),
-        Request::Delete { org_id, aggregate_type_id, aggregate_id } => todo!(),
+        Request::ReadFiltered { org_id, aggregate_type_id, aggregate_id, filters } => {
+            let result = engine.borrow_mut().read_filtered(org_id, aggregate_type_id, aggregate_id, &filters);
+            Response::ReadFilteredResult(result.map_err(|e| format!("{:?}", e)))
+        }
+        Request::Exists { org_id, aggregate_type_id, aggregate_id } => {
+            let result = engine.borrow_mut().exists(org_id, aggregate_type_id, aggregate_id);
+            Response::ExistsResult(result.map_err(|e| format!("{:?}", e)))
+        }
+        Request::TrimStart { org_id, aggregate_type_id, aggregate_id, keep_from_event_batch_index } => {
+            let result = engine.borrow_mut().trim_start(org_id, aggregate_type_id, aggregate_id, keep_from_event_batch_index);
+            Response::TrimStartResult(result.map_err(|e| format!("{:?}", e)))
+        }
+        Request::Delete { org_id, aggregate_type_id, aggregate_id } => {
+            let result = engine.borrow_mut().delete(org_id, aggregate_type_id, aggregate_id);
+            Response::DeleteResult(result.map_err(|e| format!("{:?}", e)))
+        }
     }
 }
 

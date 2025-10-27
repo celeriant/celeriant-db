@@ -244,7 +244,7 @@ fn run_client_connection(
         }
 
         // Generate random Fibonacci number between 1 and 10
-        let fib_input: u64 = rng.gen_range(1..=10);
+        let fib_input: u64 = rng.gen_range(1..=18);
 
         let request_start = Instant::now();
 
@@ -270,6 +270,8 @@ fn run_client_connection(
             expected_event_batch_index: None,
             filter_duplicate_client_events: false,
         };
+
+        // let request = Request::ReadFiltered { org_id: 1, aggregate_type_id: 1, aggregate_id: 1, filters: ReadFilters { from_event_batch_index: 1, to_event_batch_index: Some(3), max_bytes: None, include_event_types: None, exclude_client_id: None, include_client_id: None, exclude_user_id: None, include_user_id: None, min_server_timestamp: None, max_server_timestamp: None, min_client_event_index: None, max_client_event_index: None, min_event_timestamp: None, max_event_timestamp: None, min_event_index: None, max_event_index: None } };
 
         // let request = Request::Exists { org_id: 1, aggregate_type_id: 1, aggregate_id: fib_input as u128 };
 
@@ -352,6 +354,8 @@ fn run_client_connection(
                             Response::AppendEventsResult(Err(e)) => format!("Error: {}", e),
                             Response::ExistsResult(Ok(exists)) => exists.to_string(),
                             Response::ExistsResult(Err(e)) => format!("Error: {}", e),
+                            Response::ReadFilteredResult(Ok(rr)) => format!("Read result {}", rr.event_batches.len()),
+                            Response::ReadFilteredResult(Err(e)) => format!("Error: {}", e),
                             _ => "Unexpected response type".to_string(),
                         };
 
