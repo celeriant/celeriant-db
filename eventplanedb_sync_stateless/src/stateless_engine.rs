@@ -86,8 +86,8 @@ mod tests {
     use crate::stateless_engine::StatelessEngine;
     use crate::stateless_reader::StatelessReader;
     use crate::stateless_writer::StatelessWriter;
-    use eventplanedb_storage_structures::constants::BLOOM_HASH_SEED;
-    use eventplanedb_storage_structures::{
+    use eventplanedb_structures::constants::BLOOM_HASH_SEED;
+    use eventplanedb_structures::{
         compression_type::CompressionType,
         constants::{BLOOM_BYTES, BLOOM_HASH_COUNT},
         event_batch_item::EventBatchItem,

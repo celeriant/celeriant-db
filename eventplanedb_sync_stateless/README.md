@@ -4,7 +4,7 @@ A high-performance, stateless storage engine for event sourcing databases that p
 
 ## Overview
 
-The `eventplanedb_storage_stateless` crate is the core storage layer for EventPlaneDB, designed to handle large volumes of event data with minimal memory overhead and maximum I/O efficiency. It operates in a stateless manner, meaning all operations work directly with file handles without maintaining in-memory state.
+The `eventplanedb_sync_stateless` crate is the core storage layer for EventPlaneDB, designed to handle large volumes of event data with minimal memory overhead and maximum I/O efficiency. It operates in a stateless manner, meaning all operations work directly with file handles without maintaining in-memory state.
 
 ## Key Features
 
@@ -175,8 +175,8 @@ flowchart TD
 ### Basic Write/Read Cycle
 
 ```rust
-use eventplanedb_storage_stateless::*;
-use eventplanedb_storage_structures::*;
+use eventplanedb_sync_stateless::*;
+use eventplanedb_structures::*;
 
 // Create the engine
 let engine = StatelessEngine::builder()
@@ -329,7 +329,7 @@ The engine is designed for minimal memory overhead:
 
 This crate depends on other EventPlaneDB components:
 
-- `eventplanedb_storage_structures`: Shared data structures and constants
+- `eventplanedb_structures`: Shared data structures and constants
 
 Other notable 3rd party libraries:
 

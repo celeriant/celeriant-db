@@ -6,13 +6,13 @@ use std::io::{self, Read, Seek, SeekFrom};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 
-use eventplanedb_storage_structures::compression_type::CompressionType;
-use eventplanedb_storage_structures::constants::{
+use eventplanedb_structures::compression_type::CompressionType;
+use eventplanedb_structures::constants::{
     BINCODE_CONFIG_FIXED, BLOOM_HASH_COUNT, BLOOM_HASH_SEED,
 };
-use eventplanedb_storage_structures::event_batch_item::EventBatchItem;
-use eventplanedb_storage_structures::event_batch_metadata::EventTypesData;
-use eventplanedb_storage_structures::{
+use eventplanedb_structures::event_batch_item::EventBatchItem;
+use eventplanedb_structures::event_batch_metadata::EventTypesData;
+use eventplanedb_structures::{
     constants::{BLOOM_BYTES, METADATA_BATCH_SIZE_BYTES},
     event_batch_metadata::EventBatchMetadata,
     read_filters::ReadFilters,

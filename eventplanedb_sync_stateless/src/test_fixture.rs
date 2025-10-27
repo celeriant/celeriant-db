@@ -6,13 +6,13 @@ pub mod tests {
     #[cfg(target_os = "windows")]
     use std::os::windows::io::AsRawHandle;
 
-    use eventplanedb_storage_structures::constants::BLOOM_HASH_SEED;
-    use eventplanedb_storage_structures::event_batch_metadata::EventBatchMetadata;
+    use eventplanedb_structures::constants::BLOOM_HASH_SEED;
+    use eventplanedb_structures::event_batch_metadata::EventBatchMetadata;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    use eventplanedb_storage_structures::read_result::ReadResult;
+    use eventplanedb_structures::read_result::ReadResult;
     #[cfg(not(target_os = "linux"))]
-    use eventplanedb_storage_structures::read_result::ReadResult;
-    use eventplanedb_storage_structures::{
+    use eventplanedb_structures::read_result::ReadResult;
+    use eventplanedb_structures::{
         compression_type::CompressionType,
         constants::{BLOOM_BYTES, BLOOM_HASH_COUNT},
         event_batch_item::EventBatchItem,

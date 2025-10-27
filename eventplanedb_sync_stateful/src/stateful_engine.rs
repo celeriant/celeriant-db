@@ -3,14 +3,12 @@ use std::{
     path::PathBuf,
 };
 
-use eventplanedb_storage_stateless::{
+use eventplanedb_sync_stateless::{
     stateless_destructive::StatelessDestructive, stateless_engine::StatelessEngine,
-    stateless_reader::StatelessReader, stateless_writer::StatelessWriter, stateless_writer_async::StatelessWriterAsync,
+    stateless_reader::StatelessReader, stateless_writer::StatelessWriter,
 };
 
-use glommio::io::DmaFile;
-
-use eventplanedb_storage_structures::{
+use eventplanedb_structures::{
     compression_type::CompressionType,
     constants::{BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED},
     event_batch_item::EventBatchItem,
@@ -22,7 +20,7 @@ use eventplanedb_storage_structures::{
 use fastbloom::BloomFilter;
 use std::collections::HashSet;
 
-use crate::{dma_file_cache::DmaFileCache, event_index_cache::EventIndexCache};
+use crate::{event_index_cache::EventIndexCache};
 
 use super::{
     client_event_index_cache::ClientEventIndexCache, event_batch_index_cache::EventBatchIndexCache,
@@ -74,7 +72,6 @@ pub struct StatefulEngine {
 
     // File handle management
     file_cache: FileCache,
-    dma_file_cache: DmaFileCache,
 
     // Shared resources for writing
     bloom_filter: BloomFilter,
@@ -89,8 +86,7 @@ impl StatefulEngine {
             ClientEventIndexCache::new(config.client_event_index_cache_size);
         let memory_cache = LruMemoryCache::new(config.recent_batches_cache_size);
         let file_cache = FileCache::new(config.max_file_handles);
-        let dma_file_cache = DmaFileCache::new(config.max_file_handles);
-
+        
         let bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8)
             .seed(&BLOOM_HASH_SEED)
             .hashes(BLOOM_HASH_COUNT);
@@ -102,7 +98,6 @@ impl StatefulEngine {
             client_event_index_cache,
             memory_cache,
             file_cache,
-            dma_file_cache,
             bloom_filter,
             event_type_dedup: HashSet::new(),
         }
@@ -416,8 +411,6 @@ impl StatefulEngine {
             self.get_aggregate_paths(org_id, aggregate_type_id, aggregate_id);
         self.file_cache.remove(event_batch_path.to_str().unwrap());
         self.file_cache.remove(metadata_path.to_str().unwrap());
-        self.dma_file_cache.remove(event_batch_path.to_str().unwrap());
-        self.dma_file_cache.remove(metadata_path.to_str().unwrap());
     }
 
     fn try_read_from_memory_cache(
@@ -586,40 +579,6 @@ impl StatefulEngine {
             batch.events.retain(|event| event.event_index <= max_index);
         }
     }
-
-
-    async fn create_dma_files_for_append(
-        &self,
-        org_id: u128,
-        aggregate_type_id: u128,
-        aggregate_id: u128,
-    ) -> io::Result<(DmaFile, DmaFile)> {
-        use glommio::io::OpenOptions;
-        
-        let (event_batch_path, metadata_path) =
-            self.get_aggregate_paths(org_id, aggregate_type_id, aggregate_id);
-
-        // Ensure directory exists
-        self.ensure_aggregate_directory(org_id, aggregate_type_id, aggregate_id)?;
-
-        // Use OpenOptions to open files for writing without truncating
-        let event_batch_file = OpenOptions::new()
-            .write(true)
-            .create(true)  // Create if doesn't exist
-            .dma_open(&event_batch_path)
-            .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to open event batch file for writing: {}", e)))?;
-
-        let metadata_file = OpenOptions::new()
-            .write(true)
-            .create(true)  // Create if doesn't exist
-            .dma_open(&metadata_path)
-            .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to open metadata file for writing: {}", e)))?;
-
-        Ok((event_batch_file, metadata_file))
-    }
-
     
 }
 
@@ -637,146 +596,6 @@ pub trait StatefulWriterAsync {
         expected_event_batch_index: Option<u64>,
         filter_duplicate_client_events: bool,
     ) -> io::Result<EventBatchMetadata>;
-}
-
-#[async_trait::async_trait(?Send)]
-pub trait StatefulReaderAsync {
-    async fn read_filtered_async(
-        &mut self,
-        org_id: u128,
-        aggregate_type_id: u128,
-        aggregate_id: u128,
-        filters: &ReadFilters,
-    ) -> io::Result<ReadResult>;
-
-    async fn exists_async(
-        &mut self,
-        org_id: u128,
-        aggregate_type_id: u128,
-        aggregate_id: u128,
-    ) -> io::Result<bool>;
-}
-
-
-#[async_trait::async_trait(?Send)]
-impl StatefulWriterAsync for StatefulEngine {
-    async fn append_events_async(
-        &mut self,
-        org_id: u128,
-        aggregate_type_id: u128,
-        aggregate_id: u128,
-        client_id: u128,
-        user_id: Option<u128>,
-        mut events: Vec<EventItem>,
-        expected_event_batch_index: Option<u64>,
-        filter_duplicate_client_events: bool,
-    ) -> io::Result<EventBatchMetadata> {
-        if events.is_empty() {
-            return Err(io::Error::other("Cannot write empty event batch"));
-        }
-
-        // Ensure aggregate directory exists
-        self.ensure_aggregate_directory(org_id, aggregate_type_id, aggregate_id)?;
-
-        // Get next event batch index
-        let next_event_batch_index =
-            self.get_next_event_batch_index(org_id, aggregate_type_id, aggregate_id)?;
-
-        // Optimistic concurrency check
-        if let Some(expected_index) = expected_event_batch_index {
-            if expected_index != next_event_batch_index {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "Optimistic concurrency check failed: expected batch index {}, but next is {}",
-                        expected_index, next_event_batch_index
-                    ),
-                ));
-            }
-        }
-
-        // Filter out duplicate events based on client event index
-        if filter_duplicate_client_events {
-            self.filter_duplicate_events(
-                org_id,
-                aggregate_type_id,
-                aggregate_id,
-                client_id,
-                &mut events,
-            )?;
-        }
-
-        if events.is_empty() {
-            return Err(io::Error::other(
-                "All events were duplicates and filtered out",
-            ));
-        }
-
-        // Assign server-side event indices
-        let final_event_index = self
-            .assign_event_indices(org_id, aggregate_type_id, aggregate_id, &mut events)?
-            .unwrap();
-
-        // Create event batch
-        let server_timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-
-        let event_batch = EventBatchItem::new(
-            next_event_batch_index,
-            server_timestamp,
-            client_id,
-            user_id,
-            events,
-        );
-
-        // Get file paths and writers
-        let (event_batch_path, metadata_path) =
-            self.get_aggregate_paths(org_id, aggregate_type_id, aggregate_id);
-        let event_batch_writer = self
-            .dma_file_cache
-            .create_append_writer(event_batch_path.to_str().unwrap()).await?;
-        let metadata_writer = self
-            .dma_file_cache
-            .create_append_writer(metadata_path.to_str().unwrap()).await?;
-
-        // Write to disk using stateless engine
-        let metadata = self.config.stateless_engine.append_event_batch_async(
-            &mut *event_batch_writer.borrow_mut(),
-            &mut *metadata_writer.borrow_mut(),
-            &mut self.bloom_filter,
-            &mut self.event_type_dedup,
-            self.config.compression_type,
-            &event_batch,
-        ).await?;
-
-        // Update caches
-        self.update_client_event_index_cache(
-            org_id,
-            aggregate_type_id,
-            aggregate_id,
-            client_id,
-            &event_batch.events,
-        )?;
-        self.event_batch_index_cache.set(
-            org_id,
-            aggregate_type_id,
-            aggregate_id,
-            next_event_batch_index,
-        );
-        self.memory_cache.add(
-            org_id,
-            aggregate_type_id,
-            aggregate_id,
-            event_batch,
-            metadata.clone(),
-        );
-        self.event_index_cache
-            .set(org_id, aggregate_type_id, aggregate_id, final_event_index);
-
-        Ok(metadata)
-    }
 }
 
 pub trait StatefulWriter {
@@ -1157,185 +976,6 @@ mod tests {
     use glommio::{LocalExecutor, LocalExecutorBuilder, Placement};
 
     //TODO: A test that simulates a failed write after consuming an index, creating a gap
-
-    #[test]
-    fn test_async_append_events_basic() {
-        let ex = LocalExecutorBuilder::new(Placement::Unbound)
-            .spawn(|| async {
-                let mut fixture = StatefulTestFixture::new().unwrap();
-
-                let events = fixture.create_test_events(1, 2);
-                let metadata = fixture
-                    .engine
-                    .append_events_async(544, 655, 123, 100, Some(200), events, None, true)
-                    .await
-                    .unwrap();
-
-                assert_eq!(metadata.event_batch_index, 1);
-                assert_eq!(metadata.client_id, 100);
-                assert_eq!(metadata.user_id, 200);
-            })
-            .unwrap();
-
-        ex.join().unwrap();
-    }
-
-    #[test]
-    fn test_async_append_events_with_compression() {
-        let ex = LocalExecutorBuilder::new(Placement::Unbound)
-            .spawn(|| async {
-                let config = StatefulEngineConfig {
-                    compression_type: CompressionType::Zstd { level: 3 },
-                    ..Default::default()
-                };
-                let mut fixture = StatefulTestFixture::with_config(config).unwrap();
-
-                // Create events with larger, compressible data
-                let large_data = vec![b'A'; 1000];
-                let events = vec![
-                    EventItem::new(1, 1, 1000, 42, 1, large_data.clone()),
-                    EventItem::new(2, 2, 1001, 43, 1, large_data),
-                ];
-
-                let metadata = fixture
-                    .engine
-                    .append_events_async(544, 655, 123, 100, None, events, None, true)
-                    .await
-                    .unwrap();
-
-                // With compression, compressed size should be less than uncompressed
-                assert!(metadata.compressed_size < metadata.uncompressed_size);
-            })
-            .unwrap();
-
-        ex.join().unwrap();
-    }
-
-    #[test]
-    fn test_async_duplicate_event_filtering() {
-        let ex = LocalExecutorBuilder::new(Placement::Unbound)
-            .spawn(|| async {
-                let mut fixture = StatefulTestFixture::new().unwrap();
-
-                // First write
-                let events1 = vec![
-                    EventItem::new(1, 1, 1000, 42, 1, b"event1".to_vec()),
-                    EventItem::new(2, 2, 1001, 42, 1, b"event2".to_vec()),
-                ];
-
-                fixture
-                    .engine
-                    .append_events_async(544, 655, 123, 100, None, events1, None, true)
-                    .await
-                    .unwrap();
-
-                // Second write with overlapping client_event_index
-                let events2 = vec![
-                    EventItem::new(2, 3, 1002, 42, 1, b"event2_dup".to_vec()), // Should be filtered
-                    EventItem::new(3, 4, 1003, 42, 1, b"event3".to_vec()),     // Should be written
-                ];
-
-                let _metadata2 = fixture
-                    .engine
-                    .append_events_async(544, 655, 123, 100, None, events2, None, true)
-                    .await
-                    .unwrap();
-
-                // Read back using sync method and verify only new events were written
-                let result = fixture
-                    .engine
-                    .read_filtered(544, 655, 123, &ReadFilters::new(2))
-                    .unwrap();
-                assert_eq!(result.event_batches.len(), 1);
-                assert_eq!(result.event_batches[0].events.len(), 1); // Only event 3
-                assert_eq!(result.event_batches[0].events[0].client_event_index, 3);
-            })
-            .unwrap();
-
-        ex.join().unwrap();
-    }
-
-    #[test]
-    fn test_async_optimistic_concurrency_success() {
-        let ex = LocalExecutorBuilder::new(Placement::Unbound)
-            .spawn(|| async {
-                let mut fixture = StatefulTestFixture::new().unwrap();
-
-                // First write
-                let events1 = fixture.create_test_events(1, 1);
-                fixture
-                    .engine
-                    .append_events_async(544, 655, 123, 100, None, events1, None, true)
-                    .await
-                    .unwrap();
-
-                // Second write with correct expected index
-                let events2 = fixture.create_test_events(2, 1);
-                let result = fixture
-                    .engine
-                    .append_events_async(544, 655, 123, 100, None, events2, Some(2), true)
-                    .await;
-                    
-                assert!(result.is_ok());
-                assert_eq!(result.unwrap().event_batch_index, 2);
-            })
-            .unwrap();
-
-        ex.join().unwrap();
-    }
-
-    #[test]
-    fn test_async_optimistic_concurrency_failure() {
-        let ex = LocalExecutorBuilder::new(Placement::Unbound)
-            .spawn(|| async {
-                let mut fixture = StatefulTestFixture::new().unwrap();
-
-                // First write
-                let events1 = fixture.create_test_events(1, 1);
-                fixture
-                    .engine
-                    .append_events_async(544, 655, 123, 100, None, events1, None, true)
-                    .await
-                    .unwrap();
-
-                // Second write with incorrect expected index
-                let events2 = fixture.create_test_events(2, 1);
-                let result = fixture
-                    .engine
-                    .append_events_async(544, 655, 123, 100, None, events2, Some(5), true)
-                    .await;
-
-                assert!(result.is_err());
-                let err = result.unwrap_err().to_string();
-                assert!(err.contains("Optimistic concurrency check failed"));
-                assert!(err.contains("expected batch index 5, but next is 2"));
-            })
-            .unwrap();
-
-        ex.join().unwrap();
-    }
-
-    #[test]
-    fn test_async_empty_events_rejected() {
-        let ex = LocalExecutorBuilder::new(Placement::Unbound)
-            .spawn(|| async {
-                let mut fixture = StatefulTestFixture::new().unwrap();
-
-                let result = fixture
-                    .engine
-                    .append_events_async(544, 655, 123, 100, None, vec![], None, true)
-                    .await;
-                    
-                assert!(result.is_err());
-                assert!(result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("Cannot write empty event batch"));
-            })
-            .unwrap();
-
-        ex.join().unwrap();
-    }
 
     struct StatefulTestFixture {
         _temp_dir: TempDir,

@@ -1,7 +1,7 @@
 use std::io;
 
 use bincode::{Decode, Encode};
-use eventplanedb_storage_structures::{
+use eventplanedb_structures::{
     compression_type::CompressionType, constants::BINCODE_CONFIG_VARIABLE,
 };
 

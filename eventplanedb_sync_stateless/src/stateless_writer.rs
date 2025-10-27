@@ -1,23 +1,29 @@
-use eventplanedb_storage_structures::compression_type::CompressionType;
-use eventplanedb_storage_structures::constants::{BINCODE_CONFIG_FIXED, BLOOM_BYTES};
-use eventplanedb_storage_structures::event_batch_item::EventBatchItem;
-use eventplanedb_storage_structures::event_batch_metadata::EventBatchMetadata;
-use eventplanedb_storage_structures::event_item::EventItem;
+use eventplanedb_structures::compression_type::CompressionType;
+use eventplanedb_structures::constants::{BINCODE_CONFIG_FIXED, BLOOM_BYTES};
+use eventplanedb_structures::event_batch_item::EventBatchItem;
+use eventplanedb_structures::event_batch_metadata::EventBatchMetadata;
+use eventplanedb_structures::event_item::EventItem;
 use fastbloom::BloomFilter;
-use futures_lite::AsyncWriteExt;
-use glommio::io::{DmaStreamWriter};
 
 use std::collections::HashSet;
-use std::io;
+use std::fs::File;
+use std::io::Write;
+use std::io::{self};
 
 use crate::stateless_engine::StatelessEngine;
 use crate::wire_format::to_wire_format_variable;
 
-pub trait StatelessWriterAsync {
-    async fn append_event_batch_async(
+//TODO: Can we do file preallocation that won't break EOF logic?
+//fallocate(fd, FALLOC_FL_KEEP_SIZE, ...)
+
+//TODO: Should the writer be using Direct I/O on linux to skip the page cache?
+//https://transactional.blog/how-to-learn/disk-io
+
+pub trait StatelessWriter {
+    fn append_event_batch(
         &self,
-        event_batch_writer: &mut DmaStreamWriter,
-        metadata_writer: &mut DmaStreamWriter,
+        event_batch_writer: &mut File,
+        metadata_writer: &mut File,
         bloom_filter: &mut BloomFilter,
         event_type_dedup: &mut HashSet<u64>,
         compression_type: CompressionType,
@@ -25,11 +31,11 @@ pub trait StatelessWriterAsync {
     ) -> io::Result<EventBatchMetadata>;
 }
 
-impl StatelessWriterAsync for StatelessEngine {
-    async fn append_event_batch_async(
+impl StatelessWriter for StatelessEngine {
+    fn append_event_batch(
         &self,
-        event_batch_writer: &mut DmaStreamWriter,
-        metadata_writer: &mut DmaStreamWriter,
+        event_batch_writer: &mut File,
+        metadata_writer: &mut File,
         bloom_filter: &mut BloomFilter,
         event_type_dedup: &mut HashSet<u64>,
         compression_type: CompressionType,
@@ -49,17 +55,17 @@ impl StatelessWriterAsync for StatelessEngine {
         let event_types_data = if use_bloom {
             let bloom_bytes =
                 create_bloom_filter_bytes(bloom_filter, event_type_dedup, &event_batch_item.events);
-            eventplanedb_storage_structures::event_batch_metadata::EventTypesData::Bloom(
+            eventplanedb_structures::event_batch_metadata::EventTypesData::Bloom(
                 bloom_bytes,
             )
         } else {
-            eventplanedb_storage_structures::event_batch_metadata::EventTypesData::Direct(
+            eventplanedb_structures::event_batch_metadata::EventTypesData::Direct(
                 event_types,
             )
         };
 
-        // Create and serialize metadata
-        let metadata = eventplanedb_storage_structures::event_batch_metadata::EventBatchMetadata::from_batch_item(
+        // Create and serialise metadata
+        let metadata = eventplanedb_structures::event_batch_metadata::EventBatchMetadata::from_batch_item(
             event_batch_item,
             uncompressed_size as u64,
             compressed_event_batch_item.len() as u64,
@@ -71,12 +77,13 @@ impl StatelessWriterAsync for StatelessEngine {
         let metadata_bytes = bincode::encode_to_vec(&metadata, BINCODE_CONFIG_FIXED)
             .map_err(|e| io::Error::other(e.to_string()))?;
 
-        event_batch_writer.write_all(&compressed_event_batch_item).await
-            .map_err(|e| io::Error::new(io::ErrorKind::WriteZero, format!("Failed to write event batch: {}", e)))?;
-        
-        metadata_writer.write_all(&metadata_bytes).await
-            .map_err(|e| io::Error::new(io::ErrorKind::WriteZero, format!("Failed to write metadata: {}", e)))?;
-        
+        // Write data to disk
+        event_batch_writer.write_all(&compressed_event_batch_item)?;
+        metadata_writer.write_all(&metadata_bytes)?;
+
+        //TODO: Test for file corruption - pull out USB stick and see if corrupt, and if we can repair
+        event_batch_writer.flush()?;
+        metadata_writer.flush()?;
 
         Ok(metadata)
     }

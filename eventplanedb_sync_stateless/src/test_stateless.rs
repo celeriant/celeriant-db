@@ -7,8 +7,8 @@ mod tests {
     use crate::stateless_reader::StatelessReader;
     use crate::stateless_writer::StatelessWriter;
     use crate::test_fixture::tests::TestFixture;
-    use eventplanedb_storage_structures::constants::{BLOOM_HASH_SEED, METADATA_BATCH_SIZE_BYTES};
-    use eventplanedb_storage_structures::{
+    use eventplanedb_structures::constants::{BLOOM_HASH_SEED, METADATA_BATCH_SIZE_BYTES};
+    use eventplanedb_structures::{
         compression_type::CompressionType,
         constants::{BLOOM_BYTES, BLOOM_HASH_COUNT},
         event_batch_item::EventBatchItem,
@@ -52,7 +52,7 @@ mod tests {
         assert_eq!(metadata.min_client_event_index, 33);
         assert_eq!(metadata.max_client_event_index, 33);
         match metadata.event_types_data {
-            eventplanedb_storage_structures::event_batch_metadata::EventTypesData::Direct(
+            eventplanedb_structures::event_batch_metadata::EventTypesData::Direct(
                 ref types,
             ) => {
                 assert_eq!(types.len(), 4);
@@ -68,7 +68,7 @@ mod tests {
         let read_result = fixture.read_filtered(
             &mut event_batch_reader,
             &mut metadata_reader,
-            &eventplanedb_storage_structures::read_filters::ReadFilters::default(),
+            &eventplanedb_structures::read_filters::ReadFilters::default(),
         )?;
 
         assert_eq!(read_result.next_event_batch_index, None);
@@ -131,7 +131,7 @@ mod tests {
         assert_eq!(metadata.min_client_event_index, 33);
         assert_eq!(metadata.max_client_event_index, 34);
         match metadata.event_types_data {
-            eventplanedb_storage_structures::event_batch_metadata::EventTypesData::Direct(
+            eventplanedb_structures::event_batch_metadata::EventTypesData::Direct(
                 ref types,
             ) => {
                 assert_eq!(types.len(), 4);
@@ -147,7 +147,7 @@ mod tests {
         let read_result = fixture.read_filtered(
             &mut event_batch_reader,
             &mut metadata_reader,
-            &eventplanedb_storage_structures::read_filters::ReadFilters::default(),
+            &eventplanedb_structures::read_filters::ReadFilters::default(),
         )?;
 
         assert_eq!(read_result.next_event_batch_index, None);
@@ -219,7 +219,7 @@ mod tests {
         assert_eq!(metadata.min_client_event_index, 33);
         assert_eq!(metadata.max_client_event_index, 34);
         match metadata.event_types_data {
-            eventplanedb_storage_structures::event_batch_metadata::EventTypesData::Direct(
+            eventplanedb_structures::event_batch_metadata::EventTypesData::Direct(
                 ref types,
             ) => {
                 assert_eq!(types.len(), 4);
@@ -259,7 +259,7 @@ mod tests {
         assert_eq!(metadata.min_client_event_index, 35);
         assert_eq!(metadata.max_client_event_index, 35);
         match metadata.event_types_data {
-            eventplanedb_storage_structures::event_batch_metadata::EventTypesData::Direct(
+            eventplanedb_structures::event_batch_metadata::EventTypesData::Direct(
                 ref types,
             ) => {
                 assert_eq!(types.len(), 4);
@@ -275,7 +275,7 @@ mod tests {
         let read_result = fixture.read_filtered(
             &mut event_batch_reader,
             &mut metadata_reader,
-            &eventplanedb_storage_structures::read_filters::ReadFilters::default(),
+            &eventplanedb_structures::read_filters::ReadFilters::default(),
         )?;
 
         assert_eq!(read_result.next_event_batch_index, None);
@@ -344,7 +344,7 @@ mod tests {
         let read_result = fixture.read_filtered(
             &mut event_batch_reader,
             &mut metadata_reader,
-            &eventplanedb_storage_structures::read_filters::ReadFilters::default(),
+            &eventplanedb_structures::read_filters::ReadFilters::default(),
         );
         assert!(read_result.is_err());
 
@@ -378,7 +378,7 @@ mod tests {
         let read_result = fixture.read_filtered(
             &mut event_batch_reader,
             &mut metadata_reader,
-            &eventplanedb_storage_structures::read_filters::ReadFilters::default(),
+            &eventplanedb_structures::read_filters::ReadFilters::default(),
         )?;
 
         assert_eq!(read_result.event_batches.len(), num_batches);
@@ -601,7 +601,7 @@ mod tests {
             fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch)?;
 
         match metadata.event_types_data {
-            eventplanedb_storage_structures::event_batch_metadata::EventTypesData::Direct(_) => {
+            eventplanedb_structures::event_batch_metadata::EventTypesData::Direct(_) => {
                 // Success, direct storage used
             }
             _ => panic!("Expected direct event type storage"),
@@ -626,7 +626,7 @@ mod tests {
             fixture.write_batch(&mut event_batch_writer, &mut metadata_writer, &batch)?;
 
         match metadata.event_types_data {
-            eventplanedb_storage_structures::event_batch_metadata::EventTypesData::Bloom(_) => {
+            eventplanedb_structures::event_batch_metadata::EventTypesData::Bloom(_) => {
                 // Success, bloom filter used
             }
             _ => panic!("Expected bloom filter storage"),

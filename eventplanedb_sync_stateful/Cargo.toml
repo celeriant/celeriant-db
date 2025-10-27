@@ -6,11 +6,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-eventplanedb_storage_structures = { path = "../eventplanedb_storage_structures" }
-eventplanedb_storage_stateless = { path = "../eventplanedb_storage_stateless" }
+eventplanedb_structures = { path = "../eventplanedb_structures" }
+eventplanedb_sync_stateless = { path = "../eventplanedb_sync_stateless" }
 fastbloom.workspace = true
 lru.workspace = true
-glommio.workspace = true
 async-trait.workspace = true
 futures-lite.workspace = true
 

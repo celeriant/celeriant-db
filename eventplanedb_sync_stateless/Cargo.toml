@@ -1,12 +1,12 @@
 [package]
-name = "eventplanedb_storage_stateless"
+name = "eventplanedb_sync_stateless"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-eventplanedb_storage_structures = { path = "../eventplanedb_storage_structures" }
+eventplanedb_structures = { path = "../eventplanedb_structures" }
 fastbloom.workspace = true
 crc32fast.workspace = true
 bincode.workspace = true
@@ -14,7 +14,6 @@ zstd.workspace = true
 brotli.workspace = true
 flate2.workspace = true
 snap.workspace = true
-glommio.workspace = true
 futures-lite.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]

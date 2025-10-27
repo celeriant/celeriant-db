@@ -229,6 +229,7 @@ impl WriteOperations {
             writer_metadata.write(&item.metadata_bytes).await
                 .map_err(|e| AppendError::WriteError { message: format!("metadata write failed: {}", e) })?;
         }
+        
         writer_event_batch.close().await
             .map_err(|e| AppendError::WriteError { message: format!("event batch close failed: {}", e) })?;
         writer_metadata.close().await
