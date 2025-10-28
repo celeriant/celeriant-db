@@ -2,19 +2,7 @@ use std::{collections::{HashMap, HashSet}, path::Path};
 
 use eventplanedb_structures::{append_result::AppendResult, compression_type::CompressionType, constants::{BINCODE_CONFIG_FIXED, BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED, METADATA_BATCH_SIZE_BYTES}, event_batch_item::EventBatchItem, event_batch_metadata::{EventBatchMetadata, EventTypesData}, event_item::EventItem, read_filters::ReadFilters, wire_format::to_wire_format_variable};
 use fastbloom::BloomFilter;
-use futures_lite::AsyncWriteExt;
-use glommio::{io::{DmaFile, DmaStreamWriter, DmaStreamWriterBuilder, OpenOptions}, GlommioError};
-
-use std::{
-    cell::RefCell,
-    rc::Rc,
-    time::Duration,
-};
-use glommio::{
-    timer::sleep,
-};
-
-use crate::local_event::LocalEvent;
+use glommio::{io::{DmaFile, OpenOptions}, GlommioError};
 
 pub struct BatchMetadataItemPair {
     pub metadata: EventBatchMetadata,
@@ -396,6 +384,8 @@ impl WriteOperations {
     }
 
     pub fn maybe_read_cached_events(&self, filters: &ReadFilters) -> Result<Vec<EventItem>, CacheReadError> {
+        //TODO: Implement cache for write operations and limit
+        
         // Not async, doesn't require mutable access as it just reads from in-memory cache
 
         // Will create a new vec with items that are copied from the cache

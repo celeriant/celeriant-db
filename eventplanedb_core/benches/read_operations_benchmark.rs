@@ -1,5 +1,5 @@
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use eventplanedb_core::files::read_operations::{
+use eventplanedb_core::files::read_objects::{
     read_fixed_records_visit_const, read_objects, read_objects_absolute, AbsoluteObjectPosition,
 };
 use glommio::{GlommioError, LocalExecutorBuilder, Placement};
