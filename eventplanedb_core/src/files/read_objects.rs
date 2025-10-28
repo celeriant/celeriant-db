@@ -1,5 +1,10 @@
-use glommio::io::DmaFile;
-use std::{path::Path};
+use glommio::{GlommioError, io::DmaFile};
+
+#[derive(Debug)]
+pub enum ReadVisitError<E> {
+    Io(GlommioError<()>),
+    Visitor(E),
+}
 
 pub struct ObjectPosition {
     pub start_pos: u64,
@@ -12,8 +17,8 @@ pub struct AbsoluteObjectPosition {
     pub end_pos: u64,
 }
 
-pub async fn read_objects_absolute<P: AsRef<Path>>(
-    path: P,
+pub async fn read_objects_absolute(
+    file: &DmaFile,
     object_positions: &[AbsoluteObjectPosition],
     max_chunk_size: u64,
 ) -> glommio::Result<Vec<Vec<u8>>, ()> {
@@ -29,8 +34,6 @@ pub async fn read_objects_absolute<P: AsRef<Path>>(
         "object_positions must be ordered by start_pos and non-overlapping"
     );
 
-    // We assume `object_positions` are ordered by start_pos and non-overlapping.
-    let file = DmaFile::open(path).await?;
     let alignment = file.alignment();
     assert!(
         (max_chunk_size as u64) >= alignment && (max_chunk_size as u64) % alignment == 0,
@@ -136,8 +139,8 @@ pub async fn read_objects_absolute<P: AsRef<Path>>(
     Ok(objects)
 }
 
-pub async fn read_objects<P: AsRef<Path>>(
-    path: P,
+pub async fn read_objects(
+    file: &DmaFile,
     start_positions: &[u64],
     max_chunk_size: u64,
 ) -> glommio::Result<Vec<Vec<u8>>, ()> {
@@ -146,7 +149,7 @@ pub async fn read_objects<P: AsRef<Path>>(
         return Ok(Vec::new());
     }
 
-    // New: strictly increasing to disallow zero-length objects (duplicate starts).
+    // strictly increasing to disallow zero-length objects (duplicate starts).
     assert!(
         start_positions
             .windows(2)
@@ -154,7 +157,6 @@ pub async fn read_objects<P: AsRef<Path>>(
         "start_positions must be strictly increasing (no zero-length objects from duplicate starts)"
     );
 
-    let file = DmaFile::open(path).await?;
     let alignment = file.alignment();
     assert!(
         (max_chunk_size as u64) >= alignment && (max_chunk_size as u64) % alignment == 0,
@@ -243,23 +245,23 @@ pub async fn read_objects<P: AsRef<Path>>(
 /// - start: absolute byte offset (must be < file size)
 /// - end_exclusive: absolute end offset (exclusive); None => EOF
 /// - max_chunk_size: must be a multiple of the device alignment
-pub async fn read_fixed_records_visit_const<P: AsRef<Path>, const N: usize>(
-    path: P,
+pub async fn read_fixed_records_visit_const<const N: usize, E>(
+    file: &DmaFile,
     start: u64,
     end_exclusive: Option<u64>,
     max_chunk_size: u64,
-    mut on_record: impl FnMut(&[u8; N]),
-) -> glommio::Result<usize, ()> {
+    mut on_record: impl FnMut(&[u8; N]) -> Result<(), E>,
+) -> Result<usize, ReadVisitError<E>> {
     assert!(N > 0, "record size N must be > 0");
 
-    let file = DmaFile::open(path).await?;
     let alignment = file.alignment();
     assert!(
         max_chunk_size >= alignment && max_chunk_size % alignment == 0,
         "max_chunk_size must be a multiple of the device alignment ({alignment})"
     );
 
-    let file_size = file.file_size().await?;
+    let file_size = file.file_size().await
+        .map_err(|e| ReadVisitError::Io(e))?;
     assert!(start < file_size, "start must be less than file size");
     let stop_at = std::cmp::min(end_exclusive.unwrap_or(file_size), file_size);
     assert!(start < stop_at, "empty range: start must be < end/EOF");
@@ -279,7 +281,10 @@ pub async fn read_fixed_records_visit_const<P: AsRef<Path>, const N: usize>(
     while chunk_start < last_end {
         let chunk_end = std::cmp::min(chunk_start + max_chunk_size, last_end);
         let read_len = (chunk_end - chunk_start) as usize;
-        let chunk = file.read_at(chunk_start, read_len).await?;
+        let chunk = match file.read_at(chunk_start, read_len).await {
+            Ok(c) => c,
+            Err(e) => return Err(ReadVisitError::Io(e)),
+        };
 
         let mut data = if first_chunk && start > chunk_start {
             &chunk[(start - chunk_start) as usize..]
@@ -293,7 +298,9 @@ pub async fn read_fixed_records_visit_const<P: AsRef<Path>, const N: usize>(
             let need = N - carry_len;
             if data.len() >= need {
                 carry[carry_len..carry_len + need].copy_from_slice(&data[..need]);
-                on_record(&carry);
+                if let Err(ev) = on_record(&carry) {
+                    return Err(ReadVisitError::Visitor(ev));
+                }
                 records += 1;
                 data = &data[need..];
                 carry_len = 0;
@@ -307,7 +314,9 @@ pub async fn read_fixed_records_visit_const<P: AsRef<Path>, const N: usize>(
         // Process all full records in this chunk without copying
         let (full, rem) = data.as_chunks::<N>();
         for rec in full {
-            on_record(rec);
+            if let Err(ev) = on_record(rec) {
+                return Err(ReadVisitError::Visitor(ev));
+            }
             records += 1;
         }
 
@@ -390,7 +399,8 @@ mod test {
             let (file_path, start_positions, _end_positions) = create_test_file(folder, &object_sizes);
 
             for chunk_size in different_chunk_sizes().iter().enumerate() {
-                let objects = read_objects(&file_path, &start_positions.clone(), *chunk_size.1).await.unwrap();
+                let file = DmaFile::open(&file_path).await.unwrap();
+                let objects = read_objects(&file, &start_positions.clone(), *chunk_size.1).await.unwrap();
 
                 assert_eq!(objects.len(), object_sizes.len());
                 for (i, obj) in objects.iter().enumerate() {
@@ -422,8 +432,8 @@ mod test {
             for chunk_size in different_chunk_sizes().iter().enumerate() {
                 // Skip the first object's start position
                 let skipped_start_positions = start_positions[1..].to_vec();
-
-                let objects = read_objects(&file_path, &skipped_start_positions, *chunk_size.1)
+                let file = DmaFile::open(&file_path).await.unwrap();
+                let objects = read_objects(&file, &skipped_start_positions, *chunk_size.1)
                     .await
                     .unwrap();
 
@@ -474,7 +484,8 @@ mod test {
             }
 
             for chunk_size in different_chunk_sizes().iter().enumerate() {
-                let objects = read_objects_absolute(&file_path, &object_positions, *chunk_size.1).await.unwrap();
+                let file = DmaFile::open(&file_path).await.unwrap();
+                let objects = read_objects_absolute(&file, &object_positions, *chunk_size.1).await.unwrap();
 
                 assert_eq!(objects.len(), 3);
                 let mut j = 0;
@@ -523,7 +534,8 @@ mod test {
             }
 
             for chunk_size in different_chunk_sizes().iter().enumerate() {
-                let objects = read_objects_absolute(&file_path, &object_positions, *chunk_size.1).await.unwrap();
+                let file = DmaFile::open(&file_path).await.unwrap();
+                let objects = read_objects_absolute(&file, &object_positions, *chunk_size.1).await.unwrap();
 
                 assert_eq!(objects.len(), 2);
                 let mut j = 0;
@@ -555,7 +567,8 @@ mod test {
             bad_positions.swap(0, 1); // now [4096, 0, 8192]
 
             // Should panic due to "start_positions must be non-decreasing"
-            let _ = read_objects(&file_path, &bad_positions, 1 << 12).await;
+            let file = DmaFile::open(&file_path).await.unwrap();
+            let _ = read_objects(&file, &bad_positions, 1 << 12).await;
         }).unwrap();
 
         // Expect the task to have panicked
@@ -580,7 +593,8 @@ mod test {
             ];
 
             // Should panic due to "object_positions must be ordered by start_pos and non-overlapping"
-            let _ = read_objects_absolute(&file_path, &overlaps, 1 << 12).await;
+            let file = DmaFile::open(&file_path).await.unwrap();
+            let _ = read_objects_absolute(&file, &overlaps, 1 << 12).await;
         }).unwrap();
 
         // Expect the task to have panicked
@@ -598,7 +612,8 @@ mod test {
             let (file_path, starts, _ends) = create_test_file(folder, &object_sizes);
 
             // 1 is almost certainly not a valid alignment multiple on real devices
-            let _ = read_objects(&file_path, &starts, 1).await;
+            let file = DmaFile::open(&file_path).await.unwrap();
+            let _ = read_objects(&file, &starts, 1).await;
         }).unwrap();
 
         assert!(handle.join().is_err());
@@ -620,7 +635,8 @@ mod test {
             ];
 
             // 1 is almost certainly not a valid alignment multiple on real devices
-            let _ = read_objects_absolute(&file_path, &positions, 1).await;
+            let file = DmaFile::open(&file_path).await.unwrap();
+            let _ = read_objects_absolute(&file, &positions, 1).await;
         }).unwrap();
 
         assert!(handle.join().is_err());
@@ -641,7 +657,8 @@ mod test {
             let custom_starts = vec![0u64, 4u64, 4u64, 8u64, file_size];
 
             // Should assert due to zero-length object(s) / last start at EOF
-            let _ = read_objects(&file_path, &custom_starts, 1 << 12).await;
+            let file = DmaFile::open(&file_path).await.unwrap();
+            let _ = read_objects(&file, &custom_starts, 1 << 12).await;
         }).unwrap();
 
         assert!(handle.join().is_err());
@@ -668,7 +685,8 @@ mod test {
             ];
 
             // Should assert due to zero-length absolute objects and last start at EOF
-            let _ = read_objects_absolute(&file_path, &positions, 1 << 12).await;
+            let file: DmaFile = DmaFile::open(&file_path).await.unwrap();
+            let _ = read_objects_absolute(&file, &positions, 1 << 12).await;
         }).unwrap();
 
         assert!(handle.join().is_err());
@@ -692,7 +710,8 @@ mod test {
                 AbsoluteObjectPosition { start_pos: start, end_pos: end_far },
             ];
 
-            let objects = read_objects_absolute(&file_path, &positions, 1 << 12).await.unwrap();
+            let file: DmaFile = DmaFile::open(&file_path).await.unwrap();
+            let objects = read_objects_absolute(&file, &positions, 1 << 12).await.unwrap();
             assert_eq!(objects.len(), 1);
             assert_eq!(objects[0].len(), (file_size - start) as usize);
             assert!(objects[0].iter().all(|&b| b == 1));
@@ -708,10 +727,11 @@ mod test {
             let object_sizes = vec![1024];
             let (file_path, _starts, _ends) = create_test_file(folder, &object_sizes);
 
-            let v = read_objects(&file_path, &[], 1 << 12).await.unwrap();
+            let file: DmaFile = DmaFile::open(&file_path).await.unwrap();
+            let v = read_objects(&file, &[], 1 << 12).await.unwrap();
             assert!(v.is_empty());
 
-            let v2 = read_objects_absolute(&file_path, &[], 1 << 12).await.unwrap();
+            let v2 = read_objects_absolute(&file, &[], 1 << 12).await.unwrap();
             assert!(v2.is_empty());
         }).unwrap();
         handle.join().unwrap();
@@ -730,8 +750,10 @@ mod test {
             for chunk_size in different_chunk_sizes() {
                 // Collect records to validate content
                 let mut seen: Vec<[u8; N]> = Vec::new();
-                let count = read_fixed_records_visit_const::<_, N>(&file_path, 0, None, chunk_size, |rec| {
+                let file: DmaFile = DmaFile::open(&file_path).await.unwrap();
+                let count = read_fixed_records_visit_const::<N, ()>(&file, 0, None, chunk_size, |rec| {
                     seen.push(*rec);
+                    Ok(())
                 }).await.unwrap();
 
                 assert_eq!(count, 10);
@@ -746,8 +768,9 @@ mod test {
 
                 // Same result when end_exclusive == EOF
                 let mut count2 = 0usize;
-                let count2_ret = read_fixed_records_visit_const::<_, N>(&file_path, 0, Some(file_size), chunk_size, |_rec| {
+                let count2_ret = read_fixed_records_visit_const::<N, ()>(&file, 0, Some(file_size), chunk_size, |_rec| {
                     count2 += 1;
+                    Ok(())
                 }).await.unwrap();
                 assert_eq!(count2, 10);
                 assert_eq!(count2_ret, 10);
@@ -770,8 +793,10 @@ mod test {
             let end = (7 * N + 100) as u64;
             for chunk_size in different_chunk_sizes() {
                 let mut count = 0usize;
-                let ret = read_fixed_records_visit_const::<_, N>(&file_path, 0, Some(end), chunk_size, |_rec| {
+                let file: DmaFile = DmaFile::open(&file_path).await.unwrap();
+                let ret = read_fixed_records_visit_const::<N, ()>(&file, 0, Some(end), chunk_size, |_rec| {
                     count += 1;
+                    Ok(())
                 }).await.unwrap();
 
                 assert_eq!(count, 7);
@@ -798,14 +823,14 @@ mod test {
 
             for chunk_size in different_chunk_sizes() {
                 let mut seen_idx = 0usize;
-                let ret = read_fixed_records_visit_const::<_, N>(&file_path, start, None, chunk_size, |rec| {
+                let file: DmaFile = DmaFile::open(&file_path).await.unwrap();
+                let ret = read_fixed_records_visit_const::<N, ()>(&file, start, None, chunk_size, |rec| {
                     // Validate content straddling file-record boundaries:
                     // Each returned record starts at abs offset: start + seen_idx * N
                     let abs_off = start as usize + seen_idx * N;
                     let file_rec_idx = abs_off / N;
                     let offset_in_file_rec = abs_off % N;
                     let head_len = N - offset_in_file_rec;
-                    let tail_len = offset_in_file_rec; // together must be N with next rec
 
                     // First segment from file_rec_idx
                     let expected_byte_head = (file_rec_idx % 256) as u8;
@@ -817,6 +842,7 @@ mod test {
                         assert!(rec[head_len..].iter().all(|&b| b == expected_byte_tail));
                     }
                     seen_idx += 1;
+                    Ok(())
                 }).await.unwrap();
 
                 assert_eq!(ret, expected);
@@ -843,8 +869,10 @@ mod test {
 
             // Count only; content pattern already covered elsewhere
             let mut count = 0usize;
-            let ret = read_fixed_records_visit_const::<_, N>(&file_path, 0, Some(file_size), chunk_size, |_rec| {
+            let file: DmaFile = DmaFile::open(&file_path).await.unwrap();
+            let ret = read_fixed_records_visit_const::<N, ()>(&file, 0, Some(file_size), chunk_size, |_rec| {
                 count += 1;
+                Ok(())
             }).await.unwrap();
 
             assert_eq!(ret, record_count);
@@ -863,13 +891,14 @@ mod test {
             let (file_path, file_size) = create_fixed_record_file(dir, N, 2); // 626 bytes
 
             // start >= file_size should assert
-            let _ = read_fixed_records_visit_const::<_, N>(&file_path, file_size, None, 1 << 12, |_rec| {}).await;
+            let file: DmaFile = DmaFile::open(&file_path).await.unwrap();
+            let _ = read_fixed_records_visit_const::<N, ()>(&file, file_size, None, 1 << 12, |_rec| Ok(())).await;
 
             // empty range start == end_exclusive should assert
-            let _ = read_fixed_records_visit_const::<_, N>(&file_path, 10, Some(10), 1 << 12, |_rec| {}).await;
+            let _ = read_fixed_records_visit_const::<N, ()>(&file, 10, Some(10), 1 << 12, |_rec| Ok(())).await;
 
             // invalid chunk size (almost certainly not a multiple of alignment)
-            let _ = read_fixed_records_visit_const::<_, N>(&file_path, 0, None, 1, |_rec| {}).await;
+            let _ = read_fixed_records_visit_const::<N, ()>(&file, 0, None, 1, |_rec| Ok(())).await;
         }).unwrap();
 
         // All three should have panicked in the task
@@ -897,7 +926,8 @@ mod test {
             let bad_chunk_size = alignment + 1;
 
             // This should panic due to the chunk size assertion.
-            let _ = read_objects(&file_path, &starts, bad_chunk_size).await;
+            let file: DmaFile = DmaFile::open(&file_path).await.unwrap();
+            let _ = read_objects(&file, &starts, bad_chunk_size).await;
         }).unwrap();
 
         assert!(handle.join().is_err());

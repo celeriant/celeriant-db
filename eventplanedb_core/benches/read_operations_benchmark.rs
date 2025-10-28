@@ -2,6 +2,7 @@ use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use eventplanedb_core::files::read_objects::{
     read_fixed_records_visit_const, read_objects, read_objects_absolute, AbsoluteObjectPosition,
 };
+use glommio::io::DmaFile;
 use glommio::{GlommioError, LocalExecutorBuilder, Placement};
 use std::fs::File;
 use std::hint::black_box;
@@ -68,8 +69,9 @@ fn bench_read_objects(c: &mut Criterion) {
             let file_path = file_path.clone();
             let start_positions = start_positions.clone();
             let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(move || async move {
+                let file: DmaFile = DmaFile::open(&file_path).await.unwrap();
                 let objects =
-                    read_objects(&file_path, black_box(&start_positions), chunk_size).await?;
+                    read_objects(&file, black_box(&start_positions), chunk_size).await?;
                 black_box(objects);
                 Ok::<(), GlommioError<()>>(())
             }).unwrap();
@@ -107,8 +109,9 @@ fn bench_read_objects_absolute(c: &mut Criterion) {
             let dense_file_path = dense_file_path.clone();
             let dense_positions = dense_positions.clone();
             let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(move || async move {
+                let file: DmaFile = DmaFile::open(&dense_file_path).await.unwrap();
                 let objects = read_objects_absolute(
-                    &dense_file_path,
+                    &file,
                     black_box(&dense_positions),
                     chunk_size,
                 )
@@ -149,8 +152,9 @@ fn bench_read_objects_absolute(c: &mut Criterion) {
             let sparse_file_path = sparse_file_path.clone();
             let sparse_positions = sparse_positions.clone();
             let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(move || async move {
+                let file: DmaFile = DmaFile::open(&sparse_file_path).await.unwrap();
                 let objects = read_objects_absolute(
-                    &sparse_file_path,
+                    &file,
                     black_box(&sparse_positions),
                     chunk_size,
                 )
@@ -183,8 +187,9 @@ fn bench_read_fixed_records(c: &mut Criterion) {
         b.iter(|| {
             let file_path = file_path.clone();
             let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(move || async move {
-                let count = read_fixed_records_visit_const::<_, RECORD_SIZE>(
-                    &file_path,
+                let file: DmaFile = DmaFile::open(&file_path).await.unwrap();
+                let count = read_fixed_records_visit_const::<RECORD_SIZE>(
+                    &file,
                     0,
                     None,
                     chunk_size,
