@@ -6,6 +6,7 @@ pub struct ObjectPosition {
     pub can_skip: bool,
 }
 
+#[derive(Clone)]
 pub struct AbsoluteObjectPosition {
     pub start_pos: u64,
     pub end_pos: u64,
@@ -874,5 +875,31 @@ mod test {
         // All three should have panicked in the task
         assert!(handle.join().is_err());
     }
-    
+
+    #[test]
+    fn test_read_objects_bad_chunk_advancement_logic() {
+        // This test exposes the flawed chunk advancement logic.
+        // The function asserts that chunk size must be a multiple of alignment.
+        // If that assert were removed, the logic `chunk_start -= chunk_start % alignment`
+        // would cause chunks to overlap and data to be re-read.
+        // The test will pass by panicking on the existing assertion.
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
+            let tempdir = tempdir().unwrap();
+            let folder = tempdir.path().to_str().unwrap();
+
+            let object_sizes = vec![4096, 4096];
+            let (file_path, starts, _ends) = create_test_file(folder, &object_sizes);
+
+            // To get alignment, we need to open the file first.
+            let alignment = DmaFile::open(&file_path).await.unwrap().alignment();
+            
+            // Use a chunk size that is NOT a multiple of alignment.
+            let bad_chunk_size = alignment + 1;
+
+            // This should panic due to the chunk size assertion.
+            let _ = read_objects(&file_path, &starts, bad_chunk_size).await;
+        }).unwrap();
+
+        assert!(handle.join().is_err());
+    }
 }

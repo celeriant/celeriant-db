@@ -403,8 +403,8 @@ mod tests {
         let unicode_data = "你好世界".to_string().into_bytes();
         let binary_data = vec![0u8, 1u8, 2u8, 255u8];
 
-        let event1 = EventItem::new(1, 1, 1000, 1, 1, unicode_data);
-        let event2 = EventItem::new(2, 2, 1000, 2, 1, binary_data);
+        let event1 = EventItem::new(1, 1, None, 1000, 1, 1, unicode_data);
+        let event2 = EventItem::new(2, 2, None, 1000, 2, 1, binary_data);
 
         let batch = EventBatchItem::new(
             1,
@@ -445,7 +445,7 @@ mod tests {
 
         let engine = StatelessEngine::builder().build();
 
-        let event = EventItem::new(1, 1, 1000, 1, 1, b"test event".to_vec());
+        let event = EventItem::new(1, 1, None, 1000, 1, 1, b"test event".to_vec());
         let batch = EventBatchItem::new(1, 1600000000000, 123456789, Some(987654321), vec![event]);
 
         let compression_types = vec![
@@ -492,7 +492,7 @@ mod tests {
 
         let engine = StatelessEngine::builder().build();
 
-        let event = EventItem::new(1, 1, 1000, 1, 1, b"test event".to_vec());
+        let event = EventItem::new(1, 1, None, 1000, 1, 1, b"test event".to_vec());
         let batch = EventBatchItem::new(1, 1600000000000, 123456789, Some(987654321), vec![event]);
 
         let levels = vec![1, 3, 6, 9];
@@ -547,7 +547,7 @@ mod tests {
         let engine = StatelessEngine::builder().build();
 
         let repetitive_data = "A".repeat(1024).into_bytes(); // Highly repetitive data
-        let event = EventItem::new(1, 1, 1000, 1, 1, repetitive_data);
+        let event = EventItem::new(1, 1, None, 1000, 1, 1, repetitive_data);
         let batch = EventBatchItem::new(1, 1600000000000, 123456789, Some(987654321), vec![event]);
 
         let compression_types = vec![
@@ -592,7 +592,7 @@ mod tests {
 
         let mut events = Vec::new();
         for i in 1..=4 {
-            let event = EventItem::new(i, i, 1000, i, 1, b"test event".to_vec());
+            let event = EventItem::new(i, i, None, 1000, i, 1, b"test event".to_vec());
             events.push(event);
         }
         let batch = EventBatchItem::new(1, 1600000000000, 123456789, Some(987654321), events);
@@ -617,7 +617,7 @@ mod tests {
 
         let mut events = Vec::new();
         for i in 1..=5 {
-            let event = EventItem::new(i, i, 1000, i, 1, b"test event".to_vec());
+            let event = EventItem::new(i, i, None, 1000, i, 1, b"test event".to_vec());
             events.push(event);
         }
         let batch = EventBatchItem::new(1, 1600000000000, 123456789, Some(987654321), events);
@@ -642,13 +642,13 @@ mod tests {
         let mut event_type_dedup = HashSet::new();
 
         let events = vec![
-            EventItem::new(1, 1, 1000, 1, 1, b"test event".to_vec()),
-            EventItem::new(2, 2, 1000, 1, 1, b"test event".to_vec()),
-            EventItem::new(3, 3, 1000, 2, 1, b"test event".to_vec()),
-            EventItem::new(4, 4, 1000, 2, 1, b"test event".to_vec()),
-            EventItem::new(5, 5, 1000, 4, 1, b"test event".to_vec()),
-            EventItem::new(6, 6, 1000, 5, 1, b"test event".to_vec()),
-            EventItem::new(7, 7, 1000, 6, 1, b"test event".to_vec()),
+            EventItem::new(1, 1, None, 1000, 1, 1, b"test event".to_vec()),
+            EventItem::new(2, 2, None, 1000, 1, 1, b"test event".to_vec()),
+            EventItem::new(3, 3, None, 1000, 2, 1, b"test event".to_vec()),
+            EventItem::new(4, 4, None, 1000, 2, 1, b"test event".to_vec()),
+            EventItem::new(5, 5, None, 1000, 4, 1, b"test event".to_vec()),
+            EventItem::new(6, 6, None, 1000, 5, 1, b"test event".to_vec()),
+            EventItem::new(7, 7, None, 1000, 6, 1, b"test event".to_vec()),
         ];
         let batch = EventBatchItem::new(1, 1600000000000, 123456789, Some(987654321), events);
 
@@ -670,7 +670,7 @@ mod tests {
     fn test_simple_read_all() -> io::Result<()> {
         let mut fixture = TestFixture::new()?;
 
-        let event = EventItem::new(1, 1, 1000, 1, 1, b"test event".to_vec());
+        let event = EventItem::new(1, 1, None, 1000, 1, 1, b"test event".to_vec());
         let batch1 = EventBatchItem::new(
             1,
             1600000000000,

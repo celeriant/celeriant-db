@@ -199,13 +199,14 @@ pub mod tests {
 
         // Helper methods for creating common test data
         pub fn create_simple_event(&self, index: u64) -> EventItem {
-            EventItem::new(index, index, 1000, 1, 1, b"test event".to_vec())
+            EventItem::new(index, index, None, 1000, 1, 1, b"test event".to_vec())
         }
 
         pub fn create_event_with_type(&self, index: u64, event_type: u64) -> EventItem {
             EventItem::new(
                 index,
                 index,
+                None,
                 1000 + index,
                 event_type,
                 1,
@@ -214,11 +215,11 @@ pub mod tests {
         }
 
         pub fn create_event_with_timestamp(&self, index: u64, timestamp: u64) -> EventItem {
-            EventItem::new(index, index, timestamp, 1, 1, b"test event".to_vec())
+            EventItem::new(index, index, None, timestamp, 1, 1, b"test event".to_vec())
         }
 
         pub fn create_event_with_data(&self, index: u64, data: Vec<u8>) -> EventItem {
-            EventItem::new(index, index, 1000, 1, 1, data)
+            EventItem::new(index, index, None, 1000, 1, 1, data)
         }
 
         pub fn create_simple_batch(

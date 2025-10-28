@@ -973,7 +973,6 @@ mod tests {
     use super::*;
     use std::{collections::HashMap, fs, io, path::PathBuf, time::Duration, u128};
     use tempfile::TempDir;
-    use glommio::{LocalExecutor, LocalExecutorBuilder, Placement};
 
     //TODO: A test that simulates a failed write after consuming an index, creating a gap
 
@@ -1034,6 +1033,7 @@ mod tests {
                     EventItem::new(
                         start_index + i as u64,
                         start_index + i as u64,
+                        None,
                         1000 + i as u64,
                         42,
                         1,
@@ -1135,13 +1135,13 @@ mod tests {
             };
             let mut engine = StatefulEngine::new(config);
 
-            let events = vec![EventItem::new(1, 1, 1000, 42, 1, b"test".to_vec())];
+            let events = vec![EventItem::new(1, 1, None, 1000, 42, 1, b"test".to_vec())];
 
             let metadata1 =
                 engine.append_events(544, 655, 123, 100, None, events.clone(), None, true)?;
             assert_eq!(metadata1.event_batch_index, 1);
 
-            let events2 = vec![EventItem::new(2, 2, 1000, 42, 1, b"test".to_vec())];
+            let events2 = vec![EventItem::new(2, 2, None, 1000, 42, 1, b"test".to_vec())];
             let metadata2 = engine.append_events(544, 655, 123, 100, None, events2, None, true)?;
             assert_eq!(metadata2.event_batch_index, 2);
         }
@@ -1154,7 +1154,7 @@ mod tests {
             };
             let mut engine = StatefulEngine::new(config);
 
-            let events = vec![EventItem::new(3, 3, 1000, 42, 1, b"test".to_vec())];
+            let events = vec![EventItem::new(3, 3, None, 1000, 42, 1, b"test".to_vec())];
 
             // Should continue from index 2
             let metadata3 = engine.append_events(544, 655, 123, 100, None, events, None, true)?;
@@ -1172,9 +1172,9 @@ mod tests {
 
         // First write with events having client_event_index 1, 2, 3
         let events1 = vec![
-            EventItem::new(1, 1, 1000, 42, 1, b"event1".to_vec()),
-            EventItem::new(2, 2, 1001, 42, 1, b"event2".to_vec()),
-            EventItem::new(3, 3, 1002, 42, 1, b"event3".to_vec()),
+            EventItem::new(1, 1, None, 1000, 42, 1, b"event1".to_vec()),
+            EventItem::new(2, 2, None, 1001, 42, 1, b"event2".to_vec()),
+            EventItem::new(3, 3, None, 1002, 42, 1, b"event3".to_vec()),
         ];
 
         fixture
@@ -1184,10 +1184,10 @@ mod tests {
         // Second write with overlapping client_event_index (2, 3, 4, 5)
         // Only events with index 4 and 5 should be written
         let events2 = vec![
-            EventItem::new(2, 4, 1003, 42, 1, b"event2_dup".to_vec()), // Should be filtered
-            EventItem::new(3, 5, 1004, 42, 1, b"event3_dup".to_vec()), // Should be filtered
-            EventItem::new(4, 6, 1005, 42, 1, b"event4".to_vec()),     // Should be written
-            EventItem::new(5, 7, 1006, 42, 1, b"event5".to_vec()),     // Should be written
+            EventItem::new(2, 4, None, 1003, 42, 1, b"event2_dup".to_vec()), // Should be filtered
+            EventItem::new(3, 5, None, 1004, 42, 1, b"event3_dup".to_vec()), // Should be filtered
+            EventItem::new(4, 6, None, 1005, 42, 1, b"event4".to_vec()),     // Should be written
+            EventItem::new(5, 7, None, 1006, 42, 1, b"event5".to_vec()),     // Should be written
         ];
 
         let _metadata2 = fixture
@@ -1212,8 +1212,8 @@ mod tests {
 
         // Client 100 writes events with client_event_index 1, 2
         let events1 = vec![
-            EventItem::new(1, 1, 1000, 42, 1, b"client100_event1".to_vec()),
-            EventItem::new(2, 2, 1001, 42, 1, b"client100_event2".to_vec()),
+            EventItem::new(1, 1, None, 1000, 42, 1, b"client100_event1".to_vec()),
+            EventItem::new(2, 2, None, 1001, 42, 1, b"client100_event2".to_vec()),
         ];
 
         fixture
@@ -1223,8 +1223,8 @@ mod tests {
         // Client 200 writes events with same client_event_index 1, 2
         // These should NOT be filtered since they're from a different client
         let events2 = vec![
-            EventItem::new(1, 3, 1002, 42, 1, b"client200_event1".to_vec()),
-            EventItem::new(2, 4, 1003, 42, 1, b"client200_event2".to_vec()),
+            EventItem::new(1, 3, None, 1002, 42, 1, b"client200_event1".to_vec()),
+            EventItem::new(2, 4, None, 1003, 42, 1, b"client200_event2".to_vec()),
         ];
 
         fixture
@@ -1248,8 +1248,8 @@ mod tests {
 
         // First write
         let events1 = vec![
-            EventItem::new(1, 1, 1000, 42, 1, b"event1".to_vec()),
-            EventItem::new(2, 2, 1001, 42, 1, b"event2".to_vec()),
+            EventItem::new(1, 1, None, 1000, 42, 1, b"event1".to_vec()),
+            EventItem::new(2, 2, None, 1001, 42, 1, b"event2".to_vec()),
         ];
 
         fixture
@@ -1258,8 +1258,8 @@ mod tests {
 
         // Second write with same client_event_indices - all should be filtered out
         let events2 = vec![
-            EventItem::new(1, 3, 1002, 42, 1, b"event1_dup".to_vec()),
-            EventItem::new(2, 4, 1003, 42, 1, b"event2_dup".to_vec()),
+            EventItem::new(1, 3, None, 1002, 42, 1, b"event1_dup".to_vec()),
+            EventItem::new(2, 4, None, 1003, 42, 1, b"event2_dup".to_vec()),
         ];
 
         let result = fixture
@@ -1281,14 +1281,14 @@ mod tests {
         let mut fixture = StatefulTestFixture::new()?;
 
         // Client 100 writes to aggregate1
-        let events1 = vec![EventItem::new(1, 1, 1000, 42, 1, b"test".to_vec())];
+        let events1 = vec![EventItem::new(1, 1, None, 1000, 42, 1, b"test".to_vec())];
         fixture
             .engine
             .append_events(544, 655, 111, 100, None, events1, None, true)?;
 
         // Same client writes to aggregate2 with same client_event_index
         // Should NOT be filtered since it's a different aggregate
-        let events2 = vec![EventItem::new(1, 2, 1001, 42, 1, b"test".to_vec())];
+        let events2 = vec![EventItem::new(1, 2, None, 1001, 42, 1, b"test".to_vec())];
         let result = fixture
             .engine
             .append_events(544, 655, 222, 100, None, events2, None, true);
@@ -1474,6 +1474,7 @@ mod tests {
             let events = vec![EventItem::new(
                 i + 1,
                 i + 1,
+                None,
                 1000 + i,
                 42,
                 1,
@@ -1634,6 +1635,7 @@ mod tests {
             let events = vec![EventItem::new(
                 i + 1,
                 i + 1,
+                None,
                 1000 + i,
                 42,
                 1,
@@ -1749,6 +1751,7 @@ mod tests {
                 let events = vec![EventItem::new(
                     aggregate_idx * 10 + client_id - 100 + 1,
                     aggregate_idx * 10 + client_id - 100 + 1,
+                    None,
                     1000,
                     42,
                     1,
@@ -1809,8 +1812,8 @@ mod tests {
 
         // Write events with different event types
         let events1 = vec![
-            EventItem::new(1, 1, 1000, 42, 1, b"event1".to_vec()), // event_type_major = 42
-            EventItem::new(2, 2, 1001, 43, 1, b"event2".to_vec()), // event_type_major = 43
+            EventItem::new(1, 1, None, 1000, 42, 1, b"event1".to_vec()), // event_type_major = 42
+            EventItem::new(2, 2, None, 1001, 43, 1, b"event2".to_vec()), // event_type_major = 43
         ];
 
         fixture
@@ -1819,8 +1822,8 @@ mod tests {
 
         // Write more events - bloom filter should accumulate state
         let events2 = vec![
-            EventItem::new(3, 3, 1002, 44, 1, b"event3".to_vec()), // event_type_major = 44
-            EventItem::new(4, 4, 1003, 42, 1, b"event4".to_vec()), // duplicate type
+            EventItem::new(3, 3, None, 1002, 44, 1, b"event3".to_vec()), // event_type_major = 44
+            EventItem::new(4, 4, None, 1003, 42, 1, b"event4".to_vec()), // duplicate type
         ];
 
         let result = fixture
@@ -1837,8 +1840,8 @@ mod tests {
 
         // Write batch with duplicate event types within same batch
         let events1 = vec![
-            EventItem::new(1, 1, 1000, 42, 1, b"event1".to_vec()),
-            EventItem::new(2, 2, 1001, 42, 1, b"event2".to_vec()), // same type in batch
+            EventItem::new(1, 1, None, 1000, 42, 1, b"event1".to_vec()),
+            EventItem::new(2, 2, None, 1001, 42, 1, b"event2".to_vec()), // same type in batch
         ];
 
         let result = fixture
@@ -1914,6 +1917,7 @@ mod tests {
             let events = vec![EventItem::new(
                 i + 1,
                 i + 1,
+                None,
                 1000 + i,
                 42,
                 1,
@@ -1941,7 +1945,7 @@ mod tests {
 
         // Write a batch with very large data
         let large_data = vec![0u8; 10000]; // 10KB
-        let events = vec![EventItem::new(1, 1, 1000, 42, 1, large_data)];
+        let events = vec![EventItem::new(1, 1, None, 1000, 42, 1, large_data)];
         fixture
             .engine
             .append_events(544, 655, 123, 100, None, events, None, true)?;
@@ -1965,9 +1969,9 @@ mod tests {
 
         // Write events with different types
         let events = vec![
-            EventItem::new(1, 1, 1000, 42, 1, b"type42".to_vec()),
-            EventItem::new(2, 2, 1001, 43, 1, b"type43".to_vec()),
-            EventItem::new(3, 3, 1002, 44, 1, b"type44".to_vec()),
+            EventItem::new(1, 1, None, 1000, 42, 1, b"type42".to_vec()),
+            EventItem::new(2, 2, None, 1001, 43, 1, b"type43".to_vec()),
+            EventItem::new(3, 3, None, 1002, 44, 1, b"type44".to_vec()),
         ];
         fixture
             .engine
@@ -1992,9 +1996,9 @@ mod tests {
 
         // Write events with different client event indices
         let events = vec![
-            EventItem::new(1, 1, 1000, 42, 1, b"event1".to_vec()),
-            EventItem::new(5, 2, 1001, 42, 1, b"event5".to_vec()),
-            EventItem::new(10, 3, 1002, 42, 1, b"event10".to_vec()),
+            EventItem::new(1, 1, None, 1000, 42, 1, b"event1".to_vec()),
+            EventItem::new(5, 2, None, 1001, 42, 1, b"event5".to_vec()),
+            EventItem::new(10, 3, None, 1002, 42, 1, b"event10".to_vec()),
         ];
         fixture
             .engine
@@ -2019,9 +2023,9 @@ mod tests {
 
         // Write events with different event timestamps
         let events = vec![
-            EventItem::new(1, 1, 1000, 42, 1, b"event1".to_vec()),
-            EventItem::new(2, 2, 2000, 42, 1, b"event2".to_vec()),
-            EventItem::new(3, 3, 3000, 42, 1, b"event3".to_vec()),
+            EventItem::new(1, 1, None, 1000, 42, 1, b"event1".to_vec()),
+            EventItem::new(2, 2, None, 2000, 42, 1, b"event2".to_vec()),
+            EventItem::new(3, 3, None, 3000, 42, 1, b"event3".to_vec()),
         ];
         fixture
             .engine
@@ -2047,9 +2051,9 @@ mod tests {
         // Write events with different event indices
         // We set 10, 20, 30 here but they are overwritten by the server logic. This is intentional!
         let events = vec![
-            EventItem::new(1, 10, 1000, 42, 1, b"event1".to_vec()),
-            EventItem::new(2, 20, 1001, 42, 1, b"event2".to_vec()),
-            EventItem::new(3, 30, 1002, 42, 1, b"event3".to_vec()),
+            EventItem::new(1, 10, None, 1000, 42, 1, b"event1".to_vec()),
+            EventItem::new(2, 20, None, 1001, 42, 1, b"event2".to_vec()),
+            EventItem::new(3, 30, None, 1002, 42, 1, b"event3".to_vec()),
         ];
         fixture
             .engine
@@ -2152,7 +2156,7 @@ mod tests {
 
         // Write many small batches to trigger eviction
         for i in 0..10 {
-            let events = vec![EventItem::new(i + 1, i + 1, 1000, 42, 1, b"small".to_vec())];
+            let events = vec![EventItem::new(i + 1, i + 1, None, 1000, 42, 1, b"small".to_vec())];
             fixture
                 .engine
                 .append_events(544, 655, 123, 100, None, events, None, true)?;
@@ -2177,7 +2181,7 @@ mod tests {
 
         // Write with multiple clients to trigger eviction
         for client_id in 100..110 {
-            let events = vec![EventItem::new(1, 1, 1000, 42, 1, b"test".to_vec())];
+            let events = vec![EventItem::new(1, 1, None, 1000, 42, 1, b"test".to_vec())];
             fixture
                 .engine
                 .append_events(544, 655, 123, client_id, None, events, None, true)?;
@@ -2185,7 +2189,7 @@ mod tests {
 
         // Cache should have evicted earlier clients, but duplicate filtering should still work
         // (by falling back to disk reads if needed)
-        let events_dup = vec![EventItem::new(1, 2, 1001, 42, 1, b"dup".to_vec())];
+        let events_dup = vec![EventItem::new(1, 2, None, 1001, 42, 1, b"dup".to_vec())];
         let result = fixture
             .engine
             .append_events(544, 655, 123, 100, None, events_dup, None, true);
@@ -2266,12 +2270,12 @@ mod tests {
 
         // Write diverse data
         let events1 = vec![
-            EventItem::new(1, 1, 1000, 42, 1, b"event1".to_vec()),
-            EventItem::new(5, 2, 2000, 43, 1, b"event5".to_vec()),
+            EventItem::new(1, 1, None, 1000, 42, 1, b"event1".to_vec()),
+            EventItem::new(5, 2, None, 2000, 43, 1, b"event5".to_vec()),
         ];
         let events2 = vec![
-            EventItem::new(10, 3, 1500, 42, 1, b"event10".to_vec()),
-            EventItem::new(15, 4, 2500, 44, 1, b"event15".to_vec()),
+            EventItem::new(10, 3, None, 1500, 42, 1, b"event10".to_vec()),
+            EventItem::new(15, 4, None, 2500, 44, 1, b"event15".to_vec()),
         ];
 
         fixture
@@ -2307,6 +2311,7 @@ mod tests {
                 let events = vec![EventItem::new(
                     (batch * 3 + (client_id - 100)) as u64 + 1,
                     batch as u64 + 1,
+                    None,
                     1000 + batch,
                     42,
                     1,
@@ -2349,7 +2354,7 @@ mod tests {
 
         let mut engine = StatefulEngine::with_default_config(base_path);
 
-        let events = vec![EventItem::new(1, 1, 1000, 42, 1, b"test".to_vec())];
+        let events = vec![EventItem::new(1, 1, None, 1000, 42, 1, b"test".to_vec())];
         let result = engine.append_events(544, 655, 123, 100, None, events, None, true);
         assert!(result.is_ok());
 
@@ -2402,8 +2407,8 @@ mod tests {
     fn test_organization_isolation_client_event_indices() -> io::Result<()> {
         let mut fixture = StatefulTestFixture::new()?;
 
-        let events1 = vec![EventItem::new(1, 1, 1000, 42, 1, b"event1".to_vec())];
-        let events2 = vec![EventItem::new(1, 2, 1001, 42, 1, b"event1_dup".to_vec())];
+        let events1 = vec![EventItem::new(1, 1, None, 1000, 42, 1, b"event1".to_vec())];
+        let events2 = vec![EventItem::new(1, 2, None, 1001, 42, 1, b"event1_dup".to_vec())];
 
         // Write to org 100
         fixture
@@ -2559,8 +2564,8 @@ mod tests {
     fn test_aggregate_type_isolation_client_event_indices() -> io::Result<()> {
         let mut fixture = StatefulTestFixture::new()?;
 
-        let events1 = vec![EventItem::new(1, 1, 1000, 42, 1, b"event1".to_vec())];
-        let events2 = vec![EventItem::new(1, 2, 1001, 42, 1, b"event1_dup".to_vec())];
+        let events1 = vec![EventItem::new(1, 1, None, 1000, 42, 1, b"event1".to_vec())];
+        let events2 = vec![EventItem::new(1, 2, None, 1001, 42, 1, b"event1_dup".to_vec())];
 
         // Write to aggregate_type 200
         fixture
@@ -2672,6 +2677,7 @@ mod tests {
                     let events = vec![EventItem::new(
                         1,
                         1,
+                        None,
                         1000,
                         42,
                         1,
@@ -2892,7 +2898,7 @@ mod tests {
         let mut fixture = StatefulTestFixture::new()?;
 
         // Write same client_event_index to different hierarchy positions
-        let events = vec![EventItem::new(42, 1, 1000, 1, 1, b"test".to_vec())];
+        let events = vec![EventItem::new(42, 1, None, 1000, 1, 1, b"test".to_vec())];
 
         fixture
             .engine
@@ -2910,7 +2916,7 @@ mod tests {
         // All should succeed - no cross-pollution
 
         // Now try duplicates within each scope
-        let dup_events = vec![EventItem::new(42, 2, 1001, 1, 1, b"dup".to_vec())];
+        let dup_events = vec![EventItem::new(42, 2, None, 1001, 1, 1, b"dup".to_vec())];
 
         let result1 =
             fixture
@@ -2954,6 +2960,7 @@ mod tests {
                         let events = vec![EventItem::new(
                             write_count,
                             write_count,
+                            None,
                             1000 + write_count,
                             42,
                             1,
@@ -3140,8 +3147,8 @@ mod tests {
 
         // First write with events having client_event_index 1, 2
         let events1 = vec![
-            EventItem::new(1, 1, 1000, 42, 1, b"event1_first".to_vec()),
-            EventItem::new(2, 2, 1001, 42, 1, b"event2_first".to_vec()),
+            EventItem::new(1, 1, None, 1000, 42, 1, b"event1_first".to_vec()),
+            EventItem::new(2, 2, None, 1001, 42, 1, b"event2_first".to_vec()),
         ];
 
         fixture
@@ -3151,9 +3158,9 @@ mod tests {
         // Second write with same client_event_index but filter_duplicate_client_events = false
         // All events should be written regardless of duplicate client_event_index
         let events2 = vec![
-            EventItem::new(1, 3, 1002, 42, 1, b"event1_second".to_vec()), // Same client_event_index
-            EventItem::new(2, 4, 1003, 42, 1, b"event2_second".to_vec()), // Same client_event_index
-            EventItem::new(3, 5, 1004, 42, 1, b"event3_new".to_vec()),    // New client_event_index
+            EventItem::new(1, 3, None, 1002, 42, 1, b"event1_second".to_vec()), // Same client_event_index
+            EventItem::new(2, 4, None, 1003, 42, 1, b"event2_second".to_vec()), // Same client_event_index
+            EventItem::new(3, 5, None, 1004, 42, 1, b"event3_new".to_vec()),    // New client_event_index
         ];
 
         let metadata2 = fixture
@@ -3211,8 +3218,8 @@ mod tests {
 
             // First write - should get event indices 1, 2
             let events1 = vec![
-                EventItem::new(1, 0, 1000, 42, 1, b"event1".to_vec()),
-                EventItem::new(2, 0, 1001, 43, 1, b"event2".to_vec()),
+                EventItem::new(1, 0, None, 1000, 42, 1, b"event1".to_vec()),
+                EventItem::new(2, 0, None, 1001, 43, 1, b"event2".to_vec()),
             ];
             let metadata1 = engine.append_events(100, 200, 300, 400, None, events1, None, true)?;
             assert_eq!(metadata1.event_batch_index, 1);
@@ -3221,9 +3228,9 @@ mod tests {
 
             // Second write - should use cache and get event indices 3, 4, 5
             let events2 = vec![
-                EventItem::new(3, 0, 1002, 44, 1, b"event3".to_vec()),
-                EventItem::new(4, 0, 1003, 45, 1, b"event4".to_vec()),
-                EventItem::new(5, 0, 1004, 46, 1, b"event5".to_vec()),
+                EventItem::new(3, 0, None, 1002, 44, 1, b"event3".to_vec()),
+                EventItem::new(4, 0, None, 1003, 45, 1, b"event4".to_vec()),
+                EventItem::new(5, 0, None, 1004, 46, 1, b"event5".to_vec()),
             ];
             let metadata2 = engine.append_events(100, 200, 300, 400, None, events2, None, true)?;
             assert_eq!(metadata2.event_batch_index, 2);
@@ -3249,8 +3256,8 @@ mod tests {
 
             // Third write - should read last index from disk and continue with 6, 7
             let events3 = vec![
-                EventItem::new(6, 0, 1005, 47, 1, b"event6".to_vec()),
-                EventItem::new(7, 0, 1006, 48, 1, b"event7".to_vec()),
+                EventItem::new(6, 0, None, 1005, 47, 1, b"event6".to_vec()),
+                EventItem::new(7, 0, None, 1006, 48, 1, b"event7".to_vec()),
             ];
             let metadata3 = engine.append_events(100, 200, 300, 400, None, events3, None, true)?;
             assert_eq!(metadata3.event_batch_index, 3);

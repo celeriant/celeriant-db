@@ -360,7 +360,7 @@ mod tests {
         let mut cache = LruMemoryCache::new(16 * 1024 * 1024);
 
         // Add first batch (index 1)
-        let event1 = EventItem::new(1, 1, 1000, 42, 1, b"test1".to_vec());
+        let event1 = EventItem::new(1, 1, None, 1000, 42, 1, b"test1".to_vec());
         let batch1 = EventBatchItem::new(1, 2000, 123, Some(456), vec![event1]);
         let metadata1 = EventBatchMetadata {
             event_batch_index: 1,
@@ -371,7 +371,7 @@ mod tests {
         cache.add(554, 665, 123, batch1, metadata1);
 
         // Try to add batch with gap (index 3 instead of 2)
-        let event3 = EventItem::new(3, 3, 1000, 42, 1, b"test3".to_vec());
+        let event3 = EventItem::new(3, 3, None, 1000, 42, 1, b"test3".to_vec());
         let batch3 = EventBatchItem::new(3, 2000, 123, Some(456), vec![event3]);
         let metadata3 = EventBatchMetadata {
             event_batch_index: 3,
@@ -389,7 +389,7 @@ mod tests {
         assert!(cache.get_pos(554, 665, 123, 3).is_none());
 
         // Now add correct sequential batch (index 2)
-        let event2 = EventItem::new(2, 2, 1000, 42, 1, b"test2".to_vec());
+        let event2 = EventItem::new(2, 2, None, 1000, 42, 1, b"test2".to_vec());
         let batch2 = EventBatchItem::new(2, 2000, 123, Some(456), vec![event2]);
         let metadata2 = EventBatchMetadata {
             event_batch_index: 2,
@@ -409,7 +409,7 @@ mod tests {
     fn test_add_without_cloning() {
         let mut cache = LruMemoryCache::new(16 * 1024 * 1024); // 16MB limit
 
-        let event = EventItem::new(1, 1, 1000, 42, 1, b"test".to_vec());
+        let event = EventItem::new(1, 1, None, 1000, 42, 1, b"test".to_vec());
         let batch = EventBatchItem::new(5, 2000, 123, Some(456), vec![event]);
         let metadata = EventBatchMetadata {
             event_batch_index: 5,
@@ -432,7 +432,7 @@ mod tests {
 
         // Add multiple batches to same aggregate - tests the get_mut optimization
         for i in 1..=3 {
-            let event = EventItem::new(i, i, 1000 + i, 42, 1, b"test".to_vec());
+            let event = EventItem::new(i, i, None, 1000 + i, 42, 1, b"test".to_vec());
             let batch = EventBatchItem::new(i, 2000 + i, 123, Some(456), vec![event]);
             let metadata = EventBatchMetadata {
                 event_batch_index: i,
@@ -458,7 +458,7 @@ mod tests {
         let mut cache = LruMemoryCache::new(2000); // 2KB limit
 
         // Add first aggregate with 1KB
-        let event1 = EventItem::new(1, 1, 1000, 42, 1, b"test1".to_vec());
+        let event1 = EventItem::new(1, 1, None, 1000, 42, 1, b"test1".to_vec());
         let batch1 = EventBatchItem::new(1, 2000, 123, Some(456), vec![event1]);
         let metadata1 = EventBatchMetadata {
             event_batch_index: 1,
@@ -469,7 +469,7 @@ mod tests {
         cache.add(554, 665, 111, batch1, metadata1);
 
         // Add second aggregate with 1KB (total: 2KB, at limit)
-        let event2 = EventItem::new(1, 1, 1000, 42, 1, b"test2".to_vec());
+        let event2 = EventItem::new(1, 1, None, 1000, 42, 1, b"test2".to_vec());
         let batch2 = EventBatchItem::new(1, 2000, 789, Some(456), vec![event2]);
         let metadata2 = EventBatchMetadata {
             event_batch_index: 1,
@@ -483,7 +483,7 @@ mod tests {
         assert_eq!(cache.aggregate_count(), 2);
 
         // Add third aggregate with 1KB - should trigger eviction
-        let event3 = EventItem::new(1, 1, 1000, 42, 1, b"test3".to_vec());
+        let event3 = EventItem::new(1, 1, None, 1000, 42, 1, b"test3".to_vec());
         let batch3 = EventBatchItem::new(1, 2000, 999, Some(456), vec![event3]);
         let metadata3 = EventBatchMetadata {
             event_batch_index: 1,
@@ -505,7 +505,7 @@ mod tests {
     fn test_mutable_access() {
         let mut cache = LruMemoryCache::new(16 * 1024 * 1024);
 
-        let event = EventItem::new(1, 1, 1000, 42, 1, b"test".to_vec());
+        let event = EventItem::new(1, 1, None, 1000, 42, 1, b"test".to_vec());
         let batch = EventBatchItem::new(5, 2000, 123, Some(456), vec![event]);
         let metadata = EventBatchMetadata {
             event_batch_index: 5,
@@ -533,7 +533,7 @@ mod tests {
 
         let mut batches = Vec::new();
         for i in 1..=3 {
-            let event = EventItem::new(i, i, 1000 + i, 42, 1, b"test".to_vec());
+            let event = EventItem::new(i, i, None, 1000 + i, 42, 1, b"test".to_vec());
             let batch = EventBatchItem::new(i, 2000 + i, 123, Some(456), vec![event]);
             let metadata = EventBatchMetadata {
                 event_batch_index: i,
@@ -558,7 +558,7 @@ mod tests {
         let mut cache = LruMemoryCache::new(16 * 1024 * 1024);
 
         // Same aggregate_type_id and aggregate_id across different orgs
-        let event1 = EventItem::new(1, 1, 1000, 42, 1, b"test1".to_vec());
+        let event1 = EventItem::new(1, 1, None, 1000, 42, 1, b"test1".to_vec());
         let batch1 = EventBatchItem::new(1, 2000, 200, Some(456), vec![event1]);
         let metadata1 = EventBatchMetadata {
             event_batch_index: 1,
@@ -568,7 +568,7 @@ mod tests {
         };
         cache.add(1, 100, 200, batch1, metadata1);
 
-        let event2 = EventItem::new(1, 1, 1000, 42, 1, b"test2".to_vec());
+        let event2 = EventItem::new(1, 1, None, 1000, 42, 1, b"test2".to_vec());
         let batch2 = EventBatchItem::new(1, 2000, 200, Some(456), vec![event2]);
         let metadata2 = EventBatchMetadata {
             event_batch_index: 1,
@@ -596,7 +596,7 @@ mod tests {
         let mut cache = LruMemoryCache::new(16 * 1024 * 1024);
 
         // Same org_id and aggregate_id across different aggregate_type_ids
-        let event1 = EventItem::new(1, 1, 1000, 42, 1, b"test1".to_vec());
+        let event1 = EventItem::new(1, 1, None, 1000, 42, 1, b"test1".to_vec());
         let batch1 = EventBatchItem::new(1, 2000, 200, Some(456), vec![event1]);
         let metadata1 = EventBatchMetadata {
             event_batch_index: 1,
@@ -606,7 +606,7 @@ mod tests {
         };
         cache.add(1, 100, 200, batch1, metadata1);
 
-        let event2 = EventItem::new(1, 1, 1000, 42, 1, b"test2".to_vec());
+        let event2 = EventItem::new(1, 1, None, 1000, 42, 1, b"test2".to_vec());
         let batch2 = EventBatchItem::new(1, 2000, 200, Some(456), vec![event2]);
         let metadata2 = EventBatchMetadata {
             event_batch_index: 1,
@@ -643,6 +643,7 @@ mod tests {
             let event = EventItem::new(
                 1,
                 1,
+                None,
                 1000,
                 42,
                 1,
@@ -672,7 +673,7 @@ mod tests {
         let mut cache = LruMemoryCache::new(3000); // 3KB limit
 
         // Add entries for different orgs/types
-        let event1 = EventItem::new(1, 1, 1000, 42, 1, b"test1".to_vec());
+        let event1 = EventItem::new(1, 1, None, 1000, 42, 1, b"test1".to_vec());
         let batch1 = EventBatchItem::new(1, 2000, 200, Some(456), vec![event1]);
         let metadata1 = EventBatchMetadata {
             event_batch_index: 1,
@@ -682,7 +683,7 @@ mod tests {
         };
         cache.add(1, 100, 200, batch1, metadata1);
 
-        let event2 = EventItem::new(1, 1, 1000, 42, 1, b"test2".to_vec());
+        let event2 = EventItem::new(1, 1, None, 1000, 42, 1, b"test2".to_vec());
         let batch2 = EventBatchItem::new(1, 2000, 201, Some(456), vec![event2]);
         let metadata2 = EventBatchMetadata {
             event_batch_index: 1,
@@ -692,7 +693,7 @@ mod tests {
         };
         cache.add(1, 101, 201, batch2, metadata2);
 
-        let event3 = EventItem::new(1, 1, 1000, 42, 1, b"test3".to_vec());
+        let event3 = EventItem::new(1, 1, None, 1000, 42, 1, b"test3".to_vec());
         let batch3 = EventBatchItem::new(1, 2000, 202, Some(456), vec![event3]);
         let metadata3 = EventBatchMetadata {
             event_batch_index: 1,
@@ -721,7 +722,7 @@ mod tests {
     fn test_touch_aggregate() {
         let mut cache = LruMemoryCache::new(16 * 1024 * 1024);
 
-        let event = EventItem::new(1, 1, 1000, 42, 1, b"test".to_vec());
+        let event = EventItem::new(1, 1, None, 1000, 42, 1, b"test".to_vec());
         let batch = EventBatchItem::new(1, 2000, 123, Some(456), vec![event]);
         let metadata = EventBatchMetadata {
             event_batch_index: 1,
@@ -744,7 +745,7 @@ mod tests {
     fn test_peek_operations() {
         let mut cache = LruMemoryCache::new(16 * 1024 * 1024);
 
-        let event = EventItem::new(1, 1, 1000, 42, 1, b"test".to_vec());
+        let event = EventItem::new(1, 1, None, 1000, 42, 1, b"test".to_vec());
         let batch = EventBatchItem::new(1, 2000, 123, Some(456), vec![event]);
         let metadata = EventBatchMetadata {
             event_batch_index: 1,
@@ -773,7 +774,7 @@ mod tests {
 
         assert_eq!(cache.memory_utilization_percent(), 0.0);
 
-        let event = EventItem::new(1, 1, 1000, 42, 1, b"test".to_vec());
+        let event = EventItem::new(1, 1, None, 1000, 42, 1, b"test".to_vec());
         let batch = EventBatchItem::new(1, 2000, 123, Some(456), vec![event]);
         let metadata = EventBatchMetadata {
             event_batch_index: 1,
@@ -804,7 +805,7 @@ mod tests {
 
         // Add all combinations
         for (org_id, aggregate_type_id, aggregate_id, data) in &combinations {
-            let event = EventItem::new(1, 1, 1000, 42, 1, data.as_bytes().to_vec());
+            let event = EventItem::new(1, 1, None, 1000, 42, 1, data.as_bytes().to_vec());
             let batch = EventBatchItem::new(1, 2000, *aggregate_id, Some(456), vec![event]);
             let metadata = EventBatchMetadata {
                 event_batch_index: 1,

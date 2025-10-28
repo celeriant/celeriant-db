@@ -18,3 +18,8 @@ crc32fast.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "read_operations_benchmark"
+harness = false

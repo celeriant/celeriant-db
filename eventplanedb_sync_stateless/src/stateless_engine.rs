@@ -114,13 +114,14 @@ mod tests {
         let event1 = EventItem::new(
             3, // local_index
             1,
+            None,
             1000,                          // event_time
             42,                            // event_type_major
             1,                             // event_type_minor
             b"test event data 1".to_vec(), // value
         );
 
-        let event2 = EventItem::new(4, 2, 1050, 42, 1, b"test event data 2".to_vec());
+        let event2 = EventItem::new(4, 2, None, 1050, 42, 1, b"test event data 2".to_vec());
 
         let batch = EventBatchItem::new(
             2,                    // server_id
@@ -242,7 +243,7 @@ mod tests {
         let engine = StatelessEngine::builder().build();
 
         // Create test data for multiple batches
-        let event1 = EventItem::new(1, 1, 1000, 42, 1, b"test event data 1".to_vec());
+        let event1 = EventItem::new(1, 1, None, 1000, 42, 1, b"test event data 1".to_vec());
         let batch1 = EventBatchItem::new(
             5,               // event_batch_index
             1600000000000,   // server_time
@@ -251,7 +252,7 @@ mod tests {
             vec![event1],    // events
         );
 
-        let event2 = EventItem::new(2, 2, 1050, 43, 1, b"test event data 2".to_vec());
+        let event2 = EventItem::new(2, 2, None, 1050, 43, 1, b"test event data 2".to_vec());
         let batch2 = EventBatchItem::new(
             6,               // event_batch_index
             1600000001000,   // server_time
