@@ -259,6 +259,22 @@ impl WriteOperations {
             });
         }
 
+        // Phase 2: Trim old events from front if cache exceeds max size
+        let mut total_cache_size: usize = self.data_cache
+            .iter()
+            .map(|pair| pair.metadata.compressed_size as usize)
+            .sum();
+
+        let mut items_to_remove = 0;
+        while total_cache_size > self.max_data_cache_size_bytes && items_to_remove < self.data_cache.len() {
+            total_cache_size -= self.data_cache[items_to_remove].metadata.compressed_size as usize;
+            items_to_remove += 1;
+        }
+
+        if items_to_remove > 0 {
+            self.data_cache.drain(0..items_to_remove);
+        }
+
         Ok(())
     }
     
@@ -477,7 +493,7 @@ impl WriteOperations {
 
 //Some tests
 #[cfg(test)]
-pub mod tests {
+pub mod test_write_operations {
     use glommio::{LocalExecutorBuilder, Placement};
 
     use super::*;

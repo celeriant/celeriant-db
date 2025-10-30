@@ -1,13 +1,12 @@
 
 #[cfg(test)]
-mod test {
-    use std::ptr::read;
+mod test_basic_read_write {
     use uuid::Uuid;
 
     use eventplanedb_structures::{event_item::EventItem, read_filters::ReadFilters};
     use glommio::{LocalExecutorBuilder, Placement};
 
-    use crate::files::{read_operations::{CacheableReadResult, ReadOperations, tests::read_file_operations}, write_operations::{AppendOptions, CacheReadError, tests::{create_files, empty_aggregate_write_file_operations}}};
+    use crate::files::{read_operations::{CacheableReadResult, test_read_operations::read_file_operations}, write_operations::{AppendOptions, CacheReadError, test_write_operations::{create_files, empty_aggregate_write_file_operations}}};
 
     fn check_read_1(read_result: &CacheableReadResult, event_id: u128, expected_cache_len: usize) {
         assert_eq!(read_result.filtered_event_batches.len(), 2);

@@ -527,7 +527,7 @@ fn bloom_filter_from_bytes(bloom_bytes: &[u64; BLOOM_BYTES / 8]) -> BloomFilter 
 
 //Some tests
 #[cfg(test)]
-pub mod tests {
+pub mod test_read_operations {
     use super::*;
 
     fn read_config() -> AggregateReadConfig {
