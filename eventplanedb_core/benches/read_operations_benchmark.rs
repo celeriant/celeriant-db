@@ -3,10 +3,16 @@ use eventplanedb_core::files::read_objects::{
     read_fixed_records_visit_const, read_objects, read_objects_absolute, AbsoluteObjectPosition,
 };
 use glommio::io::DmaFile;
-use glommio::{GlommioError, LocalExecutorBuilder, Placement};
+use glommio::{
+    channels::channel_mesh::{Full, MeshBuilder},
+    enclose, CpuSet, GlommioError, LocalExecutorBuilder, LocalExecutorPoolBuilder, Placement,
+    PoolPlacement,
+};
 use std::fs::File;
 use std::hint::black_box;
 use std::io::{Seek, SeekFrom, Write};
+use std::sync::Arc;
+use std::time::Duration;
 use tempfile::tempdir;
 
 // Helper function to create a test file with variable-sized objects.
@@ -48,36 +54,96 @@ fn create_fixed_record_file(
     (file_path, file_size)
 }
 
-fn bench_read_objects(c: &mut Criterion) {
-    let mut group = c.benchmark_group("read_objects");
+// Run N executors, each with its own independent file.
+// This measures total throughput across all executors.
+fn bench_read_objects_multi_executors(c: &mut Criterion) {
+    let mut group = c.benchmark_group("read_objects_multi_executors");
+    group
+        .sample_size(10)
+        .measurement_time(Duration::from_secs(15))
+        .warm_up_time(Duration::from_secs(5));
+
+    let nbr_shards = num_cpus::get();
+    let online_cpus = CpuSet::online().ok();
+    
     let tempdir = tempdir().unwrap();
     let folder = tempdir.path().to_str().unwrap();
+
+    // Match TCP server style: one executor per shard using MaxSpread
+    let executors = nbr_shards;
+    let glommio_tasks_per_executor: usize = 8;
 
     let object_count = 10_000;
     let object_size = 1024; // 1KB
     let object_sizes = vec![object_size; object_count];
-    let total_bytes = (object_count * object_size) as u64;
-
-    let (file_path, start_positions, _end_positions) = create_test_file(folder, &object_sizes);
-
-    group.throughput(Throughput::Bytes(total_bytes));
-
+    let total_bytes_per_file = (object_count * object_size) as u64;
     let chunk_size = 1024 * 1024; // 1MB
 
-    group.bench_function("10k_1KB_objects", |b| {
-        b.iter(|| {
-            let file_path = file_path.clone();
-            let start_positions = start_positions.clone();
-            let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(move || async move {
-                let file: DmaFile = DmaFile::open(&file_path).await.unwrap();
-                let objects =
-                    read_objects(&file, black_box(&start_positions), chunk_size).await?;
-                black_box(objects);
-                Ok::<(), GlommioError<()>>(())
-            }).unwrap();
-            let _ = handle.join().unwrap();
-        });
-    });
+    // Pre-create one file per executor/shard
+    let mut file_paths: Vec<String> = Vec::with_capacity(executors);
+    let mut positions_list = Vec::with_capacity(executors);
+    for _ in 0..executors {
+        let (file_path, starts, _ends) = create_test_file(folder, &object_sizes);
+        file_paths.push(file_path);
+        positions_list.push(Arc::<[u64]>::from(starts.into_boxed_slice()));
+    }
+
+    let file_paths = Arc::new(file_paths);
+    let positions_list = Arc::new(positions_list);
+
+    group.throughput(Throughput::Bytes(
+        total_bytes_per_file * (glommio_tasks_per_executor as u64) * (executors as u64),
+    ));
+
+    group.bench_function(
+        format!("{}exec_x_{}tasks_each_10k_1KB", executors, glommio_tasks_per_executor),
+        |b| {
+            b.iter(|| {
+                // Build a pool spread across shards and run the work on all of them
+                LocalExecutorPoolBuilder::new(PoolPlacement::MaxSpread(
+                    executors,
+                    online_cpus.clone(),
+                ))
+                .on_all_shards({
+                    let file_paths = file_paths.clone();
+                    let positions_list = positions_list.clone();
+                    move || {
+                        let file_paths = file_paths.clone();
+                        let positions_list = positions_list.clone();
+                        async move {
+                            let executor_id = glommio::executor().id() % file_paths.len();;
+                            let file_path = file_paths[executor_id].clone();
+                            let positions = positions_list[executor_id].clone();
+
+                            let file: DmaFile = DmaFile::open(&file_path).await.unwrap();
+
+                            let mut handles = Vec::with_capacity(glommio_tasks_per_executor);
+                            for _ in 0..glommio_tasks_per_executor {
+                                let file = file.dup().unwrap();
+                                let positions = positions.clone();
+                                handles.push(glommio::spawn_local(async move {
+                                    let objects = read_objects(
+                                        &file,
+                                        black_box(positions.as_ref()),
+                                        chunk_size,
+                                    )
+                                    .await
+                                    .unwrap();
+                                    black_box(objects);
+                                }));
+                            }
+
+                            for h in handles {
+                                h.await;
+                            }
+                        }
+                    }
+                })
+                .unwrap()
+                .join_all();
+            });
+        },
+    );
 
     group.finish();
 }
@@ -188,16 +254,17 @@ fn bench_read_fixed_records(c: &mut Criterion) {
             let file_path = file_path.clone();
             let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(move || async move {
                 let file: DmaFile = DmaFile::open(&file_path).await.unwrap();
-                let count = read_fixed_records_visit_const::<RECORD_SIZE>(
+                let count = read_fixed_records_visit_const::<RECORD_SIZE, ()>(
                     &file,
                     0,
                     None,
                     chunk_size,
                     |rec| {
                         black_box(rec);
+                        Ok(())
                     },
                 )
-                .await?;
+                .await.unwrap();
                 black_box(count);
                 Ok::<(), GlommioError<()>>(())
             }).unwrap();
@@ -210,8 +277,8 @@ fn bench_read_fixed_records(c: &mut Criterion) {
 
 criterion_group!(
     benches,
-    bench_read_objects,
     bench_read_objects_absolute,
-    bench_read_fixed_records
+    bench_read_fixed_records,
+    bench_read_objects_multi_executors
 );
 criterion_main!(benches);

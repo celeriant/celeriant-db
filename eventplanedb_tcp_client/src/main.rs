@@ -350,7 +350,7 @@ fn run_client_connection(
                             Response::AppendEventsResult(Ok(metadata)) => {
                                 format!(
                                     "Success: batch_index={}",
-                                    metadata.event_batch_index
+                                    metadata.next_event_batch_index
                                 )
                             }
                             Response::AppendEventsResult(Err(e)) => format!("Error: {}", e),

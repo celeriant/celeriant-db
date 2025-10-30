@@ -19,8 +19,8 @@ pub enum AppendError {
     },
     ClientIdempotencyViolation {
         client_id: u128,
-        last_event_index: u64,
-        attempted_event_index: u64,
+        last_client_event_index: u64,
+        attempted_client_event_index: u64,
     },
     EmptyEventsList {
         client_id: u128,
@@ -77,6 +77,8 @@ pub struct WriteOperations {
     bloom_filter: BloomFilter,
     event_type_dedup: HashSet<u64>,
     append_event_batch_queue: Vec<AppendEventBatchQueueItem>,
+    file_len_metadata: u64,
+    file_len_event_batch: u64,
 }
 
 async fn append_only_file<P: AsRef<Path>>(path: P) -> Result<DmaFile, GlommioError<()>> {
@@ -152,6 +154,9 @@ impl WriteOperations {
         let metadata_dma_file = append_only_file(path_metadata).await?;
         let event_batches_dma_file = append_only_file(path_event_batches).await?;
 
+        let file_len_metadata = metadata_dma_file.file_size().await?;
+        let file_len_event_batch = event_batches_dma_file.file_size().await?;
+
         let bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8)
             .seed(&BLOOM_HASH_SEED)
             .hashes(BLOOM_HASH_COUNT);
@@ -167,6 +172,8 @@ impl WriteOperations {
             bloom_filter,
             event_type_dedup: HashSet::new(),
             append_event_batch_queue: vec![],
+            file_len_metadata,
+            file_len_event_batch
         })
     }
 
@@ -226,6 +233,9 @@ impl WriteOperations {
             meta_offset += len;
         }
 
+        let event_buf_len = event_buf.len() as u64;
+        let meta_buf_len = meta_buf.len() as u64;
+
         // Single write_at per file
         self.event_batches_dma_file.write_at(event_buf, event_batches_file_size).await
             .map_err(|e| AppendError::WriteError { message: format!("event batch write failed: {}", e) })?;
@@ -236,6 +246,9 @@ impl WriteOperations {
             .map_err(|e| AppendError::WriteError { message: format!("metadata write failed: {}", e) })?;
         self.event_batches_dma_file.fdatasync().await
             .map_err(|e| AppendError::WriteError { message: format!("event_batches_dma_file fdatasync failed: {}", e) })?;
+
+        self.file_len_event_batch += event_buf_len;
+        self.file_len_metadata += meta_buf_len;
 
         for item in self.append_event_batch_queue.drain(..){
             self.data_cache.push(BatchMetadataItemPair {
@@ -287,13 +300,13 @@ impl WriteOperations {
 
         // If checking idempotency, check if client is providing the same events again using client event index, if so, error
         if append_options.enforce_client_idempotency {
-            if let Some(&last_event_index) = self.client_event_indexes.get(&append_options.client_id) {
-                let attempted_event_index = events.iter().map(|e| e.client_event_index).min().unwrap_or(0);
-                if attempted_event_index <= last_event_index {
+            if let Some(&last_client_event_index) = self.client_event_indexes.get(&append_options.client_id) {
+                let attempted_client_event_index = events.iter().map(|e| e.client_event_index).min().unwrap_or(0);
+                if attempted_client_event_index <= last_client_event_index {
                     return Err(AppendError::ClientIdempotencyViolation {
                         client_id: append_options.client_id,
-                        last_event_index,
-                        attempted_event_index,
+                        last_client_event_index,
+                        attempted_client_event_index,
                     });
                 }
             }
@@ -379,7 +392,7 @@ impl WriteOperations {
             .insert(append_options.client_id, latest_client_event_index);
 
         Ok(AppendResult {
-            event_batch_index: self.next_event_batch_index,
+            next_event_batch_index: self.next_event_batch_index,
         })
     }
 
@@ -392,11 +405,19 @@ impl WriteOperations {
 
         Ok(vec![])
     }
+    
+    pub fn file_len_metadata(&self) -> u64 {
+        self.file_len_metadata
+    }
+    
+    pub fn file_len_event_batch(&self) -> u64 {
+        self.file_len_event_batch
+    }
 }
 
 //Some tests
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use glommio::{LocalExecutorBuilder, Placement};
 
     use super::*;
@@ -407,20 +428,20 @@ mod tests {
         }
     }
 
-    fn create_files(folder: &str) {
+    pub fn create_files(folder: &str) {
         let metadata_path = format!("{}/metadata.bin", folder);
         let event_batches_path = format!("{}/event_batches.bin", folder);
         std::fs::File::create(metadata_path).unwrap();
         std::fs::File::create(event_batches_path).unwrap();
     }
 
-    async fn empty_aggregate_write_file_operations(folder: &str) -> Result<WriteOperations, GlommioError<()>> {
+    pub async fn empty_aggregate_write_file_operations(folder: &str) -> Result<WriteOperations, GlommioError<()>> {
        let service = WriteOperations::open(
         format!("{}/metadata.bin", folder),
         format!("{}/event_batches.bin", folder),
             vec![],
-            0,
-            0,
+            1,
+            1,
             HashMap::new(),
             write_config(),
         ).await?;

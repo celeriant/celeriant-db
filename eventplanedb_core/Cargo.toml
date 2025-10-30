@@ -19,7 +19,13 @@ crc32fast.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 criterion.workspace = true
+num_cpus.workspace = true
+uuid.workspace = true
 
 [[bench]]
-name = "read_operations_benchmark"
+name = "read_objects_benchmark"
+harness = false
+
+[[bench]]
+name = "print_northstar_benchmark"
 harness = false
