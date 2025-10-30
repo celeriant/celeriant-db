@@ -59,6 +59,7 @@ pub struct ReadOperations {
     config: AggregateReadConfig,
 }
 
+#[derive(Debug)]
 pub struct CacheableReadResult {
     pub uncached_metadata_set: Vec<MetadataWithAbsolutePosition>,
     pub filtered_event_batches: Vec<EventBatchItem>,

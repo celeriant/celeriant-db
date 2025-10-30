@@ -4,6 +4,8 @@ use eventplanedb_structures::{append_result::AppendResult, compression_type::Com
 use fastbloom::BloomFilter;
 use glommio::{io::{DmaFile, OpenOptions}, GlommioError};
 
+use crate::files::read_operations::{CacheableReadResult, apply_event_filters, is_include_batch};
+
 pub struct BatchMetadataItemPair {
     pub metadata: EventBatchMetadata,
     pub item: EventBatchItem,
@@ -43,7 +45,7 @@ pub enum CacheReadError {
     // So cache miss can only occur for older event batch index ranges
     CacheMiss {
         missing_from_event_batch_index: u64,        
-        missing_to_event_batch_index: u64,
+        missing_to_event_batch_index: Option<u64>,
     },
 }
 
@@ -396,14 +398,72 @@ impl WriteOperations {
         })
     }
 
-    pub fn maybe_read_cached_events(&self, filters: &ReadFilters) -> Result<Vec<EventItem>, CacheReadError> {
-        //TODO: Implement cache for write operations and limit
-        
-        // Not async, doesn't require mutable access as it just reads from in-memory cache
+    pub fn maybe_read_cached_events(&self, filters: &ReadFilters) -> Result<CacheableReadResult, CacheReadError> {
+        // Check if cache is empty
+        if self.data_cache.is_empty() {
+            return Err(CacheReadError::CacheMiss { 
+                missing_from_event_batch_index: filters.from_event_batch_index, 
+                missing_to_event_batch_index: filters.to_event_batch_index 
+            });
+        }
 
-        // Will create a new vec with items that are copied from the cache
+        // Get the range of cached event batch indexes
+        let cache_min_batch_index = self.data_cache[0].metadata.event_batch_index;
 
-        Ok(vec![])
+        // Check if requested range is within cache
+        if filters.from_event_batch_index < cache_min_batch_index {
+            return Err(CacheReadError::CacheMiss { 
+                missing_from_event_batch_index: filters.from_event_batch_index, 
+                missing_to_event_batch_index: Some(cache_min_batch_index.saturating_sub(1))
+            });
+        }
+
+        // Collect matching event batches from cache
+        let mut filtered_event_batches = Vec::new();
+        let mut cumulative_size: u64 = 0;
+        let mut next_event_batch_index: Option<u64> = None;
+
+        for pair in self.data_cache.iter() {
+            let metadata = &pair.metadata;
+            
+            // Check if we've exceeded the to_event_batch_index
+            if filters.to_event_batch_index.map_or(false, |to_index| {
+                metadata.event_batch_index > to_index
+            }) {
+                break;
+            }
+
+            // Check if this batch should be included based on metadata filters
+            if !is_include_batch(metadata, filters) {
+                continue;
+            }
+
+            // Check max_bytes limit if specified
+            if let Some(max_bytes) = filters.max_bytes {
+                let next_size = cumulative_size + metadata.compressed_size;
+                if next_size > max_bytes as u64 {
+                    // Mark next batch index for pagination
+                    next_event_batch_index = Some(metadata.event_batch_index);
+                    break;
+                }
+                cumulative_size = next_size;
+            }
+
+            // Clone the batch and apply event-level filters
+            let mut event_batch = pair.item.clone();
+            apply_event_filters(&mut event_batch, filters);
+
+            // Only include batches that have events after filtering
+            if !event_batch.events.is_empty() {
+                filtered_event_batches.push(event_batch);
+            }
+        }
+
+        Ok(CacheableReadResult {
+            uncached_metadata_set: Vec::new(),
+            filtered_event_batches,
+            next_event_batch_index,
+        })
     }
     
     pub fn file_len_metadata(&self) -> u64 {
