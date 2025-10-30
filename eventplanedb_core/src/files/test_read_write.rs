@@ -9,7 +9,7 @@ mod test {
 
     use crate::files::{read_operations::{CacheableReadResult, ReadOperations, tests::read_file_operations}, write_operations::{AppendOptions, CacheReadError, tests::{create_files, empty_aggregate_write_file_operations}}};
 
-    fn check_read_1(read_result: CacheableReadResult, event_id: u128, expected_cache_len: usize) {
+    fn check_read_1(read_result: &CacheableReadResult, event_id: u128, expected_cache_len: usize) {
         assert_eq!(read_result.filtered_event_batches.len(), 2);
 
         assert_eq!(read_result.filtered_event_batches[0].client_id, 123);
@@ -52,13 +52,13 @@ mod test {
         assert_eq!(read_result.uncached_metadata_set.len(), expected_cache_len);
     }
 
-    fn check_read_2(read_result: CacheableReadResult, expected_cache_len: usize) {
+    fn check_read_2(read_result: &CacheableReadResult, expected_cache_len: usize) {
         assert_eq!(read_result.filtered_event_batches.len(), 0);
         assert_eq!(read_result.next_event_batch_index, None);
         assert_eq!(read_result.uncached_metadata_set.len(), expected_cache_len); //Not affected by filters
     }
 
-    fn check_read_3(read_result: CacheableReadResult, expected_cache_len: usize) {
+    fn check_read_3(read_result: &CacheableReadResult, expected_cache_len: usize) {
         assert_eq!(read_result.filtered_event_batches.len(), 2);
 
         assert_eq!(read_result.filtered_event_batches[0].event_batch_index, 1);
@@ -68,6 +68,7 @@ mod test {
 
         assert_eq!(read_result.filtered_event_batches[1].event_batch_index, 2);
         assert_eq!(read_result.filtered_event_batches[1].events.len(), 1);
+        assert_eq!(read_result.filtered_event_batches[1].events[0].event_value, vec![11,12,13].into());
 
         assert_eq!(read_result.next_event_batch_index, None);
         assert_eq!(read_result.uncached_metadata_set.len(), expected_cache_len);
@@ -132,31 +133,43 @@ mod test {
 
             //Now that we have sync success, it should be in the writer cache
             let cache_read = writer.maybe_read_cached_events(&read_filters).unwrap();
-            check_read_1(cache_read, event_id, 0);
+            check_read_1(&cache_read, event_id, 0);
 
             let reader = read_file_operations(folder).await.unwrap();
             
             let read_result = reader.read(1, writer.file_len_metadata(), writer.file_len_event_batch(), &read_filters).await.unwrap();
 
-            check_read_1(read_result, event_id, 2);
+            check_read_1(&read_result, event_id, 2);
 
             //Basic filter on metadata
             read_filters = read_filters.exclude_client_id(123);
             let read_result = reader.read(1, writer.file_len_metadata(), writer.file_len_event_batch(), &read_filters).await.unwrap();
-            check_read_2(read_result, 2);
+            check_read_2(&read_result, 2);
 
-            let read_result = writer.maybe_read_cached_events(&read_filters).unwrap();
-            check_read_2(read_result, 0);
+            let cache_read = writer.maybe_read_cached_events(&read_filters).unwrap();
+            check_read_2(&cache_read, 0);
 
             //Basic filter on event batches
             let mut read_filters = ReadFilters::new(1);
             read_filters = read_filters.min_event_timestamp(334);
             let read_result = reader.read(1, writer.file_len_metadata(), writer.file_len_event_batch(), &read_filters).await.unwrap();
 
-            check_read_3(read_result, 2);
+            check_read_3(&read_result, 2);
 
-            let read_result = writer.maybe_read_cached_events(&read_filters).unwrap();
-            check_read_3(read_result, 0);
+            let cache_result = writer.maybe_read_cached_events(&read_filters).unwrap();
+            check_read_3(&cache_result, 0);
+
+            //Let's update the cache now and check cache is used for metadata
+            let mut reader2 = read_file_operations(folder).await.unwrap();
+            reader2.update_metadata_cache(read_result.uncached_metadata_set);       
+
+            //Cache should be idempotent
+            let read_result = reader.read(1, writer.file_len_metadata(), writer.file_len_event_batch(), &read_filters).await.unwrap();     
+            reader2.update_metadata_cache(read_result.uncached_metadata_set);
+
+            let read_result = reader2.read(1, writer.file_len_metadata(), writer.file_len_event_batch(), &read_filters).await.unwrap();
+            check_read_3(&read_result, 0);
+
         }).unwrap();
         handle.join().unwrap();
     }

@@ -222,6 +222,49 @@ impl ReadOperations {
             next_event_batch_index,
         })
     }
+    
+    pub fn update_metadata_cache(&mut self, mut uncached_metadata_set: Vec<MetadataWithAbsolutePosition>) {
+        if uncached_metadata_set.is_empty() {
+            return;
+        }
+        
+        // Find split point - how many items from uncached_metadata_set to keep
+        let items_to_keep = if let Some(first_cached) = self.cache_metadata.first() {
+            let min_cached_index = first_cached.event_batch_metadata.event_batch_index;
+            // Find first item >= min_cached_index and keep everything before it
+            uncached_metadata_set.iter()
+                .position(|m| m.event_batch_metadata.event_batch_index >= min_cached_index)
+                .unwrap_or(uncached_metadata_set.len())
+        } else {
+            uncached_metadata_set.len()
+        };
+        
+        // Truncate to remove any overlapping items
+        uncached_metadata_set.truncate(items_to_keep);
+        
+        // Insert at the front (moves uncached_metadata_set, no allocation)
+        self.cache_metadata.splice(0..0, uncached_metadata_set);
+        
+        // Trim cache to fit within max_data_cache_size_bytes
+        // Keep the newest items (at the back) and remove oldest (at the front)
+        let mut total_size = 0;
+        let mut keep_count = 0;
+        
+        for _metadata in self.cache_metadata.iter() {
+            let entry_size = METADATA_BATCH_SIZE_BYTES as usize;
+            if total_size + entry_size > self.config.max_data_cache_size_bytes {
+                break;
+            }
+            total_size += entry_size;
+            keep_count += 1;
+        }
+        
+        // Remove oldest items from the front if cache is too large
+        if self.cache_metadata.len() > keep_count {
+            let remove_count = self.cache_metadata.len() - keep_count;
+            self.cache_metadata.drain(0..remove_count);
+        }
+    }
 
 }
 
