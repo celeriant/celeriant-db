@@ -278,16 +278,16 @@ pub fn apply_event_filters(event_batch: &mut EventBatchItem, read_filters: &Read
     }
 
     // Final filtering for local_index
-    if let Some(min_local_index) = read_filters.min_client_event_index {
+    if let Some(min_event_index) = read_filters.min_event_index {
         event_batch
             .events
-            .retain(|event| event.client_event_index >= min_local_index);
+            .retain(|event| event.event_index >= min_event_index);
     }
 
-    if let Some(max_local_index) = read_filters.max_client_event_index {
+    if let Some(max_event_index) = read_filters.max_event_index {
         event_batch
             .events
-            .retain(|event| event.client_event_index <= max_local_index);
+            .retain(|event| event.event_index <= max_event_index);
     }
 
     // Final filtering for event_time

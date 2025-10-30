@@ -241,12 +241,12 @@ impl WriteOperations {
         // Single write_at per file
         self.event_batches_dma_file.write_at(event_buf, event_batches_file_size).await
             .map_err(|e| AppendError::WriteError { message: format!("event batch write failed: {}", e) })?;
-        self.metadata_dma_file.fdatasync().await
+        self.event_batches_dma_file.fdatasync().await
             .map_err(|e| AppendError::WriteError { message: format!("metadata_dma_file fdatasync failed: {}", e) })?;
 
         self.metadata_dma_file.write_at(meta_buf, metadata_file_size).await
             .map_err(|e| AppendError::WriteError { message: format!("metadata write failed: {}", e) })?;
-        self.event_batches_dma_file.fdatasync().await
+        self.metadata_dma_file.fdatasync().await
             .map_err(|e| AppendError::WriteError { message: format!("event_batches_dma_file fdatasync failed: {}", e) })?;
 
         self.file_len_event_batch += event_buf_len;
