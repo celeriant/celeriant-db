@@ -1,9 +1,9 @@
-use std::{path::Path, ptr::read};
+use std::{collections::HashMap, path::Path, ptr::read};
 use eventplanedb_structures::{compression_type::CompressionType, constants::{BINCODE_CONFIG_FIXED, BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED, METADATA_BATCH_SIZE_BYTES}, event_batch_item::EventBatchItem, event_batch_metadata::{EventBatchMetadata, EventTypesData}, read_filters::ReadFilters, read_result::ReadResult, wire_format::from_wire_format_variable};
 use fastbloom::BloomFilter;
 use glommio::{GlommioError, io::{DmaFile, OpenOptions}};
 
-use crate::files::{read_objects::{self, AbsoluteObjectPosition, ReadVisitError}, write_operations::BatchMetadataItemPair};
+use crate::files::{read_objects::{self, AbsoluteObjectPosition, ReadVisitError}, write_operations::{BatchMetadataItemPair, WriteOperationsDataRequirements}};
 
 #[derive(Debug)]
 pub enum ReadError {
@@ -78,7 +78,151 @@ async fn read_only_file<P: AsRef<Path>>(path: P) -> Result<DmaFile, GlommioError
     Ok(dma_file)
 }
 
+pub struct WriteOperationsDataRequirementsAndCachedData {
+    pub uncached_metadata_set: Vec<MetadataWithAbsolutePosition>,
+    pub write_operations_data_requirements: WriteOperationsDataRequirements,
+}
+
 impl ReadOperations {
+
+    pub async fn get_write_operations_data_requirements(
+        &self,
+    ) -> Result<WriteOperationsDataRequirementsAndCachedData, ReadError> {
+
+        let file_len_metadata = self.metadata_dma_file.file_size().await?;
+        let file_len_event_batch = self.event_batches_dma_file.file_size().await?;
+
+        // No metadata in file => initial state
+        if file_len_metadata == 0 {
+            let write_operations_data_requirements = WriteOperationsDataRequirements {
+                data_cache: vec![],
+                next_event_index: 1,
+                next_event_batch_index: 1,
+                client_event_indexes: HashMap::new(),
+            };
+            return Ok(WriteOperationsDataRequirementsAndCachedData {
+                uncached_metadata_set: vec![],
+                write_operations_data_requirements,
+            });
+        }
+
+        let rec_size = METADATA_BATCH_SIZE_BYTES as u64;
+        assert!(
+            file_len_metadata % rec_size == 0,
+            "metadata file is not a multiple of METADATA_BATCH_SIZE_BYTES"
+        );
+
+        // Snapshot cache (tail of file)
+        let cached_snapshot: Vec<&MetadataWithAbsolutePosition> = self.cache_metadata.iter().collect();
+        let cached_count = cached_snapshot.len() as u64;
+
+        // Determine uncached prefix size (in bytes) and record count
+        let total_records = file_len_metadata / rec_size;
+        let cached_bytes = std::cmp::min(cached_count, total_records) * rec_size;
+        let uncached_bytes = file_len_metadata.saturating_sub(cached_bytes);
+        let uncached_records = (uncached_bytes / rec_size) as usize;
+
+        // Bound how many we return to prime read cache
+        let metadata_cache_capacity = self.config.max_data_cache_size_bytes / METADATA_BATCH_SIZE_BYTES;
+        let return_count = std::cmp::min(uncached_records, metadata_cache_capacity);
+
+        // Single pass over the uncached prefix to:
+        // - build client_event_indexes
+        // - track last scanned metadata (for next_* if no cache)
+        // - collect the last `return_count` items of the scanned prefix to return
+        let mut client_event_indexes: HashMap<u128, u64> = HashMap::new();
+        let mut last_scanned: Option<EventBatchMetadata> = None;
+
+        // Use a small ring buffer for the tail we want to return
+        let mut ring: std::collections::VecDeque<MetadataWithAbsolutePosition> =
+            std::collections::VecDeque::with_capacity(return_count.max(1));
+
+        if uncached_bytes > 0 && return_count > 0 || uncached_bytes > 0 {
+            read_objects::read_fixed_records_visit_const::<METADATA_BATCH_SIZE_BYTES, ReadError>(
+                &self.metadata_dma_file,
+                0,
+                Some(uncached_bytes),
+                self.config.max_chunk_size,
+                |metadata_bytes| {
+                    let meta: EventBatchMetadata =
+                        bincode::decode_from_slice(metadata_bytes, BINCODE_CONFIG_FIXED)
+                            .map_err(|e| ReadError::SerializationError { message: e.to_string() })?
+                            .0;
+
+                    // Build client map (latest max index per client)
+                    client_event_indexes
+                        .entry(meta.client_id)
+                        .and_modify(|v| { if meta.max_client_event_index > *v { *v = meta.max_client_event_index; } })
+                        .or_insert(meta.max_client_event_index);
+
+                    // Keep the tail subset to return
+                    if return_count > 0 {
+                        ring.push_back(MetadataWithAbsolutePosition {
+                            event_batch_metadata: meta.clone(),
+                            event_batch_absolute_position: 0,
+                        });
+                        if ring.len() > return_count {
+                            ring.pop_front();
+                        }
+                    }
+
+                    last_scanned = Some(meta);
+                    Ok(())
+                },
+            ).await?;
+        }
+
+        // Merge cached client indexes
+        for c in cached_snapshot.iter() {
+            let meta = &c.event_batch_metadata;
+            client_event_indexes
+                .entry(meta.client_id)
+                .and_modify(|v| { if meta.max_client_event_index > *v { *v = meta.max_client_event_index; } })
+                .or_insert(meta.max_client_event_index);
+        }
+
+        // Compute next_* from latest record (prefer cached tail if available)
+        let (next_event_index, next_event_batch_index) = if let Some(last_cached) = cached_snapshot.last() {
+            let m = &last_cached.event_batch_metadata;
+            (m.max_event_index.saturating_add(1), m.event_batch_index.saturating_add(1))
+        } else if let Some(m) = last_scanned {
+            (m.max_event_index.saturating_add(1), m.event_batch_index.saturating_add(1))
+        } else {
+            // Shouldn't happen since file_len_metadata > 0, but be safe
+            (1, 1)
+        };
+
+        // Materialize uncached metadata set and assign absolute positions using the first cached
+        // item's absolute position as the base (or EOF if no cache).
+        let mut uncached_metadata_set: Vec<MetadataWithAbsolutePosition> = ring.into_iter().collect();
+
+        if !uncached_metadata_set.is_empty() {
+            let mut base_pos = if let Some(first_cached) = cached_snapshot.first() {
+                first_cached.event_batch_absolute_position
+            } else {
+                file_len_event_batch
+            };
+
+            // Assign positions by walking backward
+            for m in uncached_metadata_set.iter_mut().rev() {
+                base_pos = base_pos.saturating_sub(m.event_batch_metadata.compressed_size);
+                m.event_batch_absolute_position = base_pos;
+            }
+        }
+
+        let write_operations_data_requirements = WriteOperationsDataRequirements {
+            data_cache: vec![], // writer builds cache from newly appended data
+            next_event_index,
+            next_event_batch_index,
+            client_event_indexes,
+        };
+
+        Ok(WriteOperationsDataRequirementsAndCachedData {
+            uncached_metadata_set,
+            write_operations_data_requirements,
+        })
+    }
+
     pub async fn open<P: AsRef<Path>>(
         path_metadata: P, 
         path_event_batches: P, 
@@ -528,6 +672,8 @@ fn bloom_filter_from_bytes(bloom_bytes: &[u64; BLOOM_BYTES / 8]) -> BloomFilter 
 //Some tests
 #[cfg(test)]
 pub mod test_read_operations {
+    use std::fs;
+
     use super::*;
 
     fn read_config() -> AggregateReadConfig {
@@ -546,5 +692,16 @@ pub mod test_read_operations {
         ).await?;
 
         Ok(service)
+    }
+
+    /// Return the lengths (in bytes) of `metadata.bin` and `event_batches.bin` in `folder`.
+    pub fn file_lengths(folder: &str) -> std::io::Result<(u64, u64)> {
+        let meta_path = format!("{}/metadata.bin", folder);
+        let events_path = format!("{}/event_batches.bin", folder);
+
+        let meta_len = fs::metadata(meta_path)?.len();
+        let events_len = fs::metadata(events_path)?.len();
+
+        Ok((meta_len, events_len))
     }
 }

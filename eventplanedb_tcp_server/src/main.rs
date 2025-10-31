@@ -2,7 +2,7 @@ use core::fmt;
 use std::{cell::RefCell, collections::HashMap, fmt::format, os::fd::{FromRawFd, IntoRawFd}, path, rc::Rc, time::Duration};
 
 use ahash::AHasher;
-use eventplanedb_core::{files::write_operations::{AggregateWriteConfig, AppendError, AppendOptions, WriteOperations}, local_event::LocalEvent};
+use eventplanedb_core::{files::write_operations::{AggregateWriteConfig, AppendError, AppendOptions, WriteOperations, WriteOperationsDataRequirements}, local_event::LocalEvent};
 use eventplanedb_structures::{aggregate_key::AggregateKey, compression_type::CompressionType};
 use eventplanedb_sync_stateful::stateful_engine::{StatefulDestructive, StatefulEngine, StatefulEngineConfig, StatefulReader};
 use std::hash::{Hash, Hasher};
@@ -310,14 +310,17 @@ async fn process_on_shard_async(
             let entry_rc = match entry_rc {
                 Some(rc) => rc,
                 None => {
+                    let data_requirements = WriteOperationsDataRequirements {
+                        data_cache: vec![],
+                        next_event_index: 1,
+                        next_event_batch_index: 1,
+                        client_event_indexes: HashMap::new(),
+                    };
                     // create outside of any borrow (open is async)
                     let new_wo = WriteOperations::open(
                         &path_metadata,
                         &path_event_batches,
-                        vec![],
-                        1,
-                        1,
-                        HashMap::new(),
+                        data_requirements,
                         write_config(),
                     ).await.unwrap();
                     let rc = Rc::new(RefCell::new(new_wo));

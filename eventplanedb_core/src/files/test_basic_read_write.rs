@@ -1,12 +1,14 @@
 
 #[cfg(test)]
 mod test_basic_read_write {
+    use std::collections::HashMap;
+
     use uuid::Uuid;
 
     use eventplanedb_structures::{event_item::EventItem, read_filters::ReadFilters};
     use glommio::{LocalExecutorBuilder, Placement};
 
-    use crate::files::{read_operations::{CacheableReadResult, test_read_operations::read_file_operations}, write_operations::{AppendOptions, CacheReadError, test_write_operations::{create_files, empty_aggregate_write_file_operations}}};
+    use crate::files::{read_operations::{CacheableReadResult, test_read_operations::{file_lengths, read_file_operations}}, write_operations::{AppendOptions, CacheReadError, test_write_operations::{create_files, empty_aggregate_write_file_operations, existing_aggregate_write_file_operations_no_cache}}};
 
     fn check_read_1(read_result: &CacheableReadResult, event_id: u128, expected_cache_len: usize) {
         assert_eq!(read_result.filtered_event_batches.len(), 2);
@@ -71,6 +73,81 @@ mod test_basic_read_write {
 
         assert_eq!(read_result.next_event_batch_index, None);
         assert_eq!(read_result.uncached_metadata_set.len(), expected_cache_len);
+    }
+
+    #[test]
+    fn basic_read_write_two_writers() {
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
+            
+            // Create the files and a writer
+            let tempdir = tempfile::tempdir().unwrap();
+            let folder = tempdir.path().to_str().unwrap();
+            create_files(folder);
+
+            {            
+                // Write some event batches
+                let events = vec![
+                    EventItem::new(45, 0, None, 333, 2, 3, vec![1,2,3,4,5]),
+                    EventItem::new(46, 0, None, 334, 4, 0, vec![6,7,8,9,10]),
+                ];
+                let append_options = AppendOptions {
+                    client_id: 123,
+                    compression_type: eventplanedb_structures::compression_type::CompressionType::None,
+                    enforce_client_idempotency: true,
+                    expected_event_batch_index: Some(1),
+                    server_timestamp_millis: 998,
+                    user_id: None
+                };
+
+                let mut writer = empty_aggregate_write_file_operations(folder).await.unwrap();
+                let append_result = writer.queue_events_in_memory(events, &append_options).unwrap();
+                assert_eq!(append_result.next_event_batch_index, 2);
+
+                //Write to disk
+                writer.sync_with_rollback().await.unwrap();
+            }
+
+            // Generate a guid and map it to u128
+            let id = Uuid::new_v4();
+            let event_id = id.as_u128();
+            
+            {
+                let events = vec![
+                    EventItem::new(47, 0, Some(event_id), 339, 2, 3, vec![11,12,13]),
+                ];
+                let append_options = AppendOptions {
+                    client_id: 123,
+                    compression_type: eventplanedb_structures::compression_type::CompressionType::None,
+                    enforce_client_idempotency: true,
+                    expected_event_batch_index: Some(2),
+                    server_timestamp_millis: 999,
+                    user_id: Some(34343)
+                };
+                
+                let mut reader = read_file_operations(folder).await.unwrap();
+
+                let data_requirements_and_cache = reader.get_write_operations_data_requirements().await.unwrap();
+                reader.update_metadata_cache(data_requirements_and_cache.uncached_metadata_set);
+
+                let mut writer = existing_aggregate_write_file_operations_no_cache(folder, data_requirements_and_cache.write_operations_data_requirements).await.unwrap();
+                let append_result = writer.queue_events_in_memory(events, &append_options).unwrap();
+                assert_eq!(append_result.next_event_batch_index, 3);
+
+                //Write to disk
+                writer.sync_with_rollback().await.unwrap();
+            }
+
+            let mut read_filters = ReadFilters::new(1);
+            read_filters = read_filters.min_event_timestamp(334);
+
+            let (file_len_metadata, file_len_event_batch) = file_lengths(folder).unwrap();
+            let reader2 = read_file_operations(folder).await.unwrap();
+            let read_result = reader2.read(1, file_len_metadata, file_len_event_batch, &read_filters).await.unwrap();
+            check_read_3(&read_result, 2);
+
+
+        }).unwrap();
+        handle.join().unwrap();
     }
     
     #[test]

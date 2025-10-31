@@ -137,6 +137,13 @@ struct AppendEventBatchQueueItem {
     event_batch_metadata: EventBatchMetadata,
 }
 
+pub struct WriteOperationsDataRequirements {
+    pub data_cache: Vec<BatchMetadataItemPair>, 
+    pub next_event_index: u64, 
+    pub next_event_batch_index: u64, 
+    pub client_event_indexes: HashMap<u128, u64>,
+}
+
 /// Allows appending new events for an aggregate. Note this doesn't handle fdatasync.
 /// Also caches recent events and indexes in memory for fast read access
 /// If cached read fails, you should fall back to the AggregateReadFileOperations struct
@@ -146,10 +153,7 @@ impl WriteOperations {
     pub async fn open<P: AsRef<Path>>(
         path_metadata: P, 
         path_event_batches: P, 
-        data_cache: Vec<BatchMetadataItemPair>, 
-        next_event_index: u64, 
-        next_event_batch_index: u64, 
-        client_event_indexes: HashMap<u128, u64>,
+        data_requirements: WriteOperationsDataRequirements,
         aggregate_write_config: AggregateWriteConfig,
         ) -> Result<WriteOperations, GlommioError<()>> {
 
@@ -166,10 +170,10 @@ impl WriteOperations {
         Ok(WriteOperations {
             metadata_dma_file, 
             event_batches_dma_file, 
-            data_cache, 
-            next_event_batch_index, 
-            next_event_index, 
-            client_event_indexes,
+            data_cache: data_requirements.data_cache, 
+            next_event_batch_index: data_requirements.next_event_batch_index, 
+            next_event_index: data_requirements.next_event_index, 
+            client_event_indexes: data_requirements.client_event_indexes,
             max_data_cache_size_bytes: aggregate_write_config.max_data_cache_size_bytes,
             bloom_filter,
             event_type_dedup: HashSet::new(),
@@ -512,13 +516,29 @@ pub mod test_write_operations {
     }
 
     pub async fn empty_aggregate_write_file_operations(folder: &str) -> Result<WriteOperations, GlommioError<()>> {
-       let service = WriteOperations::open(
-        format!("{}/metadata.bin", folder),
-        format!("{}/event_batches.bin", folder),
-            vec![],
-            1,
-            1,
-            HashMap::new(),
+        let data_requirements = WriteOperationsDataRequirements {
+            data_cache: vec![], 
+            next_event_index: 1, 
+            next_event_batch_index: 1, 
+            client_event_indexes: HashMap::new(),
+        };
+        let service = WriteOperations::open(
+            format!("{}/metadata.bin", folder), 
+            format!("{}/event_batches.bin", folder), 
+            data_requirements,
+            write_config(),
+        ).await?;
+
+        Ok(service)
+    }
+
+    pub async fn existing_aggregate_write_file_operations_no_cache(
+        folder: &str,
+        data_requirements: WriteOperationsDataRequirements) -> Result<WriteOperations, GlommioError<()>> {
+        let service = WriteOperations::open(
+            format!("{}/metadata.bin", folder),
+            format!("{}/event_batches.bin", folder),
+            data_requirements,
             write_config(),
         ).await?;
 
