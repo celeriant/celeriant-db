@@ -4,8 +4,6 @@ members = [
     "eventplanedb_core",
     "eventplanedb_tcp_server",
     "eventplanedb_tcp_client",
-    "eventplanedb_sync_stateless",
-    "eventplanedb_sync_stateful",
 ]
 
 resolver = "2"

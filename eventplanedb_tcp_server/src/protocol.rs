@@ -1,4 +1,5 @@
 use bincode::{Decode, Encode};
+use eventplanedb_structures::aggregate_key::AggregateKey;
 use eventplanedb_structures::{read_filters::ReadFilters, read_result::ReadResult, append_result::AppendResult};
 use eventplanedb_structures::{event_item::EventItem};
 use serde::{Deserialize, Serialize};
@@ -60,5 +61,23 @@ impl Request {
             Request::TrimStart { aggregate_id, .. } => aggregate_id,
             Request::Delete { aggregate_id, .. } => aggregate_id,
         }
+    }
+
+    pub fn aggregate_key(&self) -> AggregateKey {
+        match self {
+            Request::AppendEvents { org_id, aggregate_type_id, aggregate_id, .. }
+            | Request::ReadFiltered { org_id, aggregate_type_id, aggregate_id, .. }
+            | Request::Exists { org_id, aggregate_type_id, aggregate_id }
+            | Request::TrimStart { org_id, aggregate_type_id, aggregate_id, .. }
+            | Request::Delete { org_id, aggregate_type_id, aggregate_id } => {
+                AggregateKey::new(*org_id, *aggregate_type_id, *aggregate_id)
+            }
+        }
+    }
+}
+
+impl From<&Request> for AggregateKey {
+    fn from(req: &Request) -> Self {
+        req.aggregate_key()
     }
 }

@@ -55,6 +55,7 @@ impl From<GlommioError<()>> for AppendError {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct AggregateWriteConfig {
     pub max_data_cache_size_bytes: usize,
 }
@@ -81,18 +82,6 @@ pub struct WriteOperations {
     append_event_batch_queue: Vec<AppendEventBatchQueueItem>,
     file_len_metadata: u64,
     file_len_event_batch: u64,
-}
-
-async fn append_only_file<P: AsRef<Path>>(path: P) -> Result<DmaFile, GlommioError<()>> {
-    let dma_file = OpenOptions::new()
-        .read(false)
-        .write(false)
-        .create(false)
-        .append(true)
-        .dma_open(path)
-        .await?;
-
-    Ok(dma_file)
 }
 
 fn extract_unique_event_types(events: &[EventItem]) -> ([u64; 4], bool) {
@@ -138,6 +127,10 @@ struct AppendEventBatchQueueItem {
 }
 
 pub struct WriteOperationsDataRequirements {
+    pub file_len_metadata: u64,
+    pub metadata_dma_file: DmaFile,
+    pub file_len_event_batch: u64,
+    pub event_batches_dma_file: DmaFile,
     pub data_cache: Vec<BatchMetadataItemPair>, 
     pub next_event_index: u64, 
     pub next_event_batch_index: u64, 
@@ -150,26 +143,18 @@ pub struct WriteOperationsDataRequirements {
 /// This struct never reads from disk, only appends. So it requires cache data on initialization.
 impl WriteOperations {
 
-    pub async fn open<P: AsRef<Path>>(
-        path_metadata: P, 
-        path_event_batches: P, 
+    pub fn open(
         data_requirements: WriteOperationsDataRequirements,
         aggregate_write_config: AggregateWriteConfig,
         ) -> Result<WriteOperations, GlommioError<()>> {
-
-        let metadata_dma_file = append_only_file(path_metadata).await?;
-        let event_batches_dma_file = append_only_file(path_event_batches).await?;
-
-        let file_len_metadata = metadata_dma_file.file_size().await?;
-        let file_len_event_batch = event_batches_dma_file.file_size().await?;
 
         let bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8)
             .seed(&BLOOM_HASH_SEED)
             .hashes(BLOOM_HASH_COUNT);
         
         Ok(WriteOperations {
-            metadata_dma_file, 
-            event_batches_dma_file, 
+            metadata_dma_file: data_requirements.metadata_dma_file, 
+            event_batches_dma_file: data_requirements.event_batches_dma_file, 
             data_cache: data_requirements.data_cache, 
             next_event_batch_index: data_requirements.next_event_batch_index, 
             next_event_index: data_requirements.next_event_index, 
@@ -178,8 +163,8 @@ impl WriteOperations {
             bloom_filter,
             event_type_dedup: HashSet::new(),
             append_event_batch_queue: vec![],
-            file_len_metadata,
-            file_len_event_batch
+            file_len_metadata: data_requirements.file_len_metadata,
+            file_len_event_batch: data_requirements.file_len_event_batch
         })
     }
 
@@ -492,83 +477,5 @@ impl WriteOperations {
     
     pub fn file_len_event_batch(&self) -> u64 {
         self.file_len_event_batch
-    }
-}
-
-//Some tests
-#[cfg(test)]
-pub mod test_write_operations {
-    use glommio::{LocalExecutorBuilder, Placement};
-
-    use super::*;
-
-    fn write_config() -> AggregateWriteConfig {
-        AggregateWriteConfig {
-            max_data_cache_size_bytes: 10 * 1024 * 1024,
-        }
-    }
-
-    pub fn create_files(folder: &str) {
-        let metadata_path = format!("{}/metadata.bin", folder);
-        let event_batches_path = format!("{}/event_batches.bin", folder);
-        std::fs::File::create(metadata_path).unwrap();
-        std::fs::File::create(event_batches_path).unwrap();
-    }
-
-    pub async fn empty_aggregate_write_file_operations(folder: &str) -> Result<WriteOperations, GlommioError<()>> {
-        let data_requirements = WriteOperationsDataRequirements {
-            data_cache: vec![], 
-            next_event_index: 1, 
-            next_event_batch_index: 1, 
-            client_event_indexes: HashMap::new(),
-        };
-        let service = WriteOperations::open(
-            format!("{}/metadata.bin", folder), 
-            format!("{}/event_batches.bin", folder), 
-            data_requirements,
-            write_config(),
-        ).await?;
-
-        Ok(service)
-    }
-
-    pub async fn existing_aggregate_write_file_operations_no_cache(
-        folder: &str,
-        data_requirements: WriteOperationsDataRequirements) -> Result<WriteOperations, GlommioError<()>> {
-        let service = WriteOperations::open(
-            format!("{}/metadata.bin", folder),
-            format!("{}/event_batches.bin", folder),
-            data_requirements,
-            write_config(),
-        ).await?;
-
-        Ok(service)
-    }
-
-    #[test]
-    fn test_fail_if_files_not_exist() {
-        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn( || async move {
-
-            let tempdir = tempfile::tempdir().unwrap();
-            let folder = tempdir.path().to_str().unwrap();
-            let result = empty_aggregate_write_file_operations(folder).await;
-            assert!(result.is_err());
-
-        }).unwrap();
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn test_open_existing_files() {
-        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn( || async move {
-
-            let tempdir = tempfile::tempdir().unwrap();
-            let folder = tempdir.path().to_str().unwrap();
-            create_files(folder);
-            let result = empty_aggregate_write_file_operations(folder).await;
-            assert!(result.is_ok());
-
-        }).unwrap();
-        handle.join().unwrap();
     }
 }

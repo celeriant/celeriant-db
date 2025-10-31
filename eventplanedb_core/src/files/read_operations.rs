@@ -1,9 +1,9 @@
-use std::{collections::HashMap, path::Path, ptr::read};
-use eventplanedb_structures::{compression_type::CompressionType, constants::{BINCODE_CONFIG_FIXED, BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED, METADATA_BATCH_SIZE_BYTES}, event_batch_item::EventBatchItem, event_batch_metadata::{EventBatchMetadata, EventTypesData}, read_filters::ReadFilters, read_result::ReadResult, wire_format::from_wire_format_variable};
+use std::{collections::HashMap, path::Path};
+use eventplanedb_structures::{compression_type::CompressionType, constants::{BINCODE_CONFIG_FIXED, BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED, METADATA_BATCH_SIZE_BYTES}, event_batch_item::EventBatchItem, event_batch_metadata::{EventBatchMetadata, EventTypesData}, read_filters::ReadFilters, wire_format::from_wire_format_variable};
 use fastbloom::BloomFilter;
 use glommio::{GlommioError, io::{DmaFile, OpenOptions}};
 
-use crate::files::{read_objects::{self, AbsoluteObjectPosition, ReadVisitError}, write_operations::{BatchMetadataItemPair, WriteOperationsDataRequirements}};
+use crate::files::{read_objects::{self, AbsoluteObjectPosition, ReadVisitError}, write_operations::{WriteOperationsDataRequirements}};
 
 #[derive(Debug)]
 pub enum ReadError {
@@ -41,6 +41,7 @@ impl From<ReadVisitError<ReadError>> for ReadError {
     }
 }
 
+#[derive(Clone)]
 pub struct AggregateReadConfig {
     pub max_data_cache_size_bytes: usize,
     pub max_chunk_size: u64
@@ -66,10 +67,10 @@ pub struct CacheableReadResult {
     pub next_event_batch_index: Option<u64>,
 }
 
-async fn read_only_file<P: AsRef<Path>>(path: P) -> Result<DmaFile, GlommioError<()>> {
+async fn get_existing_file_as_dma<P: AsRef<Path>>(path: P) -> Result<DmaFile, GlommioError<()>> {
     let dma_file = OpenOptions::new()
         .read(true)
-        .write(false)
+        .write(true)
         .create(false)
         .append(false)
         .dma_open(path)
@@ -92,9 +93,16 @@ impl ReadOperations {
         let file_len_metadata = self.metadata_dma_file.file_size().await?;
         let file_len_event_batch = self.event_batches_dma_file.file_size().await?;
 
+        let event_batches_dma_file = self.event_batches_dma_file.dup()?;
+        let metadata_dma_file = self.metadata_dma_file.dup()?;
+
         // No metadata in file => initial state
         if file_len_metadata == 0 {
             let write_operations_data_requirements = WriteOperationsDataRequirements {
+                event_batches_dma_file,
+                metadata_dma_file,
+                file_len_event_batch,
+                file_len_metadata,
                 data_cache: vec![],
                 next_event_index: 1,
                 next_event_batch_index: 1,
@@ -212,6 +220,10 @@ impl ReadOperations {
 
         let write_operations_data_requirements = WriteOperationsDataRequirements {
             data_cache: vec![], // writer builds cache from newly appended data
+            event_batches_dma_file,
+            metadata_dma_file,
+            file_len_event_batch,
+            file_len_metadata,
             next_event_index,
             next_event_batch_index,
             client_event_indexes,
@@ -226,12 +238,17 @@ impl ReadOperations {
     pub async fn open<P: AsRef<Path>>(
         path_metadata: P, 
         path_event_batches: P, 
-        cache_metadata: Vec<MetadataWithAbsolutePosition>,
         aggregate_read_config: AggregateReadConfig,
         ) -> Result<ReadOperations, GlommioError<()>> {
 
-        let metadata_dma_file = read_only_file(path_metadata).await?;
-        let event_batches_dma_file = read_only_file(path_event_batches).await?;
+        let metadata_dma_file = get_existing_file_as_dma(path_metadata).await?;
+        let event_batches_dma_file = get_existing_file_as_dma(path_event_batches).await?;
+
+        //TODO: Should we pre-allocate the entire memory buffer? Seems excessive.
+        let metadata_dma_file_size = metadata_dma_file.file_size().await? as usize;
+
+        let cache_capacity_bytes = std::cmp::min(metadata_dma_file_size, aggregate_read_config.max_data_cache_size_bytes);
+        let cache_metadata = Vec::with_capacity(cache_capacity_bytes / METADATA_BATCH_SIZE_BYTES);
         
         Ok(ReadOperations {
             metadata_dma_file, 
@@ -667,41 +684,4 @@ fn bloom_filter_from_bytes(bloom_bytes: &[u64; BLOOM_BYTES / 8]) -> BloomFilter 
     BloomFilter::from_vec(bloom_bytes.to_vec())
         .seed(&BLOOM_HASH_SEED)
         .hashes(BLOOM_HASH_COUNT)
-}
-
-//Some tests
-#[cfg(test)]
-pub mod test_read_operations {
-    use std::fs;
-
-    use super::*;
-
-    fn read_config() -> AggregateReadConfig {
-        AggregateReadConfig {
-            max_chunk_size: 1 << 20,
-            max_data_cache_size_bytes: 1 << 24
-        }
-    }
-
-    pub async fn read_file_operations(folder: &str) -> Result<ReadOperations, GlommioError<()>> {
-       let service = ReadOperations::open(
-        format!("{}/metadata.bin", folder),
-        format!("{}/event_batches.bin", folder),
-            vec![],
-            read_config()
-        ).await?;
-
-        Ok(service)
-    }
-
-    /// Return the lengths (in bytes) of `metadata.bin` and `event_batches.bin` in `folder`.
-    pub fn file_lengths(folder: &str) -> std::io::Result<(u64, u64)> {
-        let meta_path = format!("{}/metadata.bin", folder);
-        let events_path = format!("{}/event_batches.bin", folder);
-
-        let meta_len = fs::metadata(meta_path)?.len();
-        let events_len = fs::metadata(events_path)?.len();
-
-        Ok((meta_len, events_len))
-    }
 }

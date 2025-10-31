@@ -1,14 +1,14 @@
 
 #[cfg(test)]
 mod test_basic_read_write {
-    use std::collections::HashMap;
+    use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
     use uuid::Uuid;
 
-    use eventplanedb_structures::{event_item::EventItem, read_filters::ReadFilters};
+    use eventplanedb_structures::{aggregate_key::{self, AggregateKey}, event_item::EventItem, read_filters::ReadFilters};
     use glommio::{LocalExecutorBuilder, Placement};
 
-    use crate::files::{read_operations::{CacheableReadResult, test_read_operations::{file_lengths, read_file_operations}}, write_operations::{AppendOptions, CacheReadError, test_write_operations::{create_files, empty_aggregate_write_file_operations, existing_aggregate_write_file_operations_no_cache}}};
+    use crate::files::{helper::{get_or_create_reader, get_or_create_writer}, read_operations::{AggregateReadConfig, CacheableReadResult, ReadOperations}, write_operations::{AggregateWriteConfig, AppendOptions, CacheReadError, WriteOperations}}
 
     fn check_read_1(read_result: &CacheableReadResult, event_id: u128, expected_cache_len: usize) {
         assert_eq!(read_result.filtered_event_batches.len(), 2);
@@ -79,10 +79,23 @@ mod test_basic_read_write {
     fn basic_read_write_two_writers() {
         let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
             
+            let read_operations_cache = Rc::new(RefCell::new(HashMap::<AggregateKey, Rc<RefCell<ReadOperations>>>::new()));
+            let write_operations_cache = Rc::new(RefCell::new(HashMap::<AggregateKey, Rc<RefCell<WriteOperations>>>::new()));
+
+            let aggregate_key = AggregateKey::new(1, 1, 1);
+
+            let aggregate_read_config = AggregateReadConfig {
+                max_chunk_size: 1 << 20,
+                max_data_cache_size_bytes: 1 << 20,
+            };
+
+            let aggregate_write_config = AggregateWriteConfig {
+                max_data_cache_size_bytes: 1 << 25
+            };
+
             // Create the files and a writer
             let tempdir = tempfile::tempdir().unwrap();
-            let folder = tempdir.path().to_str().unwrap();
-            create_files(folder);
+            let data_root_folder = tempdir.path().to_str().unwrap();
 
             {            
                 // Write some event batches
@@ -99,11 +112,13 @@ mod test_basic_read_write {
                     user_id: None
                 };
 
-                let mut writer = empty_aggregate_write_file_operations(folder).await.unwrap();
-                let append_result = writer.queue_events_in_memory(events, &append_options).unwrap();
+                let writer = get_or_create_writer(&aggregate_key, data_root_folder, true, &read_operations_cache, &aggregate_read_config, &write_operations_cache, &aggregate_write_config).await.unwrap();
+                let writer_borrow = writer.borrow();
+                let append_result = writer_borrow.queue_events_in_memory(events, &append_options).unwrap();
                 assert_eq!(append_result.next_event_batch_index, 2);
 
                 //Write to disk
+                let writer = writer.borrow_mut();
                 writer.sync_with_rollback().await.unwrap();
             }
 
@@ -124,25 +139,20 @@ mod test_basic_read_write {
                     user_id: Some(34343)
                 };
                 
-                let mut reader = read_file_operations(folder).await.unwrap();
-
-                let data_requirements_and_cache = reader.get_write_operations_data_requirements().await.unwrap();
-                reader.update_metadata_cache(data_requirements_and_cache.uncached_metadata_set);
-
-                let mut writer = existing_aggregate_write_file_operations_no_cache(folder, data_requirements_and_cache.write_operations_data_requirements).await.unwrap();
-                let append_result = writer.queue_events_in_memory(events, &append_options).unwrap();
+                let writer = get_or_create_writer(&aggregate_key, data_root_folder, false, &read_operations_cache, &aggregate_read_config, &write_operations_cache, &aggregate_write_config).await.unwrap();
+                let append_result = writer.borrow().queue_events_in_memory(events, &append_options).unwrap();
                 assert_eq!(append_result.next_event_batch_index, 3);
 
                 //Write to disk
-                writer.sync_with_rollback().await.unwrap();
+                writer.borrow_mut().sync_with_rollback().await.unwrap();
             }
 
             let mut read_filters = ReadFilters::new(1);
             read_filters = read_filters.min_event_timestamp(334);
 
-            let (file_len_metadata, file_len_event_batch) = file_lengths(folder).unwrap();
-            let reader2 = read_file_operations(folder).await.unwrap();
-            let read_result = reader2.read(1, file_len_metadata, file_len_event_batch, &read_filters).await.unwrap();
+            let writer = get_or_create_writer(&aggregate_key, data_root_folder, false, &read_operations_cache, &aggregate_read_config, &write_operations_cache, &aggregate_write_config).await.unwrap();
+            let reader = get_or_create_reader(&aggregate_key, data_root_folder, false, &read_operations_cache, &aggregate_read_config).await.unwrap();
+            let read_result = reader.borrow().read(1, writer.borrow().file_len_metadata(), writer.borrow().file_len_event_batch(), &read_filters).await.unwrap();
             check_read_3(&read_result, 2);
 
 
@@ -158,7 +168,7 @@ mod test_basic_read_write {
             let tempdir = tempfile::tempdir().unwrap();
             let folder = tempdir.path().to_str().unwrap();
             create_files(folder);
-            let mut writer = empty_aggregate_write_file_operations(folder).await.unwrap();
+            let mut writer = create_test_writer(folder).await.unwrap();
             
             // Write some event batches
             let events = vec![
