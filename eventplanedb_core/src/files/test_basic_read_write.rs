@@ -180,11 +180,6 @@ mod test_basic_read_write {
             // Create the files and a writer
             let tempdir = tempfile::tempdir().unwrap();
             let data_root_folder = tempdir.path().to_str().unwrap();
-
-            let base_folder = format!("{}/{}/{}/{}", data_root_folder, aggregate_key.org_id, aggregate_key.aggregate_type_id, aggregate_key.aggregate_id);
-            std::fs::create_dir_all(&base_folder).unwrap();
-            std::fs::File::create(format!("{}/metadata.bin", base_folder)).unwrap();
-            std::fs::File::create(format!("{}/event_batches.bin", base_folder)).unwrap();
             
             // Write some event batches
             let events = vec![
@@ -200,7 +195,7 @@ mod test_basic_read_write {
                 user_id: None
             };
 
-            let writer = get_or_create_writer(&aggregate_key, data_root_folder, false, &read_operations_cache, &aggregate_read_config, &write_operations_cache, &aggregate_write_config).await.unwrap();
+            let writer = get_or_create_writer(&aggregate_key, data_root_folder, true, &read_operations_cache, &aggregate_read_config, &write_operations_cache, &aggregate_write_config).await.unwrap();
             let append_result = writer.borrow_mut().queue_events_in_memory(events, &append_options).unwrap();
             assert_eq!(append_result.next_event_batch_index, 2);
 

@@ -3,7 +3,7 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc};
 use eventplanedb_structures::aggregate_key::AggregateKey;
 use glommio::{GlommioError};
 
-use crate::files::{read_operations::{AggregateReadConfig, ReadError, ReadOperations}, write_operations::{AggregateWriteConfig, WriteOperations}};
+use crate::files::{read_operations::{AggregateReadConfig, ReadError, ReadOperations, WriteOperationsDataRequirementsAndCachedData}, write_operations::{AggregateWriteConfig, WriteOperations}};
 
 pub async fn get_or_create_writer(
     aggregate_key: &AggregateKey,
@@ -21,11 +21,12 @@ pub async fn get_or_create_writer(
 
             let reader_ref = get_or_create_reader(aggregate_key, data_root_folder, create_if_not_exists, read_operations_cache, aggregate_read_config).await?;
             let data_requirements = reader_ref.borrow().get_write_operations_data_requirements().await?;
-
+            
             // Idempotent cache update, ok under concurrent conditions
-            if data_requirements.uncached_metadata_set.len() > 0 {
-                reader_ref.borrow_mut().update_metadata_cache(data_requirements.uncached_metadata_set);
-            }
+            //TODO: Can't borrow mut here due to another borrow?
+            // if data_requirements.uncached_metadata_set.len() > 0 {
+            //     reader_ref.borrow_mut().update_metadata_cache(data_requirements.uncached_metadata_set);
+            // }
 
             let instance = WriteOperations::open(data_requirements.write_operations_data_requirements, aggregate_write_config.clone())?;
 

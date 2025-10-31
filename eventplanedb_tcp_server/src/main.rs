@@ -2,7 +2,7 @@ use core::fmt;
 use std::{cell::RefCell, collections::HashMap, os::fd::{FromRawFd, IntoRawFd}, rc::Rc, time::Duration};
 
 use ahash::AHasher;
-use eventplanedb_core::{files::{read_operations::{AggregateReadConfig, ReadOperations}, write_operations::{AggregateWriteConfig, AppendOptions, WriteOperations}}, local_event::LocalEvent};
+use eventplanedb_core::{files::{helper::get_or_create_writer, read_operations::{AggregateReadConfig, ReadOperations}, write_operations::{AggregateWriteConfig, AppendOptions, WriteOperations}}, local_event::LocalEvent};
 use eventplanedb_structures::{aggregate_key::AggregateKey, append_result::AppendResult, compression_type::CompressionType};
 use std::hash::{Hash, Hasher};
 use glommio::{CpuSet, LocalExecutorPoolBuilder, PoolPlacement, channels::channel_mesh::{Full, MeshBuilder, Senders}, enclose, net::TcpListener, spawn_local, sync::Semaphore, timer::sleep};
@@ -266,127 +266,36 @@ async fn sync_with_delay(write_operations: &Rc<RefCell<WriteOperations>>, wal_sy
     Ok(())
 }
 
-
-async fn process_append_events(
-    request: Request,
-    read_operations: &Rc<RefCell<HashMap<AggregateKey, Rc<RefCell<ReadOperations>>>>>,
-    write_operations: &Rc<RefCell<HashMap<AggregateKey, Rc<RefCell<WriteOperations>>>>>,
-    wal_sync_events: &Rc<RefCell<HashMap<AggregateKey, Rc<RefCell<Option<Rc<LocalEvent>>>>>>>,
-    semaphores: &Rc<RefCell<HashMap<AggregateKey, Rc<Semaphore>>>>,
-    aggregate_read_config: &AggregateReadConfig,
-    aggregate_write_config: &AggregateWriteConfig,
-) -> Response {
-
-    let aggregate_key: AggregateKey = (&request).into();
-
-    let Request::AppendEvents {
-        sync_delay_us,
-        org_id,
-        aggregate_type_id,
-        aggregate_id,
-        client_id,
-        user_id,
-        events,
-        expected_event_batch_index,
-        filter_duplicate_client_events,
-    } = request else {
-        return Response::AppendEventsResult(Err("expected AppendEvents request".into()));
-    };
-
-    // try read-only access to get an Rc to the entry (no mutable borrow of the whole map)
-    let reader_ref = {
-        let map_ref = read_operations.borrow();
-        map_ref.get(&aggregate_key).cloned()
-    };
-
-    let reader_ref = read_operations.borrow().get(&aggregate_key).cloned();
-    let reader_ref = match reader_ref {
-        Some(reader_ref) => reader_ref,
-        None => {
-
-            //TODO: If path or files exist already, we don't need to create
-            let base_folder = format!("data/{org_id}/{aggregate_type_id}/{aggregate_id}");
-            if let Err(e) = std::fs::create_dir_all(&base_folder) {
-                return Response::AppendEventsResult(Err(format!("Failed to create directory structure: {}", e)));
-            }
-
-            // Create metadata and event batch files in the aggregate folder
-            let path_metadata = format!("{}/metadata.bin", base_folder);
-            let path_event_batches = format!("{}/event_batches.bin", base_folder);
-    
-            // create outside of any borrow (open is async)
-            let reader = ReadOperations::open(path_metadata, path_event_batches, *aggregate_read_config.clone()).await?;
-
-            let reader_ref = Rc::new(RefCell::new(reader));
-            // insert with a short-lived mutable borrow of the map
-            read_operations.borrow_mut().insert(aggregate_key.clone(), reader_ref.clone());
-            reader_ref
-        }
-    };
-
-
-    Response::AppendEventsResult(Ok(AppendResult {
-        next_event_batch_index: 0,
-    }))
-}
-
 /// This is a synchronous function that blocks the current thread
 /// It is called on the shard that is responsible for the given value
 async fn process_on_shard_async(
     request: Request,
-    read_operations: &Rc<RefCell<HashMap<AggregateKey, Rc<RefCell<ReadOperations>>>>>,
-    write_operations: &Rc<RefCell<HashMap<AggregateKey, Rc<RefCell<WriteOperations>>>>>,
+    read_operations_cache: &Rc<RefCell<HashMap<AggregateKey, Rc<RefCell<ReadOperations>>>>>,
+    write_operations_cache: &Rc<RefCell<HashMap<AggregateKey, Rc<RefCell<WriteOperations>>>>>,
     wal_sync_events: &Rc<RefCell<HashMap<AggregateKey, Rc<RefCell<Option<Rc<LocalEvent>>>>>>>,
     semaphores: &Rc<RefCell<HashMap<AggregateKey, Rc<Semaphore>>>>,
 ) -> Response {
+
+    let aggregate_read_config = AggregateReadConfig {
+        max_chunk_size: 1 << 20,
+        max_data_cache_size_bytes: 1 << 20,
+    };
+
+    let aggregate_write_config = AggregateWriteConfig {
+        max_data_cache_size_bytes: 1 << 25
+    };
 
     match request {
         Request::AppendEvents { sync_delay_us, org_id, aggregate_type_id, aggregate_id, client_id, user_id, events, expected_event_batch_index, filter_duplicate_client_events } => {
 
             let aggregate_key = AggregateKey::new(org_id, aggregate_type_id, aggregate_id);
 
+            //TODO: Only if create=true
+            let writer = get_or_create_writer(&aggregate_key, "data", true, &read_operations_cache, &aggregate_read_config, &write_operations_cache, &aggregate_write_config).await;
 
-
-
-            let base_folder = format!("data/{org_id}/{aggregate_type_id}/{aggregate_id}");
-            if let Err(e) = std::fs::create_dir_all(&base_folder) {
-                return Response::AppendEventsResult(Err(format!("Failed to create directory structure: {}", e)));
-            }
-
-            // Create metadata and event batch files in the aggregate folder
-            let path_metadata = format!("{}/metadata.bin", base_folder);
-            let path_event_batches = format!("{}/event_batches.bin", base_folder);
-
-            // Create files if they don't exist
-            for path in [&path_metadata, &path_event_batches] {
-                if !std::path::Path::new(path).exists() {
-                    if let Err(e) = std::fs::File::create(path) {
-                        return Response::AppendEventsResult(Err(format!("Failed to create file {}: {}", path, e)));
-                    }
-                }
-            }
-
-
-            // try read-only access to get an Rc to the entry (no mutable borrow of the whole map)
-            let entry_rc = {
-                let map_ref = write_operations.borrow();
-                map_ref.get(&aggregate_key).cloned()
-            };
-
-            let entry_rc = match entry_rc {
-                Some(rc) => rc,
-                None => {
-            
-                    // create outside of any borrow (open is async)
-                    let new_wo = WriteOperations::open(
-                        data_requirements,
-                        write_config(),
-                    ).unwrap();
-                    let rc = Rc::new(RefCell::new(new_wo));
-                    // insert with a short-lived mutable borrow of the map
-                    write_operations.borrow_mut().insert(aggregate_key.clone(), rc.clone());
-                    rc
-                }
+            let writer = match writer {
+                Ok(w) => w,
+                Err(e) => return Response::AppendEventsResult(Err(format!("Failed to create file writer"))),
             };
 
             let sem_entry_rc = {
@@ -416,7 +325,7 @@ async fn process_on_shard_async(
                     .unwrap()
                     .as_millis() as u64;
 
-                let mut wo = entry_rc.borrow_mut();
+                let mut wo = writer.borrow_mut();
                 let append_options = AppendOptions {
                     client_id,
                     user_id,
@@ -448,7 +357,7 @@ async fn process_on_shard_async(
 
             // // Have dropped mutable borrow, so now wait for write to disk
             //TODO: Need better metrics around wal sync time
-            match sync_with_delay(&entry_rc, wal_sync_event, Duration::from_micros(sync_delay_us), sem_entry_rc).await {
+            match sync_with_delay(&writer, wal_sync_event, Duration::from_micros(sync_delay_us), sem_entry_rc).await {
                 Ok(_) => result,
                 Err(e) => e,
             }
