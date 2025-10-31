@@ -4,9 +4,8 @@ use std::{cell::RefCell, collections::HashMap, os::fd::{FromRawFd, IntoRawFd}, r
 use ahash::AHasher;
 use eventplanedb_core::{files::{read_operations::{AggregateReadConfig, ReadOperations}, write_operations::{AggregateWriteConfig, AppendOptions, WriteOperations}}, local_event::LocalEvent};
 use eventplanedb_structures::{aggregate_key::AggregateKey, append_result::AppendResult, compression_type::CompressionType};
-use eventplanedb_sync_stateful::stateful_engine::{StatefulDestructive, StatefulEngine, StatefulEngineConfig, StatefulReader};
 use std::hash::{Hash, Hasher};
-use glommio::{CpuSet, GlommioError, LocalExecutorPoolBuilder, PoolPlacement, channels::channel_mesh::{Full, MeshBuilder, Senders}, enclose, net::TcpListener, spawn_local, sync::Semaphore, timer::sleep};
+use glommio::{CpuSet, LocalExecutorPoolBuilder, PoolPlacement, channels::channel_mesh::{Full, MeshBuilder, Senders}, enclose, net::TcpListener, spawn_local, sync::Semaphore, timer::sleep};
 use futures_lite::AsyncWriteExt;
 use log::{debug, error, info};
 

@@ -700,7 +700,7 @@ mod test {
 
             // Two chunks: 6 bytes of 0, 4 bytes of 1
             let object_sizes = vec![6, 4];
-            let (file_path, starts, ends) = create_test_file(folder, &object_sizes);
+            let (file_path, starts, _ends) = create_test_file(folder, &object_sizes);
             let file_size = (object_sizes.iter().sum::<usize>()) as u64;
 
             // Request from second object start to far beyond EOF

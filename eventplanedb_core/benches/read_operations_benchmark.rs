@@ -4,8 +4,7 @@ use eventplanedb_core::files::read_objects::{
 };
 use glommio::io::DmaFile;
 use glommio::{
-    channels::channel_mesh::{Full, MeshBuilder},
-    enclose, CpuSet, GlommioError, LocalExecutorBuilder, LocalExecutorPoolBuilder, Placement,
+    CpuSet, GlommioError, LocalExecutorBuilder, LocalExecutorPoolBuilder, Placement,
     PoolPlacement,
 };
 use std::fs::File;

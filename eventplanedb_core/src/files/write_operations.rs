@@ -1,8 +1,8 @@
-use std::{collections::{HashMap, HashSet}, path::Path};
+use std::{collections::{HashMap, HashSet}};
 
-use eventplanedb_structures::{append_result::AppendResult, compression_type::CompressionType, constants::{BINCODE_CONFIG_FIXED, BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED, METADATA_BATCH_SIZE_BYTES}, event_batch_item::EventBatchItem, event_batch_metadata::{EventBatchMetadata, EventTypesData}, event_item::EventItem, read_filters::ReadFilters, wire_format::to_wire_format_variable};
+use eventplanedb_structures::{append_result::AppendResult, compression_type::CompressionType, constants::{BINCODE_CONFIG_FIXED, BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED}, event_batch_item::EventBatchItem, event_batch_metadata::{EventBatchMetadata, EventTypesData}, event_item::EventItem, read_filters::ReadFilters, wire_format::to_wire_format_variable};
 use fastbloom::BloomFilter;
-use glommio::{io::{DmaFile, OpenOptions}, GlommioError};
+use glommio::{io::{DmaFile}, GlommioError};
 
 use crate::files::read_operations::{CacheableReadResult, apply_event_filters, is_include_batch};
 
