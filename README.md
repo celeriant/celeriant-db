@@ -44,3 +44,16 @@ Simple, immutable, per-aggregate event storage on local disk.
 - [ ] https://leanpub.com/esversioning/read
 - [ ] Talks from Greg Young (eg. https://www.youtube.com/watch?v=JHGkaShoyNs)
 - [ ] https://vvvvalvalval.github.io/posts/2018-11-12-datomic-event-sourcing-without-the-hassle.html
+
+
+# Running client
+cargo run -p eventplanedb_tcp_client --release -- 127.0.0.1:10000 512 16 25 30
+
+output:
+TCP Client (minimal work)
+Server: 127.0.0.1:10000
+Connections: 512
+Aggregates: 16
+Sync delay (us): 25
+Duration (s): 30
+Completed: 2201722 requests in 30.07s -> 73227.8 RPS

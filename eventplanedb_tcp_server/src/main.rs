@@ -2,10 +2,10 @@ use core::fmt;
 use std::{cell::RefCell, collections::HashMap, os::fd::{FromRawFd, IntoRawFd}, rc::Rc, time::Duration};
 
 use ahash::AHasher;
-use eventplanedb_core::{files::{helper::get_or_create_writer, read_operations::{AggregateReadConfig, ReadOperations}, write_operations::{AggregateWriteConfig, AppendOptions, WriteOperations}}, local_event::LocalEvent};
+use eventplanedb_core::{files::{helper::{get_or_create_reader, get_or_create_writer}, read_operations::{AggregateReadConfig, ReadOperations}, write_operations::{AggregateWriteConfig, AppendOptions, WriteOperations}}, local_event::LocalEvent};
 use eventplanedb_structures::{aggregate_key::AggregateKey, append_result::AppendResult, compression_type::CompressionType};
 use std::hash::{Hash, Hasher};
-use glommio::{CpuSet, LocalExecutorPoolBuilder, PoolPlacement, channels::channel_mesh::{Full, MeshBuilder, Senders}, enclose, net::TcpListener, spawn_local, sync::Semaphore, timer::sleep};
+use glommio::{CpuSet, LocalExecutorPoolBuilder, PoolPlacement, channels::channel_mesh::{Full, MeshBuilder, Senders}, enclose, net::TcpListener, spawn_local, sync::{RwLock, Semaphore}, timer::sleep};
 use futures_lite::AsyncWriteExt;
 use log::{debug, error, info};
 
@@ -78,10 +78,10 @@ fn main() {
         // Our stateful storage engine, pinned per shard
         // Each shard has its own instance of the engine
         //TODO: Included in server configuration
-        let read_operations = Rc::new(RefCell::new(HashMap::<AggregateKey, Rc<RefCell<ReadOperations>>>::new()));
-        let write_operations = Rc::new(RefCell::new(HashMap::<AggregateKey, Rc<RefCell<WriteOperations>>>::new()));
-        let wal_sync_events = Rc::new(RefCell::new(HashMap::<AggregateKey, Rc<RefCell<Option<Rc<LocalEvent>>>>>::new()));
-        let semaphores = Rc::new(RefCell::new(HashMap::<AggregateKey, Rc<Semaphore>>::new()));        
+        let read_operations = Rc::new(RwLock::new(HashMap::<AggregateKey, Rc<RwLock<ReadOperations>>>::new()));
+        let write_operations = Rc::new(RwLock::new(HashMap::<AggregateKey, Rc<RwLock<WriteOperations>>>::new()));
+        let wal_sync_events = Rc::new(RwLock::new(HashMap::<AggregateKey, Rc<RefCell<Option<Rc<LocalEvent>>>>>::new()));
+        let semaphores = Rc::new(RwLock::new(HashMap::<AggregateKey, Rc<Semaphore>>::new()));        
 
         // There is a receiver for each other shard that we must listen to
         // So we can spin up a thread for each of these, to allow concurrent processing from other shards
@@ -159,10 +159,10 @@ async fn process_tcp_stream(
     nbr_shards: usize, 
     mut tcp_stream: glommio::net::TcpStream<glommio::net::Preallocated>, 
     sender: Rc<RefCell<Senders<Msg>>>,
-    write_operations: Rc<RefCell<HashMap<AggregateKey, Rc<RefCell<WriteOperations>>>>>,
-    wal_sync_events: Rc<RefCell<HashMap<AggregateKey, Rc<RefCell<Option<Rc<LocalEvent>>>>>>>,
-    semaphores: Rc<RefCell<HashMap<AggregateKey, Rc<Semaphore>>>>,
-    read_operations: Rc<RefCell<HashMap<AggregateKey, Rc<RefCell<ReadOperations>>>>>,
+    write_operations: Rc<RwLock<HashMap<AggregateKey, Rc<RwLock<WriteOperations>>>>>,
+    wal_sync_events: Rc<RwLock<HashMap<AggregateKey, Rc<RefCell<Option<Rc<LocalEvent>>>>>>>,
+    semaphores: Rc<RwLock<HashMap<AggregateKey, Rc<Semaphore>>>>,
+    read_operations: Rc<RwLock<HashMap<AggregateKey, Rc<RwLock<ReadOperations>>>>>,
 ) {
     // It's critical to spawn local here as this allows accepting of new connections
     // It also allows processing messages sent from other shards 
@@ -177,8 +177,9 @@ async fn process_tcp_stream(
             // Determine which shard to route this request to
             // If we are already on the correct shard, we can process it directly without an additional spawn local
             let aggregate_id = request.aggregate_id();
-            let hash = hash_aggregate_id(aggregate_id);
-            let idx = (hash as usize) % nbr_shards;
+            // let hash = hash_aggregate_id(aggregate_id);
+            // let idx = (hash as usize) % nbr_shards;
+            let idx = (aggregate_id % nbr_shards as u128) as usize;
 
             if idx != shard_id {
                 // Leave the TCP connection from the client open
@@ -225,7 +226,7 @@ fn write_config() -> AggregateWriteConfig {
 }
 
 
-async fn sync_with_delay(write_operations: &Rc<RefCell<WriteOperations>>, wal_sync_event: Rc<RefCell<Option<Rc<LocalEvent>>>>, wal_sync_delay: Duration, sem_entry_rc: Rc<Semaphore>) -> Result<(), Response> {
+async fn sync_with_delay(write_operations: &Rc<RwLock<WriteOperations>>, wal_sync_event: Rc<RefCell<Option<Rc<LocalEvent>>>>, wal_sync_delay: Duration, sem_entry_rc: Rc<Semaphore>) -> Result<(), Response> {
     // Check if there's already a sync in progress
     let maybe_event = wal_sync_event.borrow().as_ref().cloned();
     
@@ -251,7 +252,7 @@ async fn sync_with_delay(write_operations: &Rc<RefCell<WriteOperations>>, wal_sy
                 return Err(Response::AppendEventsResult(Err("Failed to acquire write lock for sync".to_string())));
             }
 
-            let mut write_operations = write_operations.borrow_mut();
+            let mut write_operations = write_operations.write().await.unwrap();
             let try_sync = write_operations.sync_with_rollback().await;
             if try_sync.is_err() {
                 let err = try_sync.err().unwrap();
@@ -270,10 +271,10 @@ async fn sync_with_delay(write_operations: &Rc<RefCell<WriteOperations>>, wal_sy
 /// It is called on the shard that is responsible for the given value
 async fn process_on_shard_async(
     request: Request,
-    read_operations_cache: &Rc<RefCell<HashMap<AggregateKey, Rc<RefCell<ReadOperations>>>>>,
-    write_operations_cache: &Rc<RefCell<HashMap<AggregateKey, Rc<RefCell<WriteOperations>>>>>,
-    wal_sync_events: &Rc<RefCell<HashMap<AggregateKey, Rc<RefCell<Option<Rc<LocalEvent>>>>>>>,
-    semaphores: &Rc<RefCell<HashMap<AggregateKey, Rc<Semaphore>>>>,
+    read_operations_cache: &Rc<RwLock<HashMap<AggregateKey, Rc<RwLock<ReadOperations>>>>>,
+    write_operations_cache: &Rc<RwLock<HashMap<AggregateKey, Rc<RwLock<WriteOperations>>>>>,
+    wal_sync_events: &Rc<RwLock<HashMap<AggregateKey, Rc<RefCell<Option<Rc<LocalEvent>>>>>>>,
+    semaphores: &Rc<RwLock<HashMap<AggregateKey, Rc<Semaphore>>>>,
 ) -> Response {
 
     let aggregate_read_config = AggregateReadConfig {
@@ -299,7 +300,7 @@ async fn process_on_shard_async(
             };
 
             let sem_entry_rc = {
-                let map_ref = semaphores.borrow();
+                let map_ref = semaphores.read().await.unwrap();
                 map_ref.get(&aggregate_key).cloned()
             };
 
@@ -308,7 +309,7 @@ async fn process_on_shard_async(
                 None => {
                     let rc = Rc::new(Semaphore::new(1));
                     // insert with a short-lived mutable borrow of the map
-                    semaphores.borrow_mut().insert(aggregate_key.clone(), rc.clone());
+                    semaphores.write().await.unwrap().insert(aggregate_key.clone(), rc.clone());
                     rc
                 }
             };
@@ -325,7 +326,7 @@ async fn process_on_shard_async(
                     .unwrap()
                     .as_millis() as u64;
 
-                let mut wo = writer.borrow_mut();
+                let mut wo = writer.write().await.unwrap();
                 let append_options = AppendOptions {
                     client_id,
                     user_id,
@@ -341,7 +342,7 @@ async fn process_on_shard_async(
             }
 
             let wal_sync_event = {
-                let map_ref = wal_sync_events.borrow();
+                let map_ref = wal_sync_events.read().await.unwrap();
                 map_ref.get(&aggregate_key).cloned()
             };
 
@@ -350,7 +351,7 @@ async fn process_on_shard_async(
                 None => {
                     let rc: Rc<RefCell<Option<Rc<LocalEvent>>>> = Rc::new(RefCell::new(None));
                     // insert with a short-lived mutable borrow of the map
-                    wal_sync_events.borrow_mut().insert(aggregate_key.clone(), rc.clone());
+                    wal_sync_events.write().await.unwrap().insert(aggregate_key.clone(), rc.clone());
                     rc
                 }
             };
