@@ -57,3 +57,51 @@ Aggregates: 16
 Sync delay (us): 25
 Duration (s): 30
 Completed: 2201722 requests in 30.07s -> 73227.8 RPS
+
+# Running EventStoreDB to compare
+docker run -d   --name esdb-node   -p 2113:2113   -p 1113:1113   -v esdb-data:/var/lib/eventstore   eventstore/eventstore:latest   --insecure   --enable-atom-pub-over-http   --run-projections=None   --unsafe-disable-flush-to-disk=false   --write-through=true   --unbuffered=true   --cluster-size=1   --log-level=Information
+cargo run -p eventstoredb_client --release -- esdb://admin:changeit@localhost:2113?tls=false 512 16 30
+
+
+# Running RedPanda to compare
+docker run -d \
+  --name redpanda \
+  --restart unless-stopped \
+  --cpus 16 \
+  --memory 7G \
+  -p 9092:9092 \
+  -p 9644:9644 \
+  -p 8081:8081 \
+  -p 8082:8082 \
+  -p 19092:19092 \
+  -v redpanda-data:/var/lib/redpanda/data \
+  docker.redpanda.com/redpandadata/redpanda:v25.2.10 \
+  redpanda start \
+    --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092 \
+    --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092 \
+    --pandaproxy-addr internal://0.0.0.0:8082,external://0.0.0.0:18082 \
+    --advertise-pandaproxy-addr internal://redpanda:8082,external://localhost:18082 \
+    --schema-registry-addr internal://0.0.0.0:8081,external://0.0.0.0:18081 \
+    --advertise-rpc-addr redpanda:33145 \
+    --rpc-addr 0.0.0.0:33145 \
+    --mode dev-container \
+    --smp 16 \
+    --memory 4G \
+    --default-log-level=info \
+    --set redpanda.enable_idempotence=true \
+    --set redpanda.enable_transactions=false \
+    --set redpanda.auto_create_topics_enabled=true \
+    --set redpanda.default_topic_partitions=1 \
+    --set redpanda.default_topic_replications=1 \
+    --set redpanda.enable_coproc=false \
+    --set redpanda.developer_mode=true
+
+cargo run -p redpanda_client --release -- 127.0.0.1:19092 bench-agg 512 16 30
+
+Redpanda Client (one topic per aggregate, durable-ish ack)
+Brokers: 127.0.0.1:19092
+Topic prefix: bench-agg
+Connections (tasks): 512
+Aggregates (topics): 16
+Duration (s): 30
+Completed: 967498 appends in 30.01s -> 32234.0 RPS
