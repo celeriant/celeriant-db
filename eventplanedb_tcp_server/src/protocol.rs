@@ -18,6 +18,7 @@ pub enum Request {
         allow_create: bool,
         expected_event_batch_index: Option<u64>,
         filter_duplicate_client_events: bool,
+        durable_write: bool,
     },
     ReadFiltered {
         org_id: u128,

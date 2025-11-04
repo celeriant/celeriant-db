@@ -218,7 +218,7 @@ async fn process_tcp_stream(
     }).detach();
 }
 
-async fn sync_with_delay(write_operations: &Rc<RwLock<WriteOperations>>, wal_sync_event: Rc<RefCell<Option<Rc<LocalEvent>>>>, wal_sync_delay: Duration, sem_entry_rc: Rc<Semaphore>) -> Result<(), Response> {
+async fn sync_with_delay(write_operations: &Rc<RwLock<WriteOperations>>, wal_sync_event: Rc<RefCell<Option<Rc<LocalEvent>>>>, wal_sync_delay: Duration) -> Result<(), Response> {
     // Check if there's already a sync in progress
     let maybe_event = wal_sync_event.borrow().as_ref().cloned();
     
@@ -239,11 +239,6 @@ async fn sync_with_delay(write_operations: &Rc<RwLock<WriteOperations>>, wal_syn
         
         // Do the actual sync
         {
-            let try_permit = sem_entry_rc.acquire_permit(1).await;
-            if try_permit.is_err() {
-                return Err(Response::AppendEventsResult(Err("Failed to acquire write lock for sync".to_string())));
-            }
-
             let mut write_operations = write_operations.write().await.unwrap();
             let try_sync = write_operations.sync_with_rollback().await;
             if try_sync.is_err() {
@@ -280,7 +275,7 @@ async fn process_on_shard_async(
     };
 
     match request {
-        Request::AppendEvents { sync_delay_us, org_id, aggregate_type_id, aggregate_id, client_id, user_id, events, allow_create, expected_event_batch_index, filter_duplicate_client_events } => {
+        Request::AppendEvents { sync_delay_us, org_id, aggregate_type_id, aggregate_id, client_id, user_id, events, allow_create, expected_event_batch_index, filter_duplicate_client_events, durable_write } => {
 
             let aggregate_key = AggregateKey::new(org_id, aggregate_type_id, aggregate_id);
 
@@ -291,27 +286,8 @@ async fn process_on_shard_async(
                 Err(e) => return Response::AppendEventsResult(Err(format!("Failed to create file writer"))),
             };
 
-            let sem_entry_rc = {
-                let map_ref = semaphores.read().await.unwrap();
-                map_ref.get(&aggregate_key).cloned()
-            };
-
-            let sem_entry_rc = match sem_entry_rc {
-                Some(rc) => rc,
-                None => {
-                    let rc = Rc::new(Semaphore::new(1));
-                    // insert with a short-lived mutable borrow of the map
-                    semaphores.write().await.unwrap().insert(aggregate_key.clone(), rc.clone());
-                    rc
-                }
-            };
-
             let result: Response;
             {
-                let try_permit = sem_entry_rc.acquire_permit(1).await;
-                if try_permit.is_err() {
-                    Response::AppendEventsResult(Err("Failed to acquire write lock for sync".to_string()));
-                }
 
                 let server_timestamp_millis = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -348,9 +324,20 @@ async fn process_on_shard_async(
                 }
             };
 
+            if !durable_write {
+                let writer_clone = writer.clone();
+                let wal_sync_event_clone = wal_sync_event.clone();
+
+                spawn_local(async move {
+                    let _ = sync_with_delay(&writer_clone, wal_sync_event_clone, Duration::from_micros(sync_delay_us)).await;
+                }).detach();
+                
+                return result;
+            }
+
             // Have dropped mutable borrow, so now wait for write to disk
             //TODO: Need better metrics around wal sync time
-            match sync_with_delay(&writer, wal_sync_event, Duration::from_micros(sync_delay_us), sem_entry_rc).await {
+            match sync_with_delay(&writer, wal_sync_event, Duration::from_micros(sync_delay_us)).await {
                 Ok(_) => result,
                 Err(e) => e,
             }
