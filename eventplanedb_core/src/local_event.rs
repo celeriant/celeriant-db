@@ -7,28 +7,29 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
-type SharedListeners = Rc<RefCell<BTreeMap<u64, ListenerState>>>;
+type SharedListeners<T> = Rc<RefCell<BTreeMap<u64, ListenerState<T>>>>;
 
-struct ListenerState {
+struct ListenerState<T> {
     waker: Option<Waker>,
-    done: bool,
+    result: Option<T>,
 }
 
-pub struct LocalEventListener {
+pub struct LocalEventListener<T> {
     id: u64,
-    listeners: SharedListeners,
+    listeners: SharedListeners<T>,
 }
 
-impl Future for LocalEventListener {
-    type Output = ();
+impl<T: Clone> Future for LocalEventListener<T> {
+    type Output = T;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut listeners = self.listeners.borrow_mut();
 
         if let Some(state) = listeners.get(&self.id) {
-            if state.done {
+            if let Some(result) = &state.result {
+                let result = result.clone();
                 listeners.remove(&self.id);
-                return Poll::Ready(());
+                return Poll::Ready(result);
             }
         }
 
@@ -36,7 +37,7 @@ impl Future for LocalEventListener {
             self.id,
             ListenerState {
                 waker: Some(cx.waker().clone()),
-                done: false,
+                result: None,
             },
         );
 
@@ -45,18 +46,18 @@ impl Future for LocalEventListener {
 }
 
 /// An async event that is optimized for single thread use.
-pub struct LocalEvent {
-    listeners: SharedListeners,
+pub struct LocalEvent<T = ()> {
+    listeners: SharedListeners<T>,
     last_id: Cell<u64>,
 }
 
-impl Default for LocalEvent {
+impl<T> Default for LocalEvent<T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl LocalEvent {
+impl<T> LocalEvent<T> {
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -65,7 +66,7 @@ impl LocalEvent {
         }
     }
 
-    pub fn listen(&self) -> LocalEventListener {
+    pub fn listen(&self) -> LocalEventListener<T> {
         let mut listeners = self.listeners.borrow_mut();
         let id = self.last_id.get();
 
@@ -78,7 +79,7 @@ impl LocalEvent {
             id,
             ListenerState {
                 waker: None,
-                done: false,
+                result: None,
             },
         );
 
@@ -88,10 +89,13 @@ impl LocalEvent {
         }
     }
 
-    pub fn notify(&self) {
+    pub fn notify(&self, result: T)
+    where
+        T: Clone,
+    {
         let mut listeners = self.listeners.borrow_mut();
         for listener in listeners.values_mut() {
-            listener.done = true;
+            listener.result = Some(result.clone());
             if let Some(waker) = listener.waker.take() {
                 waker.wake();
             }
@@ -124,7 +128,7 @@ mod tests {
         run_with_glommio(|| async {
             let event = LocalEvent::new();
             let listener = event.listen();
-            event.notify();
+            event.notify(());
             listener.await;
         });
     }
@@ -140,7 +144,7 @@ mod tests {
             spawn_local(async move {
                 yield_now().await;
                 cloned_set.set(true);
-                event.notify();
+                event.notify(());
             })
             .detach();
 
@@ -157,14 +161,44 @@ mod tests {
             let listener1 = event.listen();
             let listener2 = event.listen();
 
-            event.notify();
+            event.notify(());
             listener1.await;
 
             let listener3 = event.listen();
 
-            event.notify();
+            event.notify(());
             listener3.await;
             listener2.await;
+        });
+    }
+
+    #[test]
+    fn event_with_result() {
+        run_with_glommio(|| async {
+            let event: LocalEvent<Result<i32, String>> = LocalEvent::new();
+            
+            let listener1 = event.listen();
+            let listener2 = event.listen();
+            
+            event.notify(Ok(42));
+            
+            assert_eq!(listener1.await, Ok(42));
+            assert_eq!(listener2.await, Ok(42));
+        });
+    }
+
+    #[test]
+    fn event_with_error() {
+        run_with_glommio(|| async {
+            let event: LocalEvent<Result<(), String>> = LocalEvent::new();
+            
+            let listener1 = event.listen();
+            let listener2 = event.listen();
+            
+            event.notify(Err("sync failed".to_string()));
+            
+            assert_eq!(listener1.await, Err("sync failed".to_string()));
+            assert_eq!(listener2.await, Err("sync failed".to_string()));
         });
     }
 }

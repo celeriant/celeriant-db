@@ -23,6 +23,8 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
+type SyncResult = Result<(), String>;
+
 struct Msg {
     fd: i32,
     value: Request,
@@ -80,7 +82,7 @@ fn main() {
         //TODO: Included in server configuration
         let read_operations = Rc::new(RwLock::new(HashMap::<AggregateKey, Rc<RwLock<ReadOperations>>>::new()));
         let write_operations = Rc::new(RwLock::new(HashMap::<AggregateKey, Rc<RwLock<WriteOperations>>>::new()));
-        let wal_sync_events = Rc::new(RwLock::new(HashMap::<AggregateKey, Rc<RefCell<Option<Rc<LocalEvent>>>>>::new()));
+        let wal_sync_events = Rc::new(RwLock::new(HashMap::<AggregateKey, Rc<RefCell<Option<Rc<LocalEvent<SyncResult>>>>>>::new()));
         let semaphores = Rc::new(RwLock::new(HashMap::<AggregateKey, Rc<Semaphore>>::new()));        
 
         // There is a receiver for each other shard that we must listen to
@@ -160,7 +162,7 @@ async fn process_tcp_stream(
     mut tcp_stream: glommio::net::TcpStream<glommio::net::Preallocated>, 
     sender: Rc<RefCell<Senders<Msg>>>,
     write_operations: Rc<RwLock<HashMap<AggregateKey, Rc<RwLock<WriteOperations>>>>>,
-    wal_sync_events: Rc<RwLock<HashMap<AggregateKey, Rc<RefCell<Option<Rc<LocalEvent>>>>>>>,
+    wal_sync_events: Rc<RwLock<HashMap<AggregateKey, Rc<RefCell<Option<Rc<LocalEvent<SyncResult>>>>>>>>,
     semaphores: Rc<RwLock<HashMap<AggregateKey, Rc<Semaphore>>>>,
     read_operations: Rc<RwLock<HashMap<AggregateKey, Rc<RwLock<ReadOperations>>>>>,
 ) {
@@ -218,14 +220,13 @@ async fn process_tcp_stream(
     }).detach();
 }
 
-async fn sync_with_delay(write_operations: &Rc<RwLock<WriteOperations>>, wal_sync_event: Rc<RefCell<Option<Rc<LocalEvent>>>>, wal_sync_delay: Duration) -> Result<(), Response> {
+async fn sync_with_delay(write_operations: &Rc<RwLock<WriteOperations>>, wal_sync_event: Rc<RefCell<Option<Rc<LocalEvent<SyncResult>>>>>, wal_sync_delay: Duration) -> SyncResult {
     // Check if there's already a sync in progress
     let maybe_event = wal_sync_event.borrow().as_ref().cloned();
     
     if let Some(event) = maybe_event {
-        // A sync is already scheduled, wait for it
-        //TODO: Not propogating errors from the sync here
-        event.listen().await;
+        // A sync is already scheduled, wait for it and return its result
+        return event.listen().await;
     } else {
         // No sync scheduled, create new event and schedule one
         let event = Rc::new(LocalEvent::new());
@@ -238,20 +239,17 @@ async fn sync_with_delay(write_operations: &Rc<RwLock<WriteOperations>>, wal_syn
         wal_sync_event.replace(None);
         
         // Do the actual sync
-        {
+        let sync_result = {
             let mut write_operations = write_operations.write().await.unwrap();
-            let try_sync = write_operations.sync_with_rollback().await;
-            if try_sync.is_err() {
-                let err = try_sync.err().unwrap();
-                return Err(Response::AppendEventsResult(Err(format!("Failed to sync events to disk: {:?}", err))));
-            }
-        }
+            write_operations.sync_with_rollback().await
+                .map_err(|e| format!("Failed to sync events to disk: {:?}", e))
+        };
         
-        // Notify waiters
-        event.notify();
+        // Notify all waiters with the result
+        event.notify(sync_result.clone());
+        
+        sync_result
     }
-    
-    Ok(())
 }
 
 /// This is a synchronous function that blocks the current thread
@@ -260,7 +258,7 @@ async fn process_on_shard_async(
     request: Request,
     read_operations_cache: &Rc<RwLock<HashMap<AggregateKey, Rc<RwLock<ReadOperations>>>>>,
     write_operations_cache: &Rc<RwLock<HashMap<AggregateKey, Rc<RwLock<WriteOperations>>>>>,
-    wal_sync_events: &Rc<RwLock<HashMap<AggregateKey, Rc<RefCell<Option<Rc<LocalEvent>>>>>>>,
+    wal_sync_events: &Rc<RwLock<HashMap<AggregateKey, Rc<RefCell<Option<Rc<LocalEvent<SyncResult>>>>>>>>,
     semaphores: &Rc<RwLock<HashMap<AggregateKey, Rc<Semaphore>>>>,
 ) -> Response {
 
@@ -288,7 +286,6 @@ async fn process_on_shard_async(
 
             let result: Response;
             {
-
                 let server_timestamp_millis = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
@@ -317,9 +314,8 @@ async fn process_on_shard_async(
             let wal_sync_event = match wal_sync_event {
                 Some(rc) => rc,
                 None => {
-                    let rc: Rc<RefCell<Option<Rc<LocalEvent>>>> = Rc::new(RefCell::new(None));
-                    // insert with a short-lived mutable borrow of the map
-                    wal_sync_events.write().await.unwrap().insert(aggregate_key.clone(), rc.clone());
+                    let rc: Rc<RefCell<Option<Rc<LocalEvent<SyncResult>>>>> = Rc::new(RefCell::new(None));
+                    wal_sync_events.try_write().await.unwrap().insert(aggregate_key.clone(), rc.clone());
                     rc
                 }
             };
@@ -329,17 +325,20 @@ async fn process_on_shard_async(
                 let wal_sync_event_clone = wal_sync_event.clone();
 
                 spawn_local(async move {
-                    let _ = sync_with_delay(&writer_clone, wal_sync_event_clone, Duration::from_micros(sync_delay_us)).await;
+                    // Errors are now propagated to all listeners via the event
+                    let sync_result = sync_with_delay(&writer_clone, wal_sync_event_clone, Duration::from_micros(sync_delay_us)).await;
+                    if let Err(e) = sync_result {
+                        error!("Background sync failed: {}", e);
+                    }
                 }).detach();
                 
                 return result;
             }
 
-            // Have dropped mutable borrow, so now wait for write to disk
-            //TODO: Need better metrics around wal sync time
+            // Wait for write to disk and propagate error if it occurs
             match sync_with_delay(&writer, wal_sync_event, Duration::from_micros(sync_delay_us)).await {
                 Ok(_) => result,
-                Err(e) => e,
+                Err(e) => Response::AppendEventsResult(Err(e)),
             }
         }
         Request::ReadFiltered { org_id, aggregate_type_id, aggregate_id, filters } => {
