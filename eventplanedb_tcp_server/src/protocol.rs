@@ -15,6 +15,7 @@ pub enum Request {
         client_id: u128,
         user_id: Option<u128>,
         events: Vec<EventItem>,
+        allow_create: bool,
         expected_event_batch_index: Option<u64>,
         filter_duplicate_client_events: bool,
     },

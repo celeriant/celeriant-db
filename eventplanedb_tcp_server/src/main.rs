@@ -218,14 +218,6 @@ async fn process_tcp_stream(
     }).detach();
 }
 
-//TODO: Remove write config hardcoded
-fn write_config() -> AggregateWriteConfig {
-    AggregateWriteConfig {
-        max_data_cache_size_bytes: 10 * 1024 * 1024,
-    }
-}
-
-
 async fn sync_with_delay(write_operations: &Rc<RwLock<WriteOperations>>, wal_sync_event: Rc<RefCell<Option<Rc<LocalEvent>>>>, wal_sync_delay: Duration, sem_entry_rc: Rc<Semaphore>) -> Result<(), Response> {
     // Check if there's already a sync in progress
     let maybe_event = wal_sync_event.borrow().as_ref().cloned();
@@ -283,16 +275,16 @@ async fn process_on_shard_async(
     };
 
     let aggregate_write_config = AggregateWriteConfig {
-        max_data_cache_size_bytes: 1 << 25
+        max_data_cache_size_bytes: 1 << 25,
+        max_chunk_size: 1 << 20,
     };
 
     match request {
-        Request::AppendEvents { sync_delay_us, org_id, aggregate_type_id, aggregate_id, client_id, user_id, events, expected_event_batch_index, filter_duplicate_client_events } => {
+        Request::AppendEvents { sync_delay_us, org_id, aggregate_type_id, aggregate_id, client_id, user_id, events, allow_create, expected_event_batch_index, filter_duplicate_client_events } => {
 
             let aggregate_key = AggregateKey::new(org_id, aggregate_type_id, aggregate_id);
 
-            //TODO: Only if create=true
-            let writer = get_or_create_writer(&aggregate_key, "data", true, &read_operations_cache, &aggregate_read_config, &write_operations_cache, &aggregate_write_config).await;
+            let writer = get_or_create_writer(&aggregate_key, "data", allow_create, &read_operations_cache, &aggregate_read_config, &write_operations_cache, &aggregate_write_config).await;
 
             let writer = match writer {
                 Ok(w) => w,
@@ -364,8 +356,87 @@ async fn process_on_shard_async(
             }
         }
         Request::ReadFiltered { org_id, aggregate_type_id, aggregate_id, filters } => todo!(),
-        Request::Exists { org_id, aggregate_type_id, aggregate_id } => todo!(),
-        Request::TrimStart { org_id, aggregate_type_id, aggregate_id, keep_from_event_batch_index } => todo!(),
+        Request::Exists { org_id, aggregate_type_id, aggregate_id } => 
+        {            
+            let aggregate_key = AggregateKey::new(org_id, aggregate_type_id, aggregate_id);
+            let reader = get_or_create_reader(&aggregate_key, "data", false, &read_operations_cache, &aggregate_read_config).await;
+            if reader.is_err() {
+                return Response::ExistsResult(Ok(false))
+            }
+            Response::ExistsResult(Ok(true))
+        },
+        Request::TrimStart { org_id, aggregate_type_id, aggregate_id, keep_from_event_batch_index } => 
+        {
+            let aggregate_key = AggregateKey::new(org_id, aggregate_type_id, aggregate_id);
+
+            let reader = get_or_create_reader(&aggregate_key, "data", false, &read_operations_cache, &aggregate_read_config).await;
+
+            let reader = match reader {
+                Ok(w) => w,
+                Err(e) => return Response::TrimStartResult(Err(format!("Failed to create file reader"))),
+            };
+
+            let writer = get_or_create_writer(&aggregate_key, "data", false, &read_operations_cache, &aggregate_read_config, &write_operations_cache, &aggregate_write_config).await;
+
+            let writer = match writer {
+                Ok(w) => w,
+                Err(e) => return Response::TrimStartResult(Err(format!("Failed to create file writer"))),
+            };
+
+            let sem_entry_rc = {
+                let map_ref = semaphores.read().await.unwrap();
+                map_ref.get(&aggregate_key).cloned()
+            };
+
+            let sem_entry_rc = match sem_entry_rc {
+                Some(rc) => rc,
+                None => {
+                    let rc = Rc::new(Semaphore::new(1));
+                    semaphores.write().await.unwrap().insert(aggregate_key.clone(), rc.clone());
+                    rc
+                }
+            };
+
+            {
+                let try_permit = sem_entry_rc.acquire_permit(1).await;
+                if try_permit.is_err() {
+                    Response::TrimStartResult(Err("Failed to acquire write lock for sync".to_string()));
+                }
+
+                let file_positions_result = {
+                    let writer = writer.read().await.unwrap();
+                    
+                    reader.read().await.unwrap().get_file_positions(
+                        writer.minimum_available_event_batch_index,
+                        keep_from_event_batch_index,
+                        writer.file_len_metadata(),
+                        writer.file_len_event_batch(),
+                    ).await
+                };
+                let (bytes_to_trim_metadata, bytes_to_trim_event_batch) = match file_positions_result {
+                    Ok((metadata_bytes, event_batch_bytes)) => (metadata_bytes, event_batch_bytes),
+                    Err(e) => return Response::TrimStartResult(Err(format!("Failed to get file positions for trim start operation: {:?}", e)))
+                };
+
+                let mut wo = writer.write().await.unwrap();
+                let trim_result = wo.trim_start(bytes_to_trim_metadata, bytes_to_trim_event_batch).await;
+                if trim_result.is_err() {
+                    return Response::TrimStartResult(Err(format!("Failed to trim aggregate up to: {keep_from_event_batch_index}")));
+                }
+                
+                match trim_result {
+                    Ok((metadata_dma_file, event_batches_dma_file)) => {
+                        let mut reader = reader.write().await.unwrap();
+                        reader.trim_start(metadata_dma_file, event_batches_dma_file);
+                    },
+                    Err(e) => {
+                        return Response::TrimStartResult(Err(format!("Failed to trim aggregate: {:?}", e)));
+                    },
+                };
+            }
+
+            Response::TrimStartResult(Ok(()))
+        },
         Request::Delete { org_id, aggregate_type_id, aggregate_id } => {
             let aggregate_key = AggregateKey::new(org_id, aggregate_type_id, aggregate_id);
             

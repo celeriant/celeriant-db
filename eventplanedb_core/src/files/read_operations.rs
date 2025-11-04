@@ -86,6 +86,129 @@ pub struct WriteOperationsDataRequirementsAndCachedData {
 
 impl ReadOperations {
 
+    async fn get_metadata_range(
+        &self,
+        minimum_available_event_batch_index: u64,
+        from_event_batch_index: u64,
+        file_len_metadata: u64,
+        file_len_event_batch: u64,
+        to_event_batch_index: Option<u64>, // None means read to end of file
+    ) -> Result<(Vec<MetadataWithAbsolutePosition>, Vec<&MetadataWithAbsolutePosition>), ReadError> {
+        
+        if minimum_available_event_batch_index > from_event_batch_index {
+            return Err(ReadError::UnavailableBatchIndex { 
+                minimum_available_event_batch_index, 
+                requested_event_batch_index: from_event_batch_index 
+            });
+        }
+
+        let metadata_read_from_bytes = from_event_batch_index.saturating_sub(minimum_available_event_batch_index) * METADATA_BATCH_SIZE_BYTES as u64;
+
+        // Handle scenario where we're reading past the end of the file
+        if file_len_metadata.saturating_sub(metadata_read_from_bytes) == 0 {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        // Calculate read boundaries
+        let metadata_read_to_bytes = if let Some(to_index) = to_event_batch_index {
+            let to_bytes = (to_index.saturating_sub(minimum_available_event_batch_index) + 1) * METADATA_BATCH_SIZE_BYTES as u64;
+            std::cmp::min(to_bytes, file_len_metadata)
+        } else {
+            file_len_metadata
+        };
+
+        // Take a snapshot of the cache
+        let cached_metadata_set_snapshot: Vec<&MetadataWithAbsolutePosition> = self.cache_metadata.iter().collect();
+
+        // Determine uncached range
+        let uncached_metadata_read_to_bytes = file_len_metadata.saturating_sub(
+            cached_metadata_set_snapshot.len() as u64 * METADATA_BATCH_SIZE_BYTES as u64
+        );
+        
+        let actual_read_to = std::cmp::min(metadata_read_to_bytes, uncached_metadata_read_to_bytes);
+        let uncached_metadata_count = ((actual_read_to.saturating_sub(metadata_read_from_bytes)) / METADATA_BATCH_SIZE_BYTES as u64) as usize;
+        let mut uncached_metadata_set: Vec<MetadataWithAbsolutePosition> = Vec::with_capacity(uncached_metadata_count);
+
+        // Absolute position reference from cache
+        let mut event_batch_absolute_position = if !cached_metadata_set_snapshot.is_empty() {
+            cached_metadata_set_snapshot[0].event_batch_absolute_position
+        } else {
+            file_len_event_batch
+        };
+
+        // Read uncached metadata from disk
+        if uncached_metadata_count > 0 {
+            read_objects::read_fixed_records_visit_const::<METADATA_BATCH_SIZE_BYTES, ReadError>(
+                &self.metadata_dma_file,
+                metadata_read_from_bytes,
+                Some(actual_read_to),
+                self.config.max_chunk_size,
+                |metadata_bytes| {
+                    let event_batch_metadata = bincode::decode_from_slice(metadata_bytes, BINCODE_CONFIG_FIXED)
+                        .map_err(|e| ReadError::SerializationError { message: e.to_string() })?
+                        .0;
+                    uncached_metadata_set.push(MetadataWithAbsolutePosition {
+                        event_batch_metadata,
+                        event_batch_absolute_position: 0
+                    });
+                    Ok(())
+                }
+            ).await?;
+        }
+
+        // Calculate absolute positions
+        for metadata_with_absolute_position in uncached_metadata_set.iter_mut().rev() {
+            event_batch_absolute_position -= metadata_with_absolute_position.event_batch_metadata.compressed_size;
+            metadata_with_absolute_position.event_batch_absolute_position = event_batch_absolute_position;
+        }
+
+        Ok((uncached_metadata_set, cached_metadata_set_snapshot))
+    }
+    
+    pub async fn get_file_positions(
+        &self, 
+        minimum_available_event_batch_index: u64, 
+        keep_from_event_batch_index: u64,
+        file_len_metadata: u64,
+        file_len_event_batch: u64,
+    ) -> Result<(u64, u64), ReadError> {
+        
+        let metadata_position = (keep_from_event_batch_index - minimum_available_event_batch_index) * METADATA_BATCH_SIZE_BYTES as u64;
+
+        // Get all metadata from start to keep_from_event_batch_index (exclusive)
+        let (uncached_metadata_set, cached_metadata_set_snapshot) = self.get_metadata_range(
+            minimum_available_event_batch_index,
+            minimum_available_event_batch_index,
+            file_len_metadata,
+            file_len_event_batch,
+            Some(keep_from_event_batch_index.saturating_sub(1)),
+        ).await?;
+
+        // Sum compressed sizes to get event batch position
+        let mut event_batch_position = 0u64;
+        
+        for metadata in uncached_metadata_set.iter() {
+            event_batch_position += metadata.event_batch_metadata.compressed_size;
+        }
+
+        for metadata in cached_metadata_set_snapshot.iter() {
+            if metadata.event_batch_metadata.event_batch_index < keep_from_event_batch_index {
+                event_batch_position += metadata.event_batch_metadata.compressed_size;
+            } else {
+                break;
+            }
+        }
+
+        Ok((metadata_position, event_batch_position))
+    }
+
+    pub fn trim_start(&mut self, metadata_dma_file: DmaFile, event_batches_dma_file: DmaFile) {
+        self.metadata_dma_file = metadata_dma_file;
+        self.event_batches_dma_file = event_batches_dma_file;
+        //TODO: Could be more specific about what to clear
+        self.cache_metadata.clear();
+    }
+
     pub async fn get_write_operations_data_requirements(
         &self,
     ) -> Result<WriteOperationsDataRequirementsAndCachedData, ReadError> {
@@ -104,6 +227,7 @@ impl ReadOperations {
                 file_len_event_batch,
                 file_len_metadata,
                 data_cache: vec![],
+                minimum_available_event_batch_index: 0,
                 next_event_index: 1,
                 next_event_batch_index: 1,
                 client_event_indexes: HashMap::new(),
@@ -145,7 +269,9 @@ impl ReadOperations {
         let mut ring: std::collections::VecDeque<MetadataWithAbsolutePosition> =
             std::collections::VecDeque::with_capacity(return_count.max(1));
 
-        if uncached_bytes > 0 && return_count > 0 || uncached_bytes > 0 {
+        let mut minimum_available_event_batch_index: Option<u64> = None;
+
+        if uncached_bytes > 0 {
             read_objects::read_fixed_records_visit_const::<METADATA_BATCH_SIZE_BYTES, ReadError>(
                 &self.metadata_dma_file,
                 0,
@@ -156,6 +282,10 @@ impl ReadOperations {
                         bincode::decode_from_slice(metadata_bytes, BINCODE_CONFIG_FIXED)
                             .map_err(|e| ReadError::SerializationError { message: e.to_string() })?
                             .0;
+
+                    if minimum_available_event_batch_index.is_none() {
+                        minimum_available_event_batch_index = Some(meta.event_batch_index);
+                    }
 
                     // Build client map (latest max index per client)
                     client_event_indexes
@@ -178,7 +308,14 @@ impl ReadOperations {
                     Ok(())
                 },
             ).await?;
+        } 
+        
+        if !self.cache_metadata.is_empty() && self.cache_metadata.first().unwrap().event_batch_absolute_position == 0 {
+            // Can get min event batch from the cache
+            minimum_available_event_batch_index = Some(self.cache_metadata.first().unwrap().event_batch_metadata.event_batch_index);
         }
+
+        assert!(minimum_available_event_batch_index.is_some(), "Should get min event batch index");
 
         // Merge cached client indexes
         for c in cached_snapshot.iter() {
@@ -224,6 +361,7 @@ impl ReadOperations {
             metadata_dma_file,
             file_len_event_batch,
             file_len_metadata,
+            minimum_available_event_batch_index: minimum_available_event_batch_index.unwrap_or(1),
             next_event_index,
             next_event_batch_index,
             client_event_indexes,
@@ -244,7 +382,6 @@ impl ReadOperations {
         let metadata_dma_file = get_existing_file_as_dma(path_metadata).await?;
         let event_batches_dma_file = get_existing_file_as_dma(path_event_batches).await?;
 
-        //TODO: Should we pre-allocate the entire memory buffer? Seems excessive.
         let metadata_dma_file_size = metadata_dma_file.file_size().await? as usize;
 
         let cache_capacity_bytes = std::cmp::min(metadata_dma_file_size, aggregate_read_config.max_data_cache_size_bytes);
@@ -261,79 +398,36 @@ impl ReadOperations {
     //minimum_available_event_batch_index comes from writer as it only changes during a trim operation
     pub async fn read(&self, minimum_available_event_batch_index: u64, file_len_metadata: u64, file_len_event_batch: u64, read_filters: &ReadFilters) -> Result<CacheableReadResult, ReadError> {
         
-        if minimum_available_event_batch_index > read_filters.from_event_batch_index {
-            return Err(ReadError::UnavailableBatchIndex { minimum_available_event_batch_index, requested_event_batch_index: read_filters.from_event_batch_index });
-        }
+        // Use the helper to get metadata range
+        let (uncached_metadata_set, cached_metadata_set_snapshot) = self.get_metadata_range(
+            minimum_available_event_batch_index,
+            read_filters.from_event_batch_index,
+            file_len_metadata,
+            file_len_event_batch,
+            read_filters.to_event_batch_index,
+        ).await?;
 
-        let metadata_read_from_bytes = read_filters.from_event_batch_index.saturating_sub(minimum_available_event_batch_index) * METADATA_BATCH_SIZE_BYTES as u64;
-
-        // Handle scenario where client requests server_id that hasn't been written yet
-        if file_len_metadata.saturating_sub(metadata_read_from_bytes) == 0 {
+        // Handle empty result
+        if uncached_metadata_set.is_empty() && cached_metadata_set_snapshot.is_empty() {
             return Ok(CacheableReadResult {
                 uncached_metadata_set: Vec::new(),
                 filtered_event_batches: Vec::new(),
                 next_event_batch_index: None,
             });
         }
-        
-        // Any cached metadata is not required to be re-read
-        // Take a snapshot of the cache as refs, as it could change at any point over await boundaries
-        let cached_metadata_set_snapshot: Vec<&MetadataWithAbsolutePosition> = self.cache_metadata.iter().collect();
 
-        // Work out if the cache covers the required read boudnaries or do we need to pull more metadata entries from disk
-        let uncached_metadata_read_to_bytes = file_len_metadata.saturating_sub(cached_metadata_set_snapshot.len() as u64 * METADATA_BATCH_SIZE_BYTES as u64);
-        let uncached_metadata_count = (uncached_metadata_read_to_bytes.saturating_sub(metadata_read_from_bytes) / METADATA_BATCH_SIZE_BYTES as u64) as usize;
-        let mut uncached_metadata_set: Vec<MetadataWithAbsolutePosition> = Vec::with_capacity(uncached_metadata_count);
-
-        // Absolute position reference from cache, uncached metadata extends in reverse from here
-        let mut event_batch_absolute_position = if cached_metadata_set_snapshot.len() > 0 {
-            cached_metadata_set_snapshot[0].event_batch_absolute_position
-        } else {
-            file_len_event_batch
-        };
-
-        if uncached_metadata_count > 0 {
-            //This is where we reach out to disk to get additional metadata
-            //It's an async boundary so it could yield for other processing on the thread
-            read_objects::read_fixed_records_visit_const::<METADATA_BATCH_SIZE_BYTES, ReadError>(
-                &self.metadata_dma_file, 
-                metadata_read_from_bytes, 
-                Some(uncached_metadata_read_to_bytes), //In case file changes due to concurrent writes...
-                self.config.max_chunk_size, 
-                | metadata_bytes | {
-                    let event_batch_metadata = bincode::decode_from_slice(metadata_bytes, BINCODE_CONFIG_FIXED)
-                        .map_err(|e| ReadError::SerializationError { message: e.to_string() })?
-                        .0;
-                    // We use MetadataWithAbsolutePosition here as this is the owned struct we will cache later
-                    uncached_metadata_set.push(MetadataWithAbsolutePosition {
-                        event_batch_metadata,
-                        event_batch_absolute_position: 0
-                    });
-                    Ok(())
-                }
-            ).await?;
-        }
-
-        // Calculate the absolution start positions for each event batch in the data file
-        // Now uncached_metadata_set is ready for caching, we can return it later!
-        for metadata_with_absolute_position in uncached_metadata_set.iter_mut().rev() {
-            event_batch_absolute_position -= metadata_with_absolute_position.event_batch_metadata.compressed_size;
-            metadata_with_absolute_position.event_batch_absolute_position = event_batch_absolute_position;
-        }
-
-        // Let's build the complete, contiguous set of metadata entries (uncached + cached) so that we can read the event batches
-        // It's mutable because we want to remove batches that don't match the read_filters
-        let mut metadata_for_reading: Vec<&MetadataWithAbsolutePosition> = Vec::with_capacity(uncached_metadata_set.len() + cached_metadata_set_snapshot.len());
+        // Build the complete, contiguous set of metadata entries
+        let mut metadata_for_reading: Vec<&MetadataWithAbsolutePosition> = Vec::with_capacity(
+            uncached_metadata_set.len() + cached_metadata_set_snapshot.len()
+        );
         metadata_for_reading.extend(uncached_metadata_set.iter());
         metadata_for_reading.extend(cached_metadata_set_snapshot.iter());
 
-        // Now we exclude metadata entries based on the filter and only take up to max_bytes (pagination)
-        // This could error if the server's max_bytes settings means we can't even return the first batch
+        // Exclude metadata entries based on filters and apply max_bytes pagination
         let next_event_batch_index: Option<u64> =
             trim_end_if_exceeds_max_bytes(&mut metadata_for_reading, &read_filters, read_filters.max_bytes)?;
 
-        // Another async boundary - this time reading the actual event batches at specific positions in the file
-        // Note the set is still ordered but there may be gaps
+        // Read the actual event batches at specific positions in the file
         let object_positions: Vec<AbsoluteObjectPosition> = metadata_for_reading.iter()
             .map(|f| AbsoluteObjectPosition { 
                 start_pos: f.event_batch_absolute_position, 
@@ -345,8 +439,7 @@ impl ReadOperations {
             &object_positions, 
             self.config.max_chunk_size).await?;
 
-        // Let's deser our event batches now and do final filtering
-        // Note event_batches_bytes_set and event_batches_bytes_set are always the same size
+        // Deserialize and filter event batches
         assert!(event_batches_bytes_set.len() == metadata_for_reading.len());
 
         let mut index = 0;
@@ -357,7 +450,11 @@ impl ReadOperations {
             let actual_crc = crc32fast::hash(&event_batch_bytes);
 
             if actual_crc != metadata.events_crc {
-                return Err(ReadError::CorruptEventBatch { expected_crc: metadata.events_crc, actual_crc, event_batch_index: metadata.event_batch_index })
+                return Err(ReadError::CorruptEventBatch { 
+                    expected_crc: metadata.events_crc, 
+                    actual_crc, 
+                    event_batch_index: metadata.event_batch_index 
+                })
             }
 
             let compression_type = CompressionType::from_tuple(metadata.compression_type, None);
@@ -383,7 +480,7 @@ impl ReadOperations {
             next_event_batch_index,
         })
     }
-    
+
     pub fn update_metadata_cache(&mut self, mut uncached_metadata_set: Vec<MetadataWithAbsolutePosition>) {
         if uncached_metadata_set.is_empty() {
             return;

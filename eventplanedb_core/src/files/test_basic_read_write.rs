@@ -90,7 +90,8 @@ mod test_basic_read_write {
             };
 
             let aggregate_write_config = AggregateWriteConfig {
-                max_data_cache_size_bytes: 1 << 25
+                max_data_cache_size_bytes: 1 << 25,
+                max_chunk_size: 1 << 20,
             };
 
             // Create the files and a writer
@@ -151,7 +152,7 @@ mod test_basic_read_write {
 
             let writer = get_or_create_writer(&aggregate_key, data_root_folder, false, &read_operations_cache, &aggregate_read_config, &write_operations_cache, &aggregate_write_config).await.unwrap();
             let reader = get_or_create_reader(&aggregate_key, data_root_folder, false, &read_operations_cache, &aggregate_read_config).await.unwrap();
-            let read_result = reader.read().await.unwrap().read(1, writer.read().await.unwrap().file_len_metadata(), writer.read().await.unwrap().file_len_event_batch(), &read_filters).await.unwrap();
+            let read_result = reader.read().await.unwrap().read(writer.read().await.unwrap().minimum_available_event_batch_index, writer.read().await.unwrap().file_len_metadata(), writer.read().await.unwrap().file_len_event_batch(), &read_filters).await.unwrap();
             check_read_3(&read_result, 2);
 
 
@@ -174,7 +175,8 @@ mod test_basic_read_write {
             };
 
             let aggregate_write_config = AggregateWriteConfig {
-                max_data_cache_size_bytes: 1 << 25
+                max_data_cache_size_bytes: 1 << 25,
+                max_chunk_size: 1 << 20,
             };
 
             // Create the files and a writer
@@ -236,13 +238,13 @@ mod test_basic_read_write {
 
             let reader = get_or_create_reader(&aggregate_key, data_root_folder, false, &read_operations_cache, &aggregate_read_config).await.unwrap();
             
-            let read_result = reader.read().await.unwrap().read(1, writer.read().await.unwrap().file_len_metadata(), writer.read().await.unwrap().file_len_event_batch(), &read_filters).await.unwrap();
+            let read_result = reader.read().await.unwrap().read(writer.read().await.unwrap().minimum_available_event_batch_index, writer.read().await.unwrap().file_len_metadata(), writer.read().await.unwrap().file_len_event_batch(), &read_filters).await.unwrap();
 
             check_read_1(&read_result, event_id, 2);
 
             //Basic filter on metadata
             read_filters = read_filters.exclude_client_id(123);
-            let read_result = reader.read().await.unwrap().read(1, writer.read().await.unwrap().file_len_metadata(), writer.read().await.unwrap().file_len_event_batch(), &read_filters).await.unwrap();
+            let read_result = reader.read().await.unwrap().read(writer.read().await.unwrap().minimum_available_event_batch_index, writer.read().await.unwrap().file_len_metadata(), writer.read().await.unwrap().file_len_event_batch(), &read_filters).await.unwrap();
             check_read_2(&read_result, 2);
 
             let cache_read = writer.read().await.unwrap().maybe_read_cached_events(&read_filters).unwrap();
@@ -251,7 +253,7 @@ mod test_basic_read_write {
             //Basic filter on event batches
             let mut read_filters = ReadFilters::new(1);
             read_filters = read_filters.min_event_timestamp(334);
-            let read_result = reader.read().await.unwrap().read(1, writer.read().await.unwrap().file_len_metadata(), writer.read().await.unwrap().file_len_event_batch(), &read_filters).await.unwrap();
+            let read_result = reader.read().await.unwrap().read(writer.read().await.unwrap().minimum_available_event_batch_index, writer.read().await.unwrap().file_len_metadata(), writer.read().await.unwrap().file_len_event_batch(), &read_filters).await.unwrap();
 
             check_read_3(&read_result, 2);
 
@@ -263,10 +265,10 @@ mod test_basic_read_write {
             reader2.write().await.unwrap().update_metadata_cache(read_result.uncached_metadata_set);       
 
             //Cache should be idempotent
-            let read_result = reader.read().await.unwrap().read(1, writer.read().await.unwrap().file_len_metadata(), writer.read().await.unwrap().file_len_event_batch(), &read_filters).await.unwrap();     
+            let read_result = reader.read().await.unwrap().read(writer.read().await.unwrap().minimum_available_event_batch_index, writer.read().await.unwrap().file_len_metadata(), writer.read().await.unwrap().file_len_event_batch(), &read_filters).await.unwrap();     
             reader2.write().await.unwrap().update_metadata_cache(read_result.uncached_metadata_set);
 
-            let read_result = reader2.read().await.unwrap().read(1, writer.read().await.unwrap().file_len_metadata(), writer.read().await.unwrap().file_len_event_batch(), &read_filters).await.unwrap();
+            let read_result = reader2.read().await.unwrap().read(writer.read().await.unwrap().minimum_available_event_batch_index, writer.read().await.unwrap().file_len_metadata(), writer.read().await.unwrap().file_len_event_batch(), &read_filters).await.unwrap();
             check_read_3(&read_result, 0);
 
         }).unwrap();

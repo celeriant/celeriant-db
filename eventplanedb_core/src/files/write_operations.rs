@@ -74,6 +74,7 @@ pub struct WriteOperations {
     metadata_dma_file: DmaFile,
     event_batches_dma_file: DmaFile,
     data_cache: Vec<BatchMetadataItemPair>,
+    pub minimum_available_event_batch_index: u64,
     next_event_index: u64,
     next_event_batch_index: u64,
     client_event_indexes: HashMap<u128, u64>,
@@ -134,6 +135,7 @@ pub struct WriteOperationsDataRequirements {
     pub file_len_event_batch: u64,
     pub event_batches_dma_file: DmaFile,
     pub data_cache: Vec<BatchMetadataItemPair>, 
+    pub minimum_available_event_batch_index: u64,
     pub next_event_index: u64, 
     pub next_event_batch_index: u64, 
     pub client_event_indexes: HashMap<u128, u64>,
@@ -160,6 +162,7 @@ impl WriteOperations {
             data_cache: data_requirements.data_cache, 
             next_event_batch_index: data_requirements.next_event_batch_index, 
             next_event_index: data_requirements.next_event_index, 
+            minimum_available_event_batch_index: data_requirements.minimum_available_event_batch_index,
             client_event_indexes: data_requirements.client_event_indexes,
             max_data_cache_size_bytes: aggregate_write_config.max_data_cache_size_bytes,
             max_chunk_size: aggregate_write_config.max_chunk_size,
@@ -251,6 +254,11 @@ impl WriteOperations {
             });
         }
 
+        if self.minimum_available_event_batch_index == 0 {
+            //Data in file is now available to read
+            self.minimum_available_event_batch_index = 1;
+        }
+
         // Phase 2: Trim old events from front if cache exceeds max size
         let mut total_cache_size: usize = self.data_cache
             .iter()
@@ -284,9 +292,13 @@ impl WriteOperations {
                         .and_modify(|e| {
                             *e = item.event_batch_metadata.min_client_event_index.saturating_sub(1);
                         });
-
                     self.next_event_index = item.event_batch_metadata.min_event_index;
                     self.next_event_batch_index = item.event_batch_metadata.event_batch_index;
+                }
+
+                if self.next_event_batch_index == 1 {
+                    //First write failed!
+                    self.minimum_available_event_batch_index = 0;
                 }
 
                 //Still must error out so we notify clients of failure to write
@@ -439,18 +451,19 @@ impl WriteOperations {
         &mut self, 
         bytes_to_trim_metadata: u64, 
         bytes_to_trim_event_batch: u64,
-        metadata_file_path: &str,
-        event_batch_file_path: &str,
     ) -> Result<(DmaFile, DmaFile), AppendError> {
         if bytes_to_trim_metadata == 0 || bytes_to_trim_event_batch == 0 {
             return Err(AppendError::WriteError { 
                 message: "Cannot trim 0 bytes".to_string() 
             });
         }
+        
+        let metadata_file_path = self.metadata_dma_file.path().unwrap().to_path_buf();
+        let event_batch_file_path = self.event_batches_dma_file.path().unwrap().to_path_buf();
 
         // Create temp file paths
-        let temp_path_metadata = format!("{}.tmp", metadata_file_path);
-        let temp_path_event_batch = format!("{}.tmp", event_batch_file_path);
+        let temp_path_metadata = format!("{}.tmp", metadata_file_path.display());
+        let temp_path_event_batch = format!("{}.tmp", event_batch_file_path.display());
 
         // Trim metadata file
         {
@@ -506,15 +519,16 @@ impl WriteOperations {
             temp_event_batch_file.close().await?;
         }
 
+
         // Commit by renaming temp files over originals
-        std::fs::rename(&temp_path_metadata, metadata_file_path)
+        std::fs::rename(&temp_path_metadata, &metadata_file_path)
             .map_err(|e| AppendError::WriteError { message: format!("metadata rename failed: {}", e) })?;
-        std::fs::rename(&temp_path_event_batch, event_batch_file_path)
+        std::fs::rename(&temp_path_event_batch, &event_batch_file_path)
             .map_err(|e| AppendError::WriteError { message: format!("event batch rename failed: {}", e) })?;
 
         // Reopen files and update state
-        let new_metadata_file = DmaFile::open(metadata_file_path).await?;
-        let new_event_batch_file = DmaFile::open(event_batch_file_path).await?;
+        let new_metadata_file = DmaFile::open(&metadata_file_path).await?;
+        let new_event_batch_file = DmaFile::open(&event_batch_file_path).await?;
 
         // Update cached file lengths
         self.file_len_metadata = self.file_len_metadata.saturating_sub(bytes_to_trim_metadata);
