@@ -8,7 +8,6 @@ license.workspace = true
 [dependencies]
 eventplanedb_structures = { path = "../eventplanedb_structures" }
 eventplanedb_core = { path = "../eventplanedb_core" }
-eventplanedb_sync_stateful = { path = "../eventplanedb_sync_stateful" }
 env_logger.workspace = true
 fastrand.workspace = true
 futures-lite.workspace = true

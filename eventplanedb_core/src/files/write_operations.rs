@@ -1,6 +1,6 @@
 use std::{collections::{HashMap, HashSet}};
 
-use eventplanedb_structures::{append_result::AppendResult, compression_type::CompressionType, constants::{BINCODE_CONFIG_FIXED, BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED}, event_batch_item::EventBatchItem, event_batch_metadata::{EventBatchMetadata, EventTypesData}, event_item::EventItem, read_filters::ReadFilters, wire_format::to_wire_format_variable};
+use eventplanedb_structures::{append_result::AppendResult, compression_type::CompressionType, constants::{BINCODE_CONFIG_FIXED, BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED, METADATA_BATCH_SIZE_BYTES}, event_batch_item::EventBatchItem, event_batch_metadata::{EventBatchMetadata, EventTypesData}, event_item::EventItem, read_filters::ReadFilters, wire_format::to_wire_format_variable};
 use fastbloom::BloomFilter;
 use glommio::{io::{DmaFile}, GlommioError};
 
@@ -122,7 +122,7 @@ fn extract_unique_event_types(events: &[EventItem]) -> ([u64; 4], bool) {
 struct AppendEventBatchQueueItem {
     compressed_event_batch_item: Vec<u8>,
     event_batch_item: EventBatchItem,
-    metadata_bytes: Vec<u8>,
+    metadata_bytes: [u8; METADATA_BATCH_SIZE_BYTES],
     event_batch_metadata: EventBatchMetadata,
 }
 
@@ -380,10 +380,14 @@ impl WriteOperations {
 
         let latest_client_event_index = event_batch_metadata.max_client_event_index;
 
-        let metadata_bytes = bincode::encode_to_vec(&event_batch_metadata, BINCODE_CONFIG_FIXED)
-            .map_err(|e| AppendError::SerializationError { 
-                message: format!("Failed to serialize metadata: {}", e) 
-            })?;
+        let mut metadata_bytes = [0u8; METADATA_BATCH_SIZE_BYTES];
+        bincode::encode_into_slice(
+            &event_batch_metadata, 
+            &mut metadata_bytes, 
+            BINCODE_CONFIG_FIXED
+        ).map_err(|e| AppendError::SerializationError { 
+            message: format!("Failed to serialize metadata: {}", e) 
+        })?;
 
         self.append_event_batch_queue.push(AppendEventBatchQueueItem {
             compressed_event_batch_item,

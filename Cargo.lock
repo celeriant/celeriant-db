@@ -664,37 +664,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "eventplanedb_sync_stateful"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "eventplanedb_structures",
- "eventplanedb_sync_stateless",
- "fastbloom",
- "futures-lite",
- "lru",
- "tempfile",
-]
-
-[[package]]
-name = "eventplanedb_sync_stateless"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "brotli",
- "crc32fast",
- "eventplanedb_structures",
- "fastbloom",
- "flate2",
- "futures-lite",
- "io-uring",
- "rand 0.9.2",
- "snap",
- "tempfile",
- "zstd",
-]
-
-[[package]]
 name = "eventplanedb_tcp_client"
 version = "0.1.0"
 dependencies = [
@@ -712,7 +681,6 @@ dependencies = [
  "env_logger",
  "eventplanedb_core",
  "eventplanedb_structures",
- "eventplanedb_sync_stateful",
  "fastrand",
  "futures-lite",
  "glommio",
@@ -1312,17 +1280,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "189d0897e4cbe8c75efedf3502c18c887b05046e59d28404d4d8e46cbc4d1e86"
 dependencies = [
  "memoffset",
-]
-
-[[package]]
-name = "io-uring"
-version = "0.7.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "046fa2d4d00aea763528b4950358d0ead425372445dc8ff86312b3c69ff7727b"
-dependencies = [
- "bitflags 2.9.4",
- "cfg-if",
- "libc",
 ]
 
 [[package]]
