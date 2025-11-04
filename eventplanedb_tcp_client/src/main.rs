@@ -19,6 +19,7 @@ pub enum Request {
         client_id: u128,
         user_id: Option<u128>,
         events: Vec<EventItem>,
+        allow_create: bool,
         expected_event_batch_index: Option<u64>,
         filter_duplicate_client_events: bool,
     },
@@ -42,6 +43,7 @@ fn build_combined_request_bytes(
         events: events.clone(), // cloned once at startup per aggregate
         expected_event_batch_index: None,
         filter_duplicate_client_events: false,
+        allow_create: true
     };
 
     let encoded = bincode::encode_to_vec(&request, config::standard()).unwrap();

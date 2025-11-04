@@ -3,7 +3,7 @@ use std::{cell::RefCell, collections::HashMap, os::fd::{FromRawFd, IntoRawFd}, r
 
 use ahash::AHasher;
 use eventplanedb_core::{files::{helper::{get_or_create_reader, get_or_create_writer}, read_operations::{AggregateReadConfig, ReadOperations}, write_operations::{AggregateWriteConfig, AppendOptions, WriteOperations}}, local_event::LocalEvent};
-use eventplanedb_structures::{aggregate_key::AggregateKey, append_result::AppendResult, compression_type::CompressionType};
+use eventplanedb_structures::{aggregate_key::AggregateKey, append_result::AppendResult, compression_type::CompressionType, read_result::ReadResult};
 use std::hash::{Hash, Hasher};
 use glommio::{CpuSet, LocalExecutorPoolBuilder, PoolPlacement, channels::channel_mesh::{Full, MeshBuilder, Senders}, enclose, net::TcpListener, spawn_local, sync::{RwLock, Semaphore}, timer::sleep};
 use futures_lite::AsyncWriteExt;
@@ -355,7 +355,52 @@ async fn process_on_shard_async(
                 Err(e) => e,
             }
         }
-        Request::ReadFiltered { org_id, aggregate_type_id, aggregate_id, filters } => todo!(),
+        Request::ReadFiltered { org_id, aggregate_type_id, aggregate_id, filters } => {
+            let aggregate_key = AggregateKey::new(org_id, aggregate_type_id, aggregate_id);
+
+            let writer = get_or_create_writer(&aggregate_key, "data", false, &read_operations_cache, &aggregate_read_config, &write_operations_cache, &aggregate_write_config).await;
+
+            let writer = match writer {
+                Ok(w) => w,
+                Err(e) => return Response::AppendEventsResult(Err(format!("Failed to create file writer"))),
+            };
+
+            let r_writer = writer.read().await.unwrap();
+            match r_writer.maybe_read_cached_events(&filters) {
+                Ok(result) => return Response::ReadFilteredResult(Ok(ReadResult {
+                    event_batches: result.filtered_event_batches,
+                    next_event_batch_index: result.next_event_batch_index,
+                })),
+                Err(e) => ()
+            };
+
+            let reader = get_or_create_reader(&aggregate_key, "data", false, &read_operations_cache, &aggregate_read_config).await;
+
+            let reader = match reader {
+                Ok(w) => w,
+                Err(e) => return Response::TrimStartResult(Err(format!("Failed to create file reader"))),
+            };
+
+            let read_result = {
+                let r_reader = reader.read().await.unwrap();
+                r_reader.read(r_writer.minimum_available_event_batch_index, r_writer.file_len_metadata(), r_writer.file_len_event_batch(), &filters).await
+            };
+
+            match read_result {
+                Ok(result) => 
+                {
+                    if !result.uncached_metadata_set.is_empty() {
+                        let mut w_reader = reader.write().await.unwrap();
+                        w_reader.update_metadata_cache(result.uncached_metadata_set);
+                    }
+                    return Response::ReadFilteredResult(Ok(ReadResult {
+                        event_batches: result.filtered_event_batches,
+                        next_event_batch_index: result.next_event_batch_index,
+                    }))
+                },
+                Err(e) => return Response::ReadFilteredResult(Err(format!("Failed to read aggregate"))),
+            }
+        },
         Request::Exists { org_id, aggregate_type_id, aggregate_id } => 
         {            
             let aggregate_key = AggregateKey::new(org_id, aggregate_type_id, aggregate_id);
