@@ -82,7 +82,7 @@ fn main() {
         //TODO: Included in server configuration
         let read_operations = Rc::new(RwLock::new(HashMap::<AggregateKey, Rc<RwLock<ReadOperations>>>::new()));
         let write_operations = Rc::new(RwLock::new(HashMap::<AggregateKey, Rc<RwLock<WriteOperations>>>::new()));
-        let wal_sync_events = Rc::new(RwLock::new(HashMap::<AggregateKey, Rc<RefCell<Option<Rc<LocalEvent<SyncResult>>>>>>::new()));
+        let wal_sync_events = Rc::new(RwLock::new(HashMap::<AggregateKey, Rc<RwLock<Option<Rc<LocalEvent<SyncResult>>>>>>::new()));
         let semaphores = Rc::new(RwLock::new(HashMap::<AggregateKey, Rc<Semaphore>>::new()));        
 
         // There is a receiver for each other shard that we must listen to
@@ -162,7 +162,7 @@ async fn process_tcp_stream(
     mut tcp_stream: glommio::net::TcpStream<glommio::net::Preallocated>, 
     sender: Rc<RefCell<Senders<Msg>>>,
     write_operations: Rc<RwLock<HashMap<AggregateKey, Rc<RwLock<WriteOperations>>>>>,
-    wal_sync_events: Rc<RwLock<HashMap<AggregateKey, Rc<RefCell<Option<Rc<LocalEvent<SyncResult>>>>>>>>,
+    wal_sync_events: Rc<RwLock<HashMap<AggregateKey, Rc<RwLock<Option<Rc<LocalEvent<SyncResult>>>>>>>>,
     semaphores: Rc<RwLock<HashMap<AggregateKey, Rc<Semaphore>>>>,
     read_operations: Rc<RwLock<HashMap<AggregateKey, Rc<RwLock<ReadOperations>>>>>,
 ) {
@@ -220,35 +220,57 @@ async fn process_tcp_stream(
     }).detach();
 }
 
-async fn sync_with_delay(write_operations: &Rc<RwLock<WriteOperations>>, wal_sync_event: Rc<RefCell<Option<Rc<LocalEvent<SyncResult>>>>>, wal_sync_delay: Duration) -> SyncResult {
-    // Check if there's already a sync in progress
-    let maybe_event = wal_sync_event.borrow().as_ref().cloned();
-    
-    if let Some(event) = maybe_event {
-        // A sync is already scheduled, wait for it and return its result
-        return event.listen().await;
-    } else {
-        // No sync scheduled, create new event and schedule one
-        let event = Rc::new(LocalEvent::new());
-        wal_sync_event.replace(Some(event.clone()));
+async fn sync_with_delay(
+    write_operations: &Rc<RwLock<WriteOperations>>, 
+    wal_sync_event: &RwLock<Option<Rc<LocalEvent<SyncResult>>>>, 
+    wal_sync_delay: Duration
+) -> SyncResult {
+    // Try to become the sync coordinator
+    match wal_sync_event.try_write() {
+        Ok(mut maybe_event) => {
+            // We won! Check if sync is already in progress
+            if let Some(event) = maybe_event.as_ref() {
+                // Another task beat us between our check and lock acquisition
+                let event = event.clone();
+                drop(maybe_event); // Release lock before awaiting
+                return event.listen().await;
+            }
+            
+            // We're the coordinator - create the event
+            let event = Rc::new(LocalEvent::new());
+            *maybe_event = Some(event.clone());
+            drop(maybe_event); // Release lock while sleeping
+            
+            // Sleep for the delay period
+            sleep(wal_sync_delay).await;
+            
+            // Clear the event before sync (need write lock again)
+            wal_sync_event.write().await.unwrap().take();
+            
+            // Do the actual sync
+            let sync_result = {
+                let mut write_operations = write_operations.write().await.unwrap();
+                write_operations.sync_with_rollback().await
+                    .map_err(|e| format!("Failed to sync events to disk: {:?}", e))
+            };
+            
+            // Notify all waiters
+            event.notify(sync_result.clone());
+            
+            sync_result
+        }
         
-        // Sleep for the delay period
-        sleep(wal_sync_delay).await;
-        
-        // Clear the event before sync
-        wal_sync_event.replace(None);
-        
-        // Do the actual sync
-        let sync_result = {
-            let mut write_operations = write_operations.write().await.unwrap();
-            write_operations.sync_with_rollback().await
-                .map_err(|e| format!("Failed to sync events to disk: {:?}", e))
-        };
-        
-        // Notify all waiters with the result
-        event.notify(sync_result.clone());
-        
-        sync_result
+        Err(_) => {
+            // Another task is coordinating the sync - just wait for it
+            let event = {
+                let maybe_event = wal_sync_event.read().await.unwrap();
+                maybe_event.as_ref()
+                    .expect("If try_write failed, event should exist")
+                    .clone()
+            };
+            
+            event.listen().await
+        }
     }
 }
 
@@ -258,7 +280,7 @@ async fn process_on_shard_async(
     request: Request,
     read_operations_cache: &Rc<RwLock<HashMap<AggregateKey, Rc<RwLock<ReadOperations>>>>>,
     write_operations_cache: &Rc<RwLock<HashMap<AggregateKey, Rc<RwLock<WriteOperations>>>>>,
-    wal_sync_events: &Rc<RwLock<HashMap<AggregateKey, Rc<RefCell<Option<Rc<LocalEvent<SyncResult>>>>>>>>,
+    wal_sync_events: &Rc<RwLock<HashMap<AggregateKey, Rc<RwLock<Option<Rc<LocalEvent<SyncResult>>>>>>>>,
     semaphores: &Rc<RwLock<HashMap<AggregateKey, Rc<Semaphore>>>>,
 ) -> Response {
 
@@ -314,8 +336,8 @@ async fn process_on_shard_async(
             let wal_sync_event = match wal_sync_event {
                 Some(rc) => rc,
                 None => {
-                    let rc: Rc<RefCell<Option<Rc<LocalEvent<SyncResult>>>>> = Rc::new(RefCell::new(None));
-                    wal_sync_events.try_write().await.unwrap().insert(aggregate_key.clone(), rc.clone());
+                    let rc: Rc<RwLock<Option<Rc<LocalEvent<SyncResult>>>>> = Rc::new(RwLock::new(None));
+                    wal_sync_events.write().await.unwrap().insert(aggregate_key.clone(), rc.clone());
                     rc
                 }
             };
@@ -326,7 +348,7 @@ async fn process_on_shard_async(
 
                 spawn_local(async move {
                     // Errors are now propagated to all listeners via the event
-                    let sync_result = sync_with_delay(&writer_clone, wal_sync_event_clone, Duration::from_micros(sync_delay_us)).await;
+                    let sync_result = sync_with_delay(&writer_clone, &wal_sync_event_clone, Duration::from_micros(sync_delay_us)).await;
                     if let Err(e) = sync_result {
                         error!("Background sync failed: {}", e);
                     }
@@ -336,7 +358,7 @@ async fn process_on_shard_async(
             }
 
             // Wait for write to disk and propagate error if it occurs
-            match sync_with_delay(&writer, wal_sync_event, Duration::from_micros(sync_delay_us)).await {
+            match sync_with_delay(&writer, &wal_sync_event, Duration::from_micros(sync_delay_us)).await {
                 Ok(_) => result,
                 Err(e) => Response::AppendEventsResult(Err(e)),
             }
