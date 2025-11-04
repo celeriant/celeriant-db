@@ -1,7 +1,7 @@
 
 #[cfg(test)]
 mod test_basic_read_write {
-    use std::{cell::RefCell, collections::HashMap, rc::Rc};
+    use std::{collections::HashMap, rc::Rc};
 
     use uuid::Uuid;
 

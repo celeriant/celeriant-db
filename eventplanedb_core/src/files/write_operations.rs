@@ -58,6 +58,7 @@ impl From<GlommioError<()>> for AppendError {
 #[derive(Debug, Clone)]
 pub struct AggregateWriteConfig {
     pub max_data_cache_size_bytes: usize,
+    pub max_chunk_size: usize
 }
 
 pub struct AppendOptions {
@@ -77,6 +78,7 @@ pub struct WriteOperations {
     next_event_batch_index: u64,
     client_event_indexes: HashMap<u128, u64>,
     max_data_cache_size_bytes: usize,
+    max_chunk_size: usize,
     bloom_filter: BloomFilter,
     event_type_dedup: HashSet<u64>,
     append_event_batch_queue: Vec<AppendEventBatchQueueItem>,
@@ -160,6 +162,7 @@ impl WriteOperations {
             next_event_index: data_requirements.next_event_index, 
             client_event_indexes: data_requirements.client_event_indexes,
             max_data_cache_size_bytes: aggregate_write_config.max_data_cache_size_bytes,
+            max_chunk_size: aggregate_write_config.max_chunk_size,
             bloom_filter,
             event_type_dedup: HashSet::new(),
             append_event_batch_queue: vec![],
@@ -405,6 +408,127 @@ impl WriteOperations {
         Ok(AppendResult {
             next_event_batch_index: self.next_event_batch_index,
         })
+    }
+
+    pub async fn trim_end(&mut self, new_metadata_len: u64, new_event_batch_len: u64) -> Result<(), AppendError> {
+        let mut truncated = false;
+
+        // Truncate the metadata file
+        if self.file_len_metadata > new_metadata_len {
+            self.metadata_dma_file.truncate(new_metadata_len).await?;
+            self.file_len_metadata = new_metadata_len;
+            truncated = true;
+        }
+        
+        // Truncate the event batches file
+        if self.file_len_event_batch > new_event_batch_len {
+            self.event_batches_dma_file.truncate(new_event_batch_len).await?;
+            self.file_len_event_batch = new_event_batch_len;
+            truncated = true;
+        }
+        
+        if truncated {
+            // Clear the data cache as it's now invalid
+            self.data_cache.clear();
+        }
+        
+        Ok(())
+    }
+
+    pub async fn trim_start(
+        &mut self, 
+        bytes_to_trim_metadata: u64, 
+        bytes_to_trim_event_batch: u64,
+        metadata_file_path: &str,
+        event_batch_file_path: &str,
+    ) -> Result<(DmaFile, DmaFile), AppendError> {
+        if bytes_to_trim_metadata == 0 || bytes_to_trim_event_batch == 0 {
+            return Err(AppendError::WriteError { 
+                message: "Cannot trim 0 bytes".to_string() 
+            });
+        }
+
+        // Create temp file paths
+        let temp_path_metadata = format!("{}.tmp", metadata_file_path);
+        let temp_path_event_batch = format!("{}.tmp", event_batch_file_path);
+
+        // Trim metadata file
+        {
+            let metadata_remaining_size = self.file_len_metadata.saturating_sub(bytes_to_trim_metadata);
+            let temp_metadata_file = DmaFile::create(&temp_path_metadata).await?;
+            
+            let mut offset = bytes_to_trim_metadata;
+            let mut remaining = metadata_remaining_size;
+            let mut write_pos = 0u64;
+            
+            while remaining > 0 {
+                let to_read = std::cmp::min(remaining, self.max_chunk_size as u64);
+                let aligned_size = self.metadata_dma_file.align_up(to_read) as usize;
+                
+                let chunk = self.metadata_dma_file.read_at_aligned(offset, aligned_size).await?;
+                let actual_read = std::cmp::min(chunk.len(), to_read as usize);
+                
+                temp_metadata_file.write_at(chunk.into(), write_pos).await?;
+                
+                offset += actual_read as u64;
+                write_pos += actual_read as u64;
+                remaining -= actual_read as u64;
+            }
+            
+            temp_metadata_file.fdatasync().await?;
+            temp_metadata_file.close().await?;
+        }
+
+        // Trim event batch file
+        {
+            let event_batch_remaining_size = self.file_len_event_batch.saturating_sub(bytes_to_trim_event_batch);
+            let temp_event_batch_file = DmaFile::create(&temp_path_event_batch).await?;
+            
+            let mut offset = bytes_to_trim_event_batch;
+            let mut remaining = event_batch_remaining_size;
+            let mut write_pos = 0u64;
+            
+            while remaining > 0 {
+                let to_read = std::cmp::min(remaining, self.max_chunk_size as u64);
+                let aligned_size = self.event_batches_dma_file.align_up(to_read) as usize;
+                
+                let chunk = self.event_batches_dma_file.read_at_aligned(offset, aligned_size).await?;
+                let actual_read = std::cmp::min(chunk.len(), to_read as usize);
+                
+                temp_event_batch_file.write_at(chunk.into(), write_pos).await?;
+                
+                offset += actual_read as u64;
+                write_pos += actual_read as u64;
+                remaining -= actual_read as u64;
+            }
+            
+            temp_event_batch_file.fdatasync().await?;
+            temp_event_batch_file.close().await?;
+        }
+
+        // Commit by renaming temp files over originals
+        std::fs::rename(&temp_path_metadata, metadata_file_path)
+            .map_err(|e| AppendError::WriteError { message: format!("metadata rename failed: {}", e) })?;
+        std::fs::rename(&temp_path_event_batch, event_batch_file_path)
+            .map_err(|e| AppendError::WriteError { message: format!("event batch rename failed: {}", e) })?;
+
+        // Reopen files and update state
+        let new_metadata_file = DmaFile::open(metadata_file_path).await?;
+        let new_event_batch_file = DmaFile::open(event_batch_file_path).await?;
+
+        // Update cached file lengths
+        self.file_len_metadata = self.file_len_metadata.saturating_sub(bytes_to_trim_metadata);
+        self.file_len_event_batch = self.file_len_event_batch.saturating_sub(bytes_to_trim_event_batch);
+
+        // Duplicate file handles for return
+        let dup_metadata_file = new_metadata_file.dup()?;
+        let dup_event_batch_file = new_event_batch_file.dup()?;
+
+        // Update internal file handles
+        self.metadata_dma_file = new_metadata_file;
+        self.event_batches_dma_file = new_event_batch_file;
+
+        Ok((dup_metadata_file, dup_event_batch_file))
     }
 
     pub fn maybe_read_cached_events(&self, filters: &ReadFilters) -> Result<CacheableReadResult, CacheReadError> {

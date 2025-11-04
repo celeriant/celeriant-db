@@ -1,4 +1,4 @@
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{collections::HashMap, rc::Rc};
 
 use eventplanedb_structures::aggregate_key::AggregateKey;
 use glommio::{GlommioError, sync::RwLock};

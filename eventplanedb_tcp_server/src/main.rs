@@ -356,7 +356,7 @@ async fn process_on_shard_async(
                 }
             };
 
-            // // Have dropped mutable borrow, so now wait for write to disk
+            // Have dropped mutable borrow, so now wait for write to disk
             //TODO: Need better metrics around wal sync time
             match sync_with_delay(&writer, wal_sync_event, Duration::from_micros(sync_delay_us), sem_entry_rc).await {
                 Ok(_) => result,
@@ -366,7 +366,31 @@ async fn process_on_shard_async(
         Request::ReadFiltered { org_id, aggregate_type_id, aggregate_id, filters } => todo!(),
         Request::Exists { org_id, aggregate_type_id, aggregate_id } => todo!(),
         Request::TrimStart { org_id, aggregate_type_id, aggregate_id, keep_from_event_batch_index } => todo!(),
-        Request::Delete { org_id, aggregate_type_id, aggregate_id } => todo!(),
+        Request::Delete { org_id, aggregate_type_id, aggregate_id } => {
+            let aggregate_key = AggregateKey::new(org_id, aggregate_type_id, aggregate_id);
+            
+            // 1. Remove from caches (this drops WriteOperations and closes files)
+            {
+                let mut write_cache = write_operations_cache.write().await.unwrap();
+                let mut read_cache = read_operations_cache.write().await.unwrap();
+                let mut wal_events = wal_sync_events.write().await.unwrap();
+                let mut sems = semaphores.write().await.unwrap();
+
+                write_cache.remove(&aggregate_key);
+                read_cache.remove(&aggregate_key);
+                wal_events.remove(&aggregate_key);
+                sems.remove(&aggregate_key);
+            }
+            
+            // 2. Now that files are closed, delete them from filesystem
+            let metadata_path = format!("data/{}/{}/{}/metadata.bin", org_id, aggregate_type_id, aggregate_id);
+            let events_path = format!("data/{}/{}/{}/events.bin", org_id, aggregate_type_id, aggregate_id);
+            
+            match (std::fs::remove_file(&metadata_path), std::fs::remove_file(&events_path)) {
+                (Ok(_), Ok(_)) => Response::DeleteResult(Ok(())),
+                (Err(e), _) | (_, Err(e)) => Response::DeleteResult(Err(format!("Failed to delete files: {}", e))),
+            }
+        },
     }
 }
 
