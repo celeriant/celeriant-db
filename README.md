@@ -47,16 +47,15 @@ Simple, immutable, per-aggregate event storage on local disk.
 
 
 # Running client
-cargo run -p eventplanedb_tcp_client --release -- 127.0.0.1:10000 512 16 25 30
+cargo run -p eventplanedb_tcp_client --release -- 127.0.0.1:10000 14096 32 200 30
 
-output:
 TCP Client (minimal work)
 Server: 127.0.0.1:10000
-Connections: 512
-Aggregates: 16
-Sync delay (us): 25
+Connections: 14096
+Aggregates: 32
+Sync delay (us): 200
 Duration (s): 30
-Completed: 2201722 requests in 30.07s -> 73227.8 RPS
+Completed: 8411088 requests in 31.28s -> 268916.8 RPS
 
 # Running EventStoreDB to compare
 docker run -d   --name esdb-node   -p 2113:2113   -p 1113:1113   -v esdb-data:/var/lib/eventstore   eventstore/eventstore:latest   --insecure   --enable-atom-pub-over-http   --run-projections=None   --unsafe-disable-flush-to-disk=false   --write-through=true   --unbuffered=true   --cluster-size=1   --log-level=Information

@@ -1,4 +1,4 @@
-use std::{collections::{HashMap, HashSet}};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use eventplanedb_structures::{append_result::AppendResult, compression_type::CompressionType, constants::{BINCODE_CONFIG_FIXED, BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED, METADATA_BATCH_SIZE_BYTES}, event_batch_item::EventBatchItem, event_batch_metadata::{EventBatchMetadata, EventTypesData}, event_item::EventItem, read_filters::ReadFilters, wire_format::to_wire_format_variable};
 use fastbloom::BloomFilter;
@@ -73,7 +73,8 @@ pub struct AppendOptions {
 pub struct WriteOperations {
     metadata_dma_file: DmaFile,
     event_batches_dma_file: DmaFile,
-    data_cache: Vec<BatchMetadataItemPair>,
+    data_cache: VecDeque<BatchMetadataItemPair>,
+    total_cache_size_bytes: usize,
     pub minimum_available_event_batch_index: u64,
     next_event_index: u64,
     next_event_batch_index: u64,
@@ -134,7 +135,7 @@ pub struct WriteOperationsDataRequirements {
     pub metadata_dma_file: DmaFile,
     pub file_len_event_batch: u64,
     pub event_batches_dma_file: DmaFile,
-    pub data_cache: Vec<BatchMetadataItemPair>, 
+    pub data_cache: VecDeque<BatchMetadataItemPair>, 
     pub minimum_available_event_batch_index: u64,
     pub next_event_index: u64, 
     pub next_event_batch_index: u64, 
@@ -156,10 +157,17 @@ impl WriteOperations {
             .seed(&BLOOM_HASH_SEED)
             .hashes(BLOOM_HASH_COUNT);
         
+        // Calculate initial cache size
+        let total_cache_size_bytes: usize = data_requirements.data_cache
+            .iter()
+            .map(|pair| pair.metadata.uncompressed_size as usize)
+            .sum();
+
         Ok(WriteOperations {
             metadata_dma_file: data_requirements.metadata_dma_file, 
             event_batches_dma_file: data_requirements.event_batches_dma_file, 
             data_cache: data_requirements.data_cache, 
+            total_cache_size_bytes,
             next_event_batch_index: data_requirements.next_event_batch_index, 
             next_event_index: data_requirements.next_event_index, 
             minimum_available_event_batch_index: data_requirements.minimum_available_event_batch_index,
@@ -247,11 +255,22 @@ impl WriteOperations {
         self.file_len_event_batch += event_buf_len;
         self.file_len_metadata += meta_buf_len;
 
-        for item in self.append_event_batch_queue.drain(..){
-            self.data_cache.push(BatchMetadataItemPair {
-                metadata: item.event_batch_metadata,
-                item: item.event_batch_item,
-            });
+        // Phase 1: Add new items to cache efficiently
+        let queue_len = self.append_event_batch_queue.len();
+        if queue_len > 0 {
+            // Reserve capacity upfront for better performance
+            self.data_cache.reserve(queue_len);
+            
+            // Bulk add items and track size
+            for item in self.append_event_batch_queue.drain(..) {
+                let uncompressed_size = item.event_batch_metadata.uncompressed_size as usize;
+                self.total_cache_size_bytes += uncompressed_size;
+                
+                self.data_cache.push_back(BatchMetadataItemPair {
+                    metadata: item.event_batch_metadata,
+                    item: item.event_batch_item,
+                });
+            }
         }
 
         if self.minimum_available_event_batch_index == 0 {
@@ -259,20 +278,30 @@ impl WriteOperations {
             self.minimum_available_event_batch_index = 1;
         }
 
-        // Phase 2: Trim old events from front if cache exceeds max size
-        let mut total_cache_size: usize = self.data_cache
-            .iter()
-            .map(|pair| pair.metadata.compressed_size as usize)
-            .sum();
 
-        let mut items_to_remove = 0;
-        while total_cache_size > self.max_data_cache_size_bytes && items_to_remove < self.data_cache.len() {
-            total_cache_size -= self.data_cache[items_to_remove].metadata.compressed_size as usize;
-            items_to_remove += 1;
-        }
-
-        if items_to_remove > 0 {
-            self.data_cache.drain(0..items_to_remove);
+        // Phase 2: Trim old events from front if cache significantly exceeds max size
+        // Only trim if we're over by at least 10% to avoid constant trimming overhead
+        let trim_threshold = self.max_data_cache_size_bytes + (self.max_data_cache_size_bytes / 25);
+        
+        if self.total_cache_size_bytes > trim_threshold {
+            // Calculate how many items to remove in one pass
+            let mut items_to_remove = 0;
+            let mut size_to_remove = 0;
+            let target_size = self.max_data_cache_size_bytes;
+            
+            for pair in self.data_cache.iter() {
+                if self.total_cache_size_bytes - size_to_remove <= target_size {
+                    break;
+                }
+                size_to_remove += pair.metadata.compressed_size as usize;
+                items_to_remove += 1;
+            }
+            
+            // Remove all items in one bulk operation
+            if items_to_remove > 0 {
+                self.data_cache.drain(..items_to_remove);
+                self.total_cache_size_bytes -= size_to_remove;
+            }
         }
 
         Ok(())
@@ -442,6 +471,7 @@ impl WriteOperations {
         if truncated {
             // Clear the data cache as it's now invalid
             self.data_cache.clear();
+            self.total_cache_size_bytes = 0;  // Reset cache size tracking
         }
         
         Ok(())

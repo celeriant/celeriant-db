@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::Path};
+use std::{collections::{HashMap, VecDeque}, path::Path};
 use eventplanedb_structures::{compression_type::CompressionType, constants::{BINCODE_CONFIG_FIXED, BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED, METADATA_BATCH_SIZE_BYTES}, event_batch_item::EventBatchItem, event_batch_metadata::{EventBatchMetadata, EventTypesData}, read_filters::ReadFilters, wire_format::from_wire_format_variable};
 use fastbloom::BloomFilter;
 use glommio::{GlommioError, io::{DmaFile, OpenOptions}};
@@ -226,7 +226,7 @@ impl ReadOperations {
                 metadata_dma_file,
                 file_len_event_batch,
                 file_len_metadata,
-                data_cache: vec![],
+                data_cache: VecDeque::new(),
                 minimum_available_event_batch_index: 0,
                 next_event_index: 1,
                 next_event_batch_index: 1,
@@ -356,7 +356,7 @@ impl ReadOperations {
         }
 
         let write_operations_data_requirements = WriteOperationsDataRequirements {
-            data_cache: vec![], // writer builds cache from newly appended data
+            data_cache: VecDeque::new(), // writer builds cache from newly appended data
             event_batches_dma_file,
             metadata_dma_file,
             file_len_event_batch,

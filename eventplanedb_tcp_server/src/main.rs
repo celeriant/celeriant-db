@@ -320,7 +320,7 @@ async fn process_on_shard_async(
                     expected_event_batch_index,
                     enforce_client_idempotency: filter_duplicate_client_events,
                     server_timestamp_millis,
-                    compression_type: CompressionType::Snappy
+                    compression_type: CompressionType::Zstd { level: 1 }
                 };
                 result = match wo.queue_events_in_memory(events, &append_options) {
                     Ok(result) => Response::AppendEventsResult(Ok(result)),
