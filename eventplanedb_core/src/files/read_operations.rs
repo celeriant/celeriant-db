@@ -23,6 +23,8 @@ pub enum ReadError {
         expected_crc: u32,
         actual_crc: u32,
         event_batch_index: u64,
+        file_pos_metadata: u64, 
+        file_pos_event_batch: u64
     }
 }
 
@@ -453,7 +455,9 @@ impl ReadOperations {
                 return Err(ReadError::CorruptEventBatch { 
                     expected_crc: metadata.events_crc, 
                     actual_crc, 
-                    event_batch_index: metadata.event_batch_index 
+                    event_batch_index: metadata.event_batch_index,
+                    file_pos_event_batch: object_positions[index].start_pos,
+                    file_pos_metadata: metadata_for_reading[index].event_batch_absolute_position
                 })
             }
 
