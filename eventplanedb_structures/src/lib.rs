@@ -9,3 +9,8 @@ pub mod read_result;
 pub mod append_result;
 pub mod aggregate_key;
 pub mod wire_format;
+pub mod batch_metadata_item_pair;
+pub mod directory_filters;
+pub mod organisation;
+pub mod read_all_result;
+pub mod aggregate_info;

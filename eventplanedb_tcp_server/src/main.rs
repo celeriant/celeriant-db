@@ -14,8 +14,10 @@ use protocol::{Request, Response};
 
 mod wire_format;
 use wire_format::WireError;
-use wire_format::read_message;
-use wire_format::write_message;
+use wire_format::read_request;
+use wire_format::write_response;
+
+mod error_code;
 
 use mimalloc::MiMalloc;
 
@@ -295,7 +297,7 @@ async fn process_on_shard_async(
     };
 
     match request {
-        Request::AppendEvents { sync_delay_us, org_id, aggregate_type_id, aggregate_id, client_id, user_id, events, allow_create, expected_event_batch_index, filter_duplicate_client_events, durable_write } => {
+        Request::Write { sync_delay_us, org_id, aggregate_type_id, aggregate_id, client_id, user_id, events, allow_create, expected_event_batch_index, filter_duplicate_client_events, durable_write } => {
 
             let aggregate_key = AggregateKey::new(org_id, aggregate_type_id, aggregate_id);
 
@@ -303,7 +305,7 @@ async fn process_on_shard_async(
 
             let writer = match writer {
                 Ok(w) => w,
-                Err(e) => return Response::AppendEventsResult(Err(format!("Failed to create file writer"))),
+                Err(e) => return Response::WriteResult(Err(format!("Failed to create file writer"))),
             };
 
             let result: Response;
@@ -323,8 +325,8 @@ async fn process_on_shard_async(
                     compression_type: CompressionType::Zstd { level: 1 }
                 };
                 result = match wo.queue_events_in_memory(events, &append_options) {
-                    Ok(result) => Response::AppendEventsResult(Ok(result)),
-                    Err(e) => Response::AppendEventsResult(Err(format!("Failed to append events: {:?}", e))),
+                    Ok(result) => Response::WriteResult(Ok(result)),
+                    Err(e) => Response::WriteResult(Err(format!("Failed to append events: {:?}", e))),
                 };
             }
 
@@ -360,22 +362,22 @@ async fn process_on_shard_async(
             // Wait for write to disk and propagate error if it occurs
             match sync_with_delay(&writer, &wal_sync_event, Duration::from_micros(sync_delay_us)).await {
                 Ok(_) => result,
-                Err(e) => Response::AppendEventsResult(Err(e)),
+                Err(e) => Response::WriteResult(Err(e)),
             }
         }
-        Request::ReadFiltered { org_id, aggregate_type_id, aggregate_id, filters } => {
+        Request::Read { org_id, aggregate_type_id, aggregate_id, filters } => {
             let aggregate_key = AggregateKey::new(org_id, aggregate_type_id, aggregate_id);
 
             let writer = get_or_create_writer(&aggregate_key, "data", false, &read_operations_cache, &aggregate_read_config, &write_operations_cache, &aggregate_write_config).await;
 
             let writer = match writer {
                 Ok(w) => w,
-                Err(e) => return Response::AppendEventsResult(Err(format!("Failed to create file writer"))),
+                Err(e) => return Response::WriteResult(Err(format!("Failed to create file writer"))),
             };
 
             let r_writer = writer.read().await.unwrap();
             match r_writer.maybe_read_cached_events(&filters) {
-                Ok(result) => return Response::ReadFilteredResult(Ok(ReadResult {
+                Ok(result) => return Response::ReadResult(Ok(ReadResult {
                     event_batches: result.filtered_event_batches,
                     next_event_batch_index: result.next_event_batch_index,
                 })),
@@ -401,12 +403,12 @@ async fn process_on_shard_async(
                         let mut w_reader = reader.write().await.unwrap();
                         w_reader.update_metadata_cache(result.uncached_metadata_set);
                     }
-                    return Response::ReadFilteredResult(Ok(ReadResult {
+                    return Response::ReadResult(Ok(ReadResult {
                         event_batches: result.filtered_event_batches,
                         next_event_batch_index: result.next_event_batch_index,
                     }))
                 },
-                Err(e) => return Response::ReadFilteredResult(Err(format!("Failed to read aggregate"))),
+                Err(e) => return Response::ReadResult(Err(format!("Failed to read aggregate"))),
             }
         },
         Request::Exists { org_id, aggregate_type_id, aggregate_id } => 

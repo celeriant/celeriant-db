@@ -1,15 +1,10 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use eventplanedb_structures::{append_result::AppendResult, compression_type::CompressionType, constants::{BINCODE_CONFIG_FIXED, BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED, METADATA_BATCH_SIZE_BYTES}, event_batch_item::EventBatchItem, event_batch_metadata::{EventBatchMetadata, EventTypesData}, event_item::EventItem, read_filters::ReadFilters, wire_format::to_wire_format_variable};
+use eventplanedb_structures::{append_result::AppendResult, batch_metadata_item_pair::BatchMetadataItemPair, compression_type::CompressionType, constants::{BINCODE_CONFIG_FIXED, BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED, METADATA_BATCH_SIZE_BYTES}, event_batch_item::EventBatchItem, event_batch_metadata::{EventBatchMetadata, EventTypesData}, event_item::EventItem, read_filters::ReadFilters, wire_format::to_wire_format_variable};
 use fastbloom::BloomFilter;
 use glommio::{io::{DmaFile}, GlommioError};
 
 use crate::files::read_operations::{CacheableReadResult, apply_event_filters, is_include_batch};
-
-pub struct BatchMetadataItemPair {
-    pub metadata: EventBatchMetadata,
-    pub item: EventBatchItem,
-}
 
 #[derive(Debug)]
 pub enum AppendError {
@@ -160,7 +155,7 @@ impl WriteOperations {
         // Calculate initial cache size
         let total_cache_size_bytes: usize = data_requirements.data_cache
             .iter()
-            .map(|pair| pair.metadata.uncompressed_size as usize)
+            .map(|pair| pair.event_batch_metadata.uncompressed_size as usize)
             .sum();
 
         Ok(WriteOperations {
@@ -267,8 +262,8 @@ impl WriteOperations {
                 self.total_cache_size_bytes += uncompressed_size;
                 
                 self.data_cache.push_back(BatchMetadataItemPair {
-                    metadata: item.event_batch_metadata,
-                    item: item.event_batch_item,
+                    event_batch_metadata: item.event_batch_metadata,
+                    event_batch_item: item.event_batch_item,
                 });
             }
         }
@@ -293,7 +288,7 @@ impl WriteOperations {
                 if self.total_cache_size_bytes - size_to_remove <= target_size {
                     break;
                 }
-                size_to_remove += pair.metadata.compressed_size as usize;
+                size_to_remove += pair.event_batch_metadata.compressed_size as usize;
                 items_to_remove += 1;
             }
             
@@ -585,7 +580,7 @@ impl WriteOperations {
         }
 
         // Get the range of cached event batch indexes
-        let cache_min_batch_index = self.data_cache[0].metadata.event_batch_index;
+        let cache_min_batch_index = self.data_cache[0].event_batch_metadata.event_batch_index;
 
         // Check if requested range is within cache
         if filters.from_event_batch_index < cache_min_batch_index {
@@ -601,7 +596,7 @@ impl WriteOperations {
         let mut next_event_batch_index: Option<u64> = None;
 
         for pair in self.data_cache.iter() {
-            let metadata = &pair.metadata;
+            let metadata = &pair.event_batch_metadata;
             
             // Check if we've exceeded the to_event_batch_index
             if filters.to_event_batch_index.map_or(false, |to_index| {
@@ -627,7 +622,7 @@ impl WriteOperations {
             }
 
             // Clone the batch and apply event-level filters
-            let mut event_batch = pair.item.clone();
+            let mut event_batch = pair.event_batch_item.clone();
             apply_event_filters(&mut event_batch, filters);
 
             // Only include batches that have events after filtering
