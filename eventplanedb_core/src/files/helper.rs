@@ -9,9 +9,9 @@ pub async fn get_or_create_writer(
     aggregate_key: &AggregateKey,
     data_root_folder: &str,
     create_if_not_exists: bool,
-    read_operations_cache: &Rc<RwLock<HashMap<AggregateKey, Rc<RwLock<ReadOperations>>>>>,
+    read_operations_cache: &RwLock<HashMap<AggregateKey, Rc<RwLock<ReadOperations>>>>,
     aggregate_read_config: &AggregateReadConfig,
-    write_operations_cache: &Rc<RwLock<HashMap<AggregateKey, Rc<RwLock<WriteOperations>>>>>,
+    write_operations_cache: &RwLock<HashMap<AggregateKey, Rc<RwLock<WriteOperations>>>>,
     aggregate_write_config: &AggregateWriteConfig,
 ) -> Result<Rc<RwLock<WriteOperations>>, ReadError> {
     let reference = {
@@ -50,7 +50,7 @@ pub async fn get_or_create_reader(
     aggregate_key: &AggregateKey,
     data_root_folder: &str,
     create_if_not_exists: bool,
-    read_operations_cache: &Rc<RwLock<HashMap<AggregateKey, Rc<RwLock<ReadOperations>>>>>,
+    read_operations_cache: &RwLock<HashMap<AggregateKey, Rc<RwLock<ReadOperations>>>>,
     aggregate_read_config: &AggregateReadConfig,
 ) -> Result<Rc<RwLock<ReadOperations>>, GlommioError<()>> {
     let reference = {

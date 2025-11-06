@@ -1,5 +1,6 @@
-use bincode::{config, Encode};
+use bincode::{config};
 use eventplanedb_structures::event_item::EventItem;
+use eventplanedb_structures::request::Request;
 use std::collections::HashMap;
 use std::env;
 use std::io::{Read, Write};
@@ -7,24 +8,6 @@ use std::net::TcpStream;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-
-// Wire protocol request (only the variant we use)
-#[derive(Debug, Clone, Encode)]
-pub enum Request {
-    AppendEvents {
-        sync_delay_us: u64,
-        org_id: u128,
-        aggregate_type_id: u128,
-        aggregate_id: u128,
-        client_id: u128,
-        user_id: Option<u128>,
-        events: Vec<EventItem>,
-        allow_create: bool,
-        expected_event_batch_index: Option<u64>,
-        filter_duplicate_client_events: bool,
-        durable_write: bool,
-    },
-}
 
 fn build_combined_request_bytes(
     aggregate_id: u128,
@@ -34,18 +17,20 @@ fn build_combined_request_bytes(
     client_id: u128,
     events: &Vec<EventItem>,
 ) -> Vec<u8> {
-    let request = Request::AppendEvents {
-        sync_delay_us,
-        org_id,
-        aggregate_type_id,
-        aggregate_id,
-        client_id,
-        user_id: None,
-        events: events.clone(), // cloned once at startup per aggregate
-        expected_event_batch_index: None,
-        filter_duplicate_client_events: false,
-        allow_create: true,
-        durable_write: true,
+    let request = Request::Write { 
+        correlation_id: None, 
+        org_id, 
+        aggregate_type_id, 
+        aggregate_id, 
+        client_id, 
+        user_id: None, 
+        events: events.clone(), 
+        allow_create: true, 
+        allow_repair_corruption: false, 
+        expected_event_batch_index: None, 
+        enforce_client_idempotency: false, 
+        durable_write_with_delay_us: Some(sync_delay_us), 
+        compression_type: eventplanedb_structures::compression_type::CompressionType::Zstd { level: 1 } 
     };
 
     let encoded = bincode::encode_to_vec(&request, config::standard()).unwrap();

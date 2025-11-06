@@ -13,3 +13,6 @@ zstd.workspace = true
 brotli.workspace = true
 flate2.workspace = true
 snap.workspace = true
+futures-lite.workspace = true
+rmp-serde.workspace = true
+thiserror.workspace = true

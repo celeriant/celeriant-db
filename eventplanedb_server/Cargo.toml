@@ -1,5 +1,5 @@
 [package]
-name = "eventplanedb_tcp_server"
+name = "eventplanedb_server"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true

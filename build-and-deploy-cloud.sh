@@ -2,7 +2,7 @@
 
 set -e
 
-IMAGE_NAME="eventplanedb-tcp-server"
+IMAGE_NAME="eventplanedb-server"
 IMAGE_TAG="latest"
 CONTAINER_NAME="eventplanedb-server"
 TCP_PORT="10000"

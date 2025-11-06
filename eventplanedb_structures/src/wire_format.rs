@@ -1,8 +1,22 @@
 use std::io;
+use bincode::{config, Decode, Encode};
+use thiserror::Error;
 
-use bincode::{Decode, Encode};
+use crate::eventplanedb_error::EventPlaneDBError;
+use crate::{compression_type::CompressionType};
 
-use crate::{compression_type::CompressionType, constants::BINCODE_CONFIG_VARIABLE};
+
+/// Protocol constants
+//TODO: Make configurable - max message size, stack buffer size
+pub const MAX_MESSAGE_SIZE: u32 = 64 * 1024 * 1024; // 64MB max message size
+pub const STACK_BUFFER_SIZE: u32 = 30 * 1024; // 30KB stack buffer threshold
+pub const PROTOCOL_VERSION_V1: u32 = 1;
+pub const PROTOCOL_VERSION_V2: u32 = 2;
+
+/// Bincode configuration for variable-length encoding
+const BINCODE_CONFIG_VARIABLE: config::Configuration = config::standard();
+
+//TODO: When we have a large message, we always allocate on the heap, use a buffer pool?
 
 pub fn to_wire_format_variable<T>(
     item: &T,
@@ -88,4 +102,51 @@ where
     bincode::decode_from_slice(&decompressed, BINCODE_CONFIG_VARIABLE)
         .map(|(events, _)| events)
         .map_err(|e| io::Error::other(e.to_string()))
+}
+
+#[derive(Error, Debug)]
+pub enum WireError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("Serialization error: {0}")]
+    Serialization(#[from] rmp_serde::encode::Error),
+    #[error("Deserialization error: {0}")]
+    Deserialization(#[from] rmp_serde::decode::Error),
+    #[error("Bincode encode error: {0}")]
+    BincodeEncode(#[from] bincode::error::EncodeError),
+    #[error("Bincode decode error: {0}")]
+    BincodeDecode(#[from] bincode::error::DecodeError),
+    #[error("Message too large: {0} bytes")]
+    MessageTooLarge(u32),
+    #[error("Unsupported protocol version: {0}")]
+    UnsupportedVersion(u32),
+    #[error("Invalid format")]
+    InvalidFormat,
+    #[error("Invalid format with version specified")]
+    InvalidFormatWithVersion(u32), // Add this variant
+}
+
+impl From<crate::wire_format::WireError> for EventPlaneDBError {
+    fn from(e: crate::wire_format::WireError) -> Self {
+        use crate::wire_format::WireError;
+        match e {
+            WireError::Io(io_err) => EventPlaneDBError::io_error(io_err),
+            WireError::Serialization(e) => EventPlaneDBError::serialization_error(e),
+            WireError::Deserialization(e) => EventPlaneDBError::serialization_error(e),
+            WireError::BincodeEncode(e) => EventPlaneDBError::serialization_error(e),
+            WireError::BincodeDecode(e) => EventPlaneDBError::serialization_error(e),
+            WireError::MessageTooLarge(size) => {
+                EventPlaneDBError::message_too_large(size as u64, crate::wire_format::MAX_MESSAGE_SIZE as u64)
+            }
+            WireError::UnsupportedVersion(version) => {
+                EventPlaneDBError::unsupported_protocol_version(version)
+            }
+            WireError::InvalidFormat => {
+                EventPlaneDBError::invalid_wire_format("Invalid message format")
+            }
+            WireError::InvalidFormatWithVersion(version) => {
+                EventPlaneDBError::invalid_wire_format(format!("Invalid message format with version {version}"))
+            },
+        }
+    }
 }

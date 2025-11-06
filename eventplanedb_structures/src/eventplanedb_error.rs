@@ -1,37 +1,7 @@
+use crate::error_code::ErrorCode;
 use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
-// Unit-only enum for easy matching in all languages
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
-#[serde(rename_all = "snake_case")]
-pub enum ErrorCode {
-    // Read errors
-    IoError,
-    MaxBytesTooSmall,
-    SerializationError,
-    UnavailableBatchIndex,
-    CorruptEventBatch,
-    
-    // Write errors
-    OptimisticConcurrencyViolation,
-    ClientIdempotencyViolation,
-    EmptyEventsList,
-    NoEventsToAppend,
-    WriteError,
-    
-    // Protocol/Transport errors
-    MessageTooLarge,
-    UnsupportedProtocolVersion,
-    InvalidWireFormat,
-    
-    // General errors
-    NotFound,
-    AlreadyExists,
-    PermissionDenied,
-    InvalidArgument,
-    ResourceExhausted,
-    Internal,
-}
 
 // Structured error with optional typed fields
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
@@ -87,6 +57,15 @@ pub struct EventPlaneDBError {
 }
 
 impl EventPlaneDBError {
+
+    pub fn invalid_request() -> Self {
+        Self {
+            code: ErrorCode::InvalidRequest,
+            message: "Failed to deserialize request".to_string(),
+            ..Default::default()
+        }
+    }
+
     // Helper constructors for each error type
     pub fn optimistic_concurrency_violation(
         client_id: u128,
@@ -191,6 +170,7 @@ impl EventPlaneDBError {
             ..Default::default()
         }
     }
+    
     pub fn message_too_large(size: u64, max_size: u64) -> Self {
         Self {
             code: ErrorCode::MessageTooLarge,
@@ -270,7 +250,6 @@ impl EventPlaneDBError {
     }
 }
 
-// Default impl for easy construction
 impl Default for EventPlaneDBError {
     fn default() -> Self {
         Self {
@@ -291,78 +270,6 @@ impl Default for EventPlaneDBError {
             message_size: None,
             max_message_size: None,
             protocol_version: None,
-        }
-    }
-}
-
-// Conversion from your internal errors
-impl From<eventplanedb_core::files::read_operations::ReadError> for EventPlaneDBError {
-    fn from(e: eventplanedb_core::files::read_operations::ReadError) -> Self {
-        use eventplanedb_core::files::read_operations::ReadError;
-        match e {
-            ReadError::IoError(io_err) => EventPlaneDBError::io_error(io_err),
-            ReadError::MaxBytesTooSmall { current_max_bytes, required_max_bytes } => {
-                EventPlaneDBError::max_bytes_too_small(current_max_bytes, required_max_bytes)
-            }
-            ReadError::SerializationError { message } => EventPlaneDBError::serialization_error(message),
-            ReadError::UnavailableBatchIndex { minimum_available_event_batch_index, requested_event_batch_index } => {
-                EventPlaneDBError::unavailable_batch_index(minimum_available_event_batch_index, requested_event_batch_index)
-            }
-            ReadError::CorruptEventBatch { expected_crc, actual_crc, event_batch_index, .. } => {
-                EventPlaneDBError::corrupt_event_batch(expected_crc, actual_crc, event_batch_index)
-            }
-        }
-    }
-}
-
-impl From<eventplanedb_core::files::write_operations::AppendError> for EventPlaneDBError {
-    fn from(e: eventplanedb_core::files::write_operations::AppendError) -> Self {
-        use eventplanedb_core::files::write_operations::AppendError;
-        match e {
-            AppendError::IoError(io_err) => EventPlaneDBError::io_error(io_err),
-            AppendError::OptimisticConcurrencyViolation { client_id, expected_event_batch_index, current_event_batch_index } => {
-                EventPlaneDBError::optimistic_concurrency_violation(client_id, expected_event_batch_index, current_event_batch_index)
-            }
-            AppendError::ClientIdempotencyViolation { client_id, last_client_event_index, attempted_client_event_index } => {
-                EventPlaneDBError::client_idempotency_violation(client_id, last_client_event_index, attempted_client_event_index)
-            }
-            AppendError::EmptyEventsList { client_id } => Self {
-                code: ErrorCode::EmptyEventsList,
-                message: "No events provided".to_string(),
-                client_id: Some(client_id),
-                ..Default::default()
-            },
-            AppendError::NoEventsToAppend { client_id, existing_event_index } => Self {
-                code: ErrorCode::NoEventsToAppend,
-                message: format!("No new events to append (last index: {})", existing_event_index),
-                client_id: Some(client_id),
-                last_client_event_index: Some(existing_event_index),
-                ..Default::default()
-            },
-            AppendError::SerializationError { message } => EventPlaneDBError::serialization_error(message),
-            AppendError::WriteError { message } => EventPlaneDBError::write_error(message),
-        }
-    }
-}
-
-impl From<crate::wire_format::WireError> for EventPlaneDBError {
-    fn from(e: crate::wire_format::WireError) -> Self {
-        use crate::wire_format::WireError;
-        match e {
-            WireError::Io(io_err) => EventPlaneDBError::io_error(io_err),
-            WireError::Serialization(e) => EventPlaneDBError::serialization_error(e),
-            WireError::Deserialization(e) => EventPlaneDBError::serialization_error(e),
-            WireError::BincodeEncode(e) => EventPlaneDBError::serialization_error(e),
-            WireError::BincodeDecode(e) => EventPlaneDBError::serialization_error(e),
-            WireError::MessageTooLarge(size) => {
-                EventPlaneDBError::message_too_large(size as u64, crate::wire_format::MAX_MESSAGE_SIZE as u64)
-            }
-            WireError::UnsupportedVersion(version) => {
-                EventPlaneDBError::unsupported_protocol_version(version)
-            }
-            WireError::InvalidFormat => {
-                EventPlaneDBError::invalid_wire_format("Invalid message format")
-            }
         }
     }
 }

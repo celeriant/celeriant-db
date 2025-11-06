@@ -2,10 +2,8 @@
 members = [
     "eventplanedb_structures",
     "eventplanedb_core",
-    "eventplanedb_tcp_server",
-    "eventplanedb_tcp_client",
-    "eventstoredb_client",
-    "redpanda_client",
+    "eventplanedb_server",
+    "eventplanedb_client",
 ]
 
 resolver = "2"

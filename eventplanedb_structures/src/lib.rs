@@ -14,3 +14,7 @@ pub mod directory_filters;
 pub mod organisation;
 pub mod read_all_result;
 pub mod aggregate_info;
+pub mod error_code;
+pub mod response;
+pub mod request;
+pub mod eventplanedb_error;

@@ -1,4 +1,4 @@
-# Multi-stage build for eventplanedb_tcp_server
+# Multi-stage build for eventplanedb_server
 FROM rust:1.91-bookworm AS builder
 
 # Install build dependencies
@@ -13,13 +13,11 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY eventplanedb_structures ./eventplanedb_structures
 COPY eventplanedb_core ./eventplanedb_core
-COPY eventplanedb_tcp_server ./eventplanedb_tcp_server
-COPY eventplanedb_tcp_client ./eventplanedb_tcp_client
-COPY eventstoredb_client ./eventstoredb_client
-COPY redpanda_client ./redpanda_client
+COPY eventplanedb_server ./eventplanedb_server
+COPY eventplanedb_client ./eventplanedb_client
 
-# Build the TCP server in release mode
-RUN cargo build --release -p eventplanedb_tcp_server
+# Build the server in release mode
+RUN cargo build --release -p eventplanedb_server
 
 # Runtime stage - minimal image with newer kernel support
 FROM debian:bookworm-slim
@@ -33,7 +31,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Copy binary from builder
-COPY --from=builder /build/target/release/eventplanedb_tcp_server /app/
+COPY --from=builder /build/target/release/eventplanedb_server /app/
 
 # Create data directory
 RUN mkdir -p /app/data
@@ -46,4 +44,4 @@ ENV RUST_LOG=info
 ENV RUST_BACKTRACE=1
 
 # Run as root to allow io_uring operations (needed for Glommio)
-CMD ["./eventplanedb_tcp_server"]
+CMD ["./eventplanedb_server"]
