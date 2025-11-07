@@ -1,7 +1,7 @@
 use std::{cell::RefCell, os::fd::{FromRawFd, IntoRawFd}, rc::Rc};
 
 use eventplanedb_core::files::{read_operations::AggregateReadConfig, write_operations::AggregateWriteConfig};
-use eventplanedb_structures::{eventplanedb_error::EventPlaneDBError, request::{Request, read_request}, response::{Response, write_response}, wire_format::{PROTOCOL_VERSION_V2, WireError}};
+use eventplanedb_structures::{eventplanedb_error::EventPlaneDBError, request::{Request, read_request}, response::{ProtocolErrorResponse, Response, write_response}, wire_format::{PROTOCOL_VERSION_V2, WireError}};
 use glommio::{CpuSet, LocalExecutorPoolBuilder, PoolPlacement, channels::channel_mesh::{Full, MeshBuilder, Senders}, enclose, net::TcpListener, spawn_local};
 use futures_lite::AsyncWriteExt;
 use log::{debug, error, info};
@@ -226,10 +226,10 @@ async fn read_from_tcp_stream(
             None
         }
         Err(WireError::InvalidFormatWithVersion(version)) => {
-            let error_response = Response::ProtocolError {
+            let error_response = Response::ProtocolError(ProtocolErrorResponse {
                 correlation_id: None,
                 error: EventPlaneDBError::invalid_request(),
-            };
+            });
             
             if let Err(e) = write_response(tcp_stream, &error_response, eventplanedb_structures::compression_type::CompressionType::None).await {
                 error!("Shard {shard_id} failed to send error response: {e}");

@@ -1,10 +1,9 @@
 use std::{collections::HashMap, rc::Rc, time::Duration};
 
-use bincode::enc::write;
 use eventplanedb_core::{files::{helper::{get_or_create_reader, get_or_create_writer}, read_operations::{AggregateReadConfig, ReadOperations}, write_operations::{AggregateWriteConfig, AppendOptions, WriteOperations}}, local_event::LocalEvent};
-use eventplanedb_structures::{aggregate_key::AggregateKey, compression_type::CompressionType, event_item::EventItem, eventplanedb_error::EventPlaneDBError, read_result::ReadResult, request::{DeleteRequest, ReadRequest, Request, TrimStartRequest, WriteRequest}, response::Response};
 use glommio::{spawn_local, sync::{RwLock, Semaphore}, timer::sleep};
 use log::error;
+use eventplanedb_structures::{aggregate_key::AggregateKey, compression_type::CompressionType, event_item::EventItem, eventplanedb_error::EventPlaneDBError, read_result::ReadResult, request::{DeleteRequest, ReadRequest, Request, TrimStartRequest, WriteRequest}, response::{DeleteResponse, ExistsResponse, ListAggregatesResponse, ListOrganisationsResponse, LockResponse, ReadAllResponse, ReadResponse, Response, TrimEndResponse, TrimStartResponse, UnlockResponse, WriteBatchesResponse, WriteResponse}};
 
 type SyncResult = Result<(), EventPlaneDBError>;
 
@@ -124,16 +123,16 @@ impl ProcessRequest {
                 let result = self.handle_write(request).await;
 
                 match result {
-                    Ok(append_result) => Response::WriteResult {
+                    Ok(append_result) => Response::Write(WriteResponse {
                         correlation_id,
                         error: None,
                         result: Some(append_result),
-                    },
-                    Err(e) => Response::WriteResult {
+                    }),
+                    Err(e) => Response::Write(WriteResponse {
                         correlation_id,
                         error: Some(e),
                         result: None,
-                    },
+                    }),
                 }
             }
 
@@ -142,16 +141,16 @@ impl ProcessRequest {
                 let result = self.handle_read(request).await;
 
                 match result {
-                    Ok(read_result) => Response::ReadResult {
+                    Ok(read_result) => Response::Read(ReadResponse {
                         correlation_id,
                         error: None,
                         result: Some(read_result),
-                    },
-                    Err(e) => Response::ReadResult {
+                    }),
+                    Err(e) => Response::Read(ReadResponse {
                         correlation_id,
                         error: Some(e),
                         result: None,
-                    },
+                    }),
                 }
             }
 
@@ -159,11 +158,11 @@ impl ProcessRequest {
                 let aggregate_key = AggregateKey::new(request.org_id, request.aggregate_type_id, request.aggregate_id);
                 let exists = self.get_or_create_reader(&aggregate_key).await.is_ok();
 
-                Response::ExistsResult {
+                Response::Exists(ExistsResponse {
                     correlation_id: request.correlation_id,
                     error: None,
                     exists,
-                }
+                })
             }
 
             Request::TrimStart(request) => {
@@ -171,14 +170,14 @@ impl ProcessRequest {
                 let result = self.handle_trim_start(request).await;
 
                 match result {
-                    Ok(()) => Response::TrimStartResult {
+                    Ok(()) => Response::TrimStart(TrimStartResponse {
                         correlation_id,
                         error: None,
-                    },
-                    Err(e) => Response::TrimStartResult {
+                    }),
+                    Err(e) => Response::TrimStart(TrimStartResponse {
                         correlation_id,
                         error: Some(e),
-                    },
+                    }),
                 }
             }
 
@@ -187,74 +186,74 @@ impl ProcessRequest {
                 let result = self.handle_delete(request).await;
 
                 match result {
-                    Ok(()) => Response::DeleteResult {
+                    Ok(()) => Response::Delete(DeleteResponse {
                         correlation_id,
                         error: None,
-                    },
-                    Err(e) => Response::DeleteResult {
+                    }),
+                    Err(e) => Response::Delete(DeleteResponse {
                         correlation_id,
                         error: Some(e),
-                    },
+                    }),
                 }
             }
 
             Request::ListOrganisations(request) => {
                 let correlation_id = request.correlation_id;
-                Response::ListOrganisationsResult {
+                Response::ListOrganisations(ListOrganisationsResponse {
                     correlation_id,
                     error: Some(EventPlaneDBError::internal()),
                     organisations: vec![],
-                }
+                })
             }
 
             Request::ListAggregates(request) => {
                 let correlation_id = request.correlation_id;
-                Response::ListAggregatesResult {
+                Response::ListAggregates(ListAggregatesResponse {
                     correlation_id,
                     error: Some(EventPlaneDBError::internal()),
                     aggregates: vec![],
-                }
+                })
             }
 
             Request::Lock(request) => {
                 let correlation_id = request.correlation_id;
-                Response::LockResult {
+                Response::Lock(LockResponse {
                     correlation_id,
                     error: Some(EventPlaneDBError::internal()),
-                }
+                })
             }
 
             Request::Unlock(request) => {
                 let correlation_id = request.correlation_id;
-                Response::UnlockResult {
+                Response::Unlock(UnlockResponse {
                     correlation_id,
                     error: Some(EventPlaneDBError::internal()),
-                }
+                })
             }
 
             Request::ReadAll(request) => {
                 let correlation_id = request.correlation_id;
-                Response::ReadAllResult {
+                Response::ReadAll(ReadAllResponse {
                     correlation_id,
                     error: Some(EventPlaneDBError::internal()),
                     result: None,
-                }
+                })
             }
 
             Request::WriteBatches(request) => {
                 let correlation_id = request.correlation_id;
-                Response::WriteBatchesResult {
+                Response::WriteBatches(WriteBatchesResponse {
                     correlation_id,
                     error: Some(EventPlaneDBError::internal()),
-                }
+                })
             }
 
             Request::TrimEnd(request) => {
                 let correlation_id = request.correlation_id;
-                Response::TrimEndResult {
+                Response::TrimEnd(TrimEndResponse {
                     correlation_id,
                     error: Some(EventPlaneDBError::internal()),
-                }
+                })
             }
         }
     }
