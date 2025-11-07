@@ -50,6 +50,7 @@ fn build_combined_request_bytes(
     // COMPRESSION
     // let mut combined = Vec::with_capacity(header_size + compressed.len());
     // combined.extend_from_slice(&protocol_version.to_be_bytes());
+    // combined.extend_from_slice(&(request_type as u32).to_be_bytes());
     // combined.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
     // combined.push(type_id);
     // combined.extend_from_slice(&compressed);
