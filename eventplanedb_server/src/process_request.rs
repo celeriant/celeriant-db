@@ -1,7 +1,8 @@
 use std::{collections::HashMap, rc::Rc, time::Duration};
 
+use bincode::enc::write;
 use eventplanedb_core::{files::{helper::{get_or_create_reader, get_or_create_writer}, read_operations::{AggregateReadConfig, ReadOperations}, write_operations::{AggregateWriteConfig, AppendOptions, WriteOperations}}, local_event::LocalEvent};
-use eventplanedb_structures::{aggregate_key::AggregateKey, compression_type::CompressionType, event_item::EventItem, eventplanedb_error::EventPlaneDBError, read_result::ReadResult, request::Request, response::Response};
+use eventplanedb_structures::{aggregate_key::AggregateKey, compression_type::CompressionType, event_item::EventItem, eventplanedb_error::EventPlaneDBError, read_result::ReadResult, request::{DeleteRequest, ReadRequest, Request, TrimStartRequest, WriteRequest}, response::Response};
 use glommio::{spawn_local, sync::{RwLock, Semaphore}, timer::sleep};
 use log::error;
 
@@ -71,7 +72,7 @@ impl ProcessRequest {
             &self.aggregate_read_config,
         )
         .await
-        .map_err(|e| EventPlaneDBError::io_error(e))
+        .map_err(|e| EventPlaneDBError::io_error())
     }
 
     // Helper: Get or create WAL sync event
@@ -118,34 +119,9 @@ impl ProcessRequest {
 
     pub async fn process(&self, request: Request) -> Response {
         match request {
-            Request::Write {
-                correlation_id,
-                org_id,
-                aggregate_type_id,
-                aggregate_id,
-                client_id,
-                user_id,
-                events,
-                allow_create,
-                allow_repair_corruption: _,
-                expected_event_batch_index,
-                enforce_client_idempotency,
-                durable_write_with_delay_us,
-                compression_type,
-            } => {
-                let result = self.handle_write(
-                    org_id,
-                    aggregate_type_id,
-                    aggregate_id,
-                    client_id,
-                    user_id,
-                    events,
-                    allow_create,
-                    expected_event_batch_index,
-                    enforce_client_idempotency,
-                    durable_write_with_delay_us,
-                    compression_type,
-                ).await;
+            Request::Write(request) => {
+                let correlation_id = request.correlation_id;
+                let result = self.handle_write(request).await;
 
                 match result {
                     Ok(append_result) => Response::WriteResult {
@@ -161,19 +137,9 @@ impl ProcessRequest {
                 }
             }
 
-            Request::Read {
-                correlation_id,
-                org_id,
-                aggregate_type_id,
-                aggregate_id,
-                filters,
-            } => {
-                let result = self.handle_read(
-                    org_id,
-                    aggregate_type_id,
-                    aggregate_id,
-                    filters,
-                ).await;
+            Request::Read(request) => {
+                let correlation_id = request.correlation_id;
+                let result = self.handle_read(request).await;
 
                 match result {
                     Ok(read_result) => Response::ReadResult {
@@ -189,35 +155,20 @@ impl ProcessRequest {
                 }
             }
 
-            Request::Exists {
-                correlation_id,
-                org_id,
-                aggregate_type_id,
-                aggregate_id,
-            } => {
-                let aggregate_key = AggregateKey::new(org_id, aggregate_type_id, aggregate_id);
+            Request::Exists(request) => {
+                let aggregate_key = AggregateKey::new(request.org_id, request.aggregate_type_id, request.aggregate_id);
                 let exists = self.get_or_create_reader(&aggregate_key).await.is_ok();
 
                 Response::ExistsResult {
-                    correlation_id,
+                    correlation_id: request.correlation_id,
                     error: None,
                     exists,
                 }
             }
 
-            Request::TrimStart {
-                correlation_id,
-                org_id,
-                aggregate_type_id,
-                aggregate_id,
-                keep_from_event_batch_index,
-            } => {
-                let result = self.handle_trim_start(
-                    org_id,
-                    aggregate_type_id,
-                    aggregate_id,
-                    keep_from_event_batch_index,
-                ).await;
+            Request::TrimStart(request) => {
+                let correlation_id = request.correlation_id;
+                let result = self.handle_trim_start(request).await;
 
                 match result {
                     Ok(()) => Response::TrimStartResult {
@@ -231,13 +182,9 @@ impl ProcessRequest {
                 }
             }
 
-            Request::Delete {
-                correlation_id,
-                org_id,
-                aggregate_type_id,
-                aggregate_id,
-            } => {
-                let result = self.handle_delete(org_id, aggregate_type_id, aggregate_id).await;
+            Request::Delete(request) => {
+                let correlation_id = request.correlation_id;
+                let result = self.handle_delete(request).await;
 
                 match result {
                     Ok(()) => Response::DeleteResult {
@@ -251,55 +198,62 @@ impl ProcessRequest {
                 }
             }
 
-            Request::ListOrganisations { correlation_id, filters: _ } => {
+            Request::ListOrganisations(request) => {
+                let correlation_id = request.correlation_id;
                 Response::ListOrganisationsResult {
                     correlation_id,
-                    error: Some(EventPlaneDBError::internal("Not implemented")),
+                    error: Some(EventPlaneDBError::internal()),
                     organisations: vec![],
                 }
             }
 
-            Request::ListAggregates { correlation_id, org_id: _, aggregate_type_id: _, filters: _ } => {
+            Request::ListAggregates(request) => {
+                let correlation_id = request.correlation_id;
                 Response::ListAggregatesResult {
                     correlation_id,
-                    error: Some(EventPlaneDBError::internal("Not implemented")),
+                    error: Some(EventPlaneDBError::internal()),
                     aggregates: vec![],
                 }
             }
 
-            Request::Lock { correlation_id, org_id: _, aggregate_type_id: _, aggregate_id: _, client_id: _, timeout_ms: _, allow_read: _ } => {
+            Request::Lock(request) => {
+                let correlation_id = request.correlation_id;
                 Response::LockResult {
                     correlation_id,
-                    error: Some(EventPlaneDBError::internal("Not implemented")),
+                    error: Some(EventPlaneDBError::internal()),
                 }
             }
 
-            Request::Unlock { correlation_id, org_id: _, aggregate_type_id: _, aggregate_id: _ } => {
+            Request::Unlock(request) => {
+                let correlation_id = request.correlation_id;
                 Response::UnlockResult {
                     correlation_id,
-                    error: Some(EventPlaneDBError::internal("Not implemented")),
+                    error: Some(EventPlaneDBError::internal()),
                 }
             }
 
-            Request::ReadAll { correlation_id, org_id: _, aggregate_type_id: _, aggregate_id: _, filters: _ } => {
+            Request::ReadAll(request) => {
+                let correlation_id = request.correlation_id;
                 Response::ReadAllResult {
                     correlation_id,
-                    error: Some(EventPlaneDBError::internal("Not implemented")),
+                    error: Some(EventPlaneDBError::internal()),
                     result: None,
                 }
             }
 
-            Request::WriteBatches { correlation_id, org_id: _, aggregate_type_id: _, aggregate_id: _, allow_create: _, allow_repair_corruption: _, durable_write_with_delay_us: _, batches: _ } => {
+            Request::WriteBatches(request) => {
+                let correlation_id = request.correlation_id;
                 Response::WriteBatchesResult {
                     correlation_id,
-                    error: Some(EventPlaneDBError::internal("Not implemented")),
+                    error: Some(EventPlaneDBError::internal()),
                 }
             }
 
-            Request::TrimEnd { correlation_id, org_id: _, aggregate_type_id: _, aggregate_id: _, trim_from_event_batch_index: _ } => {
+            Request::TrimEnd(request) => {
+                let correlation_id = request.correlation_id;
                 Response::TrimEndResult {
                     correlation_id,
-                    error: Some(EventPlaneDBError::internal("Not implemented")),
+                    error: Some(EventPlaneDBError::internal()),
                 }
             }
         }
@@ -307,38 +261,28 @@ impl ProcessRequest {
 
     async fn handle_write(
         &self,
-        org_id: u128,
-        aggregate_type_id: u128,
-        aggregate_id: u128,
-        client_id: u128,
-        user_id: Option<u128>,
-        events: Vec<EventItem>,
-        allow_create: bool,
-        expected_event_batch_index: Option<u64>,
-        enforce_client_idempotency: bool,
-        durable_write_with_delay_us: Option<u64>,
-        compression_type: CompressionType,
+        request: WriteRequest,
     ) -> Result<eventplanedb_structures::append_result::AppendResult, EventPlaneDBError> {
-        let aggregate_key = AggregateKey::new(org_id, aggregate_type_id, aggregate_id);
-        let writer = self.get_or_create_writer(&aggregate_key, allow_create).await?;
+        let aggregate_key = AggregateKey::new(request.org_id, request.aggregate_type_id, request.aggregate_id);
+        let writer = self.get_or_create_writer(&aggregate_key, request.allow_create).await?;
 
         let server_timestamp_millis = Self::get_server_timestamp_millis();
 
         let append_result = {
             let mut wo = writer.write().await.unwrap();
             let append_options = AppendOptions {
-                client_id,
-                user_id,
-                expected_event_batch_index,
-                enforce_client_idempotency,
+                client_id: request.client_id,
+                user_id: request.user_id,
+                expected_event_batch_index: request.expected_event_batch_index,
+                enforce_client_idempotency: request.enforce_client_idempotency,
                 server_timestamp_millis,
-                compression_type,
+                compression_type: request.compression_type,
             };
-            wo.queue_events_in_memory(events, &append_options)?
+            wo.queue_events_in_memory(request.events, &append_options)?
         };
 
         // Handle durable write
-        if let Some(delay_us) = durable_write_with_delay_us {
+        if let Some(delay_us) = request.durable_write_with_delay_us {
             let wal_sync_event = self.get_or_create_wal_sync_event(&aggregate_key).await;
             
             // Wait for write to disk and propagate error if it occurs
@@ -362,18 +306,15 @@ impl ProcessRequest {
 
     async fn handle_read(
         &self,
-        org_id: u128,
-        aggregate_type_id: u128,
-        aggregate_id: u128,
-        filters: eventplanedb_structures::read_filters::ReadFilters,
+        request: ReadRequest,
     ) -> Result<ReadResult, EventPlaneDBError> {
-        let aggregate_key = AggregateKey::new(org_id, aggregate_type_id, aggregate_id);
+        let aggregate_key = AggregateKey::new(request.org_id, request.aggregate_type_id, request.aggregate_id);
         let writer = self.get_or_create_writer(&aggregate_key, false).await?;
 
         // Try cache first
         {
             let r_writer = writer.read().await.unwrap();
-            if let Ok(result) = r_writer.maybe_read_cached_events(&filters) {
+            if let Ok(result) = r_writer.maybe_read_cached_events(&request.filters) {
                 return Ok(ReadResult {
                     event_batches: result.filtered_event_batches,
                     next_event_batch_index: result.next_event_batch_index,
@@ -391,7 +332,7 @@ impl ProcessRequest {
                 r_writer.minimum_available_event_batch_index,
                 r_writer.file_len_metadata(),
                 r_writer.file_len_event_batch(),
-                &filters,
+                &request.filters,
             ).await?
         };
 
@@ -409,24 +350,21 @@ impl ProcessRequest {
 
     async fn handle_trim_start(
         &self,
-        org_id: u128,
-        aggregate_type_id: u128,
-        aggregate_id: u128,
-        keep_from_event_batch_index: u64,
+        request: TrimStartRequest
     ) -> Result<(), EventPlaneDBError> {
-        let aggregate_key = AggregateKey::new(org_id, aggregate_type_id, aggregate_id);
+        let aggregate_key = AggregateKey::new(request.org_id, request.aggregate_type_id, request.aggregate_id);
         let reader = self.get_or_create_reader(&aggregate_key).await?;
         let writer = self.get_or_create_writer(&aggregate_key, false).await?;
         let sem = self.get_or_create_semaphore(&aggregate_key).await;
 
         let _permit = sem.acquire_permit(1).await
-            .map_err(|_| EventPlaneDBError::internal("Failed to acquire write lock for trim"))?;
+            .map_err(|_| EventPlaneDBError::internal())?;
 
         let (bytes_to_trim_metadata, bytes_to_trim_event_batch) = {
             let r_writer = writer.read().await.unwrap();
             reader.read().await.unwrap().get_file_positions(
                 r_writer.minimum_available_event_batch_index,
-                keep_from_event_batch_index,
+                request.keep_from_event_batch_index,
                 r_writer.file_len_metadata(),
                 r_writer.file_len_event_batch(),
             ).await?
@@ -435,7 +373,7 @@ impl ProcessRequest {
         let (metadata_dma_file, event_batches_dma_file) = {
             let mut wo = writer.write().await.unwrap();
             wo.trim_start(bytes_to_trim_metadata, bytes_to_trim_event_batch).await
-                .map_err(|e| EventPlaneDBError::write_error(format!("Failed to trim: {:?}", e)))?
+                .map_err(|e| EventPlaneDBError::write_error())?
         };
 
         let mut reader_mut = reader.write().await.unwrap();
@@ -446,11 +384,9 @@ impl ProcessRequest {
 
     async fn handle_delete(
         &self,
-        org_id: u128,
-        aggregate_type_id: u128,
-        aggregate_id: u128,
+        request: DeleteRequest,
     ) -> Result<(), EventPlaneDBError> {
-        let aggregate_key = AggregateKey::new(org_id, aggregate_type_id, aggregate_id);
+        let aggregate_key = AggregateKey::new(request.org_id, request.aggregate_type_id, request.aggregate_id);
 
         // Remove from all caches
         {
@@ -466,13 +402,14 @@ impl ProcessRequest {
         }
 
         // Delete files from filesystem
-        let metadata_path = format!("data/{}/{}/{}/metadata.bin", org_id, aggregate_type_id, aggregate_id);
-        let events_path = format!("data/{}/{}/{}/events.bin", org_id, aggregate_type_id, aggregate_id);
+        //TODO: Configurable settings required
+        let metadata_path = format!("data/{}/{}/{}/metadata.bin", request.org_id, request.aggregate_type_id, request.aggregate_id);
+        let events_path = format!("data/{}/{}/{}/events.bin", request.org_id, request.aggregate_type_id, request.aggregate_id);
 
         std::fs::remove_file(&metadata_path)
-            .map_err(|e| EventPlaneDBError::io_error(format!("Failed to delete metadata file: {}", e)))?;
+            .map_err(|e| EventPlaneDBError::io_error())?;
         std::fs::remove_file(&events_path)
-            .map_err(|e| EventPlaneDBError::io_error(format!("Failed to delete events file: {}", e)))?;
+            .map_err(|e| EventPlaneDBError::io_error())?;
 
         Ok(())
     }
@@ -509,7 +446,7 @@ async fn sync_with_delay(
             let sync_result = {
                 let mut write_operations = write_operations.write().await.unwrap();
                 write_operations.sync_with_rollback().await
-                    .map_err(|e| EventPlaneDBError::write_error(format!("Failed to sync events to disk: {:?}", e)))
+                    .map_err(|e| EventPlaneDBError::write_error())
             };
             
             // Notify all waiters

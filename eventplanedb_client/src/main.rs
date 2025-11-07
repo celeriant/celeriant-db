@@ -1,7 +1,6 @@
-use bincode::{config};
 use eventplanedb_structures::constants::BINCODE_CONFIG_VARIABLE;
 use eventplanedb_structures::event_item::EventItem;
-use eventplanedb_structures::request::Request;
+use eventplanedb_structures::request::{Request, RequestType, WriteRequest};
 use std::collections::HashMap;
 use std::env;
 use std::io::{Read, Write};
@@ -18,7 +17,7 @@ fn build_combined_request_bytes(
     client_id: u128,
     events: &Vec<EventItem>,
 ) -> Vec<u8> {
-    let request = Request::Write { 
+    let request = WriteRequest { 
         correlation_id: None, 
         org_id, 
         aggregate_type_id, 
@@ -46,6 +45,7 @@ fn build_combined_request_bytes(
 
     let protocol_version = 2u32;
     let header_size = 9;
+    let request_type = RequestType::Write;
 
     // COMPRESSION
     // let mut combined = Vec::with_capacity(header_size + compressed.len());
@@ -57,6 +57,7 @@ fn build_combined_request_bytes(
     // NO COMPRESSION
     let mut combined = Vec::with_capacity(header_size + encoded.len());
     combined.extend_from_slice(&protocol_version.to_be_bytes());
+    combined.extend_from_slice(&(request_type as u32).to_be_bytes());
     combined.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
     combined.push(0u8);
     combined.extend_from_slice(&encoded);

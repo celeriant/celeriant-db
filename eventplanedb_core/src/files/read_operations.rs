@@ -533,10 +533,26 @@ impl ReadOperations {
 pub fn apply_event_filters(event_batch: &mut EventBatchItem, read_filters: &ReadFilters) {
     
     // Final event type filtering (bloom filter might have false positives)
-    if let Some(event_types) = read_filters.include_event_types.as_deref() {
+    if read_filters.include_event_type_1.is_some() 
+        || read_filters.include_event_type_2.is_some() 
+        || read_filters.include_event_type_3.is_some() 
+        || read_filters.include_event_type_4.is_some() {
+        
+        let include_event_types = [
+            read_filters.include_event_type_1, 
+            read_filters.include_event_type_2, 
+            read_filters.include_event_type_3, 
+            read_filters.include_event_type_4
+        ];
+        
         event_batch
             .events
-            .retain(|event| event_types.contains(&event.event_type_major));
+            .retain(|event| {
+                include_event_types
+                    .iter()
+                    .filter_map(|&et| et)
+                    .any(|include_type| event.event_type_major == include_type)
+            });
     }
 
     // Final filtering for local_index
@@ -741,42 +757,37 @@ pub fn is_include_batch(metadata: &EventBatchMetadata, filters: &ReadFilters) ->
         return false;
     }
 
-    if filters
-        .include_event_types
-        .as_ref()
-        .map_or(false, |include_event_types| {
-            //Is there at least one of the include_event_types in the event batch? If not, return true to skip
-            let at_least_one_match =
-                check_event_types_match(&metadata.event_types_data, &include_event_types);
-            !at_least_one_match
-        })
-    {
-        return false;
+    if filters.include_event_type_1.is_some() ||
+        filters.include_event_type_2.is_some() ||
+        filters.include_event_type_3.is_some() ||
+        filters.include_event_type_4.is_some() {
+        
+        let include_event_types = [filters.include_event_type_1, filters.include_event_type_2, filters.include_event_type_3, filters.include_event_type_4];
+
+        if !check_event_types_match(&metadata.event_types_data, &include_event_types) {
+            return false;
+        }
     }
 
     true
 }
 
-fn check_event_types_match(event_types_data: &EventTypesData, include_event_types: &[u64]) -> bool {
+fn check_event_types_match(event_types_data: &EventTypesData, include_event_types: &[Option<u64>; 4]) -> bool {
     match event_types_data {
         EventTypesData::Direct(event_types) => {
-            // Check if any of the required types are in the direct array
-            if event_types.len() < include_event_types.len() {
-                event_types
-                    .iter()
-                    .any(|&batch_type| include_event_types.contains(&batch_type))
-            } else {
-                include_event_types
-                    .iter()
-                    .any(|&include_event_type| event_types.contains(&include_event_type))
-            }
+            // Check if any of the required types are in the batch's event types
+            include_event_types
+                .iter()
+                .filter_map(|&et| et)  // Filter out None values
+                .any(|include_type| event_types.contains(&include_type))
         }
         EventTypesData::Bloom(bloom_bytes) => {
             // Create bloom filter and test each required type
             let bloom = bloom_filter_from_bytes(bloom_bytes);
             include_event_types
                 .iter()
-                .any(|&include_event_type| bloom.contains(&include_event_type.to_le_bytes()))
+                .filter_map(|&et| et)  // Filter out None values
+                .any(|include_type| bloom.contains(&include_type.to_le_bytes()))
         }
     }
 }

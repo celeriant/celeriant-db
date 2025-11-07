@@ -189,18 +189,18 @@ pub enum WireError {
     #[error("Invalid format")]
     InvalidFormat,
     #[error("Invalid format with version specified")]
-    InvalidFormatWithVersion(u32), // Add this variant
+    InvalidFormatWithVersion(u32),
 }
 
 impl From<crate::wire_format::WireError> for EventPlaneDBError {
     fn from(e: crate::wire_format::WireError) -> Self {
         use crate::wire_format::WireError;
         match e {
-            WireError::Io(io_err) => EventPlaneDBError::io_error(io_err),
-            WireError::Serialization(e) => EventPlaneDBError::serialization_error(e),
-            WireError::Deserialization(e) => EventPlaneDBError::serialization_error(e),
-            WireError::BincodeEncode(e) => EventPlaneDBError::serialization_error(e),
-            WireError::BincodeDecode(e) => EventPlaneDBError::serialization_error(e),
+            WireError::Io(io_err) => EventPlaneDBError::io_error(),
+            WireError::Serialization(e) => EventPlaneDBError::serialization_error(),
+            WireError::Deserialization(e) => EventPlaneDBError::serialization_error(),
+            WireError::BincodeEncode(e) => EventPlaneDBError::serialization_error(),
+            WireError::BincodeDecode(e) => EventPlaneDBError::serialization_error(),
             WireError::MessageTooLarge(size) => {
                 EventPlaneDBError::message_too_large(size as u64, crate::wire_format::MAX_MESSAGE_SIZE as u64)
             }
@@ -208,10 +208,10 @@ impl From<crate::wire_format::WireError> for EventPlaneDBError {
                 EventPlaneDBError::unsupported_protocol_version(version)
             }
             WireError::InvalidFormat => {
-                EventPlaneDBError::invalid_wire_format("Invalid message format")
+                EventPlaneDBError::invalid_wire_format()
             }
             WireError::InvalidFormatWithVersion(version) => {
-                EventPlaneDBError::invalid_wire_format(format!("Invalid message format with version {version}"))
+                EventPlaneDBError::invalid_wire_format()
             },
         }
     }
