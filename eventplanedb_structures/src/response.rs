@@ -59,6 +59,7 @@ impl ResponseType {
                 | ResponseType::Delete
                 | ResponseType::WriteBatches
                 | ResponseType::ProtocolError
+                | ResponseType::Write
         )
     }
 }
@@ -265,6 +266,9 @@ where
             ResponseType::ProtocolError => {
                 Response::ProtocolError(read_fixed_size(reader, message_length, &mut buffer).await?)
             }
+            ResponseType::Write => {
+                Response::Write(read_fixed_size(reader, message_length, &mut buffer).await?)
+            }
             _ => unreachable!(),
         }
     } else {
@@ -280,9 +284,6 @@ where
             }
             ResponseType::ReadAll => {
                 Response::ReadAll(read_variable_size(reader, message_length, compression_type).await?)
-            }
-            ResponseType::Write => {
-                Response::Write(read_variable_size(reader, message_length, compression_type).await?)
             }
             _ => unreachable!(),
         }
@@ -307,7 +308,7 @@ where
     // Write header at the beginning of the buffer
     buffer[0..4].copy_from_slice(&PROTOCOL_VERSION_V2.to_be_bytes());
     buffer[4..8].copy_from_slice(&(response_type as u32).to_be_bytes());
-    buffer[8..12].copy_from_slice(&0u32.to_be_bytes()); // length = 0 for fixed size
+    buffer[8..12].copy_from_slice(&(encoded_len as u32).to_be_bytes());
     buffer[12] = 0; // compression = 0 for fixed size
     
     // Write only the used portion (header + actual encoded length)
@@ -372,6 +373,7 @@ where
             Response::Delete(res) => write_fixed_size(writer, res, response_type).await,
             Response::WriteBatches(res) => write_fixed_size(writer, res, response_type).await,
             Response::ProtocolError(res) => write_fixed_size(writer, res, response_type).await,
+            Response::Write(res) => write_fixed_size(writer, res, response_type).await,
             _ => unreachable!(),
         }
     } else {
@@ -381,7 +383,6 @@ where
             Response::ListAggregates(res) => write_variable_size(writer, res, response_type, compression_type).await,
             Response::Read(res) => write_variable_size(writer, res, response_type, compression_type).await,
             Response::ReadAll(res) => write_variable_size(writer, res, response_type, compression_type).await,
-            Response::Write(res) => write_variable_size(writer, res, response_type, compression_type).await,
             _ => unreachable!(),
         }
     }

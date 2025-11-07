@@ -111,7 +111,8 @@ fn run_client_connection(
         }
 
         // length is in bytes 4..8
-        let len = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
+        let len = u32::from_be_bytes(header[8..12].try_into().unwrap()) as usize;
+        // let len = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
 
         if len > scratch.len() {
             scratch.resize(len, 0);
