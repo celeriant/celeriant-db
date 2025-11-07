@@ -1,6 +1,6 @@
 use std::{collections::HashMap, rc::Rc, time::Duration};
 
-use eventplanedb_core::{files::{helper::{get_or_create_reader, get_or_create_writer}, read_operations::{AggregateReadConfig, ReadOperations}, write_operations::{AggregateWriteConfig, WriteOperations}}, local_event::LocalEvent};
+use eventplanedb_core::{files::{helper::{get_or_create_reader, get_or_create_writer}, read_operations::{AggregateReadConfig, ReadOperations}, write_operations::{AggregateWriteConfig, AppendOptions, WriteOperations}}, local_event::LocalEvent};
 use eventplanedb_structures::{aggregate_key::AggregateKey, compression_type::CompressionType, event_item::EventItem, eventplanedb_error::EventPlaneDBError, read_result::ReadResult, request::Request, response::Response};
 use glommio::{spawn_local, sync::{RwLock, Semaphore}, timer::sleep};
 use log::error;
@@ -319,8 +319,6 @@ impl ProcessRequest {
         durable_write_with_delay_us: Option<u64>,
         compression_type: CompressionType,
     ) -> Result<eventplanedb_structures::append_result::AppendResult, EventPlaneDBError> {
-        use eventplanedb_core::files::write_operations::AppendOptions;
-
         let aggregate_key = AggregateKey::new(org_id, aggregate_type_id, aggregate_id);
         let writer = self.get_or_create_writer(&aggregate_key, allow_create).await?;
 

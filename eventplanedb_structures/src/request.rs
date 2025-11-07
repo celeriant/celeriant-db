@@ -1,8 +1,7 @@
 use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
-use std::io::Cursor;
-use crate::{batch_metadata_item_pair::BatchMetadataItemPair, compression_type::CompressionType, constants::BINCODE_CONFIG_VARIABLE, directory_filters::DirectoryFilters, event_item::EventItem, read_filters::ReadFilters, wire_format::{MAX_MESSAGE_SIZE, PROTOCOL_VERSION_V1, PROTOCOL_VERSION_V2, STACK_BUFFER_SIZE, WireError}};
+use crate::{batch_metadata_item_pair::BatchMetadataItemPair, compression_type::CompressionType, directory_filters::DirectoryFilters, event_item::EventItem, read_filters::ReadFilters, wire_format::{MAX_MESSAGE_SIZE, PROTOCOL_VERSION_V2, WireError, from_wire_format_variable, to_wire_format_variable}};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub enum Request {
@@ -164,262 +163,63 @@ impl Request {
         }
     }
 }
-
 /// Read a request from the wire protocol
 pub async fn read_request<R>(reader: &mut R) -> Result<(Request, u32), WireError>
 where
     R: AsyncReadExt + Unpin,
 {
-    // Read version (4 bytes)
-    let mut version_buffer = [0u8; 4];
-    reader.read_exact(&mut version_buffer).await?;
-    let version = u32::from_be_bytes(version_buffer);
+    // Read entire header (9 bytes: 4 version + 4 length + 1 compression)
+    let mut header_buffer = [0u8; 9];
+    reader.read_exact(&mut header_buffer).await?;
+    
+    let version = u32::from_be_bytes(header_buffer[0..4].try_into().unwrap());
+    let message_length = u32::from_be_bytes(header_buffer[4..8].try_into().unwrap());
+    let compression_type = CompressionType::from_tuple(header_buffer[8], None);
 
-    // Read length (4 bytes)
-    let mut length_buffer = [0u8; 4];
-    reader.read_exact(&mut length_buffer).await?;
-    let message_length = u32::from_be_bytes(length_buffer);
+    if version != PROTOCOL_VERSION_V2 {
+        return Err(WireError::UnsupportedVersion(version));
+    }
 
     if message_length > MAX_MESSAGE_SIZE {
         return Err(WireError::MessageTooLarge(message_length));
     }
 
-    let message = match version {
-        PROTOCOL_VERSION_V1 => read_request_v1(reader, message_length as usize).await,
-        PROTOCOL_VERSION_V2 => read_request_v2(reader, message_length as usize).await,
-        _ => Err(WireError::UnsupportedVersion(version)),
-    }?;
+    // Read payload
+    let mut payload = vec![0u8; message_length as usize];
+    reader.read_exact(&mut payload).await?;
 
-    Ok((message, version))
+    // Decompress and decode
+    let message = from_wire_format_variable(&payload, compression_type, message_length as usize)?;
+
+    Ok((message, PROTOCOL_VERSION_V2))
 }
 
 pub async fn write_request<W>(
     writer: &mut W,
     message: &Request,
-    use_v2: bool,
+    compression_type: CompressionType,
 ) -> Result<(), WireError>
 where
     W: AsyncWriteExt + Unpin,
 {
-    let protocol_version = if use_v2 {
-        PROTOCOL_VERSION_V2
-    } else {
-        PROTOCOL_VERSION_V1
-    };
+    // Encode and compress
+    let (_uncompressed_size, encoded) = to_wire_format_variable(message, compression_type)?;
 
-    if use_v2 {
-        write_request_v2(writer, message, protocol_version).await
-    } else {
-        write_request_v1(writer, message, protocol_version).await
-    }
-}
-
-async fn read_request_v1<R>(reader: &mut R, message_length: usize) -> Result<Request, WireError>
-where
-    R: AsyncReadExt + Unpin,
-{
-    // Read payload - use stack for small messages, heap for large ones
-    let message = if message_length <= STACK_BUFFER_SIZE as usize {
-        // Use stack allocation for small messages
-        let mut stack_buffer = [0u8; STACK_BUFFER_SIZE as usize];
-        let payload_slice = &mut stack_buffer[..message_length];
-        reader.read_exact(payload_slice).await?;
-        rmp_serde::from_slice(payload_slice)?
-    } else {
-        // Use heap allocation for large messages
-        let mut payload = vec![0u8; message_length];
-        reader.read_exact(&mut payload).await?;
-        rmp_serde::from_slice(&payload)?
-    };
-
-    Ok(message)
-}
-
-async fn read_request_v2<R>(reader: &mut R, message_length: usize) -> Result<Request, WireError>
-where
-    R: AsyncReadExt + Unpin,
-{
-    let message = if message_length <= STACK_BUFFER_SIZE as usize {
-        let mut stack_buffer = [0u8; STACK_BUFFER_SIZE as usize];
-        reader
-            .read_exact(&mut stack_buffer[..message_length])
-            .await?;
-        bincode::decode_from_slice(&stack_buffer[..message_length], BINCODE_CONFIG_VARIABLE)
-            .map_err(|_| WireError::InvalidFormatWithVersion(PROTOCOL_VERSION_V2))?
-            .0
-    } else {
-        let mut heap_buffer = vec![0u8; message_length];
-        reader.read_exact(&mut heap_buffer).await?;
-        bincode::decode_from_slice(&heap_buffer, BINCODE_CONFIG_VARIABLE)
-            .map_err(|_| WireError::InvalidFormatWithVersion(PROTOCOL_VERSION_V2))?
-            .0
-    };
-
-    Ok(message)
-}
-
-async fn write_request_v1<W>(
-    writer: &mut W,
-    message: &Request,
-    protocol_version: u32,
-) -> Result<(), WireError>
-where
-    W: AsyncWriteExt + Unpin,
-{
-    match message {
-        Request::Write { events, .. } if !events.is_empty() => {
-            // Write requests with events can be large, use heap allocation
-            let encoded = rmp_serde::to_vec(message)?;
-
-            if encoded.len() > MAX_MESSAGE_SIZE as usize {
-                return Err(WireError::MessageTooLarge(encoded.len() as u32));
-            }
-
-            let header_size = 8;
-            let mut combined = Vec::with_capacity(header_size + encoded.len());
-            combined.extend_from_slice(&protocol_version.to_be_bytes());
-            combined.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
-            combined.extend_from_slice(&encoded);
-
-            writer.write_all(&combined).await?;
-        }
-        Request::WriteBatches { batches, .. } if !batches.is_empty() => {
-            // WriteBatches with batches can be large, use heap allocation
-            let encoded = rmp_serde::to_vec(message)?;
-
-            if encoded.len() > MAX_MESSAGE_SIZE as usize {
-                return Err(WireError::MessageTooLarge(encoded.len() as u32));
-            }
-
-            let header_size = 8;
-            let mut combined = Vec::with_capacity(header_size + encoded.len());
-            combined.extend_from_slice(&protocol_version.to_be_bytes());
-            combined.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
-            combined.extend_from_slice(&encoded);
-
-            writer.write_all(&combined).await?;
-        }
-        _ => {
-            // Other requests are typically small, try stack buffer
-            let mut stack_buffer = [0u8; STACK_BUFFER_SIZE as usize];
-            let mut cursor = Cursor::new(&mut stack_buffer[8..]);
-
-            match rmp_serde::encode::write(&mut cursor, message) {
-                Ok(()) => {
-                    let encoded_len = cursor.position() as usize;
-
-                    if encoded_len > MAX_MESSAGE_SIZE as usize {
-                        return Err(WireError::MessageTooLarge(encoded_len as u32));
-                    }
-
-                    stack_buffer[0..4].copy_from_slice(&protocol_version.to_be_bytes());
-                    stack_buffer[4..8].copy_from_slice(&(encoded_len as u32).to_be_bytes());
-
-                    writer.write_all(&stack_buffer[..8 + encoded_len]).await?;
-                }
-                Err(_) => {
-                    // Stack buffer too small, fall back to heap
-                    let encoded = rmp_serde::to_vec(message)?;
-                    let encoded_len = encoded.len();
-
-                    if encoded_len > MAX_MESSAGE_SIZE as usize {
-                        return Err(WireError::MessageTooLarge(encoded_len as u32));
-                    }
-
-                    let header_size = 8;
-                    let mut combined = Vec::with_capacity(header_size + encoded.len());
-                    combined.extend_from_slice(&protocol_version.to_be_bytes());
-                    combined.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
-                    combined.extend_from_slice(&encoded);
-
-                    writer.write_all(&combined).await?;
-                }
-            }
-        }
+    if encoded.len() > MAX_MESSAGE_SIZE as usize {
+        return Err(WireError::MessageTooLarge(encoded.len() as u32));
     }
 
-    Ok(())
-}
+    // Build header: version (4) + length (4) + compression_type (1)
+    let (type_id, _) = compression_type.to_tuple();
 
-async fn write_request_v2<W>(
-    writer: &mut W,
-    message: &Request,
-    protocol_version: u32,
-) -> Result<(), WireError>
-where
-    W: AsyncWriteExt + Unpin,
-{
-    match message {
-        Request::Write { events, .. } if !events.is_empty() => {
-            // Write requests with events can be large, use heap allocation
-            let encoded = bincode::encode_to_vec(message, BINCODE_CONFIG_VARIABLE)?;
+    let mut header = Vec::with_capacity(9);
+    header.extend_from_slice(&PROTOCOL_VERSION_V2.to_be_bytes());
+    header.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+    header.push(type_id);
 
-            if encoded.len() > MAX_MESSAGE_SIZE as usize {
-                return Err(WireError::MessageTooLarge(encoded.len() as u32));
-            }
-
-            let header_size = 8;
-            let mut combined = Vec::with_capacity(header_size + encoded.len());
-            combined.extend_from_slice(&protocol_version.to_be_bytes());
-            combined.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
-            combined.extend_from_slice(&encoded);
-
-            writer.write_all(&combined).await?;
-        }
-        Request::WriteBatches { batches, .. } if !batches.is_empty() => {
-            // WriteBatches with batches can be large, use heap allocation
-            let encoded = bincode::encode_to_vec(message, BINCODE_CONFIG_VARIABLE)?;
-
-            if encoded.len() > MAX_MESSAGE_SIZE as usize {
-                return Err(WireError::MessageTooLarge(encoded.len() as u32));
-            }
-
-            let header_size = 8;
-            let mut combined = Vec::with_capacity(header_size + encoded.len());
-            combined.extend_from_slice(&protocol_version.to_be_bytes());
-            combined.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
-            combined.extend_from_slice(&encoded);
-
-            writer.write_all(&combined).await?;
-        }
-        _ => {
-            // Other requests are typically small, try stack buffer
-            let mut stack_buffer = [0u8; STACK_BUFFER_SIZE as usize];
-
-            match bincode::encode_into_slice(
-                message,
-                &mut stack_buffer[8..],
-                BINCODE_CONFIG_VARIABLE,
-            ) {
-                Ok(encoded_len) => {
-                    if encoded_len > MAX_MESSAGE_SIZE as usize {
-                        return Err(WireError::MessageTooLarge(encoded_len as u32));
-                    }
-
-                    stack_buffer[0..4].copy_from_slice(&protocol_version.to_be_bytes());
-                    stack_buffer[4..8].copy_from_slice(&(encoded_len as u32).to_be_bytes());
-
-                    writer.write_all(&stack_buffer[..8 + encoded_len]).await?;
-                }
-                Err(_) => {
-                    // Stack buffer too small, fall back to heap
-                    let encoded = bincode::encode_to_vec(message, BINCODE_CONFIG_VARIABLE)?;
-                    let encoded_len = encoded.len();
-                    if encoded_len > MAX_MESSAGE_SIZE as usize {
-                        return Err(WireError::MessageTooLarge(encoded.len() as u32));
-                    }
-
-                    let header_size = 8;
-                    let mut combined = Vec::with_capacity(header_size + encoded.len());
-                    combined.extend_from_slice(&protocol_version.to_be_bytes());
-                    combined.extend_from_slice(&(encoded_len as u32).to_be_bytes());
-                    combined.extend_from_slice(&encoded);
-
-                    writer.write_all(&combined).await?;
-                }
-            }
-        }
-    }
+    // Write header and payload
+    writer.write_all(&header).await?;
+    writer.write_all(&encoded).await?;
 
     Ok(())
 }

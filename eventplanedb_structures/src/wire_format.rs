@@ -18,6 +18,72 @@ const BINCODE_CONFIG_VARIABLE: config::Configuration = config::standard();
 
 //TODO: When we have a large message, we always allocate on the heap, use a buffer pool?
 
+pub fn to_wire_format_variable_stack<T>(
+    item: &T,
+    compression_type: CompressionType,
+    serialize_buffer: &mut [u8],
+    compress_buffer: &mut [u8],
+) -> io::Result<(usize, usize)>
+where
+    T: Encode,
+{
+    let uncompressed_size = bincode::encode_into_slice(item, serialize_buffer, BINCODE_CONFIG_VARIABLE)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+
+    let compressed_size = match compression_type {
+        CompressionType::None => {
+            // No compression - just copy to output buffer if different from input
+            if serialize_buffer.as_ptr() != compress_buffer.as_ptr() {
+                compress_buffer[..uncompressed_size].copy_from_slice(&serialize_buffer[..uncompressed_size]);
+            }
+            uncompressed_size
+        }
+        CompressionType::Zstd { level } => {
+            let size = zstd::bulk::compress_to_buffer(
+                &serialize_buffer[..uncompressed_size],
+                compress_buffer,
+                level,
+            )
+            .map_err(|e| io::Error::other(e.to_string()))?;
+            size
+        }
+        CompressionType::Snappy => {
+            let compressed = snap::raw::Encoder::new()
+                .compress_vec(&serialize_buffer[..uncompressed_size])
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            
+            if compressed.len() > compress_buffer.len() {
+                return Err(io::Error::other("Compression buffer too small"));
+            }
+            compress_buffer[..compressed.len()].copy_from_slice(&compressed);
+            compressed.len()
+        }
+        CompressionType::Brotli { level } => {
+            let mut output = std::io::Cursor::new(compress_buffer);
+            let params = brotli::enc::BrotliEncoderParams {
+                quality: level,
+                ..Default::default()
+            };
+            brotli::BrotliCompress(
+                &mut std::io::Cursor::new(&serialize_buffer[..uncompressed_size]),
+                &mut output,
+                &params,
+            )
+            .map_err(|e| io::Error::other(e.to_string()))?;
+            output.position() as usize
+        }
+        CompressionType::Gzip { level } => {
+            use flate2::{Compression, write::GzEncoder};
+            let mut encoder = GzEncoder::new(std::io::Cursor::new(compress_buffer), Compression::new(level as u32));
+            std::io::Write::write_all(&mut encoder, &serialize_buffer[..uncompressed_size])?;
+            let cursor = encoder.finish()?;
+            cursor.position() as usize
+        }
+    };
+
+    Ok((uncompressed_size, compressed_size))
+}
+
 pub fn to_wire_format_variable<T>(
     item: &T,
     compression_type: CompressionType,

@@ -208,7 +208,7 @@ async fn process_tcp_stream(
 }
 
 async fn write_to_tcp_stream(response: Response, tcp_stream: &mut glommio::net::TcpStream<glommio::net::Preallocated>, version: u32) {
-    if let Err(e) = write_response(tcp_stream, &response, version == PROTOCOL_VERSION_V2).await {
+    if let Err(e) = write_response(tcp_stream, &response, eventplanedb_structures::compression_type::CompressionType::None).await {
         error!("Failed to write response to TCP stream: {e}");
         // Connection will be dropped when tcp_stream goes out of scope
         //TODO: We don't really expect a failure to serialize here, but its an edge case to handle
@@ -231,8 +231,7 @@ async fn read_from_tcp_stream(
                 error: EventPlaneDBError::invalid_request(),
             };
             
-            let use_v2 = version == PROTOCOL_VERSION_V2;
-            if let Err(e) = write_response(tcp_stream, &error_response, use_v2).await {
+            if let Err(e) = write_response(tcp_stream, &error_response, eventplanedb_structures::compression_type::CompressionType::None).await {
                 error!("Shard {shard_id} failed to send error response: {e}");
             }
             

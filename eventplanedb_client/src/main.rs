@@ -1,4 +1,5 @@
 use bincode::{config};
+use eventplanedb_structures::constants::BINCODE_CONFIG_VARIABLE;
 use eventplanedb_structures::event_item::EventItem;
 use eventplanedb_structures::request::Request;
 use std::collections::HashMap;
@@ -30,14 +31,37 @@ fn build_combined_request_bytes(
         expected_event_batch_index: None, 
         enforce_client_idempotency: false, 
         durable_write_with_delay_us: Some(sync_delay_us), 
-        compression_type: eventplanedb_structures::compression_type::CompressionType::Zstd { level: 1 } 
+        compression_type: eventplanedb_structures::compression_type::CompressionType::None 
     };
 
-    let encoded = bincode::encode_to_vec(&request, config::standard()).unwrap();
-    let mut combined = Vec::with_capacity(8 + encoded.len()); // 4 bytes version + 4 bytes length + payload
-    combined.extend_from_slice(&(2u32).to_be_bytes()); // version
-    combined.extend_from_slice(&(encoded.len() as u32).to_be_bytes()); // length
+    // Use the same encoding as write_request_v2
+    let encoded = bincode::encode_to_vec(&request, BINCODE_CONFIG_VARIABLE).unwrap();
+    
+    // Compress the encoded data (V2 protocol uses snap compression)
+    let compressed = snap::raw::Encoder::new()
+        .compress_vec(&encoded)
+        .unwrap();
+
+    let (type_id, _) = eventplanedb_structures::compression_type::CompressionType::Snappy.to_tuple();
+
+    let protocol_version = 2u32;
+    let header_size = 9;
+
+    // COMPRESSION
+    // let mut combined = Vec::with_capacity(header_size + compressed.len());
+    // combined.extend_from_slice(&protocol_version.to_be_bytes());
+    // combined.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
+    // combined.push(type_id);
+    // combined.extend_from_slice(&compressed);
+
+    // NO COMPRESSION
+    let mut combined = Vec::with_capacity(header_size + encoded.len());
+    combined.extend_from_slice(&protocol_version.to_be_bytes());
+    combined.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+    combined.push(0u8);
     combined.extend_from_slice(&encoded);
+
+    
     combined
 }
 
@@ -60,7 +84,7 @@ fn run_client_connection(
     let deadline = Instant::now() + duration;
     let mut count: u64 = 0;
 
-    let mut header = [0u8; 8];
+    let mut header = [0u8; 9];
     let mut scratch: Vec<u8> = vec![0u8; 4096]; // reusable buffer for response payload
     // let mut agg_idx: u128 = 0;
 
@@ -135,17 +159,6 @@ fn main() {
     let client_id: u128 = 1;
 
     // One tiny event payload reused in all requests (only cloned during cache build)
-    let base_events = vec![
-        EventItem::new(
-            0,
-            0,
-            None,
-            0,
-            1,
-            0,
-            b"Hello world".to_vec(),
-        ),
-    ];
     // let base_events = vec![
     //     EventItem::new(
     //         0,
@@ -154,27 +167,38 @@ fn main() {
     //         0,
     //         1,
     //         0,
-    //         b"In the quiet hum of servers running through the night, we craft elegant algorithms and pristine code. Each function a verse, each variable a word. We debug with patience, refactor with purpose, and ship with hope. Through countless iterations we learn and grow, transforming coffee into software, ideas into reality. We embrace the edge cases, handle the errors gracefully, and celebrate when the tests finally pass. In this digital forge we are architects and artists, building systems that scale, creating experiences that matter, writing the future one commit at a time with determination and endless curiosity.".to_vec(),
-    //     ),
-    //     EventItem::new(
-    //         1,
-    //         0,
-    //         None,
-    //         0,
-    //         1,
-    //         0,
-    //         b"Through fiber and copper the data streams flow, carrying dreams across the digital expanse. Packets traverse networks, dancing through routers, finding their path through the chaos of wires. We build bridges of bandwidth, tunnels of trust, establishing connections that span continents and cultures. Each byte tells a story, each frame holds meaning. We monitor latencies, optimize throughput, ensuring the message arrives intact and timely. In this web of communication we are guardians and guides, maintaining the infrastructure that binds our world together, enabling conversations that change lives and forge futures.".to_vec(),
-    //     ),
-    //     EventItem::new(
-    //         2,
-    //         0,
-    //         None,
-    //         0,
-    //         1,
-    //         0,
-    //         b"Layer upon layer we construct the architecture, foundations of databases supporting towers of services. Microservices communicate, APIs expose interfaces, containers orchestrate in harmony. We design for resilience, plan for failure, build redundancy into every component. Load balancers distribute the weight, caches accelerate the response, queues buffer the storms. Through careful planning and thoughtful design we create systems that endure. We document thoroughly, test rigorously, deploy cautiously. In this realm of distributed systems we are engineers and visionaries, solving puzzles of scale and complexity, turning requirements into elegant solutions.".to_vec(),
+    //         b"Hello world".to_vec(),
     //     ),
     // ];
+    let base_events = vec![
+        EventItem::new(
+            0,
+            0,
+            None,
+            0,
+            1,
+            0,
+            b"In the quiet hum of servers running through the night, we craft elegant algorithms and pristine code. Each function a verse, each variable a word. We debug with patience, refactor with purpose, and ship with hope. Through countless iterations we learn and grow, transforming coffee into software, ideas into reality. We embrace the edge cases, handle the errors gracefully, and celebrate when the tests finally pass. In this digital forge we are architects and artists, building systems that scale, creating experiences that matter, writing the future one commit at a time with determination and endless curiosity.".to_vec(),
+        ),
+        EventItem::new(
+            1,
+            0,
+            None,
+            0,
+            1,
+            0,
+            b"Through fiber and copper the data streams flow, carrying dreams across the digital expanse. Packets traverse networks, dancing through routers, finding their path through the chaos of wires. We build bridges of bandwidth, tunnels of trust, establishing connections that span continents and cultures. Each byte tells a story, each frame holds meaning. We monitor latencies, optimize throughput, ensuring the message arrives intact and timely. In this web of communication we are guardians and guides, maintaining the infrastructure that binds our world together, enabling conversations that change lives and forge futures.".to_vec(),
+        ),
+        EventItem::new(
+            2,
+            0,
+            None,
+            0,
+            1,
+            0,
+            b"Layer upon layer we construct the architecture, foundations of databases supporting towers of services. Microservices communicate, APIs expose interfaces, containers orchestrate in harmony. We design for resilience, plan for failure, build redundancy into every component. Load balancers distribute the weight, caches accelerate the response, queues buffer the storms. Through careful planning and thoughtful design we create systems that endure. We document thoroughly, test rigorously, deploy cautiously. In this realm of distributed systems we are engineers and visionaries, solving puzzles of scale and complexity, turning requirements into elegant solutions.".to_vec(),
+        ),
+    ];
 
     // Up-front cache of full request bytes for each aggregate
     let mut map = HashMap::with_capacity(num_aggregates as usize);

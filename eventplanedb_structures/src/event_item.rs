@@ -98,4 +98,33 @@ impl EventItem {
             iv: Some(iv),
         }
     }
+
+    pub fn size_bytes(&self) -> usize {
+        let mut size = 0;
+        
+        // Fixed size fields
+        size += 8; // client_event_index
+        size += 8; // event_index
+        size += 8; // event_timestamp
+        size += 8; // event_type_major
+        size += 8; // event_type_minor
+        
+        // Option discriminant + potential value
+        size += 1; // event_id discriminant
+        if self.event_id.is_some() {
+            size += 16; // u128
+        }
+        
+        size += 1; // iv discriminant
+        if self.iv.is_some() {
+            size += 12; // [u8; 12]
+        }
+        
+        // Vec length prefix (bincode uses variable length encoding, estimate 8 bytes)
+        size += 8;
+        // Variable size event_value
+        size += self.event_value.len();
+        
+        size
+    }
 }
