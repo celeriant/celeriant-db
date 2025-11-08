@@ -1,14 +1,15 @@
-use eventplanedb_structures::eventplanedb_error::EventPlaneDBError;
+use eventplanedb_structures::{error_code::ErrorCode, eventplanedb_error::EventPlaneDBError};
+
+use crate::files::{read_operations::ReadError, write_operations::AppendError};
 
 impl From<crate::files::read_operations::ReadError> for EventPlaneDBError {
     fn from(e: crate::files::read_operations::ReadError) -> Self {
-        use crate::files::read_operations::ReadError;
         match e {
-            ReadError::IoError(io_err) => EventPlaneDBError::io_error(),
+            ReadError::IoError(_io_err) => EventPlaneDBError::io_error(),
             ReadError::MaxBytesTooSmall { current_max_bytes, required_max_bytes } => {
                 EventPlaneDBError::max_bytes_too_small(current_max_bytes, required_max_bytes)
             }
-            ReadError::SerializationError { message } => EventPlaneDBError::serialization_error(),
+            ReadError::SerializationError { message: _ } => EventPlaneDBError::serialization_error(),
             ReadError::UnavailableBatchIndex { minimum_available_event_batch_index, requested_event_batch_index } => {
                 EventPlaneDBError::unavailable_batch_index(minimum_available_event_batch_index, requested_event_batch_index)
             }
@@ -20,10 +21,7 @@ impl From<crate::files::read_operations::ReadError> for EventPlaneDBError {
 }
 
 impl From<crate::files::write_operations::AppendError> for EventPlaneDBError {
-    fn from(e: crate::files::write_operations::AppendError) -> Self {
-        use crate::files::write_operations::AppendError;
-        use eventplanedb_structures::error_code::ErrorCode;
-        
+    fn from(e: crate::files::write_operations::AppendError) -> Self {        
         match e {
             AppendError::IoError(_io_err) => EventPlaneDBError::io_error(),
             AppendError::OptimisticConcurrencyViolation { client_id, expected_event_batch_index, current_event_batch_index } => {
@@ -43,8 +41,8 @@ impl From<crate::files::write_operations::AppendError> for EventPlaneDBError {
                 last_client_event_index: Some(existing_event_index),
                 ..Default::default()
             },
-            AppendError::SerializationError { message } => EventPlaneDBError::serialization_error(),
-            AppendError::WriteError { message } => EventPlaneDBError::write_error(),
+            AppendError::SerializationError { message: _ } => EventPlaneDBError::serialization_error(),
+            AppendError::WriteError { message: _ } => EventPlaneDBError::write_error(),
         }
     }
 }

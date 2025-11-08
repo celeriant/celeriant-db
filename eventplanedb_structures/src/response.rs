@@ -7,8 +7,6 @@ use crate::eventplanedb_error::EventPlaneDBError;
 use crate::wire_format::{MAX_MESSAGE_SIZE, PROTOCOL_VERSION_V2, WireError, from_wire_format_variable, to_wire_format_variable};
 use crate::{aggregate_info::AggregateInfo, append_result::AppendResult, constants::BINCODE_CONFIG_FIXED, organisation::Organisation, read_all_result::ReadAllResult, read_result::ReadResult};
 
-const HEADER_SIZE: usize = 9; // version(4) + length(4) + compression(1)
-
 // Response type discriminants
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

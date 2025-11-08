@@ -48,30 +48,4 @@ impl EventBatchItem {
             events,
         }
     }
-
-    pub fn size_bytes(&self) -> usize {
-        let mut size = 0;
-        
-        // Fixed size fields
-        size += 8;  // event_batch_index
-        size += 8;  // server_timestamp
-        size += 16; // client_id
-        
-        // Option discriminant + potential value
-        size += 1; // user_id discriminant
-        if self.user_id.is_some() {
-            size += 16; // u128
-        }
-        
-        // Vec length prefix for events
-        size += 8;
-        
-        // Sum up all events
-        for event in &self.events {
-            size += event.size_bytes();
-        }
-        
-        size
-    }
-
 }

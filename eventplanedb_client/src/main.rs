@@ -1,6 +1,6 @@
 use eventplanedb_structures::constants::BINCODE_CONFIG_VARIABLE;
 use eventplanedb_structures::event_item::EventItem;
-use eventplanedb_structures::request::{Request, RequestType, WriteRequest};
+use eventplanedb_structures::request::{RequestType, WriteRequest};
 use std::collections::HashMap;
 use std::env;
 use std::io::{Read, Write};
@@ -37,11 +37,11 @@ fn build_combined_request_bytes(
     let encoded = bincode::encode_to_vec(&request, BINCODE_CONFIG_VARIABLE).unwrap();
     
     // Compress the encoded data (V2 protocol uses snap compression)
-    let compressed = snap::raw::Encoder::new()
-        .compress_vec(&encoded)
-        .unwrap();
+    // let compressed = snap::raw::Encoder::new()
+    //     .compress_vec(&encoded)
+    //     .unwrap();
 
-    let (type_id, _) = eventplanedb_structures::compression_type::CompressionType::Snappy.to_tuple();
+    // let (type_id, _) = eventplanedb_structures::compression_type::CompressionType::Snappy.to_tuple();
 
     let protocol_version = 2u32;
     let header_size = 9;

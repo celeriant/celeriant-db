@@ -196,11 +196,11 @@ impl From<crate::wire_format::WireError> for EventPlaneDBError {
     fn from(e: crate::wire_format::WireError) -> Self {
         use crate::wire_format::WireError;
         match e {
-            WireError::Io(io_err) => EventPlaneDBError::io_error(),
-            WireError::Serialization(e) => EventPlaneDBError::serialization_error(),
-            WireError::Deserialization(e) => EventPlaneDBError::serialization_error(),
-            WireError::BincodeEncode(e) => EventPlaneDBError::serialization_error(),
-            WireError::BincodeDecode(e) => EventPlaneDBError::serialization_error(),
+            WireError::Io(_io_err) => EventPlaneDBError::io_error(),
+            WireError::Serialization(_e) => EventPlaneDBError::serialization_error(),
+            WireError::Deserialization(_e) => EventPlaneDBError::serialization_error(),
+            WireError::BincodeEncode(_e) => EventPlaneDBError::serialization_error(),
+            WireError::BincodeDecode(_e) => EventPlaneDBError::serialization_error(),
             WireError::MessageTooLarge(size) => {
                 EventPlaneDBError::message_too_large(size as u64, crate::wire_format::MAX_MESSAGE_SIZE as u64)
             }
@@ -210,7 +210,7 @@ impl From<crate::wire_format::WireError> for EventPlaneDBError {
             WireError::InvalidFormat => {
                 EventPlaneDBError::invalid_wire_format()
             }
-            WireError::InvalidFormatWithVersion(version) => {
+            WireError::InvalidFormatWithVersion(_version) => {
                 EventPlaneDBError::invalid_wire_format()
             },
         }

@@ -1,7 +1,7 @@
 use std::{cell::RefCell, os::fd::{FromRawFd, IntoRawFd}, rc::Rc};
 
 use eventplanedb_core::files::{read_operations::AggregateReadConfig, write_operations::AggregateWriteConfig};
-use eventplanedb_structures::{eventplanedb_error::EventPlaneDBError, request::{Request, read_request}, response::{ProtocolErrorResponse, Response, write_response}, wire_format::{PROTOCOL_VERSION_V2, WireError}};
+use eventplanedb_structures::{eventplanedb_error::EventPlaneDBError, request::{Request, read_request}, response::{ProtocolErrorResponse, Response, write_response}, wire_format::WireError};
 use glommio::{CpuSet, LocalExecutorPoolBuilder, PoolPlacement, channels::channel_mesh::{Full, MeshBuilder, Senders}, enclose, net::TcpListener, spawn_local};
 use futures_lite::AsyncWriteExt;
 use log::{debug, error, info};
@@ -207,7 +207,7 @@ async fn process_tcp_stream(
     }).detach();
 }
 
-async fn write_to_tcp_stream(response: Response, tcp_stream: &mut glommio::net::TcpStream<glommio::net::Preallocated>, version: u32) {
+async fn write_to_tcp_stream(response: Response, tcp_stream: &mut glommio::net::TcpStream<glommio::net::Preallocated>, _version: u32) {
     if let Err(e) = write_response(tcp_stream, &response, eventplanedb_structures::compression_type::CompressionType::None).await {
         error!("Failed to write response to TCP stream: {e}");
         // Connection will be dropped when tcp_stream goes out of scope
@@ -225,7 +225,7 @@ async fn read_from_tcp_stream(
             debug!("Shard {shard_id} client disconnected");
             None
         }
-        Err(WireError::InvalidFormatWithVersion(version)) => {
+        Err(WireError::InvalidFormatWithVersion(_version)) => {
             let error_response = Response::ProtocolError(ProtocolErrorResponse {
                 correlation_id: None,
                 error: EventPlaneDBError::invalid_request(),

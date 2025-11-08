@@ -3,7 +3,7 @@ use std::{collections::HashMap, rc::Rc, time::Duration};
 use eventplanedb_core::{files::{helper::{get_or_create_reader, get_or_create_writer}, read_operations::{AggregateReadConfig, ReadOperations}, write_operations::{AggregateWriteConfig, AppendOptions, WriteOperations}}, local_event::LocalEvent};
 use glommio::{spawn_local, sync::{RwLock, Semaphore}, timer::sleep};
 use log::error;
-use eventplanedb_structures::{aggregate_key::AggregateKey, compression_type::CompressionType, event_item::EventItem, eventplanedb_error::EventPlaneDBError, read_result::ReadResult, request::{DeleteRequest, ReadRequest, Request, TrimStartRequest, WriteRequest}, response::{DeleteResponse, ExistsResponse, ListAggregatesResponse, ListOrganisationsResponse, LockResponse, ReadAllResponse, ReadResponse, Response, TrimEndResponse, TrimStartResponse, UnlockResponse, WriteBatchesResponse, WriteResponse}};
+use eventplanedb_structures::{aggregate_key::AggregateKey, eventplanedb_error::EventPlaneDBError, read_result::ReadResult, request::{DeleteRequest, ReadRequest, Request, TrimStartRequest, WriteRequest}, response::{DeleteResponse, ExistsResponse, ListAggregatesResponse, ListOrganisationsResponse, LockResponse, ReadAllResponse, ReadResponse, Response, TrimEndResponse, TrimStartResponse, UnlockResponse, WriteBatchesResponse, WriteResponse}};
 
 type SyncResult = Result<(), EventPlaneDBError>;
 
@@ -71,7 +71,7 @@ impl ProcessRequest {
             &self.aggregate_read_config,
         )
         .await
-        .map_err(|e| EventPlaneDBError::io_error())
+        .map_err(|_e| EventPlaneDBError::io_error())
     }
 
     // Helper: Get or create WAL sync event
@@ -372,7 +372,7 @@ impl ProcessRequest {
         let (metadata_dma_file, event_batches_dma_file) = {
             let mut wo = writer.write().await.unwrap();
             wo.trim_start(bytes_to_trim_metadata, bytes_to_trim_event_batch).await
-                .map_err(|e| EventPlaneDBError::write_error())?
+                .map_err(|_e| EventPlaneDBError::write_error())?
         };
 
         let mut reader_mut = reader.write().await.unwrap();
@@ -403,12 +403,12 @@ impl ProcessRequest {
         // Delete files from filesystem
         //TODO: Configurable settings required
         let metadata_path = format!("data/{}/{}/{}/metadata.bin", request.org_id, request.aggregate_type_id, request.aggregate_id);
-        let events_path = format!("data/{}/{}/{}/events.bin", request.org_id, request.aggregate_type_id, request.aggregate_id);
+        let events_path = format!("data/{}/{}/{}/event_batches.bin", request.org_id, request.aggregate_type_id, request.aggregate_id);
 
         std::fs::remove_file(&metadata_path)
-            .map_err(|e| EventPlaneDBError::io_error())?;
+            .map_err(|_e| EventPlaneDBError::io_error())?;
         std::fs::remove_file(&events_path)
-            .map_err(|e| EventPlaneDBError::io_error())?;
+            .map_err(|_e| EventPlaneDBError::io_error())?;
 
         Ok(())
     }
@@ -445,7 +445,7 @@ async fn sync_with_delay(
             let sync_result = {
                 let mut write_operations = write_operations.write().await.unwrap();
                 write_operations.sync_with_rollback().await
-                    .map_err(|e| EventPlaneDBError::write_error())
+                    .map_err(|_e| EventPlaneDBError::write_error())
             };
             
             // Notify all waiters
