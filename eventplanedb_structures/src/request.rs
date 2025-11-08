@@ -14,15 +14,12 @@ pub enum RequestType {
     ListOrganisations = 1,
     ListAggregates = 2,
     Exists = 3,
-    Lock = 4,
-    Unlock = 5,
-    Read = 6,
-    ReadAll = 7,
-    Write = 8,
-    WriteBatches = 9,
-    TrimStart = 10,
-    TrimEnd = 11,
-    Delete = 12,
+    Read = 4,
+    ReadAll = 5,
+    Write = 6,
+    WriteBatches = 7,
+    TrimStart = 8,
+    Delete = 9,
 }
 
 impl RequestType {
@@ -31,15 +28,12 @@ impl RequestType {
             1 => Ok(RequestType::ListOrganisations),
             2 => Ok(RequestType::ListAggregates),
             3 => Ok(RequestType::Exists),
-            4 => Ok(RequestType::Lock),
-            5 => Ok(RequestType::Unlock),
-            6 => Ok(RequestType::Read),
-            7 => Ok(RequestType::ReadAll),
-            8 => Ok(RequestType::Write),
-            9 => Ok(RequestType::WriteBatches),
-            10 => Ok(RequestType::TrimStart),
-            11 => Ok(RequestType::TrimEnd),
-            12 => Ok(RequestType::Delete),
+            4 => Ok(RequestType::Read),
+            5 => Ok(RequestType::ReadAll),
+            6 => Ok(RequestType::Write),
+            7 => Ok(RequestType::WriteBatches),
+            8 => Ok(RequestType::TrimStart),
+            9 => Ok(RequestType::Delete),
             _ => Err(WireError::InvalidFormatWithVersion(value)),
         }
     }
@@ -49,12 +43,9 @@ impl RequestType {
             self,
             RequestType::ListAggregates
                 | RequestType::Exists
-                | RequestType::Lock
-                | RequestType::Unlock
                 | RequestType::Read
                 | RequestType::ReadAll
                 | RequestType::TrimStart
-                | RequestType::TrimEnd
                 | RequestType::Delete
         )
     }
@@ -77,25 +68,6 @@ pub struct ListAggregatesRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct ExistsRequest {
-    pub correlation_id: Option<u128>,
-    pub org_id: u128,
-    pub aggregate_type_id: u128,
-    pub aggregate_id: u128,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
-pub struct LockRequest {
-    pub correlation_id: Option<u128>,
-    pub org_id: u128,
-    pub aggregate_type_id: u128,
-    pub aggregate_id: u128,
-    pub client_id: u128,
-    pub timeout_ms: u64,
-    pub allow_read: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
-pub struct UnlockRequest {
     pub correlation_id: Option<u128>,
     pub org_id: u128,
     pub aggregate_type_id: u128,
@@ -159,15 +131,6 @@ pub struct TrimStartRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
-pub struct TrimEndRequest {
-    pub correlation_id: Option<u128>,
-    pub org_id: u128,
-    pub aggregate_type_id: u128,
-    pub aggregate_id: u128,
-    pub trim_from_event_batch_index: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct DeleteRequest {
     pub correlation_id: Option<u128>,
     pub org_id: u128,
@@ -180,14 +143,11 @@ pub enum Request {
     ListOrganisations(ListOrganisationsRequest),
     ListAggregates(ListAggregatesRequest),
     Exists(ExistsRequest),
-    Lock(LockRequest),
-    Unlock(UnlockRequest),
     Read(ReadRequest),
     ReadAll(ReadAllRequest),
     Write(WriteRequest),
     WriteBatches(WriteBatchesRequest),
     TrimStart(TrimStartRequest),
-    TrimEnd(TrimEndRequest),
     Delete(DeleteRequest),
 }
 
@@ -197,14 +157,11 @@ impl Request {
             Request::ListOrganisations(_) => RequestType::ListOrganisations,
             Request::ListAggregates(_) => RequestType::ListAggregates,
             Request::Exists(_) => RequestType::Exists,
-            Request::Lock(_) => RequestType::Lock,
-            Request::Unlock(_) => RequestType::Unlock,
             Request::Read(_) => RequestType::Read,
             Request::ReadAll(_) => RequestType::ReadAll,
             Request::Write(_) => RequestType::Write,
             Request::WriteBatches(_) => RequestType::WriteBatches,
             Request::TrimStart(_) => RequestType::TrimStart,
-            Request::TrimEnd(_) => RequestType::TrimEnd,
             Request::Delete(_) => RequestType::Delete,
         }
     }
@@ -216,14 +173,11 @@ impl Request {
             Request::ListOrganisations(_) => 0,
             Request::ListAggregates(_) => 0,
             Request::Exists(req) => req.aggregate_id,
-            Request::Lock(req) => req.aggregate_id,
-            Request::Unlock(req) => req.aggregate_id,
             Request::Read(req) => req.aggregate_id,
             Request::ReadAll(req) => req.aggregate_id,
             Request::Write(req) => req.aggregate_id,
             Request::WriteBatches(req) => req.aggregate_id,
             Request::TrimStart(req) => req.aggregate_id,
-            Request::TrimEnd(req) => req.aggregate_id,
             Request::Delete(req) => req.aggregate_id,
         }
     }
@@ -273,12 +227,6 @@ where
             RequestType::Exists => {
                 Request::Exists(read_fixed_size(reader, message_length, &mut buffer).await?)
             }
-            RequestType::Lock => {
-                Request::Lock(read_fixed_size(reader, message_length, &mut buffer).await?)
-            }
-            RequestType::Unlock => {
-                Request::Unlock(read_fixed_size(reader, message_length, &mut buffer).await?)
-            }
             RequestType::Read => {
                 Request::Read(read_fixed_size(reader, message_length, &mut buffer).await?)
             }
@@ -287,9 +235,6 @@ where
             }
             RequestType::TrimStart => {
                 Request::TrimStart(read_fixed_size(reader, message_length, &mut buffer).await?)
-            }
-            RequestType::TrimEnd => {
-                Request::TrimEnd(read_fixed_size(reader, message_length, &mut buffer).await?)
             }
             RequestType::Delete => {
                 Request::Delete(read_fixed_size(reader, message_length, &mut buffer).await?)
@@ -389,12 +334,9 @@ where
         match request {
             Request::ListAggregates(req) => write_fixed_size(writer, req, request_type).await,
             Request::Exists(req) => write_fixed_size(writer, req, request_type).await,
-            Request::Lock(req) => write_fixed_size(writer, req, request_type).await,
-            Request::Unlock(req) => write_fixed_size(writer, req, request_type).await,
             Request::Read(req) => write_fixed_size(writer, req, request_type).await,
             Request::ReadAll(req) => write_fixed_size(writer, req, request_type).await,
             Request::TrimStart(req) => write_fixed_size(writer, req, request_type).await,
-            Request::TrimEnd(req) => write_fixed_size(writer, req, request_type).await,
             Request::Delete(req) => write_fixed_size(writer, req, request_type).await,
             _ => unreachable!(),
         }

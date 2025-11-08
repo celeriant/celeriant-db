@@ -3,7 +3,7 @@ use std::{collections::HashMap, rc::Rc, time::Duration};
 use eventplanedb_core::{files::{helper::{get_or_create_reader, get_or_create_writer}, read_operations::{AggregateReadConfig, ReadOperations}, write_operations::{AggregateWriteConfig, AppendOptions, WriteOperations}}, local_event::LocalEvent};
 use glommio::{spawn_local, sync::{RwLock, Semaphore}, timer::sleep};
 use log::error;
-use eventplanedb_structures::{aggregate_key::AggregateKey, eventplanedb_error::EventPlaneDBError, read_result::ReadResult, request::{DeleteRequest, ReadRequest, Request, TrimStartRequest, WriteRequest}, response::{DeleteResponse, ExistsResponse, ListAggregatesResponse, ListOrganisationsResponse, LockResponse, ReadAllResponse, ReadResponse, Response, TrimEndResponse, TrimStartResponse, UnlockResponse, WriteBatchesResponse, WriteResponse}};
+use eventplanedb_structures::{aggregate_key::AggregateKey, eventplanedb_error::EventPlaneDBError, read_result::ReadResult, request::{DeleteRequest, ReadRequest, Request, TrimStartRequest, WriteRequest}, response::{DeleteResponse, ExistsResponse, ListAggregatesResponse, ListOrganisationsResponse, ReadAllResponse, ReadResponse, Response, TrimStartResponse, WriteBatchesResponse, WriteResponse}};
 
 type SyncResult = Result<(), EventPlaneDBError>;
 
@@ -215,22 +215,6 @@ impl ProcessRequest {
                 })
             }
 
-            Request::Lock(request) => {
-                let correlation_id = request.correlation_id;
-                Response::Lock(LockResponse {
-                    correlation_id,
-                    error: Some(EventPlaneDBError::internal()),
-                })
-            }
-
-            Request::Unlock(request) => {
-                let correlation_id = request.correlation_id;
-                Response::Unlock(UnlockResponse {
-                    correlation_id,
-                    error: Some(EventPlaneDBError::internal()),
-                })
-            }
-
             Request::ReadAll(request) => {
                 let correlation_id = request.correlation_id;
                 Response::ReadAll(ReadAllResponse {
@@ -243,14 +227,6 @@ impl ProcessRequest {
             Request::WriteBatches(request) => {
                 let correlation_id = request.correlation_id;
                 Response::WriteBatches(WriteBatchesResponse {
-                    correlation_id,
-                    error: Some(EventPlaneDBError::internal()),
-                })
-            }
-
-            Request::TrimEnd(request) => {
-                let correlation_id = request.correlation_id;
-                Response::TrimEnd(TrimEndResponse {
                     correlation_id,
                     error: Some(EventPlaneDBError::internal()),
                 })

@@ -110,7 +110,7 @@ fn bench_read_objects_multi_executors(c: &mut Criterion) {
                         let file_paths = file_paths.clone();
                         let positions_list = positions_list.clone();
                         async move {
-                            let executor_id = glommio::executor().id() % file_paths.len();;
+                            let executor_id = glommio::executor().id() % file_paths.len();
                             let file_path = file_paths[executor_id].clone();
                             let positions = positions_list[executor_id].clone();
 

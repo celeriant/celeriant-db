@@ -14,16 +14,13 @@ pub enum ResponseType {
     ListOrganisations = 1,
     ListAggregates = 2,
     Exists = 3,
-    Lock = 4,
-    Unlock = 5,
-    Read = 6,
-    ReadAll = 7,
-    Write = 8,
-    WriteBatches = 9,
-    TrimStart = 10,
-    TrimEnd = 11,
-    Delete = 12,
-    ProtocolError = 13,
+    Read = 4,
+    ReadAll = 5,
+    Write = 6,
+    WriteBatches = 7,
+    TrimStart = 8,
+    Delete = 9,
+    ProtocolError = 10,
 }
 
 impl ResponseType {
@@ -32,16 +29,13 @@ impl ResponseType {
             1 => Ok(ResponseType::ListOrganisations),
             2 => Ok(ResponseType::ListAggregates),
             3 => Ok(ResponseType::Exists),
-            4 => Ok(ResponseType::Lock),
-            5 => Ok(ResponseType::Unlock),
-            6 => Ok(ResponseType::Read),
-            7 => Ok(ResponseType::ReadAll),
-            8 => Ok(ResponseType::Write),
-            9 => Ok(ResponseType::WriteBatches),
-            10 => Ok(ResponseType::TrimStart),
-            11 => Ok(ResponseType::TrimEnd),
-            12 => Ok(ResponseType::Delete),
-            13 => Ok(ResponseType::ProtocolError),
+            4 => Ok(ResponseType::Read),
+            5 => Ok(ResponseType::ReadAll),
+            6 => Ok(ResponseType::Write),
+            7 => Ok(ResponseType::WriteBatches),
+            8 => Ok(ResponseType::TrimStart),
+            9 => Ok(ResponseType::Delete),
+            10 => Ok(ResponseType::ProtocolError),
             _ => Err(WireError::InvalidFormatWithVersion(value)),
         }
     }
@@ -50,10 +44,7 @@ impl ResponseType {
         matches!(
             self,
             ResponseType::Exists
-                | ResponseType::Lock
-                | ResponseType::Unlock
                 | ResponseType::TrimStart
-                | ResponseType::TrimEnd
                 | ResponseType::Delete
                 | ResponseType::WriteBatches
                 | ResponseType::ProtocolError
@@ -82,18 +73,6 @@ pub struct ExistsResponse {
     pub correlation_id: Option<u128>,
     pub error: Option<EventPlaneDBError>,
     pub exists: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
-pub struct LockResponse {
-    pub correlation_id: Option<u128>,
-    pub error: Option<EventPlaneDBError>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
-pub struct UnlockResponse {
-    pub correlation_id: Option<u128>,
-    pub error: Option<EventPlaneDBError>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
@@ -130,12 +109,6 @@ pub struct TrimStartResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
-pub struct TrimEndResponse {
-    pub correlation_id: Option<u128>,
-    pub error: Option<EventPlaneDBError>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct DeleteResponse {
     pub correlation_id: Option<u128>,
     pub error: Option<EventPlaneDBError>,
@@ -152,14 +125,11 @@ pub enum Response {
     ListOrganisations(ListOrganisationsResponse),
     ListAggregates(ListAggregatesResponse),
     Exists(ExistsResponse),
-    Lock(LockResponse),
-    Unlock(UnlockResponse),
     Read(ReadResponse),
     ReadAll(ReadAllResponse),
     Write(WriteResponse),
     WriteBatches(WriteBatchesResponse),
     TrimStart(TrimStartResponse),
-    TrimEnd(TrimEndResponse),
     Delete(DeleteResponse),
     ProtocolError(ProtocolErrorResponse),
 }
@@ -170,14 +140,11 @@ impl Response {
             Response::ListOrganisations(_) => ResponseType::ListOrganisations,
             Response::ListAggregates(_) => ResponseType::ListAggregates,
             Response::Exists(_) => ResponseType::Exists,
-            Response::Lock(_) => ResponseType::Lock,
-            Response::Unlock(_) => ResponseType::Unlock,
             Response::Read(_) => ResponseType::Read,
             Response::ReadAll(_) => ResponseType::ReadAll,
             Response::Write(_) => ResponseType::Write,
             Response::WriteBatches(_) => ResponseType::WriteBatches,
             Response::TrimStart(_) => ResponseType::TrimStart,
-            Response::TrimEnd(_) => ResponseType::TrimEnd,
             Response::Delete(_) => ResponseType::Delete,
             Response::ProtocolError(_) => ResponseType::ProtocolError,
         }
@@ -243,17 +210,8 @@ where
             ResponseType::Exists => {
                 Response::Exists(read_fixed_size(reader, message_length, &mut buffer).await?)
             }
-            ResponseType::Lock => {
-                Response::Lock(read_fixed_size(reader, message_length, &mut buffer).await?)
-            }
-            ResponseType::Unlock => {
-                Response::Unlock(read_fixed_size(reader, message_length, &mut buffer).await?)
-            }
             ResponseType::TrimStart => {
                 Response::TrimStart(read_fixed_size(reader, message_length, &mut buffer).await?)
-            }
-            ResponseType::TrimEnd => {
-                Response::TrimEnd(read_fixed_size(reader, message_length, &mut buffer).await?)
             }
             ResponseType::Delete => {
                 Response::Delete(read_fixed_size(reader, message_length, &mut buffer).await?)
@@ -364,10 +322,7 @@ where
         // Fixed-size responses - no compression needed
         match response {
             Response::Exists(res) => write_fixed_size(writer, res, response_type).await,
-            Response::Lock(res) => write_fixed_size(writer, res, response_type).await,
-            Response::Unlock(res) => write_fixed_size(writer, res, response_type).await,
             Response::TrimStart(res) => write_fixed_size(writer, res, response_type).await,
-            Response::TrimEnd(res) => write_fixed_size(writer, res, response_type).await,
             Response::Delete(res) => write_fixed_size(writer, res, response_type).await,
             Response::WriteBatches(res) => write_fixed_size(writer, res, response_type).await,
             Response::ProtocolError(res) => write_fixed_size(writer, res, response_type).await,
