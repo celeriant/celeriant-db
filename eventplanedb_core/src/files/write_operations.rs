@@ -80,7 +80,7 @@ pub struct WriteOperations {
     max_chunk_size: usize,
     bloom_filter: BloomFilter,
     event_type_dedup: HashSet<u64>,
-    append_event_batch_queue: Vec<AppendEventBatchQueueItem>,
+    pub append_event_batch_queue: Vec<AppendEventBatchQueueItem>,
     file_len_metadata: u64,
     file_len_event_batch: u64,
 }
@@ -120,7 +120,7 @@ fn extract_unique_event_types(events: &[EventItem]) -> ([u64; 4], bool) {
     (bloom_or_event_types, use_bloom)
 }
 
-struct AppendEventBatchQueueItem {
+pub struct AppendEventBatchQueueItem {
     compressed_event_batch_item: Vec<u8>,
     event_batch_item: EventBatchItem,
     metadata_bytes: [u8; METADATA_BATCH_SIZE_BYTES],

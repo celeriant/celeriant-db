@@ -19,6 +19,9 @@ pub struct EventPlaneDBConfig {
     #[arg(long, help = "Number of shards (defaults to CPU count)")]
     pub num_shards: Option<usize>,
 
+    #[arg(long, default_value = "10000", help = "Maximum number of open aggregates")]
+    pub max_open_aggregates: usize,
+
     // Aggregate I/O tuning (read/write)
     #[arg(long, default_value = "1048576", help = "Max chunk size for aggregate reads (1 << 20)")]
     pub aggregate_read_max_chunk_size: u64,
@@ -56,6 +59,7 @@ impl Default for EventPlaneDBConfig {
             aggregate_write_max_chunk_size: 1 << 20,
             aggregate_write_max_data_cache_size_bytes: 1 << 25,
             cache_trim_factor: 10,
+            max_open_aggregates: 10000,
             max_message_size: 64 * 1024 * 1024,
             default_log_level: "info".to_string(),
         }

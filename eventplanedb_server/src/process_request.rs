@@ -1,20 +1,61 @@
-use std::{collections::HashMap, path::{Path, PathBuf}, rc::Rc, time::Duration};
+use std::{collections::HashMap, path::{Path, PathBuf}, rc::Rc, time::Duration, cell::Cell, num::NonZeroUsize};
 
-use eventplanedb_core::{files::{helper::{get_or_create_reader, get_or_create_writer}, read_operations::{AggregateReadConfig, ReadOperations}, write_operations::{AggregateWriteConfig, AppendOptions, WriteOperations}}, local_event::LocalEvent};
+use eventplanedb_core::{files::{helper::{get_or_create_reader, get_or_create_writer, AggregateResources as CoreAggregateResources}, read_operations::{AggregateReadConfig, ReadOperations}, write_operations::{AggregateWriteConfig, AppendOptions, WriteOperations}}, local_event::LocalEvent};
 use glommio::{spawn_local, sync::{RwLock, Semaphore}, timer::sleep};
-use log::error;
+use log::{debug, error, info};
+use lru::LruCache;
 use eventplanedb_structures::{aggregate_info::AggregateInfo, aggregate_key::AggregateKey, batch_metadata_item_pair::BatchMetadataItemPair, directory_filters::DirectoryFilters, eventplanedb_error::EventPlaneDBError, organisation::Organisation, read_all_result::ReadAllResult, read_result::ReadResult, request::{DeleteRequest, ListAggregatesRequest, ListOrganisationsRequest, ReadAllRequest, ReadRequest, Request, TrimStartRequest, WriteBatchesRequest, WriteRequest}, response::{DeleteResponse, ExistsResponse, ListAggregatesResponse, ListOrganisationsResponse, ReadAllResponse, ReadResponse, Response, TrimStartResponse, WriteBatchesResponse, WriteResponse}};
 
 type SyncResult = Result<(), EventPlaneDBError>;
+
+// Server-side aggregate resources with eviction support
+struct AggregateResources {
+    core: CoreAggregateResources,
+    wal_sync_event: Rc<RwLock<Option<Rc<LocalEvent<SyncResult>>>>>,
+    semaphore: Rc<Semaphore>,
+    active_operations: Cell<u32>,
+}
+
+impl AggregateResources {
+    fn new(core: CoreAggregateResources) -> Self {
+        Self {
+            core,
+            wal_sync_event: Rc::new(RwLock::new(None)),
+            semaphore: Rc::new(Semaphore::new(1)),
+            active_operations: Cell::new(0),
+        }
+    }
+
+    fn increment_active(&self) {
+        self.active_operations.set(self.active_operations.get() + 1);
+    }
+
+    fn decrement_active(&self) {
+        self.active_operations.set(self.active_operations.get() - 1);
+    }
+
+    fn is_active(&self) -> bool {
+        self.active_operations.get() > 0
+    }
+
+    async fn has_pending_sync(&self) -> bool {
+        self.wal_sync_event.read().await.unwrap().is_some()
+    }
+
+    async fn has_queued_batches(&self) -> bool {
+        let writer = self.core.writer.read().await.unwrap();
+        !writer.append_event_batch_queue.is_empty()
+    }
+}
 
 pub struct ProcessRequest {
     data_root: PathBuf,
     aggregate_read_config: AggregateReadConfig,
     aggregate_write_config: AggregateWriteConfig,    
-    read_operations: RwLock<HashMap<AggregateKey, Rc<RwLock<ReadOperations>>>>,
-    write_operations: RwLock<HashMap<AggregateKey, Rc<RwLock<WriteOperations>>>>,
-    wal_sync_events: RwLock<HashMap<AggregateKey, Rc<RwLock<Option<Rc<LocalEvent<SyncResult>>>>>>>,
-    semaphores: RwLock<HashMap<AggregateKey, Rc<Semaphore>>>,
+    aggregates: RwLock<LruCache<AggregateKey, AggregateResources>>,
+    core_cache: RwLock<LruCache<AggregateKey, CoreAggregateResources>>,
+    max_open_aggregates: usize,
+    cache_trim_factor: usize,
 }
 
 impl ProcessRequest {
@@ -22,15 +63,18 @@ impl ProcessRequest {
         data_root: PathBuf,
         aggregate_read_config: AggregateReadConfig,
         aggregate_write_config: AggregateWriteConfig,
+        max_open_aggregates: usize,
+        cache_trim_factor: usize,
     ) -> Self {
+        let capacity = NonZeroUsize::new(max_open_aggregates * 2).unwrap();
         Self {
             data_root,
             aggregate_read_config,
             aggregate_write_config,
-            read_operations: RwLock::new(HashMap::new()),
-            write_operations: RwLock::new(HashMap::new()),
-            wal_sync_events: RwLock::new(HashMap::new()),
-            semaphores: RwLock::new(HashMap::new()),
+            aggregates: RwLock::new(LruCache::new(capacity)),
+            core_cache: RwLock::new(LruCache::new(capacity)),
+            max_open_aggregates,
+            cache_trim_factor,
         }
     }
 
@@ -42,79 +86,168 @@ impl ProcessRequest {
             .as_millis() as u64
     }
 
-    // Helper: Get or create writer
+    // Get or create writer
     async fn get_or_create_writer(
         &self,
         aggregate_key: &AggregateKey,
         allow_create: bool,
     ) -> Result<Rc<RwLock<WriteOperations>>, EventPlaneDBError> {
-        get_or_create_writer(
+        // Check if already exists
+        {
+            let mut cache = self.aggregates.write().await.unwrap();
+            if let Some(resources) = cache.get(aggregate_key) {
+                resources.increment_active();
+                return Ok(resources.core.writer.clone());
+            }
+        }
+
+        // Try eviction if needed
+        self.try_evict_if_needed().await;
+
+        // Create using core helper
+        let writer = get_or_create_writer(
             aggregate_key,
             &self.data_root.to_string_lossy(),
             allow_create,
-            &self.read_operations,
+            &self.core_cache,
             &self.aggregate_read_config,
-            &self.write_operations,
             &self.aggregate_write_config,
         )
         .await
-        .map_err(EventPlaneDBError::from)
+        .map_err(EventPlaneDBError::from)?;
+
+        // Get core resources and wrap with server-side resources
+        {
+            let mut core_cache = self.core_cache.write().await.unwrap();
+            if let Some(core) = core_cache.get(aggregate_key) {
+                let resources = AggregateResources::new(CoreAggregateResources {
+                    writer: core.writer.clone(),
+                    reader: core.reader.clone(),
+                });
+                resources.increment_active();
+                
+                let mut cache = self.aggregates.write().await.unwrap();
+                cache.put(aggregate_key.clone(), resources);
+            }
+        }
+
+        Ok(writer)
     }
 
-    // Helper: Get or create reader
+    // Get or create reader
     async fn get_or_create_reader(
         &self,
         aggregate_key: &AggregateKey,
-    ) -> Result<Rc<RwLock<ReadOperations>>, EventPlaneDBError> {        
-        get_or_create_reader(
+    ) -> Result<Rc<RwLock<ReadOperations>>, EventPlaneDBError> {
+        let reader = get_or_create_reader(
             aggregate_key,
             &self.data_root.to_string_lossy(),
             false,
-            &self.read_operations,
+            &self.core_cache,
             &self.aggregate_read_config,
         )
         .await
-        .map_err(|_e| EventPlaneDBError::io_error())
+        .map_err(|_e| EventPlaneDBError::io_error())?;
+
+        // Ensure server-side resources exist
+        {
+            let mut cache = self.aggregates.write().await.unwrap();
+            if !cache.contains(aggregate_key) {
+                let core_cache = self.core_cache.read().await.unwrap();
+                if let Some(core) = core_cache.peek(aggregate_key) {
+                    let resources = AggregateResources::new(CoreAggregateResources {
+                        writer: core.writer.clone(),
+                        reader: core.reader.clone(),
+                    });
+                    cache.put(aggregate_key.clone(), resources);
+                }
+            }
+        }
+
+        Ok(reader)
     }
 
-    // Helper: Get or create WAL sync event
+    // Get or create WAL sync event
     async fn get_or_create_wal_sync_event(
         &self,
         aggregate_key: &AggregateKey,
     ) -> Rc<RwLock<Option<Rc<LocalEvent<SyncResult>>>>> {
-        let existing = {
-            let map = self.wal_sync_events.read().await.unwrap();
-            map.get(aggregate_key).cloned()
-        };
-
-        match existing {
-            Some(event) => event,
-            None => {
-                let event = Rc::new(RwLock::new(None));
-                self.wal_sync_events.write().await.unwrap()
-                    .insert(aggregate_key.clone(), event.clone());
-                event
-            }
+        let cache = self.aggregates.read().await.unwrap();
+        if let Some(resources) = cache.peek(aggregate_key) {
+            return resources.wal_sync_event.clone();
         }
+        
+        // Shouldn't happen, but create if needed
+        Rc::new(RwLock::new(None))
     }
 
-    // Helper: Get or create semaphore
+    // Get or create semaphore
     async fn get_or_create_semaphore(
         &self,
         aggregate_key: &AggregateKey,
     ) -> Rc<Semaphore> {
-        let existing = {
-            let map = self.semaphores.read().await.unwrap();
-            map.get(aggregate_key).cloned()
-        };
+        let cache = self.aggregates.read().await.unwrap();
+        if let Some(resources) = cache.peek(aggregate_key) {
+            return resources.semaphore.clone();
+        }
+        
+        // Shouldn't happen, but create if needed
+        Rc::new(Semaphore::new(1))
+    }
 
-        match existing {
-            Some(sem) => sem,
-            None => {
-                let sem = Rc::new(Semaphore::new(1));
-                self.semaphores.write().await.unwrap()
-                    .insert(aggregate_key.clone(), sem.clone());
-                sem
+    // Release active operation count
+    async fn release_resources(&self, aggregate_key: &AggregateKey) {
+        let cache = self.aggregates.read().await.unwrap();
+        if let Some(resources) = cache.peek(aggregate_key) {
+            resources.decrement_active();
+        }
+    }
+
+    // Try to evict LRU entries if over threshold (lenient)
+    async fn try_evict_if_needed(&self) {
+        let mut cache = self.aggregates.write().await.unwrap();
+        
+        let current_count = cache.len();
+        let trim_threshold = self.max_open_aggregates + 
+            (self.max_open_aggregates / self.cache_trim_factor);
+            
+        if current_count <= trim_threshold {
+            return;
+        }
+
+        let target_evictions = current_count - self.max_open_aggregates;
+        debug!("Evicting {} aggregates from cache", target_evictions);
+
+        for _ in 0..target_evictions {
+            let can_evict = if let Some((_, resources)) = cache.peek_lru() {
+                !resources.is_active() && 
+                !resources.has_pending_sync().await && 
+                !resources.has_queued_batches().await
+            } else {
+                false
+            };
+
+            if can_evict {
+                if let Some((key, resources)) = cache.peek_lru() {
+                    // Sync writer before eviction
+                    let sync_result = {
+                        let mut writer = resources.core.writer.write().await.unwrap();
+                        writer.sync_with_rollback().await
+                    };
+                    
+                    if sync_result.is_ok() {
+                        let key = key.clone();
+                        cache.pop_lru();
+                        
+                        // Also remove from core cache
+                        let mut core_cache = self.core_cache.write().await.unwrap();
+                        core_cache.pop(&key);
+                    } else {
+                        break;
+                    }
+                }
+            } else {
+                break;
             }
         }
     }
@@ -123,7 +256,9 @@ impl ProcessRequest {
         match request {
             Request::Write(request) => {
                 let correlation_id = request.correlation_id;
+                let aggregate_key = AggregateKey::new(request.org_id, request.aggregate_type_id, request.aggregate_id);
                 let result = self.handle_write(request).await;
+                self.release_resources(&aggregate_key).await;
 
                 match result {
                     Ok(append_result) => Response::Write(WriteResponse {
@@ -141,7 +276,9 @@ impl ProcessRequest {
 
             Request::Read(request) => {
                 let correlation_id = request.correlation_id;
+                let aggregate_key = AggregateKey::new(request.org_id, request.aggregate_type_id, request.aggregate_id);
                 let result = self.handle_read(request).await;
+                self.release_resources(&aggregate_key).await;
 
                 match result {
                     Ok(read_result) => Response::Read(ReadResponse {
@@ -160,6 +297,7 @@ impl ProcessRequest {
             Request::Exists(request) => {
                 let aggregate_key = AggregateKey::new(request.org_id, request.aggregate_type_id, request.aggregate_id);
                 let exists = self.get_or_create_reader(&aggregate_key).await.is_ok();
+                self.release_resources(&aggregate_key).await;
 
                 Response::Exists(ExistsResponse {
                     correlation_id: request.correlation_id,
@@ -170,7 +308,9 @@ impl ProcessRequest {
 
             Request::TrimStart(request) => {
                 let correlation_id = request.correlation_id;
+                let aggregate_key = AggregateKey::new(request.org_id, request.aggregate_type_id, request.aggregate_id);
                 let result = self.handle_trim_start(request).await;
+                self.release_resources(&aggregate_key).await;
 
                 match result {
                     Ok(()) => Response::TrimStart(TrimStartResponse {
@@ -238,7 +378,9 @@ impl ProcessRequest {
 
             Request::ReadAll(request) => {
                 let correlation_id = request.correlation_id;
+                let aggregate_key = AggregateKey::new(request.org_id, request.aggregate_type_id, request.aggregate_id);
                 let result = self.handle_read_all(request).await;
+                self.release_resources(&aggregate_key).await;
 
                 match result {
                     Ok(result) => Response::ReadAll(ReadAllResponse {
@@ -256,7 +398,9 @@ impl ProcessRequest {
 
             Request::WriteBatches(request) => {
                 let correlation_id = request.correlation_id;
+                let aggregate_key = AggregateKey::new(request.org_id, request.aggregate_type_id, request.aggregate_id);
                 let result = self.handle_write_batches(request).await;
+                self.release_resources(&aggregate_key).await;
 
                 match result {
                     Ok(()) => Response::WriteBatches(WriteBatchesResponse {
@@ -299,17 +443,15 @@ impl ProcessRequest {
                 file_len_event_batch,
                 request.from_event_batch_index,
                 request.to_event_batch_index,
-                None, // No max_bytes limit for now
+                None,
             ).await?
         };
 
-        // Update metadata cache if needed
         if !read_result.uncached_metadata_set.is_empty() {
             let mut w_reader = reader.write().await.unwrap();
             w_reader.update_metadata_cache(read_result.uncached_metadata_set);
         }
 
-        // Convert to BatchMetadataItemPair
         let batches: Vec<BatchMetadataItemPair> = read_result.batches.into_iter()
             .map(|(event_batch_metadata, event_batch_item)| BatchMetadataItemPair {
                 event_batch_metadata,
@@ -490,17 +632,13 @@ impl ProcessRequest {
             wo.queue_events_in_memory(request.events, &append_options)?
         };
 
-        // Handle durable write
         if let Some(delay_us) = request.durable_write_with_delay_us {
             let wal_sync_event = self.get_or_create_wal_sync_event(&aggregate_key).await;
-            
-            // Wait for write to disk and propagate error if it occurs
             sync_with_delay(&writer, &wal_sync_event, Duration::from_micros(delay_us)).await?;
         } else {
-            // Spawn background sync without waiting
             let writer_clone = writer.clone();
             let wal_sync_event = self.get_or_create_wal_sync_event(&aggregate_key).await;
-            let delay_us = 200; // Default delay
+            let delay_us = 200;
 
             spawn_local(async move {
                 let sync_result = sync_with_delay(&writer_clone, &wal_sync_event, Duration::from_micros(delay_us)).await;
@@ -520,7 +658,6 @@ impl ProcessRequest {
         let aggregate_key = AggregateKey::new(request.org_id, request.aggregate_type_id, request.aggregate_id);
         let writer = self.get_or_create_writer(&aggregate_key, false).await?;
 
-        // Try cache first
         {
             let r_writer = writer.read().await.unwrap();
             if let Ok(result) = r_writer.maybe_read_cached_events(&request.filters) {
@@ -531,7 +668,6 @@ impl ProcessRequest {
             }
         }
 
-        // Cache miss, read from disk
         let reader = self.get_or_create_reader(&aggregate_key).await?;
 
         let read_result = {
@@ -545,7 +681,6 @@ impl ProcessRequest {
             ).await?
         };
 
-        // Update metadata cache if needed
         if !read_result.uncached_metadata_set.is_empty() {
             let mut w_reader = reader.write().await.unwrap();
             w_reader.update_metadata_cache(read_result.uncached_metadata_set);
@@ -597,23 +732,17 @@ impl ProcessRequest {
     ) -> Result<(), EventPlaneDBError> {
         let aggregate_key = AggregateKey::new(request.org_id, request.aggregate_type_id, request.aggregate_id);
 
-        // Remove from all caches
+        // Remove from caches
         {
-            let mut write_cache = self.write_operations.write().await.unwrap();
-            let mut read_cache = self.read_operations.write().await.unwrap();
-            let mut wal_events = self.wal_sync_events.write().await.unwrap();
-            let mut sems = self.semaphores.write().await.unwrap();
-
-            write_cache.remove(&aggregate_key);
-            read_cache.remove(&aggregate_key);
-            wal_events.remove(&aggregate_key);
-            sems.remove(&aggregate_key);
+            let mut cache = self.aggregates.write().await.unwrap();
+            let mut core_cache = self.core_cache.write().await.unwrap();
+            cache.pop(&aggregate_key);
+            core_cache.pop(&aggregate_key);
         }
 
-        // Delete files from filesystem
+        // Delete files
         let metadata_path = self.data_root.join(format!("{}/{}/{}/metadata.bin", request.org_id, request.aggregate_type_id, request.aggregate_id));
         let events_path = self.data_root.join(format!("{}/{}/{}/event_batches.bin", request.org_id, request.aggregate_type_id, request.aggregate_id));
-
 
         std::fs::remove_file(&metadata_path)
             .map_err(|_e| EventPlaneDBError::io_error())?;

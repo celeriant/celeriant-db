@@ -78,9 +78,15 @@ mod test_basic_read_write {
     #[test]
     fn basic_read_write_two_writers() {
         let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
+            use std::num::NonZeroUsize;
+            use lru::LruCache;
+            use crate::files::helper::AggregateResources;
             
-            let read_operations_cache = Rc::new(RwLock::new(HashMap::<AggregateKey, Rc<RwLock<ReadOperations>>>::new()));
-            let write_operations_cache = Rc::new(RwLock::new(HashMap::<AggregateKey, Rc<RwLock<WriteOperations>>>::new()));
+            let aggregates_cache = Rc::new(RwLock::new(
+                LruCache::<AggregateKey, AggregateResources>::new(
+                    NonZeroUsize::new(1000).unwrap()
+                )
+            ));
 
             let aggregate_key = AggregateKey::new(1, 1, 1);
 
@@ -114,7 +120,16 @@ mod test_basic_read_write {
                     user_id: None
                 };
 
-                let writer = get_or_create_writer(&aggregate_key, data_root_folder, true, &read_operations_cache, &aggregate_read_config, &write_operations_cache, &aggregate_write_config).await.unwrap();
+                let writer = get_or_create_writer(
+                    &aggregate_key,
+                    data_root_folder,
+                    true, // allow_create
+                    &aggregates_cache,
+                    &aggregate_read_config,
+                    &aggregate_write_config,
+                )
+                .await
+                .unwrap();
                 
                 let append_result = writer.write().await.unwrap().queue_events_in_memory(events, &append_options).unwrap();
                 assert_eq!(append_result.next_event_batch_index, 2);
@@ -140,7 +155,16 @@ mod test_basic_read_write {
                     user_id: Some(34343)
                 };
                 
-                let writer = get_or_create_writer(&aggregate_key, data_root_folder, false, &read_operations_cache, &aggregate_read_config, &write_operations_cache, &aggregate_write_config).await.unwrap();
+                let writer = get_or_create_writer(
+                    &aggregate_key,
+                    data_root_folder,
+                    false, // allow_create
+                    &aggregates_cache,
+                    &aggregate_read_config,
+                    &aggregate_write_config,
+                )
+                .await
+                .unwrap();
                 let append_result = writer.write().await.unwrap().queue_events_in_memory(events, &append_options).unwrap();
                 assert_eq!(append_result.next_event_batch_index, 3);
 
@@ -151,8 +175,25 @@ mod test_basic_read_write {
             let mut read_filters = ReadFilters::new(1);
             read_filters = read_filters.min_event_timestamp(334);
 
-            let writer = get_or_create_writer(&aggregate_key, data_root_folder, false, &read_operations_cache, &aggregate_read_config, &write_operations_cache, &aggregate_write_config).await.unwrap();
-            let reader = get_or_create_reader(&aggregate_key, data_root_folder, false, &read_operations_cache, &aggregate_read_config).await.unwrap();
+            let writer = get_or_create_writer(
+                &aggregate_key,
+                data_root_folder,
+                true, // allow_create
+                &aggregates_cache,
+                &aggregate_read_config,
+                &aggregate_write_config,
+            )
+            .await
+            .unwrap();
+            let reader = get_or_create_reader(
+                &aggregate_key,
+                data_root_folder,
+                false,
+                &aggregates_cache,
+                &aggregate_read_config,
+            )
+            .await
+            .unwrap();
             let read_result = reader.read().await.unwrap().read(writer.read().await.unwrap().minimum_available_event_batch_index, writer.read().await.unwrap().file_len_metadata(), writer.read().await.unwrap().file_len_event_batch(), &read_filters).await.unwrap();
             check_read_3(&read_result, 2);
 
@@ -164,9 +205,15 @@ mod test_basic_read_write {
     #[test]
     fn basic_read_write() {
         let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
+            use std::num::NonZeroUsize;
+            use lru::LruCache;
+            use crate::files::helper::AggregateResources;
             
-            let read_operations_cache = Rc::new(RwLock::new(HashMap::<AggregateKey, Rc<RwLock<ReadOperations>>>::new()));
-            let write_operations_cache = Rc::new(RwLock::new(HashMap::<AggregateKey, Rc<RwLock<WriteOperations>>>::new()));
+            let aggregates_cache = Rc::new(RwLock::new(
+                LruCache::<AggregateKey, AggregateResources>::new(
+                    NonZeroUsize::new(1000).unwrap()
+                )
+            ));
 
             let aggregate_key = AggregateKey::new(1, 1, 1);
 
@@ -199,7 +246,16 @@ mod test_basic_read_write {
                 user_id: None
             };
 
-            let writer = get_or_create_writer(&aggregate_key, data_root_folder, true, &read_operations_cache, &aggregate_read_config, &write_operations_cache, &aggregate_write_config).await.unwrap();
+            let writer = get_or_create_writer(
+                &aggregate_key,
+                data_root_folder,
+                true, // allow_create
+                &aggregates_cache,
+                &aggregate_read_config,
+                &aggregate_write_config,
+            )
+            .await
+            .unwrap();
             let append_result = writer.write().await.unwrap().queue_events_in_memory(events, &append_options).unwrap();
             assert_eq!(append_result.next_event_batch_index, 2);
 
@@ -238,7 +294,15 @@ mod test_basic_read_write {
             let cache_read = writer.read().await.unwrap().maybe_read_cached_events(&read_filters).unwrap();
             check_read_1(&cache_read, event_id, 0);
 
-            let reader = get_or_create_reader(&aggregate_key, data_root_folder, false, &read_operations_cache, &aggregate_read_config).await.unwrap();
+            let reader = get_or_create_reader(
+                &aggregate_key,
+                data_root_folder,
+                false,
+                &aggregates_cache,
+                &aggregate_read_config,
+            )
+            .await
+            .unwrap();
             
             let read_result = reader.read().await.unwrap().read(writer.read().await.unwrap().minimum_available_event_batch_index, writer.read().await.unwrap().file_len_metadata(), writer.read().await.unwrap().file_len_event_batch(), &read_filters).await.unwrap();
 
@@ -263,7 +327,15 @@ mod test_basic_read_write {
             check_read_3(&cache_result, 0);
 
             //Let's update the cache now and check cache is used for metadata
-            let reader2 = get_or_create_reader(&aggregate_key, data_root_folder, false, &read_operations_cache, &aggregate_read_config).await.unwrap();
+            let reader2 = get_or_create_reader(
+                &aggregate_key,
+                data_root_folder,
+                false,
+                &aggregates_cache,
+                &aggregate_read_config,
+            )
+            .await
+            .unwrap();
             reader2.write().await.unwrap().update_metadata_cache(read_result.uncached_metadata_set);       
 
             //Cache should be idempotent

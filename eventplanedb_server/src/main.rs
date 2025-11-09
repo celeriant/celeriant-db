@@ -59,6 +59,7 @@ fn main() {
     let listen_address = config.listen_address.clone();
     let data_root = config.data_root.clone();
     let max_message_size = config.max_message_size;
+    let max_open_aggregates = config.max_open_aggregates;
 
     // Create a pool of executors, one per shard
     // Each executor will run threads pinned to a single core
@@ -67,7 +68,7 @@ fn main() {
         nbr_shards,
         online_cpus,
     ))
-    .on_all_shards(enclose!((mesh, listen_address, data_root, max_message_size) move || async move {
+    .on_all_shards(enclose!((mesh, listen_address, data_root, max_message_size, max_open_aggregates) move || async move {
 
         // Join the full mesh to get this shard's sender and all receivers
         // The receivers are for receiving messages from other shards (synonymous with executors)
@@ -88,6 +89,8 @@ fn main() {
             data_root.clone(),
             aggregate_read_config.clone(),
             aggregate_write_config.clone(),
+            max_open_aggregates,
+            aggregate_write_config.cache_trim_factor
         ));
 
         // There is a receiver for each other shard that we must listen to
