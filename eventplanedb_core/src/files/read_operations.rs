@@ -303,8 +303,8 @@ impl ReadOperations {
         &self,
     ) -> Result<WriteOperationsDataRequirementsAndCachedData, ReadError> {
 
-        let file_len_metadata = self.metadata_dma_file.file_size().await?;
-        let file_len_event_batch = self.event_batches_dma_file.file_size().await?;
+        let mut file_len_metadata = self.metadata_dma_file.file_size().await?;
+        let mut file_len_event_batch = self.event_batches_dma_file.file_size().await?;
 
         let event_batches_dma_file = self.event_batches_dma_file.dup()?;
         let metadata_dma_file = self.metadata_dma_file.dup()?;
@@ -329,10 +329,32 @@ impl ReadOperations {
         }
 
         let rec_size = METADATA_BATCH_SIZE_BYTES as u64;
-        assert!(
-            file_len_metadata % rec_size == 0,
-            "metadata file is not a multiple of METADATA_BATCH_SIZE_BYTES"
-        );
+        
+        // Trim metadata file if not aligned (corrupt partial record at end)
+        if file_len_metadata % rec_size != 0 {
+            let aligned_len = (file_len_metadata / rec_size) * rec_size;
+            metadata_dma_file.truncate(aligned_len).await?;
+            file_len_metadata = aligned_len;
+            
+            // If we truncated everything, return initial state
+            if file_len_metadata == 0 {
+                let write_operations_data_requirements = WriteOperationsDataRequirements {
+                    event_batches_dma_file,
+                    metadata_dma_file,
+                    file_len_event_batch,
+                    file_len_metadata,
+                    data_cache: VecDeque::new(),
+                    minimum_available_event_batch_index: 0,
+                    next_event_index: 1,
+                    next_event_batch_index: 1,
+                    client_event_indexes: HashMap::new(),
+                };
+                return Ok(WriteOperationsDataRequirementsAndCachedData {
+                    uncached_metadata_set: vec![],
+                    write_operations_data_requirements,
+                });
+            }
+        }
 
         // Snapshot cache (tail of file)
         let cached_snapshot: Vec<&MetadataWithAbsolutePosition> = self.cache_metadata.iter().collect();
@@ -442,6 +464,100 @@ impl ReadOperations {
             for m in uncached_metadata_set.iter_mut().rev() {
                 base_pos = base_pos.saturating_sub(m.event_batch_metadata.compressed_size);
                 m.event_batch_absolute_position = base_pos;
+            }
+        }
+
+        // Verify CRC of last metadata entry against event batch bytes
+        // Get the last metadata entry (prefer cached, fall back to uncached)
+        let last_metadata = if let Some(last_cached) = cached_snapshot.last() {
+            Some(*last_cached)
+        } else if let Some(last_uncached) = uncached_metadata_set.last() {
+            Some(last_uncached)
+        } else {
+            None
+        };
+
+        if let Some(last_meta) = last_metadata {
+            // Read the last event batch
+            let last_batch_pos = AbsoluteObjectPosition {
+                start_pos: last_meta.event_batch_absolute_position,
+                end_pos: last_meta.event_batch_absolute_position + last_meta.event_batch_metadata.compressed_size,
+            };
+
+            let last_batch_pos_start_pos = last_batch_pos.start_pos;
+
+            let last_batch_bytes = read_objects::read_objects_absolute(
+                &event_batches_dma_file,
+                &[last_batch_pos],
+                self.config.max_chunk_size,
+            ).await?;
+
+            let last_actual_crc = crc32fast::hash(&last_batch_bytes[0]);
+
+            if last_actual_crc != last_meta.event_batch_metadata.events_crc {
+                // Last entry is corrupt, check second-to-last
+                let second_last_metadata = if cached_snapshot.len() >= 2 {
+                    Some(cached_snapshot[cached_snapshot.len() - 2])
+                } else if cached_snapshot.len() == 1 && !uncached_metadata_set.is_empty() {
+                    Some(uncached_metadata_set.last().unwrap())
+                } else if uncached_metadata_set.len() >= 2 {
+                    Some(&uncached_metadata_set[uncached_metadata_set.len() - 2])
+                } else {
+                    None
+                };
+
+                if let Some(second_last_meta) = second_last_metadata {
+                    // Read the second-to-last event batch
+                    let second_last_batch_pos = AbsoluteObjectPosition {
+                        start_pos: second_last_meta.event_batch_absolute_position,
+                        end_pos: second_last_meta.event_batch_absolute_position + second_last_meta.event_batch_metadata.compressed_size,
+                    };
+
+                    let second_last_batch_pos_start_pos = second_last_batch_pos.start_pos;
+
+                    let second_last_batch_bytes = read_objects::read_objects_absolute(
+                        &event_batches_dma_file,
+                        &[second_last_batch_pos],
+                        self.config.max_chunk_size,
+                    ).await?;
+
+                    let second_last_actual_crc = crc32fast::hash(&second_last_batch_bytes[0]);
+
+                    if second_last_actual_crc == second_last_meta.event_batch_metadata.events_crc {
+                        // Second-to-last is valid, trim to that point
+                        let trim_metadata_pos = file_len_metadata - rec_size;
+                        let trim_event_batch_pos = second_last_meta.event_batch_absolute_position + second_last_meta.event_batch_metadata.compressed_size;
+
+                        metadata_dma_file.truncate(trim_metadata_pos).await?;
+                        event_batches_dma_file.truncate(trim_event_batch_pos).await?;
+
+                        file_len_metadata = trim_metadata_pos;
+                        file_len_event_batch = trim_event_batch_pos;
+
+                        // Remove last entry from uncached_metadata_set if it's there
+                        if !uncached_metadata_set.is_empty() {
+                            uncached_metadata_set.pop();
+                        }
+                    } else {
+                        // Both last and second-to-last are corrupt
+                        return Err(ReadError::CorruptEventBatch {
+                            expected_crc: second_last_meta.event_batch_metadata.events_crc,
+                            actual_crc: second_last_actual_crc,
+                            event_batch_index: second_last_meta.event_batch_metadata.event_batch_index,
+                            file_pos_event_batch: second_last_batch_pos_start_pos,
+                            file_pos_metadata: file_len_metadata - (2 * rec_size),
+                        });
+                    }
+                } else {
+                    // Only one entry exists and it's corrupt
+                    return Err(ReadError::CorruptEventBatch {
+                        expected_crc: last_meta.event_batch_metadata.events_crc,
+                        actual_crc: last_actual_crc,
+                        event_batch_index: last_meta.event_batch_metadata.event_batch_index,
+                        file_pos_event_batch: last_batch_pos_start_pos,
+                        file_pos_metadata: file_len_metadata - rec_size,
+                    });
+                }
             }
         }
 
