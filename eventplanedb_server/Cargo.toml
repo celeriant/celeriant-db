@@ -22,3 +22,4 @@ mimalloc.workspace = true
 serde.workspace = true
 rmp-serde.workspace = true
 tempfile.workspace = true
+walkdir.workspace = true

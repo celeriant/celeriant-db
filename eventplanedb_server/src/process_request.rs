@@ -1,9 +1,9 @@
-use std::{collections::HashMap, rc::Rc, time::Duration};
+use std::{collections::HashMap, path::{Path, PathBuf}, rc::Rc, time::Duration};
 
 use eventplanedb_core::{files::{helper::{get_or_create_reader, get_or_create_writer}, read_operations::{AggregateReadConfig, ReadOperations}, write_operations::{AggregateWriteConfig, AppendOptions, WriteOperations}}, local_event::LocalEvent};
 use glommio::{spawn_local, sync::{RwLock, Semaphore}, timer::sleep};
 use log::error;
-use eventplanedb_structures::{aggregate_key::AggregateKey, batch_metadata_item_pair::BatchMetadataItemPair, eventplanedb_error::EventPlaneDBError, read_all_result::ReadAllResult, read_result::ReadResult, request::{DeleteRequest, ReadAllRequest, ReadRequest, Request, TrimStartRequest, WriteBatchesRequest, WriteRequest}, response::{DeleteResponse, ExistsResponse, ListAggregatesResponse, ListOrganisationsResponse, ReadAllResponse, ReadResponse, Response, TrimStartResponse, WriteBatchesResponse, WriteResponse}};
+use eventplanedb_structures::{aggregate_info::AggregateInfo, aggregate_key::AggregateKey, batch_metadata_item_pair::BatchMetadataItemPair, directory_filters::DirectoryFilters, eventplanedb_error::EventPlaneDBError, organisation::Organisation, read_all_result::ReadAllResult, read_result::ReadResult, request::{DeleteRequest, ListAggregatesRequest, ListOrganisationsRequest, ReadAllRequest, ReadRequest, Request, TrimStartRequest, WriteBatchesRequest, WriteRequest}, response::{DeleteResponse, ExistsResponse, ListAggregatesResponse, ListOrganisationsResponse, ReadAllResponse, ReadResponse, Response, TrimStartResponse, WriteBatchesResponse, WriteResponse}};
 
 type SyncResult = Result<(), EventPlaneDBError>;
 
@@ -199,20 +199,38 @@ impl ProcessRequest {
 
             Request::ListOrganisations(request) => {
                 let correlation_id = request.correlation_id;
-                Response::ListOrganisations(ListOrganisationsResponse {
-                    correlation_id,
-                    error: Some(EventPlaneDBError::internal()),
-                    organisations: vec![],
-                })
+                let result = self.handle_list_organisations(request);
+
+                match result {
+                    Ok(organisations) => Response::ListOrganisations(ListOrganisationsResponse {
+                        correlation_id,
+                        error: None,
+                        organisations,
+                    }),
+                    Err(e) => Response::ListOrganisations(ListOrganisationsResponse {
+                        correlation_id,
+                        error: Some(e),
+                        organisations: vec![],
+                    }),
+                }
             }
 
             Request::ListAggregates(request) => {
                 let correlation_id = request.correlation_id;
-                Response::ListAggregates(ListAggregatesResponse {
-                    correlation_id,
-                    error: Some(EventPlaneDBError::internal()),
-                    aggregates: vec![],
-                })
+                let result = self.handle_list_aggregates(request);
+
+                match result {
+                    Ok(aggregates) => Response::ListAggregates(ListAggregatesResponse {
+                        correlation_id,
+                        error: None,
+                        aggregates,
+                    }),
+                    Err(e) => Response::ListAggregates(ListAggregatesResponse {
+                        correlation_id,
+                        error: Some(e),
+                        aggregates: vec![],
+                    }),
+                }
             }
 
             Request::ReadAll(request) => {
@@ -313,6 +331,139 @@ impl ProcessRequest {
         wo.prepend_batches(&request.batches).await?;
 
         Ok(())
+    }
+
+    fn handle_list_organisations(
+        &self,
+        request: ListOrganisationsRequest,
+    ) -> Result<Vec<Organisation>, EventPlaneDBError> {
+        let data_path = Path::new("data");
+        
+        let mut orgs = Vec::new();
+        
+        let entries = std::fs::read_dir(data_path)
+            .map_err(|_| EventPlaneDBError::io_error())?;
+        
+        for entry in entries {
+            let entry = entry.map_err(|_| EventPlaneDBError::io_error())?;
+            let path = entry.path();
+            
+            if !path.is_dir() {
+                continue;
+            }
+            
+            // Parse directory name as org_id
+            let org_id = match path.file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|s| s.parse::<u128>().ok())
+            {
+                Some(id) => id,
+                None => continue,
+            };
+            
+            // Get directory metadata
+            let metadata = match std::fs::metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            
+            let created_at = metadata.created()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            
+            let modified_at = metadata.modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            
+            // Calculate disk usage by walking the directory tree
+            let disk_usage = calculate_disk_usage(&path)?;
+            
+            // Apply filters
+            if let Some(after) = request.filters.created_after_or_on {
+                if created_at < after { continue; }
+            }
+            if let Some(before) = request.filters.created_before_or_on {
+                if created_at > before { continue; }
+            }
+            if let Some(after) = request.filters.modified_after_or_on {
+                if modified_at < after { continue; }
+            }
+            if let Some(before) = request.filters.modified_before_or_on {
+                if modified_at > before { continue; }
+            }
+            if let Some(max) = request.filters.disk_usage_less_than_or_equal {
+                if disk_usage > max { continue; }
+            }
+            if let Some(min) = request.filters.disk_usage_greater_than_or_equal {
+                if disk_usage < min { continue; }
+            }
+            
+            orgs.push(Organisation {
+                org_id,
+                created_at,
+                modified_at,
+                disk_usage,
+            });
+        }
+        
+        Ok(orgs)
+    }
+
+    fn handle_list_aggregates(
+        &self,
+        request: ListAggregatesRequest,
+    ) -> Result<Vec<AggregateInfo>, EventPlaneDBError> {
+        let org_id = request.org_id;
+        let aggregate_type_id = request.aggregate_type_id;
+        let filters = request.filters;
+        
+        let mut aggregates = Vec::new();
+        
+        let base_path = if let Some(type_id) = aggregate_type_id {
+            // List specific aggregate type
+            PathBuf::from(format!("data/{}/{}", org_id, type_id))
+        } else {
+            // List all aggregate types
+            PathBuf::from(format!("data/{}", org_id))
+        };
+        
+        if !base_path.exists() {
+            return Ok(aggregates);
+        }
+        
+        if aggregate_type_id.is_some() {
+            // List aggregate instances
+            list_aggregate_instances(&base_path, org_id, aggregate_type_id.unwrap(), &filters, &mut aggregates)?;
+        } else {
+            // List aggregate types, then their instances
+            let type_entries = std::fs::read_dir(&base_path)
+                .map_err(|_| EventPlaneDBError::io_error())?;
+            
+            for type_entry in type_entries {
+                let type_entry = type_entry.map_err(|_| EventPlaneDBError::io_error())?;
+                let type_path = type_entry.path();
+                
+                if !type_path.is_dir() {
+                    continue;
+                }
+                
+                let type_id = match type_path.file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|s| s.parse::<u128>().ok())
+                {
+                    Some(id) => id,
+                    None => continue,
+                };
+                
+                list_aggregate_instances(&type_path, org_id, type_id, &filters, &mut aggregates)?;
+            }
+        }
+        
+        Ok(aggregates)
     }
 
     async fn handle_write(
@@ -523,4 +674,99 @@ async fn sync_with_delay(
             event.listen().await
         }
     }
+}
+
+fn calculate_disk_usage(path: &Path) -> Result<u64, EventPlaneDBError> {
+    let mut total = 0u64;
+    
+    for entry in walkdir::WalkDir::new(path) {
+        let entry = entry.map_err(|_| EventPlaneDBError::io_error())?;
+        if entry.file_type().is_file() {
+            total += entry.metadata()
+                .map_err(|_| EventPlaneDBError::io_error())?
+                .len();
+        }
+    }
+    
+    Ok(total)
+}
+
+// Helper function to list aggregate instances in a directory
+fn list_aggregate_instances(
+    path: &Path,
+    org_id: u128,
+    aggregate_type_id: u128,
+    filters: &DirectoryFilters,
+    aggregates: &mut Vec<AggregateInfo>,
+) -> Result<(), EventPlaneDBError> {
+    let entries = std::fs::read_dir(path)
+        .map_err(|_| EventPlaneDBError::io_error())?;
+    
+    for entry in entries {
+        let entry = entry.map_err(|_| EventPlaneDBError::io_error())?;
+        let aggregate_path = entry.path();
+        
+        if !aggregate_path.is_dir() {
+            continue;
+        }
+        
+        let aggregate_id = match aggregate_path.file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|s| s.parse::<u128>().ok())
+        {
+            Some(id) => id,
+            None => continue,
+        };
+        
+        // Get directory metadata
+        let metadata = match std::fs::metadata(&aggregate_path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        
+        let created_at = metadata.created()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        
+        let modified_at = metadata.modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        
+        let disk_usage = calculate_disk_usage(&aggregate_path)?;
+        
+        // Apply filters
+        if let Some(after) = filters.created_after_or_on {
+            if created_at < after { continue; }
+        }
+        if let Some(before) = filters.created_before_or_on {
+            if created_at > before { continue; }
+        }
+        if let Some(after) = filters.modified_after_or_on {
+            if modified_at < after { continue; }
+        }
+        if let Some(before) = filters.modified_before_or_on {
+            if modified_at > before { continue; }
+        }
+        if let Some(max) = filters.disk_usage_less_than_or_equal {
+            if disk_usage > max { continue; }
+        }
+        if let Some(min) = filters.disk_usage_greater_than_or_equal {
+            if disk_usage < min { continue; }
+        }
+        
+        aggregates.push(AggregateInfo {
+            org_id,
+            aggregate_type_id,
+            aggregate_id,
+            created_at,
+            modified_at,
+            disk_usage,
+        });
+    }
+    
+    Ok(())
 }

@@ -537,6 +537,7 @@ dependencies = [
  "serde",
  "tempfile",
  "thiserror",
+ "walkdir",
 ]
 
 [[package]]
