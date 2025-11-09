@@ -1,8 +1,8 @@
-use std::{collections::HashMap, path::{Path, PathBuf}, rc::Rc, time::Duration, cell::Cell, num::NonZeroUsize};
+use std::{path::{Path, PathBuf}, rc::Rc, time::Duration, cell::Cell, num::NonZeroUsize};
 
 use eventplanedb_core::{files::{helper::{get_or_create_reader, get_or_create_writer, AggregateResources as CoreAggregateResources}, read_operations::{AggregateReadConfig, ReadOperations}, write_operations::{AggregateWriteConfig, AppendOptions, WriteOperations}}, local_event::LocalEvent};
 use glommio::{spawn_local, sync::{RwLock, Semaphore}, timer::sleep};
-use log::{debug, error, info};
+use log::{debug, error};
 use lru::LruCache;
 use eventplanedb_structures::{aggregate_info::AggregateInfo, aggregate_key::AggregateKey, batch_metadata_item_pair::BatchMetadataItemPair, directory_filters::DirectoryFilters, eventplanedb_error::EventPlaneDBError, organisation::Organisation, read_all_result::ReadAllResult, read_result::ReadResult, request::{DeleteRequest, ListAggregatesRequest, ListOrganisationsRequest, ReadAllRequest, ReadRequest, Request, TrimStartRequest, WriteBatchesRequest, WriteRequest}, response::{DeleteResponse, ExistsResponse, ListAggregatesResponse, ListOrganisationsResponse, ReadAllResponse, ReadResponse, Response, TrimStartResponse, WriteBatchesResponse, WriteResponse}};
 
@@ -210,7 +210,7 @@ impl ProcessRequest {
         let current_count = cache.len();
         let trim_threshold = self.max_open_aggregates + 
             (self.max_open_aggregates / self.cache_trim_factor);
-            
+
         if current_count <= trim_threshold {
             return;
         }
