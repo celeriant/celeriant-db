@@ -125,6 +125,11 @@ struct AppendEventBatchQueueItem {
     event_batch_metadata: EventBatchMetadata,
 }
 
+struct PrependEventBatchQueueItem {
+    compressed_event_batch_item: Vec<u8>,
+    metadata_bytes: [u8; METADATA_BATCH_SIZE_BYTES],
+}
+
 pub struct WriteOperationsDataRequirements {
     pub file_len_metadata: u64,
     pub metadata_dma_file: DmaFile,
@@ -472,17 +477,12 @@ impl WriteOperations {
         Ok(())
     }
 
-    pub async fn trim_start(
+    async fn trim_and_prepend(
         &mut self, 
+        event_batches: Vec<PrependEventBatchQueueItem>,
         bytes_to_trim_metadata: u64, 
         bytes_to_trim_event_batch: u64,
     ) -> Result<(DmaFile, DmaFile), AppendError> {
-        if bytes_to_trim_metadata == 0 || bytes_to_trim_event_batch == 0 {
-            return Err(AppendError::WriteError { 
-                message: "Cannot trim 0 bytes".to_string() 
-            });
-        }
-        
         let metadata_file_path = self.metadata_dma_file.path().unwrap().to_path_buf();
         let event_batch_file_path = self.event_batches_dma_file.path().unwrap().to_path_buf();
 
@@ -490,14 +490,38 @@ impl WriteOperations {
         let temp_path_metadata = format!("{}.tmp", metadata_file_path.display());
         let temp_path_event_batch = format!("{}.tmp", event_batch_file_path.display());
 
-        // Trim metadata file
+        // Prepare prepend data from event_batches
+        let total_prepend_event_batch_size: usize = event_batches.iter()
+            .map(|item| item.compressed_event_batch_item.len())
+            .sum();
+        let total_prepend_metadata_size: usize = event_batches.iter()
+            .map(|item| item.metadata_bytes.len())
+            .sum();
+
+        // Trim and prepend metadata file
         {
             let metadata_remaining_size = self.file_len_metadata.saturating_sub(bytes_to_trim_metadata);
             let temp_metadata_file = DmaFile::create(&temp_path_metadata).await?;
             
+            let mut write_pos = 0u64;
+
+            // First, write the prepended metadata
+            if total_prepend_metadata_size > 0 {
+                let mut meta_buf = temp_metadata_file.alloc_dma_buffer(total_prepend_metadata_size);
+                let mut meta_offset = 0;
+                for item in event_batches.iter() {
+                    let len = item.metadata_bytes.len();
+                    meta_buf.as_bytes_mut()[meta_offset..meta_offset+len]
+                        .copy_from_slice(&item.metadata_bytes);
+                    meta_offset += len;
+                }
+                temp_metadata_file.write_at(meta_buf, write_pos).await?;
+                write_pos += total_prepend_metadata_size as u64;
+            }
+
+            // Then, copy the trimmed original data
             let mut offset = bytes_to_trim_metadata;
             let mut remaining = metadata_remaining_size;
-            let mut write_pos = 0u64;
             
             while remaining > 0 {
                 let to_read = std::cmp::min(remaining, self.max_chunk_size as u64);
@@ -517,14 +541,30 @@ impl WriteOperations {
             temp_metadata_file.close().await?;
         }
 
-        // Trim event batch file
+        // Trim and prepend event batch file
         {
             let event_batch_remaining_size = self.file_len_event_batch.saturating_sub(bytes_to_trim_event_batch);
             let temp_event_batch_file = DmaFile::create(&temp_path_event_batch).await?;
             
+            let mut write_pos = 0u64;
+
+            // First, write the prepended event batches
+            if total_prepend_event_batch_size > 0 {
+                let mut event_buf = temp_event_batch_file.alloc_dma_buffer(total_prepend_event_batch_size);
+                let mut event_offset = 0;
+                for item in event_batches.iter() {
+                    let len = item.compressed_event_batch_item.len();
+                    event_buf.as_bytes_mut()[event_offset..event_offset+len]
+                        .copy_from_slice(&item.compressed_event_batch_item);
+                    event_offset += len;
+                }
+                temp_event_batch_file.write_at(event_buf, write_pos).await?;
+                write_pos += total_prepend_event_batch_size as u64;
+            }
+
+            // Then, copy the trimmed original data
             let mut offset = bytes_to_trim_event_batch;
             let mut remaining = event_batch_remaining_size;
-            let mut write_pos = 0u64;
             
             while remaining > 0 {
                 let to_read = std::cmp::min(remaining, self.max_chunk_size as u64);
@@ -544,7 +584,6 @@ impl WriteOperations {
             temp_event_batch_file.close().await?;
         }
 
-
         // Commit by renaming temp files over originals
         std::fs::rename(&temp_path_metadata, &metadata_file_path)
             .map_err(|e| AppendError::WriteError { message: format!("metadata rename failed: {}", e) })?;
@@ -555,9 +594,13 @@ impl WriteOperations {
         let new_metadata_file = DmaFile::open(&metadata_file_path).await?;
         let new_event_batch_file = DmaFile::open(&event_batch_file_path).await?;
 
-        // Update cached file lengths
-        self.file_len_metadata = self.file_len_metadata.saturating_sub(bytes_to_trim_metadata);
-        self.file_len_event_batch = self.file_len_event_batch.saturating_sub(bytes_to_trim_event_batch);
+        // Update cached file lengths (subtract trimmed, add prepended)
+        self.file_len_metadata = self.file_len_metadata
+            .saturating_sub(bytes_to_trim_metadata)
+            .saturating_add(total_prepend_metadata_size as u64);
+        self.file_len_event_batch = self.file_len_event_batch
+            .saturating_sub(bytes_to_trim_event_batch)
+            .saturating_add(total_prepend_event_batch_size as u64);
 
         // Duplicate file handles for return
         let dup_metadata_file = new_metadata_file.dup()?;
@@ -568,6 +611,96 @@ impl WriteOperations {
         self.event_batches_dma_file = new_event_batch_file;
 
         Ok((dup_metadata_file, dup_event_batch_file))
+    }
+
+    pub async fn trim_start(
+        &mut self, 
+        bytes_to_trim_metadata: u64, 
+        bytes_to_trim_event_batch: u64,
+    ) -> Result<(DmaFile, DmaFile), AppendError> {
+        if bytes_to_trim_metadata == 0 || bytes_to_trim_event_batch == 0 {
+            return Err(AppendError::WriteError { 
+                message: "Cannot trim 0 bytes".to_string() 
+            });
+        }
+        
+        self.trim_and_prepend(vec![], bytes_to_trim_metadata, bytes_to_trim_event_batch).await
+    }
+
+    pub async fn prepend_batches(
+        &mut self, 
+        event_batches: &Vec<BatchMetadataItemPair>,
+    ) -> Result<(DmaFile, DmaFile), AppendError> {
+
+        if event_batches.is_empty() {
+            return Err(AppendError::WriteError { 
+                message: "Cannot prepend empty batch list".to_string() 
+            });
+        }
+
+        // Validate contiguous event_batch_indexes
+        for i in 1..event_batches.len() {
+            let prev_index = event_batches[i-1].event_batch_metadata.event_batch_index;
+            let curr_index = event_batches[i].event_batch_metadata.event_batch_index;
+            
+            if curr_index != prev_index + 1 {
+                return Err(AppendError::WriteError { 
+                    message: format!(
+                        "Event batch indexes are not contiguous: {} followed by {}", 
+                        prev_index, curr_index
+                    ) 
+                });
+            }
+        }
+
+        // Validate that last event_batch_index is exactly one less than minimum_available_event_batch_index
+        let last_batch_index = event_batches.last().unwrap().event_batch_metadata.event_batch_index;
+        if last_batch_index + 1 != self.minimum_available_event_batch_index {
+            return Err(AppendError::WriteError { 
+                message: format!(
+                    "Last prepend batch index {} must be exactly one less than minimum_available_event_batch_index {}", 
+                    last_batch_index, self.minimum_available_event_batch_index
+                ) 
+            });
+        }
+
+        // Convert BatchMetadataItemPair to AppendEventBatchQueueItem
+        let mut event_batches_queued = Vec::with_capacity(event_batches.len());
+        
+        for pair in event_batches.iter() {
+            let metadata = &pair.event_batch_metadata;
+            
+            // Serialize and compress the event batch item
+            let (_, compressed_event_batch_item) = to_wire_format_variable(
+                &pair.event_batch_item, 
+                CompressionType::from_tuple(metadata.compression_type, None),
+            ).map_err(|e| AppendError::SerializationError { 
+                message: format!("Failed to serialize event batch for prepend: {}", e) 
+            })?;
+
+            // Serialize metadata
+            let mut metadata_bytes = [0u8; METADATA_BATCH_SIZE_BYTES];
+            bincode::encode_into_slice(
+                metadata, 
+                &mut metadata_bytes, 
+                BINCODE_CONFIG_FIXED
+            ).map_err(|e| AppendError::SerializationError { 
+                message: format!("Failed to serialize metadata for prepend: {}", e) 
+            })?;
+
+            event_batches_queued.push(PrependEventBatchQueueItem {
+                compressed_event_batch_item,
+                metadata_bytes,
+            });
+        }
+
+        // Perform trim and prepend (with 0 bytes to trim)
+        let result = self.trim_and_prepend(event_batches_queued, 0, 0).await?;
+
+        // Update minimum_available_event_batch_index to the first prepended batch
+        self.minimum_available_event_batch_index = event_batches[0].event_batch_metadata.event_batch_index;
+
+        Ok(result)
     }
 
     pub fn maybe_read_cached_events(&self, filters: &ReadFilters) -> Result<CacheableReadResult, CacheReadError> {

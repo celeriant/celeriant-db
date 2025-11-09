@@ -3,7 +3,7 @@ use std::{collections::HashMap, rc::Rc, time::Duration};
 use eventplanedb_core::{files::{helper::{get_or_create_reader, get_or_create_writer}, read_operations::{AggregateReadConfig, ReadOperations}, write_operations::{AggregateWriteConfig, AppendOptions, WriteOperations}}, local_event::LocalEvent};
 use glommio::{spawn_local, sync::{RwLock, Semaphore}, timer::sleep};
 use log::error;
-use eventplanedb_structures::{aggregate_key::AggregateKey, eventplanedb_error::EventPlaneDBError, read_result::ReadResult, request::{DeleteRequest, ReadRequest, Request, TrimStartRequest, WriteRequest}, response::{DeleteResponse, ExistsResponse, ListAggregatesResponse, ListOrganisationsResponse, ReadAllResponse, ReadResponse, Response, TrimStartResponse, WriteBatchesResponse, WriteResponse}};
+use eventplanedb_structures::{aggregate_key::AggregateKey, eventplanedb_error::EventPlaneDBError, read_result::ReadResult, request::{DeleteRequest, ReadRequest, Request, TrimStartRequest, WriteBatchesRequest, WriteRequest}, response::{DeleteResponse, ExistsResponse, ListAggregatesResponse, ListOrganisationsResponse, ReadAllResponse, ReadResponse, Response, TrimStartResponse, WriteBatchesResponse, WriteResponse}};
 
 type SyncResult = Result<(), EventPlaneDBError>;
 
@@ -226,12 +226,34 @@ impl ProcessRequest {
 
             Request::WriteBatches(request) => {
                 let correlation_id = request.correlation_id;
-                Response::WriteBatches(WriteBatchesResponse {
-                    correlation_id,
-                    error: Some(EventPlaneDBError::internal()),
-                })
+                let result = self.handle_write_batches(request).await;
+
+                match result {
+                    Ok(()) => Response::WriteBatches(WriteBatchesResponse {
+                        correlation_id,
+                        error: None,
+                    }),
+                    Err(e) => Response::WriteBatches(WriteBatchesResponse {
+                        correlation_id,
+                        error: Some(e),
+                    }),
+                }
             }
+
         }
+    }
+
+    async fn handle_write_batches(
+        &self,
+        request: WriteBatchesRequest,
+    ) -> Result<(), EventPlaneDBError> {
+        let aggregate_key = AggregateKey::new(request.org_id, request.aggregate_type_id, request.aggregate_id);
+        let writer = self.get_or_create_writer(&aggregate_key, request.allow_create).await?;
+
+        let mut wo = writer.write().await.unwrap();
+        wo.prepend_batches(&request.batches).await?;
+
+        Ok(())
     }
 
     async fn handle_write(
