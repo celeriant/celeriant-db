@@ -3,7 +3,7 @@ use std::{collections::HashMap, rc::Rc, time::Duration};
 use eventplanedb_core::{files::{helper::{get_or_create_reader, get_or_create_writer}, read_operations::{AggregateReadConfig, ReadOperations}, write_operations::{AggregateWriteConfig, AppendOptions, WriteOperations}}, local_event::LocalEvent};
 use glommio::{spawn_local, sync::{RwLock, Semaphore}, timer::sleep};
 use log::error;
-use eventplanedb_structures::{aggregate_key::AggregateKey, eventplanedb_error::EventPlaneDBError, read_result::ReadResult, request::{DeleteRequest, ReadRequest, Request, TrimStartRequest, WriteBatchesRequest, WriteRequest}, response::{DeleteResponse, ExistsResponse, ListAggregatesResponse, ListOrganisationsResponse, ReadAllResponse, ReadResponse, Response, TrimStartResponse, WriteBatchesResponse, WriteResponse}};
+use eventplanedb_structures::{aggregate_key::AggregateKey, batch_metadata_item_pair::BatchMetadataItemPair, eventplanedb_error::EventPlaneDBError, read_all_result::ReadAllResult, read_result::ReadResult, request::{DeleteRequest, ReadAllRequest, ReadRequest, Request, TrimStartRequest, WriteBatchesRequest, WriteRequest}, response::{DeleteResponse, ExistsResponse, ListAggregatesResponse, ListOrganisationsResponse, ReadAllResponse, ReadResponse, Response, TrimStartResponse, WriteBatchesResponse, WriteResponse}};
 
 type SyncResult = Result<(), EventPlaneDBError>;
 
@@ -217,11 +217,20 @@ impl ProcessRequest {
 
             Request::ReadAll(request) => {
                 let correlation_id = request.correlation_id;
-                Response::ReadAll(ReadAllResponse {
-                    correlation_id,
-                    error: Some(EventPlaneDBError::internal()),
-                    result: None,
-                })
+                let result = self.handle_read_all(request).await;
+
+                match result {
+                    Ok(result) => Response::ReadAll(ReadAllResponse {
+                        correlation_id,
+                        error: None,
+                        result: Some(result),
+                    }),
+                    Err(e) => Response::ReadAll(ReadAllResponse {
+                        correlation_id,
+                        error: Some(e),
+                        result: None,
+                    }),
+                }
             }
 
             Request::WriteBatches(request) => {
@@ -241,6 +250,56 @@ impl ProcessRequest {
             }
 
         }
+    }
+
+    async fn handle_read_all(
+        &self,
+        request: ReadAllRequest,
+    ) -> Result<ReadAllResult, EventPlaneDBError> {
+        let aggregate_key = AggregateKey::new(request.org_id, request.aggregate_type_id, request.aggregate_id);
+        let writer = self.get_or_create_writer(&aggregate_key, false).await?;
+
+        let (file_len_metadata, file_len_event_batch, minimum_available_event_batch_index) = {
+            let r_writer = writer.read().await.unwrap();
+            (
+                r_writer.file_len_metadata(),
+                r_writer.file_len_event_batch(),
+                r_writer.minimum_available_event_batch_index,
+            )
+        };
+
+        let reader = self.get_or_create_reader(&aggregate_key).await?;
+
+        let read_result = {
+            let r_reader = reader.read().await.unwrap();
+            r_reader.read_all(
+                minimum_available_event_batch_index,
+                file_len_metadata,
+                file_len_event_batch,
+                request.from_event_batch_index,
+                request.to_event_batch_index,
+                None, // No max_bytes limit for now
+            ).await?
+        };
+
+        // Update metadata cache if needed
+        if !read_result.uncached_metadata_set.is_empty() {
+            let mut w_reader = reader.write().await.unwrap();
+            w_reader.update_metadata_cache(read_result.uncached_metadata_set);
+        }
+
+        // Convert to BatchMetadataItemPair
+        let batches: Vec<BatchMetadataItemPair> = read_result.batches.into_iter()
+            .map(|(event_batch_metadata, event_batch_item)| BatchMetadataItemPair {
+                event_batch_metadata,
+                event_batch_item,
+            })
+            .collect();
+
+        Ok(ReadAllResult {
+            batches,
+            next_event_batch_index: read_result.next_event_batch_index,
+        })
     }
 
     async fn handle_write_batches(

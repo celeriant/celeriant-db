@@ -89,7 +89,10 @@ pub struct ReadAllRequest {
     pub org_id: u128,
     pub aggregate_type_id: u128,
     pub aggregate_id: u128,
-    pub filters: ReadFilters,
+    /// Starting server ID to begin reading from (inclusive). Will error if not found in stream.
+    pub from_event_batch_index: u64,
+    /// End reading event batches at this server id (inclusive). Will error if reached end of stream before this ID.
+    pub to_event_batch_index: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]

@@ -69,6 +69,13 @@ pub struct CacheableReadResult {
     pub next_event_batch_index: Option<u64>,
 }
 
+#[derive(Debug)]
+pub struct CacheableReadAllResult {
+    pub uncached_metadata_set: Vec<MetadataWithAbsolutePosition>,
+    pub batches: Vec<(EventBatchMetadata, EventBatchItem)>,
+    pub next_event_batch_index: Option<u64>,
+}
+
 async fn get_existing_file_as_dma<P: AsRef<Path>>(path: P) -> Result<DmaFile, GlommioError<()>> {
     let dma_file = OpenOptions::new()
         .read(true)
@@ -87,6 +94,87 @@ pub struct WriteOperationsDataRequirementsAndCachedData {
 }
 
 impl ReadOperations {
+
+    pub async fn read_all(
+        &self, 
+        minimum_available_event_batch_index: u64, 
+        file_len_metadata: u64, 
+        file_len_event_batch: u64,
+        from_event_batch_index: u64,
+        to_event_batch_index: Option<u64>,
+        max_bytes: Option<usize>,
+    ) -> Result<CacheableReadAllResult, ReadError> {
+        
+        let (uncached_metadata_set, cached_metadata_set_snapshot) = self.get_metadata_range(
+            minimum_available_event_batch_index,
+            from_event_batch_index,
+            file_len_metadata,
+            file_len_event_batch,
+            to_event_batch_index,
+        ).await?;
+
+        if uncached_metadata_set.is_empty() && cached_metadata_set_snapshot.is_empty() {
+            return Ok(CacheableReadAllResult {
+                uncached_metadata_set: Vec::new(),
+                batches: Vec::new(),
+                next_event_batch_index: None,
+            });
+        }
+
+        let mut metadata_for_reading: Vec<&MetadataWithAbsolutePosition> = Vec::with_capacity(
+            uncached_metadata_set.len() + cached_metadata_set_snapshot.len()
+        );
+        metadata_for_reading.extend(uncached_metadata_set.iter());
+        metadata_for_reading.extend(cached_metadata_set_snapshot.iter());
+
+        let next_event_batch_index = apply_max_bytes_pagination(&mut metadata_for_reading, max_bytes)?;
+
+        let object_positions: Vec<AbsoluteObjectPosition> = metadata_for_reading.iter()
+            .map(|m| AbsoluteObjectPosition { 
+                start_pos: m.event_batch_absolute_position, 
+                end_pos: m.event_batch_absolute_position + m.event_batch_metadata.compressed_size 
+            }).collect();
+
+        let event_batches_bytes_set = read_objects::read_objects_absolute(
+            &self.event_batches_dma_file, 
+            &object_positions, 
+            self.config.max_chunk_size
+        ).await?;
+
+        assert!(event_batches_bytes_set.len() == metadata_for_reading.len());
+
+        let mut batches: Vec<(EventBatchMetadata, EventBatchItem)> = Vec::with_capacity(event_batches_bytes_set.len());
+        
+        for (index, event_batch_bytes) in event_batches_bytes_set.iter().enumerate() {
+            let metadata = &metadata_for_reading[index].event_batch_metadata;
+            let actual_crc = crc32fast::hash(event_batch_bytes);
+
+            if actual_crc != metadata.events_crc {
+                return Err(ReadError::CorruptEventBatch { 
+                    expected_crc: metadata.events_crc, 
+                    actual_crc, 
+                    event_batch_index: metadata.event_batch_index,
+                    file_pos_event_batch: object_positions[index].start_pos,
+                    file_pos_metadata: metadata_for_reading[index].event_batch_absolute_position
+                });
+            }
+
+            let compression_type = CompressionType::from_tuple(metadata.compression_type, None);
+            let event_batch = from_wire_format_variable::<EventBatchItem>(
+                event_batch_bytes,
+                compression_type,
+                metadata.uncompressed_size as usize,
+            ).map_err(|e| ReadError::SerializationError { message: e.to_string() })?;
+
+            batches.push((metadata.clone(), event_batch));
+        }
+
+        Ok(CacheableReadAllResult {
+            uncached_metadata_set,
+            batches,
+            next_event_batch_index,
+        })
+    }
 
     async fn get_metadata_range(
         &self,
@@ -796,4 +884,51 @@ fn bloom_filter_from_bytes(bloom_bytes: &[u64; BLOOM_BYTES / 8]) -> BloomFilter 
     BloomFilter::from_vec(bloom_bytes.to_vec())
         .seed(&BLOOM_HASH_SEED)
         .hashes(BLOOM_HASH_COUNT)
+}
+
+fn apply_max_bytes_pagination(
+    metadata_for_reading: &mut Vec<&MetadataWithAbsolutePosition>,
+    max_bytes: Option<usize>,
+) -> Result<Option<u64>, ReadError> {
+    let max_bytes = match max_bytes {
+        Some(limit) => limit as u64,
+        None => return Ok(None),
+    };
+
+    if metadata_for_reading.is_empty() {
+        return Ok(None);
+    }
+
+    let mut cumulative_size: u64 = 0;
+    let mut cut_index: Option<usize> = None;
+
+    for (index, batch) in metadata_for_reading.iter().enumerate() {
+        cumulative_size += batch.event_batch_metadata.compressed_size;
+
+        if cumulative_size > max_bytes {
+            cut_index = Some(index);
+            break;
+        }
+    }
+
+    if let Some(index) = cut_index {
+        let next_event_batch_index = if index < metadata_for_reading.len() {
+            Some(metadata_for_reading[index].event_batch_metadata.event_batch_index)
+        } else {
+            None
+        };
+
+        metadata_for_reading.truncate(index);
+
+        if metadata_for_reading.is_empty() {
+            return Err(ReadError::MaxBytesTooSmall {
+                current_max_bytes: max_bytes,
+                required_max_bytes: cumulative_size
+            });
+        }
+
+        Ok(next_event_batch_index)
+    } else {
+        Ok(None)
+    }
 }
