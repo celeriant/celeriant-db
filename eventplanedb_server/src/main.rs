@@ -1,3 +1,4 @@
+use clap::Parser;
 use std::{cell::RefCell, os::fd::{FromRawFd, IntoRawFd}, rc::Rc};
 
 use eventplanedb_core::files::{read_operations::AggregateReadConfig, write_operations::AggregateWriteConfig};
@@ -7,10 +8,11 @@ use futures_lite::AsyncWriteExt;
 use log::{debug, error, info};
 
 mod process_request;
+mod config;
 
 use mimalloc::MiMalloc;
 
-use crate::process_request::ProcessRequest;
+use crate::{config::EventPlaneDBConfig, process_request::ProcessRequest};
 
 //TODO: Compare with default allocator in benchmarks
 #[global_allocator]
@@ -24,31 +26,39 @@ struct Msg {
 
 //TODO: Graceful shutdown handling with signal handling (SIGINT, SIGTERM)
 fn main() {
+    // Parse CLI arguments
+    let config = EventPlaneDBConfig::parse();
+    
+    // Initialize logger with configured level
     env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Info) // Set default level
+        .filter_level(config.default_log_level.parse().unwrap_or(log::LevelFilter::Info))
         .init();
     
     info!("Starting EventPlaneDB Server...");
-    
-    // Take advantage of all available CPUs
-    //TODO: Server configuration via cli parameters or config file
-    let nbr_shards = num_cpus::get();
+    info!("Configuration: data_root={:?}, listen_address={}", config.data_root, config.listen_address);
+
+    // Determine number of shards
+    let nbr_shards = config.num_shards.unwrap_or_else(num_cpus::get);
     let online_cpus = CpuSet::online().ok();
-    info!("Number of CPUs: {nbr_shards}, Online CPUs: {online_cpus:?}");
+    info!("Number of shards: {nbr_shards}, Online CPUs: {online_cpus:?}");
 
     let aggregate_read_config = AggregateReadConfig {
-        max_chunk_size: 1 << 20,
-        max_data_cache_size_bytes: 1 << 20,
+        max_chunk_size: config.aggregate_read_max_chunk_size,
+        max_data_cache_size_bytes: config.aggregate_read_max_data_cache_size_bytes,
     };
 
     let aggregate_write_config = AggregateWriteConfig {
-        max_data_cache_size_bytes: 1 << 25,
-        max_chunk_size: 1 << 20,
+        max_data_cache_size_bytes: config.aggregate_write_max_data_cache_size_bytes,
+        cache_trim_factor: config.cache_trim_factor,
+        max_chunk_size: config.aggregate_write_max_chunk_size,
     };
 
     // A full mesh channel is required to allow any shard to communicate with any other shard without locking primitives
-    let mesh_channel_size = 1024;
-    let mesh = MeshBuilder::<Msg, Full>::full(nbr_shards, mesh_channel_size);
+    let mesh = MeshBuilder::<Msg, Full>::full(nbr_shards, config.mesh_channel_size);
+    
+    let listen_address = config.listen_address.clone();
+    let data_root = config.data_root.clone();
+    let max_message_size = config.max_message_size;
 
     // Create a pool of executors, one per shard
     // Each executor will run threads pinned to a single core
@@ -57,7 +67,7 @@ fn main() {
         nbr_shards,
         online_cpus,
     ))
-    .on_all_shards(enclose!((mesh) move || async move {
+    .on_all_shards(enclose!((mesh, listen_address, data_root, max_message_size) move || async move {
 
         // Join the full mesh to get this shard's sender and all receivers
         // The receivers are for receiving messages from other shards (synonymous with executors)
@@ -75,6 +85,7 @@ fn main() {
         // Our stateful request processor, pinned per shard
         // Each shard has its own instance of the engine
         let process_request = Rc::new(ProcessRequest::new(
+            data_root.clone(),
             aggregate_read_config.clone(),
             aggregate_write_config.clone(),
         ));
@@ -103,15 +114,13 @@ fn main() {
                     // Continue on the tcp connection to read more data from the client
                     // Note that we might still have to forward it on to the right shard again
                     // We need to clone sender again here as inside is a spawn local
-                    process_tcp_stream(shard_id, nbr_shards, tcp_stream, sender_clone.clone(), process_request.clone()).await;
+                    process_tcp_stream(shard_id, nbr_shards, tcp_stream, sender_clone.clone(), process_request.clone(), max_message_size).await;
                 }
             }).detach();
         }
 
         // Now that we have setup our listeners for other shards, we can start accepting TCP connections from clients
-        // We will accept connections on port 10000 on localhost
-        //TODO: Include in server configuration
-        let listener = TcpListener::bind("0.0.0.0:10000").unwrap();
+        let listener = TcpListener::bind(&listen_address).unwrap();
         info!("Shard {shard_id} listening on {}", listener.local_addr().unwrap());
 
         // An infinite loop to accept incoming TCP connections
@@ -123,7 +132,7 @@ fn main() {
                         Ok(addr) => debug!("Shard {shard_id} accepted connection from {addr}"),
                         Err(_) => error!("Shard {shard_id} accepted connection from unknown address"),
                     }
-                    process_tcp_stream(shard_id, nbr_shards, tcp_stream.buffered(), sender.clone(), process_request.clone()).await;
+                    process_tcp_stream(shard_id, nbr_shards, tcp_stream.buffered(), sender.clone(), process_request.clone(), max_message_size).await;
                 }
                 Err(e) => {
                     error!("Shard {shard_id} failed to accept connection: {e}");
@@ -152,13 +161,14 @@ async fn process_tcp_stream(
     mut tcp_stream: glommio::net::TcpStream<glommio::net::Preallocated>, 
     sender: Rc<RefCell<Senders<Msg>>>,
     process_request: Rc<ProcessRequest>,
+    max_message_size: u32,
 ) {
     // It's critical to spawn local here as this allows accepting of new connections
     // It also allows processing messages sent from other shards 
     // Both of these can happen with spawn local while still listening to an open TCP connection    
     spawn_local(async move {
         loop {
-            let (request, message_version) = match read_from_tcp_stream(shard_id, &mut tcp_stream).await {
+            let (request, message_version) = match read_from_tcp_stream(shard_id, &mut tcp_stream, max_message_size).await {
                 Some((num, message_version)) => (num, message_version),
                 None => return,
             };
@@ -217,9 +227,10 @@ async fn write_to_tcp_stream(response: Response, tcp_stream: &mut glommio::net::
 
 async fn read_from_tcp_stream(
     shard_id: usize, 
-    tcp_stream: &mut glommio::net::TcpStream<glommio::net::Preallocated>
+    tcp_stream: &mut glommio::net::TcpStream<glommio::net::Preallocated>,
+    max_message_size: u32,
 ) -> Option<(Request, u32)> {
-    match read_request(tcp_stream).await {
+    match read_request(tcp_stream, max_message_size).await {
         Ok((request, version)) => Some((request, version)),
         Err(WireError::Io(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
             debug!("Shard {shard_id} client disconnected");

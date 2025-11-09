@@ -6,9 +6,6 @@ use crate::eventplanedb_error::EventPlaneDBError;
 use crate::{compression_type::CompressionType};
 
 
-/// Protocol constants
-//TODO: Make configurable - max message size, stack buffer size
-pub const MAX_MESSAGE_SIZE: u32 = 64 * 1024 * 1024; // 64MB max message size
 pub const STACK_BUFFER_SIZE: u32 = 30 * 1024; // 30KB stack buffer threshold
 pub const PROTOCOL_VERSION_V1: u32 = 1;
 pub const PROTOCOL_VERSION_V2: u32 = 2;
@@ -202,7 +199,7 @@ impl From<crate::wire_format::WireError> for EventPlaneDBError {
             WireError::BincodeEncode(_e) => EventPlaneDBError::serialization_error(),
             WireError::BincodeDecode(_e) => EventPlaneDBError::serialization_error(),
             WireError::MessageTooLarge(size) => {
-                EventPlaneDBError::message_too_large(size as u64, crate::wire_format::MAX_MESSAGE_SIZE as u64)
+                EventPlaneDBError::message_too_large(size as u64)
             }
             WireError::UnsupportedVersion(version) => {
                 EventPlaneDBError::unsupported_protocol_version(version)

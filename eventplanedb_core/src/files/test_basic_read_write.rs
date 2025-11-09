@@ -91,6 +91,7 @@ mod test_basic_read_write {
 
             let aggregate_write_config = AggregateWriteConfig {
                 max_data_cache_size_bytes: 1 << 25,
+                cache_trim_factor: 25,
                 max_chunk_size: 1 << 20,
             };
 
@@ -176,6 +177,7 @@ mod test_basic_read_write {
 
             let aggregate_write_config = AggregateWriteConfig {
                 max_data_cache_size_bytes: 1 << 25,
+                cache_trim_factor: 25,
                 max_chunk_size: 1 << 20,
             };
 

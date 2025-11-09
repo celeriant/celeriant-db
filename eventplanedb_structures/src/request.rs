@@ -2,7 +2,7 @@ use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
 use crate::{
-    batch_metadata_item_pair::BatchMetadataItemPair, compression_type::CompressionType, constants::BINCODE_CONFIG_FIXED, directory_filters::DirectoryFilters, event_item::EventItem, read_filters::ReadFilters, wire_format::{MAX_MESSAGE_SIZE, PROTOCOL_VERSION_V2, WireError, from_wire_format_variable, to_wire_format_variable}
+    batch_metadata_item_pair::BatchMetadataItemPair, compression_type::CompressionType, constants::BINCODE_CONFIG_FIXED, directory_filters::DirectoryFilters, event_item::EventItem, read_filters::ReadFilters, wire_format::{PROTOCOL_VERSION_V2, WireError, from_wire_format_variable, to_wire_format_variable}
 };
 
 const HEADER_SIZE: usize = 13; // version(4) + type(4) + length(4) + compression(1)
@@ -200,7 +200,7 @@ where
 }
 
 /// Read a request from the wire protocol
-pub async fn read_request<R>(reader: &mut R) -> Result<(Request, u32), WireError>
+pub async fn read_request<R>(reader: &mut R, max_message_size: u32) -> Result<(Request, u32), WireError>
 where
     R: AsyncReadExt + Unpin,
 {
@@ -247,13 +247,13 @@ where
     } else {
         match request_type {
             RequestType::ListOrganisations => {
-                Request::ListOrganisations(read_variable_size(reader, message_length, compression_type).await?)
+                Request::ListOrganisations(read_variable_size(reader, message_length, compression_type, max_message_size).await?)
             }
             RequestType::Write => {
-                Request::Write(read_variable_size(reader, message_length, compression_type).await?)
+                Request::Write(read_variable_size(reader, message_length, compression_type, max_message_size).await?)
             }
             RequestType::WriteBatches => {
-                Request::WriteBatches(read_variable_size(reader, message_length, compression_type).await?)
+                Request::WriteBatches(read_variable_size(reader, message_length, compression_type, max_message_size).await?)
             }
             _ => unreachable!(),
         }
@@ -293,6 +293,7 @@ async fn write_variable_size<W, T>(
     message: &T,
     request_type: RequestType,
     compression_type: CompressionType,
+    max_message_size: usize,
 ) -> Result<(), WireError>
 where
     W: AsyncWriteExt + Unpin,
@@ -301,7 +302,7 @@ where
     // Encode and compress
     let (_uncompressed_size, encoded) = to_wire_format_variable(message, compression_type)?;
 
-    if encoded.len() > MAX_MESSAGE_SIZE as usize {
+    if encoded.len() > max_message_size as usize {
         return Err(WireError::MessageTooLarge(encoded.len() as u32));
     }
 
@@ -326,6 +327,7 @@ pub async fn write_request<W>(
     writer: &mut W,
     request: &Request,
     compression_type: CompressionType,
+    max_message_size: usize,
 ) -> Result<(), WireError>
 where
     W: AsyncWriteExt + Unpin,
@@ -346,21 +348,21 @@ where
     } else {
         // Variable-size requests - with compression
         match request {
-            Request::ListOrganisations(req) => write_variable_size(writer, req, request_type, compression_type).await,
-            Request::Write(req) => write_variable_size(writer, req, request_type, compression_type).await,
-            Request::WriteBatches(req) => write_variable_size(writer, req, request_type, compression_type).await,
+            Request::ListOrganisations(req) => write_variable_size(writer, req, request_type, compression_type, max_message_size).await,
+            Request::Write(req) => write_variable_size(writer, req, request_type, compression_type, max_message_size).await,
+            Request::WriteBatches(req) => write_variable_size(writer, req, request_type, compression_type, max_message_size).await,
             _ => unreachable!(),
         }
     }
 }
 
 /// Read a variable-size request from the wire (length and compression already read in header)
-async fn read_variable_size<R, T>(reader: &mut R, message_length: u32, compression_type: CompressionType) -> Result<T, WireError>
+async fn read_variable_size<R, T>(reader: &mut R, message_length: u32, compression_type: CompressionType, max_message_size: u32) -> Result<T, WireError>
 where
     R: AsyncReadExt + Unpin,
     T: Decode<()>,
 {
-    if message_length > MAX_MESSAGE_SIZE {
+    if message_length > max_message_size {
         return Err(WireError::MessageTooLarge(message_length));
     }
 

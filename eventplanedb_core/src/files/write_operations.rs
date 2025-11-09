@@ -53,6 +53,7 @@ impl From<GlommioError<()>> for AppendError {
 #[derive(Debug, Clone)]
 pub struct AggregateWriteConfig {
     pub max_data_cache_size_bytes: usize,
+    pub cache_trim_factor: usize,
     pub max_chunk_size: usize
 }
 
@@ -75,6 +76,7 @@ pub struct WriteOperations {
     next_event_batch_index: u64,
     client_event_indexes: HashMap<u128, u64>,
     max_data_cache_size_bytes: usize,
+    cache_trim_factor: usize,
     max_chunk_size: usize,
     bloom_filter: BloomFilter,
     event_type_dedup: HashSet<u64>,
@@ -173,6 +175,7 @@ impl WriteOperations {
             minimum_available_event_batch_index: data_requirements.minimum_available_event_batch_index,
             client_event_indexes: data_requirements.client_event_indexes,
             max_data_cache_size_bytes: aggregate_write_config.max_data_cache_size_bytes,
+            cache_trim_factor: aggregate_write_config.cache_trim_factor,
             max_chunk_size: aggregate_write_config.max_chunk_size,
             bloom_filter,
             event_type_dedup: HashSet::new(),
@@ -281,7 +284,7 @@ impl WriteOperations {
 
         // Phase 2: Trim old events from front if cache significantly exceeds max size
         // Only trim if we're over by at least 10% to avoid constant trimming overhead
-        let trim_threshold = self.max_data_cache_size_bytes + (self.max_data_cache_size_bytes / 25);
+        let trim_threshold = self.max_data_cache_size_bytes + (self.max_data_cache_size_bytes / self.cache_trim_factor);
         
         if self.total_cache_size_bytes > trim_threshold {
             // Calculate how many items to remove in one pass

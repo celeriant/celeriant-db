@@ -8,6 +8,7 @@ use eventplanedb_structures::{aggregate_info::AggregateInfo, aggregate_key::Aggr
 type SyncResult = Result<(), EventPlaneDBError>;
 
 pub struct ProcessRequest {
+    data_root: PathBuf,
     aggregate_read_config: AggregateReadConfig,
     aggregate_write_config: AggregateWriteConfig,    
     read_operations: RwLock<HashMap<AggregateKey, Rc<RwLock<ReadOperations>>>>,
@@ -18,10 +19,12 @@ pub struct ProcessRequest {
 
 impl ProcessRequest {
     pub fn new(
+        data_root: PathBuf,
         aggregate_read_config: AggregateReadConfig,
         aggregate_write_config: AggregateWriteConfig,
     ) -> Self {
         Self {
+            data_root,
             aggregate_read_config,
             aggregate_write_config,
             read_operations: RwLock::new(HashMap::new()),
@@ -47,7 +50,7 @@ impl ProcessRequest {
     ) -> Result<Rc<RwLock<WriteOperations>>, EventPlaneDBError> {
         get_or_create_writer(
             aggregate_key,
-            "data",
+            &self.data_root.to_string_lossy(),
             allow_create,
             &self.read_operations,
             &self.aggregate_read_config,
@@ -65,7 +68,7 @@ impl ProcessRequest {
     ) -> Result<Rc<RwLock<ReadOperations>>, EventPlaneDBError> {        
         get_or_create_reader(
             aggregate_key,
-            "data",
+            &self.data_root.to_string_lossy(),
             false,
             &self.read_operations,
             &self.aggregate_read_config,
@@ -337,11 +340,10 @@ impl ProcessRequest {
         &self,
         request: ListOrganisationsRequest,
     ) -> Result<Vec<Organisation>, EventPlaneDBError> {
-        let data_path = Path::new("data");
         
         let mut orgs = Vec::new();
         
-        let entries = std::fs::read_dir(data_path)
+        let entries = std::fs::read_dir(&self.data_root)
             .map_err(|_| EventPlaneDBError::io_error())?;
         
         for entry in entries {
@@ -425,10 +427,10 @@ impl ProcessRequest {
         
         let base_path = if let Some(type_id) = aggregate_type_id {
             // List specific aggregate type
-            PathBuf::from(format!("data/{}/{}", org_id, type_id))
+            self.data_root.join(format!("{}/{}", org_id, type_id))
         } else {
             // List all aggregate types
-            PathBuf::from(format!("data/{}", org_id))
+            self.data_root.join(format!("{}", org_id))
         };
         
         if !base_path.exists() {
@@ -609,9 +611,9 @@ impl ProcessRequest {
         }
 
         // Delete files from filesystem
-        //TODO: Configurable settings required
-        let metadata_path = format!("data/{}/{}/{}/metadata.bin", request.org_id, request.aggregate_type_id, request.aggregate_id);
-        let events_path = format!("data/{}/{}/{}/event_batches.bin", request.org_id, request.aggregate_type_id, request.aggregate_id);
+        let metadata_path = self.data_root.join(format!("{}/{}/{}/metadata.bin", request.org_id, request.aggregate_type_id, request.aggregate_id));
+        let events_path = self.data_root.join(format!("{}/{}/{}/event_batches.bin", request.org_id, request.aggregate_type_id, request.aggregate_id));
+
 
         std::fs::remove_file(&metadata_path)
             .map_err(|_e| EventPlaneDBError::io_error())?;

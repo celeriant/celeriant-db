@@ -49,9 +49,6 @@ pub struct EventPlaneDBError {
     pub message_size: Option<u64>,
     
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_message_size: Option<u64>,
-    
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub protocol_version: Option<u32>,
 }
 
@@ -146,11 +143,10 @@ impl EventPlaneDBError {
         }
     }
     
-    pub fn message_too_large(size: u64, max_size: u64) -> Self {
+    pub fn message_too_large(size: u64) -> Self {
         Self {
             code: ErrorCode::MessageTooLarge,
             message_size: Some(size),
-            max_message_size: Some(max_size),
             ..Default::default()
         }
     }
@@ -230,7 +226,6 @@ impl Default for EventPlaneDBError {
             actual_crc: None,
             event_batch_index: None,
             message_size: None,
-            max_message_size: None,
             protocol_version: None,
         }
     }

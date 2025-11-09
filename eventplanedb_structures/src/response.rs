@@ -4,7 +4,7 @@ use futures_lite::{AsyncReadExt, AsyncWriteExt};
 
 use crate::compression_type::CompressionType;
 use crate::eventplanedb_error::EventPlaneDBError;
-use crate::wire_format::{MAX_MESSAGE_SIZE, PROTOCOL_VERSION_V2, WireError, from_wire_format_variable, to_wire_format_variable};
+use crate::wire_format::{PROTOCOL_VERSION_V2, WireError, from_wire_format_variable, to_wire_format_variable};
 use crate::{aggregate_info::AggregateInfo, append_result::AppendResult, constants::BINCODE_CONFIG_FIXED, organisation::Organisation, read_all_result::ReadAllResult, read_result::ReadResult};
 
 // Response type discriminants
@@ -170,10 +170,6 @@ where
     R: AsyncReadExt + Unpin,
     T: Decode<()>,
 {
-    if message_length > MAX_MESSAGE_SIZE {
-        return Err(WireError::MessageTooLarge(message_length));
-    }
-
     // Read payload
     let mut payload = vec![0u8; message_length as usize];
     reader.read_exact(&mut payload).await?;
@@ -286,10 +282,6 @@ where
 {
     // Encode and compress
     let (_uncompressed_size, encoded) = to_wire_format_variable(message, compression_type)?;
-
-    if encoded.len() > MAX_MESSAGE_SIZE as usize {
-        return Err(WireError::MessageTooLarge(encoded.len() as u32));
-    }
 
     // Combine header + payload into single buffer for one write
     let (type_id, _) = compression_type.to_tuple();
