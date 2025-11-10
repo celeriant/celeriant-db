@@ -589,6 +589,7 @@ dependencies = [
  "log",
  "lru",
  "mimalloc",
+ "nix 0.30.1",
  "num_cpus",
  "rmp-serde",
  "serde",

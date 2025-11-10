@@ -25,3 +25,4 @@ tempfile.workspace = true
 walkdir.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
+nix.workspace = true

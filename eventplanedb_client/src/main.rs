@@ -75,7 +75,10 @@ fn run_client_connection(
 ) -> u64 {
     let mut stream = match TcpStream::connect(&server_addr) {
         Ok(s) => s,
-        Err(_) => return 0,
+        Err(e) => {
+            print!("{}",e);
+            panic!()
+        }
     };
 
     // Socket options (set once per thread)
@@ -141,9 +144,9 @@ fn main() {
     // Args: [server_addr] [num_connections] [num_aggregates] [sync_delay_us] [duration_secs]
     let args: Vec<String> = env::args().collect();
 
-    let server_addr = parse_arg(&args, 1, String::from("127.0.0.1:10000"));
-    let num_connections = parse_arg(&args, 2, 200usize);
-    let num_aggregates = parse_arg(&args, 3, 4u128);
+    let server_addr = parse_arg(&args, 1, String::from("0.0.0.0:10001"));
+    let num_connections = parse_arg(&args, 2, 1usize);
+    let num_aggregates = parse_arg(&args, 3, 1u128);
     let sync_delay_us = parse_arg(&args, 4, 100u64);
     let duration_secs = parse_arg(&args, 5, 30u64);
 

@@ -1,14 +1,16 @@
 use clap::Parser;
-use std::{cell::RefCell, os::fd::{FromRawFd, IntoRawFd}, rc::Rc};
+use std::{cell::{Cell, RefCell}, os::fd::{FromRawFd, IntoRawFd}, rc::Rc, time::Duration};
 
 use eventplanedb_core::{files::{read_operations::AggregateReadConfig, write_operations::AggregateWriteConfig}, process_request::ProcessRequest};
 use eventplanedb_structures::{eventplanedb_error::EventPlaneDBError, request::{Request, read_request}, response::{ProtocolErrorResponse, Response, write_response}, wire_format::WireError};
 use glommio::{CpuSet, LocalExecutorPoolBuilder, PoolPlacement, channels::channel_mesh::{Full, MeshBuilder, Senders}, enclose, net::TcpListener, spawn_local};
 use futures_lite::AsyncWriteExt;
 use log::{debug, error, info};
-use std::sync::mpsc::channel;
 
 mod config;
+mod signal_handler;
+
+use signal_handler::SignalHandler;
 
 use mimalloc::MiMalloc;
 
@@ -20,8 +22,9 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 struct Msg {
     fd: i32,
-    value: Request,
+    value: Option<Request>,
     message_version: u32,
+    require_shutdown: bool,
 }
 
 fn main() {
@@ -60,13 +63,6 @@ fn main() {
     let max_message_size = config.max_message_size;
     let max_open_aggregates = config.max_open_aggregates;
 
-    // Create a broadcast channel for shutdown notifications
-    //TODO: Implement this handling in accepting of new client connections and pipelining on existing client connections
-    let (shutdown_tx, shutdown_rx) = channel();
-    
-    ctrlc::set_handler(move || shutdown_tx.send(()).expect("Could not send signal on channel."))
-        .expect("Error setting Ctrl-C handler");
-
     // Create a pool of executors, one per shard
     // Each executor will run threads pinned to a single core
     // The mesh BUILDER is copied in to each shard so they can all join the full mesh
@@ -85,6 +81,9 @@ fn main() {
         let executor_id = glommio::executor().id();
         info!("Starting executor {executor_id} with shard id {shard_id}");
 
+        // Local shutdown flag to avoid cross-thread contention
+        let shutdown_flag = Rc::new(Cell::new(false));
+
         // The same sender is used in multiple threads so we need to wrap it in a RefCell and Rc
         // This is safe because we are in a single threaded executor
         let sender = Rc::new(RefCell::new(sender));
@@ -99,6 +98,53 @@ fn main() {
             aggregate_write_config.cache_trim_factor
         ));
 
+        // Shard 0 sets up signal handler with polling loop
+        if shard_id == 0 {
+            let mut signal_handler = SignalHandler::new()
+                .expect("Failed to initialize signal handler");
+            
+            let sender_clone = sender.clone();
+            let shutdown_flag_clone = shutdown_flag.clone();
+            
+            spawn_local(async move {
+                loop {
+                    // Check for signal FIRST
+                    match signal_handler.poll_signal() {
+                        Ok(Some(sig)) => {
+                            info!("Received shutdown signal ({:?}). Initiating graceful shutdown...", sig);
+                            shutdown_flag_clone.set(true);
+                            
+                            // Broadcast shutdown to all other shards
+                            for peer in 0..sender_clone.borrow().nr_consumers() {
+                                if peer != shard_id {
+                                    let shutdown_msg = Msg {
+                                        fd: -1,
+                                        value: None,
+                                        message_version: 0,
+                                        require_shutdown: true,
+                                    };
+                                    if let Err(e) = sender_clone.borrow().try_send_to(peer, shutdown_msg) {
+                                        error!("Failed to send shutdown signal to shard {peer}: {e:?}");
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                        Ok(None) => {
+                            // No signal yet, sleep and check again
+                        }
+                        Err(e) => {
+                            error!("Error polling for signals: {e}");
+                            break;
+                        }
+                    }
+                    
+                    // Sleep at the END of the loop
+                    glommio::timer::sleep(Duration::from_secs(1)).await;
+                }
+            }).detach();
+        }
+
         // There is a receiver for each other shard that we must listen to
         // So we can spin up a thread for each of these, to allow concurrent processing from other shards
         // We still need the sender for THIS shard though as we may have to forward requests from clients to other shards
@@ -106,9 +152,26 @@ fn main() {
         for (_src_shard, stream) in receivers.streams() {
             let sender_clone = sender.clone();
             let process_request = process_request.clone();
+            let shutdown_flag = shutdown_flag.clone();
 
             spawn_local(async move {
                 while let Some(msg) = stream.recv().await {
+                    // Check if this is a shutdown signal
+                    if msg.require_shutdown {
+                        info!("Shard {shard_id} received shutdown signal");
+                        shutdown_flag.set(true);
+                        continue;
+                    }
+
+                    // Check local shutdown flag
+                    if shutdown_flag.get() {
+                        info!("Shard {shard_id} rejecting forwarded message due to shutdown");
+                        let mut tcp_stream = unsafe { glommio::net::TcpStream::from_raw_fd(msg.fd) };
+                        let error_msg = "Server is shutting down. Please reconnect.\n";
+                        let _ = tcp_stream.write_all(error_msg.as_bytes()).await;
+                        continue;
+                    }
+
                     debug!("Shard {shard_id} received forwarded message");
                     
                     // Reconstruct TcpStream from raw fd
@@ -120,14 +183,15 @@ fn main() {
                     // Other shard has accepted and already read the request data.
                     // So we can process it immediately and write the response back
                     debug!("Shard {shard_id} processing forwarded request for client");
-                    let response = process_request.process(msg.value).await;
+                    let response = process_request.process(msg.value.unwrap()).await;
                     write_to_tcp_stream(response, &mut tcp_stream, msg.message_version).await;
 
-                    // Continue on the tcp connection to read more data from the client
-                    // Note that we might still have to forward it on to the right shard again
-                    // We need to clone sender again here as inside is a spawn local
-                    debug!("Shard {shard_id} keeping client alive for pipelining");
-                    process_tcp_stream(shard_id, nbr_shards, tcp_stream, sender_clone.clone(), process_request.clone(), max_message_size).await;
+                    if !shutdown_flag.get() {
+                        debug!("Shard {shard_id} keeping client alive for pipelining");
+                        process_tcp_stream(shard_id, nbr_shards, tcp_stream, sender_clone.clone(), process_request.clone(), max_message_size, shutdown_flag.clone()).await;
+                    } else {
+                        debug!("Shard {shard_id} closing connection due to shutdown");
+                    }
                 }
             }).detach();
         }
@@ -146,34 +210,38 @@ fn main() {
         // An infinite loop to accept incoming TCP connections
         // Essentially a fire + forget model where each connection is handled in its own task
         loop {
-            match listener.accept().await {
+            if shutdown_flag.get() {
+                info!("Shard {shard_id} stopping acceptance of new connections");
+                break;
+            }
+
+            match glommio::timer::timeout(Duration::from_millis(100), listener.accept()).await {
                 Ok(tcp_stream) => {
+                    if shutdown_flag.get() {
+                        info!("Shard {shard_id} rejecting connection due to shutdown");
+                        let mut stream = tcp_stream;
+                        let error_msg = "Server is shutting down. Please reconnect.\n";
+                        let _ = stream.write_all(error_msg.as_bytes()).await;
+                        continue;
+                    }
+
                     match tcp_stream.peer_addr() {
                         Ok(addr) => debug!("Shard {shard_id} accepted connection from {addr}"),
                         Err(_) => error!("Shard {shard_id} accepted connection from unknown address"),
                     }
-                    process_tcp_stream(shard_id, nbr_shards, tcp_stream.buffered(), sender.clone(), process_request.clone(), max_message_size).await;
+                    process_tcp_stream(shard_id, nbr_shards, tcp_stream.buffered(), sender.clone(), process_request.clone(), max_message_size, shutdown_flag.clone()).await;
                 }
-                Err(e) => {
-                    error!("Shard {shard_id} failed to accept connection: {e}");
-                    // Continue listening for other connections instead of crashing
-                    continue;
-                }
+                Err(_) => continue,
             }
         }
 
+        info!("Shard {shard_id} shutdown complete");
     }))
     .unwrap()
     .join_all();
-}
 
-/// Hash function for aggregate_id to determine shard assignment
-///TODO: Compare with murmur3 as dbeel uses that
-// fn hash_aggregate_id(aggregate_id: &u128) -> u64 {
-//     let mut hasher = AHasher::default();
-//     aggregate_id.hash(&mut hasher);
-//     hasher.finish()
-// }
+    info!("EventPlaneDB Server shutdown complete");
+}
 
 async fn process_tcp_stream(
     shard_id: usize, 
@@ -182,52 +250,48 @@ async fn process_tcp_stream(
     sender: Rc<RefCell<Senders<Msg>>>,
     process_request: Rc<ProcessRequest>,
     max_message_size: u32,
+    shutdown_flag: Rc<Cell<bool>>,
 ) {
-    // It's critical to spawn local here as this allows accepting of new connections
-    // It also allows processing messages sent from other shards 
-    // Both of these can happen with spawn local while still listening to an open TCP connection    
     spawn_local(async move {
         loop {
+            // Check shutdown before reading next request (prevents pipelining during shutdown)
+            if shutdown_flag.get() {
+                debug!("Shard {shard_id} closing connection due to shutdown");
+                break;
+            }
+
             let (request, message_version) = match read_from_tcp_stream(shard_id, &mut tcp_stream, max_message_size).await {
                 Some((num, message_version)) => (num, message_version),
-                None => return,
+                None => break,
             };
 
-            // Determine which shard to route this request to
-            // If we are already on the correct shard, we can process it directly without an additional spawn local
             let aggregate_id = request.routing_id();
-            // let hash = hash_aggregate_id(aggregate_id);
-            // let idx = (hash as usize) % nbr_shards;
             let idx = (aggregate_id % nbr_shards as u128) as usize;
 
             if idx != shard_id {
                 debug!("Shard {shard_id} forwarding request for aggregate {aggregate_id} to shard {idx}");
-                // Leave the TCP connection from the client open
-                // This effectively transfers the connection to another shard
                 let fd = tcp_stream.into_raw_fd();
-                let msg = Msg { value: request, fd, message_version };
+                let msg = Msg { 
+                    value: Some(request), 
+                    fd, 
+                    message_version,
+                    require_shutdown: false,
+                };
                 
-                // Try to send the message to the target shard
                 match sender.borrow().try_send_to(idx, msg) {
                     Ok(()) => {
-                        // Successfully sent to other shard
+                        // Successfully forwarded - this connection is now owned by another shard
                         break;
                     }
                     Err(_) => {
-                        // Channel is full or other error occurred
                         error!("Shard {shard_id} failed to forward message to shard {idx}: channel full or unavailable. Closing connection.");
                         
-                        // Reconstruct the stream to properly close it
                         let mut tcp_stream = unsafe { glommio::net::TcpStream::from_raw_fd(fd) };
-                        
-                        // Write an error response to the client before closing
                         let error_response = "Server is overwhelmed. Please try again later.\n";
                         if let Err(e) = tcp_stream.write_all(error_response.as_bytes()).await {
                             error!("Failed to write error response: {e}");
                         }
-                        
-                        // The tcp_stream will be properly dropped here, closing the connection
-                        return;
+                        break;
                     }
                 }
             } else {
