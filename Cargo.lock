@@ -593,6 +593,7 @@ dependencies = [
  "num_cpus",
  "rmp-serde",
  "serde",
+ "signal-hook",
  "tempfile",
  "thiserror",
  "walkdir",

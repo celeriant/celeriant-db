@@ -73,13 +73,7 @@ fn run_client_connection(
     cached_requests: Arc<HashMap<u128, Vec<u8>>>,
     aggregate_id: u128,
 ) -> u64 {
-    let mut stream = match TcpStream::connect(&server_addr) {
-        Ok(s) => s,
-        Err(e) => {
-            print!("{}",e);
-            panic!()
-        }
-    };
+    let mut stream = TcpStream::connect(&server_addr).unwrap();
 
     // Socket options (set once per thread)
     let _ = stream.set_nodelay(true);
