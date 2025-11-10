@@ -23,23 +23,23 @@ pub struct EventPlaneDBConfig {
     pub max_open_aggregates: usize,
 
     // Aggregate I/O tuning (read/write)
-    #[arg(long, default_value = "1048576", help = "Max chunk size for aggregate reads (1 << 20)")]
+    #[arg(long, default_value_t = 1024 * 1024, help = "Max chunk size for aggregate reads (1 MiB)")]
     pub aggregate_read_max_chunk_size: u64,
     
-    #[arg(long, default_value = "1048576", help = "Max data cache size for aggregate reads (1 << 20)")]
+    #[arg(long, default_value_t = 1024 * 1024, help = "Max data cache size for aggregate reads (1 MiB)")]
     pub aggregate_read_max_data_cache_size_bytes: usize,
     
-    #[arg(long, default_value = "1048576", help = "Max chunk size for aggregate writes (1 << 20)")]
+    #[arg(long, default_value_t = 1024 * 1024, help = "Max chunk size for aggregate writes (1 MiB)")]
     pub aggregate_write_max_chunk_size: usize,
     
-    #[arg(long, default_value = "33554432", help = "Max data cache size for aggregate writes (1 << 25)")]
+    #[arg(long, default_value_t = 32 * 1024 * 1024, help = "Max data cache size for aggregate writes (32 MiB)")]
     pub aggregate_write_max_data_cache_size_bytes: usize,
 
     #[arg(long, default_value = "10", help = "Cache trim factor")]
     pub cache_trim_factor: usize,
 
     // Wire protocol constants
-    #[arg(long, default_value = "67108864", help = "Maximum message size (64 * 1024 * 1024)")]
+    #[arg(long, default_value_t = 64 * 1024 * 1024, help = "Maximum message size (64 MiB)")]
     pub max_message_size: u32,
 
     // Misc / logging
@@ -54,10 +54,10 @@ impl Default for EventPlaneDBConfig {
             listen_address: "0.0.0.0:10000".to_string(),
             mesh_channel_size: 1024,
             num_shards: None,
-            aggregate_read_max_chunk_size: 1 << 20,
-            aggregate_read_max_data_cache_size_bytes: 1 << 20,
-            aggregate_write_max_chunk_size: 1 << 20,
-            aggregate_write_max_data_cache_size_bytes: 1 << 25,
+            aggregate_read_max_chunk_size: 1024 * 1024,
+            aggregate_read_max_data_cache_size_bytes: 1024 * 1024,
+            aggregate_write_max_chunk_size: 1024 * 1024,
+            aggregate_write_max_data_cache_size_bytes: 32 * 1024 * 1024,
             cache_trim_factor: 10,
             max_open_aggregates: 10000,
             max_message_size: 64 * 1024 * 1024,

@@ -1,18 +1,18 @@
 use clap::Parser;
 use std::{cell::RefCell, os::fd::{FromRawFd, IntoRawFd}, rc::Rc};
 
-use eventplanedb_core::files::{read_operations::AggregateReadConfig, write_operations::AggregateWriteConfig};
+use eventplanedb_core::{files::{read_operations::AggregateReadConfig, write_operations::AggregateWriteConfig}, process_request::ProcessRequest};
 use eventplanedb_structures::{eventplanedb_error::EventPlaneDBError, request::{Request, read_request}, response::{ProtocolErrorResponse, Response, write_response}, wire_format::WireError};
 use glommio::{CpuSet, LocalExecutorPoolBuilder, PoolPlacement, channels::channel_mesh::{Full, MeshBuilder, Senders}, enclose, net::TcpListener, spawn_local};
 use futures_lite::AsyncWriteExt;
 use log::{debug, error, info};
+use std::sync::mpsc::channel;
 
-mod process_request;
 mod config;
 
 use mimalloc::MiMalloc;
 
-use crate::{config::EventPlaneDBConfig, process_request::ProcessRequest};
+use crate::{config::EventPlaneDBConfig};
 
 //TODO: Compare with default allocator in benchmarks
 #[global_allocator]
@@ -24,7 +24,6 @@ struct Msg {
     message_version: u32,
 }
 
-//TODO: Graceful shutdown handling with signal handling (SIGINT, SIGTERM)
 fn main() {
     // Parse CLI arguments
     let config = EventPlaneDBConfig::parse();
@@ -60,6 +59,13 @@ fn main() {
     let data_root = config.data_root.clone();
     let max_message_size = config.max_message_size;
     let max_open_aggregates = config.max_open_aggregates;
+
+    // Create a broadcast channel for shutdown notifications
+    //TODO: Implement this handling in accepting of new client connections and pipelining on existing client connections
+    let (shutdown_tx, shutdown_rx) = channel();
+    
+    ctrlc::set_handler(move || shutdown_tx.send(()).expect("Could not send signal on channel."))
+        .expect("Error setting Ctrl-C handler");
 
     // Create a pool of executors, one per shard
     // Each executor will run threads pinned to a single core
@@ -103,6 +109,8 @@ fn main() {
 
             spawn_local(async move {
                 while let Some(msg) = stream.recv().await {
+                    debug!("Shard {shard_id} received forwarded message");
+                    
                     // Reconstruct TcpStream from raw fd
                     // Ensure to use a glommio TcpStream
                     // We can do this because the sender has forgotten the fd keeping it open
@@ -111,20 +119,29 @@ fn main() {
 
                     // Other shard has accepted and already read the request data.
                     // So we can process it immediately and write the response back
+                    debug!("Shard {shard_id} processing forwarded request for client");
                     let response = process_request.process(msg.value).await;
                     write_to_tcp_stream(response, &mut tcp_stream, msg.message_version).await;
 
                     // Continue on the tcp connection to read more data from the client
                     // Note that we might still have to forward it on to the right shard again
                     // We need to clone sender again here as inside is a spawn local
+                    debug!("Shard {shard_id} keeping client alive for pipelining");
                     process_tcp_stream(shard_id, nbr_shards, tcp_stream, sender_clone.clone(), process_request.clone(), max_message_size).await;
                 }
             }).detach();
         }
 
         // Now that we have setup our listeners for other shards, we can start accepting TCP connections from clients
-        let listener = TcpListener::bind(&listen_address).unwrap();
-        info!("Shard {shard_id} listening on {}", listener.local_addr().unwrap());
+        let listener = match TcpListener::bind(&listen_address) {
+            Ok(l) => l,
+            Err(e) => {
+                error!("Shard {shard_id} failed to bind to address {}: {}", listen_address, e);
+                return;
+            }
+        };
+        let local_addr = listener.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| "unknown".to_string());
+        info!("Shard {shard_id} listening on {}", local_addr);
 
         // An infinite loop to accept incoming TCP connections
         // Essentially a fire + forget model where each connection is handled in its own task
@@ -184,6 +201,7 @@ async fn process_tcp_stream(
             let idx = (aggregate_id % nbr_shards as u128) as usize;
 
             if idx != shard_id {
+                debug!("Shard {shard_id} forwarding request for aggregate {aggregate_id} to shard {idx}");
                 // Leave the TCP connection from the client open
                 // This effectively transfers the connection to another shard
                 let fd = tcp_stream.into_raw_fd();
@@ -213,6 +231,7 @@ async fn process_tcp_stream(
                     }
                 }
             } else {
+                debug!("Shard {shard_id} processing request for aggregate {aggregate_id} locally");
                 let response = process_request.process(request).await;
                 write_to_tcp_stream(response, &mut tcp_stream, message_version).await;
             }
@@ -221,6 +240,7 @@ async fn process_tcp_stream(
 }
 
 async fn write_to_tcp_stream(response: Response, tcp_stream: &mut glommio::net::TcpStream<glommio::net::Preallocated>, _version: u32) {
+    debug!("Writing response to client: {:?}", response.response_type());
     if let Err(e) = write_response(tcp_stream, &response, eventplanedb_structures::compression_type::CompressionType::None).await {
         error!("Failed to write response to TCP stream: {e}");
         // Connection will be dropped when tcp_stream goes out of scope
@@ -234,9 +254,12 @@ async fn read_from_tcp_stream(
     max_message_size: u32,
 ) -> Option<(Request, u32)> {
     match read_request(tcp_stream, max_message_size).await {
-        Ok((request, version)) => Some((request, version)),
+        Ok((request, version)) => {
+            debug!("Shard {shard_id} successfully parsed request with version {version}");
+            Some((request, version))
+        }
         Err(WireError::Io(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-            debug!("Shard {shard_id} client disconnected");
+            debug!("Client on shard {shard_id} disconnected");
             None
         }
         Err(WireError::InvalidFormatWithVersion(_version)) => {

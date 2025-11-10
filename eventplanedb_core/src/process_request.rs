@@ -1,6 +1,6 @@
 use std::{path::{Path, PathBuf}, rc::Rc, time::Duration, cell::Cell, num::NonZeroUsize};
 
-use eventplanedb_core::{files::{helper::{get_or_create_reader, get_or_create_writer, AggregateResources as CoreAggregateResources}, read_operations::{AggregateReadConfig, ReadOperations}, write_operations::{AggregateWriteConfig, AppendOptions, WriteOperations}}, local_event::LocalEvent};
+use crate::{files::{helper::{get_or_create_reader, get_or_create_writer, AggregateResources as CoreAggregateResources}, read_operations::{AggregateReadConfig, ReadOperations}, write_operations::{AggregateWriteConfig, AppendOptions, WriteOperations}}, local_event::LocalEvent};
 use glommio::{spawn_local, sync::{RwLock, Semaphore}, timer::sleep};
 use log::{debug, error};
 use lru::LruCache;

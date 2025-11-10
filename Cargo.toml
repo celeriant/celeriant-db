@@ -43,3 +43,4 @@ criterion = "0.7.0"
 uuid = { version = "1.18.1", features = ["v4"] }
 walkdir = "2.5.0"
 clap = { version = "4.5.51", features = ["derive"] }
+ctrlc = "3.5.1"
