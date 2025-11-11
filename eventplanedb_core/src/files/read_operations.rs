@@ -137,6 +137,7 @@ impl ReadOperations {
 
         let event_batches_bytes_set = read_objects::read_objects_absolute(
             &self.event_batches_dma_file, 
+            file_len_event_batch,
             &object_positions, 
             self.config.max_chunk_size
         ).await?;
@@ -230,6 +231,7 @@ impl ReadOperations {
         if uncached_metadata_count > 0 {
             read_objects::read_fixed_records_visit_const::<METADATA_BATCH_SIZE_BYTES, ReadError>(
                 &self.metadata_dma_file,
+                file_len_metadata,
                 metadata_read_from_bytes,
                 Some(actual_read_to),
                 self.config.max_chunk_size,
@@ -386,6 +388,7 @@ impl ReadOperations {
         if uncached_bytes > 0 {
             read_objects::read_fixed_records_visit_const::<METADATA_BATCH_SIZE_BYTES, ReadError>(
                 &self.metadata_dma_file,
+                file_len_metadata,
                 0,
                 Some(uncached_bytes),
                 self.config.max_chunk_size,
@@ -488,6 +491,7 @@ impl ReadOperations {
 
             let last_batch_bytes = read_objects::read_objects_absolute(
                 &event_batches_dma_file,
+                file_len_event_batch,
                 &[last_batch_pos],
                 self.config.max_chunk_size,
             ).await?;
@@ -517,6 +521,7 @@ impl ReadOperations {
 
                     let second_last_batch_bytes = read_objects::read_objects_absolute(
                         &event_batches_dma_file,
+                        file_len_event_batch,
                         &[second_last_batch_pos],
                         self.config.max_chunk_size,
                     ).await?;
@@ -642,6 +647,7 @@ impl ReadOperations {
 
         let event_batches_bytes_set = read_objects::read_objects_absolute(
             &self.event_batches_dma_file, 
+            file_len_event_batch,
             &object_positions, 
             self.config.max_chunk_size).await?;
 

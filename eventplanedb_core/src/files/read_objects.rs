@@ -19,6 +19,7 @@ pub struct AbsoluteObjectPosition {
 
 pub async fn read_objects_absolute(
     file: &DmaFile,
+    file_size: u64,
     object_positions: &[AbsoluteObjectPosition],
     max_chunk_size: u64,
 ) -> glommio::Result<Vec<Vec<u8>>, ()> {
@@ -53,8 +54,6 @@ pub async fn read_objects_absolute(
             .all(|w| w[0].start_pos < w[1].start_pos),
         "object_positions must have strictly increasing start_pos (no duplicates)"
     );
-
-    let file_size = file.file_size().await?;
 
     // disallow last entry starting exactly at EOF.
     assert!(
@@ -146,6 +145,7 @@ pub async fn read_objects_absolute(
 /// - max_chunk_size: must be a multiple of the device alignment
 pub async fn read_fixed_records_visit_const<const N: usize, E>(
     file: &DmaFile,
+    file_size: u64,
     start: u64,
     end_exclusive: Option<u64>,
     max_chunk_size: u64,
@@ -171,8 +171,6 @@ pub async fn read_fixed_records_visit_const<const N: usize, E>(
         );
     }
 
-    let file_size = file.file_size().await
-        .map_err(|e| ReadVisitError::Io(e))?;
     assert!(start < file_size, "start must be less than file size");
     let stop_at = std::cmp::min(end_exclusive.unwrap_or(file_size), file_size);
     assert!(start < stop_at, "empty range: start must be < end/EOF");
@@ -365,7 +363,7 @@ pub mod test {
 
             for chunk_size in different_chunk_sizes().iter().enumerate() {
                 let file = DmaFile::open(&file_path).await.unwrap();
-                let objects = read_objects_absolute(&file, &object_positions, *chunk_size.1).await.unwrap();
+                let objects = read_objects_absolute(&file, file_len(&file).await, &object_positions, *chunk_size.1).await.unwrap();
 
                 assert_eq!(objects.len(), 3);
                 let mut j = 0;
@@ -418,7 +416,7 @@ pub mod test {
 
             for chunk_size in different_chunk_sizes().iter().enumerate() {
                 let file = DmaFile::open(&file_path).await.unwrap();
-                let objects = read_objects_absolute(&file, &object_positions, *chunk_size.1).await.unwrap();
+                let objects = read_objects_absolute(&file, file_len(&file).await, &object_positions, *chunk_size.1).await.unwrap();
 
                 assert_eq!(objects.len(), 2);
                 let mut j = 0;
@@ -458,7 +456,7 @@ pub mod test {
 
             // Should panic due to "object_positions must be ordered by start_pos and non-overlapping"
             let file = DmaFile::open(&file_path).await.unwrap();
-            let _ = read_objects_absolute(&file, &overlaps, 1 << 12).await;
+            let _ = read_objects_absolute(&file, file_len(&file).await, &overlaps, 1 << 12).await;
         }).unwrap();
 
         // Expect the task to have panicked
@@ -485,7 +483,7 @@ pub mod test {
 
             // 1 is almost certainly not a valid alignment multiple on real devices
             let file = DmaFile::open(&file_path).await.unwrap();
-            let _ = read_objects_absolute(&file, &positions, 1).await;
+            let _ = read_objects_absolute(&file, file_len(&file).await, &positions, 1).await;
         }).unwrap();
 
         assert!(handle.join().is_err());
@@ -516,7 +514,7 @@ pub mod test {
 
             // Should assert due to zero-length absolute objects and last start at EOF
             let file: DmaFile = DmaFile::open(&file_path).await.unwrap();
-            let _ = read_objects_absolute(&file, &positions, 1 << 12).await;
+            let _ = read_objects_absolute(&file, file_len(&file).await, &positions, 1 << 12).await;
         }).unwrap();
 
         assert!(handle.join().is_err());
@@ -544,7 +542,7 @@ pub mod test {
             ];
 
             let file: DmaFile = DmaFile::open(&file_path).await.unwrap();
-            let objects = read_objects_absolute(&file, &positions, 1 << 12).await.unwrap();
+            let objects = read_objects_absolute(&file, file_len(&file).await, &positions, 1 << 12).await.unwrap();
             assert_eq!(objects.len(), 1);
             assert_eq!(objects[0].len(), (file_size - start) as usize);
             assert!(objects[0].iter().all(|&b| b == 1));
@@ -569,7 +567,7 @@ pub mod test {
 
             for chunk_size in different_chunk_sizes() {
                 let file = DmaFile::open(&file_path).await.unwrap();
-                let objects = read_objects_absolute(&file, &positions, chunk_size).await.unwrap();
+                let objects = read_objects_absolute(&file, file_len(&file).await, &positions, chunk_size).await.unwrap();
                 
                 assert_eq!(objects.len(), 1);
                 assert_eq!(objects[0].len(), object_sizes[0]);
@@ -596,7 +594,7 @@ pub mod test {
 
             for chunk_size in different_chunk_sizes() {
                 let file = DmaFile::open(&file_path).await.unwrap();
-                let objects = read_objects_absolute(&file, &positions, chunk_size).await.unwrap();
+                let objects = read_objects_absolute(&file, file_len(&file).await, &positions, chunk_size).await.unwrap();
                 
                 assert_eq!(objects.len(), 1500);
                 for (i, obj) in objects.iter().enumerate() {
@@ -626,7 +624,7 @@ pub mod test {
 
             for chunk_size in different_chunk_sizes() {
                 let file = DmaFile::open(&file_path).await.unwrap();
-                let objects = read_objects_absolute(&file, &positions, chunk_size).await.unwrap();
+                let objects = read_objects_absolute(&file, file_len(&file).await, &positions, chunk_size).await.unwrap();
                 
                 assert_eq!(objects.len(), 4);
                 for (i, obj) in objects.iter().enumerate() {
@@ -653,7 +651,7 @@ pub mod test {
             let positions: Vec<AbsoluteObjectPosition> = Vec::new();
 
             let file = DmaFile::open(&file_path).await.unwrap();
-            let objects = read_objects_absolute(&file, &positions, 1 << 12).await.unwrap();
+            let objects = read_objects_absolute(&file, file_len(&file).await, &positions, 1 << 12).await.unwrap();
             
             assert_eq!(objects.len(), 0);
         }).unwrap();
@@ -679,7 +677,7 @@ pub mod test {
 
             for chunk_size in different_chunk_sizes() {
                 let file = DmaFile::open(&file_path).await.unwrap();
-                let objects = read_objects_absolute(&file, &positions, chunk_size).await.unwrap();
+                let objects = read_objects_absolute(&file, file_len(&file).await, &positions, chunk_size).await.unwrap();
                 
                 assert_eq!(objects.len(), 1);
                 assert_eq!(objects[0].len(), object_sizes[0]);
@@ -707,7 +705,7 @@ pub mod test {
 
             for chunk_size in different_chunk_sizes() {
                 let file = DmaFile::open(&file_path).await.unwrap();
-                let objects = read_objects_absolute(&file, &positions, chunk_size).await.unwrap();
+                let objects = read_objects_absolute(&file, file_len(&file).await, &positions, chunk_size).await.unwrap();
                 
                 assert_eq!(objects.len(), 10);
                 for (i, obj) in objects.iter().enumerate() {
@@ -738,7 +736,7 @@ pub mod test {
                 .collect();
 
             let file = DmaFile::open(&file_path).await.unwrap();
-            let objects = read_objects_absolute(&file, &positions, chunk_size).await.unwrap();
+            let objects = read_objects_absolute(&file, file_len(&file).await, &positions, chunk_size).await.unwrap();
             
             assert_eq!(objects.len(), 5);
             for (i, obj) in objects.iter().enumerate() {
@@ -768,7 +766,7 @@ pub mod test {
             // Use small 64KB chunks
             let chunk_size = 1 << 16;
             let file = DmaFile::open(&file_path).await.unwrap();
-            let objects = read_objects_absolute(&file, &positions, chunk_size).await.unwrap();
+            let objects = read_objects_absolute(&file, file_len(&file).await, &positions, chunk_size).await.unwrap();
             
             assert_eq!(objects.len(), 1);
             assert_eq!(objects[0].len(), object_sizes[0]);
@@ -801,7 +799,7 @@ pub mod test {
 
             for chunk_size in different_chunk_sizes() {
                 let file = DmaFile::open(&file_path).await.unwrap();
-                let objects = read_objects_absolute(&file, &positions, chunk_size).await.unwrap();
+                let objects = read_objects_absolute(&file, file_len(&file).await, &positions, chunk_size).await.unwrap();
                 
                 assert_eq!(objects.len(), 2);
                 assert_eq!(objects[0].len(), object_sizes[1]);
@@ -831,7 +829,7 @@ pub mod test {
             ];
 
             let file = DmaFile::open(&file_path).await.unwrap();
-            let _ = read_objects_absolute(&file, &positions, 1 << 12).await;
+            let _ = read_objects_absolute(&file, file_len(&file).await, &positions, 1 << 12).await;
         }).unwrap();
 
         assert!(handle.join().is_err());
@@ -855,10 +853,14 @@ pub mod test {
             ];
 
             let file = DmaFile::open(&file_path).await.unwrap();
-            let _ = read_objects_absolute(&file, &positions, 1 << 12).await;
+            let _ = read_objects_absolute(&file, file_len(&file).await, &positions, 1 << 12).await;
         }).unwrap();
 
         assert!(handle.join().is_err());
+    }
+
+    async fn file_len(file: &DmaFile) -> u64 {
+        file.file_size().await.unwrap()
     }
 
     /// Happy Path
@@ -879,7 +881,7 @@ pub mod test {
                 // Collect records to validate content
                 let mut seen: Vec<[u8; N]> = Vec::new();
                 let file: DmaFile = DmaFile::open(&file_path).await.unwrap();
-                let count = read_fixed_records_visit_const::<N, ()>(&file, 0, None, chunk_size, |rec| {
+                let count = read_fixed_records_visit_const::<N, ()>(&file, file_len(&file).await, 0, None, chunk_size, |rec| {
                     seen.push(*rec);
                     Ok(())
                 }).await.unwrap();
@@ -896,7 +898,7 @@ pub mod test {
 
                 // Same result when end_exclusive == EOF
                 let mut count2 = 0usize;
-                let count2_ret = read_fixed_records_visit_const::<N, ()>(&file, 0, Some(file_size), chunk_size, |_rec| {
+                let count2_ret = read_fixed_records_visit_const::<N, ()>(&file, file_len(&file).await, 0, Some(file_size), chunk_size, |_rec| {
                     count2 += 1;
                     Ok(())
                 }).await.unwrap();
@@ -925,7 +927,7 @@ pub mod test {
                 // Collect records to validate content
                 let mut seen: Vec<[u8; N]> = Vec::new();
                 let file: DmaFile = DmaFile::open(&file_path).await.unwrap();
-                let count = read_fixed_records_visit_const::<N, ()>(&file, 0, None, chunk_size, |rec| {
+                let count = read_fixed_records_visit_const::<N, ()>(&file, file_len(&file).await, 0, None, chunk_size, |rec| {
                     seen.push(*rec);
                     Ok(())
                 }).await.unwrap();
@@ -942,7 +944,7 @@ pub mod test {
 
                 // Same result when end_exclusive == EOF
                 let mut count2 = 0usize;
-                let count2_ret = read_fixed_records_visit_const::<N, ()>(&file, 0, Some(file_size), chunk_size, |_rec| {
+                let count2_ret = read_fixed_records_visit_const::<N, ()>(&file, file_len(&file).await, 0, Some(file_size), chunk_size, |_rec| {
                     count2 += 1;
                     Ok(())
                 }).await.unwrap();
@@ -966,7 +968,7 @@ pub mod test {
             let (file_path, _file_size) = create_fixed_record_file(dir, N, 2); // 626 bytes
 
             let file: DmaFile = DmaFile::open(&file_path).await.unwrap();
-            let _ = read_fixed_records_visit_const::<N, ()>(&file, 313, Some(600), 1 << 12, |_rec| Ok(())).await;
+            let _ = read_fixed_records_visit_const::<N, ()>(&file, file_len(&file).await, 313, Some(600), 1 << 12, |_rec| Ok(())).await;
         }).unwrap();
 
         assert!(handle.join().is_err());
@@ -986,7 +988,7 @@ pub mod test {
             let (file_path, _file_size) = create_fixed_record_file(dir, N, 2); // 626 bytes
 
             let file: DmaFile = DmaFile::open(&file_path).await.unwrap();
-            let _ = read_fixed_records_visit_const::<N, ()>(&file, 100, None, 1 << 12, |_rec| Ok(())).await;
+            let _ = read_fixed_records_visit_const::<N, ()>(&file, file_len(&file).await, 100, None, 1 << 12, |_rec| Ok(())).await;
         }).unwrap();
 
         assert!(handle.join().is_err());
@@ -1013,7 +1015,7 @@ pub mod test {
             // Count only; content pattern already covered elsewhere
             let mut count = 0usize;
             let file: DmaFile = DmaFile::open(&file_path).await.unwrap();
-            let ret = read_fixed_records_visit_const::<N, ()>(&file, 0, Some(file_size), chunk_size, |_rec| {
+            let ret = read_fixed_records_visit_const::<N, ()>(&file, file_len(&file).await, 0, Some(file_size), chunk_size, |_rec| {
                 count += 1;
                 Ok(())
             }).await.unwrap();
@@ -1037,7 +1039,7 @@ pub mod test {
 
             // start >= file_size should assert
             let file: DmaFile = DmaFile::open(&file_path).await.unwrap();
-            let _ = read_fixed_records_visit_const::<N, ()>(&file, file_size, None, 1 << 12, |_rec| Ok(())).await;
+            let _ = read_fixed_records_visit_const::<N, ()>(&file, file_len(&file).await, file_size, None, 1 << 12, |_rec| Ok(())).await;
         }).unwrap();
 
         assert!(handle.join().is_err());
@@ -1052,7 +1054,7 @@ pub mod test {
             let file: DmaFile = DmaFile::open(&file_path).await.unwrap();
 
             // empty range start == end_exclusive should assert
-            let _ = read_fixed_records_visit_const::<N, ()>(&file, 10, Some(10), 1 << 12, |_rec| Ok(())).await;
+            let _ = read_fixed_records_visit_const::<N, ()>(&file, file_len(&file).await, 10, Some(10), 1 << 12, |_rec| Ok(())).await;
         }).unwrap();
 
         assert!(handle.join().is_err());
@@ -1066,7 +1068,7 @@ pub mod test {
             // start >= file_size should assert
             let file: DmaFile = DmaFile::open(&file_path).await.unwrap();
             // invalid chunk size (almost certainly not a multiple of alignment)
-            let _ = read_fixed_records_visit_const::<N, ()>(&file, 0, None, 1, |_rec| Ok(())).await;
+            let _ = read_fixed_records_visit_const::<N, ()>(&file, file_len(&file).await, 0, None, 1, |_rec| Ok(())).await;
         }).unwrap();
 
         assert!(handle.join().is_err());
@@ -1087,7 +1089,7 @@ pub mod test {
             let chunk_size = 1024u64;
             let mut count = 0usize;
             let file = DmaFile::open(&file_path).await.unwrap();
-            let ret = read_fixed_records_visit_const::<N, ()>(&file, 0, None, chunk_size, |_rec| {
+            let ret = read_fixed_records_visit_const::<N, ()>(&file, file_len(&file).await, 0, None, chunk_size, |_rec| {
                 count += 1;
                 Ok(())
             }).await.unwrap();
@@ -1112,7 +1114,7 @@ pub mod test {
             let chunk_size = 4096u64;
             let mut count = 0usize;
             let file = DmaFile::open(&file_path).await.unwrap();
-            let ret = read_fixed_records_visit_const::<N, ()>(&file, 0, None, chunk_size, |rec| {
+            let ret = read_fixed_records_visit_const::<N, ()>(&file, file_len(&file).await, 0, None, chunk_size, |rec| {
                 // Validate inline without copying large arrays
                 let expected = (count % 256) as u8;
                 assert!(rec.iter().all(|&b| b == expected));
@@ -1139,7 +1141,7 @@ pub mod test {
 
             let mut count = 0usize;
             let file = DmaFile::open(&file_path).await.unwrap();
-            let ret = read_fixed_records_visit_const::<N, ()>(&file, 0, Some(file_size), 1 << 12, |_rec| {
+            let ret = read_fixed_records_visit_const::<N, ()>(&file, file_len(&file).await, 0, Some(file_size), 1 << 12, |_rec| {
                 count += 1;
                 Ok(())
             }).await.unwrap();
@@ -1165,7 +1167,7 @@ pub mod test {
             let chunk_size = 1u64 << 14;
             let mut count = 0usize;
             let file = DmaFile::open(&file_path).await.unwrap();
-            let ret = read_fixed_records_visit_const::<N, ()>(&file, 0, None, chunk_size, |rec| {
+            let ret = read_fixed_records_visit_const::<N, ()>(&file, file_len(&file).await, 0, None, chunk_size, |rec| {
                 // Validate inline without storing large arrays
                 let expected = (count % 256) as u8;
                 assert!(rec.iter().all(|&b| b == expected));
@@ -1194,7 +1196,7 @@ pub mod test {
             let start = file_size - N as u64;
             let mut count = 0usize;
             let file = DmaFile::open(&file_path).await.unwrap();
-            let ret = read_fixed_records_visit_const::<N, ()>(&file, start, None, 1 << 12, |_rec| {
+            let ret = read_fixed_records_visit_const::<N, ()>(&file, file_len(&file).await, start, None, 1 << 12, |_rec| {
                 count += 1;
                 Ok(())
             }).await.unwrap();
@@ -1228,7 +1230,7 @@ pub mod test {
 
             let mut count = 0usize;
             let dma_file = DmaFile::open(&file_path).await.unwrap();
-            let ret = read_fixed_records_visit_const::<N, ()>(&dma_file, 0, None, 1 << 12, |_rec| {
+            let ret = read_fixed_records_visit_const::<N, ()>(&dma_file, file_len(&dma_file).await, 0, None, 1 << 12, |_rec| {
                 count += 1;
                 Ok(())
             }).await.unwrap();
@@ -1254,7 +1256,7 @@ pub mod test {
             let chunk_size = 1u64 << 20; // 1MB chunk for tiny file
             let mut count = 0usize;
             let file = DmaFile::open(&file_path).await.unwrap();
-            let ret = read_fixed_records_visit_const::<N, ()>(&file, 0, None, chunk_size, |_rec| {
+            let ret = read_fixed_records_visit_const::<N, ()>(&file, file_len(&file).await, 0, None, chunk_size, |_rec| {
                 count += 1;
                 Ok(())
             }).await.unwrap();
@@ -1279,7 +1281,7 @@ pub mod test {
             let chunk_size = 1u64 << 14; // 16KB
             let mut count = 0usize;
             let file = DmaFile::open(&file_path).await.unwrap();
-            let ret = read_fixed_records_visit_const::<N, ()>(&file, 0, None, chunk_size, |_rec| {
+            let ret = read_fixed_records_visit_const::<N, ()>(&file, file_len(&file).await, 0, None, chunk_size, |_rec| {
                 count += 1;
                 Ok(())
             }).await.unwrap();
@@ -1303,7 +1305,7 @@ pub mod test {
 
             let mut count = 0usize;
             let file = DmaFile::open(&file_path).await.unwrap();
-            let result = read_fixed_records_visit_const::<N, String>(&file, 0, None, 1 << 12, |_rec| {
+            let result = read_fixed_records_visit_const::<N, String>(&file, file_len(&file).await, 0, None, 1 << 12, |_rec| {
                 count += 1;
                 if count == 5 {
                     Err("Visitor error on record 5".to_string())
@@ -1338,7 +1340,7 @@ pub mod test {
             let end_beyond = file_size + 256*4;
             let mut count = 0usize;
             let file = DmaFile::open(&file_path).await.unwrap();
-            let ret = read_fixed_records_visit_const::<N, ()>(&file, 0, Some(end_beyond), 1 << 12, |_rec| {
+            let ret = read_fixed_records_visit_const::<N, ()>(&file, file_len(&file).await, 0, Some(end_beyond), 1 << 12, |_rec| {
                 count += 1;
                 Ok(())
             }).await.unwrap();
@@ -1365,7 +1367,7 @@ pub mod test {
             let start = 2000u64; // Must be multiple of N
             let mut count = 0usize;
             let file = DmaFile::open(&file_path).await.unwrap();
-            let ret = read_fixed_records_visit_const::<N, ()>(&file, start, Some(file_size), 1 << 12, |_rec| {
+            let ret = read_fixed_records_visit_const::<N, ()>(&file, file_len(&file).await, start, Some(file_size), 1 << 12, |_rec| {
                 count += 1;
                 Ok(())
             }).await.unwrap();

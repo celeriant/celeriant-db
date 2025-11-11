@@ -19,8 +19,8 @@ use glommio::PoolPlacement;
 use glommio::io::DmaFile;
 use tempfile::tempdir;
 
-// criterion_group!(benches, benchmark_read_objects_chunk_sizes, benchmark_read_objects_different_lengths, benchmark_read_fixed_records_chunk_sizes);
-criterion_group!(benches, benchmark_read_fixed_records_chunk_sizes);
+criterion_group!(benches, benchmark_read_objects_chunk_sizes, benchmark_read_objects_different_lengths, benchmark_read_fixed_records_chunk_sizes);
+// criterion_group!(benches, benchmark_read_fixed_records_chunk_sizes);
 
 
 criterion_main!(benches);
@@ -63,7 +63,7 @@ fn benchmark_read_fixed_records_chunk_sizes(c: &mut Criterion) {
 
     // Create the files before benchmarks start
     let file_path = format!("{}/fixed_records.bin", folder);
-    create_metadata_file(&file_path, N, record_count);
+    let file_size = create_metadata_file(&file_path, N, record_count);
 
     // Create independent files for each task/executor combo
     for shard_nbr in 0..nbr_shards {
@@ -87,6 +87,7 @@ fn benchmark_read_fixed_records_chunk_sizes(c: &mut Criterion) {
             &chunk_size, 
             |b, &chunk_size| {
                 b.iter(|| execute_read_fixed_records(
+                    black_box(file_size),
                     black_box(chunk_size),
                     black_box(folder),
                     black_box(glommio_tasks_per_executor),
@@ -99,7 +100,7 @@ fn benchmark_read_fixed_records_chunk_sizes(c: &mut Criterion) {
     group.finish();
 }
 
-fn execute_read_fixed_records(max_chunk_size: u64, folder: &str, glommio_tasks_per_executor: usize, nbr_shards: usize, online_cpus: &Option<CpuSet>) {
+fn execute_read_fixed_records(file_size: u64, max_chunk_size: u64, folder: &str, glommio_tasks_per_executor: usize, nbr_shards: usize, online_cpus: &Option<CpuSet>) {
     const N: usize = 256;
     
     let folder = folder.to_string();
@@ -126,6 +127,7 @@ fn execute_read_fixed_records(max_chunk_size: u64, folder: &str, glommio_tasks_p
                         let mut count = 0usize;
                         let result = read_fixed_records_visit_const::<N, ()>(
                             &file,
+                            file_size,
                             0,
                             None,
                             max_chunk_size,
@@ -200,6 +202,7 @@ fn benchmark_read_objects_chunk_sizes(c: &mut Criterion) {
     // Create the files before benchmarks start
     let file_path = format!("{}/{}_event_batches.bin", folder, label);
     let (start_positions, end_positions) = create_event_batch_file(&file_path, &size_vec);
+    let file_size = std::fs::metadata(&file_path).unwrap().len();
 
     let object_positions: Vec<AbsoluteObjectPosition> = start_positions
         .into_iter()
@@ -232,6 +235,7 @@ fn benchmark_read_objects_chunk_sizes(c: &mut Criterion) {
             &object_positions, 
             |b, object_positions| {
                 b.iter(|| execute_read_objects_different_lengths(
+                    black_box(file_size),
                     black_box(chunk_size),
                     black_box(folder),
                     black_box(label),
@@ -282,6 +286,7 @@ fn benchmark_read_objects_different_lengths(c: &mut Criterion) {
         // Create the files before benchmarks start to avoid including their costs
         let file_path = format!("{}/{}_event_batches.bin", folder, label);
         let (start_positions, end_positions) = create_event_batch_file(&file_path, &size_vec);
+        let file_size = std::fs::metadata(&file_path).unwrap().len();
 
         let object_positions: Vec<AbsoluteObjectPosition> = start_positions
             .into_iter()
@@ -305,6 +310,7 @@ fn benchmark_read_objects_different_lengths(c: &mut Criterion) {
             &object_positions, 
             |b, object_positions| {
                 b.iter(|| execute_read_objects_different_lengths(
+                    black_box(file_size),
                     black_box(32 * 1024), //32KB is optimal based on testing with benchmark_read_objects_chunk_sizes
                     black_box(folder),
                     black_box(label),
@@ -319,7 +325,7 @@ fn benchmark_read_objects_different_lengths(c: &mut Criterion) {
     group.finish();
 }
 
-fn execute_read_objects_different_lengths(max_chunk_size: u64, folder: &str, label: &str, object_positions: &Vec<AbsoluteObjectPosition>, glommio_tasks_per_executor: usize, nbr_shards: usize, online_cpus: &Option<CpuSet>) {
+fn execute_read_objects_different_lengths(file_size: u64, max_chunk_size: u64, folder: &str, label: &str, object_positions: &Vec<AbsoluteObjectPosition>, glommio_tasks_per_executor: usize, nbr_shards: usize, online_cpus: &Option<CpuSet>) {
     
     // Convert borrowed references to owned values before moving into closures
     let folder = folder.to_string();
@@ -349,6 +355,7 @@ fn execute_read_objects_different_lengths(max_chunk_size: u64, folder: &str, lab
 
                         let objects = read_objects_absolute(
                             &file,
+                            file_size,
                             black_box(object_positions.as_ref()),
                             max_chunk_size,
                         )
