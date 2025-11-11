@@ -681,6 +681,10 @@ impl ProcessRequest {
             ).await?
         };
 
+        //TODO: If we have an UNFILTERED contiguous read of batches that can be added to writer cache, add it!
+        //The writer cache could be empty and we have read up to the most recent event batch (although have to check again after getting write lock on writer)
+        //Or there could be data in the cache but the read matches up to that data and we can insert it in front
+
         if !read_result.uncached_metadata_set.is_empty() {
             let mut w_reader = reader.write().await.unwrap();
             w_reader.update_metadata_cache(read_result.uncached_metadata_set);
