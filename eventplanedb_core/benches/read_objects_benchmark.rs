@@ -6,6 +6,8 @@ use criterion::BenchmarkId;
 use criterion::Criterion;
 use criterion::Throughput;
 use criterion::{criterion_group, criterion_main};
+use eventplanedb_core::files::read_objects::AbsoluteObjectPosition;
+use eventplanedb_core::files::read_objects::read_objects_absolute;
 use eventplanedb_core::files::read_objects::test::create_event_batch_file;
 use eventplanedb_core::files::read_objects::test::object_sizes;
 use glommio::CpuSet;
@@ -67,7 +69,16 @@ fn benchmark_read_objects_chunk_sizes(c: &mut Criterion) {
 
     // Create the files before benchmarks start
     let file_path = format!("{}/{}_event_batches.bin", folder, label);
-    let (start_positions, _end_positions) = create_event_batch_file(&file_path, &size_vec);
+    let (start_positions, end_positions) = create_event_batch_file(&file_path, &size_vec);
+
+    let object_positions: Vec<AbsoluteObjectPosition> = start_positions
+        .into_iter()
+        .zip(end_positions)
+        .map(|(start_pos, end_pos)| AbsoluteObjectPosition {
+            start_pos,
+            end_pos,
+        })
+        .collect();
 
     // Create independent files for each task/executor combo
     for shard_nbr in 0..nbr_shards {
@@ -88,13 +99,13 @@ fn benchmark_read_objects_chunk_sizes(c: &mut Criterion) {
 
         group.bench_with_input(
             BenchmarkId::new("chunk_size", chunk_label), 
-            &start_positions, 
-            |b, start_positions| {
+            &object_positions, 
+            |b, object_positions| {
                 b.iter(|| execute_read_objects_different_lengths(
                     black_box(chunk_size),
                     black_box(folder),
                     black_box(label),
-                    black_box(&start_positions), 
+                    black_box(&object_positions), 
                     black_box(glommio_tasks_per_executor),
                     black_box(nbr_shards),
                     black_box(&online_cpus),
@@ -109,6 +120,8 @@ fn benchmark_read_objects_different_lengths(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("read_objects");
     
+    group.save_baseline = Some("main".to_string());
+
     group
         .sample_size(10)
         .measurement_time(Duration::from_secs(15))
@@ -140,7 +153,16 @@ fn benchmark_read_objects_different_lengths(c: &mut Criterion) {
 
         // Create the files before benchmarks start to avoid including their costs
         let file_path = format!("{}/{}_event_batches.bin", folder, label);
-        let (start_positions, _end_positions) = create_event_batch_file(&file_path, &size_vec);
+        let (start_positions, end_positions) = create_event_batch_file(&file_path, &size_vec);
+
+        let object_positions: Vec<AbsoluteObjectPosition> = start_positions
+            .into_iter()
+            .zip(end_positions)
+            .map(|(start_pos, end_pos)| AbsoluteObjectPosition {
+                start_pos,
+                end_pos,
+            })
+            .collect();
 
         // Create independant files for each task/executor combo
         for shard_nbr in 0..nbr_shards {
@@ -152,13 +174,13 @@ fn benchmark_read_objects_different_lengths(c: &mut Criterion) {
 
         group.bench_with_input(
             BenchmarkId::new("size", label), 
-            &start_positions, 
-            |b, start_positions| {
+            &object_positions, 
+            |b, object_positions| {
                 b.iter(|| execute_read_objects_different_lengths(
                     black_box(32 * 1024), //32KB is optimal based on testing with benchmark_read_objects_chunk_sizes
                     black_box(folder),
                     black_box(label),
-                    black_box(&start_positions), 
+                    black_box(&object_positions), 
                     black_box(glommio_tasks_per_executor),
                     black_box(nbr_shards),
                     black_box(&online_cpus),
@@ -169,12 +191,12 @@ fn benchmark_read_objects_different_lengths(c: &mut Criterion) {
     group.finish();
 }
 
-fn execute_read_objects_different_lengths(max_chunk_size: u64, folder: &str, label: &str, start_positions: &Vec<u64>, glommio_tasks_per_executor: usize, nbr_shards: usize, online_cpus: &Option<CpuSet>) {
+fn execute_read_objects_different_lengths(max_chunk_size: u64, folder: &str, label: &str, object_positions: &Vec<AbsoluteObjectPosition>, glommio_tasks_per_executor: usize, nbr_shards: usize, online_cpus: &Option<CpuSet>) {
     
     // Convert borrowed references to owned values before moving into closures
     let folder = folder.to_string();
     let label = label.to_string();
-    let start_positions = start_positions.clone();
+    let object_positions = object_positions.clone();
 
     LocalExecutorPoolBuilder::new(PoolPlacement::MaxSpread(
         nbr_shards,
@@ -190,16 +212,16 @@ fn execute_read_objects_different_lengths(max_chunk_size: u64, folder: &str, lab
 
                     let folder = folder.clone();
                     let label = label.clone();
-                    let start_positions = start_positions.clone();
+                    let object_positions = object_positions.clone();
 
                     handles.push(glommio::spawn_local(async move {
 
                         let file_path = format!("{}/{}_{}_{}_event_batches.bin", folder, label, shard_nbr, task_nbr);
                         let file: DmaFile = DmaFile::open(&file_path).await.unwrap();
 
-                        let objects = read_objects(
+                        let objects = read_objects_absolute(
                             &file,
-                            black_box(start_positions.as_ref()),
+                            black_box(object_positions.as_ref()),
                             max_chunk_size,
                         )
                         .await

@@ -139,107 +139,6 @@ pub async fn read_objects_absolute(
     Ok(objects)
 }
 
-pub async fn read_objects(
-    file: &DmaFile,
-    start_positions: &[u64],
-    max_chunk_size: u64,
-) -> glommio::Result<Vec<Vec<u8>>, ()> {
-
-    if start_positions.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // strictly increasing to disallow zero-length objects (duplicate starts).
-    assert!(
-        start_positions
-            .windows(2)
-            .all(|w| w[0] < w[1]),
-        "start_positions must be strictly increasing (no zero-length objects from duplicate starts)"
-    );
-
-    let alignment = file.alignment();
-    assert!(
-        (max_chunk_size as u64) >= alignment && (max_chunk_size as u64) % alignment == 0,
-        "max_chunk_size must be a multiple of the device alignment ({alignment})"
-    );
-
-    let file_size = file.file_size().await?;
-
-    // New: last start must be less than file size to avoid zero-length final object at EOF.
-    assert!(
-        start_positions.last().unwrap() < &file_size,
-        "last start_pos must be less than file size"
-    );
-
-    let mut objects = Vec::with_capacity(start_positions.len());
-    let mut object_idx = 0;
-    let mut object_start = start_positions[object_idx];
-    let mut object_end = if object_idx + 1 < start_positions.len() {
-        start_positions[object_idx + 1]
-    } else {
-        file_size
-    };
-    let mut object_buf = Vec::with_capacity(object_end.saturating_sub(object_start) as usize);
-
-    let mut chunk_start = object_start - (object_start % alignment);
-
-    while chunk_start < file_size && object_idx < start_positions.len() {
-        let chunk_end = std::cmp::min(chunk_start + max_chunk_size as u64, file_size);
-
-        // Skip ahead if this chunk ends before the next object's start
-        if chunk_end <= object_start {
-            chunk_start = object_start - (object_start % alignment);
-            continue;
-        }
-
-        let read_len = (chunk_end - chunk_start) as usize;
-        let chunk = file.read_at(chunk_start, read_len).await?;
-
-        let mut pos_in_chunk = if object_start > chunk_start {
-            (object_start - chunk_start) as usize
-        } else {
-            0
-        };
-
-        while chunk_start + (pos_in_chunk as u64) < chunk_end && object_idx < start_positions.len() {
-            // If before the current object's start within this chunk, skip the gap.
-            if chunk_start + (pos_in_chunk as u64) < object_start {
-                let target = (object_start - chunk_start) as usize;
-                pos_in_chunk = std::cmp::min(target, (chunk_end - chunk_start) as usize);
-                continue;
-            }
-
-            let cur_pos_abs = chunk_start + pos_in_chunk as u64;
-            let object_remaining = object_end.saturating_sub(cur_pos_abs);
-            let chunk_remaining = chunk_end.saturating_sub(cur_pos_abs);
-            let take_len = std::cmp::min(object_remaining, chunk_remaining) as usize;
-
-            if take_len > 0 {
-                object_buf.extend_from_slice(&chunk[pos_in_chunk..pos_in_chunk + take_len]);
-                pos_in_chunk += take_len;
-            }
-
-            if chunk_start + pos_in_chunk as u64 >= object_end {
-                objects.push(std::mem::take(&mut object_buf));
-                object_idx += 1;
-                if object_idx < start_positions.len() {
-                    object_start = start_positions[object_idx];
-                    object_end = if object_idx + 1 < start_positions.len() {
-                        start_positions[object_idx + 1]
-                    } else {
-                        file_size
-                    };
-                    object_buf = Vec::with_capacity(object_end.saturating_sub(object_start) as usize);
-                }
-            }
-        }
-        chunk_start += max_chunk_size as u64;
-        chunk_start = chunk_start - (chunk_start % alignment); // ensure alignment
-    }
-
-    Ok(objects)
-}
-
 /// Read fixed-size records from `start` up to `end_exclusive` (or EOF) and invoke `on_record`
 /// for each full record of size N. Trailing partial bytes are ignored.
 /// - start: absolute byte offset (must be < file size)
@@ -342,7 +241,6 @@ pub mod test {
     
     use tempfile::tempdir;
 
-    use crate::files::{read_objects::read_objects};
     use std::{fs::File, io::Write};
 
     pub fn object_sizes(start: usize, increment: usize, len: usize) -> Vec<usize> {
@@ -414,119 +312,9 @@ pub mod test {
         file_size
     }
 
-    #[test]
-    fn test_create_test_file() {
-        let total_bytes_per_file = 1024 * 1024 * 3; //3MB
-        let sizes = object_sizes(512, 0, total_bytes_per_file);
-
-        let tempdir = tempdir().unwrap();
-        let folder = tempdir.path().to_str().unwrap();
-
-        let (file_path, start_positions, _end_positions) = create_test_file(folder, &sizes);
-
-        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(move || async move {
-            let file = DmaFile::open(&file_path).await.unwrap();
-            
-            // Read all objects using 512-byte chunks
-            let objects = read_objects(&file, &start_positions, 512).await.unwrap();
-            
-            // Verify we got all objects
-            assert_eq!(objects.len(), start_positions.len());
-            
-            // Verify each object has correct byte value and size
-            for (i, obj) in objects.iter().enumerate() {
-                let expected_byte = (i % 256) as u8;
-                let expected_size = sizes[i];
-                
-                assert_eq!(obj.len(), expected_size, "Object {} has wrong size", i);
-                assert!(
-                    obj.iter().all(|&b| b == expected_byte),
-                    "Object {} has incorrect byte value (expected {}, got mixed values)",
-                    i, expected_byte
-                );
-            }
-            
-            file.close().await.unwrap();
-        }).unwrap();
-        
-        handle.join().unwrap();
-    }
-
     // Minimum is 1 << 9 (512KB) otherwise test may hang due to DMA alignment constraints.
     fn different_chunk_sizes() -> Vec<u64> {
         vec![1 << 9, 1 << 10, 1 << 11, 1 << 14, 1 << 17, 1 << 20, 1 << 21, 1 << 25, 1 << 29, 1 << 40, 1 << 50]
-    }
-
-
-    #[test]
-    fn test_read_objects_across_chunks() {
-        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
-            let tempdir = tempdir().unwrap();
-            let folder = tempdir.path().to_str().unwrap();
-
-            // Create objects of varying sizes, some crossing 1MB boundaries
-            let object_sizes = vec![
-                512 * 1024,   // 512KB
-                1 * 1024 * 1024, // 1MB
-                1 * 1024 * 1024 + 123, // 1MB + 123 bytes
-                256 * 1024,   // 256KB
-                2 * 1024 * 1024, // 2MB
-            ];
-            let (file_path, start_positions, _end_positions) = create_test_file(folder, &object_sizes);
-
-            for chunk_size in different_chunk_sizes().iter().enumerate() {
-                let file = DmaFile::open(&file_path).await.unwrap();
-                let objects = read_objects(&file, &start_positions.clone(), *chunk_size.1).await.unwrap();
-
-                assert_eq!(objects.len(), object_sizes.len());
-                for (i, obj) in objects.iter().enumerate() {
-                    assert_eq!(obj.len(), object_sizes[i]);
-                    let expected_byte = (i % 256) as u8;
-                    assert!(obj.iter().all(|&b| b == expected_byte));
-                }
-            }
-
-        }).unwrap();
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn test_read_objects_skip_first() {
-        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
-            let tempdir = tempdir().unwrap();
-            let folder = tempdir.path().to_str().unwrap();
-
-            // Keep the first object in the file, but don't include its start position in the read
-            let object_sizes = vec![
-                256 * 1024,        // 256KB  (will be skipped in read)
-                1 * 1024 * 1024,   // 1MB
-                1 * 1024 * 1024 + 7, // 1MB + 7 bytes
-                64 * 1024,         // 64KB
-            ];
-            let (file_path, start_positions, _end_positions) = create_test_file(folder, &object_sizes);
-
-            for chunk_size in different_chunk_sizes().iter().enumerate() {
-                // Skip the first object's start position
-                let skipped_start_positions = start_positions[1..].to_vec();
-                let file = DmaFile::open(&file_path).await.unwrap();
-                let objects = read_objects(&file, &skipped_start_positions, *chunk_size.1)
-                    .await
-                    .unwrap();
-
-                // We expect all but the first object
-                assert_eq!(objects.len(), object_sizes.len() - 1);
-
-                // Validate objects 1.. correspond exactly to what was written
-                for (j, obj) in objects.iter().enumerate() {
-                    let original_index = j + 1; // shift by one because we skipped the first
-                    assert_eq!(obj.len(), object_sizes[original_index]);
-                    let expected_byte = (original_index % 256) as u8;
-                    assert!(obj.iter().all(|&b| b == expected_byte));
-                }
-            }
-
-        }).unwrap();
-        handle.join().unwrap();
     }
 
     #[test]
@@ -630,28 +418,6 @@ pub mod test {
     }
 
     #[test]
-    fn test_read_objects_unordered_positions_panics() {
-        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
-            let tempdir = tempdir().unwrap();
-            let folder = tempdir.path().to_str().unwrap();
-
-            let object_sizes = vec![4 * 1024, 4 * 1024, 4 * 1024];
-            let (file_path, start_positions, _end_positions) = create_test_file(folder, &object_sizes);
-
-            // Make positions strictly decreasing to trigger assertion.
-            let mut bad_positions = start_positions.clone();
-            bad_positions.swap(0, 1); // now [4096, 0, 8192]
-
-            // Should panic due to "start_positions must be non-decreasing"
-            let file = DmaFile::open(&file_path).await.unwrap();
-            let _ = read_objects(&file, &bad_positions, 1 << 12).await;
-        }).unwrap();
-
-        // Expect the task to have panicked
-        assert!(handle.join().is_err());
-    }
-
-    #[test]
     fn test_read_objects_absolute_overlapping_panics() {
         let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
             let tempdir = tempdir().unwrap();
@@ -678,24 +444,6 @@ pub mod test {
     }
 
     #[test]
-    fn test_read_objects_invalid_chunk_size_panics() {
-        // Chunk size not a multiple of device alignment should assert
-        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
-            let tempdir = tempdir().unwrap();
-            let folder = tempdir.path().to_str().unwrap();
-
-            let object_sizes = vec![1024, 1024, 1024];
-            let (file_path, starts, _ends) = create_test_file(folder, &object_sizes);
-
-            // 1 is almost certainly not a valid alignment multiple on real devices
-            let file = DmaFile::open(&file_path).await.unwrap();
-            let _ = read_objects(&file, &starts, 1).await;
-        }).unwrap();
-
-        assert!(handle.join().is_err());
-    }
-
-    #[test]
     fn test_read_objects_absolute_invalid_chunk_size_panics() {
         // Chunk size not a multiple of device alignment should assert
         let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
@@ -713,28 +461,6 @@ pub mod test {
             // 1 is almost certainly not a valid alignment multiple on real devices
             let file = DmaFile::open(&file_path).await.unwrap();
             let _ = read_objects_absolute(&file, &positions, 1).await;
-        }).unwrap();
-
-        assert!(handle.join().is_err());
-    }
-
-    #[test]
-    fn test_read_objects_zero_length_in_middle_and_end() {
-        // Now should panic due to zero-length objects (duplicate start and EOF start).
-        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
-            let tempdir = tempdir().unwrap();
-            let folder = tempdir.path().to_str().unwrap();
-
-            // 3 objects of 4 bytes each
-            let object_sizes = vec![4, 4, 4];
-            let (file_path, _starts, _ends) = create_test_file(folder, &object_sizes);
-
-            let file_size = (object_sizes.iter().sum::<usize>()) as u64;
-            let custom_starts = vec![0u64, 4u64, 4u64, 8u64, file_size];
-
-            // Should assert due to zero-length object(s) / last start at EOF
-            let file = DmaFile::open(&file_path).await.unwrap();
-            let _ = read_objects(&file, &custom_starts, 1 << 12).await;
         }).unwrap();
 
         assert!(handle.join().is_err());
@@ -791,24 +517,6 @@ pub mod test {
             assert_eq!(objects.len(), 1);
             assert_eq!(objects[0].len(), (file_size - start) as usize);
             assert!(objects[0].iter().all(|&b| b == 1));
-        }).unwrap();
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn test_read_objects_empty_input_returns_empty() {
-        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
-            let tempdir = tempdir().unwrap();
-            let folder = tempdir.path().to_str().unwrap();
-            let object_sizes = vec![1024];
-            let (file_path, _starts, _ends) = create_test_file(folder, &object_sizes);
-
-            let file: DmaFile = DmaFile::open(&file_path).await.unwrap();
-            let v = read_objects(&file, &[], 1 << 12).await.unwrap();
-            assert!(v.is_empty());
-
-            let v2 = read_objects_absolute(&file, &[], 1 << 12).await.unwrap();
-            assert!(v2.is_empty());
         }).unwrap();
         handle.join().unwrap();
     }
@@ -981,31 +689,4 @@ pub mod test {
         assert!(handle.join().is_err());
     }
 
-    #[test]
-    fn test_read_objects_bad_chunk_advancement_logic() {
-        // This test exposes the flawed chunk advancement logic.
-        // The function asserts that chunk size must be a multiple of alignment.
-        // If that assert were removed, the logic `chunk_start -= chunk_start % alignment`
-        // would cause chunks to overlap and data to be re-read.
-        // The test will pass by panicking on the existing assertion.
-        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
-            let tempdir = tempdir().unwrap();
-            let folder = tempdir.path().to_str().unwrap();
-
-            let object_sizes = vec![4096, 4096];
-            let (file_path, starts, _ends) = create_test_file(folder, &object_sizes);
-
-            // To get alignment, we need to open the file first.
-            let alignment = DmaFile::open(&file_path).await.unwrap().alignment();
-            
-            // Use a chunk size that is NOT a multiple of alignment.
-            let bad_chunk_size = alignment + 1;
-
-            // This should panic due to the chunk size assertion.
-            let file: DmaFile = DmaFile::open(&file_path).await.unwrap();
-            let _ = read_objects(&file, &starts, bad_chunk_size).await;
-        }).unwrap();
-
-        assert!(handle.join().is_err());
-    }
 }
