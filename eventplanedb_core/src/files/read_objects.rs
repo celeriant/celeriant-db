@@ -334,43 +334,75 @@ pub async fn read_fixed_records_visit_const<const N: usize, E>(
     Ok(records)
 }
 
-#[cfg(test)]
-mod test {
-    use super::*;
-    use glommio::{LocalExecutorBuilder, Placement};
-    use tempfile::tempdir;
-    use std::fs::File;
-    use std::io::{Write};
+#[cfg(any(test, feature = "bench"))]
+pub mod test {
 
-    // Minimum is 1 << 9 (512KB) otherwise test may hang due to DMA alignment constraints.
-    fn different_chunk_sizes() -> Vec<u64> {
-        vec![1 << 9, 1 << 10, 1 << 11, 1 << 14, 1 << 17, 1 << 20, 1 << 21, 1 << 25, 1 << 29, 1 << 40, 1 << 50]
+    use super::*;
+    use glommio::{LocalExecutorBuilder, Placement, io::DmaFile};
+    
+    use tempfile::tempdir;
+
+    use crate::files::{read_objects::read_objects};
+    use std::{fs::File, io::Write};
+
+    pub fn object_sizes(start: usize, increment: usize, len: usize) -> Vec<usize> {
+        let mut sizes = Vec::new();
+        let mut cumulative = 0;
+        let mut i = 0;
+        
+        loop {
+            let size = start + (i * increment);
+            if cumulative + size > len {
+                break;
+            }
+            sizes.push(size);
+            cumulative += size;
+            i += 1;
+        }
+        
+        sizes
     }
 
-    fn create_test_file(path: &str, object_sizes: &[usize]) -> (String, Vec<u64>, Vec<u64>) {
+    pub fn create_test_file(path: &str, object_sizes: &[usize]) -> (String, Vec<u64>, Vec<u64>) {
         let file_path = format!("{}/testfile.bin", path);
-        let mut file = File::create(&file_path).unwrap();
-        let mut start_positions = Vec::with_capacity(object_sizes.len());        
-        let mut end_positions = Vec::with_capacity(object_sizes.len());
-
-        let mut pos = 0u64;
-
-        for (i, &size) in object_sizes.iter().enumerate() {
-            start_positions.push(pos);
-            end_positions.push(pos+size as u64);
-            let byte = (i % 256) as u8;
-            let buf = vec![byte; size];
-            file.write_all(&buf).unwrap();
-            pos += size as u64;
-        }
-        file.flush().unwrap();
+        let (start_positions, end_positions) = create_event_batch_file(&file_path, object_sizes);
         (file_path, start_positions, end_positions)
     }
 
     // Helper: create a file of `record_count` records, each record is `record_size` bytes,
     // filled with the record index (mod 256).
-    fn create_fixed_record_file(path: &str, record_size: usize, record_count: usize) -> (String, u64) {
+    pub fn create_fixed_record_file(path: &str, record_size: usize, record_count: usize) -> (String, u64) {
         let file_path = format!("{}/fixed_records.bin", path);
+        let file_size = create_metadata_file(&file_path, record_size, record_count);
+        (file_path, file_size)
+    }
+
+    // Helper function to create a test file with variable-sized objects.
+    pub fn create_event_batch_file(file_path: &str, object_sizes: &[usize]) -> (Vec<u64>, Vec<u64>) {
+        let mut file = File::create(&file_path).unwrap();
+        let mut start_positions = Vec::with_capacity(object_sizes.len());
+        let mut end_positions = Vec::with_capacity(object_sizes.len());
+        
+        let mut pos = 0u64;
+
+        for (i, &size) in object_sizes.iter().enumerate() {
+            start_positions.push(pos);
+            end_positions.push(pos + size as u64);
+            let byte = (i % 256) as u8;
+            let buf = vec![byte; size as usize];
+            file.write_all(&buf).unwrap();
+            pos += size as u64;
+        }
+        file.flush().unwrap();
+        (start_positions, end_positions)
+    }
+
+    // Helper function to create a file with fixed-sized records.
+    pub fn create_metadata_file(
+        file_path: &str,
+        record_size: usize,
+        record_count: usize,
+    ) -> u64 {
         let mut file = File::create(&file_path).unwrap();
         for i in 0..record_count {
             let byte = (i % 256) as u8;
@@ -379,8 +411,52 @@ mod test {
         }
         file.flush().unwrap();
         let file_size = (record_size as u64) * (record_count as u64);
-        (file_path, file_size)
+        file_size
     }
+
+    #[test]
+    fn test_create_test_file() {
+        let total_bytes_per_file = 1024 * 1024 * 3; //3MB
+        let sizes = object_sizes(512, 0, total_bytes_per_file);
+
+        let tempdir = tempdir().unwrap();
+        let folder = tempdir.path().to_str().unwrap();
+
+        let (file_path, start_positions, _end_positions) = create_test_file(folder, &sizes);
+
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(move || async move {
+            let file = DmaFile::open(&file_path).await.unwrap();
+            
+            // Read all objects using 512-byte chunks
+            let objects = read_objects(&file, &start_positions, 512).await.unwrap();
+            
+            // Verify we got all objects
+            assert_eq!(objects.len(), start_positions.len());
+            
+            // Verify each object has correct byte value and size
+            for (i, obj) in objects.iter().enumerate() {
+                let expected_byte = (i % 256) as u8;
+                let expected_size = sizes[i];
+                
+                assert_eq!(obj.len(), expected_size, "Object {} has wrong size", i);
+                assert!(
+                    obj.iter().all(|&b| b == expected_byte),
+                    "Object {} has incorrect byte value (expected {}, got mixed values)",
+                    i, expected_byte
+                );
+            }
+            
+            file.close().await.unwrap();
+        }).unwrap();
+        
+        handle.join().unwrap();
+    }
+
+    // Minimum is 1 << 9 (512KB) otherwise test may hang due to DMA alignment constraints.
+    fn different_chunk_sizes() -> Vec<u64> {
+        vec![1 << 9, 1 << 10, 1 << 11, 1 << 14, 1 << 17, 1 << 20, 1 << 21, 1 << 25, 1 << 29, 1 << 40, 1 << 50]
+    }
+
 
     #[test]
     fn test_read_objects_across_chunks() {

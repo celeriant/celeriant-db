@@ -23,16 +23,16 @@ pub struct EventPlaneDBConfig {
     pub max_open_aggregates: usize,
 
     // Aggregate I/O tuning (read/write)
-    #[arg(long, default_value_t = 1024 * 1024, help = "Max chunk size for aggregate reads (1 MiB)")]
+    #[arg(long, default_value_t = 32 * 1024, help = "Max chunk size for aggregate reads (32kb)")]
     pub aggregate_read_max_chunk_size: u64,
     
-    #[arg(long, default_value_t = 1024 * 1024, help = "Max data cache size for aggregate reads (1 MiB)")]
+    #[arg(long, default_value_t = 1024 * 1024 * 3, help = "Max data cache size for aggregate reads (3 MiB)")]
     pub aggregate_read_max_data_cache_size_bytes: usize,
     
-    #[arg(long, default_value_t = 1024 * 1024, help = "Max chunk size for aggregate writes (1 MiB)")]
+    #[arg(long, default_value_t = 32 * 1024, help = "Max chunk size for aggregate writes (32kb)")]
     pub aggregate_write_max_chunk_size: usize,
     
-    #[arg(long, default_value_t = 32 * 1024 * 1024, help = "Max data cache size for aggregate writes (32 MiB)")]
+    #[arg(long, default_value_t = 1024 * 1024 * 128, help = "Max data cache size for aggregate writes (128 MiB)")]
     pub aggregate_write_max_data_cache_size_bytes: usize,
 
     #[arg(long, default_value = "10", help = "Cache trim factor")]
@@ -54,10 +54,10 @@ impl Default for EventPlaneDBConfig {
             listen_address: "0.0.0.0:10000".to_string(),
             mesh_channel_size: 1024,
             num_shards: None,
-            aggregate_read_max_chunk_size: 1024 * 1024,
-            aggregate_read_max_data_cache_size_bytes: 1024 * 1024,
-            aggregate_write_max_chunk_size: 1024 * 1024,
-            aggregate_write_max_data_cache_size_bytes: 32 * 1024 * 1024,
+            aggregate_read_max_chunk_size: 32 * 1024,
+            aggregate_read_max_data_cache_size_bytes: 1024 * 1024 * 3,
+            aggregate_write_max_chunk_size: 32 * 1024,
+            aggregate_write_max_data_cache_size_bytes: 1024 * 1024 * 128,
             cache_trim_factor: 10,
             max_open_aggregates: 10000,
             max_message_size: 64 * 1024 * 1024,

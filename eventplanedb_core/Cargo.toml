@@ -5,6 +5,9 @@ authors.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+bench = ["tempfile"]
+
 [dependencies]
 eventplanedb_structures = { path = "../eventplanedb_structures" }
 fastbloom.workspace = true
@@ -17,6 +20,7 @@ serde.workspace = true
 crc32fast.workspace = true
 log.workspace = true
 walkdir.workspace = true
+tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -27,7 +31,4 @@ uuid.workspace = true
 [[bench]]
 name = "read_objects_benchmark"
 harness = false
-
-[[bench]]
-name = "print_northstar_benchmark"
-harness = false
+required-features = ["bench"]

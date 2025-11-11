@@ -1,14 +1,14 @@
 
 #[cfg(test)]
 mod test_basic_read_write {
-    use std::{collections::HashMap, rc::Rc};
+    use std::{rc::Rc};
 
     use uuid::Uuid;
 
     use eventplanedb_structures::{aggregate_key::{AggregateKey}, event_item::EventItem, read_filters::ReadFilters};
     use glommio::{LocalExecutorBuilder, Placement, sync::RwLock};
 
-    use crate::files::{helper::{get_or_create_reader, get_or_create_writer}, read_operations::{AggregateReadConfig, CacheableReadResult, ReadOperations}, write_operations::{AggregateWriteConfig, AppendOptions, CacheReadError, WriteOperations}};
+    use crate::files::{helper::{get_or_create_reader, get_or_create_writer}, read_operations::{AggregateReadConfig, CacheableReadResult}, write_operations::{AggregateWriteConfig, AppendOptions, CacheReadError}};
 
     fn check_read_1(read_result: &CacheableReadResult, event_id: u128, expected_cache_len: usize) {
         assert_eq!(read_result.filtered_event_batches.len(), 2);
