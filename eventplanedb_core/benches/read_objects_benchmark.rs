@@ -7,8 +7,11 @@ use criterion::Criterion;
 use criterion::Throughput;
 use criterion::{criterion_group, criterion_main};
 use eventplanedb_core::files::read_objects::AbsoluteObjectPosition;
+use eventplanedb_core::files::read_objects::read_fixed_records_visit_const;
 use eventplanedb_core::files::read_objects::read_objects_absolute;
 use eventplanedb_core::files::read_objects::test::create_event_batch_file;
+use eventplanedb_core::files::read_objects::test::create_fixed_record_file;
+use eventplanedb_core::files::read_objects::test::create_metadata_file;
 use eventplanedb_core::files::read_objects::test::object_sizes;
 use glommio::CpuSet;
 use glommio::LocalExecutorPoolBuilder;
@@ -16,13 +19,140 @@ use glommio::PoolPlacement;
 use glommio::io::DmaFile;
 use tempfile::tempdir;
 
-use eventplanedb_core::files::read_objects::{
-    read_objects
-};
+// criterion_group!(benches, benchmark_read_objects_chunk_sizes, benchmark_read_objects_different_lengths, benchmark_read_fixed_records_chunk_sizes);
+criterion_group!(benches, benchmark_read_fixed_records_chunk_sizes);
 
-criterion_group!(benches, benchmark_read_objects_chunk_sizes, benchmark_read_objects_different_lengths);
 
 criterion_main!(benches);
+
+fn benchmark_read_fixed_records_chunk_sizes(c: &mut Criterion) {
+    const N: usize = 256;
+
+    let mut group = c.benchmark_group("read_fixed_records_chunk_sizes");
+    
+    group
+        .sample_size(10)
+        .measurement_time(Duration::from_secs(15))
+        .warm_up_time(Duration::from_secs(5));
+
+    let nbr_shards = num_cpus::get();
+    let online_cpus = CpuSet::online().ok();
+    
+    let tempdir = tempdir().unwrap();
+    let folder = tempdir.path().to_str().unwrap();
+
+    let total_bytes_per_file = 1024 * 1024 * 13; // 13MB
+    let record_count = total_bytes_per_file / N;
+    let glommio_tasks_per_executor: usize = 4;
+
+    // Test different chunk sizes
+    let chunk_sizes: Vec<u64> = vec![
+        // 8 * 1024,          // 8 KB
+        // 16 * 1024,         // 16 KB
+        32 * 1024,         // 32 KB
+        64 * 1024,         // 64 KB
+        // 128 * 1024,        // 128 KB
+        // 256 * 1024,        // 256 KB
+        // 512 * 1024,        // 512 KB
+        // 1024 * 1024,       // 1 MB
+    ];
+
+    group.throughput(Throughput::Bytes(
+        (total_bytes_per_file as u64) * (glommio_tasks_per_executor as u64) * (nbr_shards as u64),
+    ));
+
+    // Create the files before benchmarks start
+    let file_path = format!("{}/fixed_records.bin", folder);
+    create_metadata_file(&file_path, N, record_count);
+
+    // Create independent files for each task/executor combo
+    for shard_nbr in 0..nbr_shards {
+        for task_nbr in 0..glommio_tasks_per_executor {
+            let copy_path = format!("{}/fixed_records_{}_{}.bin", folder, shard_nbr, task_nbr);
+            std::fs::copy(&file_path, &copy_path).expect("Failed to copy file");
+        }
+    }
+
+    for &chunk_size in chunk_sizes.iter() {
+        let chunk_label = if chunk_size < 1024 {
+            format!("{}b", chunk_size)
+        } else if chunk_size < 1024 * 1024 {
+            format!("{}kb", chunk_size / 1024)
+        } else {
+            format!("{}mb", chunk_size / (1024 * 1024))
+        };
+
+        group.bench_with_input(
+            BenchmarkId::new("chunk_size", chunk_label), 
+            &chunk_size, 
+            |b, &chunk_size| {
+                b.iter(|| execute_read_fixed_records(
+                    black_box(chunk_size),
+                    black_box(folder),
+                    black_box(glommio_tasks_per_executor),
+                    black_box(nbr_shards),
+                    black_box(&online_cpus),
+                ));
+            });
+    }
+
+    group.finish();
+}
+
+fn execute_read_fixed_records(max_chunk_size: u64, folder: &str, glommio_tasks_per_executor: usize, nbr_shards: usize, online_cpus: &Option<CpuSet>) {
+    const N: usize = 256;
+    
+    let folder = folder.to_string();
+
+    LocalExecutorPoolBuilder::new(PoolPlacement::MaxSpread(
+        nbr_shards,
+        online_cpus.clone(),
+    ))
+    .on_all_shards({
+        move || {
+            async move {
+                let shard_nbr = glommio::executor().id() % nbr_shards;
+
+                let mut handles = Vec::with_capacity(glommio_tasks_per_executor);
+                for task_nbr in 0..glommio_tasks_per_executor {
+
+                    let folder = folder.clone();
+
+                    handles.push(glommio::spawn_local(async move {
+
+                        let file_path = format!("{}/fixed_records_{}_{}.bin", folder, shard_nbr, task_nbr);
+                        let file: DmaFile = DmaFile::open(&file_path).await.unwrap();
+
+                        let mut count = 0usize;
+                        let result = read_fixed_records_visit_const::<N, ()>(
+                            &file,
+                            0,
+                            None,
+                            max_chunk_size,
+                            |_rec| {
+                                count += 1;
+                                Ok(())
+                            }
+                        )
+                        .await
+                        .unwrap();
+                    
+                        black_box(result);
+                        black_box(count);
+
+                        file.close().await.unwrap();
+                    }));
+                }
+
+                for h in handles {
+                    h.await;
+                }
+            }
+        }
+    })
+    .unwrap()
+    .join_all();
+}
 
 fn benchmark_read_objects_chunk_sizes(c: &mut Criterion) {
 
@@ -120,8 +250,6 @@ fn benchmark_read_objects_different_lengths(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("read_objects");
     
-    group.save_baseline = Some("main".to_string());
-
     group
         .sample_size(10)
         .measurement_time(Duration::from_secs(15))

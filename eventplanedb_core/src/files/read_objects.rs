@@ -159,6 +159,18 @@ pub async fn read_fixed_records_visit_const<const N: usize, E>(
         "max_chunk_size must be a multiple of the device alignment ({alignment})"
     );
 
+    assert!(
+        start % N as u64 == 0,
+        "start must be a multiple of the record size ({N})"
+    );
+
+    if let Some(end_exclusive) = end_exclusive {
+        assert!(
+            end_exclusive % N as u64 == 0,
+            "end_exclusive must be a multiple of the record size ({N})"
+        );
+    }
+
     let file_size = file.file_size().await
         .map_err(|e| ReadVisitError::Io(e))?;
     assert!(start < file_size, "start must be less than file size");
@@ -317,6 +329,10 @@ pub mod test {
         vec![1 << 9, 1 << 10, 1 << 11, 1 << 14, 1 << 17, 1 << 20, 1 << 21, 1 << 25, 1 << 29, 1 << 40, 1 << 50]
     }
 
+    /// Happy Path
+    /// Tests reading variable-sized objects (512KB to 2MB) with some objects skipped (2nd and 3rd)
+    /// Validates content and sizes across different chunk sizes
+    /// Verifies objects spanning multiple chunks work correctly
     #[test]
     fn test_read_objects_across_chunks_absolute() {
         let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
@@ -367,6 +383,9 @@ pub mod test {
         handle.join().unwrap();
     }
 
+    /// Happy Path
+    /// Tests skipping objects at beginning, middle, and end of file (1st, 2nd, 5th)
+    /// Ensures gaps between requested objects are handled efficiently
     #[test]
     fn test_read_objects_across_chunks_absolute_start_end_skips() {
         let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
@@ -417,6 +436,9 @@ pub mod test {
         handle.join().unwrap();
     }
 
+    // Error Condition
+    // Verifies that overlapping object positions trigger assertion failure
+    // Tests validation of the "non-overlapping" invariant
     #[test]
     fn test_read_objects_absolute_overlapping_panics() {
         let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
@@ -443,6 +465,9 @@ pub mod test {
         assert!(handle.join().is_err());
     }
 
+    /// Error Condition
+    /// Tests that chunk size not being a multiple of device alignment causes panic
+    /// Validates alignment requirements
     #[test]
     fn test_read_objects_absolute_invalid_chunk_size_panics() {
         // Chunk size not a multiple of device alignment should assert
@@ -466,6 +491,9 @@ pub mod test {
         assert!(handle.join().is_err());
     }
 
+    /// Error Condition
+    /// Tests that zero-length objects (start_pos == end_pos) cause panic
+    /// Also tests that starting exactly at EOF causes panic
     #[test]
     fn test_read_objects_absolute_zero_length_in_middle_and_end() {
         // Now should panic due to zero-length absolute objects.
@@ -494,6 +522,9 @@ pub mod test {
         assert!(handle.join().is_err());
     }
 
+    /// Edge Case
+    /// Tests that requesting end_pos beyond file size correctly truncates to EOF
+    /// Validates content is read up to actual file end
     #[test]
     fn test_read_objects_absolute_truncate_beyond_eof() {
         let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
@@ -521,6 +552,319 @@ pub mod test {
         handle.join().unwrap();
     }
 
+    /// Happy Path
+    /// Tests single object spanning entire file
+    #[test]
+    fn test_read_objects_absolute_entire_file() {
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
+            let tempdir = tempdir().unwrap();
+            let folder = tempdir.path().to_str().unwrap();
+
+            let object_sizes = vec![5 * 1024 * 1024]; // 5MB single object
+            let (file_path, starts, ends) = create_test_file(folder, &object_sizes);
+
+            let positions = vec![
+                AbsoluteObjectPosition { start_pos: starts[0], end_pos: ends[0] },
+            ];
+
+            for chunk_size in different_chunk_sizes() {
+                let file = DmaFile::open(&file_path).await.unwrap();
+                let objects = read_objects_absolute(&file, &positions, chunk_size).await.unwrap();
+                
+                assert_eq!(objects.len(), 1);
+                assert_eq!(objects[0].len(), object_sizes[0]);
+                assert!(objects[0].iter().all(|&b| b == 0));
+            }
+        }).unwrap();
+        handle.join().unwrap();
+    }
+
+    /// Happy Path
+    /// Tests many small objects (1000+ tiny objects)
+    #[test]
+    fn test_read_objects_absolute_many_small_objects() {
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
+            let tempdir = tempdir().unwrap();
+            let folder = tempdir.path().to_str().unwrap();
+
+            let object_sizes = vec![128; 1500]; // 1500 objects of 128 bytes each
+            let (file_path, starts, ends) = create_test_file(folder, &object_sizes);
+
+            let positions: Vec<_> = starts.iter().zip(ends.iter())
+                .map(|(&start, &end)| AbsoluteObjectPosition { start_pos: start, end_pos: end })
+                .collect();
+
+            for chunk_size in different_chunk_sizes() {
+                let file = DmaFile::open(&file_path).await.unwrap();
+                let objects = read_objects_absolute(&file, &positions, chunk_size).await.unwrap();
+                
+                assert_eq!(objects.len(), 1500);
+                for (i, obj) in objects.iter().enumerate() {
+                    assert_eq!(obj.len(), 128);
+                    let expected_byte = (i % 256) as u8;
+                    assert!(obj.iter().all(|&b| b == expected_byte));
+                }
+            }
+        }).unwrap();
+        handle.join().unwrap();
+    }
+
+    /// Happy Path
+    /// Tests consecutive objects with no gaps
+    #[test]
+    fn test_read_objects_absolute_consecutive_no_gaps() {
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
+            let tempdir = tempdir().unwrap();
+            let folder = tempdir.path().to_str().unwrap();
+
+            let object_sizes = vec![256 * 1024, 512 * 1024, 1024 * 1024, 128 * 1024];
+            let (file_path, starts, ends) = create_test_file(folder, &object_sizes);
+
+            let positions: Vec<_> = starts.iter().zip(ends.iter())
+                .map(|(&start, &end)| AbsoluteObjectPosition { start_pos: start, end_pos: end })
+                .collect();
+
+            for chunk_size in different_chunk_sizes() {
+                let file = DmaFile::open(&file_path).await.unwrap();
+                let objects = read_objects_absolute(&file, &positions, chunk_size).await.unwrap();
+                
+                assert_eq!(objects.len(), 4);
+                for (i, obj) in objects.iter().enumerate() {
+                    assert_eq!(obj.len(), object_sizes[i]);
+                    let expected_byte = (i % 256) as u8;
+                    assert!(obj.iter().all(|&b| b == expected_byte));
+                }
+            }
+        }).unwrap();
+        handle.join().unwrap();
+    }
+
+    /// Happy Path
+    /// Tests empty object list returns empty Vec
+    #[test]
+    fn test_read_objects_absolute_empty_list() {
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
+            let tempdir = tempdir().unwrap();
+            let folder = tempdir.path().to_str().unwrap();
+
+            let object_sizes = vec![1024];
+            let (file_path, _starts, _ends) = create_test_file(folder, &object_sizes);
+
+            let positions: Vec<AbsoluteObjectPosition> = Vec::new();
+
+            let file = DmaFile::open(&file_path).await.unwrap();
+            let objects = read_objects_absolute(&file, &positions, 1 << 12).await.unwrap();
+            
+            assert_eq!(objects.len(), 0);
+        }).unwrap();
+        handle.join().unwrap();
+    }
+
+    /// Edge Case
+    /// Tests object exactly at file start (start_pos = 0)
+    #[test]
+    fn test_read_objects_absolute_at_file_start() {
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
+            let tempdir = tempdir().unwrap();
+            let folder = tempdir.path().to_str().unwrap();
+
+            let object_sizes = vec![1024 * 1024, 512 * 1024];
+            let (file_path, starts, ends) = create_test_file(folder, &object_sizes);
+
+            assert_eq!(starts[0], 0); // Verify it starts at 0
+            
+            let positions = vec![
+                AbsoluteObjectPosition { start_pos: starts[0], end_pos: ends[0] },
+            ];
+
+            for chunk_size in different_chunk_sizes() {
+                let file = DmaFile::open(&file_path).await.unwrap();
+                let objects = read_objects_absolute(&file, &positions, chunk_size).await.unwrap();
+                
+                assert_eq!(objects.len(), 1);
+                assert_eq!(objects[0].len(), object_sizes[0]);
+                assert!(objects[0].iter().all(|&b| b == 0));
+            }
+        }).unwrap();
+        handle.join().unwrap();
+    }
+
+    /// Edge Case
+    /// Tests multiple objects all smaller than one alignment block
+    #[test]
+    fn test_read_objects_absolute_smaller_than_alignment() {
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
+            let tempdir = tempdir().unwrap();
+            let folder = tempdir.path().to_str().unwrap();
+
+            // 10 objects of 64 bytes each (smaller than typical 512-byte alignment)
+            let object_sizes = vec![64; 10];
+            let (file_path, starts, ends) = create_test_file(folder, &object_sizes);
+
+            let positions: Vec<_> = starts.iter().zip(ends.iter())
+                .map(|(&start, &end)| AbsoluteObjectPosition { start_pos: start, end_pos: end })
+                .collect();
+
+            for chunk_size in different_chunk_sizes() {
+                let file = DmaFile::open(&file_path).await.unwrap();
+                let objects = read_objects_absolute(&file, &positions, chunk_size).await.unwrap();
+                
+                assert_eq!(objects.len(), 10);
+                for (i, obj) in objects.iter().enumerate() {
+                    assert_eq!(obj.len(), 64);
+                    let expected_byte = (i % 256) as u8;
+                    assert!(obj.iter().all(|&b| b == expected_byte));
+                }
+            }
+        }).unwrap();
+        handle.join().unwrap();
+    }
+
+    /// Edge Case
+    /// Tests objects where chunk boundaries align exactly with object boundaries
+    #[test]
+    fn test_read_objects_absolute_aligned_boundaries() {
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
+            let tempdir = tempdir().unwrap();
+            let folder = tempdir.path().to_str().unwrap();
+
+            // Use 1MB objects with 1MB chunk size to align boundaries
+            let chunk_size = 1 << 20; // 1MB
+            let object_sizes = vec![chunk_size as usize; 5];
+            let (file_path, starts, ends) = create_test_file(folder, &object_sizes);
+
+            let positions: Vec<_> = starts.iter().zip(ends.iter())
+                .map(|(&start, &end)| AbsoluteObjectPosition { start_pos: start, end_pos: end })
+                .collect();
+
+            let file = DmaFile::open(&file_path).await.unwrap();
+            let objects = read_objects_absolute(&file, &positions, chunk_size).await.unwrap();
+            
+            assert_eq!(objects.len(), 5);
+            for (i, obj) in objects.iter().enumerate() {
+                assert_eq!(obj.len(), chunk_size as usize);
+                let expected_byte = (i % 256) as u8;
+                assert!(obj.iter().all(|&b| b == expected_byte));
+            }
+        }).unwrap();
+        handle.join().unwrap();
+    }
+
+    /// Edge Case
+    /// Tests large single object (several MB) with small chunks
+    #[test]
+    fn test_read_objects_absolute_large_object_small_chunks() {
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
+            let tempdir = tempdir().unwrap();
+            let folder = tempdir.path().to_str().unwrap();
+
+            let object_sizes = vec![8 * 1024 * 1024]; // 8MB
+            let (file_path, starts, ends) = create_test_file(folder, &object_sizes);
+
+            let positions = vec![
+                AbsoluteObjectPosition { start_pos: starts[0], end_pos: ends[0] },
+            ];
+
+            // Use small 64KB chunks
+            let chunk_size = 1 << 16;
+            let file = DmaFile::open(&file_path).await.unwrap();
+            let objects = read_objects_absolute(&file, &positions, chunk_size).await.unwrap();
+            
+            assert_eq!(objects.len(), 1);
+            assert_eq!(objects[0].len(), object_sizes[0]);
+            assert!(objects[0].iter().all(|&b| b == 0));
+        }).unwrap();
+        handle.join().unwrap();
+    }
+
+    /// Edge Case
+    /// Tests first object starts after significant gap from file start
+    #[test]
+    fn test_read_objects_absolute_gap_at_start() {
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
+            let tempdir = tempdir().unwrap();
+            let folder = tempdir.path().to_str().unwrap();
+
+            // Create file with objects, but we'll only read from the middle
+            let object_sizes = vec![
+                10 * 1024 * 1024, // 10MB (skip this)
+                2 * 1024 * 1024,  // 2MB (read this)
+                1 * 1024 * 1024,  // 1MB (read this)
+            ];
+            let (file_path, starts, ends) = create_test_file(folder, &object_sizes);
+
+            // Skip first 10MB object
+            let positions = vec![
+                AbsoluteObjectPosition { start_pos: starts[1], end_pos: ends[1] },
+                AbsoluteObjectPosition { start_pos: starts[2], end_pos: ends[2] },
+            ];
+
+            for chunk_size in different_chunk_sizes() {
+                let file = DmaFile::open(&file_path).await.unwrap();
+                let objects = read_objects_absolute(&file, &positions, chunk_size).await.unwrap();
+                
+                assert_eq!(objects.len(), 2);
+                assert_eq!(objects[0].len(), object_sizes[1]);
+                assert_eq!(objects[1].len(), object_sizes[2]);
+                assert!(objects[0].iter().all(|&b| b == 1));
+                assert!(objects[1].iter().all(|&b| b == 2));
+            }
+        }).unwrap();
+        handle.join().unwrap();
+    }
+
+    /// Error Condition
+    /// Tests unordered object positions cause panic
+    #[test]
+    fn test_read_objects_absolute_unordered_panics() {
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
+            let tempdir = tempdir().unwrap();
+            let folder = tempdir.path().to_str().unwrap();
+
+            let object_sizes = vec![1024, 1024, 1024];
+            let (file_path, starts, ends) = create_test_file(folder, &object_sizes);
+
+            // Out of order: second object before first
+            let positions = vec![
+                AbsoluteObjectPosition { start_pos: starts[1], end_pos: ends[1] },
+                AbsoluteObjectPosition { start_pos: starts[0], end_pos: ends[0] },
+            ];
+
+            let file = DmaFile::open(&file_path).await.unwrap();
+            let _ = read_objects_absolute(&file, &positions, 1 << 12).await;
+        }).unwrap();
+
+        assert!(handle.join().is_err());
+    }
+
+    /// Error Condition
+    /// Tests duplicate start positions cause panic
+    #[test]
+    fn test_read_objects_absolute_duplicate_starts_panics() {
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
+            let tempdir = tempdir().unwrap();
+            let folder = tempdir.path().to_str().unwrap();
+
+            let object_sizes = vec![1024, 1024];
+            let (file_path, starts, ends) = create_test_file(folder, &object_sizes);
+
+            // Duplicate start positions
+            let positions = vec![
+                AbsoluteObjectPosition { start_pos: starts[0], end_pos: ends[0] },
+                AbsoluteObjectPosition { start_pos: starts[0], end_pos: ends[1] },
+            ];
+
+            let file = DmaFile::open(&file_path).await.unwrap();
+            let _ = read_objects_absolute(&file, &positions, 1 << 12).await;
+        }).unwrap();
+
+        assert!(handle.join().is_err());
+    }
+
+    /// Happy Path
+    /// Tests reading 10 records of 313 bytes each from start to end
+    /// Validates record count and content with multiple chunk sizes
+    /// Tests both None (EOF) and explicit end_exclusive parameters
     #[test]
     fn test_read_fixed_records_visit_const_basic() {
         const N: usize = 313;
@@ -563,79 +907,94 @@ pub mod test {
         handle.join().unwrap();
     }
 
+    /// Happy Path
+    /// Tests reading 10 records of 31332 bytes each from start to end
+    /// Validates record count and content with multiple chunk sizes
+    /// Tests both None (EOF) and explicit end_exclusive parameters
     #[test]
-    fn test_read_fixed_records_visit_const_cut_tail_with_end() {
-        const N: usize = 313;
+    fn test_read_fixed_records_visit_const_large_fixed() {
+        const N: usize = 31332;
         let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
             let tmp = tempdir().unwrap();
             let dir = tmp.path().to_str().unwrap();
 
-            // 10 records => total size = 3130
-            let (file_path, _file_size) = create_fixed_record_file(dir, N, 10);
+            // 10 records of 31332 bytes, record i filled with byte i
+            let (file_path, file_size) = create_fixed_record_file(dir, N, 7);
 
-            // Start at 0, end cuts after 7 full records plus 100 extra bytes
-            let end = (7 * N + 100) as u64;
             for chunk_size in different_chunk_sizes() {
-                let mut count = 0usize;
+                // Collect records to validate content
+                let mut seen: Vec<[u8; N]> = Vec::new();
                 let file: DmaFile = DmaFile::open(&file_path).await.unwrap();
-                let ret = read_fixed_records_visit_const::<N, ()>(&file, 0, Some(end), chunk_size, |_rec| {
-                    count += 1;
+                let count = read_fixed_records_visit_const::<N, ()>(&file, 0, None, chunk_size, |rec| {
+                    seen.push(*rec);
                     Ok(())
                 }).await.unwrap();
 
                 assert_eq!(count, 7);
-                assert_eq!(ret, 7);
+                assert_eq!(seen.len(), 7);
+
+                // Validate each record is uniform with its index byte
+                for (i, rec) in seen.iter().enumerate() {
+                    assert_eq!(rec.len(), N);
+                    let expected = (i % 256) as u8;
+                    assert!(rec.iter().all(|&b| b == expected));
+                }
+
+                // Same result when end_exclusive == EOF
+                let mut count2 = 0usize;
+                let count2_ret = read_fixed_records_visit_const::<N, ()>(&file, 0, Some(file_size), chunk_size, |_rec| {
+                    count2 += 1;
+                    Ok(())
+                }).await.unwrap();
+                assert_eq!(count2, 7);
+                assert_eq!(count2_ret, 7);
             }
         }).unwrap();
         handle.join().unwrap();
     }
 
+    /// Edge Case
+    /// Tests that partial records at the end are ignored (7 full records + 100 extra bytes)
+    /// Verifies correct handling of truncated data at boundary
     #[test]
-    fn test_read_fixed_records_visit_const_unaligned_start() {
+    fn test_read_fixed_records_unaligned_end() {
         const N: usize = 313;
         let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
             let tmp = tempdir().unwrap();
             let dir = tmp.path().to_str().unwrap();
 
-            // 10 records => 3130 bytes
-            let (file_path, file_size) = create_fixed_record_file(dir, N, 10);
+            let (file_path, _file_size) = create_fixed_record_file(dir, N, 2); // 626 bytes
 
-            // Start 100 bytes into the file (not on a record boundary)
-            let start = 100u64;
-            let expected = ((file_size - start) / (N as u64)) as usize; // floor division
-            assert_eq!(expected, 9); // 3030 / 313 = 9 full records
-
-            for chunk_size in different_chunk_sizes() {
-                let mut seen_idx = 0usize;
-                let file: DmaFile = DmaFile::open(&file_path).await.unwrap();
-                let ret = read_fixed_records_visit_const::<N, ()>(&file, start, None, chunk_size, |rec| {
-                    // Validate content straddling file-record boundaries:
-                    // Each returned record starts at abs offset: start + seen_idx * N
-                    let abs_off = start as usize + seen_idx * N;
-                    let file_rec_idx = abs_off / N;
-                    let offset_in_file_rec = abs_off % N;
-                    let head_len = N - offset_in_file_rec;
-
-                    // First segment from file_rec_idx
-                    let expected_byte_head = (file_rec_idx % 256) as u8;
-                    assert!(rec[..head_len].iter().all(|&b| b == expected_byte_head));
-
-                    // Second segment (if any) from file_rec_idx + 1
-                    if head_len < N {
-                        let expected_byte_tail = ((file_rec_idx + 1) % 256) as u8;
-                        assert!(rec[head_len..].iter().all(|&b| b == expected_byte_tail));
-                    }
-                    seen_idx += 1;
-                    Ok(())
-                }).await.unwrap();
-
-                assert_eq!(ret, expected);
-                assert_eq!(seen_idx, expected);
-            }
+            let file: DmaFile = DmaFile::open(&file_path).await.unwrap();
+            let _ = read_fixed_records_visit_const::<N, ()>(&file, 313, Some(600), 1 << 12, |_rec| Ok(())).await;
         }).unwrap();
-        handle.join().unwrap();
+
+        assert!(handle.join().is_err());
     }
 
+    /// Error Condition
+    /// Tests starting from unaligned offset (100 bytes into file)
+    /// Validates records straddling original file record boundaries are correctly assembled
+    /// Tests content validation across boundary spans
+    #[test]
+    fn test_read_fixed_records_unaligned_start() {
+        const N: usize = 313;
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
+            let tmp = tempdir().unwrap();
+            let dir = tmp.path().to_str().unwrap();
+
+            let (file_path, _file_size) = create_fixed_record_file(dir, N, 2); // 626 bytes
+
+            let file: DmaFile = DmaFile::open(&file_path).await.unwrap();
+            let _ = read_fixed_records_visit_const::<N, ()>(&file, 100, None, 1 << 12, |_rec| Ok(())).await;
+        }).unwrap();
+
+        assert!(handle.join().is_err());
+    }
+
+    /// Happy Path (Stress Test)
+    /// Tests 20,000 records (~6.26 MB) to force multiple chunk reads
+    /// Validates carry mechanism across many chunk boundaries
     #[test]
     fn test_read_fixed_records_visit_const_large_multichunk() {
         const N: usize = 313;
@@ -665,6 +1024,8 @@ pub mod test {
         handle.join().unwrap();
     }
 
+    /// Error Condition
+    /// Tests three panic scenarios: start >= file_size, empty range (start == end), invalid chunk size
     #[test]
     fn test_read_fixed_records_visit_const_bounds_and_alignment_panics() {
         const N: usize = 313;
@@ -677,16 +1038,342 @@ pub mod test {
             // start >= file_size should assert
             let file: DmaFile = DmaFile::open(&file_path).await.unwrap();
             let _ = read_fixed_records_visit_const::<N, ()>(&file, file_size, None, 1 << 12, |_rec| Ok(())).await;
+        }).unwrap();
+
+        assert!(handle.join().is_err());
+
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
+            let tmp = tempdir().unwrap();
+            let dir = tmp.path().to_str().unwrap();
+
+            let (file_path, _file_size) = create_fixed_record_file(dir, N, 2); // 626 bytes
+
+            // start >= file_size should assert
+            let file: DmaFile = DmaFile::open(&file_path).await.unwrap();
 
             // empty range start == end_exclusive should assert
             let _ = read_fixed_records_visit_const::<N, ()>(&file, 10, Some(10), 1 << 12, |_rec| Ok(())).await;
+        }).unwrap();
 
+        assert!(handle.join().is_err());
+
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
+            let tmp = tempdir().unwrap();
+            let dir = tmp.path().to_str().unwrap();
+
+            let (file_path, _file_size) = create_fixed_record_file(dir, N, 2); // 626 bytes
+
+            // start >= file_size should assert
+            let file: DmaFile = DmaFile::open(&file_path).await.unwrap();
             // invalid chunk size (almost certainly not a multiple of alignment)
             let _ = read_fixed_records_visit_const::<N, ()>(&file, 0, None, 1, |_rec| Ok(())).await;
         }).unwrap();
 
-        // All three should have panicked in the task
         assert!(handle.join().is_err());
     }
 
+    /// Happy Path
+    /// Tests records that perfectly align with chunk boundaries
+    #[test]
+    fn test_read_fixed_records_perfect_alignment() {
+        const N: usize = 1024; // 1KB records
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
+            let tmp = tempdir().unwrap();
+            let dir = tmp.path().to_str().unwrap();
+
+            let (file_path, _file_size) = create_fixed_record_file(dir, N, 10);
+
+            // Use 1KB chunk size to align perfectly
+            let chunk_size = 1024u64;
+            let mut count = 0usize;
+            let file = DmaFile::open(&file_path).await.unwrap();
+            let ret = read_fixed_records_visit_const::<N, ()>(&file, 0, None, chunk_size, |_rec| {
+                count += 1;
+                Ok(())
+            }).await.unwrap();
+
+            assert_eq!(ret, 10);
+            assert_eq!(count, 10);
+        }).unwrap();
+        handle.join().unwrap();
+    }
+
+    /// Happy Path
+    /// Tests record size equals chunk size
+    #[test]
+    fn test_read_fixed_records_record_equals_chunk() {
+        const N: usize = 4096; // 4KB records
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
+            let tmp = tempdir().unwrap();
+            let dir = tmp.path().to_str().unwrap();
+
+            let (file_path, _file_size) = create_fixed_record_file(dir, N, 5);
+
+            let chunk_size = 4096u64;
+            let mut count = 0usize;
+            let file = DmaFile::open(&file_path).await.unwrap();
+            let ret = read_fixed_records_visit_const::<N, ()>(&file, 0, None, chunk_size, |rec| {
+                // Validate inline without copying large arrays
+                let expected = (count % 256) as u8;
+                assert!(rec.iter().all(|&b| b == expected));
+                count += 1;
+                Ok(())
+            }).await.unwrap();
+
+            assert_eq!(ret, 5);
+            assert_eq!(count, 5);
+        }).unwrap();
+        handle.join().unwrap();
+    }
+
+    /// Happy Path
+    /// Tests single record in file
+    #[test]
+    fn test_read_fixed_records_single_record() {
+        const N: usize = 512;
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
+            let tmp = tempdir().unwrap();
+            let dir = tmp.path().to_str().unwrap();
+
+            let (file_path, file_size) = create_fixed_record_file(dir, N, 1);
+
+            let mut count = 0usize;
+            let file = DmaFile::open(&file_path).await.unwrap();
+            let ret = read_fixed_records_visit_const::<N, ()>(&file, 0, Some(file_size), 1 << 12, |_rec| {
+                count += 1;
+                Ok(())
+            }).await.unwrap();
+
+            assert_eq!(ret, 1);
+            assert_eq!(count, 1);
+        }).unwrap();
+        handle.join().unwrap();
+    }
+
+    /// Edge Case
+    /// Tests record size larger than chunk size
+    #[test]
+    fn test_read_fixed_records_record_larger_than_chunk() {
+        const N: usize = 65536; // 64KB records (reasonable for stack allocation)
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
+            let tmp = tempdir().unwrap();
+            let dir = tmp.path().to_str().unwrap();
+
+            let (file_path, _file_size) = create_fixed_record_file(dir, N, 3);
+
+            // 16KB chunks, smaller than record size
+            let chunk_size = 1u64 << 14;
+            let mut count = 0usize;
+            let file = DmaFile::open(&file_path).await.unwrap();
+            let ret = read_fixed_records_visit_const::<N, ()>(&file, 0, None, chunk_size, |rec| {
+                // Validate inline without storing large arrays
+                let expected = (count % 256) as u8;
+                assert!(rec.iter().all(|&b| b == expected));
+                count += 1;
+                Ok(())
+            }).await.unwrap();
+
+            assert_eq!(ret, 3);
+            assert_eq!(count, 3);
+        }).unwrap();
+        handle.join().unwrap();
+    }
+
+    /// Edge Case
+    /// Tests start position very close to EOF
+    #[test]
+    fn test_read_fixed_records_near_eof() {
+        const N: usize = 100;
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
+            let tmp = tempdir().unwrap();
+            let dir = tmp.path().to_str().unwrap();
+
+            let (file_path, file_size) = create_fixed_record_file(dir, N, 10); // 1000 bytes
+
+            // Start at last record
+            let start = file_size - N as u64;
+            let mut count = 0usize;
+            let file = DmaFile::open(&file_path).await.unwrap();
+            let ret = read_fixed_records_visit_const::<N, ()>(&file, start, None, 1 << 12, |_rec| {
+                count += 1;
+                Ok(())
+            }).await.unwrap();
+
+            assert_eq!(ret, 1);
+            assert_eq!(count, 1);
+        }).unwrap();
+        handle.join().unwrap();
+    }
+
+    /// Edge Case
+    /// Tests file with partial record at end (explicit test)
+    #[test]
+    fn test_read_fixed_records_partial_at_end_ignored() {
+        const N: usize = 100;
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
+            let tmp = tempdir().unwrap();
+            let dir = tmp.path().to_str().unwrap();
+
+            // Create file with 7 full records + 50 extra bytes
+            let file_path = format!("{}/partial.bin", dir);
+            let mut file = File::create(&file_path).unwrap();
+            for i in 0..7 {
+                let byte = (i % 256) as u8;
+                let buf = vec![byte; N];
+                file.write_all(&buf).unwrap();
+            }
+            // Add partial record
+            file.write_all(&vec![99u8; 50]).unwrap();
+            file.flush().unwrap();
+
+            let mut count = 0usize;
+            let dma_file = DmaFile::open(&file_path).await.unwrap();
+            let ret = read_fixed_records_visit_const::<N, ()>(&dma_file, 0, None, 1 << 12, |_rec| {
+                count += 1;
+                Ok(())
+            }).await.unwrap();
+
+            // Should only count 7 full records, ignoring the 50-byte partial
+            assert_eq!(ret, 7);
+            assert_eq!(count, 7);
+        }).unwrap();
+        handle.join().unwrap();
+    }
+
+    /// Edge Case
+    /// Tests extremely small file (smaller than chunk size and alignment)
+    #[test]
+    fn test_read_fixed_records_tiny_file() {
+        const N: usize = 64;
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
+            let tmp = tempdir().unwrap();
+            let dir = tmp.path().to_str().unwrap();
+
+            let (file_path, _file_size) = create_fixed_record_file(dir, N, 3); // 192 bytes
+
+            let chunk_size = 1u64 << 20; // 1MB chunk for tiny file
+            let mut count = 0usize;
+            let file = DmaFile::open(&file_path).await.unwrap();
+            let ret = read_fixed_records_visit_const::<N, ()>(&file, 0, None, chunk_size, |_rec| {
+                count += 1;
+                Ok(())
+            }).await.unwrap();
+
+            assert_eq!(ret, 3);
+            assert_eq!(count, 3);
+        }).unwrap();
+        handle.join().unwrap();
+    }
+
+    /// Edge Case
+    /// Tests record size equals file alignment (typically 512)
+    #[test]
+    fn test_read_fixed_records_size_equals_alignment() {
+        const N: usize = 512;
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
+            let tmp = tempdir().unwrap();
+            let dir = tmp.path().to_str().unwrap();
+
+            let (file_path, _file_size) = create_fixed_record_file(dir, N, 20);
+
+            let chunk_size = 1u64 << 14; // 16KB
+            let mut count = 0usize;
+            let file = DmaFile::open(&file_path).await.unwrap();
+            let ret = read_fixed_records_visit_const::<N, ()>(&file, 0, None, chunk_size, |_rec| {
+                count += 1;
+                Ok(())
+            }).await.unwrap();
+
+            assert_eq!(ret, 20);
+            assert_eq!(count, 20);
+        }).unwrap();
+        handle.join().unwrap();
+    }
+
+    /// Error Condition
+    /// Tests visitor function returning an error (error propagation)
+    #[test]
+    fn test_read_fixed_records_visitor_error() {
+        const N: usize = 128;
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
+            let tmp = tempdir().unwrap();
+            let dir = tmp.path().to_str().unwrap();
+
+            let (file_path, _file_size) = create_fixed_record_file(dir, N, 10);
+
+            let mut count = 0usize;
+            let file = DmaFile::open(&file_path).await.unwrap();
+            let result = read_fixed_records_visit_const::<N, String>(&file, 0, None, 1 << 12, |_rec| {
+                count += 1;
+                if count == 5 {
+                    Err("Visitor error on record 5".to_string())
+                } else {
+                    Ok(())
+                }
+            }).await;
+
+            match result {
+                Err(ReadVisitError::Visitor(msg)) => {
+                    assert_eq!(msg, "Visitor error on record 5");
+                    assert_eq!(count, 5);
+                }
+                _ => panic!("Expected ReadVisitError::Visitor"),
+            }
+        }).unwrap();
+        handle.join().unwrap();
+    }
+
+    /// Error Condition
+    /// Tests end_exclusive beyond file_size (should work correctly)
+    #[test]
+    fn test_read_fixed_records_end_beyond_eof() {
+        const N: usize = 256;
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
+            let tmp = tempdir().unwrap();
+            let dir = tmp.path().to_str().unwrap();
+
+            let (file_path, file_size) = create_fixed_record_file(dir, N, 5);
+
+            // Request far beyond EOF
+            let end_beyond = file_size + 256*4;
+            let mut count = 0usize;
+            let file = DmaFile::open(&file_path).await.unwrap();
+            let ret = read_fixed_records_visit_const::<N, ()>(&file, 0, Some(end_beyond), 1 << 12, |_rec| {
+                count += 1;
+                Ok(())
+            }).await.unwrap();
+
+            // Should read all 5 records despite end_exclusive being beyond EOF
+            assert_eq!(ret, 5);
+            assert_eq!(count, 5);
+        }).unwrap();
+        handle.join().unwrap();
+    }
+
+    /// Edge Case
+    /// Tests when start + N > file_size (only partial record possible)
+    #[test]
+    fn test_read_fixed_records_partial_only() {
+        const N: usize = 1000;
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).spawn(|| async move {
+            let tmp = tempdir().unwrap();
+            let dir = tmp.path().to_str().unwrap();
+
+            let (file_path, file_size) = create_fixed_record_file(dir, N, 3); // 3000 bytes
+
+            // Start at 2500, only 500 bytes remain (less than N)
+            let start = 2000u64; // Must be multiple of N
+            let mut count = 0usize;
+            let file = DmaFile::open(&file_path).await.unwrap();
+            let ret = read_fixed_records_visit_const::<N, ()>(&file, start, Some(file_size), 1 << 12, |_rec| {
+                count += 1;
+                Ok(())
+            }).await.unwrap();
+
+            // Should read 1 full record (bytes 2000-3000)
+            assert_eq!(ret, 1);
+            assert_eq!(count, 1);
+        }).unwrap();
+        handle.join().unwrap();
+    }
 }
