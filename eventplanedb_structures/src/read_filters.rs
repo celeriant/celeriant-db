@@ -11,13 +11,7 @@ pub struct ReadFilters {
     /// Optional limit on the total response size in bytes to prevent large responses
     pub max_bytes: Option<usize>,
     /// Optional whitelist of event types to include in results
-    pub include_event_type_1: Option<u64>,
-    /// Optional whitelist of event types to include in results
-    pub include_event_type_2: Option<u64>,
-    /// Optional whitelist of event types to include in results
-    pub include_event_type_3: Option<u64>,
-    /// Optional whitelist of event types to include in results
-    pub include_event_type_4: Option<u64>,
+    pub include_event_types: Option<Vec<u64>>,
     /// Skip events created by this client
     pub exclude_client_id: Option<u128>,
     /// Only get events for this client
@@ -67,11 +61,8 @@ impl ReadFilters {
         self
     }
 
-    pub fn include_event_types(mut self, event_type1: Option<u64>, event_type2: Option<u64>, event_type3: Option<u64>, event_type4: Option<u64>) -> Self {
-        self.include_event_type_1 = event_type1;
-        self.include_event_type_2 = event_type2;
-        self.include_event_type_3 = event_type3;
-        self.include_event_type_4 = event_type4;
+    pub fn include_event_types(mut self, event_types: Vec<u64>) -> Self {
+        self.include_event_types = Some(event_types);
 
         self
     }
