@@ -1,18 +1,17 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use eventplanedb_structures::{append_result::AppendResult, batch_metadata_item_pair::BatchMetadataItemPair, compression_type::CompressionType, constants::{BINCODE_CONFIG_FIXED, BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED, METADATA_BATCH_SIZE_BYTES}, event_batch_item::EventBatchItem, event_batch_metadata::{EventBatchMetadata, EventTypesData}, event_item::EventItem, read_filters::ReadFilters, wire_format::{to_wire_format_fixed, to_wire_format_variable}};
+use eventplanedb_structures::{append_result::AppendResult, batch_metadata_item_pair::BatchMetadataItemPair, compression_type::CompressionType, constants::{BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED, METADATA_BATCH_SIZE_BYTES}, event_batch_item::EventBatchItem, event_batch_metadata::{EventBatchMetadata, EventTypesData}, event_item::EventItem, read_filters::ReadFilters, wire_format::{to_wire_format_fixed, to_wire_format_variable}};
 use fastbloom::BloomFilter;
 use glommio::{io::{DmaFile}, GlommioError};
 
-use crate::{read_operations::{in_memory_filtering::{apply_event_filters, is_include_batch}, read_structures::CacheableReadResult}, write_operations::{write_error::WriteError, write_structures::{AggregateWriteConfig, WriteOptions}}};
+use crate::{read_operations::{in_memory_filtering::{apply_event_filters, is_include_batch}, read_structures::{CacheableReadResult, WriteOperationsDataRequirements}}, write_operations::{write_error::WriteError, write_structures::{AggregateWriteConfig, WriteOptions}}};
 
-
-pub struct WriteOperations {
+pub struct WriteOperationsWithDmaFile {
     metadata_dma_file: DmaFile,
     event_batches_dma_file: DmaFile,
     data_cache: VecDeque<BatchMetadataItemPair>,
     total_cache_size_bytes: usize,
-    pub minimum_available_event_batch_index: u64,
+    minimum_available_event_batch_index: u64,
     next_event_index: u64,
     next_event_batch_index: u64,
     client_event_indexes: HashMap<u128, u64>,
@@ -21,96 +20,28 @@ pub struct WriteOperations {
     max_chunk_size: usize,
     bloom_filter: BloomFilter,
     event_type_dedup: HashSet<u64>,
-    pub append_event_batch_queue: Vec<AppendEventBatchQueueItem>,
+    append_event_batch_queue: Vec<AppendEventBatchQueueItem>,
     file_len_metadata: u64,
     file_len_event_batch: u64,
 }
 
-fn extract_unique_event_types(events: &[EventItem]) -> ([u64; 4], bool) {
-    let mut bloom_or_event_types = [u64::MAX, u64::MAX, u64::MAX, u64::MAX];
-    let mut use_bloom = false;
-    let mut unique_count = 0;
-
-    for event in events {
-        let event_type = event.event_type_major;
-
-        // Check if we already have this event type
-        if unique_count > 0 && bloom_or_event_types[0] == event_type {
-            continue;
-        }
-        if unique_count > 1 && bloom_or_event_types[1] == event_type {
-            continue;
-        }
-        if unique_count > 2 && bloom_or_event_types[2] == event_type {
-            continue;
-        }
-        if unique_count > 3 && bloom_or_event_types[3] == event_type {
-            continue;
-        }
-
-        // New unique event type
-        if unique_count < 4 {
-            bloom_or_event_types[unique_count] = event_type;
-            unique_count += 1;
-        } else {
-            use_bloom = true;
-            break;
-        }
-    }
-
-    (bloom_or_event_types, use_bloom)
-}
-
-pub struct AppendEventBatchQueueItem {
-    compressed_event_batch_item: Vec<u8>,
-    event_batch_item: EventBatchItem,
-    metadata_bytes: [u8; METADATA_BATCH_SIZE_BYTES],
-    event_batch_metadata: EventBatchMetadata,
-}
-
-struct PrependEventBatchQueueItem {
-    compressed_event_batch_item: Vec<u8>,
-    metadata_bytes: [u8; METADATA_BATCH_SIZE_BYTES],
-}
-
-pub struct WriteOperationsDataRequirements {
-    pub file_len_metadata: u64,
-    pub metadata_dma_file: DmaFile,
-    pub file_len_event_batch: u64,
-    pub event_batches_dma_file: DmaFile,
-    pub data_cache: VecDeque<BatchMetadataItemPair>, 
-    pub minimum_available_event_batch_index: u64,
-    pub next_event_index: u64, 
-    pub next_event_batch_index: u64, 
-    pub client_event_indexes: HashMap<u128, u64>,
-}
-
-/// Allows appending new events for an aggregate. Note this doesn't handle fdatasync.
-/// Also caches recent events and indexes in memory for fast read access
-/// If cached read fails, you should fall back to the AggregateReadFileOperations struct
-/// This struct never reads from disk, only appends. So it requires cache data on initialization.
-impl WriteOperations {
-
+impl WriteOperationsWithDmaFile {
     pub fn open(
+        metadata_dma_file: DmaFile,
+        event_batches_dma_file: DmaFile,
         data_requirements: WriteOperationsDataRequirements,
         aggregate_write_config: AggregateWriteConfig,
-        ) -> Result<WriteOperations, GlommioError<()>> {
+        ) -> Result<WriteOperationsWithDmaFile, GlommioError<()>> {
 
         let bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8)
             .seed(&BLOOM_HASH_SEED)
             .hashes(BLOOM_HASH_COUNT);
-        
-        // Calculate initial cache size
-        let total_cache_size_bytes: usize = data_requirements.data_cache
-            .iter()
-            .map(|pair| pair.event_batch_metadata.uncompressed_size as usize)
-            .sum();
 
-        Ok(WriteOperations {
-            metadata_dma_file: data_requirements.metadata_dma_file, 
-            event_batches_dma_file: data_requirements.event_batches_dma_file, 
-            data_cache: data_requirements.data_cache, 
-            total_cache_size_bytes,
+        Ok(WriteOperationsWithDmaFile {
+            metadata_dma_file, 
+            event_batches_dma_file, 
+            data_cache: VecDeque::new(), 
+            total_cache_size_bytes: 0,
             next_event_batch_index: data_requirements.next_event_batch_index, 
             next_event_index: data_requirements.next_event_index, 
             minimum_available_event_batch_index: data_requirements.minimum_available_event_batch_index,
@@ -243,166 +174,6 @@ impl WriteOperations {
 
         Ok(())
     }
-    
-    // In case of failure during sync, we need to roll back the in-memory state
-    pub async fn sync_with_rollback(&mut self) -> Result<(), WriteError> {
-        match self.sync().await {
-            Ok(_) => Ok(()),
-            Err(e) => {
-
-                //Pop off items from append_event_batch_queue, inspect metadata to rollback
-                while let Some(item) = self.append_event_batch_queue.pop() {
-                    
-                    self.client_event_indexes
-                        .entry(item.event_batch_item.client_id)
-                        .and_modify(|e| {
-                            *e = item.event_batch_metadata.min_client_event_index.saturating_sub(1);
-                        });
-                    self.next_event_index = item.event_batch_metadata.min_event_index;
-                    self.next_event_batch_index = item.event_batch_metadata.event_batch_index;
-                }
-
-                if self.next_event_batch_index == 1 {
-                    //First write failed!
-                    self.minimum_available_event_batch_index = 0;
-                }
-
-                //Still must error out so we notify clients of failure to write
-                Err(e)
-            }
-        }
-    }
-
-    /// We require the ownership of the events to be transferred, as they will be stored in the in-memory cache
-    /// The events are also mutable as we need to filter out events for client idempotency requirements
-    pub fn queue_events_in_memory(&mut self, mut events: Vec<EventItem>, write_options: &WriteOptions) -> Result<AppendResult, WriteError> {
-        // Requires mutable write buffer access
-        // Requires mutable access to cache data (events, indexes)
-
-        // Make sure we have at least one event to write
-        if events.is_empty() {
-            return Err(WriteError::EmptyEventsList());
-        }
-
-        // If checking idempotency, check if client is providing the same events again using client event index, if so, error
-        if write_options.enforce_client_idempotency {
-            if let Some(&last_client_event_index) = self.client_event_indexes.get(&write_options.client_id) {
-                let attempted_client_event_index = events.iter().map(|e| e.client_event_index).min().unwrap_or(0);
-                if attempted_client_event_index <= last_client_event_index {
-                    return Err(WriteError::ClientIdempotencyViolation {
-                        client_id: write_options.client_id,
-                        last_client_event_index,
-                        attempted_client_event_index,
-                    });
-                }
-            }
-        }
-
-        // If doing optimistic concurrency, check expected event batch index matches current
-        if let Some(expected) = write_options.expected_event_batch_index {
-            if expected != self.next_event_batch_index {
-                return Err(WriteError::OptimisticConcurrencyViolation {
-                    client_id: write_options.client_id,
-                    expected_event_batch_index: expected,
-                    current_event_batch_index: self.next_event_batch_index,
-                });
-            }
-        }
-
-        // Update events - set event indexes, server timestamp millis. Keep track of last event index assigned to update state later
-        let mut next_event_index = self.next_event_index;
-        for e in events.iter_mut() {
-            e.event_index = next_event_index;
-            next_event_index = next_event_index.saturating_add(1);
-        }
-
-        // Create EventBatchItem from events with next index, don't increment struct state yet though
-        let event_batch_item = EventBatchItem::new(
-            self.next_event_batch_index,
-            write_options.server_timestamp_millis,
-            write_options.client_id,
-            write_options.user_id,
-            events,
-        );
-
-        // Serialize and compress the event data
-        let (uncompressed_size, compressed_event_batch_item) =
-            to_wire_format_variable(&event_batch_item, write_options.compression_type)?;
-        let events_crc = crc32fast::hash(&compressed_event_batch_item);
-
-        // Determine event types data (bloom filter or direct array)
-        let (event_types, use_bloom) = extract_unique_event_types(&event_batch_item.events);
-        let event_types_data = if use_bloom {
-            let bloom_bytes =
-                self.create_bloom_filter_bytes(&event_batch_item.events);
-            EventTypesData::Bloom(
-                bloom_bytes,
-            )
-        } else {
-            EventTypesData::Direct(
-                event_types,
-            )
-        };
-
-        // Create and serialize metadata
-        let event_batch_metadata = EventBatchMetadata::from_batch_item(
-            &event_batch_item,
-            uncompressed_size as u64,
-            compressed_event_batch_item.len() as u64,
-            write_options.compression_type,
-            event_types_data,
-            events_crc,
-        );
-
-        let latest_client_event_index = event_batch_metadata.max_client_event_index;
-
-        let mut metadata_bytes = [0u8; METADATA_BATCH_SIZE_BYTES];
-        to_wire_format_fixed(&event_batch_metadata, &mut metadata_bytes)?;
-
-        self.append_event_batch_queue.push(AppendEventBatchQueueItem {
-            compressed_event_batch_item,
-            event_batch_item,
-            metadata_bytes,
-            event_batch_metadata,
-        });
-
-        // Update next event index, next event batch index, client event indexes
-        self.next_event_index = next_event_index;
-        self.next_event_batch_index = self.next_event_batch_index.saturating_add(1);
-        self.client_event_indexes
-            .insert(write_options.client_id, latest_client_event_index);
-
-        Ok(AppendResult {
-            next_event_batch_index: self.next_event_batch_index,
-        })
-    }
-
-    pub async fn trim_end(&mut self, new_metadata_len: u64, new_event_batch_len: u64) -> Result<(), WriteError> {
-        let mut truncated = false;
-
-        // Truncate the metadata file
-        if self.file_len_metadata > new_metadata_len {
-            self.metadata_dma_file.truncate(new_metadata_len).await?;
-            self.file_len_metadata = new_metadata_len;
-            truncated = true;
-        }
-        
-        // Truncate the event batches file
-        if self.file_len_event_batch > new_event_batch_len {
-            self.event_batches_dma_file.truncate(new_event_batch_len).await?;
-            self.file_len_event_batch = new_event_batch_len;
-            truncated = true;
-        }
-        
-        if truncated {
-            // Clear the data cache as it's now invalid
-            self.data_cache.clear();
-            self.total_cache_size_bytes = 0;  // Reset cache size tracking
-        }
-        
-        Ok(())
-    }
-
     async fn trim_and_prepend(
         &mut self, 
         event_batches: Vec<PrependEventBatchQueueItem>,
@@ -528,35 +299,223 @@ impl WriteOperations {
             .saturating_sub(bytes_to_trim_event_batch)
             .saturating_add(total_prepend_event_batch_size as u64);
 
-        // Duplicate file handles for return
-        let dup_metadata_file = new_metadata_file.dup()?;
-        let dup_event_batch_file = new_event_batch_file.dup()?;
-
         // Update internal file handles
         self.metadata_dma_file = new_metadata_file;
         self.event_batches_dma_file = new_event_batch_file;
 
-        Ok((dup_metadata_file, dup_event_batch_file))
+        Ok(())
     }
+}
 
-    pub async fn trim_start(
+#[allow(async_fn_in_trait)]
+pub trait WriteOperations {
+    
+    // In case of failure during sync, we need to roll back the in-memory state
+    async fn sync_with_rollback(&mut self) -> Result<(), WriteError>;
+
+    /// We require the ownership of the events to be transferred, as they will be stored in the in-memory cache
+    /// The events are also mutable as we need to filter out events for client idempotency requirements
+    fn queue_events_in_memory(&mut self, events: Vec<EventItem>, write_options: &WriteOptions) -> Result<AppendResult, WriteError>;
+
+    async fn trim_end(&mut self, new_metadata_len: u64, new_event_batch_len: u64) -> Result<(), WriteError>;
+
+    async fn trim_start(
         &mut self, 
         bytes_to_trim_metadata: u64, 
         bytes_to_trim_event_batch: u64,
-    ) -> Result<(DmaFile, DmaFile), WriteError> {
+    ) -> Result<(), WriteError>;
+
+    async fn prepend_batches(
+        &mut self, 
+        event_batches: &Vec<BatchMetadataItemPair>,
+    ) -> Result<(), WriteError>;
+
+    fn maybe_read_cached_events(&self, filters: &ReadFilters) -> Result<CacheableReadResult, WriteError>;
+    
+    fn file_len_metadata(&self) -> u64;
+    
+    fn file_len_event_batch(&self) -> u64;
+}
+
+/// Allows appending new events for an aggregate. Note this doesn't handle fdatasync.
+/// Also caches recent events and indexes in memory for fast read access
+/// If cached read fails, you should fall back to the AggregateReadFileOperations struct
+/// This struct never reads from disk, only appends. So it requires cache data on initialization.
+impl WriteOperations for WriteOperationsWithDmaFile {
+    
+    // In case of failure during sync, we need to roll back the in-memory state
+    async fn sync_with_rollback(&mut self) -> Result<(), WriteError> {
+        match self.sync().await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+
+                //Pop off items from append_event_batch_queue, inspect metadata to rollback
+                while let Some(item) = self.append_event_batch_queue.pop() {
+                    
+                    self.client_event_indexes
+                        .entry(item.event_batch_item.client_id)
+                        .and_modify(|e| {
+                            *e = item.event_batch_metadata.min_client_event_index.saturating_sub(1);
+                        });
+                    self.next_event_index = item.event_batch_metadata.min_event_index;
+                    self.next_event_batch_index = item.event_batch_metadata.event_batch_index;
+                }
+
+                if self.next_event_batch_index == 1 {
+                    //First write failed!
+                    self.minimum_available_event_batch_index = 0;
+                }
+
+                //Still must error out so we notify clients of failure to write
+                Err(e)
+            }
+        }
+    }
+
+    /// We require the ownership of the events to be transferred, as they will be stored in the in-memory cache
+    /// The events are also mutable as we need to filter out events for client idempotency requirements
+    fn queue_events_in_memory(&mut self, mut events: Vec<EventItem>, write_options: &WriteOptions) -> Result<AppendResult, WriteError> {
+
+        // Make sure we have at least one event to write
+        if events.is_empty() {
+            return Err(WriteError::EmptyEventsList());
+        }
+
+        // If checking idempotency, check if client is providing the same events again using client event index, if so, error
+        if write_options.enforce_client_idempotency {
+            if let Some(&last_client_event_index) = self.client_event_indexes.get(&write_options.client_id) {
+                let attempted_client_event_index = events.iter().map(|e| e.client_event_index).min().unwrap_or(0);
+                if attempted_client_event_index <= last_client_event_index {
+                    return Err(WriteError::ClientIdempotencyViolation {
+                        client_id: write_options.client_id,
+                        last_client_event_index,
+                        attempted_client_event_index,
+                    });
+                }
+            }
+        }
+
+        // If doing optimistic concurrency, check expected event batch index matches current
+        if let Some(expected) = write_options.expected_event_batch_index {
+            if expected != self.next_event_batch_index {
+                return Err(WriteError::OptimisticConcurrencyViolation {
+                    client_id: write_options.client_id,
+                    expected_event_batch_index: expected,
+                    current_event_batch_index: self.next_event_batch_index,
+                });
+            }
+        }
+
+        // Update events - set event indexes, server timestamp millis. Keep track of last event index assigned to update state later
+        let mut next_event_index = self.next_event_index;
+        for e in events.iter_mut() {
+            e.event_index = next_event_index;
+            next_event_index = next_event_index.saturating_add(1);
+        }
+
+        // Create EventBatchItem from events with next index, don't increment struct state yet though
+        let event_batch_item = EventBatchItem::new(
+            self.next_event_batch_index,
+            write_options.server_timestamp_millis,
+            write_options.client_id,
+            write_options.user_id,
+            events,
+        );
+
+        // Serialize and compress the event data
+        let (uncompressed_size, compressed_event_batch_item) =
+            to_wire_format_variable(&event_batch_item, write_options.compression_type)?;
+        let events_crc = crc32fast::hash(&compressed_event_batch_item);
+
+        // Determine event types data (bloom filter or direct array)
+        let (event_types, use_bloom) = extract_unique_event_types(&event_batch_item.events);
+        let event_types_data = if use_bloom {
+            let bloom_bytes =
+                self.create_bloom_filter_bytes(&event_batch_item.events);
+            EventTypesData::Bloom(
+                bloom_bytes,
+            )
+        } else {
+            EventTypesData::Direct(
+                event_types,
+            )
+        };
+
+        // Create and serialize metadata
+        let event_batch_metadata = EventBatchMetadata::from_batch_item(
+            &event_batch_item,
+            uncompressed_size as u64,
+            compressed_event_batch_item.len() as u64,
+            write_options.compression_type,
+            event_types_data,
+            events_crc,
+        );
+
+        let latest_client_event_index = event_batch_metadata.max_client_event_index;
+
+        let mut metadata_bytes = [0u8; METADATA_BATCH_SIZE_BYTES];
+        to_wire_format_fixed(&event_batch_metadata, &mut metadata_bytes)?;
+
+        self.append_event_batch_queue.push(AppendEventBatchQueueItem {
+            compressed_event_batch_item,
+            event_batch_item,
+            metadata_bytes,
+            event_batch_metadata,
+        });
+
+        // Update next event index, next event batch index, client event indexes
+        self.next_event_index = next_event_index;
+        self.next_event_batch_index = self.next_event_batch_index.saturating_add(1);
+        self.client_event_indexes
+            .insert(write_options.client_id, latest_client_event_index);
+
+        Ok(AppendResult {
+            next_event_batch_index: self.next_event_batch_index,
+        })
+    }
+
+    async fn trim_end(&mut self, new_metadata_len: u64, new_event_batch_len: u64) -> Result<(), WriteError> {
+        let mut truncated = false;
+
+        // Truncate the metadata file
+        if self.file_len_metadata > new_metadata_len {
+            self.metadata_dma_file.truncate(new_metadata_len).await?;
+            self.file_len_metadata = new_metadata_len;
+            truncated = true;
+        }
+        
+        // Truncate the event batches file
+        if self.file_len_event_batch > new_event_batch_len {
+            self.event_batches_dma_file.truncate(new_event_batch_len).await?;
+            self.file_len_event_batch = new_event_batch_len;
+            truncated = true;
+        }
+        
+        if truncated {
+            // Clear the data cache as it's now invalid
+            self.data_cache.clear();
+            self.total_cache_size_bytes = 0;  // Reset cache size tracking
+        }
+        
+        Ok(())
+    }
+
+    async fn trim_start(
+        &mut self, 
+        bytes_to_trim_metadata: u64, 
+        bytes_to_trim_event_batch: u64,
+    ) -> Result<(), WriteError> {
         if bytes_to_trim_metadata == 0 || bytes_to_trim_event_batch == 0 {
-            return Err(WriteError::WriteError { 
-                message: "Cannot trim 0 bytes".to_string() 
-            });
+            return Ok(());
         }
         
         self.trim_and_prepend(vec![], bytes_to_trim_metadata, bytes_to_trim_event_batch).await
     }
 
-    pub async fn prepend_batches(
+    async fn prepend_batches(
         &mut self, 
         event_batches: &Vec<BatchMetadataItemPair>,
-    ) -> Result<(DmaFile, DmaFile), WriteError> {
+    ) -> Result<(), WriteError> {
 
         if event_batches.is_empty() {
             return Err(WriteError::EmptyEventsList());
@@ -598,11 +557,7 @@ impl WriteOperations {
 
             // Serialize metadata
             let mut metadata_bytes = [0u8; METADATA_BATCH_SIZE_BYTES];
-            bincode::encode_into_slice(
-                metadata, 
-                &mut metadata_bytes, 
-                BINCODE_CONFIG_FIXED
-            )?;
+            to_wire_format_fixed(metadata, &mut metadata_bytes)?;
 
             event_batches_queued.push(PrependEventBatchQueueItem {
                 compressed_event_batch_item,
@@ -611,15 +566,15 @@ impl WriteOperations {
         }
 
         // Perform trim and prepend (with 0 bytes to trim)
-        let result = self.trim_and_prepend(event_batches_queued, 0, 0).await?;
+        self.trim_and_prepend(event_batches_queued, 0, 0).await?;
 
         // Update minimum_available_event_batch_index to the first prepended batch
         self.minimum_available_event_batch_index = event_batches[0].event_batch_metadata.event_batch_index;
 
-        Ok(result)
+        Ok(())
     }
 
-    pub fn maybe_read_cached_events(&self, filters: &ReadFilters) -> Result<CacheableReadResult, WriteError> {
+    fn maybe_read_cached_events(&self, filters: &ReadFilters) -> Result<CacheableReadResult, WriteError> {
         // Check if cache is empty
         if self.data_cache.is_empty() {
             return Err(WriteError::CacheMiss { 
@@ -687,11 +642,58 @@ impl WriteOperations {
         })
     }
     
-    pub fn file_len_metadata(&self) -> u64 {
+    fn file_len_metadata(&self) -> u64 {
         self.file_len_metadata
     }
     
-    pub fn file_len_event_batch(&self) -> u64 {
+    fn file_len_event_batch(&self) -> u64 {
         self.file_len_event_batch
     }
+}
+
+fn extract_unique_event_types(events: &[EventItem]) -> ([u64; 4], bool) {
+    let mut bloom_or_event_types = [u64::MAX, u64::MAX, u64::MAX, u64::MAX];
+    let mut use_bloom = false;
+    let mut unique_count = 0;
+
+    for event in events {
+        let event_type = event.event_type_major;
+
+        // Check if we already have this event type
+        if unique_count > 0 && bloom_or_event_types[0] == event_type {
+            continue;
+        }
+        if unique_count > 1 && bloom_or_event_types[1] == event_type {
+            continue;
+        }
+        if unique_count > 2 && bloom_or_event_types[2] == event_type {
+            continue;
+        }
+        if unique_count > 3 && bloom_or_event_types[3] == event_type {
+            continue;
+        }
+
+        // New unique event type
+        if unique_count < 4 {
+            bloom_or_event_types[unique_count] = event_type;
+            unique_count += 1;
+        } else {
+            use_bloom = true;
+            break;
+        }
+    }
+
+    (bloom_or_event_types, use_bloom)
+}
+
+struct AppendEventBatchQueueItem {
+    compressed_event_batch_item: Vec<u8>,
+    event_batch_item: EventBatchItem,
+    metadata_bytes: [u8; METADATA_BATCH_SIZE_BYTES],
+    event_batch_metadata: EventBatchMetadata,
+}
+
+struct PrependEventBatchQueueItem {
+    compressed_event_batch_item: Vec<u8>,
+    metadata_bytes: [u8; METADATA_BATCH_SIZE_BYTES],
 }
