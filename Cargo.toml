@@ -2,8 +2,8 @@
 members = [
     "eventplanedb_structures",
     "eventplanedb_core",
-    "eventplanedb_server",
-    "eventplanedb_client",
+    # "eventplanedb_server",
+    # "eventplanedb_client",
 ]
 
 resolver = "2"

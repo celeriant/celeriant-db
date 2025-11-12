@@ -1,70 +1,11 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use eventplanedb_structures::{append_result::AppendResult, batch_metadata_item_pair::BatchMetadataItemPair, compression_type::CompressionType, constants::{BINCODE_CONFIG_FIXED, BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED, METADATA_BATCH_SIZE_BYTES}, event_batch_item::EventBatchItem, event_batch_metadata::{EventBatchMetadata, EventTypesData}, event_item::EventItem, read_filters::ReadFilters, wire_format::to_wire_format_variable};
+use eventplanedb_structures::{append_result::AppendResult, batch_metadata_item_pair::BatchMetadataItemPair, compression_type::CompressionType, constants::{BINCODE_CONFIG_FIXED, BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED, METADATA_BATCH_SIZE_BYTES}, event_batch_item::EventBatchItem, event_batch_metadata::{EventBatchMetadata, EventTypesData}, event_item::EventItem, read_filters::ReadFilters, wire_format::{to_wire_format_fixed, to_wire_format_variable}};
 use fastbloom::BloomFilter;
 use glommio::{io::{DmaFile}, GlommioError};
 
-use crate::files::read_operations::{CacheableReadResult, apply_event_filters, is_include_batch};
+use crate::{read_operations::{in_memory_filtering::{apply_event_filters, is_include_batch}, read_structures::CacheableReadResult}, write_operations::{write_error::WriteError, write_structures::{AggregateWriteConfig, WriteOptions}}};
 
-#[derive(Debug)]
-pub enum AppendError {
-    IoError(GlommioError<()>),
-    OptimisticConcurrencyViolation {
-        client_id: u128,
-        expected_event_batch_index: u64,
-        current_event_batch_index: u64,
-    },
-    ClientIdempotencyViolation {
-        client_id: u128,
-        last_client_event_index: u64,
-        attempted_client_event_index: u64,
-    },
-    EmptyEventsList {
-        client_id: u128,
-    },
-    NoEventsToAppend {
-        client_id: u128,
-        existing_event_index: u64,
-    },
-    SerializationError {
-        message: String,
-    },
-    WriteError {
-        message: String,
-    },
-}
-
-#[derive(Debug)]
-pub enum CacheReadError {
-    // Cache data should be contiguous and always present at the latest write
-    // So cache miss can only occur for older event batch index ranges
-    CacheMiss {
-        missing_from_event_batch_index: u64,        
-        missing_to_event_batch_index: Option<u64>,
-    },
-}
-
-impl From<GlommioError<()>> for AppendError {
-    fn from(error: GlommioError<()>) -> Self {
-        AppendError::IoError(error)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct AggregateWriteConfig {
-    pub max_data_cache_size_bytes: usize,
-    pub cache_trim_factor: usize,
-    pub max_chunk_size: usize
-}
-
-pub struct AppendOptions {
-    pub client_id: u128,
-    pub user_id: Option<u128>,
-    pub expected_event_batch_index: Option<u64>,
-    pub enforce_client_idempotency: bool,
-    pub server_timestamp_millis: u64,
-    pub compression_type: CompressionType,
-}
 
 pub struct WriteOperations {
     metadata_dma_file: DmaFile,
@@ -204,12 +145,10 @@ impl WriteOperations {
         self.bloom_filter.as_slice().try_into().expect("Conversion failed")
     }
 
-    async fn sync(&mut self) -> Result<(), AppendError> {
+    async fn sync(&mut self) -> Result<(), WriteError> {
         // Get current file sizes
-        let metadata_file_size = self.metadata_dma_file.file_size().await
-            .map_err(|e| AppendError::WriteError { message: format!("metadata file size failed: {}", e) })?;
-        let event_batches_file_size = self.event_batches_dma_file.file_size().await
-            .map_err(|e| AppendError::WriteError { message: format!("event batches file size failed: {}", e) })?;
+        let metadata_file_size = self.metadata_dma_file.file_size().await?;
+        let event_batches_file_size = self.event_batches_dma_file.file_size().await?;
 
         // Calculate total sizes
         let total_event_batches_size: usize = self.append_event_batch_queue.iter()
@@ -245,15 +184,11 @@ impl WriteOperations {
         let meta_buf_len = meta_buf.len() as u64;
 
         // Single write_at per file
-        self.event_batches_dma_file.write_at(event_buf, event_batches_file_size).await
-            .map_err(|e| AppendError::WriteError { message: format!("event batch write failed: {}", e) })?;
-        self.event_batches_dma_file.fdatasync().await
-            .map_err(|e| AppendError::WriteError { message: format!("metadata_dma_file fdatasync failed: {}", e) })?;
+        self.event_batches_dma_file.write_at(event_buf, event_batches_file_size).await?;
+        self.event_batches_dma_file.fdatasync().await?;
 
-        self.metadata_dma_file.write_at(meta_buf, metadata_file_size).await
-            .map_err(|e| AppendError::WriteError { message: format!("metadata write failed: {}", e) })?;
-        self.metadata_dma_file.fdatasync().await
-            .map_err(|e| AppendError::WriteError { message: format!("event_batches_dma_file fdatasync failed: {}", e) })?;
+        self.metadata_dma_file.write_at(meta_buf, metadata_file_size).await?;
+        self.metadata_dma_file.fdatasync().await?;
 
         self.file_len_event_batch += event_buf_len;
         self.file_len_metadata += meta_buf_len;
@@ -280,7 +215,6 @@ impl WriteOperations {
             //Data in file is now available to read
             self.minimum_available_event_batch_index = 1;
         }
-
 
         // Phase 2: Trim old events from front if cache significantly exceeds max size
         // Only trim if we're over by at least 10% to avoid constant trimming overhead
@@ -311,7 +245,7 @@ impl WriteOperations {
     }
     
     // In case of failure during sync, we need to roll back the in-memory state
-    pub async fn sync_with_rollback(&mut self) -> Result<(), AppendError> {
+    pub async fn sync_with_rollback(&mut self) -> Result<(), WriteError> {
         match self.sync().await {
             Ok(_) => Ok(()),
             Err(e) => {
@@ -341,24 +275,22 @@ impl WriteOperations {
 
     /// We require the ownership of the events to be transferred, as they will be stored in the in-memory cache
     /// The events are also mutable as we need to filter out events for client idempotency requirements
-    pub fn queue_events_in_memory(&mut self, mut events: Vec<EventItem>, append_options: &AppendOptions) -> Result<AppendResult, AppendError> {
+    pub fn queue_events_in_memory(&mut self, mut events: Vec<EventItem>, write_options: &WriteOptions) -> Result<AppendResult, WriteError> {
         // Requires mutable write buffer access
         // Requires mutable access to cache data (events, indexes)
 
         // Make sure we have at least one event to write
         if events.is_empty() {
-            return Err(AppendError::EmptyEventsList {
-                client_id: append_options.client_id,
-            });
+            return Err(WriteError::EmptyEventsList());
         }
 
         // If checking idempotency, check if client is providing the same events again using client event index, if so, error
-        if append_options.enforce_client_idempotency {
-            if let Some(&last_client_event_index) = self.client_event_indexes.get(&append_options.client_id) {
+        if write_options.enforce_client_idempotency {
+            if let Some(&last_client_event_index) = self.client_event_indexes.get(&write_options.client_id) {
                 let attempted_client_event_index = events.iter().map(|e| e.client_event_index).min().unwrap_or(0);
                 if attempted_client_event_index <= last_client_event_index {
-                    return Err(AppendError::ClientIdempotencyViolation {
-                        client_id: append_options.client_id,
+                    return Err(WriteError::ClientIdempotencyViolation {
+                        client_id: write_options.client_id,
                         last_client_event_index,
                         attempted_client_event_index,
                     });
@@ -367,10 +299,10 @@ impl WriteOperations {
         }
 
         // If doing optimistic concurrency, check expected event batch index matches current
-        if let Some(expected) = append_options.expected_event_batch_index {
+        if let Some(expected) = write_options.expected_event_batch_index {
             if expected != self.next_event_batch_index {
-                return Err(AppendError::OptimisticConcurrencyViolation {
-                    client_id: append_options.client_id,
+                return Err(WriteError::OptimisticConcurrencyViolation {
+                    client_id: write_options.client_id,
                     expected_event_batch_index: expected,
                     current_event_batch_index: self.next_event_batch_index,
                 });
@@ -387,18 +319,15 @@ impl WriteOperations {
         // Create EventBatchItem from events with next index, don't increment struct state yet though
         let event_batch_item = EventBatchItem::new(
             self.next_event_batch_index,
-            append_options.server_timestamp_millis,
-            append_options.client_id,
-            append_options.user_id,
+            write_options.server_timestamp_millis,
+            write_options.client_id,
+            write_options.user_id,
             events,
         );
 
         // Serialize and compress the event data
         let (uncompressed_size, compressed_event_batch_item) =
-            to_wire_format_variable(&event_batch_item, append_options.compression_type)
-            .map_err(|e| AppendError::SerializationError { 
-                message: format!("Failed to serialize event batch: {}", e) 
-            })?;
+            to_wire_format_variable(&event_batch_item, write_options.compression_type)?;
         let events_crc = crc32fast::hash(&compressed_event_batch_item);
 
         // Determine event types data (bloom filter or direct array)
@@ -420,7 +349,7 @@ impl WriteOperations {
             &event_batch_item,
             uncompressed_size as u64,
             compressed_event_batch_item.len() as u64,
-            append_options.compression_type,
+            write_options.compression_type,
             event_types_data,
             events_crc,
         );
@@ -428,13 +357,7 @@ impl WriteOperations {
         let latest_client_event_index = event_batch_metadata.max_client_event_index;
 
         let mut metadata_bytes = [0u8; METADATA_BATCH_SIZE_BYTES];
-        bincode::encode_into_slice(
-            &event_batch_metadata, 
-            &mut metadata_bytes, 
-            BINCODE_CONFIG_FIXED
-        ).map_err(|e| AppendError::SerializationError { 
-            message: format!("Failed to serialize metadata: {}", e) 
-        })?;
+        to_wire_format_fixed(&event_batch_metadata, &mut metadata_bytes)?;
 
         self.append_event_batch_queue.push(AppendEventBatchQueueItem {
             compressed_event_batch_item,
@@ -447,14 +370,14 @@ impl WriteOperations {
         self.next_event_index = next_event_index;
         self.next_event_batch_index = self.next_event_batch_index.saturating_add(1);
         self.client_event_indexes
-            .insert(append_options.client_id, latest_client_event_index);
+            .insert(write_options.client_id, latest_client_event_index);
 
         Ok(AppendResult {
             next_event_batch_index: self.next_event_batch_index,
         })
     }
 
-    pub async fn trim_end(&mut self, new_metadata_len: u64, new_event_batch_len: u64) -> Result<(), AppendError> {
+    pub async fn trim_end(&mut self, new_metadata_len: u64, new_event_batch_len: u64) -> Result<(), WriteError> {
         let mut truncated = false;
 
         // Truncate the metadata file
@@ -485,7 +408,7 @@ impl WriteOperations {
         event_batches: Vec<PrependEventBatchQueueItem>,
         bytes_to_trim_metadata: u64, 
         bytes_to_trim_event_batch: u64,
-    ) -> Result<(DmaFile, DmaFile), AppendError> {
+    ) -> Result<(), WriteError> {
         let metadata_file_path = self.metadata_dma_file.path().unwrap().to_path_buf();
         let event_batch_file_path = self.event_batches_dma_file.path().unwrap().to_path_buf();
 
@@ -589,9 +512,9 @@ impl WriteOperations {
 
         // Commit by renaming temp files over originals
         std::fs::rename(&temp_path_metadata, &metadata_file_path)
-            .map_err(|e| AppendError::WriteError { message: format!("metadata rename failed: {}", e) })?;
+            .map_err(|e| WriteError::FileRenameFailure { from: temp_path_metadata, to: metadata_file_path.to_string_lossy().to_string(), error: e })?;
         std::fs::rename(&temp_path_event_batch, &event_batch_file_path)
-            .map_err(|e| AppendError::WriteError { message: format!("event batch rename failed: {}", e) })?;
+            .map_err(|e| WriteError::FileRenameFailure { from: temp_path_event_batch, to: event_batch_file_path.to_string_lossy().to_string(), error: e })?;
 
         // Reopen files and update state
         let new_metadata_file = DmaFile::open(&metadata_file_path).await?;
@@ -620,9 +543,9 @@ impl WriteOperations {
         &mut self, 
         bytes_to_trim_metadata: u64, 
         bytes_to_trim_event_batch: u64,
-    ) -> Result<(DmaFile, DmaFile), AppendError> {
+    ) -> Result<(DmaFile, DmaFile), WriteError> {
         if bytes_to_trim_metadata == 0 || bytes_to_trim_event_batch == 0 {
-            return Err(AppendError::WriteError { 
+            return Err(WriteError::WriteError { 
                 message: "Cannot trim 0 bytes".to_string() 
             });
         }
@@ -633,12 +556,10 @@ impl WriteOperations {
     pub async fn prepend_batches(
         &mut self, 
         event_batches: &Vec<BatchMetadataItemPair>,
-    ) -> Result<(DmaFile, DmaFile), AppendError> {
+    ) -> Result<(DmaFile, DmaFile), WriteError> {
 
         if event_batches.is_empty() {
-            return Err(AppendError::WriteError { 
-                message: "Cannot prepend empty batch list".to_string() 
-            });
+            return Err(WriteError::EmptyEventsList());
         }
 
         // Validate contiguous event_batch_indexes
@@ -647,11 +568,9 @@ impl WriteOperations {
             let curr_index = event_batches[i].event_batch_metadata.event_batch_index;
             
             if curr_index != prev_index + 1 {
-                return Err(AppendError::WriteError { 
-                    message: format!(
-                        "Event batch indexes are not contiguous: {} followed by {}", 
-                        prev_index, curr_index
-                    ) 
+                return Err(WriteError::PrependNonContiguousBatches { 
+                    from_event_batch_index: prev_index,
+                    to_event_batch_index: curr_index,
                 });
             }
         }
@@ -659,11 +578,9 @@ impl WriteOperations {
         // Validate that last event_batch_index is exactly one less than minimum_available_event_batch_index
         let last_batch_index = event_batches.last().unwrap().event_batch_metadata.event_batch_index;
         if last_batch_index + 1 != self.minimum_available_event_batch_index {
-            return Err(AppendError::WriteError { 
-                message: format!(
-                    "Last prepend batch index {} must be exactly one less than minimum_available_event_batch_index {}", 
-                    last_batch_index, self.minimum_available_event_batch_index
-                ) 
+            return Err(WriteError::PrependCreatesEventBatchIndexGap { 
+                provided_last_batch_index: last_batch_index,
+                current_first_event_batch_index: self.minimum_available_event_batch_index,
             });
         }
 
@@ -677,9 +594,7 @@ impl WriteOperations {
             let (_, compressed_event_batch_item) = to_wire_format_variable(
                 &pair.event_batch_item, 
                 CompressionType::from_tuple(metadata.compression_type, None),
-            ).map_err(|e| AppendError::SerializationError { 
-                message: format!("Failed to serialize event batch for prepend: {}", e) 
-            })?;
+            )?;
 
             // Serialize metadata
             let mut metadata_bytes = [0u8; METADATA_BATCH_SIZE_BYTES];
@@ -687,9 +602,7 @@ impl WriteOperations {
                 metadata, 
                 &mut metadata_bytes, 
                 BINCODE_CONFIG_FIXED
-            ).map_err(|e| AppendError::SerializationError { 
-                message: format!("Failed to serialize metadata for prepend: {}", e) 
-            })?;
+            )?;
 
             event_batches_queued.push(PrependEventBatchQueueItem {
                 compressed_event_batch_item,
@@ -706,10 +619,10 @@ impl WriteOperations {
         Ok(result)
     }
 
-    pub fn maybe_read_cached_events(&self, filters: &ReadFilters) -> Result<CacheableReadResult, CacheReadError> {
+    pub fn maybe_read_cached_events(&self, filters: &ReadFilters) -> Result<CacheableReadResult, WriteError> {
         // Check if cache is empty
         if self.data_cache.is_empty() {
-            return Err(CacheReadError::CacheMiss { 
+            return Err(WriteError::CacheMiss { 
                 missing_from_event_batch_index: filters.from_event_batch_index, 
                 missing_to_event_batch_index: filters.to_event_batch_index 
             });
@@ -720,7 +633,7 @@ impl WriteOperations {
 
         // Check if requested range is within cache
         if filters.from_event_batch_index < cache_min_batch_index {
-            return Err(CacheReadError::CacheMiss { 
+            return Err(WriteError::CacheMiss { 
                 missing_from_event_batch_index: filters.from_event_batch_index, 
                 missing_to_event_batch_index: Some(cache_min_batch_index.saturating_sub(1))
             });

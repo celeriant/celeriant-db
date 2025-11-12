@@ -1,11 +1,16 @@
-use bincode::{Decode, Encode};
-use serde::{Deserialize, Serialize};
-use futures_lite::{AsyncReadExt, AsyncWriteExt};
 use crate::{
-    batch_metadata_item_pair::BatchMetadataItemPair, compression_type::CompressionType, constants::BINCODE_CONFIG_FIXED, directory_filters::DirectoryFilters, event_item::EventItem, read_filters::ReadFilters, wire_format::{PROTOCOL_VERSION_V2, WireError, from_wire_format_variable, to_wire_format_variable}
+    batch_metadata_item_pair::BatchMetadataItemPair,
+    compression_type::CompressionType,
+    constants::{PROTOCOL_VERSION_V2, WIRE_FIXED_BODY_SIZE},
+    directory_filters::DirectoryFilters,
+    event_item::EventItem,
+    read_filters::ReadFilters,
+    wire_error::WireError,
+    wire_header::{WireHeader, write_fixed_size, write_variable_size},
 };
-
-const HEADER_SIZE: usize = 13; // version(4) + type(4) + length(4) + compression(1)
+use bincode::{Decode, Encode};
+use futures_lite::{AsyncReadExt, AsyncWriteExt};
+use serde::{Deserialize, Serialize};
 
 // Request type discriminants
 #[repr(u32)]
@@ -34,7 +39,7 @@ impl RequestType {
             7 => Ok(RequestType::WriteBatches),
             8 => Ok(RequestType::TrimStart),
             9 => Ok(RequestType::Delete),
-            _ => Err(WireError::InvalidFormatWithVersion(value)),
+            _ => Err(WireError::UnknownRequestType(value)),
         }
     }
 
@@ -89,9 +94,7 @@ pub struct ReadAllRequest {
     pub org_id: u128,
     pub aggregate_type_id: u128,
     pub aggregate_id: u128,
-    /// Starting server ID to begin reading from (inclusive). Will error if not found in stream.
     pub from_event_batch_index: u64,
-    /// End reading event batches at this server id (inclusive). Will error if reached end of stream before this ID.
     pub to_event_batch_index: Option<u64>,
 }
 
@@ -186,191 +189,127 @@ impl Request {
     }
 }
 
-/// Read a fixed-size request from the wire
-async fn read_fixed_size<R, T>(reader: &mut R, size: u32, buffer: &mut [u8]) -> Result<T, WireError>
-where
-    R: AsyncReadExt + Unpin,
-    T: Decode<()>
-{
-    reader.read_exact(&mut buffer[..size as usize]).await?;
-
-    bincode::decode_from_slice(&buffer[..size as usize], BINCODE_CONFIG_FIXED)
-        .map(|(msg, _)| msg)
-        .map_err(|e| WireError::BincodeDecode(e))
-}
-
 /// Read a request from the wire protocol
-pub async fn read_request<R>(reader: &mut R, max_message_size: u32) -> Result<(Request, u32), WireError>
+pub async fn read_request<R>(
+    reader: &mut R,
+    max_message_size: u32,
+) -> Result<(Request, u32), WireError>
 where
     R: AsyncReadExt + Unpin,
 {
-    // Always read full header: version(4) + type(4) + length(4) + compression(1)
-    let mut header = [0u8; HEADER_SIZE];
-    reader.read_exact(&mut header).await?;
+    let wire_header = WireHeader::from_reader(reader).await?;
 
-    let version = u32::from_be_bytes(header[0..4].try_into().unwrap());
-    let request_type_id = u32::from_be_bytes(header[4..8].try_into().unwrap());
-    let message_length = u32::from_be_bytes(header[8..12].try_into().unwrap());
-    let compression_type = CompressionType::from_tuple(header[12], None);
-
-    if version != PROTOCOL_VERSION_V2 {
-        return Err(WireError::UnsupportedVersion(version));
+    if wire_header.version != PROTOCOL_VERSION_V2 {
+        return Err(WireError::UnsupportedProtocol(wire_header.version));
     }
 
-    let request_type = RequestType::from_u32(request_type_id)?;
+    let request_type = RequestType::from_u32(wire_header.message_type)?;
 
     let request = if request_type.is_fixed_size() {
-        // Single buffer large enough for any fixed-size request (294 bytes = largest)
-        let mut buffer = [0u8; 294];
-        
+        let mut buffer = [0u8; WIRE_FIXED_BODY_SIZE];
+
         match request_type {
             RequestType::ListAggregates => {
-                Request::ListAggregates(read_fixed_size(reader, message_length, &mut buffer).await?)
+                Request::ListAggregates(wire_header.read_fixed_size(reader, &mut buffer).await?)
             }
             RequestType::Exists => {
-                Request::Exists(read_fixed_size(reader, message_length, &mut buffer).await?)
+                Request::Exists(wire_header.read_fixed_size(reader, &mut buffer).await?)
             }
             RequestType::Read => {
-                Request::Read(read_fixed_size(reader, message_length, &mut buffer).await?)
+                Request::Read(wire_header.read_fixed_size(reader, &mut buffer).await?)
             }
             RequestType::ReadAll => {
-                Request::ReadAll(read_fixed_size(reader, message_length, &mut buffer).await?)
+                Request::ReadAll(wire_header.read_fixed_size(reader, &mut buffer).await?)
             }
             RequestType::TrimStart => {
-                Request::TrimStart(read_fixed_size(reader, message_length, &mut buffer).await?)
+                Request::TrimStart(wire_header.read_fixed_size(reader, &mut buffer).await?)
             }
             RequestType::Delete => {
-                Request::Delete(read_fixed_size(reader, message_length, &mut buffer).await?)
+                Request::Delete(wire_header.read_fixed_size(reader, &mut buffer).await?)
             }
             _ => unreachable!(),
         }
     } else {
         match request_type {
-            RequestType::ListOrganisations => {
-                Request::ListOrganisations(read_variable_size(reader, message_length, compression_type, max_message_size).await?)
-            }
-            RequestType::Write => {
-                Request::Write(read_variable_size(reader, message_length, compression_type, max_message_size).await?)
-            }
-            RequestType::WriteBatches => {
-                Request::WriteBatches(read_variable_size(reader, message_length, compression_type, max_message_size).await?)
-            }
+            RequestType::ListOrganisations => Request::ListOrganisations(
+                wire_header
+                    .read_variable_size(reader, Some(max_message_size))
+                    .await?,
+            ),
+            RequestType::Write => Request::Write(
+                wire_header
+                    .read_variable_size(reader, Some(max_message_size))
+                    .await?,
+            ),
+            RequestType::WriteBatches => Request::WriteBatches(
+                wire_header
+                    .read_variable_size(reader, Some(max_message_size))
+                    .await?,
+            ),
             _ => unreachable!(),
         }
     };
 
-    Ok((request, version))
-}
-
-/// Write a fixed-size request to the wire
-async fn write_fixed_size<W, T>(writer: &mut W, message: &T, request_type: RequestType) -> Result<(), WireError>
-where
-    W: AsyncWriteExt + Unpin,
-    T: Encode,
-{
-    // Stack-allocated buffer: HEADER_SIZE (13) + largest fixed size (ReadRequest/ReadAllRequest = 294)
-    let mut buffer = [0u8; HEADER_SIZE + 294];
-    
-    // Encode message directly into the buffer after the header
-    let encoded_len = bincode::encode_into_slice(message, &mut buffer[HEADER_SIZE..], BINCODE_CONFIG_FIXED)
-        .map_err(|e| WireError::BincodeEncode(e))?;
-    
-    // Write header at the beginning of the buffer
-    buffer[0..4].copy_from_slice(&PROTOCOL_VERSION_V2.to_be_bytes());
-    buffer[4..8].copy_from_slice(&(request_type as u32).to_be_bytes());
-    buffer[8..12].copy_from_slice(&0u32.to_be_bytes()); // length = 0 for fixed size
-    buffer[12] = 0; // compression = 0 for fixed size
-    
-    // Write only the used portion (header + actual encoded length)
-    writer.write_all(&buffer[..HEADER_SIZE + encoded_len]).await?;
-
-    Ok(())
-}
-
-/// Write a variable-size request to the wire
-async fn write_variable_size<W, T>(
-    writer: &mut W,
-    message: &T,
-    request_type: RequestType,
-    compression_type: CompressionType,
-    max_message_size: usize,
-) -> Result<(), WireError>
-where
-    W: AsyncWriteExt + Unpin,
-    T: Encode,
-{
-    // Encode and compress
-    let (_uncompressed_size, encoded) = to_wire_format_variable(message, compression_type)?;
-
-    if encoded.len() > max_message_size as usize {
-        return Err(WireError::MessageTooLarge(encoded.len() as u32));
-    }
-
-    // Combine header + payload into single buffer for one write
-    let (type_id, _) = compression_type.to_tuple();
-    let total_size = HEADER_SIZE + encoded.len();
-    let mut buffer = Vec::with_capacity(total_size);
-
-    // Header: version(4) + type(4) + length(4) + compression(1)
-    buffer.extend_from_slice(&PROTOCOL_VERSION_V2.to_be_bytes());
-    buffer.extend_from_slice(&(request_type as u32).to_be_bytes());
-    buffer.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
-    buffer.push(type_id);
-    buffer.extend_from_slice(&encoded);
-
-    writer.write_all(&buffer).await?;
-
-    Ok(())
+    Ok((request, wire_header.version))
 }
 
 pub async fn write_request<W>(
     writer: &mut W,
     request: &Request,
     compression_type: CompressionType,
-    max_message_size: usize,
+    max_message_size: u32,
 ) -> Result<(), WireError>
 where
     W: AsyncWriteExt + Unpin,
 {
     let request_type = request.request_type();
+    let request_type_id = request_type as u32;
 
     if request_type.is_fixed_size() {
         // Fixed-size requests - no compression needed
         match request {
-            Request::ListAggregates(req) => write_fixed_size(writer, req, request_type).await,
-            Request::Exists(req) => write_fixed_size(writer, req, request_type).await,
-            Request::Read(req) => write_fixed_size(writer, req, request_type).await,
-            Request::ReadAll(req) => write_fixed_size(writer, req, request_type).await,
-            Request::TrimStart(req) => write_fixed_size(writer, req, request_type).await,
-            Request::Delete(req) => write_fixed_size(writer, req, request_type).await,
+            Request::ListAggregates(req) => write_fixed_size(writer, req, request_type_id).await,
+            Request::Exists(req) => write_fixed_size(writer, req, request_type_id).await,
+            Request::Read(req) => write_fixed_size(writer, req, request_type_id).await,
+            Request::ReadAll(req) => write_fixed_size(writer, req, request_type_id).await,
+            Request::TrimStart(req) => write_fixed_size(writer, req, request_type_id).await,
+            Request::Delete(req) => write_fixed_size(writer, req, request_type_id).await,
             _ => unreachable!(),
         }
     } else {
         // Variable-size requests - with compression
         match request {
-            Request::ListOrganisations(req) => write_variable_size(writer, req, request_type, compression_type, max_message_size).await,
-            Request::Write(req) => write_variable_size(writer, req, request_type, compression_type, max_message_size).await,
-            Request::WriteBatches(req) => write_variable_size(writer, req, request_type, compression_type, max_message_size).await,
+            Request::ListOrganisations(req) => {
+                write_variable_size(
+                    writer,
+                    req,
+                    request_type_id,
+                    compression_type,
+                    Some(max_message_size),
+                )
+                .await
+            }
+            Request::Write(req) => {
+                write_variable_size(
+                    writer,
+                    req,
+                    request_type_id,
+                    compression_type,
+                    Some(max_message_size),
+                )
+                .await
+            }
+            Request::WriteBatches(req) => {
+                write_variable_size(
+                    writer,
+                    req,
+                    request_type_id,
+                    compression_type,
+                    Some(max_message_size),
+                )
+                .await
+            }
             _ => unreachable!(),
         }
     }
-}
-
-/// Read a variable-size request from the wire (length and compression already read in header)
-async fn read_variable_size<R, T>(reader: &mut R, message_length: u32, compression_type: CompressionType, max_message_size: u32) -> Result<T, WireError>
-where
-    R: AsyncReadExt + Unpin,
-    T: Decode<()>,
-{
-    if message_length > max_message_size {
-        return Err(WireError::MessageTooLarge(message_length));
-    }
-
-    // Read payload
-    let mut payload = vec![0u8; message_length as usize];
-    reader.read_exact(&mut payload).await?;
-
-    // Decompress and decode
-    from_wire_format_variable(&payload, compression_type, message_length as usize)
-        .map_err(|e| WireError::Io(e))
 }

@@ -1,0 +1,1 @@
+type SyncResult = Result<(), EventPlaneDBError>;

@@ -18,3 +18,5 @@ pub mod error_code;
 pub mod response;
 pub mod request;
 pub mod eventplanedb_error;
+pub mod wire_error;
+pub mod wire_header;

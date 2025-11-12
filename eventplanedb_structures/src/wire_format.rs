@@ -1,109 +1,88 @@
+use crate::{
+    compression_type::CompressionType,
+    constants::{BINCODE_CONFIG_FIXED, BINCODE_CONFIG_VARIABLE},
+};
+use bincode::{Decode, Encode};
 use std::io;
-use bincode::{config, Decode, Encode};
-use thiserror::Error;
 
-use crate::eventplanedb_error::EventPlaneDBError;
-use crate::{compression_type::CompressionType};
+#[derive(Debug)]
+pub enum WireFormatError {
+    Serialization(bincode::error::EncodeError),
+    Deserialization(bincode::error::DecodeError),
+    Compression {
+        inner: std::io::Error,
+        snappy_error: Option<snap::Error>,
+    },
+}
 
+impl From<bincode::error::DecodeError> for WireFormatError {
+    fn from(v: bincode::error::DecodeError) -> Self {
+        Self::Deserialization(v)
+    }
+}
 
-pub const STACK_BUFFER_SIZE: u32 = 30 * 1024; // 30KB stack buffer threshold
-pub const PROTOCOL_VERSION_V1: u32 = 1;
-pub const PROTOCOL_VERSION_V2: u32 = 2;
+impl From<bincode::error::EncodeError> for WireFormatError {
+    fn from(v: bincode::error::EncodeError) -> Self {
+        Self::Serialization(v)
+    }
+}
 
-/// Bincode configuration for variable-length encoding
-const BINCODE_CONFIG_VARIABLE: config::Configuration = config::standard();
+impl From<snap::Error> for WireFormatError {
+    fn from(value: snap::Error) -> Self {
+        WireFormatError::Compression {
+            inner: io::Error::other(value.to_string()),
+            snappy_error: Some(value),
+        }
+    }
+}
 
-//TODO: When we have a large message, we always allocate on the heap, use a buffer pool?
+impl From<std::io::Error> for WireFormatError {
+    fn from(value: std::io::Error) -> Self {
+        WireFormatError::Compression {
+            inner: value,
+            snappy_error: None,
+        }
+    }
+}
 
-pub fn to_wire_format_variable_stack<T>(
-    item: &T,
-    compression_type: CompressionType,
-    serialize_buffer: &mut [u8],
-    compress_buffer: &mut [u8],
-) -> io::Result<(usize, usize)>
+pub fn to_wire_format_fixed<T>(message: &T, buffer: &mut [u8]) -> Result<usize, WireFormatError>
 where
     T: Encode,
 {
-    let uncompressed_size = bincode::encode_into_slice(item, serialize_buffer, BINCODE_CONFIG_VARIABLE)
-        .map_err(|e| io::Error::other(e.to_string()))?;
+    Ok(bincode::encode_into_slice(
+        message,
+        buffer,
+        BINCODE_CONFIG_FIXED,
+    )?)
+}
 
-    let compressed_size = match compression_type {
-        CompressionType::None => {
-            // No compression - just copy to output buffer if different from input
-            if serialize_buffer.as_ptr() != compress_buffer.as_ptr() {
-                compress_buffer[..uncompressed_size].copy_from_slice(&serialize_buffer[..uncompressed_size]);
-            }
-            uncompressed_size
-        }
-        CompressionType::Zstd { level } => {
-            let size = zstd::bulk::compress_to_buffer(
-                &serialize_buffer[..uncompressed_size],
-                compress_buffer,
-                level,
-            )
-            .map_err(|e| io::Error::other(e.to_string()))?;
-            size
-        }
-        CompressionType::Snappy => {
-            let compressed = snap::raw::Encoder::new()
-                .compress_vec(&serialize_buffer[..uncompressed_size])
-                .map_err(|e| io::Error::other(e.to_string()))?;
-            
-            if compressed.len() > compress_buffer.len() {
-                return Err(io::Error::other("Compression buffer too small"));
-            }
-            compress_buffer[..compressed.len()].copy_from_slice(&compressed);
-            compressed.len()
-        }
-        CompressionType::Brotli { level } => {
-            let mut output = std::io::Cursor::new(compress_buffer);
-            let params = brotli::enc::BrotliEncoderParams {
-                quality: level,
-                ..Default::default()
-            };
-            brotli::BrotliCompress(
-                &mut std::io::Cursor::new(&serialize_buffer[..uncompressed_size]),
-                &mut output,
-                &params,
-            )
-            .map_err(|e| io::Error::other(e.to_string()))?;
-            output.position() as usize
-        }
-        CompressionType::Gzip { level } => {
-            use flate2::{Compression, write::GzEncoder};
-            let mut encoder = GzEncoder::new(std::io::Cursor::new(compress_buffer), Compression::new(level as u32));
-            std::io::Write::write_all(&mut encoder, &serialize_buffer[..uncompressed_size])?;
-            let cursor = encoder.finish()?;
-            cursor.position() as usize
-        }
-    };
+pub fn from_wire_format_fixed<T>(buffer: &[u8]) -> Result<T, WireFormatError>
+where
+    T: Decode<()>,
+{
+    let result = bincode::decode_from_slice(buffer, BINCODE_CONFIG_FIXED)?;
 
-    Ok((uncompressed_size, compressed_size))
+    Ok(result.0)
 }
 
 pub fn to_wire_format_variable<T>(
     item: &T,
     compression_type: CompressionType,
-) -> io::Result<(usize, Vec<u8>)>
+) -> Result<(usize, Vec<u8>), WireFormatError>
 where
     T: Encode,
 {
-    //TODO: There are two heap allocations here. Can we use some kind of vec pool instead?
-    let serialized = bincode::encode_to_vec(item, BINCODE_CONFIG_VARIABLE)
-        .map_err(|e| io::Error::other(e.to_string()))?;
+    let serialized = bincode::encode_to_vec(item, BINCODE_CONFIG_VARIABLE)?;
     let uncompressed_size = serialized.len();
 
     match compression_type {
         CompressionType::None => Ok((uncompressed_size, serialized)),
         CompressionType::Zstd { level } => {
-            let compressed = zstd::bulk::compress(&serialized, level)
-                .map_err(|e| io::Error::other(e.to_string()))?;
+            let compressed = zstd::bulk::compress(&serialized, level)?;
             Ok((uncompressed_size, compressed))
         }
         CompressionType::Snappy => {
-            let compressed = snap::raw::Encoder::new()
-                .compress_vec(&serialized)
-                .map_err(|e| io::Error::other(e.to_string()))?;
+            let compressed = snap::raw::Encoder::new().compress_vec(&serialized)?;
             Ok((uncompressed_size, compressed))
         }
         CompressionType::Brotli { level } => {
@@ -116,8 +95,7 @@ where
                 &mut std::io::Cursor::new(&serialized),
                 &mut compressed,
                 &params,
-            )
-            .map_err(|e| io::Error::other(e.to_string()))?;
+            )?;
             Ok((uncompressed_size, compressed))
         }
         CompressionType::Gzip { level } => {
@@ -134,82 +112,33 @@ where
 pub fn from_wire_format_variable<T>(
     data: &[u8],
     compression_type: CompressionType,
-    capacity: usize,
-) -> io::Result<T>
+    compressed_size: usize,
+) -> Result<T, WireFormatError>
 where
     T: Decode<()>,
 {
     let decompressed = match compression_type {
         CompressionType::None => data.to_vec(),
-        CompressionType::Zstd { .. } => {
-            zstd::bulk::decompress(data, capacity).map_err(|e| io::Error::other(e.to_string()))?
-        }
+        CompressionType::Zstd { .. } => zstd::bulk::decompress(data, compressed_size)
+            .map_err(|e| io::Error::other(e.to_string()))?,
         CompressionType::Snappy => snap::raw::Decoder::new()
             .decompress_vec(data)
             .map_err(|e| io::Error::other(e.to_string()))?,
         CompressionType::Brotli { .. } => {
-            let mut decompressed = Vec::with_capacity(capacity);
-            brotli::BrotliDecompress(&mut std::io::Cursor::new(data), &mut decompressed)
-                .map_err(|e| io::Error::other(e.to_string()))?;
+            let mut decompressed = Vec::with_capacity(compressed_size);
+            brotli::BrotliDecompress(&mut std::io::Cursor::new(data), &mut decompressed)?;
             decompressed
         }
         CompressionType::Gzip { .. } => {
             use flate2::read::GzDecoder;
             let mut decoder = GzDecoder::new(data);
-            let mut decompressed = Vec::with_capacity(capacity);
+            let mut decompressed = Vec::with_capacity(compressed_size);
             std::io::Read::read_to_end(&mut decoder, &mut decompressed)?;
             decompressed
         }
     };
 
-    bincode::decode_from_slice(&decompressed, BINCODE_CONFIG_VARIABLE)
-        .map(|(events, _)| events)
-        .map_err(|e| io::Error::other(e.to_string()))
-}
+    let result = bincode::decode_from_slice(&decompressed, BINCODE_CONFIG_VARIABLE)?;
 
-#[derive(Error, Debug)]
-pub enum WireError {
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("Serialization error: {0}")]
-    Serialization(#[from] rmp_serde::encode::Error),
-    #[error("Deserialization error: {0}")]
-    Deserialization(#[from] rmp_serde::decode::Error),
-    #[error("Bincode encode error: {0}")]
-    BincodeEncode(#[from] bincode::error::EncodeError),
-    #[error("Bincode decode error: {0}")]
-    BincodeDecode(#[from] bincode::error::DecodeError),
-    #[error("Message too large: {0} bytes")]
-    MessageTooLarge(u32),
-    #[error("Unsupported protocol version: {0}")]
-    UnsupportedVersion(u32),
-    #[error("Invalid format")]
-    InvalidFormat,
-    #[error("Invalid format with version specified")]
-    InvalidFormatWithVersion(u32),
-}
-
-impl From<crate::wire_format::WireError> for EventPlaneDBError {
-    fn from(e: crate::wire_format::WireError) -> Self {
-        use crate::wire_format::WireError;
-        match e {
-            WireError::Io(_io_err) => EventPlaneDBError::io_error(),
-            WireError::Serialization(_e) => EventPlaneDBError::serialization_error(),
-            WireError::Deserialization(_e) => EventPlaneDBError::serialization_error(),
-            WireError::BincodeEncode(_e) => EventPlaneDBError::serialization_error(),
-            WireError::BincodeDecode(_e) => EventPlaneDBError::serialization_error(),
-            WireError::MessageTooLarge(size) => {
-                EventPlaneDBError::message_too_large(size as u64)
-            }
-            WireError::UnsupportedVersion(version) => {
-                EventPlaneDBError::unsupported_protocol_version(version)
-            }
-            WireError::InvalidFormat => {
-                EventPlaneDBError::invalid_wire_format()
-            }
-            WireError::InvalidFormatWithVersion(_version) => {
-                EventPlaneDBError::invalid_wire_format()
-            },
-        }
-    }
+    Ok(result.0)
 }
