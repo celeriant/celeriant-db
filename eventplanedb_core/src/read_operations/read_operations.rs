@@ -6,12 +6,11 @@ use eventplanedb_structures::{
     read_filters::ReadFilters,
     wire_format::{from_wire_format_fixed, from_wire_format_variable},
 };
-use glommio::{GlommioError, io::DmaFile};
+use glommio::io::{DmaFile, OpenOptions};
 use std::{collections::HashMap, path::Path};
 
 use crate::{
     files::{
-        dma_file::get_existing_file_as_dma,
         read_fixed_records_visit_const,
         read_objects_absolute::{self, AbsoluteObjectPosition},
     },
@@ -146,12 +145,25 @@ impl ReadOperationsWithDmaFiles {
     /// # Returns
     /// New `ReadOperations` instance ready for reading
     pub async fn open<P: AsRef<Path>>(
+        base_folder: P,
         path_metadata: P,
         path_event_batches: P,
+        create_if_not_exists: bool,
         aggregate_read_config: AggregateReadConfig,
-    ) -> Result<ReadOperationsWithDmaFiles, GlommioError<()>> {
-        let metadata_dma_file = get_existing_file_as_dma(path_metadata).await?;
-        let event_batches_dma_file = get_existing_file_as_dma(path_event_batches).await?;
+    ) -> Result<ReadOperationsWithDmaFiles, ReadError> {
+        if create_if_not_exists {
+            std::fs::create_dir_all(&base_folder).map_err(|error| {
+                ReadError::CannotCreateFolders {
+                    path: base_folder.as_ref().to_string_lossy().to_string(),
+                    error,
+                }
+            })?;
+        }
+
+        let metadata_dma_file =
+            get_existing_file_as_dma(path_metadata, create_if_not_exists).await?;
+        let event_batches_dma_file =
+            get_existing_file_as_dma(path_event_batches, create_if_not_exists).await?;
 
         let metadata_dma_file_size = metadata_dma_file.file_size().await? as usize;
 
@@ -865,4 +877,19 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
             self.cache_metadata.drain(0..remove_count);
         }
     }
+}
+
+async fn get_existing_file_as_dma<P: AsRef<Path>>(
+    path: P,
+    create_if_not_exists: bool,
+) -> Result<DmaFile, ReadError> {
+    let dma_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(create_if_not_exists)
+        .append(false)
+        .dma_open(path)
+        .await?;
+
+    Ok(dma_file)
 }

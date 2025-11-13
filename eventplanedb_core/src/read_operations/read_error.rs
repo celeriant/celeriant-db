@@ -6,6 +6,10 @@ use crate::files::read_fixed_records_visit_const::ReadVisitError;
 #[derive(Debug)]
 pub enum ReadError {
     IoError(GlommioError<()>),
+    CannotCreateFolders {
+        path: String,
+        error: std::io::Error,
+    },
     MaxBytesTooSmall {
         current_max_bytes: u64,
         required_max_bytes: u64,

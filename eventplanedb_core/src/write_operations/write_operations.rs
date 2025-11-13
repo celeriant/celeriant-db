@@ -1,17 +1,36 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use eventplanedb_structures::{append_result::AppendResult, batch_metadata_item_pair::BatchMetadataItemPair, compression_type::CompressionType, constants::{BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED, METADATA_BATCH_SIZE_BYTES}, event_batch_item::EventBatchItem, event_batch_metadata::{EventBatchMetadata, EventTypesData}, event_item::EventItem, read_filters::ReadFilters, wire_format::{to_wire_format_fixed, to_wire_format_variable}};
+use eventplanedb_structures::{
+    append_result::AppendResult,
+    batch_metadata_item_pair::BatchMetadataItemPair,
+    compression_type::CompressionType,
+    constants::{BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED, METADATA_BATCH_SIZE_BYTES},
+    event_batch_item::EventBatchItem,
+    event_batch_metadata::{EventBatchMetadata, EventTypesData},
+    event_item::EventItem,
+    read_filters::ReadFilters,
+    wire_format::{to_wire_format_fixed, to_wire_format_variable},
+};
 use fastbloom::BloomFilter;
-use glommio::{io::{DmaFile}, GlommioError};
+use glommio::{GlommioError, io::DmaFile};
 
-use crate::{read_operations::{in_memory_filtering::{apply_event_filters, is_include_batch}, read_structures::{CacheableReadResult, WriteOperationsDataRequirements}}, write_operations::{write_error::WriteError, write_structures::{AggregateWriteConfig, WriteOptions}}};
+use crate::{
+    read_operations::{
+        in_memory_filtering::{apply_event_filters, is_include_batch},
+        read_structures::{CacheableReadResult, WriteOperationsDataRequirements},
+    },
+    write_operations::{
+        write_error::WriteError,
+        write_structures::{AggregateWriteConfig, WriteOptions},
+    },
+};
 
 pub struct WriteOperationsWithDmaFile {
     metadata_dma_file: DmaFile,
     event_batches_dma_file: DmaFile,
     data_cache: VecDeque<BatchMetadataItemPair>,
     total_cache_size_bytes: usize,
-    minimum_available_event_batch_index: u64,
+    pub minimum_available_event_batch_index: u64,
     next_event_index: u64,
     next_event_batch_index: u64,
     client_event_indexes: HashMap<u128, u64>,
@@ -21,8 +40,8 @@ pub struct WriteOperationsWithDmaFile {
     bloom_filter: BloomFilter,
     event_type_dedup: HashSet<u64>,
     append_event_batch_queue: Vec<AppendEventBatchQueueItem>,
-    file_len_metadata: u64,
-    file_len_event_batch: u64,
+    pub file_len_metadata: u64,
+    pub file_len_event_batch: u64,
 }
 
 impl WriteOperationsWithDmaFile {
@@ -31,20 +50,20 @@ impl WriteOperationsWithDmaFile {
         event_batches_dma_file: DmaFile,
         data_requirements: WriteOperationsDataRequirements,
         aggregate_write_config: AggregateWriteConfig,
-        ) -> Result<WriteOperationsWithDmaFile, GlommioError<()>> {
-
+    ) -> Result<WriteOperationsWithDmaFile, GlommioError<()>> {
         let bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8)
             .seed(&BLOOM_HASH_SEED)
             .hashes(BLOOM_HASH_COUNT);
 
         Ok(WriteOperationsWithDmaFile {
-            metadata_dma_file, 
-            event_batches_dma_file, 
-            data_cache: VecDeque::new(), 
+            metadata_dma_file,
+            event_batches_dma_file,
+            data_cache: VecDeque::new(),
             total_cache_size_bytes: 0,
-            next_event_batch_index: data_requirements.next_event_batch_index, 
-            next_event_index: data_requirements.next_event_index, 
-            minimum_available_event_batch_index: data_requirements.minimum_available_event_batch_index,
+            next_event_batch_index: data_requirements.next_event_batch_index,
+            next_event_index: data_requirements.next_event_index,
+            minimum_available_event_batch_index: data_requirements
+                .minimum_available_event_batch_index,
             client_event_indexes: data_requirements.client_event_indexes,
             max_data_cache_size_bytes: aggregate_write_config.max_data_cache_size_bytes,
             cache_trim_factor: aggregate_write_config.cache_trim_factor,
@@ -53,14 +72,11 @@ impl WriteOperationsWithDmaFile {
             event_type_dedup: HashSet::new(),
             append_event_batch_queue: vec![],
             file_len_metadata: data_requirements.file_len_metadata,
-            file_len_event_batch: data_requirements.file_len_event_batch
+            file_len_event_batch: data_requirements.file_len_event_batch,
         })
     }
 
-    fn create_bloom_filter_bytes(
-        &mut self,
-        events: &[EventItem],
-    ) -> [u64; BLOOM_BYTES / 8] {
+    fn create_bloom_filter_bytes(&mut self, events: &[EventItem]) -> [u64; BLOOM_BYTES / 8] {
         // Populate bloom filter with multiple event types
         self.bloom_filter.clear();
         self.event_type_dedup.clear();
@@ -73,7 +89,10 @@ impl WriteOperationsWithDmaFile {
             self.bloom_filter.insert(&event_type.to_le_bytes());
         }
 
-        self.bloom_filter.as_slice().try_into().expect("Conversion failed")
+        self.bloom_filter
+            .as_slice()
+            .try_into()
+            .expect("Conversion failed")
     }
 
     async fn sync(&mut self) -> Result<(), WriteError> {
@@ -82,22 +101,28 @@ impl WriteOperationsWithDmaFile {
         let event_batches_file_size = self.event_batches_dma_file.file_size().await?;
 
         // Calculate total sizes
-        let total_event_batches_size: usize = self.append_event_batch_queue.iter()
+        let total_event_batches_size: usize = self
+            .append_event_batch_queue
+            .iter()
             .map(|item| item.compressed_event_batch_item.len())
             .sum();
-        let total_metadata_size: usize = self.append_event_batch_queue.iter()
+        let total_metadata_size: usize = self
+            .append_event_batch_queue
+            .iter()
             .map(|item| item.metadata_bytes.len())
             .sum();
 
         // Allocate contiguous buffers
-        let mut event_buf = self.event_batches_dma_file.alloc_dma_buffer(total_event_batches_size);
+        let mut event_buf = self
+            .event_batches_dma_file
+            .alloc_dma_buffer(total_event_batches_size);
         let mut meta_buf = self.metadata_dma_file.alloc_dma_buffer(total_metadata_size);
 
         // Copy event batches into buffer
         let mut event_offset = 0;
         for item in self.append_event_batch_queue.iter() {
             let len = item.compressed_event_batch_item.len();
-            event_buf.as_bytes_mut()[event_offset..event_offset+len]
+            event_buf.as_bytes_mut()[event_offset..event_offset + len]
                 .copy_from_slice(&item.compressed_event_batch_item);
             event_offset += len;
         }
@@ -106,7 +131,7 @@ impl WriteOperationsWithDmaFile {
         let mut meta_offset = 0;
         for item in self.append_event_batch_queue.iter() {
             let len = item.metadata_bytes.len();
-            meta_buf.as_bytes_mut()[meta_offset..meta_offset+len]
+            meta_buf.as_bytes_mut()[meta_offset..meta_offset + len]
                 .copy_from_slice(&item.metadata_bytes);
             meta_offset += len;
         }
@@ -115,10 +140,14 @@ impl WriteOperationsWithDmaFile {
         let meta_buf_len = meta_buf.len() as u64;
 
         // Single write_at per file
-        self.event_batches_dma_file.write_at(event_buf, event_batches_file_size).await?;
+        self.event_batches_dma_file
+            .write_at(event_buf, event_batches_file_size)
+            .await?;
         self.event_batches_dma_file.fdatasync().await?;
 
-        self.metadata_dma_file.write_at(meta_buf, metadata_file_size).await?;
+        self.metadata_dma_file
+            .write_at(meta_buf, metadata_file_size)
+            .await?;
         self.metadata_dma_file.fdatasync().await?;
 
         self.file_len_event_batch += event_buf_len;
@@ -129,12 +158,12 @@ impl WriteOperationsWithDmaFile {
         if queue_len > 0 {
             // Reserve capacity upfront for better performance
             self.data_cache.reserve(queue_len);
-            
+
             // Bulk add items and track size
             for item in self.append_event_batch_queue.drain(..) {
                 let uncompressed_size = item.event_batch_metadata.uncompressed_size as usize;
                 self.total_cache_size_bytes += uncompressed_size;
-                
+
                 self.data_cache.push_back(BatchMetadataItemPair {
                     event_batch_metadata: item.event_batch_metadata,
                     event_batch_item: item.event_batch_item,
@@ -149,14 +178,15 @@ impl WriteOperationsWithDmaFile {
 
         // Phase 2: Trim old events from front if cache significantly exceeds max size
         // Only trim if we're over by at least 10% to avoid constant trimming overhead
-        let trim_threshold = self.max_data_cache_size_bytes + (self.max_data_cache_size_bytes / self.cache_trim_factor);
-        
+        let trim_threshold = self.max_data_cache_size_bytes
+            + (self.max_data_cache_size_bytes / self.cache_trim_factor);
+
         if self.total_cache_size_bytes > trim_threshold {
             // Calculate how many items to remove in one pass
             let mut items_to_remove = 0;
             let mut size_to_remove = 0;
             let target_size = self.max_data_cache_size_bytes;
-            
+
             for pair in self.data_cache.iter() {
                 if self.total_cache_size_bytes - size_to_remove <= target_size {
                     break;
@@ -164,7 +194,7 @@ impl WriteOperationsWithDmaFile {
                 size_to_remove += pair.event_batch_metadata.compressed_size as usize;
                 items_to_remove += 1;
             }
-            
+
             // Remove all items in one bulk operation
             if items_to_remove > 0 {
                 self.data_cache.drain(..items_to_remove);
@@ -175,9 +205,9 @@ impl WriteOperationsWithDmaFile {
         Ok(())
     }
     async fn trim_and_prepend(
-        &mut self, 
+        &mut self,
         event_batches: Vec<PrependEventBatchQueueItem>,
-        bytes_to_trim_metadata: u64, 
+        bytes_to_trim_metadata: u64,
         bytes_to_trim_event_batch: u64,
     ) -> Result<(), WriteError> {
         let metadata_file_path = self.metadata_dma_file.path().unwrap().to_path_buf();
@@ -188,18 +218,22 @@ impl WriteOperationsWithDmaFile {
         let temp_path_event_batch = format!("{}.tmp", event_batch_file_path.display());
 
         // Prepare prepend data from event_batches
-        let total_prepend_event_batch_size: usize = event_batches.iter()
+        let total_prepend_event_batch_size: usize = event_batches
+            .iter()
             .map(|item| item.compressed_event_batch_item.len())
             .sum();
-        let total_prepend_metadata_size: usize = event_batches.iter()
+        let total_prepend_metadata_size: usize = event_batches
+            .iter()
             .map(|item| item.metadata_bytes.len())
             .sum();
 
         // Trim and prepend metadata file
         {
-            let metadata_remaining_size = self.file_len_metadata.saturating_sub(bytes_to_trim_metadata);
+            let metadata_remaining_size = self
+                .file_len_metadata
+                .saturating_sub(bytes_to_trim_metadata);
             let temp_metadata_file = DmaFile::create(&temp_path_metadata).await?;
-            
+
             let mut write_pos = 0u64;
 
             // First, write the prepended metadata
@@ -208,7 +242,7 @@ impl WriteOperationsWithDmaFile {
                 let mut meta_offset = 0;
                 for item in event_batches.iter() {
                     let len = item.metadata_bytes.len();
-                    meta_buf.as_bytes_mut()[meta_offset..meta_offset+len]
+                    meta_buf.as_bytes_mut()[meta_offset..meta_offset + len]
                         .copy_from_slice(&item.metadata_bytes);
                     meta_offset += len;
                 }
@@ -219,39 +253,45 @@ impl WriteOperationsWithDmaFile {
             // Then, copy the trimmed original data
             let mut offset = bytes_to_trim_metadata;
             let mut remaining = metadata_remaining_size;
-            
+
             while remaining > 0 {
                 let to_read = std::cmp::min(remaining, self.max_chunk_size as u64);
                 let aligned_size = self.metadata_dma_file.align_up(to_read) as usize;
-                
-                let chunk = self.metadata_dma_file.read_at_aligned(offset, aligned_size).await?;
+
+                let chunk = self
+                    .metadata_dma_file
+                    .read_at_aligned(offset, aligned_size)
+                    .await?;
                 let actual_read = std::cmp::min(chunk.len(), to_read as usize);
-                
+
                 temp_metadata_file.write_at(chunk.into(), write_pos).await?;
-                
+
                 offset += actual_read as u64;
                 write_pos += actual_read as u64;
                 remaining -= actual_read as u64;
             }
-            
+
             temp_metadata_file.fdatasync().await?;
             temp_metadata_file.close().await?;
         }
 
         // Trim and prepend event batch file
         {
-            let event_batch_remaining_size = self.file_len_event_batch.saturating_sub(bytes_to_trim_event_batch);
+            let event_batch_remaining_size = self
+                .file_len_event_batch
+                .saturating_sub(bytes_to_trim_event_batch);
             let temp_event_batch_file = DmaFile::create(&temp_path_event_batch).await?;
-            
+
             let mut write_pos = 0u64;
 
             // First, write the prepended event batches
             if total_prepend_event_batch_size > 0 {
-                let mut event_buf = temp_event_batch_file.alloc_dma_buffer(total_prepend_event_batch_size);
+                let mut event_buf =
+                    temp_event_batch_file.alloc_dma_buffer(total_prepend_event_batch_size);
                 let mut event_offset = 0;
                 for item in event_batches.iter() {
                     let len = item.compressed_event_batch_item.len();
-                    event_buf.as_bytes_mut()[event_offset..event_offset+len]
+                    event_buf.as_bytes_mut()[event_offset..event_offset + len]
                         .copy_from_slice(&item.compressed_event_batch_item);
                     event_offset += len;
                 }
@@ -262,40 +302,57 @@ impl WriteOperationsWithDmaFile {
             // Then, copy the trimmed original data
             let mut offset = bytes_to_trim_event_batch;
             let mut remaining = event_batch_remaining_size;
-            
+
             while remaining > 0 {
                 let to_read = std::cmp::min(remaining, self.max_chunk_size as u64);
                 let aligned_size = self.event_batches_dma_file.align_up(to_read) as usize;
-                
-                let chunk = self.event_batches_dma_file.read_at_aligned(offset, aligned_size).await?;
+
+                let chunk = self
+                    .event_batches_dma_file
+                    .read_at_aligned(offset, aligned_size)
+                    .await?;
                 let actual_read = std::cmp::min(chunk.len(), to_read as usize);
-                
-                temp_event_batch_file.write_at(chunk.into(), write_pos).await?;
-                
+
+                temp_event_batch_file
+                    .write_at(chunk.into(), write_pos)
+                    .await?;
+
                 offset += actual_read as u64;
                 write_pos += actual_read as u64;
                 remaining -= actual_read as u64;
             }
-            
+
             temp_event_batch_file.fdatasync().await?;
             temp_event_batch_file.close().await?;
         }
 
         // Commit by renaming temp files over originals
-        std::fs::rename(&temp_path_metadata, &metadata_file_path)
-            .map_err(|e| WriteError::FileRenameFailure { from: temp_path_metadata, to: metadata_file_path.to_string_lossy().to_string(), error: e })?;
-        std::fs::rename(&temp_path_event_batch, &event_batch_file_path)
-            .map_err(|e| WriteError::FileRenameFailure { from: temp_path_event_batch, to: event_batch_file_path.to_string_lossy().to_string(), error: e })?;
+        std::fs::rename(&temp_path_metadata, &metadata_file_path).map_err(|e| {
+            WriteError::FileRenameFailure {
+                from: temp_path_metadata,
+                to: metadata_file_path.to_string_lossy().to_string(),
+                error: e,
+            }
+        })?;
+        std::fs::rename(&temp_path_event_batch, &event_batch_file_path).map_err(|e| {
+            WriteError::FileRenameFailure {
+                from: temp_path_event_batch,
+                to: event_batch_file_path.to_string_lossy().to_string(),
+                error: e,
+            }
+        })?;
 
         // Reopen files and update state
         let new_metadata_file = DmaFile::open(&metadata_file_path).await?;
         let new_event_batch_file = DmaFile::open(&event_batch_file_path).await?;
 
         // Update cached file lengths (subtract trimmed, add prepended)
-        self.file_len_metadata = self.file_len_metadata
+        self.file_len_metadata = self
+            .file_len_metadata
             .saturating_sub(bytes_to_trim_metadata)
             .saturating_add(total_prepend_metadata_size as u64);
-        self.file_len_event_batch = self.file_len_event_batch
+        self.file_len_event_batch = self
+            .file_len_event_batch
             .saturating_sub(bytes_to_trim_event_batch)
             .saturating_add(total_prepend_event_batch_size as u64);
 
@@ -309,32 +366,38 @@ impl WriteOperationsWithDmaFile {
 
 #[allow(async_fn_in_trait)]
 pub trait WriteOperations {
-    
     // In case of failure during sync, we need to roll back the in-memory state
     async fn sync_with_rollback(&mut self) -> Result<(), WriteError>;
 
     /// We require the ownership of the events to be transferred, as they will be stored in the in-memory cache
     /// The events are also mutable as we need to filter out events for client idempotency requirements
-    fn queue_events_in_memory(&mut self, events: Vec<EventItem>, write_options: &WriteOptions) -> Result<AppendResult, WriteError>;
+    fn queue_events_in_memory(
+        &mut self,
+        events: Vec<EventItem>,
+        write_options: &WriteOptions,
+    ) -> Result<AppendResult, WriteError>;
 
-    async fn trim_end(&mut self, new_metadata_len: u64, new_event_batch_len: u64) -> Result<(), WriteError>;
+    async fn trim_end(
+        &mut self,
+        new_metadata_len: u64,
+        new_event_batch_len: u64,
+    ) -> Result<(), WriteError>;
 
     async fn trim_start(
-        &mut self, 
-        bytes_to_trim_metadata: u64, 
+        &mut self,
+        bytes_to_trim_metadata: u64,
         bytes_to_trim_event_batch: u64,
     ) -> Result<(), WriteError>;
 
     async fn prepend_batches(
-        &mut self, 
+        &mut self,
         event_batches: &Vec<BatchMetadataItemPair>,
     ) -> Result<(), WriteError>;
 
-    fn maybe_read_cached_events(&self, filters: &ReadFilters) -> Result<CacheableReadResult, WriteError>;
-    
-    fn file_len_metadata(&self) -> u64;
-    
-    fn file_len_event_batch(&self) -> u64;
+    fn maybe_read_cached_events(
+        &self,
+        filters: &ReadFilters,
+    ) -> Result<CacheableReadResult, WriteError>;
 }
 
 /// Allows appending new events for an aggregate. Note this doesn't handle fdatasync.
@@ -342,20 +405,20 @@ pub trait WriteOperations {
 /// If cached read fails, you should fall back to the AggregateReadFileOperations struct
 /// This struct never reads from disk, only appends. So it requires cache data on initialization.
 impl WriteOperations for WriteOperationsWithDmaFile {
-    
     // In case of failure during sync, we need to roll back the in-memory state
     async fn sync_with_rollback(&mut self) -> Result<(), WriteError> {
         match self.sync().await {
             Ok(_) => Ok(()),
             Err(e) => {
-
                 //Pop off items from append_event_batch_queue, inspect metadata to rollback
                 while let Some(item) = self.append_event_batch_queue.pop() {
-                    
                     self.client_event_indexes
                         .entry(item.event_batch_item.client_id)
                         .and_modify(|e| {
-                            *e = item.event_batch_metadata.min_client_event_index.saturating_sub(1);
+                            *e = item
+                                .event_batch_metadata
+                                .min_client_event_index
+                                .saturating_sub(1);
                         });
                     self.next_event_index = item.event_batch_metadata.min_event_index;
                     self.next_event_batch_index = item.event_batch_metadata.event_batch_index;
@@ -374,8 +437,11 @@ impl WriteOperations for WriteOperationsWithDmaFile {
 
     /// We require the ownership of the events to be transferred, as they will be stored in the in-memory cache
     /// The events are also mutable as we need to filter out events for client idempotency requirements
-    fn queue_events_in_memory(&mut self, mut events: Vec<EventItem>, write_options: &WriteOptions) -> Result<AppendResult, WriteError> {
-
+    fn queue_events_in_memory(
+        &mut self,
+        mut events: Vec<EventItem>,
+        write_options: &WriteOptions,
+    ) -> Result<AppendResult, WriteError> {
         // Make sure we have at least one event to write
         if events.is_empty() {
             return Err(WriteError::EmptyEventsList());
@@ -383,8 +449,14 @@ impl WriteOperations for WriteOperationsWithDmaFile {
 
         // If checking idempotency, check if client is providing the same events again using client event index, if so, error
         if write_options.enforce_client_idempotency {
-            if let Some(&last_client_event_index) = self.client_event_indexes.get(&write_options.client_id) {
-                let attempted_client_event_index = events.iter().map(|e| e.client_event_index).min().unwrap_or(0);
+            if let Some(&last_client_event_index) =
+                self.client_event_indexes.get(&write_options.client_id)
+            {
+                let attempted_client_event_index = events
+                    .iter()
+                    .map(|e| e.client_event_index)
+                    .min()
+                    .unwrap_or(0);
                 if attempted_client_event_index <= last_client_event_index {
                     return Err(WriteError::ClientIdempotencyViolation {
                         client_id: write_options.client_id,
@@ -430,15 +502,10 @@ impl WriteOperations for WriteOperationsWithDmaFile {
         // Determine event types data (bloom filter or direct array)
         let (event_types, use_bloom) = extract_unique_event_types(&event_batch_item.events);
         let event_types_data = if use_bloom {
-            let bloom_bytes =
-                self.create_bloom_filter_bytes(&event_batch_item.events);
-            EventTypesData::Bloom(
-                bloom_bytes,
-            )
+            let bloom_bytes = self.create_bloom_filter_bytes(&event_batch_item.events);
+            EventTypesData::Bloom(bloom_bytes)
         } else {
-            EventTypesData::Direct(
-                event_types,
-            )
+            EventTypesData::Direct(event_types)
         };
 
         // Create and serialize metadata
@@ -456,12 +523,13 @@ impl WriteOperations for WriteOperationsWithDmaFile {
         let mut metadata_bytes = [0u8; METADATA_BATCH_SIZE_BYTES];
         to_wire_format_fixed(&event_batch_metadata, &mut metadata_bytes)?;
 
-        self.append_event_batch_queue.push(AppendEventBatchQueueItem {
-            compressed_event_batch_item,
-            event_batch_item,
-            metadata_bytes,
-            event_batch_metadata,
-        });
+        self.append_event_batch_queue
+            .push(AppendEventBatchQueueItem {
+                compressed_event_batch_item,
+                event_batch_item,
+                metadata_bytes,
+                event_batch_metadata,
+            });
 
         // Update next event index, next event batch index, client event indexes
         self.next_event_index = next_event_index;
@@ -474,7 +542,11 @@ impl WriteOperations for WriteOperationsWithDmaFile {
         })
     }
 
-    async fn trim_end(&mut self, new_metadata_len: u64, new_event_batch_len: u64) -> Result<(), WriteError> {
+    async fn trim_end(
+        &mut self,
+        new_metadata_len: u64,
+        new_event_batch_len: u64,
+    ) -> Result<(), WriteError> {
         let mut truncated = false;
 
         // Truncate the metadata file
@@ -483,51 +555,53 @@ impl WriteOperations for WriteOperationsWithDmaFile {
             self.file_len_metadata = new_metadata_len;
             truncated = true;
         }
-        
+
         // Truncate the event batches file
         if self.file_len_event_batch > new_event_batch_len {
-            self.event_batches_dma_file.truncate(new_event_batch_len).await?;
+            self.event_batches_dma_file
+                .truncate(new_event_batch_len)
+                .await?;
             self.file_len_event_batch = new_event_batch_len;
             truncated = true;
         }
-        
+
         if truncated {
             // Clear the data cache as it's now invalid
             self.data_cache.clear();
-            self.total_cache_size_bytes = 0;  // Reset cache size tracking
+            self.total_cache_size_bytes = 0; // Reset cache size tracking
         }
-        
+
         Ok(())
     }
 
     async fn trim_start(
-        &mut self, 
-        bytes_to_trim_metadata: u64, 
+        &mut self,
+        bytes_to_trim_metadata: u64,
         bytes_to_trim_event_batch: u64,
     ) -> Result<(), WriteError> {
         if bytes_to_trim_metadata == 0 || bytes_to_trim_event_batch == 0 {
             return Ok(());
         }
-        
-        self.trim_and_prepend(vec![], bytes_to_trim_metadata, bytes_to_trim_event_batch).await
+
+        self.trim_and_prepend(vec![], bytes_to_trim_metadata, bytes_to_trim_event_batch)
+            .await
     }
 
     async fn prepend_batches(
-        &mut self, 
+        &mut self,
         event_batches: &Vec<BatchMetadataItemPair>,
     ) -> Result<(), WriteError> {
-
         if event_batches.is_empty() {
             return Err(WriteError::EmptyEventsList());
         }
 
         // Validate contiguous event_batch_indexes
         for i in 1..event_batches.len() {
-            let prev_index = event_batches[i-1].event_batch_metadata.event_batch_index;
+            let prev_index = event_batches[i - 1].event_batch_metadata.event_batch_index;
             let curr_index = event_batches[i].event_batch_metadata.event_batch_index;
-            
+
             if curr_index != prev_index + 1 {
-                return Err(WriteError::PrependNonContiguousBatches { 
+                return Err(WriteError::PrependNonContiguousBatches {
                     from_event_batch_index: prev_index,
                     to_event_batch_index: curr_index,
                 });
@@ -535,9 +609,13 @@ impl WriteOperations for WriteOperationsWithDmaFile {
         }
 
         // Validate that last event_batch_index is exactly one less than minimum_available_event_batch_index
-        let last_batch_index = event_batches.last().unwrap().event_batch_metadata.event_batch_index;
+        let last_batch_index = event_batches
+            .last()
+            .unwrap()
+            .event_batch_metadata
+            .event_batch_index;
         if last_batch_index + 1 != self.minimum_available_event_batch_index {
-            return Err(WriteError::PrependCreatesEventBatchIndexGap { 
+            return Err(WriteError::PrependCreatesEventBatchIndexGap {
                 provided_last_batch_index: last_batch_index,
                 current_first_event_batch_index: self.minimum_available_event_batch_index,
             });
@@ -545,13 +623,13 @@ impl WriteOperations for WriteOperationsWithDmaFile {
 
         // Convert BatchMetadataItemPair to AppendEventBatchQueueItem
         let mut event_batches_queued = Vec::with_capacity(event_batches.len());
-        
+
         for pair in event_batches.iter() {
             let metadata = &pair.event_batch_metadata;
-            
+
             // Serialize and compress the event batch item
             let (_, compressed_event_batch_item) = to_wire_format_variable(
-                &pair.event_batch_item, 
+                &pair.event_batch_item,
                 CompressionType::from_tuple(metadata.compression_type, None),
             )?;
 
@@ -569,17 +647,21 @@ impl WriteOperations for WriteOperationsWithDmaFile {
         self.trim_and_prepend(event_batches_queued, 0, 0).await?;
 
         // Update minimum_available_event_batch_index to the first prepended batch
-        self.minimum_available_event_batch_index = event_batches[0].event_batch_metadata.event_batch_index;
+        self.minimum_available_event_batch_index =
+            event_batches[0].event_batch_metadata.event_batch_index;
 
         Ok(())
     }
 
-    fn maybe_read_cached_events(&self, filters: &ReadFilters) -> Result<CacheableReadResult, WriteError> {
+    fn maybe_read_cached_events(
+        &self,
+        filters: &ReadFilters,
+    ) -> Result<CacheableReadResult, WriteError> {
         // Check if cache is empty
         if self.data_cache.is_empty() {
-            return Err(WriteError::CacheMiss { 
-                missing_from_event_batch_index: filters.from_event_batch_index, 
-                missing_to_event_batch_index: filters.to_event_batch_index 
+            return Err(WriteError::CacheMiss {
+                missing_from_event_batch_index: filters.from_event_batch_index,
+                missing_to_event_batch_index: filters.to_event_batch_index,
             });
         }
 
@@ -588,9 +670,9 @@ impl WriteOperations for WriteOperationsWithDmaFile {
 
         // Check if requested range is within cache
         if filters.from_event_batch_index < cache_min_batch_index {
-            return Err(WriteError::CacheMiss { 
-                missing_from_event_batch_index: filters.from_event_batch_index, 
-                missing_to_event_batch_index: Some(cache_min_batch_index.saturating_sub(1))
+            return Err(WriteError::CacheMiss {
+                missing_from_event_batch_index: filters.from_event_batch_index,
+                missing_to_event_batch_index: Some(cache_min_batch_index.saturating_sub(1)),
             });
         }
 
@@ -601,11 +683,12 @@ impl WriteOperations for WriteOperationsWithDmaFile {
 
         for pair in self.data_cache.iter() {
             let metadata = &pair.event_batch_metadata;
-            
+
             // Check if we've exceeded the to_event_batch_index
-            if filters.to_event_batch_index.map_or(false, |to_index| {
-                metadata.event_batch_index > to_index
-            }) {
+            if filters
+                .to_event_batch_index
+                .map_or(false, |to_index| metadata.event_batch_index > to_index)
+            {
                 break;
             }
 
@@ -640,14 +723,6 @@ impl WriteOperations for WriteOperationsWithDmaFile {
             filtered_event_batches,
             next_event_batch_index,
         })
-    }
-    
-    fn file_len_metadata(&self) -> u64 {
-        self.file_len_metadata
-    }
-    
-    fn file_len_event_batch(&self) -> u64 {
-        self.file_len_event_batch
     }
 }
 

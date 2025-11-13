@@ -4,7 +4,7 @@ use eventplanedb_structures::{
     event_batch_item::EventBatchItem, event_batch_metadata::EventBatchMetadata,
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MetadataWithAbsolutePosition {
     pub event_batch_metadata: EventBatchMetadata,
     pub event_batch_absolute_position: u64,
