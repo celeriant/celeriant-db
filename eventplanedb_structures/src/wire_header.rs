@@ -82,7 +82,7 @@ impl WireHeader {
         let message_type = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
         let compressed_length = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
         let uncompressed_length = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
-        let compression_type = CompressionType::from_tuple(header[17], None);
+        let compression_type = CompressionType::from_tuple(header[16], None);
 
         Ok(Self {
             version,

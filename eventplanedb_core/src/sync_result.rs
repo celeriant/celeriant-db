@@ -1,3 +1,3 @@
-use crate::write_operations::write_error::WriteError;
+use eventplanedb_structures::eventplanedb_error::EventPlaneDBError;
 
-pub type SyncResult = Result<(), WriteError>;
+pub type SyncResult = Result<(), EventPlaneDBError>;

@@ -44,7 +44,7 @@ fn build_combined_request_bytes(
     // let (type_id, _) = eventplanedb_structures::compression_type::CompressionType::Snappy.to_tuple();
 
     let protocol_version = 2u32;
-    let header_size = 9;
+    let header_size = 17;
     let request_type = RequestType::Write;
 
     // COMPRESSION
@@ -57,10 +57,11 @@ fn build_combined_request_bytes(
 
     // NO COMPRESSION
     let mut combined = Vec::with_capacity(header_size + encoded.len());
-    combined.extend_from_slice(&protocol_version.to_be_bytes());
-    combined.extend_from_slice(&(request_type as u32).to_be_bytes());
-    combined.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
-    combined.push(0u8);
+    combined.extend_from_slice(&protocol_version.to_le_bytes());
+    combined.extend_from_slice(&(request_type as u32).to_le_bytes());
+    combined.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+    combined.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+    combined.extend_from_slice(&(0 as u8).to_le_bytes());
     combined.extend_from_slice(&encoded);
 
     
@@ -83,7 +84,7 @@ fn run_client_connection(
     let deadline = Instant::now() + duration;
     let mut count: u64 = 0;
 
-    let mut header = [0u8; 13];
+    let mut header = [0u8; 17];
     let mut scratch: Vec<u8> = vec![0u8; 4096]; // reusable buffer for response payload
     // let mut agg_idx: u128 = 0;
 
@@ -109,7 +110,7 @@ fn run_client_connection(
         }
 
         // length is in bytes 4..8
-        let len = u32::from_be_bytes(header[8..12].try_into().unwrap()) as usize;
+        let len = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
         // let len = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
 
         if len > scratch.len() {
@@ -138,7 +139,7 @@ fn main() {
     // Args: [server_addr] [num_connections] [num_aggregates] [sync_delay_us] [duration_secs]
     let args: Vec<String> = env::args().collect();
 
-    let server_addr = parse_arg(&args, 1, String::from("0.0.0.0:10001"));
+    let server_addr = parse_arg(&args, 1, String::from("0.0.0.0:10000"));
     let num_connections = parse_arg(&args, 2, 1usize);
     let num_aggregates = parse_arg(&args, 3, 1u128);
     let sync_delay_us = parse_arg(&args, 4, 100u64);

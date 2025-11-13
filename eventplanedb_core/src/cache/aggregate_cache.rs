@@ -47,4 +47,9 @@ impl AggregateCache {
         cache.put(aggregate_key.clone(), Rc::clone(&resources));
         resources
     }
+    
+    pub fn pop(&self, aggregate_key: &AggregateKey) {
+        let mut cache = self.aggregates_cache.borrow_mut();
+        cache.pop(aggregate_key);
+    }
 }

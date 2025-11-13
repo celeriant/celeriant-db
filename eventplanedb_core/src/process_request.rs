@@ -1,6 +1,6 @@
-use std::{path::{Path}, rc::Rc, time::Duration, num::NonZeroUsize};
+use std::{path::{Path}, time::Duration, num::NonZeroUsize};
 
-use glommio::{spawn_local, sync::{RwLock}, timer::sleep};
+use glommio::spawn_local;
 use log::{error};
 use eventplanedb_structures::{aggregate_info::AggregateInfo, aggregate_key::AggregateKey, batch_metadata_item_pair::BatchMetadataItemPair, directory_filters::DirectoryFilters, eventplanedb_error::EventPlaneDBError, organisation::Organisation, read_all_result::ReadAllResult, read_result::ReadResult, request::{DeleteRequest, ListAggregatesRequest, ListOrganisationsRequest, ReadAllRequest, ReadRequest, Request, TrimStartRequest, WriteBatchesRequest, WriteRequest}, response::{DeleteResponse, ExistsResponse, ListAggregatesResponse, ListOrganisationsResponse, ReadAllResponse, ReadResponse, Response, TrimStartResponse, WriteBatchesResponse, WriteResponse}};
 
@@ -394,33 +394,30 @@ impl ProcessRequest {
     ) -> Result<eventplanedb_structures::append_result::AppendResult, EventPlaneDBError> {
         let aggregate_key = AggregateKey::new(request.org_id, request.aggregate_type_id, request.aggregate_id);
         let aggregate_resources = self.aggregate_cache.get(&aggregate_key);
-        let mut writer = aggregate_resources.get_writer_mut(request.allow_create).await?;
-        let r_writer = writer.as_mut().unwrap();
-
-        let server_timestamp_millis = Self::get_server_timestamp_millis();
-
+        
         let append_result = {
+            let mut writer = aggregate_resources.get_writer_mut(request.allow_create).await?;
+            let r_writer = writer.as_mut().unwrap();
+
             let append_options = WriteOptions {
                 client_id: request.client_id,
                 user_id: request.user_id,
                 expected_event_batch_index: request.expected_event_batch_index,
                 enforce_client_idempotency: request.enforce_client_idempotency,
-                server_timestamp_millis,
+                server_timestamp_millis: Self::get_server_timestamp_millis(),
                 compression_type: request.compression_type,
             };
             r_writer.queue_events_in_memory(request.events, &append_options)?
         };
 
         if let Some(delay_us) = request.durable_write_with_delay_us {
-            let wal_sync_event = self.get_or_create_wal_sync_event(&aggregate_key).await;
-            sync_with_delay(&writer, &wal_sync_event, Duration::from_micros(delay_us)).await?;
+            aggregate_resources.sync_with_delay(Duration::from_micros(delay_us)).await?;
         } else {
             let aggregate_resources = aggregate_resources.clone();
-            let wal_sync_event = self.get_or_create_wal_sync_event(&aggregate_key).await;
             let delay_us = 200;
 
             spawn_local(async move {
-                let sync_result = sync_with_delay(&writer_clone, &wal_sync_event, Duration::from_micros(delay_us)).await;
+                let sync_result = aggregate_resources.sync_with_delay(Duration::from_micros(delay_us)).await;
                 if let Err(e) = sync_result {
                     error!("Background sync failed: {:?}", e);
                 }
@@ -510,14 +507,7 @@ impl ProcessRequest {
         request: DeleteRequest,
     ) -> Result<(), EventPlaneDBError> {
         let aggregate_key = AggregateKey::new(request.org_id, request.aggregate_type_id, request.aggregate_id);
-
-        // Remove from caches
-        {
-            let mut cache = self.aggregates.write().await.unwrap();
-            let mut core_cache = self.core_cache.write().await.unwrap();
-            cache.pop(&aggregate_key);
-            core_cache.pop(&aggregate_key);
-        }
+        self.aggregate_cache.pop(&aggregate_key);
 
         // Delete files
         let data_root_folder = Path::new(&self.data_root_folder).to_path_buf();
@@ -530,60 +520,6 @@ impl ProcessRequest {
             .map_err(|_e| EventPlaneDBError::io_error())?;
 
         Ok(())
-    }
-}
-
-async fn sync_with_delay(
-    write_operations: &Rc<RwLock<WriteOperations>>, 
-    wal_sync_event: &RwLock<Option<Rc<LocalEvent<SyncResult>>>>, 
-    wal_sync_delay: Duration
-) -> SyncResult {
-    // Try to become the sync coordinator
-    match wal_sync_event.try_write() {
-        Ok(mut maybe_event) => {
-            // We won! Check if sync is already in progress
-            if let Some(event) = maybe_event.as_ref() {
-                // Another task beat us between our check and lock acquisition
-                let event = event.clone();
-                drop(maybe_event); // Release lock before awaiting
-                return event.listen().await;
-            }
-            
-            // We're the coordinator - create the event
-            let event = Rc::new(LocalEvent::new());
-            *maybe_event = Some(event.clone());
-            drop(maybe_event); // Release lock while sleeping
-            
-            // Sleep for the delay period
-            sleep(wal_sync_delay).await;
-            
-            // Clear the event before sync (need write lock again)
-            wal_sync_event.write().await.unwrap().take();
-            
-            // Do the actual sync
-            let sync_result = {
-                let mut write_operations = write_operations.write().await.unwrap();
-                write_operations.sync_with_rollback().await
-                    .map_err(|_e| EventPlaneDBError::write_error())
-            };
-            
-            // Notify all waiters
-            event.notify(sync_result.clone());
-            
-            sync_result
-        }
-        
-        Err(_) => {
-            // Another task is coordinating the sync - just wait for it
-            let event = {
-                let maybe_event = wal_sync_event.read().await.unwrap();
-                maybe_event.as_ref()
-                    .expect("If try_write failed, event should exist")
-                    .clone()
-            };
-            
-            event.listen().await
-        }
     }
 }
 

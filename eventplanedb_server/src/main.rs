@@ -1,8 +1,8 @@
 use clap::Parser;
 use std::{cell::{Cell, RefCell}, os::fd::{FromRawFd, IntoRawFd}, rc::Rc, time::Duration};
 
-use eventplanedb_core::{files::{read_operations::AggregateReadConfig, write_operations::AggregateWriteConfig}, process_request::ProcessRequest};
-use eventplanedb_structures::{eventplanedb_error::EventPlaneDBError, request::{Request, read_request}, response::{ProtocolErrorResponse, Response, write_response}, wire_format::WireError};
+use eventplanedb_core::{process_request::ProcessRequest, read_operations::read_structures::AggregateReadConfig, write_operations::write_structures::AggregateWriteConfig};
+use eventplanedb_structures::{eventplanedb_error::EventPlaneDBError, request::{Request, read_request}, response::{ProtocolErrorResponse, Response, write_response}, wire_error::WireError};
 use glommio::{CpuSet, LocalExecutorPoolBuilder, PoolPlacement, channels::channel_mesh::{Full, MeshBuilder, Senders}, enclose, net::TcpListener, spawn_local};
 use futures_lite::AsyncWriteExt;
 use log::{debug, error, info};
@@ -91,11 +91,11 @@ fn main() {
         // Our stateful request processor, pinned per shard
         // Each shard has its own instance of the engine
         let process_request = Rc::new(ProcessRequest::new(
-            data_root.clone(),
+            data_root.to_string_lossy().to_string(),
             aggregate_read_config.clone(),
             aggregate_write_config.clone(),
             max_open_aggregates,
-            aggregate_write_config.cache_trim_factor
+            Some(max_message_size as usize),
         ));
 
         // Shard 0 sets up signal handler with polling loop
@@ -306,7 +306,7 @@ async fn process_tcp_stream(
 async fn write_to_tcp_stream(response: Response, tcp_stream: &mut glommio::net::TcpStream<glommio::net::Preallocated>, _version: u32) {
     debug!("Writing response to client: {:?}", response.response_type());
     if let Err(e) = write_response(tcp_stream, &response, eventplanedb_structures::compression_type::CompressionType::None).await {
-        error!("Failed to write response to TCP stream: {e}");
+        error!("Failed to write response to TCP stream");
         // Connection will be dropped when tcp_stream goes out of scope
         //TODO: We don't really expect a failure to serialize here, but its an edge case to handle
     }
@@ -322,25 +322,23 @@ async fn read_from_tcp_stream(
             debug!("Shard {shard_id} successfully parsed request with version {version}");
             Some((request, version))
         }
-        Err(WireError::Io(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+        Err(WireError::NetworkError(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
             debug!("Client on shard {shard_id} disconnected");
             None
         }
-        Err(WireError::InvalidFormatWithVersion(_version)) => {
+        Err(WireError::UnsupportedProtocol(_version)) => {
             let error_response = Response::ProtocolError(ProtocolErrorResponse {
-                correlation_id: None,
-                error: EventPlaneDBError::invalid_request(),
             });
             
-            if let Err(e) = write_response(tcp_stream, &error_response, eventplanedb_structures::compression_type::CompressionType::None).await {
-                error!("Shard {shard_id} failed to send error response: {e}");
+            if let Err(_e) = write_response(tcp_stream, &error_response, eventplanedb_structures::compression_type::CompressionType::None).await {
+                error!("Shard {shard_id} failed to send error response");
             }
             
             None
         }
-        Err(e) => {
+        Err(_e) => {
             // Fallback to v1 for unknown errors
-            error!("Shard {shard_id} failed to read request: {e}");
+            error!("Shard {shard_id} failed to read request");
             None
         }
     }
