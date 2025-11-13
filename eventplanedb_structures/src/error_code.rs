@@ -18,6 +18,9 @@ pub enum ErrorCode {
     EmptyEventsList,
     NoEventsToAppend,
     WriteError,
+    CacheMiss,
+    PrependCreatesEventBatchIndexGap,
+    PrependNonContiguousBatches,
     
     // Protocol/Transport errors
     MessageTooLarge,

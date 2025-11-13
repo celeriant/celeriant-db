@@ -26,8 +26,8 @@ use crate::{
 };
 
 pub struct WriteOperationsWithDmaFile {
-    metadata_dma_file: DmaFile,
-    event_batches_dma_file: DmaFile,
+    pub metadata_dma_file: DmaFile,
+    pub event_batches_dma_file: DmaFile,
     data_cache: VecDeque<BatchMetadataItemPair>,
     total_cache_size_bytes: usize,
     pub minimum_available_event_batch_index: u64,
@@ -444,7 +444,7 @@ impl WriteOperations for WriteOperationsWithDmaFile {
     ) -> Result<AppendResult, WriteError> {
         // Make sure we have at least one event to write
         if events.is_empty() {
-            return Err(WriteError::EmptyEventsList());
+            return Err(WriteError::EmptyEventsList);
         }
 
         // If checking idempotency, check if client is providing the same events again using client event index, if so, error
@@ -592,7 +592,7 @@ impl WriteOperations for WriteOperationsWithDmaFile {
         event_batches: &Vec<BatchMetadataItemPair>,
     ) -> Result<(), WriteError> {
         if event_batches.is_empty() {
-            return Err(WriteError::EmptyEventsList());
+            return Err(WriteError::EmptyEventsList);
         }
 
         // Validate contiguous event_batch_indexes

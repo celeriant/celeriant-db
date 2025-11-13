@@ -50,6 +50,18 @@ pub struct EventPlaneDBError {
     
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protocol_version: Option<u32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_event_batch_index: Option<u64>,
+    
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_event_batch_index: Option<u64>,
+    
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provided_last_batch_index: Option<u64>,
+    
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_first_event_batch_index: Option<u64>,
 }
 
 impl EventPlaneDBError {
@@ -207,6 +219,33 @@ impl EventPlaneDBError {
             ..Default::default()
         }
     }
+
+    pub fn cache_miss(from: u64, to: Option<u64>) -> Self {
+        Self {
+            code: ErrorCode::CacheMiss,
+            from_event_batch_index: Some(from),
+            to_event_batch_index: to,
+            ..Default::default()
+        }
+    }
+    
+    pub fn prepend_creates_gap(provided_last: u64, current_first: u64) -> Self {
+        Self {
+            code: ErrorCode::PrependCreatesEventBatchIndexGap,
+            provided_last_batch_index: Some(provided_last),
+            current_first_event_batch_index: Some(current_first),
+            ..Default::default()
+        }
+    }
+    
+    pub fn prepend_non_contiguous(from: u64, to: u64) -> Self {
+        Self {
+            code: ErrorCode::PrependNonContiguousBatches,
+            from_event_batch_index: Some(from),
+            to_event_batch_index: Some(to),
+            ..Default::default()
+        }
+    }
 }
 
 impl Default for EventPlaneDBError {
@@ -227,6 +266,10 @@ impl Default for EventPlaneDBError {
             event_batch_index: None,
             message_size: None,
             protocol_version: None,
+            from_event_batch_index: None,
+            to_event_batch_index: None,
+            provided_last_batch_index: None,
+            current_first_event_batch_index: None,
         }
     }
 }

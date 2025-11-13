@@ -15,7 +15,7 @@ pub enum WriteError {
         last_client_event_index: u64,
         attempted_client_event_index: u64,
     },
-    EmptyEventsList(),
+    EmptyEventsList,
     NoEventsToAppend {
         client_id: u128,
         existing_event_index: u64,
