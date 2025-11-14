@@ -120,6 +120,13 @@ impl EventPlaneDBError {
         }
     }
     
+    pub fn corrupt_metadata() -> Self {
+        Self {
+            code: ErrorCode::CorruptMetadata,
+            ..Default::default()
+        }
+    }
+    
     pub fn corrupt_event_batch(
         expected_crc: u32,
         actual_crc: u32,

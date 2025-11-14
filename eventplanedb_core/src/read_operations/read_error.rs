@@ -19,6 +19,9 @@ pub enum ReadError {
         minimum_available_event_batch_index: u64,
         requested_event_batch_index: u64,
     },
+    CorruptMetadata {
+        file_pos_metadata: u64,
+    },
     CorruptEventBatch {
         expected_crc: u32,
         actual_crc: u32,

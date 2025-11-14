@@ -11,6 +11,7 @@ pub enum ErrorCode {
     SerializationError,
     UnavailableBatchIndex,
     CorruptEventBatch,
+    CorruptMetadata,
     
     // Write errors
     OptimisticConcurrencyViolation,

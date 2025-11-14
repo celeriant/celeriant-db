@@ -17,6 +17,9 @@ impl From<ReadError> for EventPlaneDBError {
                 EventPlaneDBError::corrupt_event_batch(expected_crc, actual_crc, event_batch_index)
             }
             ReadError::CannotCreateFolders { path: _path, error: _error } => EventPlaneDBError::io_error(),
+            ReadError::CorruptMetadata { file_pos_metadata: _file_pos_metadata } => {
+                EventPlaneDBError::corrupt_metadata()
+            }
         }
     }
 }

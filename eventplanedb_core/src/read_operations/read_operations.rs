@@ -440,26 +440,12 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
         let rec_size = METADATA_BATCH_SIZE_BYTES as u64;
 
         // Trim metadata file if not aligned (corrupt partial record at end)
+        // This is a critical failure as we have already confirmed to client that we wrote this data
         if file_len_metadata % rec_size != 0 {
             let aligned_len = (file_len_metadata / rec_size) * rec_size;
-            self.metadata_dma_file.truncate(aligned_len).await?;
-            file_len_metadata = aligned_len;
-
-            // If we truncated everything, return initial state
-            if file_len_metadata == 0 {
-                let write_operations_data_requirements = WriteOperationsDataRequirements {
-                    file_len_event_batch,
-                    file_len_metadata,
-                    minimum_available_event_batch_index: 0,
-                    next_event_index: 1,
-                    next_event_batch_index: 1,
-                    client_event_indexes: HashMap::new(),
-                };
-                return Ok(WriteOperationsDataRequirementsAndCachedData {
-                    uncached_metadata_set: vec![],
-                    write_operations_data_requirements,
-                });
-            }
+            return Err(ReadError::CorruptMetadata {
+                file_pos_metadata: aligned_len,
+            });
         }
 
         // Snapshot cache (tail of file)
@@ -483,7 +469,6 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
         // - track last scanned metadata (for next_* if no cache)
         // - collect the last `return_count` items of the scanned prefix to return
         let mut client_event_indexes: HashMap<u128, u64> = HashMap::new();
-        let mut last_scanned: Option<EventBatchMetadata> = None;
 
         // Use a small ring buffer for the tail we want to return
         let mut ring: std::collections::VecDeque<MetadataWithAbsolutePosition> =
@@ -521,7 +506,7 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
                     // Keep the tail subset to return
                     if return_count > 0 {
                         ring.push_back(MetadataWithAbsolutePosition {
-                            event_batch_metadata: meta.clone(),
+                            event_batch_metadata: meta,
                             event_batch_absolute_position: 0,
                         });
                         if ring.len() > return_count {
@@ -529,7 +514,6 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
                         }
                     }
 
-                    last_scanned = Some(meta);
                     Ok(())
                 },
             )
@@ -558,37 +542,6 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
             minimum_available_event_batch_index.is_some(),
             "Should get min event batch index"
         );
-
-        // Merge cached client indexes
-        for c in cached_snapshot.iter() {
-            let meta = &c.event_batch_metadata;
-            client_event_indexes
-                .entry(meta.client_id)
-                .and_modify(|v| {
-                    if meta.max_client_event_index > *v {
-                        *v = meta.max_client_event_index;
-                    }
-                })
-                .or_insert(meta.max_client_event_index);
-        }
-
-        // Compute next_* from latest record (prefer cached tail if available)
-        let (next_event_index, next_event_batch_index) =
-            if let Some(last_cached) = cached_snapshot.last() {
-                let m = &last_cached.event_batch_metadata;
-                (
-                    m.max_event_index.saturating_add(1),
-                    m.event_batch_index.saturating_add(1),
-                )
-            } else if let Some(m) = last_scanned {
-                (
-                    m.max_event_index.saturating_add(1),
-                    m.event_batch_index.saturating_add(1),
-                )
-            } else {
-                // Shouldn't happen since file_len_metadata > 0, but be safe
-                (1, 1)
-            };
 
         // Materialize uncached metadata set and assign absolute positions using the first cached
         // item's absolute position as the base (or EOF if no cache).
@@ -619,7 +572,8 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
             None
         };
 
-        if let Some(last_meta) = last_metadata {
+        // First time reading (no cache) so check for corruption
+        if cached_snapshot.len() == 0 && let Some(last_meta) = last_metadata {
             // Read the last event batch
             let last_batch_pos = AbsoluteObjectPosition {
                 start_pos: last_meta.event_batch_absolute_position,
@@ -689,6 +643,19 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
                         if !uncached_metadata_set.is_empty() {
                             uncached_metadata_set.pop();
                         }
+
+                        //Rebuild the client_id to last client_event_index cache
+                        client_event_indexes.clear();
+                        for meta in &uncached_metadata_set {
+                            client_event_indexes
+                                .entry(meta.event_batch_metadata.client_id)
+                                .and_modify(|v| {
+                                    if meta.event_batch_metadata.max_client_event_index > *v {
+                                        *v = meta.event_batch_metadata.max_client_event_index;
+                                    }
+                                })
+                                .or_insert(meta.event_batch_metadata.max_client_event_index);
+                        }
                     } else {
                         // Both last and second-to-last are corrupt
                         return Err(ReadError::CorruptEventBatch {
@@ -713,6 +680,38 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
                 }
             }
         }
+
+        // Merge cached client indexes
+        for c in cached_snapshot.iter() {
+            let meta = &c.event_batch_metadata;
+            client_event_indexes
+                .entry(meta.client_id)
+                .and_modify(|v| {
+                    if meta.max_client_event_index > *v {
+                        *v = meta.max_client_event_index;
+                    }
+                })
+                .or_insert(meta.max_client_event_index);
+        }
+
+        // Compute next_* from latest record (prefer cached tail if available)
+        let (next_event_index, next_event_batch_index) =
+            if let Some(last_cached) = cached_snapshot.last() {
+                let m = &last_cached.event_batch_metadata;
+                (
+                    m.max_event_index.saturating_add(1),
+                    m.event_batch_index.saturating_add(1),
+                )
+            } else if let Some(last_uncached) = uncached_metadata_set.last() {
+                let m = &last_uncached.event_batch_metadata;
+                (
+                    m.max_event_index.saturating_add(1),
+                    m.event_batch_index.saturating_add(1),
+                )
+            } else {
+                // Shouldn't happen since file_len_metadata > 0, but be safe
+                (1, 1)
+            };
 
         let write_operations_data_requirements = WriteOperationsDataRequirements {
             file_len_event_batch,
