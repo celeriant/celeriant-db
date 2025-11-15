@@ -5,7 +5,7 @@ use crate::read_operations::{read_error::ReadError, read_structures::MetadataWit
 
 pub fn apply_event_filters(event_batch: &mut EventBatchItem, read_filters: &ReadFilters) {
     // Final event type filtering (bloom filter might have false positives)
-    if let Some(event_types) = read_filters.include_event_types.as_deref() {
+    if let Some(event_types) = read_filters.include_event_types.as_deref() && !event_types.is_empty() {
         event_batch
             .events
             .retain(|event| event_types.contains(&event.event_type_major));
@@ -56,8 +56,8 @@ pub fn is_include_batch(metadata: &EventBatchMetadata, filters: &ReadFilters) ->
         return false;
     }
 
-    if filters.to_event_batch_index.map_or(false, |to_server_id| {
-        metadata.event_batch_index > to_server_id
+    if filters.to_event_batch_index.map_or(false, |to_event_batch_index| {
+        metadata.event_batch_index > to_event_batch_index
     }) {
         return false;
     }
@@ -152,18 +152,11 @@ pub fn is_include_batch(metadata: &EventBatchMetadata, filters: &ReadFilters) ->
         return false;
     }
 
-    if filters
-        .include_event_types
-        .as_ref()
-        .map_or(false, |include_event_types| {
-            //Is there at least one of the include_event_types in the event batch? If not, return true to skip
-            let at_least_one_match =
-                check_event_types_match(&metadata.event_types_data, &include_event_types);
-            !at_least_one_match
-        })
-    {
-        return false;
-    }
+    if let Some(include_event_types) = &filters.include_event_types {
+        if !include_event_types.is_empty() && !check_event_types_match(&metadata.event_types_data, &include_event_types) {
+            return false;
+        }
+    } 
 
     true
 }
@@ -197,7 +190,6 @@ fn bloom_filter_from_bytes(bloom_bytes: &[u64; BLOOM_BYTES / 8]) -> BloomFilter 
         .seed(&BLOOM_HASH_SEED)
         .hashes(BLOOM_HASH_COUNT)
 }
-
 
 pub fn trim_end_if_exceeds_max_bytes(
     metadata_for_reading: &mut Vec<&MetadataWithAbsolutePosition>,
@@ -236,7 +228,7 @@ pub fn trim_end_if_exceeds_max_bytes(
 
     // If we need to trim
     if let Some(index) = cut_index {
-        // Get the server_id of the first batch we're trimming
+        // Get the event_batch_index of the first batch we're trimming
         let next_event_batch_index = if index < metadata_for_reading.len() {
             Some(
                 metadata_for_reading[index]
@@ -264,7 +256,6 @@ pub fn trim_end_if_exceeds_max_bytes(
         Ok(None)
     }
 }
-
 
 pub fn apply_max_bytes_pagination(
     metadata_for_reading: &mut Vec<&MetadataWithAbsolutePosition>,
@@ -314,5 +305,465 @@ pub fn apply_max_bytes_pagination(
         Ok(next_event_batch_index)
     } else {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eventplanedb_structures::{
+        event_batch_item::EventBatchItem,
+        event_item::EventItem,
+        read_filters::ReadFilters,
+        event_batch_metadata::{EventBatchMetadata, EventTypesData},
+    };
+
+    fn mk_metadata(
+        event_batch_index: u64,
+        server_timestamp: u64,
+        client_id: u128,
+        user_id: u128,
+        min_cidx: u64,
+        max_cidx: u64,
+        min_ts: u64,
+        max_ts: u64,
+        min_eidx: u64,
+        max_eidx: u64,
+        compressed_size: u64,
+        event_types: &[u64; 4],
+    ) -> EventBatchMetadata {
+        EventBatchMetadata {
+            uncompressed_size: 0,
+            event_types_data: EventTypesData::Direct(*event_types),
+            event_batch_index,
+            client_id,
+            user_id,
+            server_timestamp,
+            compressed_size,
+            compression_type: 0,
+            events_crc: 0,
+            min_client_event_index: min_cidx,
+            max_client_event_index: max_cidx,
+            min_event_timestamp: min_ts,
+            max_event_timestamp: max_ts,
+            min_event_index: min_eidx,
+            max_event_index: max_eidx,
+        }
+    }
+
+    // Build EventBatchMetadata with Bloom event types (insert the provided types into the bloom)
+    fn mk_metadata_bloom(
+        event_batch_index: u64,
+        server_timestamp: u64,
+        client_id: u128,
+        user_id: u128,
+        min_cidx: u64,
+        max_cidx: u64,
+        min_ts: u64,
+        max_ts: u64,
+        min_eidx: u64,
+        max_eidx: u64,
+        compressed_size: u64,
+        types_to_insert: &[u64],
+    ) -> EventBatchMetadata {
+        // Start with an empty bloom bitmap
+        let mut bloom = BloomFilter::from_vec(vec![0u64; BLOOM_BYTES / 8])
+            .seed(&BLOOM_HASH_SEED)
+            .hashes(BLOOM_HASH_COUNT);
+
+        // Insert the event types
+        for t in types_to_insert {
+            bloom.insert(&t.to_le_bytes());
+        }
+
+        // Extract the underlying storage back into a fixed-size array
+        let bloom_bytes: [u64; BLOOM_BYTES / 8] = bloom.as_slice().try_into().unwrap();
+
+        EventBatchMetadata {
+            uncompressed_size: 0,
+            event_types_data: EventTypesData::Bloom(bloom_bytes),
+            event_batch_index,
+            client_id,
+            user_id,
+            server_timestamp,
+            compressed_size,
+            compression_type: 0,
+            events_crc: 0,
+            min_client_event_index: min_cidx,
+            max_client_event_index: max_cidx,
+            min_event_timestamp: min_ts,
+            max_event_timestamp: max_ts,
+            min_event_index: min_eidx,
+            max_event_index: max_eidx,
+        }
+    }
+
+    fn mk_event(
+        event_type_major: u64,
+        event_index: u64,
+        client_event_index: u64,
+        event_timestamp: u64,
+    ) -> EventItem {
+        EventItem {
+            event_type_major,
+            event_index,
+            client_event_index,
+            event_timestamp,
+            // ... leave other fields default/zero if present ...
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn is_include_batch_inclusive_batch_index_bounds() {
+        let meta = mk_metadata(
+            10, // bx
+            1000,
+            1,
+            2,
+            1,
+            5,
+            100,
+            200,
+            10,
+            20,
+            123,
+            &[1, 2, 0, 0],
+        );
+
+        // from <= bx is included (inclusive lower bound)
+        let filters = ReadFilters::new(10);
+        assert!(is_include_batch(&meta, &filters));
+
+        // from > bx excluded
+        let filters = ReadFilters::new(11);
+        assert!(!is_include_batch(&meta, &filters));
+
+        // to >= bx included (inclusive upper bound)
+        let filters = ReadFilters::new(1).to_event_batch_index(10);
+        assert!(is_include_batch(&meta, &filters));
+
+        // to < bx excluded
+        let filters = ReadFilters::new(1).to_event_batch_index(9);
+        assert!(!is_include_batch(&meta, &filters));
+    }
+
+    #[test]
+    fn is_include_batch_inclusive_server_timestamp_bounds() {
+        let base = mk_metadata(5, 1000, 1, 2, 1, 5, 100, 200, 10, 20, 1, &[1, 0, 0, 0]);
+
+        // min_server_timestamp: keep when server_timestamp >= min
+        let filters = ReadFilters::new(1).min_server_timestamp(1000);
+        assert!(is_include_batch(&base, &filters)); // equal allowed
+        let filters = ReadFilters::new(1).min_server_timestamp(1001);
+        assert!(!is_include_batch(&base, &filters)); // 1000 < 1001 excluded
+
+        // max_server_timestamp: keep when server_timestamp <= max
+        let filters = ReadFilters::new(1).max_server_timestamp(1000);
+        assert!(is_include_batch(&base, &filters)); // equal allowed
+        let filters = ReadFilters::new(1).max_server_timestamp(999);
+        assert!(!is_include_batch(&base, &filters)); // 1000 > 999 excluded
+    }
+
+    #[test]
+    fn is_include_batch_include_exclude_client_and_user() {
+        let meta = mk_metadata(1, 1, 123, 456, 0, 0, 0, 0, 0, 0, 1, &[0, 0, 0, 0]);
+
+        // Exclude matching client
+        let filters = ReadFilters::new(1).exclude_client_id(123);
+        assert!(!is_include_batch(&meta, &filters));
+
+        // Include non-matching client -> excluded
+        let filters = ReadFilters::new(1).include_client_id(124);
+        assert!(!is_include_batch(&meta, &filters));
+
+        // Include matching client -> included
+        let filters = ReadFilters::new(1).include_client_id(123);
+        assert!(is_include_batch(&meta, &filters));
+
+        // Exclude matching user
+        let filters = ReadFilters::new(1).exclude_user_id(456);
+        assert!(!is_include_batch(&meta, &filters));
+
+        // Include non-matching user -> excluded
+        let filters = ReadFilters::new(1).include_user_id(999);
+        assert!(!is_include_batch(&meta, &filters));
+
+        // Include matching user -> included
+        let filters = ReadFilters::new(1).include_user_id(456);
+        assert!(is_include_batch(&meta, &filters));
+    }
+
+    #[test]
+    fn is_include_batch_inclusive_ranges_for_client_index_event_time_and_event_index() {
+        // Batch with ranges:
+        // client_event_index: [10, 20]
+        // event_timestamp: [1_000, 2_000]
+        // event_index: [100, 200]
+        let meta = mk_metadata(1, 0, 0, 0, 10, 20, 1000, 2000, 100, 200, 1, &[0, 0, 0, 0]);
+
+        // min_client_event_index: keep when max >= min (inclusive)
+        let filters = ReadFilters::new(1).min_client_event_index(20);
+        assert!(is_include_batch(&meta, &filters)); // edge ok
+        let filters = ReadFilters::new(1).min_client_event_index(21);
+        assert!(!is_include_batch(&meta, &filters)); // 20 < 21 -> no overlap
+
+        // max_client_event_index: keep when min <= max (inclusive)
+        let filters = ReadFilters::new(1).max_client_event_index(10);
+        assert!(is_include_batch(&meta, &filters));
+        let filters = ReadFilters::new(1).max_client_event_index(9);
+        assert!(!is_include_batch(&meta, &filters));
+
+        // min_event_timestamp: keep when batch.max_event_timestamp >= min (inclusive)
+        let filters = ReadFilters::new(1).min_event_timestamp(2000);
+        assert!(is_include_batch(&meta, &filters));
+        let filters = ReadFilters::new(1).min_event_timestamp(2001);
+        assert!(!is_include_batch(&meta, &filters));
+
+        // max_event_timestamp: keep when batch.min_event_timestamp <= max (inclusive)
+        let filters = ReadFilters::new(1).max_event_timestamp(1000);
+        assert!(is_include_batch(&meta, &filters));
+        let filters = ReadFilters::new(1).max_event_timestamp(999);
+        assert!(!is_include_batch(&meta, &filters));
+
+        // min_event_index: keep when batch.max_event_index >= min (inclusive)
+        let filters = ReadFilters::new(1).min_event_index(200);
+        assert!(is_include_batch(&meta, &filters));
+        let filters = ReadFilters::new(1).min_event_index(201);
+        assert!(!is_include_batch(&meta, &filters));
+
+        // max_event_index: keep when batch.min_event_index <= max (inclusive)
+        let filters = ReadFilters::new(1).max_event_index(100);
+        assert!(is_include_batch(&meta, &filters));
+        let filters = ReadFilters::new(1).max_event_index(99);
+        assert!(!is_include_batch(&meta, &filters));
+    }
+
+    #[test]
+    fn is_include_batch_include_event_types_direct() {
+        // Batch types are {2, 4}
+        let meta = mk_metadata(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, &[2, 4, 0, 0]);
+
+        // Any overlap -> included
+        let filters = ReadFilters::new(1).include_event_types(vec![4, 7, 9]);
+        assert!(is_include_batch(&meta, &filters));
+
+        // No overlap -> excluded
+        let filters = ReadFilters::new(1).include_event_types(vec![7, 9]);
+        assert!(!is_include_batch(&meta, &filters));
+    }
+
+    #[test]
+    fn is_include_batch_include_event_types_bloom() {
+        // Batch types are {2, 4}
+        let meta = mk_metadata_bloom(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, &[2, 4, 0, 0, 7, 8, 11]);
+
+        // Any overlap -> included
+        let filters = ReadFilters::new(1).include_event_types(vec![4, 7, 9]);
+        assert!(is_include_batch(&meta, &filters));
+
+        // No overlap -> excluded
+        let filters = ReadFilters::new(1).include_event_types(vec![66, 9]);
+        assert!(!is_include_batch(&meta, &filters));
+    }
+
+    #[test]
+    fn apply_event_filters_keeps_only_matching_events_all_fields_inclusive() {
+        // Build a batch with varied events
+        // Types: 1, 2, 3
+        // event_index: 9, 10, 11, 12
+        // client_event_index: 99, 100, 101, 102
+        // event_timestamp: 999, 1000, 1001, 1002
+        let mut batch = EventBatchItem {
+            event_batch_index: 1,
+            server_timestamp: 1,
+            client_id: 1,
+            user_id: Some(2),
+            events: vec![
+                mk_event(1, 9, 99, 999),
+                mk_event(2, 10, 100, 1000),
+                mk_event(2, 11, 101, 1001),
+                mk_event(3, 12, 102, 1002),
+            ],
+        };
+
+        let filters = ReadFilters::new(1)
+            .include_event_types(vec![2, 3])
+            .min_event_index(10)
+            .max_event_index(12)
+            .min_event_timestamp(1000)
+            .max_event_timestamp(1002)
+            .min_client_event_index(100)
+            .max_client_event_index(102);
+
+        apply_event_filters(&mut batch, &filters);
+
+        // The first event is filtered out by every numeric min (it's all one less).
+        // Remaining 3 meet the inclusive edges; types 2 and 3 are allowed.
+        let kept: Vec<(u64, u64, u64, u64)> = batch
+            .events
+            .iter()
+            .map(|e| (e.event_type_major, e.event_index, e.client_event_index, e.event_timestamp))
+            .collect();
+
+        assert_eq!(
+            kept,
+            vec![(2, 10, 100, 1000), (2, 11, 101, 1001), (3, 12, 102, 1002)]
+        );
+    }
+
+    #[test]
+    fn apply_event_filters_type_whitelist_only() {
+        let mut batch = EventBatchItem {
+            event_batch_index: 1,
+            server_timestamp: 1,
+            client_id: 1,
+            user_id: None,
+            events: vec![mk_event(1, 1, 1, 1), mk_event(2, 2, 2, 2), mk_event(3, 3, 3, 3)],
+        };
+
+        let filters = ReadFilters::new(1).include_event_types(vec![2]);
+        apply_event_filters(&mut batch, &filters);
+
+        let kept_types: Vec<u64> = batch.events.iter().map(|e| e.event_type_major).collect();
+        assert_eq!(kept_types, vec![2]);
+    }
+
+    // Helpers for pagination tests: assume MetadataWithAbsolutePosition implements Default
+    fn mk_mwap(meta: EventBatchMetadata) -> crate::read_operations::read_structures::MetadataWithAbsolutePosition {
+        crate::read_operations::read_structures::MetadataWithAbsolutePosition {
+            event_batch_metadata: meta,
+            event_batch_absolute_position: 0,
+        }
+    }
+
+    #[test]
+    fn trim_end_if_exceeds_max_bytes_truncates_and_returns_next_index() {
+        // Three batches: sizes 100, 200, 300; total 600
+        // max_bytes=250 -> only first fits; next index should be second's bx
+        let m1 = mk_mwap(mk_metadata(10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 100, &[0, 0, 0, 0]));
+        let m2 = mk_mwap(mk_metadata(11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 200, &[0, 0, 0, 0]));
+        let m3 = mk_mwap(mk_metadata(12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 300, &[0, 0, 0, 0]));
+
+        let mut v = vec![&m1, &m2, &m3];
+
+        // No additional filtering (include all)
+        let filters = ReadFilters::new(1);
+
+        let next = trim_end_if_exceeds_max_bytes(&mut v, &filters, Some(250)).unwrap();
+        assert_eq!(next, Some(11));
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].event_batch_metadata.event_batch_index, 10);
+    }
+
+    #[test]
+    fn trim_end_if_exceeds_max_bytes_all_fit_returns_none() {
+        let m1 = mk_mwap(mk_metadata(5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 100, &[0, 0, 0, 0]));
+        let m2 = mk_mwap(mk_metadata(6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 150, &[0, 0, 0, 0]));
+
+        let mut v = vec![&m1, &m2];
+        let filters = ReadFilters::new(1);
+
+        let next = trim_end_if_exceeds_max_bytes(&mut v, &filters, Some(300)).unwrap();
+        assert_eq!(next, None);
+        assert_eq!(v.len(), 2);
+    }
+
+    #[test]
+    fn trim_end_if_exceeds_max_bytes_too_small_errors() {
+        // Single batch size=200; max_bytes=100 -> error
+        let m1 = mk_mwap(mk_metadata(99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 200, &[0, 0, 0, 0]));
+        let mut v = vec![&m1];
+        let filters = ReadFilters::new(1);
+
+        let err = trim_end_if_exceeds_max_bytes(&mut v, &filters, Some(100)).unwrap_err();
+        match err {
+            ReadError::MaxBytesTooSmall { current_max_bytes, required_max_bytes } => {
+                assert_eq!(current_max_bytes, 100);
+                assert_eq!(required_max_bytes, 200);
+            }
+            e => panic!("unexpected error: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn apply_max_bytes_pagination_behaves_like_trim_without_filtering() {
+        let m1 = mk_mwap(mk_metadata(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 120, &[0, 0, 0, 0]));
+        let m2 = mk_mwap(mk_metadata(2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 130, &[0, 0, 0, 0]));
+        let m3 = mk_mwap(mk_metadata(3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 140, &[0, 0, 0, 0]));
+
+        let mut v = vec![&m1, &m2, &m3];
+
+        // 120+130=250 fits; adding 140 would exceed 300
+        let next = apply_max_bytes_pagination(&mut v, Some(300)).unwrap();
+        assert_eq!(next, Some(3)); // next batch index that was cut
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].event_batch_metadata.event_batch_index, 1);
+        assert_eq!(v[1].event_batch_metadata.event_batch_index, 2);
+    }
+
+    #[test]
+    fn include_event_types_empty_treated_as_no_filter() {
+        let meta = mk_metadata(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, &[2, 4, 0, 0]);
+        let filters = ReadFilters::new(1).include_event_types(vec![]);
+        assert!(is_include_batch(&meta, &filters));
+
+        let mut batch = EventBatchItem {
+            event_batch_index: 1,
+            server_timestamp: 1,
+            client_id: 1,
+            user_id: None,
+            events: vec![mk_event(1, 1, 1, 1), mk_event(2, 2, 2, 2)],
+        };
+        apply_event_filters(&mut batch, &filters);
+        // No filtering took place
+        assert_eq!(batch.events.len(), 2);
+    }
+
+    #[test]
+    fn apply_max_bytes_pagination_too_small_errors() {
+        let m1 = mk_mwap(mk_metadata(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 200, &[0, 0, 0, 0]));
+        let mut v = vec![&m1];
+        let err = apply_max_bytes_pagination(&mut v, Some(100)).unwrap_err();
+        match err {
+            ReadError::MaxBytesTooSmall { current_max_bytes, required_max_bytes } => {
+                assert_eq!(current_max_bytes, 100);
+                assert_eq!(required_max_bytes, 200);
+            }
+            e => panic!("unexpected error: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn pagination_exact_boundary_includes_all() {
+        let m1 = mk_mwap(mk_metadata(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 100, &[0, 0, 0, 0]));
+        let m2 = mk_mwap(mk_metadata(2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 200, &[0, 0, 0, 0]));
+
+        let mut v = vec![&m1, &m2];
+        let next = apply_max_bytes_pagination(&mut v, Some(300)).unwrap();
+        assert_eq!(next, None);
+        assert_eq!(v.len(), 2);
+    }
+
+    #[test]
+    fn trim_end_if_exceeds_max_bytes_filters_out_all_returns_none() {
+        let m1 = mk_mwap(mk_metadata(10, 1000, 1, 2, 0, 0, 0, 0, 0, 0, 100, &[2, 0, 0, 0]));
+        let mut v = vec![&m1];
+
+        // Filter to a different client_id so batch gets filtered out
+        let filters = ReadFilters::new(1).include_client_id(999);
+        let next = trim_end_if_exceeds_max_bytes(&mut v, &filters, Some(1000)).unwrap();
+
+        assert!(v.is_empty());
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn include_and_exclude_client_conflict_exclude_wins() {
+        let meta = mk_metadata(1, 0, 123, 0, 0, 0, 0, 0, 0, 0, 1, &[0, 0, 0, 0]);
+        let filters = ReadFilters::new(1)
+            .include_client_id(123)
+            .exclude_client_id(123);
+        assert!(!is_include_batch(&meta, &filters));
     }
 }

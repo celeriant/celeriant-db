@@ -56,6 +56,9 @@ impl From<WriteError> for EventPlaneDBError {
                 EventPlaneDBError::prepend_non_contiguous(from_event_batch_index, to_event_batch_index)
             }
             WriteError::FileRenameFailure { from: _from, to: _to, error: _error } => EventPlaneDBError::io_error(),
+            WriteError::ZeroEventType { client_event_index } => {
+                EventPlaneDBError::zero_event_type(client_event_index)
+            },
         }
     }
 }

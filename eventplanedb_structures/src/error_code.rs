@@ -18,6 +18,7 @@ pub enum ErrorCode {
     ClientIdempotencyViolation,
     EmptyEventsList,
     NoEventsToAppend,
+    ZeroEventType,
     WriteError,
     CacheMiss,
     PrependCreatesEventBatchIndexGap,

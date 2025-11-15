@@ -20,6 +20,9 @@ pub enum WriteError {
         client_id: u128,
         existing_event_index: u64,
     },
+    ZeroEventType {
+        client_event_index: u64,
+    },
     CacheMiss {
         missing_from_event_batch_index: u64,        
         missing_to_event_batch_index: Option<u64>,
@@ -36,7 +39,7 @@ pub enum WriteError {
         from: String,
         to: String,
         error: std::io::Error,
-    }
+    },
 }
 
 impl From<WireFormatError> for WriteError {

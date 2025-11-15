@@ -253,6 +253,14 @@ impl EventPlaneDBError {
             ..Default::default()
         }
     }
+
+    pub fn zero_event_type(client_event_index: u64) -> Self {
+        Self {
+            code: ErrorCode::ZeroEventType,
+            attempted_client_event_index: Some(client_event_index),
+            ..Default::default()
+        }
+    }
 }
 
 impl Default for EventPlaneDBError {

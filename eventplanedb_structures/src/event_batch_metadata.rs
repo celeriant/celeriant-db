@@ -151,3 +151,98 @@ impl EventBatchMetadata {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        event_item::EventItem,
+        event_batch_item::EventBatchItem,
+        compression_type::CompressionType,
+    };
+
+    fn mk_event(
+        t: u64,
+        eidx: u64,
+        cidx: u64,
+        ts: u64,
+    ) -> EventItem {
+        EventItem {
+            event_type_major: t,
+            event_index: eidx,
+            client_event_index: cidx,
+            event_timestamp: ts,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn from_batch_item_computes_min_max_fields_and_copies_headers() {
+        let events = vec![
+            mk_event(2, 100, 10, 1_000),            
+            mk_event(3, 150, 15, 1_500),
+            mk_event(4, 200, 20, 2_000),
+        ];
+
+        let batch = EventBatchItem {
+            event_batch_index: 42,
+            server_timestamp: 9_999,
+            client_id: 0xA,
+            user_id: Some(0xB),
+            events,
+        };
+
+        let meta = EventBatchMetadata::from_batch_item(
+            &batch,
+            1234,                // uncompressed
+            567,                 // compressed
+            CompressionType::Snappy,
+            EventTypesData::Direct([2, 4, 0, 0]),
+            0xDEADBEEF,
+        );
+
+        assert_eq!(meta.event_batch_index, 42);
+        assert_eq!(meta.server_timestamp, 9_999);
+        assert_eq!(meta.client_id, 0xA);
+        assert_eq!(meta.user_id, 0xB);
+        assert_eq!(meta.uncompressed_size, 1234);
+        assert_eq!(meta.compressed_size, 567);        
+        assert_eq!(meta.compression_type, 2);
+        assert_eq!(meta.events_crc, 0xDEADBEEF);
+
+        // Min/max from the 3 events
+        assert_eq!(meta.min_client_event_index, 10);
+        assert_eq!(meta.max_client_event_index, 20);
+        assert_eq!(meta.min_event_timestamp, 1_000);
+        assert_eq!(meta.max_event_timestamp, 2_000);
+        assert_eq!(meta.min_event_index, 100);
+        assert_eq!(meta.max_event_index, 200);
+    }
+
+    #[test]
+    fn from_batch_item_handles_empty_events() {
+        let batch = EventBatchItem {
+            event_batch_index: 7,
+            server_timestamp: 77,
+            client_id: 0x1,
+            user_id: None,
+            events: vec![],
+        };
+
+        let meta = EventBatchMetadata::from_batch_item(
+            &batch,
+            10,
+            5,
+            CompressionType::None,
+            EventTypesData::Direct([0, 0, 0, 0]),
+            0,
+        );
+
+        assert_eq!(meta.min_client_event_index, 0);
+        assert_eq!(meta.min_event_timestamp, 0);
+        assert_eq!(meta.min_event_index, 0);
+        assert_eq!(meta.max_client_event_index, 0);
+        assert_eq!(meta.max_event_timestamp, 0);
+        assert_eq!(meta.max_event_index, 0);
+    }
+}

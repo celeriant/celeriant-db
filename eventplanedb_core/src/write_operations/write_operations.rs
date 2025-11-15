@@ -447,6 +447,13 @@ impl WriteOperations for WriteOperationsWithDmaFile {
             return Err(WriteError::EmptyEventsList);
         }
 
+        // Validate that no event uses the sentinel 0 event type
+        if let Some(ev) = events.iter().find(|e| e.event_type_major == 0) {
+            return Err(WriteError::ZeroEventType {
+                client_event_index: ev.client_event_index,
+            });
+        }
+
         // If checking idempotency, check if client is providing the same events again using client event index, if so, error
         if write_options.enforce_client_idempotency {
             if let Some(&last_client_event_index) =
