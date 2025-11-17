@@ -13,6 +13,7 @@ pub enum WireFormatError {
         inner: std::io::Error,
         snappy_error: Option<snap::Error>,
     },
+    UnsupportedVersion(u32),
 }
 
 impl From<bincode::error::DecodeError> for WireFormatError {

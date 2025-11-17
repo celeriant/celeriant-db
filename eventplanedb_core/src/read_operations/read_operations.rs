@@ -1,10 +1,5 @@
 use eventplanedb_structures::{
-    compression_type::CompressionType,
-    constants::METADATA_BATCH_SIZE_BYTES,
-    event_batch_item::EventBatchItem,
-    event_batch_metadata::EventBatchMetadata,
-    read_filters::ReadFilters,
-    wire_format::{from_wire_format_fixed, from_wire_format_variable},
+    compression_type::CompressionType, constants::METADATA_BATCH_SIZE_BYTES, event_batch_item::EventBatchItem, event_batch_metadata::EventBatchMetadata, read_filters::ReadFilters, version_aware_wire_format::{deserialize_event_batch_metadata_versioned, deserialize_event_batch_versioned}
 };
 use glommio::io::{DmaFile, OpenOptions};
 use std::{collections::HashMap, path::Path};
@@ -257,10 +252,11 @@ impl ReadOperationsWithDmaFiles {
                 Some(actual_read_to),
                 self.config.max_chunk_size,
                 |metadata_bytes| {
-                    let event_batch_metadata = from_wire_format_fixed(metadata_bytes)?;
+                    let (event_batch_metadata, format_version_on_disk) = deserialize_event_batch_metadata_versioned(metadata_bytes)?;
                     uncached_metadata_set.push(MetadataWithAbsolutePosition {
                         event_batch_metadata,
                         event_batch_absolute_position: 0,
+                        format_version_on_disk
                     });
                     Ok(())
                 },
@@ -364,6 +360,8 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
 
         for (index, event_batch_bytes) in event_batches_bytes_set.iter().enumerate() {
             let metadata = &metadata_for_reading[index].event_batch_metadata;
+            let format_version_on_disk = metadata_for_reading[index].format_version_on_disk;
+
             let actual_crc = crc32fast::hash(event_batch_bytes);
 
             if actual_crc != metadata.events_crc {
@@ -377,10 +375,11 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
             }
 
             let compression_type = CompressionType::from_tuple(metadata.compression_type, None);
-            let event_batch = from_wire_format_variable::<EventBatchItem>(
+            let event_batch = deserialize_event_batch_versioned(
                 event_batch_bytes,
                 compression_type,
                 metadata.uncompressed_size as usize,
+                format_version_on_disk,
             )?;
 
             batches.push((metadata.clone(), event_batch));
@@ -514,7 +513,7 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
                 Some(uncached_bytes),
                 self.config.max_chunk_size,
                 |metadata_bytes| {
-                    let meta: EventBatchMetadata = from_wire_format_fixed(metadata_bytes)?;
+                    let (meta, format_version_on_disk) = deserialize_event_batch_metadata_versioned(metadata_bytes)?;
 
                     if minimum_available_event_batch_index.is_none() {
                         minimum_available_event_batch_index = Some(meta.event_batch_index);
@@ -535,6 +534,7 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
                         ring.push_back(MetadataWithAbsolutePosition {
                             event_batch_metadata: meta,
                             event_batch_absolute_position: 0,
+                            format_version_on_disk
                         });
                         if ring.len() > return_count {
                             ring.pop_front();
@@ -822,6 +822,7 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
             Vec::with_capacity(event_batches_bytes_set.len());
         for event_batch_bytes in event_batches_bytes_set.iter() {
             let metadata = &metadata_for_reading[index].event_batch_metadata;
+            let format_version_on_disk = metadata_for_reading[index].format_version_on_disk;
             let actual_crc = crc32fast::hash(&event_batch_bytes);
 
             if actual_crc != metadata.events_crc {
@@ -835,10 +836,11 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
             }
 
             let compression_type = CompressionType::from_tuple(metadata.compression_type, None);
-            let mut event_batch = from_wire_format_variable::<EventBatchItem>(
+            let mut event_batch = deserialize_event_batch_versioned(
                 &event_batch_bytes,
                 compression_type,
                 metadata.uncompressed_size as usize,
+                format_version_on_disk
             )?;
 
             // Apply all event filters

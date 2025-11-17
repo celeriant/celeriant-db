@@ -190,7 +190,7 @@ impl Request {
         match self {
             Request::ListOrganisations(_) => 0,
             Request::ListAggregates(_) => 0,
-            Request::UpdateCacheLimits(req) => 0,
+            Request::UpdateCacheLimits(_) => 0,
             Request::Exists(req) => req.aggregate_id,
             Request::Read(req) => req.aggregate_id,
             Request::ReadAll(req) => req.aggregate_id,

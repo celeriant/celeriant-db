@@ -1,15 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use eventplanedb_structures::{
-    append_result::AppendResult,
-    batch_metadata_item_pair::BatchMetadataItemPair,
-    compression_type::CompressionType,
-    constants::{BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED, METADATA_BATCH_SIZE_BYTES},
-    event_batch_item::EventBatchItem,
-    event_batch_metadata::{EventBatchMetadata, EventTypesData},
-    event_item::EventItem,
-    read_filters::ReadFilters,
-    wire_format::{to_wire_format_fixed, to_wire_format_variable},
+    append_result::AppendResult, batch_metadata_item_pair::BatchMetadataItemPair, compression_type::CompressionType, constants::{BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED, METADATA_BATCH_SIZE_BYTES}, event_batch_item::EventBatchItem, event_batch_metadata::{EventBatchMetadata, EventTypesData}, event_item::EventItem, read_filters::ReadFilters, version_aware_wire_format::to_wire_format_fixed_with_version, wire_format::{to_wire_format_variable}
 };
 use fastbloom::BloomFilter;
 use glommio::{GlommioError, io::DmaFile};
@@ -557,7 +549,7 @@ impl WriteOperations for WriteOperationsWithDmaFile {
         let latest_client_event_index = event_batch_metadata.max_client_event_index;
 
         let mut metadata_bytes = [0u8; METADATA_BATCH_SIZE_BYTES];
-        to_wire_format_fixed(&event_batch_metadata, &mut metadata_bytes)?;
+        to_wire_format_fixed_with_version(&event_batch_metadata, &mut metadata_bytes)?;
 
         self.append_event_batch_queue
             .push(AppendEventBatchQueueItem {
@@ -671,7 +663,7 @@ impl WriteOperations for WriteOperationsWithDmaFile {
 
             // Serialize metadata
             let mut metadata_bytes = [0u8; METADATA_BATCH_SIZE_BYTES];
-            to_wire_format_fixed(metadata, &mut metadata_bytes)?;
+            to_wire_format_fixed_with_version(metadata, &mut metadata_bytes)?;
 
             event_batches_queued.push(PrependEventBatchQueueItem {
                 compressed_event_batch_item,

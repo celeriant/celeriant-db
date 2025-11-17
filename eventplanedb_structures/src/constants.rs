@@ -6,6 +6,7 @@ pub const METADATA_BATCH_SIZE_BYTES: usize = 256;
 pub const PROTOCOL_VERSION_V2: u32 = 2;
 pub const WIRE_HEADER_SIZE: usize = 17;
 pub const WIRE_FIXED_BODY_SIZE: usize = 1024;
+pub const WIRE_FORMAT_CURRENT_VERSION: u32 = 1;
 
 pub static BINCODE_CONFIG_FIXED: bincode::config::Configuration<
     bincode::config::LittleEndian,

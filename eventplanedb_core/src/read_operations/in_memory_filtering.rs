@@ -312,10 +312,7 @@ pub fn apply_max_bytes_pagination(
 mod tests {
     use super::*;
     use eventplanedb_structures::{
-        event_batch_item::EventBatchItem,
-        event_item::EventItem,
-        read_filters::ReadFilters,
-        event_batch_metadata::{EventBatchMetadata, EventTypesData},
+        constants::WIRE_FORMAT_CURRENT_VERSION, event_batch_item::EventBatchItem, event_batch_metadata::{EventBatchMetadata, EventTypesData}, event_item::EventItem, read_filters::ReadFilters
     };
 
     fn mk_metadata(
@@ -634,6 +631,7 @@ mod tests {
         crate::read_operations::read_structures::MetadataWithAbsolutePosition {
             event_batch_metadata: meta,
             event_batch_absolute_position: 0,
+            format_version_on_disk: WIRE_FORMAT_CURRENT_VERSION,
         }
     }
 
