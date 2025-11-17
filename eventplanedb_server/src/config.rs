@@ -39,8 +39,12 @@ pub struct EventPlaneDBConfig {
     pub cache_trim_factor: usize,
 
     // Wire protocol constants
-    #[arg(long, default_value_t = 64 * 1024 * 1024, help = "Maximum message size (64 MiB)")]
-    pub max_message_size: u32,
+    #[arg(long, help = "Maximum request message size (16 MiB)")]
+    pub max_request_size: Option<u32>,
+
+    // Wire protocol constants
+    #[arg(long, help = "Maximum size of event batches set to return (64 MiB)")]
+    pub max_event_batches_response_size: Option<u64>,
 
     // Misc / logging
     #[arg(long, default_value = "info", help = "Default log level (trace, debug, info, warn, error)")]
@@ -60,7 +64,8 @@ impl Default for EventPlaneDBConfig {
             aggregate_write_max_data_cache_size_bytes: 1024 * 1024 * 128,
             cache_trim_factor: 10,
             max_open_aggregates: 10000,
-            max_message_size: 64 * 1024 * 1024,
+            max_request_size: Some(16 * 1024 * 1024),
+            max_event_batches_response_size: Some(64 * 1024 * 1024),
             default_log_level: "info".to_string(),
         }
     }

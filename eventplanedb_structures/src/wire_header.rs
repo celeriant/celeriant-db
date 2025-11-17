@@ -32,7 +32,7 @@ pub async fn write_variable_size<W, T>(
     message: &T,
     request_response_type: u32,
     compression_type: CompressionType,
-    max_message_size: Option<u32>,
+    max_request_size: Option<u32>,
 ) -> Result<(), WireError>
 where
     W: AsyncWriteExt + Unpin,
@@ -45,8 +45,8 @@ where
     let compressed_size = encoded.len() as u32;
     let (compression_type_id, _) = compression_type.to_tuple();
 
-    if let Some(max_message_size) = max_message_size && compressed_size > max_message_size {
-        return Err(WireError::MessageTooLarge { message_length: compressed_size, max_message_size });
+    if let Some(max_request_size) = max_request_size && compressed_size > max_request_size {
+        return Err(WireError::MessageTooLarge { message_length: compressed_size, max_request_size });
     }
     
     let mut buffer = Vec::with_capacity(WIRE_HEADER_SIZE + encoded.len());
@@ -93,13 +93,13 @@ impl WireHeader {
         })
     }
 
-    pub async fn read_variable_size<R, T>(&self, reader: &mut R, max_message_size: Option<u32>) -> Result<T, WireError>
+    pub async fn read_variable_size<R, T>(&self, reader: &mut R, max_request_size: Option<u32>) -> Result<T, WireError>
     where
         R: AsyncReadExt + Unpin,
         T: Decode<()>,
     {
-        if let Some(max_message_size) = max_message_size && self.compressed_length > max_message_size {
-            return Err(WireError::MessageTooLarge { message_length: self.compressed_length, max_message_size });
+        if let Some(max_request_size) = max_request_size && self.compressed_length > max_request_size {
+            return Err(WireError::MessageTooLarge { message_length: self.compressed_length, max_request_size });
         }
 
         let compressed_length = self.compressed_length as usize;

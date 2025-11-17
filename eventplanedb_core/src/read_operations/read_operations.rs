@@ -122,6 +122,7 @@ pub trait ReadOperations {
         file_len_metadata: u64,
         file_len_event_batch: u64,
         read_filters: &ReadFilters,
+        max_bytes: Option<usize>,
     ) -> Result<CacheableReadResult, ReadError>;
 
     /// Updates the internal metadata cache with newly read entries.
@@ -735,6 +736,7 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
         file_len_metadata: u64,
         file_len_event_batch: u64,
         read_filters: &ReadFilters,
+        max_bytes: Option<usize>,
     ) -> Result<CacheableReadResult, ReadError> {
         // Use the helper to get metadata range
         let (uncached_metadata_set, cached_metadata_set_snapshot) = self
@@ -766,7 +768,7 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
         let next_event_batch_index: Option<u64> = trim_end_if_exceeds_max_bytes(
             &mut metadata_for_reading,
             &read_filters,
-            read_filters.max_bytes,
+            max_bytes,
         )?;
 
         // Read the actual event batches at specific positions in the file

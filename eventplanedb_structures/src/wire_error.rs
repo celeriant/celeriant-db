@@ -12,7 +12,7 @@ pub enum WireError {
     UnknownResponseType(u32),
     MessageTooLarge {
         message_length: u32,
-        max_message_size: u32,
+        max_request_size: u32,
     },
     UnsupportedProtocol(u32),
 }

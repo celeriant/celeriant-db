@@ -263,6 +263,7 @@ mod test_basic_read_write {
                         writer_ref.file_len_metadata,
                         writer_ref.file_len_event_batch,
                         &read_filters,
+                        None
                     )
                     .await
                     .unwrap();
@@ -360,7 +361,7 @@ mod test_basic_read_write {
                     let cache_read_attempt = writer
                         .as_ref()
                         .unwrap()
-                        .maybe_read_cached_events(&read_filters)
+                        .maybe_read_cached_events(&read_filters, None)
                         .expect_err("Cache did not miss");
 
                     match cache_read_attempt {
@@ -386,7 +387,7 @@ mod test_basic_read_write {
                     let cache_read = writer
                         .as_ref()
                         .unwrap()
-                        .maybe_read_cached_events(&read_filters)
+                        .maybe_read_cached_events(&read_filters, None)
                         .unwrap();
                     check_read_1(&cache_read, event_id, 0);
                 }
@@ -404,6 +405,7 @@ mod test_basic_read_write {
                             writer_ref.file_len_metadata,
                             writer_ref.file_len_event_batch,
                             &read_filters,
+                            None,
                         )
                         .await
                         .unwrap();
@@ -418,12 +420,13 @@ mod test_basic_read_write {
                             writer_ref.file_len_metadata,
                             writer_ref.file_len_event_batch,
                             &read_filters,
+                            None,
                         )
                         .await
                         .unwrap();
                     check_read_2(&read_result, 2);
 
-                    let cache_read = writer_ref.maybe_read_cached_events(&read_filters).unwrap();
+                    let cache_read = writer_ref.maybe_read_cached_events(&read_filters, None).unwrap();
                     check_read_2(&cache_read, 0);
 
                     //Basic filter on event batches
@@ -435,13 +438,14 @@ mod test_basic_read_write {
                             writer_ref.file_len_metadata,
                             writer_ref.file_len_event_batch,
                             &read_filters,
+                            None,
                         )
                         .await
                         .unwrap();
 
                     check_read_3(&read_result, 2);
 
-                    let cache_result = writer_ref.maybe_read_cached_events(&read_filters).unwrap();
+                    let cache_result = writer_ref.maybe_read_cached_events(&read_filters, None).unwrap();
                     check_read_3(&cache_result, 0);
 
                     read_result
@@ -467,6 +471,7 @@ mod test_basic_read_write {
                             writer_ref.file_len_metadata,
                             writer_ref.file_len_event_batch,
                             &read_filters,
+                            None,
                         )
                         .await
                         .unwrap();

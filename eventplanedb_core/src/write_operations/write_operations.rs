@@ -397,6 +397,7 @@ pub trait WriteOperations {
     fn maybe_read_cached_events(
         &self,
         filters: &ReadFilters,
+        max_bytes: Option<usize>,
     ) -> Result<CacheableReadResult, WriteError>;
 }
 
@@ -663,6 +664,7 @@ impl WriteOperations for WriteOperationsWithDmaFile {
     fn maybe_read_cached_events(
         &self,
         filters: &ReadFilters,
+        max_bytes: Option<usize>,
     ) -> Result<CacheableReadResult, WriteError> {
         // Check if cache is empty
         if self.data_cache.is_empty() {
@@ -705,7 +707,7 @@ impl WriteOperations for WriteOperationsWithDmaFile {
             }
 
             // Check max_bytes limit if specified
-            if let Some(max_bytes) = filters.max_bytes {
+            if let Some(max_bytes) = max_bytes {
                 let next_size = cumulative_size + metadata.compressed_size;
                 if next_size > max_bytes as u64 {
                     // Mark next batch index for pagination

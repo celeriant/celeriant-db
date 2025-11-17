@@ -60,7 +60,8 @@ fn main() {
     
     let listen_address = config.listen_address.clone();
     let data_root = config.data_root.clone();
-    let max_message_size = config.max_message_size;
+    let max_request_size = config.max_request_size;
+    let max_event_batches_response_size = config.max_event_batches_response_size.map(|v| v as usize);
     let max_open_aggregates = config.max_open_aggregates;
 
     // Create a pool of executors, one per shard
@@ -70,7 +71,7 @@ fn main() {
         nbr_shards,
         online_cpus,
     ))
-    .on_all_shards(enclose!((mesh, listen_address, data_root, max_message_size, max_open_aggregates) move || async move {
+    .on_all_shards(enclose!((mesh, listen_address, data_root, max_request_size, max_event_batches_response_size, max_open_aggregates) move || async move {
 
         // Join the full mesh to get this shard's sender and all receivers
         // The receivers are for receiving messages from other shards (synonymous with executors)
@@ -95,7 +96,6 @@ fn main() {
             aggregate_read_config.clone(),
             aggregate_write_config.clone(),
             max_open_aggregates,
-            Some(max_message_size as usize),
         ));
 
         // Shard 0 sets up signal handler with polling loop
@@ -183,12 +183,12 @@ fn main() {
                     // Other shard has accepted and already read the request data.
                     // So we can process it immediately and write the response back
                     debug!("Shard {shard_id} processing forwarded request for client");
-                    let response = process_request.process(msg.value.unwrap()).await;
+                    let response = process_request.process(msg.value.unwrap(), max_event_batches_response_size).await;
                     write_to_tcp_stream(response, &mut tcp_stream, msg.message_version).await;
 
                     if !shutdown_flag.get() {
                         debug!("Shard {shard_id} keeping client alive for pipelining");
-                        process_tcp_stream(shard_id, nbr_shards, tcp_stream, sender_clone.clone(), process_request.clone(), max_message_size, shutdown_flag.clone()).await;
+                        process_tcp_stream(shard_id, nbr_shards, tcp_stream, sender_clone.clone(), process_request.clone(), max_request_size, max_event_batches_response_size, shutdown_flag.clone()).await;
                     } else {
                         debug!("Shard {shard_id} closing connection due to shutdown");
                     }
@@ -229,7 +229,7 @@ fn main() {
                         Ok(addr) => debug!("Shard {shard_id} accepted connection from {addr}"),
                         Err(_) => error!("Shard {shard_id} accepted connection from unknown address"),
                     }
-                    process_tcp_stream(shard_id, nbr_shards, tcp_stream.buffered(), sender.clone(), process_request.clone(), max_message_size, shutdown_flag.clone()).await;
+                    process_tcp_stream(shard_id, nbr_shards, tcp_stream.buffered(), sender.clone(), process_request.clone(), max_request_size, max_event_batches_response_size, shutdown_flag.clone()).await;
                 }
                 Err(_) => continue,
             }
@@ -249,7 +249,8 @@ async fn process_tcp_stream(
     mut tcp_stream: glommio::net::TcpStream<glommio::net::Preallocated>, 
     sender: Rc<RefCell<Senders<Msg>>>,
     process_request: Rc<ProcessRequest>,
-    max_message_size: u32,
+    max_request_size: Option<u32>, 
+    max_event_batches_response_size: Option<usize>,
     shutdown_flag: Rc<Cell<bool>>,
 ) {
     spawn_local(async move {
@@ -260,7 +261,7 @@ async fn process_tcp_stream(
                 break;
             }
 
-            let (request, message_version) = match read_from_tcp_stream(shard_id, &mut tcp_stream, max_message_size).await {
+            let (request, message_version) = match read_from_tcp_stream(shard_id, &mut tcp_stream, max_request_size).await {
                 Some((num, message_version)) => (num, message_version),
                 None => break,
             };
@@ -296,7 +297,7 @@ async fn process_tcp_stream(
                 }
             } else {
                 debug!("Shard {shard_id} processing request for aggregate {aggregate_id} locally");
-                let response = process_request.process(request).await;
+                let response = process_request.process(request, max_event_batches_response_size).await;
                 write_to_tcp_stream(response, &mut tcp_stream, message_version).await;
             }
         }
@@ -315,9 +316,9 @@ async fn write_to_tcp_stream(response: Response, tcp_stream: &mut glommio::net::
 async fn read_from_tcp_stream(
     shard_id: usize, 
     tcp_stream: &mut glommio::net::TcpStream<glommio::net::Preallocated>,
-    max_message_size: u32,
+    max_request_size: Option<u32>,
 ) -> Option<(Request, u32)> {
-    match read_request(tcp_stream, max_message_size).await {
+    match read_request(tcp_stream, max_request_size).await {
         Ok((request, version)) => {
             debug!("Shard {shard_id} successfully parsed request with version {version}");
             Some((request, version))

@@ -9,7 +9,6 @@ use crate::{cache::aggregate_cache::AggregateCache, read_operations::{read_opera
 pub struct ProcessRequest { 
     data_root_folder: String,
     aggregate_cache: AggregateCache,
-    max_bytes: Option<usize>,
 }
 
 impl ProcessRequest {
@@ -18,13 +17,11 @@ impl ProcessRequest {
         aggregate_read_config: AggregateReadConfig,
         aggregate_write_config: AggregateWriteConfig,
         max_open_aggregates: usize,
-        max_bytes: Option<usize>,
     ) -> Self {
         let capacity = NonZeroUsize::new(max_open_aggregates).unwrap();
         Self {
             data_root_folder: data_root_folder.clone(),
             aggregate_cache: AggregateCache::new(capacity, data_root_folder, aggregate_read_config, aggregate_write_config),
-            max_bytes
         }
     }
 
@@ -36,7 +33,7 @@ impl ProcessRequest {
             .as_millis() as u64
     }
 
-    pub async fn process(&self, request: Request) -> Response {
+    pub async fn process(&self, request: Request, max_event_batches_response_size: Option<usize>) -> Response {
         match request {
             Request::Write(request) => {
                 let correlation_id = request.correlation_id;
@@ -58,7 +55,7 @@ impl ProcessRequest {
 
             Request::Read(request) => {
                 let correlation_id = request.correlation_id;
-                let result = self.handle_read(request).await;
+                let result = self.handle_read(request, max_event_batches_response_size).await;
 
                 match result {
                     Ok(read_result) => Response::Read(ReadResponse {
@@ -156,7 +153,7 @@ impl ProcessRequest {
 
             Request::ReadAll(request) => {
                 let correlation_id = request.correlation_id;
-                let result = self.handle_read_all(request).await;
+                let result = self.handle_read_all(request, max_event_batches_response_size).await;
 
                 match result {
                     Ok(result) => Response::ReadAll(ReadAllResponse {
@@ -194,6 +191,7 @@ impl ProcessRequest {
     async fn handle_read_all(
         &self,
         request: ReadAllRequest,
+        max_event_batches_response_size: Option<usize>,
     ) -> Result<ReadAllResult, EventPlaneDBError> {
         let aggregate_key = AggregateKey::new(request.org_id, request.aggregate_type_id, request.aggregate_id);
         let aggregate_resources = self.aggregate_cache.get(&aggregate_key);
@@ -218,7 +216,7 @@ impl ProcessRequest {
                 file_len_event_batch,
                 request.from_event_batch_index,
                 request.to_event_batch_index,
-                self.max_bytes,
+                max_event_batches_response_size,
             ).await?
         };
 
@@ -430,6 +428,7 @@ impl ProcessRequest {
     async fn handle_read(
         &self,
         request: ReadRequest,
+        max_event_batches_response_size: Option<usize>,
     ) -> Result<ReadResult, EventPlaneDBError> {
         let aggregate_key = AggregateKey::new(request.org_id, request.aggregate_type_id, request.aggregate_id);
         let aggregate_resources = self.aggregate_cache.get(&aggregate_key);
@@ -437,7 +436,7 @@ impl ProcessRequest {
         let (file_len_metadata, file_len_event_batch, minimum_available_event_batch_index) = {
             let writer = aggregate_resources.get_writer(false).await?;
             let r_writer = writer.as_ref().unwrap();
-            if let Ok(result) = r_writer.maybe_read_cached_events(&request.filters) {
+            if let Ok(result) = r_writer.maybe_read_cached_events(&request.filters, max_event_batches_response_size) {
                 return Ok(ReadResult {
                     event_batches: result.filtered_event_batches,
                     next_event_batch_index: result.next_event_batch_index,
@@ -459,6 +458,7 @@ impl ProcessRequest {
                 file_len_metadata,
                 file_len_event_batch,
                 &request.filters,
+                max_event_batches_response_size,
             ).await?
         };
 

@@ -192,7 +192,7 @@ impl Request {
 /// Read a request from the wire protocol
 pub async fn read_request<R>(
     reader: &mut R,
-    max_message_size: u32,
+    max_request_size: Option<u32>,
 ) -> Result<(Request, u32), WireError>
 where
     R: AsyncReadExt + Unpin,
@@ -233,17 +233,17 @@ where
         match request_type {
             RequestType::ListOrganisations => Request::ListOrganisations(
                 wire_header
-                    .read_variable_size(reader, Some(max_message_size))
+                    .read_variable_size(reader, max_request_size)
                     .await?,
             ),
             RequestType::Write => Request::Write(
                 wire_header
-                    .read_variable_size(reader, Some(max_message_size))
+                    .read_variable_size(reader, max_request_size)
                     .await?,
             ),
             RequestType::WriteBatches => Request::WriteBatches(
                 wire_header
-                    .read_variable_size(reader, Some(max_message_size))
+                    .read_variable_size(reader, max_request_size)
                     .await?,
             ),
             _ => unreachable!(),

@@ -8,8 +8,6 @@ pub struct ReadFilters {
     pub from_event_batch_index: u64,
     /// End reading event batches at this server id (inclusive). Will error if reached end of stream before this ID.
     pub to_event_batch_index: Option<u64>,
-    /// Optional limit on the total response size in bytes to prevent large responses
-    pub max_bytes: Option<usize>,
     /// Optional whitelist of event types to include in results
     pub include_event_types: Option<Vec<u64>>,
     /// Skip events created by this client
@@ -53,11 +51,6 @@ impl ReadFilters {
 
     pub fn to_event_batch_index(mut self, event_batch_index: u64) -> Self {
         self.to_event_batch_index = Some(event_batch_index);
-        self
-    }
-
-    pub fn max_bytes(mut self, max_bytes: usize) -> Self {
-        self.max_bytes = Some(max_bytes);
         self
     }
 
