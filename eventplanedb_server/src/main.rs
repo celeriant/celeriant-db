@@ -166,13 +166,23 @@ fn main() {
                     // Check local shutdown flag
                     if shutdown_flag.get() {
                         info!("Shard {shard_id} rejecting forwarded message due to shutdown");
-                        let mut tcp_stream = unsafe { glommio::net::TcpStream::from_raw_fd(msg.fd) };
-                        let error_msg = "Server is shutting down. Please reconnect.\n";
-                        let _ = tcp_stream.write_all(error_msg.as_bytes()).await;
+                        if msg.fd >= 0 {
+                            let mut tcp_stream = unsafe { glommio::net::TcpStream::from_raw_fd(msg.fd) };
+                            let error_msg = "Server is shutting down. Please reconnect.\n";
+                            let _ = tcp_stream.write_all(error_msg.as_bytes()).await;
+                        }
                         continue;
                     }
 
                     debug!("Shard {shard_id} received forwarded message");
+                    
+                    // If fd is -1, this is a broadcast message (e.g., UpdateCacheLimits)
+                    // Process it locally without responding to a client
+                    if msg.fd == -1 {
+                        debug!("Shard {shard_id} processing broadcast message");
+                        let _ = process_request.process(msg.value.unwrap(), max_event_batches_response_size).await;
+                        continue;
+                    }
                     
                     // Reconstruct TcpStream from raw fd
                     // Ensure to use a glommio TcpStream
@@ -246,6 +256,38 @@ fn main() {
     info!("EventPlaneDB Server shutdown complete");
 }
 
+async fn process_and_maybe_broadcast_request(
+    request: Request,
+    shard_id: usize,
+    nbr_shards: usize,
+    process_request: Rc<ProcessRequest>,
+    sender: Rc<RefCell<Senders<Msg>>>,
+    max_event_batches_response_size: Option<usize>,
+) -> Response {
+    // Check if this is an UpdateCacheLimits request that needs broadcasting
+    if matches!(request, Request::UpdateCacheLimits(_)) {
+        info!("Shard {shard_id} broadcasting UpdateCacheLimits to all shards");
+        
+        // Broadcast to all other shards (they process without responding to client)
+        for peer in 0..nbr_shards {
+            if peer != shard_id {
+                let broadcast_msg = Msg {
+                    fd: -1,  // -1 indicates broadcast message, no client response needed
+                    value: Some(request.clone()),
+                    message_version: 0,
+                    require_shutdown: false,
+                };
+                if let Err(e) = sender.borrow().try_send_to(peer, broadcast_msg) {
+                    error!("Failed to broadcast UpdateCacheLimits to shard {peer}: {e:?}");
+                }
+            }
+        }
+    }
+    
+    // Process locally and return response
+    process_request.process(request, max_event_batches_response_size).await
+}
+
 async fn process_tcp_stream(
     shard_id: usize, 
     nbr_shards: usize, 
@@ -300,7 +342,14 @@ async fn process_tcp_stream(
                 }
             } else {
                 debug!("Shard {shard_id} processing request for aggregate {aggregate_id} locally");
-                let response = process_request.process(request, max_event_batches_response_size).await;
+                let response = process_and_maybe_broadcast_request(
+                    request,
+                    shard_id,
+                    nbr_shards,
+                    process_request.clone(),
+                    sender.clone(),
+                    max_event_batches_response_size,
+                ).await;
                 write_to_tcp_stream(response, &mut tcp_stream, message_version).await;
             }
         }
