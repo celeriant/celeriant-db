@@ -41,6 +41,8 @@ This file should test the functionality and edge cases of the writer's in-memory
 *   **Cache Management:**
     *   `test_cache_trims_when_oversize`: Write data in excess of `max_data_cache_size_bytes` to trigger the cache trimming logic. Verify that the oldest batches are evicted and reading them now causes a `CacheMiss`.
     *   `test_sync_rollback_on_failure`: Simulate an IO error during `sync` (eg. delete the file or lock it?) and verify that the in-memory state (e.g., `next_event_index`, `client_event_indexes`) is correctly rolled back to its pre-sync state.
+*   **Dynamic Adjustments:**
+    *   `test_update_max_data_cache_size_bytes`: Verify that dynamically adjusting `max_data_cache_size_bytes` triggers the cache trimming logic.
 
 ### New Test File: `test_read_write/test_concurrency_and_idempotency.rs`
 

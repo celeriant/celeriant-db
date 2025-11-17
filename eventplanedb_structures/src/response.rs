@@ -26,6 +26,7 @@ pub enum ResponseType {
     TrimStart = 8,
     Delete = 9,
     ProtocolError = 10,
+    UpdateCacheLimits = 11,
 }
 
 impl ResponseType {
@@ -41,6 +42,7 @@ impl ResponseType {
             8 => Ok(ResponseType::TrimStart),
             9 => Ok(ResponseType::Delete),
             10 => Ok(ResponseType::ProtocolError),
+            11 => Ok(ResponseType::UpdateCacheLimits),
             _ => Err(WireError::UnknownResponseType(value)),
         }
     }
@@ -54,8 +56,16 @@ impl ResponseType {
                 | ResponseType::WriteBatches
                 | ResponseType::ProtocolError
                 | ResponseType::Write
+                | ResponseType::UpdateCacheLimits
         )
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub struct UpdateCacheLimitsResponse {
+    pub correlation_id: Option<u128>,
+    pub error: Option<EventPlaneDBError>,
+    pub accepted: bool,
 }
 
 // Individual response structs
@@ -134,6 +144,7 @@ pub enum Response {
     TrimStart(TrimStartResponse),
     Delete(DeleteResponse),
     ProtocolError(ProtocolErrorResponse),
+    UpdateCacheLimits(UpdateCacheLimitsResponse),
 }
 
 impl Response {
@@ -149,6 +160,7 @@ impl Response {
             Response::TrimStart(_) => ResponseType::TrimStart,
             Response::Delete(_) => ResponseType::Delete,
             Response::ProtocolError(_) => ResponseType::ProtocolError,
+            Response::UpdateCacheLimits(_) => ResponseType::UpdateCacheLimits,
         }
     }
 }
@@ -187,6 +199,9 @@ where
             }
             ResponseType::Write => {
                 Response::Write(wire_header.read_fixed_size(reader, &mut buffer).await?)
+            }
+            ResponseType::UpdateCacheLimits => {
+                Response::UpdateCacheLimits(wire_header.read_fixed_size(reader, &mut buffer).await?)
             }
             _ => unreachable!(),
         }
@@ -231,6 +246,7 @@ where
             Response::WriteBatches(res) => write_fixed_size(writer, res, response_type_id).await,
             Response::ProtocolError(res) => write_fixed_size(writer, res, response_type_id).await,
             Response::Write(res) => write_fixed_size(writer, res, response_type_id).await,
+            Response::UpdateCacheLimits(res) => write_fixed_size(writer, res, response_type_id).await,
             _ => unreachable!(),
         }
     } else {

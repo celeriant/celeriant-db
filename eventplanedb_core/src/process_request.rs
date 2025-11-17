@@ -2,7 +2,7 @@ use std::{path::{Path}, time::Duration, num::NonZeroUsize};
 
 use glommio::spawn_local;
 use log::{error};
-use eventplanedb_structures::{aggregate_info::AggregateInfo, aggregate_key::AggregateKey, batch_metadata_item_pair::BatchMetadataItemPair, directory_filters::DirectoryFilters, eventplanedb_error::EventPlaneDBError, organisation::Organisation, read_all_result::ReadAllResult, read_result::ReadResult, request::{DeleteRequest, ListAggregatesRequest, ListOrganisationsRequest, ReadAllRequest, ReadRequest, Request, TrimStartRequest, WriteBatchesRequest, WriteRequest}, response::{DeleteResponse, ExistsResponse, ListAggregatesResponse, ListOrganisationsResponse, ReadAllResponse, ReadResponse, Response, TrimStartResponse, WriteBatchesResponse, WriteResponse}};
+use eventplanedb_structures::{aggregate_info::AggregateInfo, aggregate_key::AggregateKey, batch_metadata_item_pair::BatchMetadataItemPair, directory_filters::DirectoryFilters, eventplanedb_error::EventPlaneDBError, organisation::Organisation, read_all_result::ReadAllResult, read_result::ReadResult, request::{DeleteRequest, ListAggregatesRequest, ListOrganisationsRequest, ReadAllRequest, ReadRequest, Request, TrimStartRequest, UpdateCacheLimitsRequest, WriteBatchesRequest, WriteRequest}, response::{DeleteResponse, ExistsResponse, ListAggregatesResponse, ListOrganisationsResponse, ReadAllResponse, ReadResponse, Response, TrimStartResponse, UpdateCacheLimitsResponse, WriteBatchesResponse, WriteResponse}};
 
 use crate::{cache::aggregate_cache::AggregateCache, read_operations::{read_operations::ReadOperations, read_structures::AggregateReadConfig}, write_operations::{write_operations::WriteOperations, write_structures::{AggregateWriteConfig, WriteOptions}}};
 
@@ -35,6 +35,25 @@ impl ProcessRequest {
 
     pub async fn process(&self, request: Request, max_event_batches_response_size: Option<usize>) -> Response {
         match request {
+
+            Request::UpdateCacheLimits(request) => {
+                let correlation_id = request.correlation_id;
+                let result = self.handle_update_cache_limits(request).await;
+
+                match result {
+                    Ok(accepted) => Response::UpdateCacheLimits(UpdateCacheLimitsResponse {
+                        correlation_id,
+                        error: None,
+                        accepted,
+                    }),
+                    Err(e) => Response::UpdateCacheLimits(UpdateCacheLimitsResponse {
+                        correlation_id,
+                        error: Some(e),
+                        accepted: false,
+                    }),
+                }
+            }
+            
             Request::Write(request) => {
                 let correlation_id = request.correlation_id;
                 let result = self.handle_write(request).await;
@@ -236,6 +255,49 @@ impl ProcessRequest {
             batches,
             next_event_batch_index: read_result.next_event_batch_index,
         })
+    }
+
+    async fn handle_update_cache_limits(
+        &self,
+        request: UpdateCacheLimitsRequest,
+    ) -> Result<bool, EventPlaneDBError> {
+        // Update the stored configs for new aggregates
+        let new_read_config = AggregateReadConfig {
+            max_chunk_size: self.aggregate_cache.aggregate_read_config.borrow().max_chunk_size,
+            max_data_cache_size_bytes: request.aggregate_read_max_data_cache_size_bytes as usize,
+        };
+
+        let new_write_config = AggregateWriteConfig {
+            max_data_cache_size_bytes: request.aggregate_write_max_data_cache_size_bytes as usize,
+            cache_trim_factor: self.aggregate_cache.aggregate_write_config.borrow().cache_trim_factor,
+            max_chunk_size: self.aggregate_cache.aggregate_write_config.borrow().max_chunk_size,
+        };
+
+        // Update configs for new aggregates
+        self.aggregate_cache.update_configs(new_read_config, new_write_config);
+
+        // Update all existing cached aggregates
+        let keys = self.aggregate_cache.get_all_keys();
+        
+        for key in keys {
+            let aggregate_resources = self.aggregate_cache.get(&key);
+            
+            // Update reader cache limit
+            if let Ok(mut reader) = aggregate_resources.get_reader_mut(false).await {
+                if let Some(r_reader) = reader.as_mut() {
+                    r_reader.update_max_data_cache_size_bytes(request.aggregate_read_max_data_cache_size_bytes as usize);
+                }
+            }
+            
+            // Update writer cache limit
+            if let Ok(mut writer) = aggregate_resources.get_writer_mut(false).await {
+                if let Some(r_writer) = writer.as_mut() {
+                    r_writer.update_max_data_cache_size_bytes(request.aggregate_write_max_data_cache_size_bytes as usize);
+                }
+            }
+        }
+
+        Ok(true)
     }
 
     async fn handle_write_batches(

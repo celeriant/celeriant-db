@@ -38,6 +38,8 @@ pub struct ReadOperationsWithDmaFiles {
 
 #[allow(async_fn_in_trait)]
 pub trait ReadOperations {
+    fn update_max_data_cache_size_bytes(&mut self, value: usize);
+
     /// Reads all event batches within a specified range without applying filters.
     ///
     /// # Parameters
@@ -280,6 +282,30 @@ impl ReadOperationsWithDmaFiles {
 }
 
 impl ReadOperations for ReadOperationsWithDmaFiles {
+    
+    fn update_max_data_cache_size_bytes(&mut self, value: usize) {
+        self.config.max_data_cache_size_bytes = value;
+        
+        // Proactively trim cache if it exceeds the new size
+        let mut total_size = 0;
+        let mut keep_count = 0;
+
+        for _metadata in self.cache_metadata.iter() {
+            let entry_size = METADATA_BATCH_SIZE_BYTES as usize;
+            if total_size + entry_size > value {
+                break;
+            }
+            total_size += entry_size;
+            keep_count += 1;
+        }
+
+        // Remove oldest items from the front if cache is too large
+        if self.cache_metadata.len() > keep_count {
+            let remove_count = self.cache_metadata.len() - keep_count;
+            self.cache_metadata.drain(0..remove_count);
+        }
+    }
+
     async fn read_all(
         &self,
         minimum_available_event_batch_index: u64,

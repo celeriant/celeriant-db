@@ -12,8 +12,8 @@ use crate::write_operations::write_structures::AggregateWriteConfig;
 pub struct AggregateCache {
     aggregates_cache: Rc<RefCell<LruCache<AggregateKey, Rc<AggregateResources>>>>,
     data_root_folder: String,
-    aggregate_read_config: AggregateReadConfig,
-    aggregate_write_config: AggregateWriteConfig,
+    pub aggregate_read_config: Rc<RefCell<AggregateReadConfig>>,
+    pub aggregate_write_config: Rc<RefCell<AggregateWriteConfig>>,
 }
 
 impl AggregateCache {
@@ -26,8 +26,8 @@ impl AggregateCache {
         Self {
             aggregates_cache: Rc::new(RefCell::new(LruCache::new(capacity))),
             data_root_folder,
-            aggregate_read_config,
-            aggregate_write_config,
+            aggregate_read_config: Rc::new(RefCell::new(aggregate_read_config)),
+            aggregate_write_config: Rc::new(RefCell::new(aggregate_write_config)),
         }
     }
 
@@ -41,8 +41,8 @@ impl AggregateCache {
         let resources = Rc::new(AggregateResources::new(
             aggregate_key.clone(),
             &self.data_root_folder,
-            self.aggregate_read_config.clone(),
-            self.aggregate_write_config.clone(),
+            self.aggregate_read_config.borrow().clone(),
+            self.aggregate_write_config.borrow().clone(),
         ));
         cache.put(aggregate_key.clone(), Rc::clone(&resources));
         resources
@@ -51,5 +51,17 @@ impl AggregateCache {
     pub fn pop(&self, aggregate_key: &AggregateKey) {
         let mut cache = self.aggregates_cache.borrow_mut();
         cache.pop(aggregate_key);
+    }
+
+    pub fn get_all_keys(&self) -> Vec<AggregateKey> {
+        self.aggregates_cache.borrow()
+            .iter()
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
+    pub fn update_configs(&self, read_config: AggregateReadConfig, write_config: AggregateWriteConfig) {
+        *self.aggregate_read_config.borrow_mut() = read_config;
+        *self.aggregate_write_config.borrow_mut() = write_config;
     }
 }

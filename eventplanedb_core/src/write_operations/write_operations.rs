@@ -366,6 +366,9 @@ impl WriteOperationsWithDmaFile {
 
 #[allow(async_fn_in_trait)]
 pub trait WriteOperations {
+    
+    fn update_max_data_cache_size_bytes(&mut self, value: usize);
+
     // In case of failure during sync, we need to roll back the in-memory state
     async fn sync_with_rollback(&mut self) -> Result<(), WriteError>;
 
@@ -406,6 +409,31 @@ pub trait WriteOperations {
 /// If cached read fails, you should fall back to the AggregateReadFileOperations struct
 /// This struct never reads from disk, only appends. So it requires cache data on initialization.
 impl WriteOperations for WriteOperationsWithDmaFile {
+    
+    fn update_max_data_cache_size_bytes(&mut self, value: usize) {
+        self.max_data_cache_size_bytes = value;
+    
+        // Proactively trim cache if it exceeds the new max size
+        if self.total_cache_size_bytes > value {
+            let mut items_to_remove = 0;
+            let mut size_to_remove = 0;
+
+            for pair in self.data_cache.iter() {
+                if self.total_cache_size_bytes - size_to_remove <= value {
+                    break;
+                }
+                size_to_remove += pair.event_batch_metadata.uncompressed_size as usize;
+                items_to_remove += 1;
+            }
+
+            // Remove all items in one bulk operation
+            if items_to_remove > 0 {
+                self.data_cache.drain(..items_to_remove);
+                self.total_cache_size_bytes -= size_to_remove;
+            }
+        }
+    }
+
     // In case of failure during sync, we need to roll back the in-memory state
     async fn sync_with_rollback(&mut self) -> Result<(), WriteError> {
         match self.sync().await {

@@ -25,6 +25,7 @@ pub enum RequestType {
     WriteBatches = 7,
     TrimStart = 8,
     Delete = 9,
+    UpdateCacheLimits = 10,
 }
 
 impl RequestType {
@@ -39,6 +40,7 @@ impl RequestType {
             7 => Ok(RequestType::WriteBatches),
             8 => Ok(RequestType::TrimStart),
             9 => Ok(RequestType::Delete),
+            10 => Ok(RequestType::UpdateCacheLimits),
             _ => Err(WireError::UnknownRequestType(value)),
         }
     }
@@ -52,8 +54,16 @@ impl RequestType {
                 | RequestType::ReadAll
                 | RequestType::TrimStart
                 | RequestType::Delete
+                | RequestType::UpdateCacheLimits
         )
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub struct UpdateCacheLimitsRequest {
+    pub correlation_id: Option<u128>,
+    pub aggregate_read_max_data_cache_size_bytes: u64,
+    pub aggregate_write_max_data_cache_size_bytes: u64,
 }
 
 // Individual request structs
@@ -155,6 +165,7 @@ pub enum Request {
     WriteBatches(WriteBatchesRequest),
     TrimStart(TrimStartRequest),
     Delete(DeleteRequest),
+    UpdateCacheLimits(UpdateCacheLimitsRequest),
 }
 
 impl Request {
@@ -169,6 +180,7 @@ impl Request {
             Request::WriteBatches(_) => RequestType::WriteBatches,
             Request::TrimStart(_) => RequestType::TrimStart,
             Request::Delete(_) => RequestType::Delete,
+            Request::UpdateCacheLimits(_) => RequestType::UpdateCacheLimits,
         }
     }
 
@@ -178,6 +190,7 @@ impl Request {
         match self {
             Request::ListOrganisations(_) => 0,
             Request::ListAggregates(_) => 0,
+            Request::UpdateCacheLimits(req) => 0,
             Request::Exists(req) => req.aggregate_id,
             Request::Read(req) => req.aggregate_id,
             Request::ReadAll(req) => req.aggregate_id,
@@ -227,6 +240,9 @@ where
             RequestType::Delete => {
                 Request::Delete(wire_header.read_fixed_size(reader, &mut buffer).await?)
             }
+            RequestType::UpdateCacheLimits => {
+                Request::UpdateCacheLimits(wire_header.read_fixed_size(reader, &mut buffer).await?)
+            }
             _ => unreachable!(),
         }
     } else {
@@ -274,6 +290,7 @@ where
             Request::ReadAll(req) => write_fixed_size(writer, req, request_type_id).await,
             Request::TrimStart(req) => write_fixed_size(writer, req, request_type_id).await,
             Request::Delete(req) => write_fixed_size(writer, req, request_type_id).await,
+            Request::UpdateCacheLimits(req) => write_fixed_size(writer, req, request_type_id).await,
             _ => unreachable!(),
         }
     } else {
