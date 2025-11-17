@@ -231,7 +231,10 @@ fn main() {
                     }
                     process_tcp_stream(shard_id, nbr_shards, tcp_stream.buffered(), sender.clone(), process_request.clone(), max_request_size, max_event_batches_response_size, shutdown_flag.clone()).await;
                 }
-                Err(_) => continue,
+                Err(_) => {
+                    debug!("Shard {shard_id} timed out waiting for connection. Could also be error due to tcp connection limit on OS");
+                    glommio::timer::sleep(Duration::from_millis(10)).await;
+                },
             }
         }
 
