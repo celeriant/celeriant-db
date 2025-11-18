@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use eventplanedb_structures::{
-    event_batch_item::EventBatchItem, event_batch_metadata::EventBatchMetadata,
+    event_batch_item::EventBatchItem, event_batch_metadata::EventBatchMetadata
 };
 
 #[derive(Debug, Clone)]
@@ -27,13 +27,6 @@ pub struct AggregateReadConfig {
 pub struct CacheableReadResult {
     pub uncached_metadata_set: Vec<MetadataWithAbsolutePosition>,
     pub filtered_event_batches: Vec<EventBatchItem>,
-    pub next_event_batch_index: Option<u64>,
-}
-
-#[derive(Debug)]
-pub struct CacheableReadAllResult {
-    pub uncached_metadata_set: Vec<MetadataWithAbsolutePosition>,
-    pub batches: Vec<(EventBatchMetadata, EventBatchItem)>,
     pub next_event_batch_index: Option<u64>,
 }
 

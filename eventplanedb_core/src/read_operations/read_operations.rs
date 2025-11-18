@@ -10,7 +10,7 @@ use crate::{
         read_objects_absolute::{self, AbsoluteObjectPosition},
     },
     read_operations::read_structures::{
-        AggregateReadConfig, CacheableReadAllResult, CacheableReadResult,
+        AggregateReadConfig, CacheableReadResult,
         MetadataWithAbsolutePosition, WriteOperationsDataRequirements,
         WriteOperationsDataRequirementsAndCachedData,
     },
@@ -34,28 +34,6 @@ pub struct ReadOperationsWithDmaFiles {
 #[allow(async_fn_in_trait)]
 pub trait ReadOperations {
     fn update_max_data_cache_size_bytes(&mut self, value: usize);
-
-    /// Reads all event batches within a specified range without applying filters.
-    ///
-    /// # Parameters
-    /// * `minimum_available_event_batch_index` - The oldest event batch index still available (after any trims)
-    /// * `file_len_metadata` - Current size of the metadata file in bytes
-    /// * `file_len_event_batch` - Current size of the event batches file in bytes
-    /// * `from_event_batch_index` - Starting event batch index (inclusive)
-    /// * `to_event_batch_index` - Optional ending event batch index (inclusive). None means read to end of file
-    /// * `max_bytes` - Optional maximum compressed bytes to read. Used for pagination
-    ///
-    /// # Returns
-    /// `CacheableReadAllResult` containing uncached metadata, event batches, and next pagination index
-    async fn read_all(
-        &self,
-        minimum_available_event_batch_index: u64,
-        file_len_metadata: u64,
-        file_len_event_batch: u64,
-        from_event_batch_index: u64,
-        to_event_batch_index: Option<u64>,
-        max_bytes: Option<usize>,
-    ) -> Result<CacheableReadAllResult, ReadError>;
 
     /// Calculates the file positions (in bytes) for trimming operation.
     ///
@@ -300,96 +278,6 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
             let remove_count = self.cache_metadata.len() - keep_count;
             self.cache_metadata.drain(0..remove_count);
         }
-    }
-
-    async fn read_all(
-        &self,
-        minimum_available_event_batch_index: u64,
-        file_len_metadata: u64,
-        file_len_event_batch: u64,
-        from_event_batch_index: u64,
-        to_event_batch_index: Option<u64>,
-        max_bytes: Option<usize>,
-    ) -> Result<CacheableReadAllResult, ReadError> {
-        let (uncached_metadata_set, cached_metadata_set_snapshot) = self
-            .get_metadata_range(
-                minimum_available_event_batch_index,
-                from_event_batch_index,
-                file_len_metadata,
-                file_len_event_batch,
-                to_event_batch_index,
-            )
-            .await?;
-
-        if uncached_metadata_set.is_empty() && cached_metadata_set_snapshot.is_empty() {
-            return Ok(CacheableReadAllResult {
-                uncached_metadata_set: Vec::new(),
-                batches: Vec::new(),
-                next_event_batch_index: None,
-            });
-        }
-
-        let mut metadata_for_reading: Vec<&MetadataWithAbsolutePosition> =
-            Vec::with_capacity(uncached_metadata_set.len() + cached_metadata_set_snapshot.len());
-        metadata_for_reading.extend(uncached_metadata_set.iter());
-        metadata_for_reading.extend(cached_metadata_set_snapshot.iter());
-
-        let next_event_batch_index =
-            apply_max_bytes_pagination(&mut metadata_for_reading, max_bytes)?;
-
-        let object_positions: Vec<AbsoluteObjectPosition> = metadata_for_reading
-            .iter()
-            .map(|m| AbsoluteObjectPosition {
-                start_pos: m.event_batch_absolute_position,
-                end_pos: m.event_batch_absolute_position + m.event_batch_metadata.compressed_size,
-            })
-            .collect();
-
-        let event_batches_bytes_set = read_objects_absolute::read_objects_absolute(
-            &self.event_batches_dma_file,
-            file_len_event_batch,
-            &object_positions,
-            self.config.max_chunk_size,
-        )
-        .await?;
-
-        assert!(event_batches_bytes_set.len() == metadata_for_reading.len());
-
-        let mut batches: Vec<(EventBatchMetadata, EventBatchItem)> =
-            Vec::with_capacity(event_batches_bytes_set.len());
-
-        for (index, event_batch_bytes) in event_batches_bytes_set.iter().enumerate() {
-            let metadata = &metadata_for_reading[index].event_batch_metadata;
-            let format_version_on_disk = metadata_for_reading[index].format_version_on_disk;
-
-            let actual_crc = crc32fast::hash(event_batch_bytes);
-
-            if actual_crc != metadata.events_crc {
-                return Err(ReadError::CorruptEventBatch {
-                    expected_crc: metadata.events_crc,
-                    actual_crc,
-                    event_batch_index: metadata.event_batch_index,
-                    file_pos_event_batch: object_positions[index].start_pos,
-                    file_pos_metadata: metadata_for_reading[index].event_batch_absolute_position,
-                });
-            }
-
-            let compression_type = CompressionType::from_tuple(metadata.compression_type, None);
-            let event_batch = deserialize_event_batch_versioned(
-                event_batch_bytes,
-                compression_type,
-                metadata.uncompressed_size as usize,
-                format_version_on_disk,
-            )?;
-
-            batches.push((metadata.clone(), event_batch));
-        }
-
-        Ok(CacheableReadAllResult {
-            uncached_metadata_set,
-            batches,
-            next_event_batch_index,
-        })
     }
 
     async fn get_file_positions(

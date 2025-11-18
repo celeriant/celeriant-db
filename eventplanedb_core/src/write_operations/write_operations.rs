@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use eventplanedb_structures::{
-    append_result::AppendResult, batch_metadata_item_pair::BatchMetadataItemPair, compression_type::CompressionType, constants::{BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED, METADATA_BATCH_SIZE_BYTES}, event_batch_item::EventBatchItem, event_batch_metadata::{EventBatchMetadata, EventTypesData}, event_item::EventItem, read_filters::ReadFilters, version_aware_wire_format::to_wire_format_fixed_with_version, wire_format::{to_wire_format_variable}
+    compression_type::CompressionType, constants::{BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED, METADATA_BATCH_SIZE_BYTES}, event_batch_item::EventBatchItem, event_batch_metadata::{EventBatchMetadata, EventTypesData}, event_item::EventItem, read_filters::ReadFilters, version_aware_wire_format::to_wire_format_fixed_with_version, wire_format::to_wire_format_variable, write_result::WriteResult
 };
 use fastbloom::BloomFilter;
 use glommio::{GlommioError, io::DmaFile};
@@ -17,14 +17,19 @@ use crate::{
     },
 };
 
+pub struct CacheItem {
+    event_batch_item: EventBatchItem,
+    event_batch_metadata: EventBatchMetadata
+}
+
 pub struct WriteOperationsWithDmaFile {
     pub metadata_dma_file: DmaFile,
     pub event_batches_dma_file: DmaFile,
-    data_cache: VecDeque<BatchMetadataItemPair>,
+    pub data_cache: VecDeque<CacheItem>,
     total_cache_size_bytes: usize,
     pub minimum_available_event_batch_index: u64,
     next_event_index: u64,
-    next_event_batch_index: u64,
+    pub next_event_batch_index: u64,
     client_event_indexes: HashMap<u128, u64>,
     max_data_cache_size_bytes: usize,
     cache_trim_factor: usize,
@@ -156,8 +161,8 @@ impl WriteOperationsWithDmaFile {
                 let uncompressed_size = item.event_batch_metadata.uncompressed_size as usize;
                 self.total_cache_size_bytes += uncompressed_size;
 
-                self.data_cache.push_back(BatchMetadataItemPair {
-                    event_batch_metadata: item.event_batch_metadata,
+                self.data_cache.push_back(CacheItem {
+                    event_batch_metadata: item.event_batch_metadata,    
                     event_batch_item: item.event_batch_item,
                 });
             }
@@ -183,7 +188,7 @@ impl WriteOperationsWithDmaFile {
                 if self.total_cache_size_bytes - size_to_remove <= target_size {
                     break;
                 }
-                size_to_remove += pair.event_batch_metadata.compressed_size as usize;
+                size_to_remove += pair.event_batch_metadata.uncompressed_size as usize;
                 items_to_remove += 1;
             }
 
@@ -370,7 +375,7 @@ pub trait WriteOperations {
         &mut self,
         events: Vec<EventItem>,
         write_options: &WriteOptions,
-    ) -> Result<AppendResult, WriteError>;
+    ) -> Result<WriteResult, WriteError>;
 
     async fn trim_end(
         &mut self,
@@ -386,7 +391,8 @@ pub trait WriteOperations {
 
     async fn prepend_batches(
         &mut self,
-        event_batches: &Vec<BatchMetadataItemPair>,
+        compression_type: CompressionType,
+        event_batches: &Vec<EventBatchItem>,
     ) -> Result<(), WriteError>;
 
     fn maybe_read_cached_events(
@@ -462,7 +468,7 @@ impl WriteOperations for WriteOperationsWithDmaFile {
         &mut self,
         mut events: Vec<EventItem>,
         write_options: &WriteOptions,
-    ) -> Result<AppendResult, WriteError> {
+    ) -> Result<WriteResult, WriteError> {
         // Make sure we have at least one event to write
         if events.is_empty() {
             return Err(WriteError::EmptyEventsList);
@@ -565,7 +571,7 @@ impl WriteOperations for WriteOperationsWithDmaFile {
         self.client_event_indexes
             .insert(write_options.client_id, latest_client_event_index);
 
-        Ok(AppendResult {
+        Ok(WriteResult {
             next_event_batch_index: self.next_event_batch_index,
         })
     }
@@ -617,7 +623,8 @@ impl WriteOperations for WriteOperationsWithDmaFile {
 
     async fn prepend_batches(
         &mut self,
-        event_batches: &Vec<BatchMetadataItemPair>,
+        compression_type: CompressionType,
+        event_batches: &Vec<EventBatchItem>,
     ) -> Result<(), WriteError> {
         if event_batches.is_empty() {
             return Err(WriteError::EmptyEventsList);
@@ -625,8 +632,8 @@ impl WriteOperations for WriteOperationsWithDmaFile {
 
         // Validate contiguous event_batch_indexes
         for i in 1..event_batches.len() {
-            let prev_index = event_batches[i - 1].event_batch_metadata.event_batch_index;
-            let curr_index = event_batches[i].event_batch_metadata.event_batch_index;
+            let prev_index = event_batches[i - 1].event_batch_index;
+            let curr_index = event_batches[i].event_batch_index;
 
             if curr_index != prev_index + 1 {
                 return Err(WriteError::PrependNonContiguousBatches {
@@ -640,7 +647,6 @@ impl WriteOperations for WriteOperationsWithDmaFile {
         let last_batch_index = event_batches
             .last()
             .unwrap()
-            .event_batch_metadata
             .event_batch_index;
         if last_batch_index + 1 != self.minimum_available_event_batch_index {
             return Err(WriteError::PrependCreatesEventBatchIndexGap {
@@ -652,18 +658,34 @@ impl WriteOperations for WriteOperationsWithDmaFile {
         // Convert BatchMetadataItemPair to AppendEventBatchQueueItem
         let mut event_batches_queued = Vec::with_capacity(event_batches.len());
 
-        for pair in event_batches.iter() {
-            let metadata = &pair.event_batch_metadata;
+        for event_batch_item in event_batches.iter() {
 
-            // Serialize and compress the event batch item
-            let (_, compressed_event_batch_item) = to_wire_format_variable(
-                &pair.event_batch_item,
-                CompressionType::from_tuple(metadata.compression_type, None),
-            )?;
+            // Serialize and compress the event data
+            let (uncompressed_size, compressed_event_batch_item) =
+                to_wire_format_variable(&event_batch_item, compression_type)?;
+            let events_crc = crc32fast::hash(&compressed_event_batch_item);
 
-            // Serialize metadata
+            // Determine event types data (bloom filter or direct array)
+            let (event_types, use_bloom) = extract_unique_event_types(&event_batch_item.events);
+            let event_types_data = if use_bloom {
+                let bloom_bytes = self.create_bloom_filter_bytes(&event_batch_item.events);
+                EventTypesData::Bloom(bloom_bytes)
+            } else {
+                EventTypesData::Direct(event_types)
+            };
+
+            // Create and serialize metadata
+            let event_batch_metadata = EventBatchMetadata::from_batch_item(
+                &event_batch_item,
+                uncompressed_size as u64,
+                compressed_event_batch_item.len() as u64,
+                compression_type,
+                event_types_data,
+                events_crc,
+            );
+
             let mut metadata_bytes = [0u8; METADATA_BATCH_SIZE_BYTES];
-            to_wire_format_fixed_with_version(metadata, &mut metadata_bytes)?;
+            to_wire_format_fixed_with_version(&event_batch_metadata, &mut metadata_bytes)?;
 
             event_batches_queued.push(PrependEventBatchQueueItem {
                 compressed_event_batch_item,
@@ -676,7 +698,7 @@ impl WriteOperations for WriteOperationsWithDmaFile {
 
         // Update minimum_available_event_batch_index to the first prepended batch
         self.minimum_available_event_batch_index =
-            event_batches[0].event_batch_metadata.event_batch_index;
+            event_batches[0].event_batch_index;
 
         Ok(())
     }
@@ -695,7 +717,7 @@ impl WriteOperations for WriteOperationsWithDmaFile {
         }
 
         // Get the range of cached event batch indexes
-        let cache_min_batch_index = self.data_cache[0].event_batch_metadata.event_batch_index;
+        let cache_min_batch_index = self.data_cache[0].event_batch_item.event_batch_index;
 
         // Check if requested range is within cache
         if filters.from_event_batch_index < cache_min_batch_index {

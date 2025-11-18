@@ -1,12 +1,5 @@
 use crate::{
-    batch_metadata_item_pair::BatchMetadataItemPair,
-    compression_type::CompressionType,
-    constants::{PROTOCOL_VERSION_V2, WIRE_FIXED_BODY_SIZE},
-    directory_filters::DirectoryFilters,
-    event_item::EventItem,
-    read_filters::ReadFilters,
-    wire_error::WireError,
-    wire_header::{WireHeader, write_fixed_size, write_variable_size},
+    compression_type::CompressionType, constants::{PROTOCOL_VERSION_V2, WIRE_FIXED_BODY_SIZE}, directory_filters::DirectoryFilters, event_batch_item::EventBatchItem, event_item::EventItem, read_filters::ReadFilters, wire_error::WireError, wire_header::{WireHeader, write_fixed_size, write_variable_size}
 };
 use bincode::{Decode, Encode};
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
@@ -20,12 +13,11 @@ pub enum RequestType {
     ListAggregates = 2,
     Exists = 3,
     Read = 4,
-    ReadAll = 5,
-    Write = 6,
-    WriteBatches = 7,
-    TrimStart = 8,
-    Delete = 9,
-    UpdateCacheLimits = 10,
+    Write = 5,
+    WriteBatches = 6,
+    TrimStart = 7,
+    Delete = 8,
+    UpdateCacheLimits = 9,
 }
 
 impl RequestType {
@@ -35,12 +27,11 @@ impl RequestType {
             2 => Ok(RequestType::ListAggregates),
             3 => Ok(RequestType::Exists),
             4 => Ok(RequestType::Read),
-            5 => Ok(RequestType::ReadAll),
-            6 => Ok(RequestType::Write),
-            7 => Ok(RequestType::WriteBatches),
-            8 => Ok(RequestType::TrimStart),
-            9 => Ok(RequestType::Delete),
-            10 => Ok(RequestType::UpdateCacheLimits),
+            5 => Ok(RequestType::Write),
+            6 => Ok(RequestType::WriteBatches),
+            7 => Ok(RequestType::TrimStart),
+            8 => Ok(RequestType::Delete),
+            9 => Ok(RequestType::UpdateCacheLimits),
             _ => Err(WireError::UnknownRequestType(value)),
         }
     }
@@ -51,7 +42,6 @@ impl RequestType {
             RequestType::ListAggregates
                 | RequestType::Exists
                 | RequestType::Read
-                | RequestType::ReadAll
                 | RequestType::TrimStart
                 | RequestType::Delete
                 | RequestType::UpdateCacheLimits
@@ -99,16 +89,6 @@ pub struct ReadRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
-pub struct ReadAllRequest {
-    pub correlation_id: Option<u128>,
-    pub org_id: u128,
-    pub aggregate_type_id: u128,
-    pub aggregate_id: u128,
-    pub from_event_batch_index: u64,
-    pub to_event_batch_index: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct WriteRequest {
     pub correlation_id: Option<u128>,
     pub org_id: u128,
@@ -118,7 +98,6 @@ pub struct WriteRequest {
     pub user_id: Option<u128>,
     pub events: Vec<EventItem>,
     pub allow_create: bool,
-    pub allow_repair_corruption: bool,
     pub expected_event_batch_index: Option<u64>,
     pub enforce_client_idempotency: bool,
     pub durable_write_with_delay_us: Option<u64>,
@@ -132,9 +111,9 @@ pub struct WriteBatchesRequest {
     pub aggregate_type_id: u128,
     pub aggregate_id: u128,
     pub allow_create: bool,
-    pub allow_repair_corruption: bool,
     pub durable_write_with_delay_us: Option<u64>,
-    pub batches: Vec<BatchMetadataItemPair>,
+    pub compression_type: CompressionType,
+    pub batches: Vec<EventBatchItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
@@ -160,7 +139,6 @@ pub enum Request {
     ListAggregates(ListAggregatesRequest),
     Exists(ExistsRequest),
     Read(ReadRequest),
-    ReadAll(ReadAllRequest),
     Write(WriteRequest),
     WriteBatches(WriteBatchesRequest),
     TrimStart(TrimStartRequest),
@@ -175,7 +153,6 @@ impl Request {
             Request::ListAggregates(_) => RequestType::ListAggregates,
             Request::Exists(_) => RequestType::Exists,
             Request::Read(_) => RequestType::Read,
-            Request::ReadAll(_) => RequestType::ReadAll,
             Request::Write(_) => RequestType::Write,
             Request::WriteBatches(_) => RequestType::WriteBatches,
             Request::TrimStart(_) => RequestType::TrimStart,
@@ -193,7 +170,6 @@ impl Request {
             Request::UpdateCacheLimits(_) => 0,
             Request::Exists(req) => req.aggregate_id,
             Request::Read(req) => req.aggregate_id,
-            Request::ReadAll(req) => req.aggregate_id,
             Request::Write(req) => req.aggregate_id,
             Request::WriteBatches(req) => req.aggregate_id,
             Request::TrimStart(req) => req.aggregate_id,
@@ -230,9 +206,6 @@ where
             }
             RequestType::Read => {
                 Request::Read(wire_header.read_fixed_size(reader, &mut buffer).await?)
-            }
-            RequestType::ReadAll => {
-                Request::ReadAll(wire_header.read_fixed_size(reader, &mut buffer).await?)
             }
             RequestType::TrimStart => {
                 Request::TrimStart(wire_header.read_fixed_size(reader, &mut buffer).await?)
@@ -287,7 +260,6 @@ where
             Request::ListAggregates(req) => write_fixed_size(writer, req, request_type_id).await,
             Request::Exists(req) => write_fixed_size(writer, req, request_type_id).await,
             Request::Read(req) => write_fixed_size(writer, req, request_type_id).await,
-            Request::ReadAll(req) => write_fixed_size(writer, req, request_type_id).await,
             Request::TrimStart(req) => write_fixed_size(writer, req, request_type_id).await,
             Request::Delete(req) => write_fixed_size(writer, req, request_type_id).await,
             Request::UpdateCacheLimits(req) => write_fixed_size(writer, req, request_type_id).await,

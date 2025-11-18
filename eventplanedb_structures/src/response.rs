@@ -8,8 +8,8 @@ use crate::eventplanedb_error::EventPlaneDBError;
 use crate::wire_error::WireError;
 use crate::wire_header::{WireHeader, write_fixed_size, write_variable_size};
 use crate::{
-    aggregate_info::AggregateInfo, append_result::AppendResult, organisation::Organisation,
-    read_all_result::ReadAllResult, read_result::ReadResult,
+    aggregate_info::AggregateInfo, write_result::WriteResult, organisation::Organisation,
+    read_result::ReadResult,
 };
 
 // Response type discriminants
@@ -20,13 +20,12 @@ pub enum ResponseType {
     ListAggregates = 2,
     Exists = 3,
     Read = 4,
-    ReadAll = 5,
-    Write = 6,
-    WriteBatches = 7,
-    TrimStart = 8,
-    Delete = 9,
-    ProtocolError = 10,
-    UpdateCacheLimits = 11,
+    Write = 5,
+    WriteBatches = 6,
+    TrimStart = 7,
+    Delete = 8,
+    ProtocolError = 9,
+    UpdateCacheLimits = 10,
 }
 
 impl ResponseType {
@@ -36,13 +35,12 @@ impl ResponseType {
             2 => Ok(ResponseType::ListAggregates),
             3 => Ok(ResponseType::Exists),
             4 => Ok(ResponseType::Read),
-            5 => Ok(ResponseType::ReadAll),
-            6 => Ok(ResponseType::Write),
-            7 => Ok(ResponseType::WriteBatches),
-            8 => Ok(ResponseType::TrimStart),
-            9 => Ok(ResponseType::Delete),
-            10 => Ok(ResponseType::ProtocolError),
-            11 => Ok(ResponseType::UpdateCacheLimits),
+            5 => Ok(ResponseType::Write),
+            6 => Ok(ResponseType::WriteBatches),
+            7 => Ok(ResponseType::TrimStart),
+            8 => Ok(ResponseType::Delete),
+            9 => Ok(ResponseType::ProtocolError),
+            10 => Ok(ResponseType::UpdateCacheLimits),
             _ => Err(WireError::UnknownResponseType(value)),
         }
     }
@@ -98,17 +96,10 @@ pub struct ReadResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
-pub struct ReadAllResponse {
-    pub correlation_id: Option<u128>,
-    pub error: Option<EventPlaneDBError>,
-    pub result: Option<ReadAllResult>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct WriteResponse {
     pub correlation_id: Option<u128>,
     pub error: Option<EventPlaneDBError>,
-    pub result: Option<AppendResult>,
+    pub result: Option<WriteResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
@@ -138,7 +129,6 @@ pub enum Response {
     ListAggregates(ListAggregatesResponse),
     Exists(ExistsResponse),
     Read(ReadResponse),
-    ReadAll(ReadAllResponse),
     Write(WriteResponse),
     WriteBatches(WriteBatchesResponse),
     TrimStart(TrimStartResponse),
@@ -154,7 +144,6 @@ impl Response {
             Response::ListAggregates(_) => ResponseType::ListAggregates,
             Response::Exists(_) => ResponseType::Exists,
             Response::Read(_) => ResponseType::Read,
-            Response::ReadAll(_) => ResponseType::ReadAll,
             Response::Write(_) => ResponseType::Write,
             Response::WriteBatches(_) => ResponseType::WriteBatches,
             Response::TrimStart(_) => ResponseType::TrimStart,
@@ -216,9 +205,6 @@ where
             ResponseType::Read => {
                 Response::Read(wire_header.read_variable_size(reader, None).await?)
             }
-            ResponseType::ReadAll => {
-                Response::ReadAll(wire_header.read_variable_size(reader, None).await?)
-            }
             _ => unreachable!(),
         }
     };
@@ -259,9 +245,6 @@ where
                 write_variable_size(writer, res, response_type_id, compression_type, None).await
             }
             Response::Read(res) => {
-                write_variable_size(writer, res, response_type_id, compression_type, None).await
-            }
-            Response::ReadAll(res) => {
                 write_variable_size(writer, res, response_type_id, compression_type, None).await
             }
             _ => unreachable!(),
