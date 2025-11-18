@@ -26,7 +26,6 @@ fn build_combined_request_bytes(
         user_id: None, 
         events: events.clone(), 
         allow_create: true, 
-        allow_repair_corruption: false, 
         expected_event_batch_index: None, 
         enforce_client_idempotency: false, 
         durable_write_with_delay_us: Some(sync_delay_us), 

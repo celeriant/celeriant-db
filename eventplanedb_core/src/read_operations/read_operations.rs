@@ -1,5 +1,11 @@
 use eventplanedb_structures::{
-    compression_type::CompressionType, constants::METADATA_BATCH_SIZE_BYTES, event_batch_item::EventBatchItem, event_batch_metadata::EventBatchMetadata, read_filters::ReadFilters, version_aware_wire_format::{deserialize_event_batch_metadata_versioned, deserialize_event_batch_versioned}
+    compression_type::CompressionType,
+    constants::METADATA_BATCH_SIZE_BYTES,
+    event_batch_item::EventBatchItem,
+    read_filters::ReadFilters,
+    version_aware_wire_format::{
+        deserialize_event_batch_metadata_versioned, deserialize_event_batch_versioned,
+    },
 };
 use glommio::io::{DmaFile, OpenOptions};
 use std::{collections::HashMap, path::Path};
@@ -10,16 +16,14 @@ use crate::{
         read_objects_absolute::{self, AbsoluteObjectPosition},
     },
     read_operations::read_structures::{
-        AggregateReadConfig, CacheableReadResult,
-        MetadataWithAbsolutePosition, WriteOperationsDataRequirements,
-        WriteOperationsDataRequirementsAndCachedData,
+        AggregateReadConfig, CacheableReadResult, MetadataWithAbsolutePosition,
+        WriteOperationsDataRequirements, WriteOperationsDataRequirementsAndCachedData,
     },
 };
 use crate::{
     read_operations::in_memory_filtering::apply_event_filters,
     read_operations::{
-        in_memory_filtering::{apply_max_bytes_pagination, trim_end_if_exceeds_max_bytes},
-        read_error::ReadError,
+        in_memory_filtering::trim_end_if_exceeds_max_bytes, read_error::ReadError,
         read_structures::FilePositions,
     },
 };
@@ -230,11 +234,12 @@ impl ReadOperationsWithDmaFiles {
                 Some(actual_read_to),
                 self.config.max_chunk_size,
                 |metadata_bytes| {
-                    let (event_batch_metadata, format_version_on_disk) = deserialize_event_batch_metadata_versioned(metadata_bytes)?;
+                    let (event_batch_metadata, format_version_on_disk) =
+                        deserialize_event_batch_metadata_versioned(metadata_bytes)?;
                     uncached_metadata_set.push(MetadataWithAbsolutePosition {
                         event_batch_metadata,
                         event_batch_absolute_position: 0,
-                        format_version_on_disk
+                        format_version_on_disk,
                     });
                     Ok(())
                 },
@@ -256,10 +261,9 @@ impl ReadOperationsWithDmaFiles {
 }
 
 impl ReadOperations for ReadOperationsWithDmaFiles {
-    
     fn update_max_data_cache_size_bytes(&mut self, value: usize) {
         self.config.max_data_cache_size_bytes = value;
-        
+
         // Proactively trim cache if it exceeds the new size
         let mut total_size = 0;
         let mut keep_count = 0;
@@ -401,7 +405,8 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
                 Some(uncached_bytes),
                 self.config.max_chunk_size,
                 |metadata_bytes| {
-                    let (meta, format_version_on_disk) = deserialize_event_batch_metadata_versioned(metadata_bytes)?;
+                    let (meta, format_version_on_disk) =
+                        deserialize_event_batch_metadata_versioned(metadata_bytes)?;
 
                     if minimum_available_event_batch_index.is_none() {
                         minimum_available_event_batch_index = Some(meta.event_batch_index);
@@ -422,7 +427,7 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
                         ring.push_back(MetadataWithAbsolutePosition {
                             event_batch_metadata: meta,
                             event_batch_absolute_position: 0,
-                            format_version_on_disk
+                            format_version_on_disk,
                         });
                         if ring.len() > return_count {
                             ring.pop_front();
@@ -488,7 +493,9 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
         };
 
         // First time reading (no cache) so check for corruption
-        if cached_snapshot.len() == 0 && let Some(last_meta) = last_metadata {
+        if cached_snapshot.len() == 0
+            && let Some(last_meta) = last_metadata
+        {
             // Read the last event batch
             let last_batch_pos = AbsoluteObjectPosition {
                 start_pos: last_meta.event_batch_absolute_position,
@@ -679,11 +686,8 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
         metadata_for_reading.extend(cached_metadata_set_snapshot.iter());
 
         // Exclude metadata entries based on filters and apply max_bytes pagination
-        let next_event_batch_index: Option<u64> = trim_end_if_exceeds_max_bytes(
-            &mut metadata_for_reading,
-            &read_filters,
-            max_bytes,
-        )?;
+        let next_event_batch_index: Option<u64> =
+            trim_end_if_exceeds_max_bytes(&mut metadata_for_reading, &read_filters, max_bytes)?;
 
         // Read the actual event batches at specific positions in the file
         let object_positions: Vec<AbsoluteObjectPosition> = metadata_for_reading
@@ -728,7 +732,7 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
                 &event_batch_bytes,
                 compression_type,
                 metadata.uncompressed_size as usize,
-                format_version_on_disk
+                format_version_on_disk,
             )?;
 
             // Apply all event filters

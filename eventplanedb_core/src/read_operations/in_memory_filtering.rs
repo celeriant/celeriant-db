@@ -257,57 +257,6 @@ pub fn trim_end_if_exceeds_max_bytes(
     }
 }
 
-pub fn apply_max_bytes_pagination(
-    metadata_for_reading: &mut Vec<&MetadataWithAbsolutePosition>,
-    max_bytes: Option<usize>,
-) -> Result<Option<u64>, ReadError> {
-    let max_bytes = match max_bytes {
-        Some(limit) => limit as u64,
-        None => return Ok(None),
-    };
-
-    if metadata_for_reading.is_empty() {
-        return Ok(None);
-    }
-
-    let mut cumulative_size: u64 = 0;
-    let mut cut_index: Option<usize> = None;
-
-    for (index, batch) in metadata_for_reading.iter().enumerate() {
-        cumulative_size += batch.event_batch_metadata.compressed_size;
-
-        if cumulative_size > max_bytes {
-            cut_index = Some(index);
-            break;
-        }
-    }
-
-    if let Some(index) = cut_index {
-        let next_event_batch_index = if index < metadata_for_reading.len() {
-            Some(
-                metadata_for_reading[index]
-                    .event_batch_metadata
-                    .event_batch_index,
-            )
-        } else {
-            None
-        };
-
-        metadata_for_reading.truncate(index);
-
-        if metadata_for_reading.is_empty() {
-            return Err(ReadError::MaxBytesTooSmall {
-                current_max_bytes: max_bytes,
-                required_max_bytes: cumulative_size,
-            });
-        }
-
-        Ok(next_event_batch_index)
-    } else {
-        Ok(None)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -685,22 +634,6 @@ mod tests {
     }
 
     #[test]
-    fn apply_max_bytes_pagination_behaves_like_trim_without_filtering() {
-        let m1 = mk_mwap(mk_metadata(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 120, &[0, 0, 0, 0]));
-        let m2 = mk_mwap(mk_metadata(2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 130, &[0, 0, 0, 0]));
-        let m3 = mk_mwap(mk_metadata(3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 140, &[0, 0, 0, 0]));
-
-        let mut v = vec![&m1, &m2, &m3];
-
-        // 120+130=250 fits; adding 140 would exceed 300
-        let next = apply_max_bytes_pagination(&mut v, Some(300)).unwrap();
-        assert_eq!(next, Some(3)); // next batch index that was cut
-        assert_eq!(v.len(), 2);
-        assert_eq!(v[0].event_batch_metadata.event_batch_index, 1);
-        assert_eq!(v[1].event_batch_metadata.event_batch_index, 2);
-    }
-
-    #[test]
     fn include_event_types_empty_treated_as_no_filter() {
         let meta = mk_metadata(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, &[2, 4, 0, 0]);
         let filters = ReadFilters::new(1).include_event_types(vec![]);
@@ -716,31 +649,6 @@ mod tests {
         apply_event_filters(&mut batch, &filters);
         // No filtering took place
         assert_eq!(batch.events.len(), 2);
-    }
-
-    #[test]
-    fn apply_max_bytes_pagination_too_small_errors() {
-        let m1 = mk_mwap(mk_metadata(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 200, &[0, 0, 0, 0]));
-        let mut v = vec![&m1];
-        let err = apply_max_bytes_pagination(&mut v, Some(100)).unwrap_err();
-        match err {
-            ReadError::MaxBytesTooSmall { current_max_bytes, required_max_bytes } => {
-                assert_eq!(current_max_bytes, 100);
-                assert_eq!(required_max_bytes, 200);
-            }
-            e => panic!("unexpected error: {:?}", e),
-        }
-    }
-
-    #[test]
-    fn pagination_exact_boundary_includes_all() {
-        let m1 = mk_mwap(mk_metadata(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 100, &[0, 0, 0, 0]));
-        let m2 = mk_mwap(mk_metadata(2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 200, &[0, 0, 0, 0]));
-
-        let mut v = vec![&m1, &m2];
-        let next = apply_max_bytes_pagination(&mut v, Some(300)).unwrap();
-        assert_eq!(next, None);
-        assert_eq!(v.len(), 2);
     }
 
     #[test]
