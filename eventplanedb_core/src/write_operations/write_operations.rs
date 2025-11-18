@@ -787,8 +787,15 @@ impl WriteOperations for WriteOperationsWithDmaFile {
 
             // Check max_bytes limit if specified
             if let Some(max_bytes) = max_bytes {
-                let next_size = cumulative_size + metadata.compressed_size;
+                let next_size = cumulative_size + metadata.uncompressed_size;
                 if next_size > max_bytes as u64 {
+                    // If this is the first batch and it doesn't fit, the limit is too small
+                    if filtered_event_batches.is_empty() {
+                        return Err(WriteError::MaxBytesTooSmall {
+                            current_max_bytes: max_bytes as u64,
+                            required_max_bytes: metadata.uncompressed_size,
+                        });
+                    }
                     // Mark next batch index for pagination
                     next_event_batch_index = Some(metadata.event_batch_index);
                     break;

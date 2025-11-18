@@ -40,6 +40,10 @@ pub enum WriteError {
         to: String,
         error: std::io::Error,
     },
+    MaxBytesTooSmall {
+        current_max_bytes: u64,
+        required_max_bytes: u64,
+    },
 }
 
 impl From<WireFormatError> for WriteError {

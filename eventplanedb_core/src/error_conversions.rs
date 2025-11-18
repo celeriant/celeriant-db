@@ -27,6 +27,9 @@ impl From<ReadError> for EventPlaneDBError {
 impl From<WriteError> for EventPlaneDBError {
     fn from(e: WriteError) -> Self {        
         match e {
+            WriteError::MaxBytesTooSmall { current_max_bytes, required_max_bytes } => {
+                EventPlaneDBError::max_bytes_too_small(current_max_bytes, required_max_bytes)
+            }
             WriteError::IoError(_io_err) => EventPlaneDBError::io_error(),
             WriteError::OptimisticConcurrencyViolation { client_id, expected_event_batch_index, current_event_batch_index } => {
                 EventPlaneDBError::optimistic_concurrency_violation(client_id, expected_event_batch_index, current_event_batch_index)

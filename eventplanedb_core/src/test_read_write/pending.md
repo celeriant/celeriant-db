@@ -1,21 +1,3 @@
-### New Test File: `test_read_write/test_trimming_and_prepending.rs`
-
-This file should focus on testing the lifecycle of data archival, including removing old data and prepending historical data.
-
-*   **Trimming Start:**
-    *   `test_trim_start_successfully_removes_data`: Write several batches, call `trim_start` to remove the first few, then read to verify they are gone and the `minimum_available_event_batch_index` has been updated.
-    *   `test_trim_start_reading_trimmed_index_fails`: After a trim, attempt to read a batch index that was removed and assert that it returns an `UnavailableBatchIndex` error.
-    *   `test_trim_start_invalidates_caches`: Create reader/writers, write batches, then prepare another writer and update the reader's cache, perform a trim, then check reader and writer caches are cleared/invalidated.
-    *   `test_trim_start_then_write`: Write batches, trim some batches from start, then try to write more batches. Should succeed.
-*   **Trimming End:**
-    *   `test_trim_end_removes_recent_data`: Write several batches, call `trim_end` to remove the last few, and verify they are no longer readable.
-*   **Prepending Data:**
-    *   `test_prepend_successfully_adds_older_data`: Write batches 10-15, then prepend batches 5-9 and verify that all batches from 5 to 15 are now readable.
-    *   `test_prepend_with_index_gap_fails`: Attempt to prepend batches 5-7 when the oldest existing batch is 10, and verify it fails with a `PrependCreatesEventBatchIndexGap` error.
-    *   `test_prepend_with_non_contiguous_data_fails`: Attempt to prepend a list of batches that are not contiguous (e.g., batches 5, 6, and 8) and verify it fails with a `PrependNonContiguousBatches` error.
-*   **File Position Calculation:**
-    *   `test_get_file_positions_accurate`: Test the `get_file_positions` read operation to ensure it accurately calculates the byte offsets needed for a future `trim_start` operation.
-
 ### New Test File: `test_read_write/test_pagination.rs`
 
 This file should be dedicated to testing the `max_bytes` pagination feature for both general reads and cached reads.
