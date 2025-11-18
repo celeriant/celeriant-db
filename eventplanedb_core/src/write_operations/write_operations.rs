@@ -1,15 +1,14 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::{collections::{HashMap, HashSet, VecDeque}, fmt::Write, path::Path};
 
 use eventplanedb_structures::{
     compression_type::CompressionType, constants::{BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED, METADATA_BATCH_SIZE_BYTES}, event_batch_item::EventBatchItem, event_batch_metadata::{EventBatchMetadata, EventTypesData}, event_item::EventItem, read_filters::ReadFilters, version_aware_wire_format::to_wire_format_fixed_with_version, wire_format::to_wire_format_variable, write_result::WriteResult
 };
 use fastbloom::BloomFilter;
-use glommio::{GlommioError, io::DmaFile};
+use glommio::{GlommioError, io::{DmaFile, OpenOptions}};
 
 use crate::{
     read_operations::{
-        in_memory_filtering::{apply_event_filters, is_include_batch},
-        read_structures::{CacheableReadResult, WriteOperationsDataRequirements},
+        in_memory_filtering::{apply_event_filters, is_include_batch}, read_structures::{CacheableReadResult, WriteOperationsDataRequirements}
     },
     write_operations::{
         write_error::WriteError,
@@ -323,6 +322,19 @@ impl WriteOperationsWithDmaFile {
             temp_event_batch_file.close().await?;
         }
 
+        // Now close the OLD files to release their file descriptors
+        let old_metadata = std::mem::replace(
+            &mut self.metadata_dma_file, 
+            DmaFile::open(&temp_path_metadata).await?  // Dummy placeholder
+        );
+        old_metadata.close().await?;
+        
+        let old_event_batch = std::mem::replace(
+            &mut self.event_batches_dma_file,
+            DmaFile::open(&temp_path_event_batch).await?  // Dummy placeholder  
+        );
+        old_event_batch.close().await?;
+
         // Commit by renaming temp files over originals
         std::fs::rename(&temp_path_metadata, &metadata_file_path).map_err(|e| {
             WriteError::FileRenameFailure {
@@ -340,8 +352,8 @@ impl WriteOperationsWithDmaFile {
         })?;
 
         // Reopen files and update state
-        let new_metadata_file = DmaFile::open(&metadata_file_path).await?;
-        let new_event_batch_file = DmaFile::open(&event_batch_file_path).await?;
+        let new_metadata_file = get_existing_file_as_dma(&metadata_file_path, false).await?;
+        let new_event_batch_file = get_existing_file_as_dma(&event_batch_file_path, false).await?;
 
         // Update cached file lengths (subtract trimmed, add prepended)
         self.file_len_metadata = self
@@ -360,6 +372,23 @@ impl WriteOperationsWithDmaFile {
         Ok(())
     }
 }
+
+
+pub async fn get_existing_file_as_dma<P: AsRef<Path>>(
+    path: P,
+    create_if_not_exists: bool,
+) -> Result<DmaFile, WriteError> {
+    let dma_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(create_if_not_exists)
+        .append(false)
+        .dma_open(path)
+        .await?;
+
+    Ok(dma_file)
+}
+
 
 #[allow(async_fn_in_trait)]
 pub trait WriteOperations {
@@ -385,6 +414,7 @@ pub trait WriteOperations {
 
     async fn trim_start(
         &mut self,
+        keep_from_event_batch_index: u64,
         bytes_to_trim_metadata: u64,
         bytes_to_trim_event_batch: u64,
     ) -> Result<(), WriteError>;
@@ -610,6 +640,7 @@ impl WriteOperations for WriteOperationsWithDmaFile {
 
     async fn trim_start(
         &mut self,
+        keep_from_event_batch_index: u64,
         bytes_to_trim_metadata: u64,
         bytes_to_trim_event_batch: u64,
     ) -> Result<(), WriteError> {
@@ -617,8 +648,14 @@ impl WriteOperations for WriteOperationsWithDmaFile {
             return Ok(());
         }
 
-        self.trim_and_prepend(vec![], bytes_to_trim_metadata, bytes_to_trim_event_batch)
-            .await
+        let result =self.trim_and_prepend(vec![], bytes_to_trim_metadata, bytes_to_trim_event_batch)
+            .await?;
+
+        self.minimum_available_event_batch_index = keep_from_event_batch_index;
+        self.data_cache.clear();
+        self.total_cache_size_bytes = 0;
+
+        Ok(result)
     }
 
     async fn prepend_batches(

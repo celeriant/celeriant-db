@@ -296,14 +296,20 @@ impl ProcessRequest {
             request.aggregate_id,
         );
         let aggregate_resources = self.aggregate_cache.get(&aggregate_key);
+        let mut reader = aggregate_resources
+            .get_reader_mut(request.allow_create)
+            .await?;
         let mut writer = aggregate_resources
             .get_writer_mut(request.allow_create)
             .await?;
-        writer
-            .as_mut()
-            .unwrap()
-            .prepend_batches(request.compression_type, &request.batches)
+        let reader_ref = reader.as_mut().unwrap();
+        let writer_ref = writer.as_mut().unwrap();
+        writer_ref.prepend_batches(request.compression_type, &request.batches)
             .await?;
+        reader_ref.trim_start(
+            writer_ref.metadata_dma_file.dup().unwrap(),
+            writer_ref.event_batches_dma_file.dup().unwrap(),
+        );
 
         Ok(())
     }
@@ -601,6 +607,7 @@ impl ProcessRequest {
 
         r_writer
             .trim_start(
+                request.keep_from_event_batch_index,
                 file_positions.metadata_position,
                 file_positions.event_batch_position,
             )
