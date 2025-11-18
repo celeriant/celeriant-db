@@ -1,4 +1,4 @@
-use std::{collections::{HashMap, HashSet, VecDeque}, fmt::Write, path::Path};
+use std::{collections::{HashMap, HashSet, VecDeque}, path::Path};
 
 use eventplanedb_structures::{
     compression_type::CompressionType, constants::{BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED, METADATA_BATCH_SIZE_BYTES}, event_batch_item::EventBatchItem, event_batch_metadata::{EventBatchMetadata, EventTypesData}, event_item::EventItem, read_filters::ReadFilters, version_aware_wire_format::to_wire_format_fixed_with_version, wire_format::to_wire_format_variable, write_result::WriteResult
