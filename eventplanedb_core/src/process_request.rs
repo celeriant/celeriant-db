@@ -618,7 +618,7 @@ impl ProcessRequest {
             .dup()
             .map_err(|_e| EventPlaneDBError::io_error())?;
         let event_batches_dma_file = r_writer
-            .metadata_dma_file
+            .event_batches_dma_file
             .dup()
             .map_err(|_e| EventPlaneDBError::io_error())?;
 
