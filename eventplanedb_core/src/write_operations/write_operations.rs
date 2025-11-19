@@ -17,19 +17,19 @@ use crate::{
 };
 
 pub struct CacheItem {
-    event_batch_item: EventBatchItem,
-    event_batch_metadata: EventBatchMetadata
+    pub event_batch_item: EventBatchItem,
+    pub event_batch_metadata: EventBatchMetadata
 }
 
 pub struct WriteOperationsWithDmaFile {
     pub metadata_dma_file: DmaFile,
     pub event_batches_dma_file: DmaFile,
     pub data_cache: VecDeque<CacheItem>,
-    total_cache_size_bytes: usize,
+    pub total_cache_size_bytes: usize,
     pub minimum_available_event_batch_index: u64,
-    next_event_index: u64,
+    pub next_event_index: u64,
     pub next_event_batch_index: u64,
-    client_event_indexes: HashMap<u128, u64>,
+    pub client_event_indexes: HashMap<u128, u64>,
     max_data_cache_size_bytes: usize,
     cache_trim_factor: usize,
     max_chunk_size: usize,
