@@ -10,7 +10,6 @@ use eventplanedb_core::files::read_objects_absolute::AbsoluteObjectPosition;
 use eventplanedb_core::files::read_fixed_records_visit_const::read_fixed_records_visit_const;
 use eventplanedb_core::files::read_objects_absolute::read_objects_absolute;
 use eventplanedb_core::files::read_objects_absolute::test::create_event_batch_file;
-use eventplanedb_core::files::read_objects_absolute::test::create_fixed_record_file;
 use eventplanedb_core::files::read_objects_absolute::test::create_metadata_file;
 use eventplanedb_core::files::read_objects_absolute::test::object_sizes;
 use glommio::CpuSet;

@@ -801,8 +801,8 @@ mod test_process_request_integration {
                 let aggregate_type_id = 1;
                 let aggregate_id = 1;
 
-                // Write batches 3-5
-                for i in 3..=5 {
+                // Write batches 1-5
+                for i in 1..=5 {
                     let write_req = Request::Write(WriteRequest {
                         correlation_id: Some(i as u128),
                         org_id,
@@ -811,10 +811,10 @@ mod test_process_request_integration {
                         client_id: 100,
                         user_id: None,
                         events: create_events(i * 10, 2, i * 1000),
-                        allow_create: i == 3,
+                        allow_create: i == 1,
                         expected_event_batch_index: Some(i),
                         enforce_client_idempotency: true,
-                        durable_write_with_delay_us: Some(0),
+                        durable_write_with_delay_us: Some(20),
                         compression_type: CompressionType::None,
                     });
 
