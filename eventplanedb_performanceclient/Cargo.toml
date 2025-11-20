@@ -1,5 +1,5 @@
 [package]
-name = "eventplanedb_client"
+name = "eventplanedb_performanceclient"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true

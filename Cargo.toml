@@ -4,7 +4,8 @@ members = [
     "eventplanedb_core",
     "eventplanedb_server",
     "eventplanedb_client",
-    "eventplanedb_client_example"
+    "eventplanedb_client_example",
+    "eventplanedb_performanceclient",
 ]
 
 resolver = "2"

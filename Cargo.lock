@@ -621,6 +621,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "eventplanedb_performanceclient"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "eventplanedb_structures",
+ "rand",
+ "snap",
+]
+
+[[package]]
 name = "eventplanedb_server"
 version = "0.1.0"
 dependencies = [

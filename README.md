@@ -47,7 +47,7 @@ Simple, immutable, per-aggregate event storage on local disk.
 
 
 # Running client
-cargo run -p eventplanedb_client --release -- 127.0.0.1:10000 14096 32 200 30
+cargo run -p eventplanedb_performanceclient --release -- 127.0.0.1:10000 8000 16 40 10
 
 TCP Client (minimal work)
 Server: 127.0.0.1:10000
