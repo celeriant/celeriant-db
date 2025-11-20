@@ -46,7 +46,6 @@ fn main() {
 
     let aggregate_read_config = AggregateReadConfig {
         max_chunk_size: config.aggregate_read_max_chunk_size,
-        max_data_cache_size_bytes: config.aggregate_read_max_data_cache_size_bytes,
     };
 
     let aggregate_write_config = AggregateWriteConfig {

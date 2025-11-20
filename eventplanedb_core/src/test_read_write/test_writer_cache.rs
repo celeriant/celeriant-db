@@ -69,7 +69,7 @@ mod test_writer_cache {
             .spawn(|| async move {
                 let aggregate_read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
-                    max_data_cache_size_bytes: 1 << 20,
+                    
                 };
 
                 let aggregate_write_config = AggregateWriteConfig {
@@ -110,8 +110,8 @@ mod test_writer_cache {
                 let result = writer_ref
                     .maybe_read_cached_events(&filters, None)
                     .unwrap();
-                assert!(result.filtered_event_batches.len() >= 2);
-                for batch in &result.filtered_event_batches {
+                assert!(result.event_batches.len() >= 2);
+                for batch in &result.event_batches {
                     for event in &batch.events {
                         assert!(event.event_timestamp >= 2000 && event.event_timestamp <= 4000);
                     }
@@ -122,8 +122,8 @@ mod test_writer_cache {
                 let result = writer_ref
                     .maybe_read_cached_events(&filters, None)
                     .unwrap();
-                assert_eq!(result.filtered_event_batches.len(), 2);
-                for batch in &result.filtered_event_batches {
+                assert_eq!(result.event_batches.len(), 2);
+                for batch in &result.event_batches {
                     assert_eq!(batch.client_id, 200);
                 }
 
@@ -132,8 +132,8 @@ mod test_writer_cache {
                 let result = writer_ref
                     .maybe_read_cached_events(&filters, None)
                     .unwrap();
-                assert!(result.filtered_event_batches.len() >= 2);
-                for batch in &result.filtered_event_batches {
+                assert!(result.event_batches.len() >= 2);
+                for batch in &result.event_batches {
                     for event in &batch.events {
                         assert_eq!(event.event_type_major, 1);
                     }
@@ -146,8 +146,8 @@ mod test_writer_cache {
                 let result = writer_ref
                     .maybe_read_cached_events(&filters, None)
                     .unwrap();
-                assert_eq!(result.filtered_event_batches.len(), 2);
-                for batch in &result.filtered_event_batches {
+                assert_eq!(result.event_batches.len(), 2);
+                for batch in &result.event_batches {
                     assert_eq!(batch.client_id, 100);
                     for event in &batch.events {
                         assert_eq!(event.event_type_major, 2);
@@ -164,7 +164,7 @@ mod test_writer_cache {
             .spawn(|| async move {
                 let aggregate_read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
-                    max_data_cache_size_bytes: 1 << 20,
+                    
                 };
 
                 let aggregate_write_config = AggregateWriteConfig {
@@ -248,7 +248,7 @@ mod test_writer_cache {
             .spawn(|| async move {
                 let aggregate_read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
-                    max_data_cache_size_bytes: 1 << 20,
+                    
                 };
 
                 let aggregate_write_config = AggregateWriteConfig {
@@ -335,7 +335,7 @@ mod test_writer_cache {
             .spawn(|| async move {
                 let aggregate_read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
-                    max_data_cache_size_bytes: 1 << 20,
+                    
                 };
 
                 // Set a small cache size to trigger trimming
@@ -439,7 +439,7 @@ mod test_writer_cache {
             .spawn(|| async move {
                 let aggregate_read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
-                    max_data_cache_size_bytes: 1 << 20,
+                    
                 };
 
                 let aggregate_write_config = AggregateWriteConfig {
@@ -537,7 +537,7 @@ mod test_writer_cache {
             .spawn(|| async move {
                 let aggregate_read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
-                    max_data_cache_size_bytes: 1 << 20,
+                    
                 };
 
                 let aggregate_write_config = AggregateWriteConfig {
@@ -583,7 +583,7 @@ mod test_writer_cache {
                     let filters = ReadFilters::new(1);
                     let result = writer_ref.maybe_read_cached_events(&filters, None);
                     assert!(result.is_ok());
-                    assert_eq!(result.unwrap().filtered_event_batches.len(), 10);
+                    assert_eq!(result.unwrap().event_batches.len(), 10);
                 }
 
                 // Dynamically reduce cache size
@@ -610,7 +610,7 @@ mod test_writer_cache {
                         }
                         Ok(res) => {
                             // If we got results, they shouldn't start from batch 1
-                            assert!(res.filtered_event_batches[0].event_batch_index > 1);
+                            assert!(res.event_batches[0].event_batch_index > 1);
                         },
                         _ => panic!("wrong branch")
                     }

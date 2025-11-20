@@ -1,0 +1,41 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug simple_client",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=simple_client",
+                    "--package=eventplanedb_client_example"
+                ],
+                "filter": {
+                    "name": "simple_client",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug high_throughput",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=high_throughput",
+                    "--package=eventplanedb_client_example"
+                ],
+                "filter": {
+                    "name": "high_throughput",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}

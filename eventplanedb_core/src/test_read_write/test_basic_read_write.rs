@@ -5,7 +5,7 @@ mod test_basic_read_write {
     use uuid::Uuid;
 
     use eventplanedb_structures::{
-        aggregate_key::AggregateKey, event_item::EventItem, read_filters::ReadFilters,
+        aggregate_key::AggregateKey, event_item::EventItem, read_filters::ReadFilters, read_result::ReadResult,
     };
     use glommio::{LocalExecutorBuilder, Placement};
 
@@ -13,7 +13,7 @@ mod test_basic_read_write {
         cache::aggregate_cache::AggregateCache,
         read_operations::{
             read_operations::ReadOperations,
-            read_structures::{AggregateReadConfig, CacheableReadResult},
+            read_structures::{AggregateReadConfig},
         },
         write_operations::{
             write_error::WriteError,
@@ -22,138 +22,135 @@ mod test_basic_read_write {
         },
     };
 
-    fn check_read_1(read_result: &CacheableReadResult, event_id: u128, expected_cache_len: usize) {
-        assert_eq!(read_result.filtered_event_batches.len(), 2);
+    fn check_read_1(read_result: &ReadResult, event_id: u128) {
+        assert_eq!(read_result.event_batches.len(), 2);
 
-        assert_eq!(read_result.filtered_event_batches[0].client_id, 123);
-        assert_eq!(read_result.filtered_event_batches[0].event_batch_index, 1);
-        assert_eq!(read_result.filtered_event_batches[0].server_timestamp, 998);
-        assert_eq!(read_result.filtered_event_batches[0].user_id, None);
-        assert_eq!(read_result.filtered_event_batches[0].events.len(), 2);
+        assert_eq!(read_result.event_batches[0].client_id, 123);
+        assert_eq!(read_result.event_batches[0].event_batch_index, 1);
+        assert_eq!(read_result.event_batches[0].server_timestamp, 998);
+        assert_eq!(read_result.event_batches[0].user_id, None);
+        assert_eq!(read_result.event_batches[0].events.len(), 2);
 
         assert_eq!(
-            read_result.filtered_event_batches[0].events[0].client_event_index,
+            read_result.event_batches[0].events[0].client_event_index,
             45
         );
         assert_eq!(
-            read_result.filtered_event_batches[0].events[0].event_id,
+            read_result.event_batches[0].events[0].event_id,
             None
         );
         assert_eq!(
-            read_result.filtered_event_batches[0].events[0].event_index,
+            read_result.event_batches[0].events[0].event_index,
             1
         );
         assert_eq!(
-            read_result.filtered_event_batches[0].events[0].event_timestamp,
+            read_result.event_batches[0].events[0].event_timestamp,
             333
         );
         assert_eq!(
-            read_result.filtered_event_batches[0].events[0].event_type_major,
+            read_result.event_batches[0].events[0].event_type_major,
             2
         );
         assert_eq!(
-            read_result.filtered_event_batches[0].events[0].event_type_minor,
+            read_result.event_batches[0].events[0].event_type_minor,
             3
         );
         assert_eq!(
-            read_result.filtered_event_batches[0].events[0].event_value,
+            read_result.event_batches[0].events[0].event_value,
             vec![1, 2, 3, 4, 5].into()
         );
 
         assert_eq!(
-            read_result.filtered_event_batches[0].events[1].client_event_index,
+            read_result.event_batches[0].events[1].client_event_index,
             46
         );
         assert_eq!(
-            read_result.filtered_event_batches[0].events[1].event_id,
+            read_result.event_batches[0].events[1].event_id,
             None
         );
         assert_eq!(
-            read_result.filtered_event_batches[0].events[1].event_index,
+            read_result.event_batches[0].events[1].event_index,
             2
         );
         assert_eq!(
-            read_result.filtered_event_batches[0].events[1].event_timestamp,
+            read_result.event_batches[0].events[1].event_timestamp,
             334
         );
         assert_eq!(
-            read_result.filtered_event_batches[0].events[1].event_type_major,
+            read_result.event_batches[0].events[1].event_type_major,
             4
         );
         assert_eq!(
-            read_result.filtered_event_batches[0].events[1].event_type_minor,
+            read_result.event_batches[0].events[1].event_type_minor,
             0
         );
         assert_eq!(
-            read_result.filtered_event_batches[0].events[1].event_value,
+            read_result.event_batches[0].events[1].event_value,
             vec![6, 7, 8, 9, 10].into()
         );
 
-        assert_eq!(read_result.filtered_event_batches[1].client_id, 123);
-        assert_eq!(read_result.filtered_event_batches[1].event_batch_index, 2);
-        assert_eq!(read_result.filtered_event_batches[1].server_timestamp, 999);
-        assert_eq!(read_result.filtered_event_batches[1].user_id, Some(34343));
-        assert_eq!(read_result.filtered_event_batches[1].events.len(), 1);
+        assert_eq!(read_result.event_batches[1].client_id, 123);
+        assert_eq!(read_result.event_batches[1].event_batch_index, 2);
+        assert_eq!(read_result.event_batches[1].server_timestamp, 999);
+        assert_eq!(read_result.event_batches[1].user_id, Some(34343));
+        assert_eq!(read_result.event_batches[1].events.len(), 1);
 
         assert_eq!(
-            read_result.filtered_event_batches[1].events[0].client_event_index,
+            read_result.event_batches[1].events[0].client_event_index,
             47
         );
         assert_eq!(
-            read_result.filtered_event_batches[1].events[0].event_id,
+            read_result.event_batches[1].events[0].event_id,
             Some(event_id)
         );
         assert_eq!(
-            read_result.filtered_event_batches[1].events[0].event_index,
+            read_result.event_batches[1].events[0].event_index,
             3
         );
         assert_eq!(
-            read_result.filtered_event_batches[1].events[0].event_timestamp,
+            read_result.event_batches[1].events[0].event_timestamp,
             339
         );
         assert_eq!(
-            read_result.filtered_event_batches[1].events[0].event_type_major,
+            read_result.event_batches[1].events[0].event_type_major,
             2
         );
         assert_eq!(
-            read_result.filtered_event_batches[1].events[0].event_type_minor,
+            read_result.event_batches[1].events[0].event_type_minor,
             3
         );
         assert_eq!(
-            read_result.filtered_event_batches[1].events[0].event_value,
+            read_result.event_batches[1].events[0].event_value,
             vec![11, 12, 13].into()
         );
 
         assert_eq!(read_result.next_event_batch_index, None);
-        assert_eq!(read_result.uncached_metadata_set.len(), expected_cache_len);
     }
 
-    fn check_read_2(read_result: &CacheableReadResult, expected_cache_len: usize) {
-        assert_eq!(read_result.filtered_event_batches.len(), 0);
+    fn check_read_2(read_result: &ReadResult) {
+        assert_eq!(read_result.event_batches.len(), 0);
         assert_eq!(read_result.next_event_batch_index, None);
-        assert_eq!(read_result.uncached_metadata_set.len(), expected_cache_len); //Not affected by filters
     }
 
-    fn check_read_3(read_result: &CacheableReadResult, expected_cache_len: usize) {
-        assert_eq!(read_result.filtered_event_batches.len(), 2);
+    fn check_read_3(read_result: &ReadResult) {
+        assert_eq!(read_result.event_batches.len(), 2);
 
-        assert_eq!(read_result.filtered_event_batches[0].event_batch_index, 1);
-        assert_eq!(read_result.filtered_event_batches[0].events.len(), 1);
+        assert_eq!(read_result.event_batches[0].event_batch_index, 1);
+        assert_eq!(read_result.event_batches[0].events.len(), 1);
 
         assert_eq!(
-            read_result.filtered_event_batches[0].events[0].event_value,
+            read_result.event_batches[0].events[0].event_value,
             vec![6, 7, 8, 9, 10].into()
         );
 
-        assert_eq!(read_result.filtered_event_batches[1].event_batch_index, 2);
-        assert_eq!(read_result.filtered_event_batches[1].events.len(), 1);
+        assert_eq!(read_result.event_batches[1].event_batch_index, 2);
+        assert_eq!(read_result.event_batches[1].events.len(), 1);
         assert_eq!(
-            read_result.filtered_event_batches[1].events[0].event_value,
+            read_result.event_batches[1].events[0].event_value,
             vec![11, 12, 13].into()
         );
 
         assert_eq!(read_result.next_event_batch_index, None);
-        assert_eq!(read_result.uncached_metadata_set.len(), expected_cache_len);
     }
 
     #[test]
@@ -162,7 +159,6 @@ mod test_basic_read_write {
             .spawn(|| async move {
                 let aggregate_read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
-                    max_data_cache_size_bytes: 1 << 20,
                 };
 
                 let aggregate_write_config = AggregateWriteConfig {
@@ -267,7 +263,7 @@ mod test_basic_read_write {
                     )
                     .await
                     .unwrap();
-                check_read_3(&read_result, 2);
+                check_read_3(&read_result);
             })
             .unwrap();
         handle.join().unwrap();
@@ -279,7 +275,6 @@ mod test_basic_read_write {
             .spawn(|| async move {
                 let aggregate_read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
-                    max_data_cache_size_bytes: 1 << 20,
                 };
 
                 let aggregate_write_config = AggregateWriteConfig {
@@ -389,13 +384,13 @@ mod test_basic_read_write {
                         .unwrap()
                         .maybe_read_cached_events(&read_filters, None)
                         .unwrap();
-                    check_read_1(&cache_read, event_id, 0);
+                    check_read_1(&cache_read, event_id);
                 }
 
                 let writer = aggregate_resources.get_writer(true).await.unwrap();
                 let writer_ref = writer.as_ref().unwrap();
 
-                let read_result = {
+                {
                     let reader = aggregate_resources.get_reader(true).await.unwrap();
                     let reader_ref = reader.as_ref().unwrap();
 
@@ -410,7 +405,7 @@ mod test_basic_read_write {
                         .await
                         .unwrap();
 
-                    check_read_1(&read_result, event_id, 2);
+                    check_read_1(&read_result, event_id);
 
                     //Basic filter on metadata
                     read_filters = read_filters.exclude_client_id(123);
@@ -424,10 +419,10 @@ mod test_basic_read_write {
                         )
                         .await
                         .unwrap();
-                    check_read_2(&read_result, 2);
+                    check_read_2(&read_result);
 
                     let cache_read = writer_ref.maybe_read_cached_events(&read_filters, None).unwrap();
-                    check_read_2(&cache_read, 0);
+                    check_read_2(&cache_read);
 
                     //Basic filter on event batches
                     let mut read_filters = ReadFilters::new(1);
@@ -443,26 +438,15 @@ mod test_basic_read_write {
                         .await
                         .unwrap();
 
-                    check_read_3(&read_result, 2);
+                    check_read_3(&read_result);
 
                     let cache_result = writer_ref.maybe_read_cached_events(&read_filters, None).unwrap();
-                    check_read_3(&cache_result, 0);
-
-                    read_result
-                };
-
-                {
-                    //Let's update the cache now and check cache is used for metadata
-                    let mut reader2 = aggregate_resources.get_reader_mut(true).await.unwrap();
-                    let reader2_ref = reader2.as_mut().unwrap();
-                    reader2_ref.update_metadata_cache(read_result.uncached_metadata_set.clone());
+                    check_read_3(&cache_result);
                 }
 
                 {
-                    //Cache should be idempotent
                     let mut reader = aggregate_resources.get_reader_mut(true).await.unwrap();
                     let reader_ref = reader.as_mut().unwrap();
-                    reader_ref.update_metadata_cache(read_result.uncached_metadata_set);
                     let mut read_filters = ReadFilters::new(1);
                     read_filters = read_filters.min_event_timestamp(334);
                     let read_result = reader_ref
@@ -475,7 +459,7 @@ mod test_basic_read_write {
                         )
                         .await
                         .unwrap();
-                    check_read_3(&read_result, 0);
+                    check_read_3(&read_result);
                 }
             })
             .unwrap();

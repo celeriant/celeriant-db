@@ -42,7 +42,7 @@ mod test_process_request_integration {
 
                 let read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
-                    max_data_cache_size_bytes: 1 << 20,
+                    
                 };
 
                 let write_config = AggregateWriteConfig {
@@ -208,7 +208,7 @@ mod test_process_request_integration {
                     data_root.to_string(),
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
-                        max_data_cache_size_bytes: 1 << 20,
+                        
                     },
                     AggregateWriteConfig {
                         max_data_cache_size_bytes: 1 << 25,
@@ -311,7 +311,7 @@ mod test_process_request_integration {
                     data_root.to_string(),
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
-                        max_data_cache_size_bytes: 1 << 20,
+                        
                     },
                     AggregateWriteConfig {
                         max_data_cache_size_bytes: 1 << 25,
@@ -403,7 +403,7 @@ mod test_process_request_integration {
                     data_root.to_string(),
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
-                        max_data_cache_size_bytes: 1 << 20,
+                        
                     },
                     AggregateWriteConfig {
                         max_data_cache_size_bytes: 1 << 25,
@@ -523,7 +523,7 @@ mod test_process_request_integration {
                     data_root.to_string(),
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
-                        max_data_cache_size_bytes: 1 << 20,
+                        
                     },
                     AggregateWriteConfig {
                         max_data_cache_size_bytes: 1 << 25,
@@ -615,7 +615,7 @@ mod test_process_request_integration {
                     data_root.to_string(),
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
-                        max_data_cache_size_bytes: 1 << 20,
+                        
                     },
                     AggregateWriteConfig {
                         max_data_cache_size_bytes: 1 << 25,
@@ -646,7 +646,6 @@ mod test_process_request_integration {
                 // Update cache limits
                 let update_req = Request::UpdateCacheLimits(UpdateCacheLimitsRequest {
                     correlation_id: Some(2),
-                    aggregate_read_max_data_cache_size_bytes: 1 << 21,
                     aggregate_write_max_data_cache_size_bytes: 1 << 26,
                 });
 
@@ -699,7 +698,7 @@ mod test_process_request_integration {
                     data_root.to_string(),
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
-                        max_data_cache_size_bytes: 1 << 20,
+                        
                     },
                     AggregateWriteConfig {
                         max_data_cache_size_bytes: 1 << 25,
@@ -787,7 +786,7 @@ mod test_process_request_integration {
                     data_root.to_string(),
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
-                        max_data_cache_size_bytes: 1 << 20,
+                        
                     },
                     AggregateWriteConfig {
                         max_data_cache_size_bytes: 1 << 25,
@@ -906,7 +905,7 @@ mod test_process_request_integration {
                     data_root.to_string(),
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
-                        max_data_cache_size_bytes: 1 << 20,
+                        
                     },
                     AggregateWriteConfig {
                         max_data_cache_size_bytes: 1 << 25,
@@ -1023,7 +1022,7 @@ mod test_process_request_integration {
                     data_root.to_string(),
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
-                        max_data_cache_size_bytes: 1 << 20,
+                        
                     },
                     AggregateWriteConfig {
                         max_data_cache_size_bytes: 1 << 25,
@@ -1131,7 +1130,7 @@ mod test_process_request_integration {
                     data_root.to_string(),
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
-                        max_data_cache_size_bytes: 1 << 20,
+                        
                     },
                     AggregateWriteConfig {
                         max_data_cache_size_bytes: 1 << 25,
@@ -1217,7 +1216,7 @@ mod test_process_request_integration {
                     data_root.to_string(),
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
-                        max_data_cache_size_bytes: 1 << 20,
+                        
                     },
                     AggregateWriteConfig {
                         max_data_cache_size_bytes: 1 << 25,
@@ -1303,7 +1302,7 @@ mod test_process_request_integration {
                     data_root.to_string(),
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
-                        max_data_cache_size_bytes: 1 << 20,
+                        
                     },
                     AggregateWriteConfig {
                         max_data_cache_size_bytes: 1 << 25,

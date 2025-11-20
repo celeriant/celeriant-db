@@ -52,7 +52,6 @@ impl RequestType {
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct UpdateCacheLimitsRequest {
     pub correlation_id: Option<u128>,
-    pub aggregate_read_max_data_cache_size_bytes: u64,
     pub aggregate_write_max_data_cache_size_bytes: u64,
 }
 

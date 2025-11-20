@@ -93,7 +93,7 @@ mod test_trimming_and_prepending {
             .spawn(|| async move {
                 let aggregate_read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
-                    max_data_cache_size_bytes: 1 << 20,
+                    
                 };
 
                 let aggregate_write_config = AggregateWriteConfig {
@@ -217,17 +217,17 @@ mod test_trimming_and_prepending {
                         .await
                         .unwrap();
 
-                    assert_eq!(read_result.filtered_event_batches.len(), 3);
+                    assert_eq!(read_result.event_batches.len(), 3);
                     assert_eq!(
-                        read_result.filtered_event_batches[0].event_batch_index,
+                        read_result.event_batches[0].event_batch_index,
                         3
                     );
                     assert_eq!(
-                        read_result.filtered_event_batches[1].event_batch_index,
+                        read_result.event_batches[1].event_batch_index,
                         4
                     );
                     assert_eq!(
-                        read_result.filtered_event_batches[2].event_batch_index,
+                        read_result.event_batches[2].event_batch_index,
                         5
                     );
 
@@ -283,7 +283,7 @@ mod test_trimming_and_prepending {
 
                     //Now lets try and prepend back the trimmed batches
                     //First error condition - creating a gap
-                    let err = writer_ref.prepend_batches(CompressionType::None, &first_batch.filtered_event_batches).await.unwrap_err();
+                    let err = writer_ref.prepend_batches(CompressionType::None, &first_batch.event_batches).await.unwrap_err();
                     match err {
                         WriteError::PrependCreatesEventBatchIndexGap { 
                             provided_last_batch_index,
@@ -296,7 +296,7 @@ mod test_trimming_and_prepending {
                     }
 
                     //Second error condition - overlap
-                    let err = writer_ref.prepend_batches(CompressionType::None, &first_three_batches.filtered_event_batches).await.unwrap_err();
+                    let err = writer_ref.prepend_batches(CompressionType::None, &first_three_batches.event_batches).await.unwrap_err();
                     match err {
                         WriteError::PrependCreatesEventBatchIndexGap { 
                             provided_last_batch_index,
@@ -308,7 +308,7 @@ mod test_trimming_and_prepending {
                         _ => panic!("Expected PrependCreatesEventBatchIndexGap error, got {:?}", err),
                     }
 
-                    writer_ref.prepend_batches(CompressionType::Snappy, &first_two_batches.filtered_event_batches).await.unwrap();
+                    writer_ref.prepend_batches(CompressionType::Snappy, &first_two_batches.event_batches).await.unwrap();
                     reader_ref.trim_start(
                         writer_ref.metadata_dma_file.dup().unwrap(),
                         writer_ref.event_batches_dma_file.dup().unwrap(),
@@ -332,13 +332,13 @@ mod test_trimming_and_prepending {
                         )
                         .await.unwrap();
 
-                    assert_eq!(read_result.filtered_event_batches.len(), 6);
+                    assert_eq!(read_result.event_batches.len(), 6);
                     assert_eq!(
-                        read_result.filtered_event_batches[0].event_batch_index,
+                        read_result.event_batches[0].event_batch_index,
                         1
                     );
                     assert_eq!(
-                        read_result.filtered_event_batches[5].event_batch_index,
+                        read_result.event_batches[5].event_batch_index,
                         6
                     );
                 }

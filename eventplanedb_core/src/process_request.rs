@@ -237,7 +237,6 @@ impl ProcessRequest {
                 .aggregate_read_config
                 .borrow()
                 .max_chunk_size,
-            max_data_cache_size_bytes: request.aggregate_read_max_data_cache_size_bytes as usize,
         };
 
         let new_write_config = AggregateWriteConfig {
@@ -263,15 +262,6 @@ impl ProcessRequest {
 
         for key in keys {
             let aggregate_resources = self.aggregate_cache.get(&key);
-
-            // Update reader cache limit
-            if let Ok(mut reader) = aggregate_resources.get_reader_mut(false).await {
-                if let Some(r_reader) = reader.as_mut() {
-                    r_reader.update_max_data_cache_size_bytes(
-                        request.aggregate_read_max_data_cache_size_bytes as usize,
-                    );
-                }
-            }
 
             // Update writer cache limit
             if let Ok(mut writer) = aggregate_resources.get_writer_mut(false).await {
@@ -539,10 +529,7 @@ impl ProcessRequest {
             if let Ok(result) =
                 r_writer.maybe_read_cached_events(&request.filters, max_event_batches_response_size)
             {
-                return Ok(ReadResult {
-                    event_batches: result.filtered_event_batches,
-                    next_event_batch_index: result.next_event_batch_index,
-                });
+                return Ok(result);
             }
             (
                 r_writer.file_len_metadata,
@@ -569,18 +556,7 @@ impl ProcessRequest {
         //The writer cache could be empty and we have read up to the most recent event batch (although have to check again after getting write lock on writer)
         //Or there could be data in the cache but the read matches up to that data and we can insert it in front
 
-        if !read_result.uncached_metadata_set.is_empty() {
-            let mut reader = aggregate_resources.get_reader_mut(false).await?;
-            reader
-                .as_mut()
-                .unwrap()
-                .update_metadata_cache(read_result.uncached_metadata_set);
-        }
-
-        Ok(ReadResult {
-            event_batches: read_result.filtered_event_batches,
-            next_event_batch_index: read_result.next_event_batch_index,
-        })
+        Ok(read_result)
     }
 
     async fn handle_trim_start(&self, request: TrimStartRequest) -> Result<(), EventPlaneDBError> {

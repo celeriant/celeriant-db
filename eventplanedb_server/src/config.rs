@@ -26,9 +26,6 @@ pub struct EventPlaneDBConfig {
     #[arg(long, default_value_t = 32 * 1024, help = "Max chunk size for aggregate reads (32kb)")]
     pub aggregate_read_max_chunk_size: u64,
     
-    #[arg(long, default_value_t = 1024 * 1024 * 3, help = "Max data cache size for aggregate reads (3 MiB)")]
-    pub aggregate_read_max_data_cache_size_bytes: usize,
-    
     #[arg(long, default_value_t = 32 * 1024, help = "Max chunk size for aggregate writes (32kb)")]
     pub aggregate_write_max_chunk_size: usize,
     
@@ -59,7 +56,6 @@ impl Default for EventPlaneDBConfig {
             mesh_channel_size: 1024,
             num_shards: None,
             aggregate_read_max_chunk_size: 32 * 1024,
-            aggregate_read_max_data_cache_size_bytes: 1024 * 1024 * 3,
             aggregate_write_max_chunk_size: 32 * 1024,
             aggregate_write_max_data_cache_size_bytes: 1024 * 1024 * 128,
             cache_trim_factor: 10,

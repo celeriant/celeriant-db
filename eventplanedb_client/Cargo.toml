@@ -1,12 +1,21 @@
 [package]
 name = "eventplanedb_client"
-version.workspace = true
-authors.workspace = true
-edition.workspace = true
-license.workspace = true
+version = "0.1.0"
+edition = "2021"
 
 [dependencies]
-rand.workspace = true
-bincode.workspace = true
 eventplanedb_structures = { path = "../eventplanedb_structures" }
-snap.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio-util.workspace = true
+futures-lite.workspace = true
+futures.workspace = true
+
+[features]
+default = []
+ffi = []
+
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]

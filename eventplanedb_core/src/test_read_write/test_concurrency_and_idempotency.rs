@@ -44,7 +44,6 @@ mod test_concurrency_and_idempotency {
             .spawn(|| async move {
                 let aggregate_read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
-                    max_data_cache_size_bytes: 1 << 20,
                 };
 
                 let aggregate_write_config = AggregateWriteConfig {
@@ -122,7 +121,6 @@ mod test_concurrency_and_idempotency {
             .spawn(|| async move {
                 let aggregate_read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
-                    max_data_cache_size_bytes: 1 << 20,
                 };
 
                 let aggregate_write_config = AggregateWriteConfig {
@@ -200,7 +198,6 @@ mod test_concurrency_and_idempotency {
             .spawn(|| async move {
                 let aggregate_read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
-                    max_data_cache_size_bytes: 1 << 20,
                 };
 
                 let aggregate_write_config = AggregateWriteConfig {
@@ -285,7 +282,6 @@ mod test_concurrency_and_idempotency {
             .spawn(|| async move {
                 let aggregate_read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
-                    max_data_cache_size_bytes: 1 << 20,
                 };
 
                 let aggregate_write_config = AggregateWriteConfig {
@@ -349,7 +345,6 @@ mod test_concurrency_and_idempotency {
             .spawn(|| async move {
                 let aggregate_read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
-                    max_data_cache_size_bytes: 1 << 20,
                 };
 
                 let aggregate_write_config = AggregateWriteConfig {
@@ -413,7 +408,6 @@ mod test_concurrency_and_idempotency {
             .spawn(|| async move {
                 let aggregate_read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
-                    max_data_cache_size_bytes: 1 << 20,
                 };
 
                 let aggregate_write_config = AggregateWriteConfig {
@@ -493,7 +487,6 @@ mod test_concurrency_and_idempotency {
             .spawn(|| async move {
                 let aggregate_read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
-                    max_data_cache_size_bytes: 1 << 20,
                 };
 
                 let aggregate_write_config = AggregateWriteConfig {
@@ -569,7 +562,6 @@ mod test_concurrency_and_idempotency {
             .spawn(|| async move {
                 let aggregate_read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
-                    max_data_cache_size_bytes: 1 << 20,
                 };
 
                 let aggregate_write_config = AggregateWriteConfig {

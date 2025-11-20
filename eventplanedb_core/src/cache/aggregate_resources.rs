@@ -116,29 +116,18 @@ impl AggregateResources {
             return self.writer.read().await.map_err(Into::into);
         }
 
-        let uncached_metadata_set = {
-            let reader_guard = self.get_reader(create_if_not_exists).await?;
-            let reader = reader_guard.as_ref().unwrap();
-            let data_requirements = reader.get_write_operations_data_requirements().await?;
+        let reader_guard = self.get_reader(create_if_not_exists).await?;
+        let reader = reader_guard.as_ref().unwrap();
+        let data_requirements = reader.get_write_operations_data_requirements().await?;
 
-            let writer_operations = WriteOperationsWithDmaFile::open(
-                reader.metadata_dma_file.dup()?,
-                reader.event_batches_dma_file.dup()?,
-                data_requirements.write_operations_data_requirements,
-                self.aggregate_write_config.clone(),
-            )?;
+        let writer_operations = WriteOperationsWithDmaFile::open(
+            reader.metadata_dma_file.dup()?,
+            reader.event_batches_dma_file.dup()?,
+            data_requirements,
+            self.aggregate_write_config.clone(),
+        )?;
 
-            *writer_guard = Some(writer_operations);
-
-            data_requirements.uncached_metadata_set
-        };
-
-        if !uncached_metadata_set.is_empty() {
-            let mut reader_write_guard = self.reader.write().await?;
-            if let Some(reader_mut) = reader_write_guard.as_mut() {
-                reader_mut.update_metadata_cache(uncached_metadata_set);
-            }
-        }
+        *writer_guard = Some(writer_operations);
 
         drop(writer_guard);
 
@@ -174,29 +163,18 @@ impl AggregateResources {
         let mut writer_guard = self.writer.write().await?;
 
         if writer_guard.is_none() {
-            let uncached_metadata_set = {
-                let reader_guard = self.get_reader(create_if_not_exists).await?;
-                let reader = reader_guard.as_ref().unwrap();
-                let data_requirements = reader.get_write_operations_data_requirements().await?;
+            let reader_guard = self.get_reader(create_if_not_exists).await?;
+            let reader = reader_guard.as_ref().unwrap();
+            let data_requirements = reader.get_write_operations_data_requirements().await?;
 
-                let writer_operations = WriteOperationsWithDmaFile::open(
-                    reader.metadata_dma_file.dup()?,
-                    reader.event_batches_dma_file.dup()?,
-                    data_requirements.write_operations_data_requirements,
-                    self.aggregate_write_config.clone(),
-                )?;
+            let writer_operations = WriteOperationsWithDmaFile::open(
+                reader.metadata_dma_file.dup()?,
+                reader.event_batches_dma_file.dup()?,
+                data_requirements,
+                self.aggregate_write_config.clone(),
+            )?;
 
-                *writer_guard = Some(writer_operations);
-
-                data_requirements.uncached_metadata_set
-            };
-
-            if !uncached_metadata_set.is_empty() {
-                let mut reader_write_guard = self.reader.write().await?;
-                if let Some(reader_mut) = reader_write_guard.as_mut() {
-                    reader_mut.update_metadata_cache(uncached_metadata_set);
-                }
-            }
+            *writer_guard = Some(writer_operations);
         }
 
         Ok(writer_guard)

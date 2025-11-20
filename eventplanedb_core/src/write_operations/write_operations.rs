@@ -1,14 +1,14 @@
 use std::{collections::{HashMap, HashSet, VecDeque}, path::Path};
 
 use eventplanedb_structures::{
-    compression_type::CompressionType, constants::{BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED, METADATA_BATCH_SIZE_BYTES}, event_batch_item::EventBatchItem, event_batch_metadata::{EventBatchMetadata, EventTypesData}, event_item::EventItem, read_filters::ReadFilters, version_aware_wire_format::to_wire_format_fixed_with_version, wire_format::to_wire_format_variable, write_result::WriteResult
+    compression_type::CompressionType, constants::{BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED, METADATA_BATCH_SIZE_BYTES}, event_batch_item::EventBatchItem, event_batch_metadata::{EventBatchMetadata, EventTypesData}, event_item::EventItem, read_filters::ReadFilters, read_result::ReadResult, version_aware_wire_format::to_wire_format_fixed_with_version, wire_format::to_wire_format_variable, write_result::WriteResult
 };
 use fastbloom::BloomFilter;
 use glommio::{GlommioError, io::{DmaFile, OpenOptions}};
 
 use crate::{
     read_operations::{
-        in_memory_filtering::{apply_event_filters, is_include_batch}, read_structures::{CacheableReadResult, WriteOperationsDataRequirements}
+        in_memory_filtering::{apply_event_filters, is_include_batch}, read_structures::{WriteOperationsDataRequirements}
     },
     write_operations::{
         write_error::WriteError,
@@ -429,7 +429,7 @@ pub trait WriteOperations {
         &self,
         filters: &ReadFilters,
         max_bytes: Option<usize>,
-    ) -> Result<CacheableReadResult, WriteError>;
+    ) -> Result<ReadResult, WriteError>;
 }
 
 /// Allows appending new events for an aggregate. Note this doesn't handle fdatasync.
@@ -744,7 +744,7 @@ impl WriteOperations for WriteOperationsWithDmaFile {
         &self,
         filters: &ReadFilters,
         max_bytes: Option<usize>,
-    ) -> Result<CacheableReadResult, WriteError> {
+    ) -> Result<ReadResult, WriteError> {
         // Check if cache is empty
         if self.data_cache.is_empty() {
             return Err(WriteError::CacheMiss {
@@ -813,9 +813,8 @@ impl WriteOperations for WriteOperationsWithDmaFile {
             }
         }
 
-        Ok(CacheableReadResult {
-            uncached_metadata_set: Vec::new(),
-            filtered_event_batches,
+        Ok(ReadResult {
+            event_batches: filtered_event_batches,
             next_event_batch_index,
         })
     }

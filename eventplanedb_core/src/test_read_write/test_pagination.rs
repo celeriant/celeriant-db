@@ -71,7 +71,7 @@ mod test_pagination {
             .spawn(|| async move {
                 let aggregate_read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
-                    max_data_cache_size_bytes: 1 << 20,
+                    
                 };
 
                 let aggregate_write_config = AggregateWriteConfig {
@@ -129,15 +129,15 @@ mod test_pagination {
                     .unwrap();
 
                 // Should return some batches but not all
-                assert!(read_result.filtered_event_batches.len() > 0);
-                assert!(read_result.filtered_event_batches.len() < 5);
+                assert!(read_result.event_batches.len() > 0);
+                assert!(read_result.event_batches.len() < 5);
 
                 // Should have next_event_batch_index for pagination
                 assert!(read_result.next_event_batch_index.is_some());
 
                 // Verify the next index is correct
                 let last_returned_index = read_result
-                    .filtered_event_batches
+                    .event_batches
                     .last()
                     .unwrap()
                     .event_batch_index;
@@ -156,7 +156,7 @@ mod test_pagination {
             .spawn(|| async move {
                 let aggregate_read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
-                    max_data_cache_size_bytes: 1 << 20,
+                    
                 };
 
                 let aggregate_write_config = AggregateWriteConfig {
@@ -241,16 +241,16 @@ mod test_pagination {
                 };
 
                 // Verify pages don't overlap
-                let last_first_page = first_page.filtered_event_batches.last().unwrap();
-                let first_second_page = second_page.filtered_event_batches.first().unwrap();
+                let last_first_page = first_page.event_batches.last().unwrap();
+                let first_second_page = second_page.event_batches.first().unwrap();
                 assert_eq!(
                     first_second_page.event_batch_index,
                     last_first_page.event_batch_index + 1
                 );
 
                 // Verify all batches accounted for when combining pages
-                let total_first = first_page.filtered_event_batches.len();
-                let total_second = second_page.filtered_event_batches.len();
+                let total_first = first_page.event_batches.len();
+                let total_second = second_page.event_batches.len();
                 assert!(total_first + total_second <= 6);
             })
             .unwrap();
@@ -263,7 +263,7 @@ mod test_pagination {
             .spawn(|| async move {
                 let aggregate_read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
-                    max_data_cache_size_bytes: 1 << 20,
+                    
                 };
 
                 let aggregate_write_config = AggregateWriteConfig {
@@ -324,13 +324,13 @@ mod test_pagination {
                     .unwrap();
 
                 // Should only contain client_id 123 batches
-                for batch in &read_result.filtered_event_batches {
+                for batch in &read_result.event_batches {
                     assert_eq!(batch.client_id, 123);
                 }
 
                 // Should have pagination since we limited max_bytes
-                assert!(read_result.filtered_event_batches.len() > 0);
-                assert!(read_result.filtered_event_batches.len() < 3); // 3 batches match filter
+                assert!(read_result.event_batches.len() > 0);
+                assert!(read_result.event_batches.len() < 3); // 3 batches match filter
                 assert!(read_result.next_event_batch_index.is_some());
             })
             .unwrap();
@@ -343,7 +343,7 @@ mod test_pagination {
             .spawn(|| async move {
                 let aggregate_read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
-                    max_data_cache_size_bytes: 1 << 20,
+                    
                 };
 
                 let aggregate_write_config = AggregateWriteConfig {
@@ -392,14 +392,14 @@ mod test_pagination {
                     .unwrap();
 
                 // Should return only first 2 batches
-                assert!(cache_read.filtered_event_batches.len() <= 2);
-                assert!(cache_read.filtered_event_batches.len() > 0);
+                assert!(cache_read.event_batches.len() <= 2);
+                assert!(cache_read.event_batches.len() > 0);
 
                 // Should have next_event_batch_index
                 assert!(cache_read.next_event_batch_index.is_some());
 
                 // Verify batches are in order
-                for (i, batch) in cache_read.filtered_event_batches.iter().enumerate() {
+                for (i, batch) in cache_read.event_batches.iter().enumerate() {
                     assert_eq!(batch.event_batch_index, (i + 1) as u64);
                 }
 
@@ -411,8 +411,8 @@ mod test_pagination {
                     .unwrap();
 
                 // Verify no overlap
-                let last_page_1 = cache_read.filtered_event_batches.last().unwrap();
-                let first_page_2 = cache_read_page_2.filtered_event_batches.first().unwrap();
+                let last_page_1 = cache_read.event_batches.last().unwrap();
+                let first_page_2 = cache_read_page_2.event_batches.first().unwrap();
                 assert_eq!(
                     first_page_2.event_batch_index,
                     last_page_1.event_batch_index + 1
@@ -428,7 +428,7 @@ mod test_pagination {
             .spawn(|| async move {
                 let aggregate_read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
-                    max_data_cache_size_bytes: 1 << 20,
+                    
                 };
 
                 let aggregate_write_config = AggregateWriteConfig {
@@ -517,7 +517,7 @@ mod test_pagination {
             .spawn(|| async move {
                 let aggregate_read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
-                    max_data_cache_size_bytes: 1 << 20,
+                    
                 };
 
                 let aggregate_write_config = AggregateWriteConfig {
@@ -574,7 +574,7 @@ mod test_pagination {
                     .unwrap();
 
                 // Should return all 3 batches
-                assert_eq!(read_result.filtered_event_batches.len(), 3);
+                assert_eq!(read_result.event_batches.len(), 3);
 
                 // Should NOT have next_event_batch_index since all fit
                 assert_eq!(read_result.next_event_batch_index, None);
@@ -589,7 +589,7 @@ mod test_pagination {
             .spawn(|| async move {
                 let aggregate_read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
-                    max_data_cache_size_bytes: 1 << 20,
+                    
                 };
 
                 let aggregate_write_config = AggregateWriteConfig {
@@ -647,7 +647,7 @@ mod test_pagination {
                     .unwrap();
 
                 // Verify all returned batches match the timestamp filter
-                for batch in &read_result.filtered_event_batches {
+                for batch in &read_result.event_batches {
                     for event in &batch.events {
                         assert!(event.event_timestamp >= 1200);
                     }

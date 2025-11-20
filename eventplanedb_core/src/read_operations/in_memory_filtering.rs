@@ -192,7 +192,7 @@ fn bloom_filter_from_bytes(bloom_bytes: &[u64; BLOOM_BYTES / 8]) -> BloomFilter 
 }
 
 pub fn trim_end_if_exceeds_max_bytes(
-    metadata_for_reading: &mut Vec<&MetadataWithAbsolutePosition>,
+    metadata_for_reading: &mut Vec<MetadataWithAbsolutePosition>,
     read_filters: &ReadFilters,
     max_bytes: Option<usize>,
 ) -> Result<Option<u64>, ReadError> {
@@ -592,7 +592,7 @@ mod tests {
         let m2 = mk_mwap(mk_metadata(11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 200, &[0, 0, 0, 0]));
         let m3 = mk_mwap(mk_metadata(12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 300, &[0, 0, 0, 0]));
 
-        let mut v = vec![&m1, &m2, &m3];
+        let mut v = vec![m1, m2, m3];
 
         // No additional filtering (include all)
         let filters = ReadFilters::new(1);
@@ -608,7 +608,7 @@ mod tests {
         let m1 = mk_mwap(mk_metadata(5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 100, &[0, 0, 0, 0]));
         let m2 = mk_mwap(mk_metadata(6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 150, &[0, 0, 0, 0]));
 
-        let mut v = vec![&m1, &m2];
+        let mut v = vec![m1, m2];
         let filters = ReadFilters::new(1);
 
         let next = trim_end_if_exceeds_max_bytes(&mut v, &filters, Some(300)).unwrap();
@@ -620,7 +620,7 @@ mod tests {
     fn trim_end_if_exceeds_max_bytes_too_small_errors() {
         // Single batch size=200; max_bytes=100 -> error
         let m1 = mk_mwap(mk_metadata(99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 200, &[0, 0, 0, 0]));
-        let mut v = vec![&m1];
+        let mut v = vec![m1];
         let filters = ReadFilters::new(1);
 
         let err = trim_end_if_exceeds_max_bytes(&mut v, &filters, Some(100)).unwrap_err();
@@ -654,7 +654,7 @@ mod tests {
     #[test]
     fn trim_end_if_exceeds_max_bytes_filters_out_all_returns_none() {
         let m1 = mk_mwap(mk_metadata(10, 1000, 1, 2, 0, 0, 0, 0, 0, 0, 100, &[2, 0, 0, 0]));
-        let mut v = vec![&m1];
+        let mut v = vec![m1];
 
         // Filter to a different client_id so batch gets filtered out
         let filters = ReadFilters::new(1).include_client_id(999);

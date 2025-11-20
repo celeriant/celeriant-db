@@ -1,0 +1,18 @@
+[package]
+name = "eventplanedb_client_example"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "simple_client"
+path = "src/simple_client.rs"
+
+[[bin]]
+name = "high_throughput"
+path = "src/high_throughput.rs"
+
+[dependencies]
+eventplanedb_client = { path = "../eventplanedb_client" }
+eventplanedb_structures = { path = "../eventplanedb_structures" }
+tokio.workspace = true
+chrono.workspace = true
