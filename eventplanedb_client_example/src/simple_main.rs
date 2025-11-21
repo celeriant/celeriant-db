@@ -45,16 +45,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => println!("Other error: {}", e),
     }
 
-    // Different compression for next request
-    // let request2 = Request::Read(ReadRequest { correlation_id: todo!(), org_id: todo!(), aggregate_type_id: todo!(), aggregate_id: todo!(), filters: todo!() });
-    // match client.send_request(&request2, CompressionType::None).await {
-    //     Ok(response) => println!("Success: {:?}", response),
-    //     Err(ClientError::EventPlaneDBError(e)) => {
-    //         // Handle specific EventPlaneDB errors
-    //         println!("DB Error: {:?}", e);
-    //     }
-    //     Err(e) => println!("Other error: {}", e),
-    // }
-
     Ok(())
 }

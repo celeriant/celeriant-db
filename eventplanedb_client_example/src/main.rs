@@ -6,8 +6,10 @@ use eventplanedb_structures::{
 };
 use tokio::time::Instant;
 
-const NUM_CONNECTIONS: usize = 8000;
+const NUM_CONNECTIONS: usize = 1;
 const TEST_DURATION_SECS: u64 = 30;
+const NUM_AGGREGATES: usize = 1;
+const SYNC_DELAY_US: u64 = 30;
 
 struct TaskStats {
     request_count: u64,
@@ -90,9 +92,9 @@ async fn run_connection_benchmark(connection_id: usize) -> Result<TaskStats, Str
     // Prepare the write request (reused for all requests)
     let request = Request::Write(WriteRequest { 
         correlation_id: Some(connection_id as u128), 
-        org_id: 1, 
+        org_id: 2, 
         aggregate_type_id: 1, 
-        aggregate_id: (connection_id % 16) as u128, // Spread across 1000 aggregates
+        aggregate_id: (connection_id % NUM_AGGREGATES) as u128, // Spread across 1000 aggregates
         client_id: connection_id as u128, 
         user_id: None, 
         events: vec![
@@ -109,7 +111,7 @@ async fn run_connection_benchmark(connection_id: usize) -> Result<TaskStats, Str
         allow_create: true, 
         expected_event_batch_index: None, 
         enforce_client_idempotency: false, 
-        durable_write_with_delay_us: Some(20), 
+        durable_write_with_delay_us: Some(SYNC_DELAY_US), 
         compression_type: CompressionType::None 
     });
     
@@ -122,7 +124,7 @@ async fn run_connection_benchmark(connection_id: usize) -> Result<TaskStats, Str
     while Instant::now() < deadline {
         let req_start = Instant::now();
         
-        match client.send_request(&request, CompressionType::Zstd { level: 6 }).await {
+        match client.send_request(&request, CompressionType::None).await {
             Ok(_) => {
                 let latency_us = req_start.elapsed().as_micros() as u64;
                 latencies.push(latency_us);

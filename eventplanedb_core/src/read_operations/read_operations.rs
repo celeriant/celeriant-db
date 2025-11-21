@@ -358,7 +358,7 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
             )
             .await?;
 
-            let last_actual_crc = crc32fast::hash(&last_batch_bytes[0]);
+            let last_actual_crc = crc32c::crc32c(&last_batch_bytes[0]);
             if last_meta.event_batch_metadata.events_crc != last_actual_crc {
                 return Err(ReadError::CorruptEventBatch {
                     expected_crc: last_meta.event_batch_metadata.events_crc,
@@ -447,7 +447,7 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
         for event_batch_bytes in event_batches_bytes_set.iter() {
             let metadata = &metadata_for_reading[index].event_batch_metadata;
             let format_version_on_disk = metadata_for_reading[index].format_version_on_disk;
-            let actual_crc = crc32fast::hash(&event_batch_bytes);
+            let actual_crc = crc32c::crc32c(&event_batch_bytes);
 
             if actual_crc != metadata.events_crc {
                 return Err(ReadError::CorruptEventBatch {

@@ -561,7 +561,7 @@ impl WriteOperations for WriteOperationsWithDmaFile {
         // Serialize and compress the event data
         let (uncompressed_size, compressed_event_batch_item) =
             to_wire_format_variable(&event_batch_item, write_options.compression_type)?;
-        let events_crc = crc32fast::hash(&compressed_event_batch_item);
+        let events_crc = crc32c::crc32c(&compressed_event_batch_item);
 
         // Determine event types data (bloom filter or direct array)
         let (event_types, use_bloom) = extract_unique_event_types(&event_batch_item.events);
@@ -700,7 +700,7 @@ impl WriteOperations for WriteOperationsWithDmaFile {
             // Serialize and compress the event data
             let (uncompressed_size, compressed_event_batch_item) =
                 to_wire_format_variable(&event_batch_item, compression_type)?;
-            let events_crc = crc32fast::hash(&compressed_event_batch_item);
+            let events_crc = crc32c::crc32c(&compressed_event_batch_item);
 
             // Determine event types data (bloom filter or direct array)
             let (event_types, use_bloom) = extract_unique_event_types(&event_batch_item.events);
