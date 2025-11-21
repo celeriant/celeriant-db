@@ -152,6 +152,27 @@ impl Response {
             Response::UpdateCacheLimits(_) => ResponseType::UpdateCacheLimits,
         }
     }
+
+    pub fn into_result(self) -> Result<Self, EventPlaneDBError> {
+        let error = match &self {
+            Response::ListOrganisations(r) => r.error.as_ref(),
+            Response::ListAggregates(r) => r.error.as_ref(),
+            Response::Exists(r) => r.error.as_ref(),
+            Response::Read(r) => r.error.as_ref(),
+            Response::Write(r) => r.error.as_ref(),
+            Response::WriteBatches(r) => r.error.as_ref(),
+            Response::TrimStart(r) => r.error.as_ref(),
+            Response::Delete(r) => r.error.as_ref(),
+            Response::UpdateCacheLimits(r) => r.error.as_ref(),
+            Response::ProtocolError(_) => None,
+        };
+        
+        if let Some(err) = error {
+            Err(err.clone())
+        } else {
+            Ok(self)
+        }
+    }
 }
 
 pub async fn read_response<R>(reader: &mut R) -> Result<Response, WireError>
