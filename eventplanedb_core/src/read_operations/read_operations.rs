@@ -260,7 +260,7 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
     async fn get_write_operations_data_requirements(
         &self,
     ) -> Result<WriteOperationsDataRequirements, ReadError> {
-        let mut file_len_metadata = self.metadata_dma_file.file_size().await?;
+        let file_len_metadata = self.metadata_dma_file.file_size().await?;
         let mut file_len_event_batch = self.event_batches_dma_file.file_size().await?;
 
         // No metadata in file => initial state
