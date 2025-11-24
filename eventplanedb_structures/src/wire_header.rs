@@ -1,21 +1,27 @@
 use bincode::{Decode, Encode};
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
+use serde::Serialize;
 
-use crate::{compression_type::CompressionType, constants::{PROTOCOL_VERSION_V2, WIRE_FIXED_BODY_SIZE, WIRE_HEADER_SIZE}, wire_error::WireError, wire_format::{from_wire_format_fixed, from_wire_format_variable, to_wire_format_fixed, to_wire_format_variable}};
+use crate::{compression_type::CompressionType, constants::{PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3, WIRE_FIXED_BODY_SIZE, WIRE_HEADER_SIZE}, wire_error::WireError, wire_format::{from_wire_format_fixed, from_wire_format_fixed_msgpack, from_wire_format_variable, from_wire_format_variable_msgpack, to_wire_format_fixed, to_wire_format_fixed_msgpack, to_wire_format_variable, to_wire_format_variable_msgpack}};
 
-pub async fn write_fixed_size<W, T>(writer: &mut W, message: &T, request_response_type: u32) -> Result<(), WireError>
+pub async fn write_fixed_size<W, T>(writer: &mut W, message: &T, request_response_type: u32, version: u32) -> Result<(), WireError>
 where
     W: AsyncWriteExt + Unpin,
-    T: Encode,
+    T: Encode + Serialize,
 {
     let mut buffer = [0u8; WIRE_HEADER_SIZE + WIRE_FIXED_BODY_SIZE];
     
-    // Encode message directly into the buffer after the header
-    let encoded_len = to_wire_format_fixed(message, &mut buffer[WIRE_HEADER_SIZE..])?;
+    // Encode message based on version
+    let encoded_len = match version {
+        PROTOCOL_VERSION_V2 => to_wire_format_fixed(message, &mut buffer[WIRE_HEADER_SIZE..])?,
+        PROTOCOL_VERSION_V3 => to_wire_format_fixed_msgpack(message, &mut buffer[WIRE_HEADER_SIZE..])?,
+        _ => return Err(WireError::UnsupportedProtocol(version)),
+    };
+
     let uncompressed_size = encoded_len as u32;
         
     // Write header at the beginning of the buffer
-    buffer[0..4].copy_from_slice(&PROTOCOL_VERSION_V2.to_le_bytes());
+    buffer[0..4].copy_from_slice(&version.to_le_bytes()); // Use the 'version' parameter
     buffer[4..8].copy_from_slice(&request_response_type.to_le_bytes());
     buffer[8..12].copy_from_slice(&uncompressed_size.to_le_bytes());    
     buffer[12..16].copy_from_slice(&uncompressed_size.to_le_bytes());
@@ -33,13 +39,18 @@ pub async fn write_variable_size<W, T>(
     request_response_type: u32,
     compression_type: CompressionType,
     max_request_size: Option<u32>,
+    version: u32,
 ) -> Result<(), WireError>
 where
     W: AsyncWriteExt + Unpin,
-    T: Encode,
+    T: Encode + Serialize,
 {
-    // Encode and compress
-    let (uncompressed_size, encoded) = to_wire_format_variable(message, compression_type)?;
+    // Encode and compress based on version
+    let (uncompressed_size, encoded) = match version {
+        PROTOCOL_VERSION_V2 => to_wire_format_variable(message, compression_type)?,
+        PROTOCOL_VERSION_V3 => to_wire_format_variable_msgpack(message, compression_type)?,
+        _ => return Err(WireError::UnsupportedProtocol(version)),
+    };
     
     let uncompressed_size = uncompressed_size as u32;
     let compressed_size = encoded.len() as u32;
@@ -50,13 +61,12 @@ where
     }
     
     let mut buffer = Vec::with_capacity(WIRE_HEADER_SIZE + encoded.len());
-    buffer.extend_from_slice(&PROTOCOL_VERSION_V2.to_le_bytes());
+    buffer.extend_from_slice(&version.to_le_bytes());
     buffer.extend_from_slice(&request_response_type.to_le_bytes());
     buffer.extend_from_slice(&(compressed_size).to_le_bytes());    
     buffer.extend_from_slice(&(uncompressed_size).to_le_bytes());
     buffer.extend_from_slice(&(compression_type_id).to_le_bytes());
     buffer.extend_from_slice(&encoded);
-
     writer.write_all(&buffer).await?;
 
     Ok(())
@@ -96,7 +106,7 @@ impl WireHeader {
     pub async fn read_variable_size<R, T>(&self, reader: &mut R, max_request_size: Option<u32>) -> Result<T, WireError>
     where
         R: AsyncReadExt + Unpin,
-        T: Decode<()>,
+        T: Decode<()> + serde::de::DeserializeOwned,
     {
         if let Some(max_request_size) = max_request_size && self.compressed_length > max_request_size {
             return Err(WireError::MessageTooLarge { message_length: self.compressed_length, max_request_size });
@@ -107,7 +117,11 @@ impl WireHeader {
         let mut payload = vec![0u8; compressed_length];
         reader.read_exact(&mut payload).await?;
 
-        let obj = from_wire_format_variable(&payload, self.compression_type, compressed_length)?;
+        let obj = match self.version {
+            PROTOCOL_VERSION_V2 => from_wire_format_variable(&payload, self.compression_type, compressed_length)?,
+            PROTOCOL_VERSION_V3 => from_wire_format_variable_msgpack(&payload, self.compression_type, compressed_length)?,
+            _ => return Err(WireError::UnsupportedProtocol(self.version)),
+        };
 
         Ok(obj)
     }
@@ -115,7 +129,7 @@ impl WireHeader {
     pub async fn read_fixed_size<R, T>(&self, reader: &mut R, buffer: &mut [u8]) -> Result<T, WireError>
     where
         R: AsyncReadExt + Unpin,
-        T: Decode<()>
+        T: Decode<()> + serde::de::DeserializeOwned,
     {
         let uncompressed_length = self.uncompressed_length as usize;
 
@@ -128,7 +142,11 @@ impl WireHeader {
 
         reader.read_exact(&mut buffer[..uncompressed_length]).await?;
 
-        let obj: T = from_wire_format_fixed(&buffer[..uncompressed_length])?;
+        let obj: T = match self.version {
+            PROTOCOL_VERSION_V2 => from_wire_format_fixed(&buffer[..uncompressed_length])?,
+            PROTOCOL_VERSION_V3 => from_wire_format_fixed_msgpack(&buffer[..uncompressed_length])?,
+            _ => return Err(WireError::UnsupportedProtocol(self.version)),
+        };
 
         Ok(obj)
     }

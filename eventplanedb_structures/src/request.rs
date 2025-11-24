@@ -1,5 +1,7 @@
 use crate::{
-    compression_type::CompressionType, constants::{PROTOCOL_VERSION_V2, WIRE_FIXED_BODY_SIZE}, directory_filters::DirectoryFilters, event_batch_item::EventBatchItem, event_item::EventItem, read_filters::ReadFilters, wire_error::WireError, wire_header::{WireHeader, write_fixed_size, write_variable_size}
+    compression_type::CompressionType,
+    constants::{PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3, WIRE_FIXED_BODY_SIZE},
+    directory_filters::DirectoryFilters, event_batch_item::EventBatchItem, event_item::EventItem, read_filters::ReadFilters, wire_error::WireError, wire_header::{WireHeader, write_fixed_size, write_variable_size}
 };
 use bincode::{Decode, Encode};
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
@@ -187,8 +189,12 @@ where
 {
     let wire_header = WireHeader::from_reader(reader).await?;
 
-    if wire_header.version != PROTOCOL_VERSION_V2 {
-        return Err(WireError::UnsupportedProtocol(wire_header.version));
+    // Support both V2 (bincode) and V3 (messagepack)
+    match wire_header.version {
+        PROTOCOL_VERSION_V2 | PROTOCOL_VERSION_V3 => {
+            // Version is handled inside read_fixed_size/read_variable_size
+        }
+        _ => return Err(WireError::UnsupportedProtocol(wire_header.version)),
     }
 
     let request_type = RequestType::from_u32(wire_header.message_type)?;
@@ -246,6 +252,7 @@ pub async fn write_request<W>(
     request: &Request,
     compression_type: CompressionType,
     max_message_size: u32,
+    version: u32,
 ) -> Result<(), WireError>
 where
     W: AsyncWriteExt + Unpin,
@@ -256,12 +263,12 @@ where
     if request_type.is_fixed_size() {
         // Fixed-size requests - no compression needed
         match request {
-            Request::ListAggregates(req) => write_fixed_size(writer, req, request_type_id).await,
-            Request::Exists(req) => write_fixed_size(writer, req, request_type_id).await,
-            Request::Read(req) => write_fixed_size(writer, req, request_type_id).await,
-            Request::TrimStart(req) => write_fixed_size(writer, req, request_type_id).await,
-            Request::Delete(req) => write_fixed_size(writer, req, request_type_id).await,
-            Request::UpdateCacheLimits(req) => write_fixed_size(writer, req, request_type_id).await,
+            Request::ListAggregates(req) => write_fixed_size(writer, req, request_type_id, version).await,
+            Request::Exists(req) => write_fixed_size(writer, req, request_type_id, version).await,
+            Request::Read(req) => write_fixed_size(writer, req, request_type_id, version).await,
+            Request::TrimStart(req) => write_fixed_size(writer, req, request_type_id, version).await,
+            Request::Delete(req) => write_fixed_size(writer, req, request_type_id, version).await,
+            Request::UpdateCacheLimits(req) => write_fixed_size(writer, req, request_type_id, version).await,
             _ => unreachable!(),
         }
     } else {
@@ -274,6 +281,7 @@ where
                     request_type_id,
                     compression_type,
                     Some(max_message_size),
+                    version,
                 )
                 .await
             }
@@ -284,6 +292,7 @@ where
                     request_type_id,
                     compression_type,
                     Some(max_message_size),
+                    version,
                 )
                 .await
             }
@@ -294,6 +303,7 @@ where
                     request_type_id,
                     compression_type,
                     Some(max_message_size),
+                    version,
                 )
                 .await
             }

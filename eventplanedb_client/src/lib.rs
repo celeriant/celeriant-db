@@ -7,6 +7,7 @@ use eventplanedb_structures::{
     compression_type::CompressionType,
     wire_error::WireError,
     eventplanedb_error::EventPlaneDBError,
+    constants::PROTOCOL_VERSION_V2,
 };
 
 /// Minimal, high-performance EventPlaneDB client
@@ -94,12 +95,13 @@ impl EventPlaneDBClient {
         compression_type: CompressionType,
     ) -> Result<Response, ClientError> {
         let request_future = async {
-            // Write request to server
+            // Write request to server with V2 protocol
             write_request(
                 &mut self.stream,
                 request,
                 compression_type,
                 self.max_request_size,
+                PROTOCOL_VERSION_V2,
             )
             .await?;
 
