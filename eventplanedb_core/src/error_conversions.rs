@@ -20,6 +20,7 @@ impl From<ReadError> for EventPlaneDBError {
             ReadError::CorruptMetadata { file_pos_metadata: _file_pos_metadata } => {
                 EventPlaneDBError::corrupt_metadata()
             }
+            ReadError::CreateFile(_io_err) => EventPlaneDBError::io_error(),
         }
     }
 }

@@ -5,6 +5,7 @@ use crate::files::read_fixed_records_visit_const::ReadVisitError;
 
 #[derive(Debug)]
 pub enum ReadError {
+    CreateFile(std::io::Error),
     IoError(GlommioError<()>),
     CannotCreateFolders {
         path: String,
@@ -29,6 +30,12 @@ pub enum ReadError {
         file_pos_metadata: u64,
         file_pos_event_batch: u64,
     },
+}
+
+impl From<std::io::Error> for ReadError {
+    fn from(error: std::io::Error) -> Self {
+        ReadError::CreateFile(error)
+    }
 }
 
 impl From<WireFormatError> for ReadError {

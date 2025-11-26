@@ -43,15 +43,21 @@ pub struct WriteOperationsWithDmaFile {
 }
 
 impl WriteOperationsWithDmaFile {
-    pub fn open(
-        metadata_dma_file: DmaFile,
-        event_batches_dma_file: DmaFile,
+    pub async fn open<P: AsRef<Path>>(
+        path_metadata: P,
+        path_event_batches: P,
         data_requirements: WriteOperationsDataRequirements,
         aggregate_write_config: AggregateWriteConfig,
     ) -> Result<WriteOperationsWithDmaFile, GlommioError<()>> {
         let bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8)
             .seed(&BLOOM_HASH_SEED)
             .hashes(BLOOM_HASH_COUNT);
+
+
+        let metadata_dma_file =
+            get_existing_file_as_dma(path_metadata).await?;
+        let event_batches_dma_file =
+            get_existing_file_as_dma(path_event_batches).await?;
 
         Ok(WriteOperationsWithDmaFile {
             metadata_dma_file,
@@ -382,8 +388,8 @@ impl WriteOperationsWithDmaFile {
         })?;
 
         // Reopen files and update state
-        let new_metadata_file = get_existing_file_as_dma(&metadata_file_path, false).await?;
-        let new_event_batch_file = get_existing_file_as_dma(&event_batch_file_path, false).await?;
+        let new_metadata_file = get_existing_file_as_dma(&metadata_file_path).await?;
+        let new_event_batch_file = get_existing_file_as_dma(&event_batch_file_path).await?;
 
         // Update cached file lengths (subtract trimmed, add prepended)
         self.file_len_metadata = self
@@ -406,12 +412,11 @@ impl WriteOperationsWithDmaFile {
 
 pub async fn get_existing_file_as_dma<P: AsRef<Path>>(
     path: P,
-    create_if_not_exists: bool,
-) -> Result<DmaFile, WriteError> {
+) -> Result<DmaFile, GlommioError<()>> {
     let dma_file = OpenOptions::new()
-        .read(true)
+        .read(false)
         .write(true)
-        .create(create_if_not_exists)
+        .create(false)
         .append(false)
         .dma_open(path)
         .await?;

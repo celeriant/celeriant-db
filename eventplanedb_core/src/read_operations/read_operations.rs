@@ -500,10 +500,15 @@ async fn get_existing_file_as_dma<P: AsRef<Path>>(
     path: P,
     create_if_not_exists: bool,
 ) -> Result<DmaFile, ReadError> {
+
+    if create_if_not_exists && !path.as_ref().exists() {
+        std::fs::File::create(&path)?;
+    }
+
     let dma_file = OpenOptions::new()
         .read(true)
-        .write(true)
-        .create(create_if_not_exists)
+        .write(false)
+        .create(false)
         .append(false)
         .dma_open(path)
         .await?;

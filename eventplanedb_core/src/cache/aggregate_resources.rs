@@ -121,11 +121,11 @@ impl AggregateResources {
         let data_requirements = reader.get_write_operations_data_requirements().await?;
 
         let writer_operations = WriteOperationsWithDmaFile::open(
-            reader.metadata_dma_file.dup()?,
-            reader.event_batches_dma_file.dup()?,
+            &self.path_metadata,
+            &self.path_event_batches,
             data_requirements,
             self.aggregate_write_config.clone(),
-        )?;
+        ).await?;
 
         *writer_guard = Some(writer_operations);
 
@@ -168,11 +168,11 @@ impl AggregateResources {
             let data_requirements = reader.get_write_operations_data_requirements().await?;
 
             let writer_operations = WriteOperationsWithDmaFile::open(
-                reader.metadata_dma_file.dup()?,
-                reader.event_batches_dma_file.dup()?,
+                &self.path_metadata,
+                &self.path_event_batches,
                 data_requirements,
                 self.aggregate_write_config.clone(),
-            )?;
+            ).await?;
 
             *writer_guard = Some(writer_operations);
         }

@@ -270,6 +270,81 @@ mod test_basic_read_write {
     }
 
     #[test]
+    fn super_basic() {
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
+            .spawn(|| async move {
+                let aggregate_read_config = AggregateReadConfig {
+                    max_chunk_size: 1 << 20,
+                };
+
+                let aggregate_write_config = AggregateWriteConfig {
+                    max_data_cache_size_bytes: 1 << 25,
+                    cache_trim_factor: 25,
+                    max_chunk_size: 1 << 20,
+                };
+
+                // Create the files and a writer
+                let tempdir = tempfile::tempdir().unwrap();
+                let data_root_folder = tempdir.path().to_str().unwrap();
+
+                let aggregates_cache = AggregateCache::new(
+                    NonZeroUsize::new(1000).unwrap(),
+                    data_root_folder.to_string(),
+                    aggregate_read_config,
+                    aggregate_write_config,
+                );
+                let aggregate_key = AggregateKey::new(1, 1, 1);
+                let aggregate_resources = aggregates_cache.get(&aggregate_key);
+
+                {
+                    // Write some event batches
+                    let events = vec![
+                        EventItem::new(45, 0, None, 333, 2, 3, vec![1, 2, 3, 4, 5]),
+                    ];
+                    let append_options = WriteOptions {
+                        client_id: 123,
+                        compression_type:
+                            eventplanedb_structures::compression_type::CompressionType::None,
+                        enforce_client_idempotency: true,
+                        expected_event_batch_index: Some(1),
+                        server_timestamp_millis: 998,
+                        user_id: None,
+                    };
+
+                    let mut writer = aggregate_resources.get_writer_mut(true).await.unwrap();
+                    let append_result = writer
+                        .as_mut()
+                        .unwrap()
+                        .queue_events_in_memory(events, &append_options)
+                        .unwrap();
+                    assert_eq!(append_result.next_event_batch_index, 2);
+                    writer.as_mut().unwrap().sync_with_rollback().await.unwrap();
+                }
+
+                {
+                    let writer = aggregate_resources.get_writer(true).await.unwrap();
+                    let writer_ref = writer.as_ref().unwrap();
+                    let reader = aggregate_resources.get_reader(true).await.unwrap();
+                    let reader_ref = reader.as_ref().unwrap();
+
+                    let _read_result = reader_ref
+                        .read(
+                            writer_ref.minimum_available_event_batch_index,
+                            writer_ref.file_len_metadata,
+                            writer_ref.file_len_event_batch,
+                            &ReadFilters::new(1),
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                }
+
+            })
+            .unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
     fn basic_read_write() {
         let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
             .spawn(|| async move {
