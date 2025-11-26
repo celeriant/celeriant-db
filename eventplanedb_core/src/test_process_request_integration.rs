@@ -53,6 +53,7 @@ mod test_process_request_integration {
 
                 let processor = ProcessRequest::new(
                     data_root.to_string(),
+                    100,
                     read_config,
                     write_config,
                     1000,
@@ -206,6 +207,7 @@ mod test_process_request_integration {
 
                 let processor = ProcessRequest::new(
                     data_root.to_string(),
+                    100,
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
                         
@@ -309,6 +311,7 @@ mod test_process_request_integration {
 
                 let processor = ProcessRequest::new(
                     data_root.to_string(),
+                    100,
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
                         
@@ -401,6 +404,7 @@ mod test_process_request_integration {
 
                 let processor = ProcessRequest::new(
                     data_root.to_string(),
+                    100,
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
                         
@@ -521,6 +525,7 @@ mod test_process_request_integration {
 
                 let processor = ProcessRequest::new(
                     data_root.to_string(),
+                    100,
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
                         
@@ -613,6 +618,7 @@ mod test_process_request_integration {
 
                 let processor = ProcessRequest::new(
                     data_root.to_string(),
+                    100,
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
                         
@@ -696,6 +702,7 @@ mod test_process_request_integration {
 
                 let processor = ProcessRequest::new(
                     data_root.to_string(),
+                    100,
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
                         
@@ -784,6 +791,7 @@ mod test_process_request_integration {
 
                 let processor = ProcessRequest::new(
                     data_root.to_string(),
+                    100,
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
                         
@@ -903,6 +911,7 @@ mod test_process_request_integration {
 
                 let processor = ProcessRequest::new(
                     data_root.to_string(),
+                    100,
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
                         
@@ -1020,6 +1029,7 @@ mod test_process_request_integration {
 
                 let processor = ProcessRequest::new(
                     data_root.to_string(),
+                    100,
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
                         
@@ -1128,6 +1138,7 @@ mod test_process_request_integration {
 
                 let processor = ProcessRequest::new(
                     data_root.to_string(),
+                    100,
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
                         
@@ -1214,6 +1225,7 @@ mod test_process_request_integration {
 
                 let processor = ProcessRequest::new(
                     data_root.to_string(),
+                    100,
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
                         
@@ -1300,6 +1312,7 @@ mod test_process_request_integration {
 
                 let processor = ProcessRequest::new(
                     data_root.to_string(),
+                    100,
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
                         
