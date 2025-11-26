@@ -32,12 +32,14 @@ use crate::{
 
 pub struct ProcessRequest {
     data_root_folder: String,
+    async_flush_ms: u64,
     aggregate_cache: AggregateCache,
 }
 
 impl ProcessRequest {
     pub fn new(
         data_root_folder: String,
+        async_flush_ms: u64,
         aggregate_read_config: AggregateReadConfig,
         aggregate_write_config: AggregateWriteConfig,
         max_open_aggregates: usize,
@@ -45,6 +47,7 @@ impl ProcessRequest {
         let capacity = NonZeroUsize::new(max_open_aggregates).unwrap();
         Self {
             data_root_folder: data_root_folder.clone(),
+            async_flush_ms,
             aggregate_cache: AggregateCache::new(
                 capacity,
                 data_root_folder,
@@ -491,15 +494,15 @@ impl ProcessRequest {
 
         if let Some(delay_us) = request.durable_write_with_delay_us {
             aggregate_resources
-                .sync_with_delay(Duration::from_micros(delay_us))
+                .sync_with_delay(Some(Duration::from_micros(delay_us)))
                 .await?;
         } else {
             let aggregate_resources = aggregate_resources.clone();
-            let delay_us = 200;
+            let async_flush_ms = self.async_flush_ms;
 
             spawn_local(async move {
                 let sync_result = aggregate_resources
-                    .sync_with_delay(Duration::from_micros(delay_us))
+                    .sync_with_delay(Some(Duration::from_millis(async_flush_ms)))
                     .await;
                 if let Err(e) = sync_result {
                     error!("Background sync failed: {:?}", e);

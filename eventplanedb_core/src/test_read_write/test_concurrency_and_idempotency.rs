@@ -457,7 +457,7 @@ mod test_concurrency_and_idempotency {
                     let resources = aggregate_resources.clone();
                     
                     let task = glommio::spawn_local(async move {
-                        let result = resources.sync_with_delay(sync_delay).await;
+                        let result = resources.sync_with_delay(Some(sync_delay)).await;
                         // All tasks should complete successfully
                         assert!(result.is_ok());
                     });

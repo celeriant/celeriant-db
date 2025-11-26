@@ -59,6 +59,7 @@ fn main() {
     
     let listen_address = config.listen_address.clone();
     let data_root = config.data_root.clone();
+    let async_flush_ms = config.async_flush_ms;
     let max_request_size = config.max_request_size;
     let max_event_batches_response_size = config.max_event_batches_response_size.map(|v| v as usize);
     let max_open_aggregates = config.max_open_aggregates;
@@ -70,7 +71,7 @@ fn main() {
         nbr_shards,
         online_cpus,
     ))
-    .on_all_shards(enclose!((mesh, listen_address, data_root, max_request_size, max_event_batches_response_size, max_open_aggregates) move || async move {
+    .on_all_shards(enclose!((mesh, listen_address, data_root, async_flush_ms, max_request_size, max_event_batches_response_size, max_open_aggregates) move || async move {
 
         // Join the full mesh to get this shard's sender and all receivers
         // The receivers are for receiving messages from other shards (synonymous with executors)
@@ -92,6 +93,7 @@ fn main() {
         // Each shard has its own instance of the engine
         let process_request = Rc::new(ProcessRequest::new(
             data_root.to_string_lossy().to_string(),
+            async_flush_ms,
             aggregate_read_config.clone(),
             aggregate_write_config.clone(),
             max_open_aggregates,

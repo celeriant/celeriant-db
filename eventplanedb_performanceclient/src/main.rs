@@ -17,6 +17,7 @@ fn build_combined_request_bytes(
     client_id: u128,
     events: &Vec<EventItem>,
 ) -> Vec<u8> {
+    
     let request = WriteRequest { 
         correlation_id: None, 
         org_id, 
@@ -28,7 +29,7 @@ fn build_combined_request_bytes(
         allow_create: true, 
         expected_event_batch_index: None, 
         enforce_client_idempotency: false, 
-        durable_write_with_delay_us: Some(sync_delay_us), 
+        durable_write_with_delay_us: if sync_delay_us == 0 { None } else { Some(sync_delay_us) }, 
         compression_type: eventplanedb_structures::compression_type::CompressionType::None 
     };
 

@@ -9,6 +9,9 @@ pub struct EventPlaneDBConfig {
     #[arg(long, default_value = "data", help = "Data directory path")]
     pub data_root: PathBuf,
 
+    #[arg(long, default_value_t = 100, help = "Asynchronous flush interval in milliseconds")]
+    pub async_flush_ms: u64,
+
     // Server networking / shards
     #[arg(long, default_value = "0.0.0.0:10000", help = "Server listen address")]
     pub listen_address: String,
@@ -52,6 +55,7 @@ impl Default for EventPlaneDBConfig {
     fn default() -> Self {
         Self {
             data_root: PathBuf::from("data"),
+            async_flush_ms: 100,
             listen_address: "0.0.0.0:10000".to_string(),
             mesh_channel_size: 1024,
             num_shards: None,

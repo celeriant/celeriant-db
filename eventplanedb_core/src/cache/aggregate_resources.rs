@@ -182,8 +182,19 @@ impl AggregateResources {
 
     pub async fn sync_with_delay(
         &self,
-        wal_sync_delay: Duration
+        wal_sync_delay: Option<Duration>
     ) -> SyncResult {
+
+        if wal_sync_delay.is_none() || wal_sync_delay.unwrap().as_micros() == 0 {
+            // No delay - do immediate sync
+            let mut writer = self.get_writer_mut(false).await?;
+            let r_writer = writer.as_mut().unwrap();
+            return r_writer.sync_with_rollback().await
+                .map_err(|_e| EventPlaneDBError::write_error());
+        }
+
+        let wal_sync_delay = wal_sync_delay.unwrap();
+
         // Try to become the sync coordinator
         match self.wal_sync_event.try_write() {
             Ok(mut maybe_event) => {
