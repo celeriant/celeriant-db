@@ -27,6 +27,8 @@ pub struct AggregateReadConfig {
 pub struct WriteOperationsDataRequirements {
     pub file_len_metadata: u64,
     pub file_len_event_batch: u64,
+    pub metadata_buffer: Vec<u8>,
+    pub event_batch_buffer: Vec<u8>,
     pub minimum_available_event_batch_index: u64,
     pub next_event_index: u64,
     pub next_event_batch_index: u64,

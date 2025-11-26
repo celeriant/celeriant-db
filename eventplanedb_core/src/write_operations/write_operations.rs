@@ -24,6 +24,8 @@ pub struct CacheItem {
 pub struct WriteOperationsWithDmaFile {
     pub metadata_dma_file: DmaFile,
     pub event_batches_dma_file: DmaFile,
+    pub metadata_buffer: Vec<u8>,
+    pub event_batch_buffer: Vec<u8>,
     pub data_cache: VecDeque<CacheItem>,
     pub total_cache_size_bytes: usize,
     pub minimum_available_event_batch_index: u64,
@@ -54,6 +56,8 @@ impl WriteOperationsWithDmaFile {
         Ok(WriteOperationsWithDmaFile {
             metadata_dma_file,
             event_batches_dma_file,
+            metadata_buffer: data_requirements.metadata_buffer,
+            event_batch_buffer: data_requirements.event_batch_buffer,
             data_cache: VecDeque::new(),
             total_cache_size_bytes: 0,
             next_event_batch_index: data_requirements.next_event_batch_index,
@@ -97,88 +101,114 @@ impl WriteOperationsWithDmaFile {
         let event_batches_file_size = self.event_batches_dma_file.file_size().await?;
 
         // Calculate total sizes
-        let total_event_batches_size: usize = self
+        let event_data_size_bytes: usize = self
             .append_event_batch_queue
             .iter()
             .map(|item| item.compressed_event_batch_item.len())
             .sum();
-        let total_metadata_size: usize = self
+        let meta_data_size_bytes: usize = self
             .append_event_batch_queue
             .iter()
             .map(|item| item.metadata_bytes.len())
             .sum();
 
-        // Allocate contiguous buffers
-        let mut event_buf = self
-            .event_batches_dma_file
-            .alloc_dma_buffer(total_event_batches_size);
-        let mut meta_buf = self.metadata_dma_file.alloc_dma_buffer(total_metadata_size);
 
-        // Copy event batches into buffer
-        let mut event_offset = 0;
+        // Where we start writing from in each file
+        let event_write_start_pos = self.event_batches_dma_file.align_down(event_batches_file_size);
+        let meta_write_start_pos = self.metadata_dma_file.align_down(metadata_file_size);
+
+        // Pad buffer sizes to alignment
+        let mut event_offset = (event_batches_file_size - event_write_start_pos) as usize;
+        let event_write_buffer_len = self.event_batches_dma_file.align_up((event_offset + event_data_size_bytes) as u64);
+
+        let mut meta_offset = (metadata_file_size - meta_write_start_pos) as usize;
+        let meta_write_buffer_len = self.metadata_dma_file.align_up((meta_offset + meta_data_size_bytes) as u64);
+
+        // Allocate aligned buffers
+        let mut event_buf = self.event_batches_dma_file.alloc_dma_buffer(event_write_buffer_len as usize);
+        let mut meta_buf = self.metadata_dma_file.alloc_dma_buffer(meta_write_buffer_len as usize);
+
+        // Where we must truncate the files to after writes
+        let event_final_len = event_batches_file_size + event_data_size_bytes as u64;
+        let metadata_final_len = metadata_file_size + meta_data_size_bytes as u64;
+
+        // How much remainder of data we have to include in next write for alignment
+        let event_carry_over_len = event_final_len - self.event_batches_dma_file.align_down(event_final_len);
+        let metadata_carry_over_len = metadata_final_len - self.metadata_dma_file.align_down(metadata_final_len);
+
+        // Copy existing data from self.event_batch_buffer into event_buf to preserve alignment
+        if event_offset > 0 {
+            event_buf.as_bytes_mut()[0..event_offset].copy_from_slice(&self.event_batch_buffer[0..event_offset]);        
+        }
         for item in self.append_event_batch_queue.iter() {
             let len = item.compressed_event_batch_item.len();
-            event_buf.as_bytes_mut()[event_offset..event_offset + len]
-                .copy_from_slice(&item.compressed_event_batch_item);
+            event_buf.as_bytes_mut()[event_offset..event_offset + len].copy_from_slice(&item.compressed_event_batch_item);
             event_offset += len;
         }
+        let event_carry_over = if event_carry_over_len > 0 {
+            let carry_over_start = event_offset - event_carry_over_len as usize;
+            event_buf.as_bytes()[carry_over_start..event_offset].to_vec()
+        } else {
+            Vec::new()
+        };
 
         // Copy metadata into buffer
-        let mut meta_offset = 0;
+        if meta_offset > 0 {
+            meta_buf.as_bytes_mut()[0..meta_offset].copy_from_slice(&self.metadata_buffer[0..meta_offset]);
+        }
         for item in self.append_event_batch_queue.iter() {
             let len = item.metadata_bytes.len();
             meta_buf.as_bytes_mut()[meta_offset..meta_offset + len]
                 .copy_from_slice(&item.metadata_bytes);
             meta_offset += len;
         }
+        let meta_carry_over = if metadata_carry_over_len > 0 {
+            let carry_over_start = meta_offset - metadata_carry_over_len as usize;
+            meta_buf.as_bytes()[carry_over_start..meta_offset].to_vec()
+        } else {
+            Vec::new()
+        };
 
-        let event_buf_len = event_buf.len() as u64;
-        let meta_buf_len = meta_buf.len() as u64;
-
-        // Single write_at per file
+        // Single write_at per file, using aligned sizes
         self.event_batches_dma_file
-            .write_at(event_buf, event_batches_file_size)
+            .write_at(event_buf, event_write_start_pos)
             .await?;
+        self.event_batches_dma_file.truncate(event_final_len).await?;
         self.event_batches_dma_file.fdatasync().await?;
 
         self.metadata_dma_file
-            .write_at(meta_buf, metadata_file_size)
+            .write_at(meta_buf, meta_write_start_pos)
             .await?;
+        self.metadata_dma_file.truncate(metadata_final_len).await?;
         self.metadata_dma_file.fdatasync().await?;
 
-        self.file_len_event_batch += event_buf_len;
-        self.file_len_metadata += meta_buf_len;
-
-        // Phase 1: Add new items to cache efficiently
+        // Update in-memory aligned buffer remainders for next write
+        self.file_len_event_batch = event_final_len;
+        self.file_len_metadata = metadata_final_len;
+        self.event_batch_buffer = event_carry_over;
+        self.metadata_buffer = meta_carry_over;
+        
         let queue_len = self.append_event_batch_queue.len();
         if queue_len > 0 {
-            // Reserve capacity upfront for better performance
             self.data_cache.reserve(queue_len);
-
-            // Bulk add items and track size
             for item in self.append_event_batch_queue.drain(..) {
                 let uncompressed_size = item.event_batch_metadata.uncompressed_size as usize;
                 self.total_cache_size_bytes += uncompressed_size;
-
                 self.data_cache.push_back(CacheItem {
-                    event_batch_metadata: item.event_batch_metadata,    
+                    event_batch_metadata: item.event_batch_metadata,
                     event_batch_item: item.event_batch_item,
                 });
             }
         }
 
         if self.minimum_available_event_batch_index == 0 {
-            //Data in file is now available to read
             self.minimum_available_event_batch_index = 1;
         }
 
-        // Phase 2: Trim old events from front if cache significantly exceeds max size
-        // Only trim if we're over by at least 10% to avoid constant trimming overhead
         let trim_threshold = self.max_data_cache_size_bytes
             + (self.max_data_cache_size_bytes / self.cache_trim_factor);
 
         if self.total_cache_size_bytes > trim_threshold {
-            // Calculate how many items to remove in one pass
             let mut items_to_remove = 0;
             let mut size_to_remove = 0;
             let target_size = self.max_data_cache_size_bytes;
@@ -191,7 +221,6 @@ impl WriteOperationsWithDmaFile {
                 items_to_remove += 1;
             }
 
-            // Remove all items in one bulk operation
             if items_to_remove > 0 {
                 self.data_cache.drain(..items_to_remove);
                 self.total_cache_size_bytes -= size_to_remove;
@@ -200,6 +229,7 @@ impl WriteOperationsWithDmaFile {
 
         Ok(())
     }
+
     async fn trim_and_prepend(
         &mut self,
         event_batches: Vec<PrependEventBatchQueueItem>,

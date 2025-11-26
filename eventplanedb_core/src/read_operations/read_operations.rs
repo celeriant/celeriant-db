@@ -265,9 +265,15 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
 
         // No metadata in file => initial state
         if file_len_metadata == 0 {
+
+            let metadata_buffer = vec![0u8; self.metadata_dma_file.alignment() as usize];
+            let event_batch_buffer = vec![0u8; self.event_batches_dma_file.alignment() as usize];
+
             let write_operations_data_requirements = WriteOperationsDataRequirements {
                 file_len_event_batch,
                 file_len_metadata,
+                metadata_buffer,
+                event_batch_buffer,
                 minimum_available_event_batch_index: 0,
                 next_event_index: 1,
                 next_event_batch_index: 1,
@@ -377,9 +383,15 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
             file_len_event_batch = trim_event_batch_pos
         }
 
+        // Get remaining bytes from both files for writer buffers to satisfy alignment constraints
+        let metadata_buffer = self.metadata_dma_file.read_at_aligned(self.metadata_dma_file.align_down(file_len_metadata), self.metadata_dma_file.alignment() as usize).await?;
+        let event_batch_buffer = self.event_batches_dma_file.read_at_aligned(self.event_batches_dma_file.align_down(file_len_event_batch), self.event_batches_dma_file.alignment() as usize).await?;
+
         let write_operations_data_requirements = WriteOperationsDataRequirements {
             file_len_event_batch,
             file_len_metadata,
+            metadata_buffer: metadata_buffer.to_vec(),
+            event_batch_buffer: event_batch_buffer.to_vec(),
             minimum_available_event_batch_index: minimum_available_event_batch_index.unwrap_or(1),
             next_event_index: last_meta.event_batch_metadata.max_event_index.saturating_add(1),
             next_event_batch_index: last_meta.event_batch_metadata.event_batch_index.saturating_add(1),

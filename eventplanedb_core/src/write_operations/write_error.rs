@@ -54,6 +54,7 @@ impl From<WireFormatError> for WriteError {
 
 impl From<GlommioError<()>> for WriteError {
     fn from(error: GlommioError<()>) -> Self {
+        println!("Converting GlommioError to WriteError: {:?}", error);
         WriteError::IoError(error)
     }
 }
