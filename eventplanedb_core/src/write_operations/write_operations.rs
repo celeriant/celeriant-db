@@ -7,13 +7,12 @@ use fastbloom::BloomFilter;
 use glommio::{GlommioError, io::{DmaFile, OpenOptions}};
 
 use crate::{
-    read_operations::{
-        in_memory_filtering::{apply_event_filters, is_include_batch}, read_structures::{WriteOperationsDataRequirements}
-    },
-    write_operations::{
+    files::open_dma_files::write_only_dma, read_operations::{
+        in_memory_filtering::{apply_event_filters, is_include_batch}, read_structures::WriteOperationsDataRequirements
+    }, write_operations::{
         write_error::WriteError,
         write_structures::{AggregateWriteConfig, WriteOptions},
-    },
+    }
 };
 
 pub struct CacheItem {
@@ -43,23 +42,17 @@ pub struct WriteOperationsWithDmaFile {
 }
 
 impl WriteOperationsWithDmaFile {
-    pub async fn open<P: AsRef<Path>>(
-        path_metadata: P,
-        path_event_batches: P,
+    pub fn new(
+        metadata_dma_file: DmaFile,
+        event_batches_dma_file: DmaFile,
         data_requirements: WriteOperationsDataRequirements,
         aggregate_write_config: AggregateWriteConfig,
-    ) -> Result<WriteOperationsWithDmaFile, GlommioError<()>> {
+    ) -> WriteOperationsWithDmaFile {
         let bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8)
             .seed(&BLOOM_HASH_SEED)
             .hashes(BLOOM_HASH_COUNT);
 
-
-        let metadata_dma_file =
-            get_existing_file_as_dma(path_metadata).await?;
-        let event_batches_dma_file =
-            get_existing_file_as_dma(path_event_batches).await?;
-
-        Ok(WriteOperationsWithDmaFile {
+        WriteOperationsWithDmaFile {
             metadata_dma_file,
             event_batches_dma_file,
             metadata_buffer: data_requirements.metadata_buffer,
@@ -79,7 +72,7 @@ impl WriteOperationsWithDmaFile {
             append_event_batch_queue: vec![],
             file_len_metadata: data_requirements.file_len_metadata,
             file_len_event_batch: data_requirements.file_len_event_batch,
-        })
+        }
     }
 
     fn create_bloom_filter_bytes(&mut self, events: &[EventItem]) -> [u64; BLOOM_BYTES / 8] {
@@ -388,8 +381,8 @@ impl WriteOperationsWithDmaFile {
         })?;
 
         // Reopen files and update state
-        let new_metadata_file = get_existing_file_as_dma(&metadata_file_path).await?;
-        let new_event_batch_file = get_existing_file_as_dma(&event_batch_file_path).await?;
+        let new_metadata_file = write_only_dma(&metadata_file_path).await?;
+        let new_event_batch_file = write_only_dma(&event_batch_file_path).await?;
 
         // Update cached file lengths (subtract trimmed, add prepended)
         self.file_len_metadata = self
@@ -407,21 +400,6 @@ impl WriteOperationsWithDmaFile {
 
         Ok(())
     }
-}
-
-
-pub async fn get_existing_file_as_dma<P: AsRef<Path>>(
-    path: P,
-) -> Result<DmaFile, GlommioError<()>> {
-    let dma_file = OpenOptions::new()
-        .read(false)
-        .write(true)
-        .create(false)
-        .append(false)
-        .dma_open(path)
-        .await?;
-
-    Ok(dma_file)
 }
 
 

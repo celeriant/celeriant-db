@@ -14,8 +14,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let request = Request::Write(WriteRequest { 
         correlation_id: Some(999), 
         org_id: 1, 
-        aggregate_type_id: 1, 
-        aggregate_id: 1, 
+        aggregate_type_id: 3, 
+        aggregate_id: 4, 
         client_id: 123, 
         user_id: None, 
         events: vec![
@@ -27,7 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 0,                          // client timestamp
                 1,                           // event_type_major
                 0,                           // event_type_minor
-                b"Welcome to a large chunk of TEXT! Welcome to a large chunk of TEXT! Welcome to a large chunk of TEXT! Welcome to a large chunk of TEXT! Welcome to a large chunk of TEXT! Welcome to a large chunk of TEXT! Welcome to a large chunk of TEXT! Welcome to a large chunk of TEXT! Welcome to a large chunk of TEXT! Welcome to a large chunk of TEXT! Welcome to a large chunk of TEXT! Welcome to a large chunk of TEXT! Welcome to a large chunk of TEXT! Welcome to a large chunk of TEXT! Welcome to a large chunk of TEXT! Welcome to a large chunk of TEXT! Welcome to a large chunk of TEXT! Welcome to a large chunk of TEXT! Welcome to a large chunk of TEXT! Welcome to a large chunk of TEXT! Welcome to a large chunk of TEXT! Welcome to a large chunk of TEXT! Welcome to a large chunk of TEXT! Welcome to a large chunk of TEXT! Welcome to a large chunk of TEXT! Welcome to a large chunk of TEXT! Welcome to a large chunk of TEXT! Welcome to a large chunk of TEXT! Welcome to a large chunk of TEXT! Welcome to a large chunk of TEXT! ".to_vec(),
+                b"Welcome to a large chunk of TEXT!".to_vec(),
             ),
         ], 
         allow_create: true, 
@@ -48,9 +48,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let request = Request::Read(ReadRequest {
         correlation_id:Some(1000),
         org_id:1,
-        aggregate_type_id:1,
-        aggregate_id:1,
-        filters: ReadFilters::new(6) 
+        aggregate_type_id:3,
+        aggregate_id:4,
+        filters: ReadFilters::new(1) 
     });
     
     match client.send_request(&request, CompressionType::Zstd { level: 6 }).await {

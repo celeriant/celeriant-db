@@ -134,7 +134,8 @@ impl ProcessRequest {
                     request.aggregate_id,
                 );
                 let aggregate_resources = self.aggregate_cache.get(&aggregate_key);
-                let exists = aggregate_resources.get_reader(false).await.is_ok();
+                let exists = aggregate_resources.get_reader(false).await;
+                let exists = exists.is_ok() && exists.unwrap().is_some();
 
                 Response::Exists(ExistsResponse {
                     correlation_id: request.correlation_id,

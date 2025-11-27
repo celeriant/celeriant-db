@@ -4,16 +4,11 @@ use eventplanedb_structures::{aggregate_key::AggregateKey, eventplanedb_error::E
 use glommio::{sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, Semaphore}, timer::sleep};
 
 use crate::{
-    local_event::LocalEvent,
-    read_operations::{
-        read_error::ReadError,
-        read_operations::{ReadOperations, ReadOperationsWithDmaFiles},
-        read_structures::AggregateReadConfig,
-    },
-    sync_result::SyncResult,
-    write_operations::{
-        write_operations::{WriteOperations, WriteOperationsWithDmaFile}, write_structures::AggregateWriteConfig,
-    },
+    files::open_dma_files::{read_only_dma, write_only_dma}, local_event::LocalEvent, read_operations::{
+        self, read_error::ReadError, read_operations::{ReadOperations, ReadOperationsWithDmaFiles}, read_structures::AggregateReadConfig
+    }, sync_result::SyncResult, write_operations::{
+        self, write_operations::{WriteOperations, WriteOperationsWithDmaFile}, write_structures::AggregateWriteConfig
+    }
 };
 
 pub struct AggregateResources {
@@ -58,6 +53,56 @@ impl AggregateResources {
         }
     }
 
+    async fn internal_init(
+        &self,
+        create_if_not_exists: bool,
+    ) -> Result<(), ReadError> {
+        
+        // If the reader is setup, we're done!
+        {
+            let reader = self.reader.read().await?;
+            if reader.is_some() {
+                return Ok(());
+            }
+        }
+
+        // Don't create files and setup cache if they don't exist
+        if !create_if_not_exists && !std::path::Path::new(&self.path_metadata).exists() {
+            return Ok(());
+        }
+
+        // Acquire write locks to initialize
+        let mut guard_writer = self.writer.write().await?;
+        let mut guard_reader = self.reader.write().await?;
+
+        // Double-check in case another task initialized while we were waiting
+        if guard_reader.is_some() {
+            return Ok(());
+        }
+
+        // Create base folder if needed
+        std::fs::create_dir_all(&self.base_folder)?;
+
+        // Open DMA files - must be done in this order due to direct I/O fs constraints
+        let writer_metadata_dma_file = write_only_dma(&self.path_metadata).await.unwrap();
+        let reader_metadata_dma_file = read_only_dma(&self.path_metadata).await.unwrap();
+        let writer_event_batch_dma_file = write_only_dma(&self.path_event_batches).await.unwrap();
+        let reader_event_batch_dma_file = read_only_dma(&self.path_event_batches).await.unwrap();
+
+        let read_operations = ReadOperationsWithDmaFiles::new(
+            reader_metadata_dma_file, reader_event_batch_dma_file, self.aggregate_read_config.clone());
+        let data_requirements = read_operations.get_write_operations_data_requirements().await?;
+        let write_operations = WriteOperationsWithDmaFile::new(
+            writer_metadata_dma_file, writer_event_batch_dma_file, data_requirements,
+            self.aggregate_write_config.clone(),
+        );
+
+        *guard_reader = Some(read_operations);
+        *guard_writer = Some(write_operations);
+
+        Ok(())
+    }
+
     pub async fn get_reader(
         &self,
         create_if_not_exists: bool,
@@ -70,27 +115,7 @@ impl AggregateResources {
             }
         }
 
-        // Acquire write lock to initialize
-        let mut writer_guard = self.reader.write().await?;
-
-        // Double-check in case another task initialized it while we were waiting
-        if writer_guard.is_some() {
-            drop(writer_guard);
-            return self.reader.read().await.map_err(Into::into);
-        }
-
-        // Initialize the reader
-        let read_operations = ReadOperationsWithDmaFiles::open(
-            &self.base_folder,
-            &self.path_metadata,
-            &self.path_event_batches,
-            create_if_not_exists,
-            self.aggregate_read_config.clone(),
-        )
-        .await?;
-
-        *writer_guard = Some(read_operations);
-        drop(writer_guard);
+        self.internal_init(create_if_not_exists).await?;
 
         self.reader.read().await.map_err(Into::into)
     }
@@ -107,29 +132,7 @@ impl AggregateResources {
             }
         }
 
-        // Acquire write lock to initialize
-        let mut writer_guard = self.writer.write().await?;
-
-        // Double-check in case another task initialized it while we were waiting
-        if writer_guard.is_some() {
-            drop(writer_guard);
-            return self.writer.read().await.map_err(Into::into);
-        }
-
-        let reader_guard = self.get_reader(create_if_not_exists).await?;
-        let reader = reader_guard.as_ref().unwrap();
-        let data_requirements = reader.get_write_operations_data_requirements().await?;
-
-        let writer_operations = WriteOperationsWithDmaFile::open(
-            &self.path_metadata,
-            &self.path_event_batches,
-            data_requirements,
-            self.aggregate_write_config.clone(),
-        ).await?;
-
-        *writer_guard = Some(writer_operations);
-
-        drop(writer_guard);
+        self.internal_init(create_if_not_exists).await?;
 
         self.writer.read().await.map_err(Into::into)
     }
@@ -138,46 +141,32 @@ impl AggregateResources {
         &self,
         create_if_not_exists: bool,
     ) -> Result<RwLockWriteGuard<'_, Option<ReadOperationsWithDmaFiles>>, ReadError> {
-        let mut writer_guard = self.reader.write().await?;
-
-        if writer_guard.is_none() {
-            let read_operations = ReadOperationsWithDmaFiles::open(
-                &self.base_folder,
-                &self.path_metadata,
-                &self.path_event_batches,
-                create_if_not_exists,
-                self.aggregate_read_config.clone(),
-            )
-            .await?;
-
-            *writer_guard = Some(read_operations);
+        {
+            let writer_guard = self.reader.write().await?;
+            if writer_guard.is_some() {
+                return Ok(writer_guard);
+            }
         }
 
-        Ok(writer_guard)
+        self.internal_init(create_if_not_exists).await?;
+
+        self.reader.write().await.map_err(Into::into)
     }
 
     pub async fn get_writer_mut(
         &self,
         create_if_not_exists: bool,
     ) -> Result<RwLockWriteGuard<'_, Option<WriteOperationsWithDmaFile>>, ReadError> {
-        let mut writer_guard = self.writer.write().await?;
-
-        if writer_guard.is_none() {
-            let reader_guard = self.get_reader(create_if_not_exists).await?;
-            let reader = reader_guard.as_ref().unwrap();
-            let data_requirements = reader.get_write_operations_data_requirements().await?;
-
-            let writer_operations = WriteOperationsWithDmaFile::open(
-                &self.path_metadata,
-                &self.path_event_batches,
-                data_requirements,
-                self.aggregate_write_config.clone(),
-            ).await?;
-
-            *writer_guard = Some(writer_operations);
+        {
+            let writer_guard = self.writer.write().await?;
+            if writer_guard.is_some() {
+                return Ok(writer_guard);
+            }
         }
 
-        Ok(writer_guard)
+        self.internal_init(create_if_not_exists).await?;
+
+        self.writer.write().await.map_err(Into::into)
     }
 
     pub async fn sync_with_delay(

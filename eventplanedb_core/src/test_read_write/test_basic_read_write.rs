@@ -2,6 +2,7 @@
 mod test_basic_read_write {
     use std::num::NonZeroUsize;
 
+    use tempfile::tempdir_in;
     use uuid::Uuid;
 
     use eventplanedb_structures::{
@@ -10,16 +11,14 @@ mod test_basic_read_write {
     use glommio::{LocalExecutorBuilder, Placement};
 
     use crate::{
-        cache::aggregate_cache::AggregateCache,
-        read_operations::{
-            read_operations::ReadOperations,
-            read_structures::{AggregateReadConfig},
-        },
-        write_operations::{
+        cache::aggregate_cache::AggregateCache, files::open_dma_files::{read_only_dma, write_only_dma}, read_operations::{
+            read_operations::{ReadOperations, ReadOperationsWithDmaFiles},
+            read_structures::AggregateReadConfig,
+        }, write_operations::{
             write_error::WriteError,
-            write_operations::WriteOperations,
+            write_operations::{WriteOperations, WriteOperationsWithDmaFile},
             write_structures::{AggregateWriteConfig, WriteOptions},
-        },
+        }
     };
 
     fn check_read_1(read_result: &ReadResult, event_id: u128) {
@@ -270,74 +269,121 @@ mod test_basic_read_write {
     }
 
     #[test]
-    fn super_basic() {
+    fn super_basic_dma_direct() {
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
+            .spawn(|| async move {
+                let aggregate_key = AggregateKey::new(1, 1, 1);
+                let tempdir = tempdir_in(".").unwrap();
+                let data_root_folder = tempdir.path().to_str().unwrap();
+                let base_folder = format!(
+                    "{}/{}/{}/{}",
+                    data_root_folder,
+                    aggregate_key.org_id,
+                    aggregate_key.aggregate_type_id,
+                    aggregate_key.aggregate_id
+                );
+                let path_metadata = format!("{}/metadata.bin", base_folder);
+
+                std::fs::create_dir_all(&base_folder).unwrap();
+                // std::fs::File::create(&path_metadata).unwrap();
+
+                let writer_metadata_dma_file = write_only_dma(&path_metadata).await.unwrap();
+                writer_metadata_dma_file.pre_allocate(512, false).await.unwrap();
+                let reader_metadata_dma_file = read_only_dma(&path_metadata).await.unwrap();
+
+                let buffer_size = writer_metadata_dma_file.alignment();
+                let mut buf = writer_metadata_dma_file.alloc_dma_buffer(buffer_size as usize);
+                buf.as_bytes_mut()[0..5].copy_from_slice(b"hello");
+
+                let _written = writer_metadata_dma_file.write_at(buf, 0).await.unwrap();
+                writer_metadata_dma_file.fdatasync().await.unwrap();
+
+                let read = reader_metadata_dma_file.read_at_aligned(0, 512).await.unwrap();
+                assert_eq!(read.len(), 512);
+                assert_eq!(
+                    &read[0..5],
+                    b"hello",
+                    "{}",
+                    String::from_utf8_lossy(&read[0..6])
+                );
+
+            })
+            .unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn super_basic_operators_direct() {
         let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
             .spawn(|| async move {
                 let aggregate_read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
                 };
-
                 let aggregate_write_config = AggregateWriteConfig {
                     max_data_cache_size_bytes: 1 << 25,
                     cache_trim_factor: 25,
                     max_chunk_size: 1 << 20,
                 };
-
-                // Create the files and a writer
-                let tempdir = tempfile::tempdir().unwrap();
-                let data_root_folder = tempdir.path().to_str().unwrap();
-
-                let aggregates_cache = AggregateCache::new(
-                    NonZeroUsize::new(1000).unwrap(),
-                    data_root_folder.to_string(),
-                    aggregate_read_config,
-                    aggregate_write_config,
-                );
                 let aggregate_key = AggregateKey::new(1, 1, 1);
-                let aggregate_resources = aggregates_cache.get(&aggregate_key);
+                let tempdir = tempdir_in(".").unwrap();
+                let data_root_folder = tempdir.path().to_str().unwrap();
+                let base_folder = format!(
+                    "{}/{}/{}/{}",
+                    data_root_folder,
+                    aggregate_key.org_id,
+                    aggregate_key.aggregate_type_id,
+                    aggregate_key.aggregate_id
+                );
+                let path_metadata = format!("{}/metadata.bin", base_folder);
+                let path_event_batches = format!("{}/event_batches.bin", base_folder);
 
-                {
-                    // Write some event batches
-                    let events = vec![
-                        EventItem::new(45, 0, None, 333, 2, 3, vec![1, 2, 3, 4, 5]),
-                    ];
-                    let append_options = WriteOptions {
-                        client_id: 123,
-                        compression_type:
-                            eventplanedb_structures::compression_type::CompressionType::None,
-                        enforce_client_idempotency: true,
-                        expected_event_batch_index: Some(1),
-                        server_timestamp_millis: 998,
-                        user_id: None,
-                    };
+                // Create base folder if needed
+                std::fs::create_dir_all(&base_folder).unwrap();
 
-                    let mut writer = aggregate_resources.get_writer_mut(true).await.unwrap();
-                    let append_result = writer
-                        .as_mut()
-                        .unwrap()
-                        .queue_events_in_memory(events, &append_options)
-                        .unwrap();
-                    assert_eq!(append_result.next_event_batch_index, 2);
-                    writer.as_mut().unwrap().sync_with_rollback().await.unwrap();
-                }
+                // Open DMA files - must be done in this order due to direct I/O fs constraints
+                let writer_metadata_dma_file = write_only_dma(&path_metadata).await.unwrap();
+                let reader_metadata_dma_file = read_only_dma(&path_metadata).await.unwrap();
+                let writer_event_batch_dma_file = write_only_dma(&path_event_batches).await.unwrap();
+                let reader_event_batch_dma_file = read_only_dma(&path_event_batches).await.unwrap();
 
-                {
-                    let writer = aggregate_resources.get_writer(true).await.unwrap();
-                    let writer_ref = writer.as_ref().unwrap();
-                    let reader = aggregate_resources.get_reader(true).await.unwrap();
-                    let reader_ref = reader.as_ref().unwrap();
+                let read_operations = ReadOperationsWithDmaFiles::new(
+                    reader_metadata_dma_file, reader_event_batch_dma_file, aggregate_read_config.clone());
+                let data_requirements = read_operations.get_write_operations_data_requirements().await.unwrap();
+                let mut write_operations = WriteOperationsWithDmaFile::new(
+                    writer_metadata_dma_file, writer_event_batch_dma_file, data_requirements,
+                    aggregate_write_config.clone(),
+                );
 
-                    let _read_result = reader_ref
-                        .read(
-                            writer_ref.minimum_available_event_batch_index,
-                            writer_ref.file_len_metadata,
-                            writer_ref.file_len_event_batch,
-                            &ReadFilters::new(1),
-                            None,
-                        )
-                        .await
-                        .unwrap();
-                }
+                // Write some event batches
+                let events = vec![
+                    EventItem::new(45, 0, None, 333, 2, 3, vec![1, 2, 3, 4, 5]),
+                ];
+                let append_options = WriteOptions {
+                    client_id: 123,
+                    compression_type:
+                        eventplanedb_structures::compression_type::CompressionType::None,
+                    enforce_client_idempotency: true,
+                    expected_event_batch_index: Some(1),
+                    server_timestamp_millis: 998,
+                    user_id: None,
+                };
+
+                let append_result = write_operations
+                    .queue_events_in_memory(events, &append_options)
+                    .unwrap();
+                assert_eq!(append_result.next_event_batch_index, 2);
+                write_operations.sync_with_rollback().await.unwrap();
+
+                let _read_result = read_operations
+                    .read(
+                        write_operations.minimum_available_event_batch_index,
+                        write_operations.file_len_metadata,
+                        write_operations.file_len_event_batch,
+                        &ReadFilters::new(1),
+                        None,
+                    )
+                    .await
+                    .unwrap();
 
             })
             .unwrap();

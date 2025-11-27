@@ -30,18 +30,18 @@ fn build_combined_request_bytes(
         expected_event_batch_index: None, 
         enforce_client_idempotency: false, 
         durable_write_with_delay_us: if sync_delay_us == 0 { None } else { Some(sync_delay_us) }, 
-        compression_type: eventplanedb_structures::compression_type::CompressionType::None 
+        compression_type: eventplanedb_structures::compression_type::CompressionType::None
     };
 
     // Use the same encoding as write_request_v2
     let encoded = bincode::encode_to_vec(&request, BINCODE_CONFIG_VARIABLE).unwrap();
     
     // Compress the encoded data (V2 protocol uses snap compression)
-    // let compressed = snap::raw::Encoder::new()
-    //     .compress_vec(&encoded)
-    //     .unwrap();
+    let compressed = snap::raw::Encoder::new()
+        .compress_vec(&encoded)
+        .unwrap();
 
-    // let (type_id, _) = eventplanedb_structures::compression_type::CompressionType::Snappy.to_tuple();
+    let (type_id, _) = eventplanedb_structures::compression_type::CompressionType::Snappy.to_tuple();
 
     let protocol_version = 2u32;
     let header_size = 17;
@@ -49,10 +49,11 @@ fn build_combined_request_bytes(
 
     // COMPRESSION
     // let mut combined = Vec::with_capacity(header_size + compressed.len());
-    // combined.extend_from_slice(&protocol_version.to_be_bytes());
-    // combined.extend_from_slice(&(request_type as u32).to_be_bytes());
-    // combined.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
-    // combined.push(type_id);
+    // combined.extend_from_slice(&protocol_version.to_le_bytes());
+    // combined.extend_from_slice(&(request_type as u32).to_le_bytes());
+    // combined.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+    // combined.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+    // combined.extend_from_slice(&(type_id as u8).to_le_bytes());
     // combined.extend_from_slice(&compressed);
 
     // NO COMPRESSION
@@ -168,7 +169,7 @@ fn main() {
             0,
             1,
             0,
-            b"Hello world".to_vec(),
+            b" Lorem ipsum dolor sit amet, consectetur adipiscing elit. Phasellus sed turpis nec ex congue dictum. Praesent molestie porttitor diam, eget porttitor erat pharetra at. Sed ornare imperdiet diam faucibus tristique. Quisque sed lectus vel risus vestibulum pretium. Duis ut leo convallis, euismod mi sed, posuere ipsum. Aliquam iaculis dignissim urna quis luctus. Suspendisse tincidunt dolor gravida risus faucibus, sed ultricies leo rhoncus. In tempus, augue nec iaculis pulvinar, diam velit fringilla justo, non sodales eros neque eget eros. Maecenas nec pellentesque sem. In eget purus enim. Aliquam id nibh a justo dictum viverra. Sed consectetur arcu at ullamcorper imperdiet. Ut gravida nisi quis condimentum egestas. Suspendisse ac ipsum vestibulum, ultrices elit vitae, aliquam risus. Quisque fermentum ex id sem tincidunt, vitae tempor ligula semper. Praesent bibendum nibh in turpis viverra, et lobortis turpis pellentesque.".to_vec(),
         ),
     ];
     // let base_events = vec![

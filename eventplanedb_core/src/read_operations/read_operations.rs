@@ -8,8 +8,7 @@ use std::{collections::HashMap, path::Path};
 
 use crate::{
     files::{
-        read_fixed_records_visit_const,
-        read_objects_absolute::{self, AbsoluteObjectPosition},
+        open_dma_files::read_only_dma, read_fixed_records_visit_const, read_objects_absolute::{self, AbsoluteObjectPosition}
     },
     read_operations::read_structures::{
         AggregateReadConfig, MetadataWithAbsolutePosition,
@@ -108,32 +107,16 @@ impl ReadOperationsWithDmaFiles {
     ///
     /// # Returns
     /// New `ReadOperations` instance ready for reading
-    pub async fn open<P: AsRef<Path>>(
-        base_folder: P,
-        path_metadata: P,
-        path_event_batches: P,
-        create_if_not_exists: bool,
+    pub fn new(
+        metadata_dma_file: DmaFile,
+        event_batches_dma_file: DmaFile,
         aggregate_read_config: AggregateReadConfig,
-    ) -> Result<ReadOperationsWithDmaFiles, ReadError> {
-        if create_if_not_exists {
-            std::fs::create_dir_all(&base_folder).map_err(|error| {
-                ReadError::CannotCreateFolders {
-                    path: base_folder.as_ref().to_string_lossy().to_string(),
-                    error,
-                }
-            })?;
-        }
-
-        let metadata_dma_file =
-            get_existing_file_as_dma(path_metadata, create_if_not_exists).await?;
-        let event_batches_dma_file =
-            get_existing_file_as_dma(path_event_batches, create_if_not_exists).await?;
-
-        Ok(ReadOperationsWithDmaFiles {
+    ) -> ReadOperationsWithDmaFiles {
+        ReadOperationsWithDmaFiles {
             metadata_dma_file,
             event_batches_dma_file,
             config: aggregate_read_config,
-        })
+        }
     }
 
     async fn get_metadata_range(
@@ -494,24 +477,4 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
             next_event_batch_index,
         })
     }
-}
-
-async fn get_existing_file_as_dma<P: AsRef<Path>>(
-    path: P,
-    create_if_not_exists: bool,
-) -> Result<DmaFile, ReadError> {
-
-    if create_if_not_exists && !path.as_ref().exists() {
-        std::fs::File::create(&path)?;
-    }
-
-    let dma_file = OpenOptions::new()
-        .read(true)
-        .write(false)
-        .create(false)
-        .append(false)
-        .dma_open(path)
-        .await?;
-
-    Ok(dma_file)
 }

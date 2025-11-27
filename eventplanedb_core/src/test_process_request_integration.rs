@@ -46,7 +46,7 @@ mod test_process_request_integration {
                 };
 
                 let write_config = AggregateWriteConfig {
-                    max_data_cache_size_bytes: 1 << 25,
+                    max_data_cache_size_bytes: 0,
                     cache_trim_factor: 25,
                     max_chunk_size: 1 << 20,
                 };
