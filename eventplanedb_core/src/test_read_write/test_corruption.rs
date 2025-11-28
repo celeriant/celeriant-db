@@ -195,6 +195,8 @@ pub mod test_corruption {
                     .await
                     .unwrap();
 
+                assert_eq!(result.file_len_event_batch, 22);
+                assert_eq!(result.file_len_metadata, 256);
                 assert_eq!(result.next_event_batch_index, 2);
                 assert_eq!(result.next_event_index, 2);
                 assert_eq!(result.minimum_available_event_batch_index, 1);

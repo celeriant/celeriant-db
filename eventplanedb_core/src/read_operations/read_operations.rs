@@ -281,7 +281,7 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
         let metadata_dma_file = self.metadata_dma_file.as_ref().unwrap();
         let event_batches_dma_file = self.event_batches_dma_file.as_ref().unwrap();
 
-        let file_len_metadata = metadata_dma_file.file_size().await?;
+        let mut file_len_metadata = metadata_dma_file.file_size().await?;
 
         // No metadata in file => initial state
         if file_len_metadata == 0 {
@@ -375,6 +375,9 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
             },
         )
         .await?;
+
+        // Handle unclosed files with preallocated but unwritten space at end
+        file_len_metadata = metadata_entries.len() as u64 * rec_size;
 
         let last_meta = metadata_entries
             .last()
