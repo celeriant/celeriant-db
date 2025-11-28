@@ -3,7 +3,9 @@ use glommio::GlommioError;
 
 #[derive(Debug)]
 pub enum WriteError {
-    IoError(GlommioError<()>),
+    DmaFileNotInitialized,
+    GlommioError(GlommioError<()>),
+    IoError(std::io::Error),
     SerializationError(WireFormatError),
     OptimisticConcurrencyViolation {
         client_id: u128,
@@ -54,7 +56,12 @@ impl From<WireFormatError> for WriteError {
 
 impl From<GlommioError<()>> for WriteError {
     fn from(error: GlommioError<()>) -> Self {
-        println!("Converting GlommioError to WriteError: {:?}", error);
+        WriteError::GlommioError(error)
+    }
+}
+
+impl From<std::io::Error> for WriteError {
+    fn from(error: std::io::Error) -> Self {
         WriteError::IoError(error)
     }
 }

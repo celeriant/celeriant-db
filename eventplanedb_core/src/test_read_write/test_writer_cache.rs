@@ -200,7 +200,7 @@ mod test_writer_cache {
                 }
 
                 // Dispose of aggregate_resources to clear cache
-                aggregates_cache.pop(&aggregate_key);
+                aggregates_cache.pop(&aggregate_key).await.unwrap();
 
                 // Write batches 11-20 with a new writer instance
                 for i in 11..=20 {
@@ -505,11 +505,11 @@ mod test_writer_cache {
                     );
 
                     // Close the metadata file to simulate IO error on sync
-                    let metadata_file = std::mem::replace(
+                    let mut metadata_file = std::mem::replace(
                         &mut writer_ref.metadata_dma_file,
-                        glommio::io::DmaFile::open("/dev/null").await.unwrap(),
+                        Some(glommio::io::DmaFile::open("/dev/null").await.unwrap()),
                     );
-                    metadata_file.close().await.unwrap();
+                    metadata_file.take().unwrap().close().await.unwrap();
 
                     // Attempt sync - should fail and rollback
                     let sync_result = writer_ref.sync_with_rollback().await;

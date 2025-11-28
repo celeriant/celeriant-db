@@ -161,6 +161,10 @@ fn main() {
                     if msg.require_shutdown {
                         info!("Shard {shard_id} received shutdown signal");
                         shutdown_flag.set(true);
+                        let cache_clear = process_request.handle_shutdown().await;
+                        if let Err(e) = cache_clear {
+                            error!("Error during shard {shard_id} shutdown: {:?}", e);
+                        }
                         continue;
                     }
 

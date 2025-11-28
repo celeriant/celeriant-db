@@ -8,7 +8,7 @@ mod test_trimming_and_prepending {
     use glommio::{LocalExecutorBuilder, Placement};
 
     use crate::{
-        cache::aggregate_cache::AggregateCache, read_operations::{
+        cache::aggregate_cache::AggregateCache, files::open_dma_files::existing_file_read_only_dma, read_operations::{
             read_error::ReadError, read_operations::ReadOperations,
             read_structures::AggregateReadConfig,
         }, write_operations::{
@@ -45,7 +45,7 @@ mod test_trimming_and_prepending {
                 event_timestamp: base_timestamp + i as u64,
                 event_type_major: 1 + (i % 3) as u64, // Vary event types 1, 2, 3
                 event_type_minor: 0,
-                event_value: Arc::new(format!("test_event_{}", i).into_bytes()),
+                event_value: Arc::new(format!("test_event_{}", client_event_index).into_bytes()),
                 iv: None,
             });
         }
@@ -153,6 +153,40 @@ mod test_trimming_and_prepending {
                     writer_ref.maybe_read_cached_events(&filters, None).unwrap()
                 };
 
+                {
+                    //Everything is cached
+                    let writer = aggregate_resources.get_writer(true).await.unwrap();
+                    let writer_ref = writer.as_ref().unwrap();
+                    // Let's get the first two batches from the writer cache to add back later
+                    let filters = ReadFilters::new(1);
+                    writer_ref.maybe_read_cached_events(&filters, None).unwrap()
+                };
+
+                // Check we can do a read of all batches
+                {
+                    let mut writer = aggregate_resources.get_writer_mut(true).await.unwrap();
+                    let reader = aggregate_resources.get_reader(true).await.unwrap();
+                    let reader_ref = reader.as_ref().unwrap();
+                    let writer_ref = writer.as_mut().unwrap();
+
+                    assert_eq!(writer_ref.minimum_available_event_batch_index, 1);
+
+                    // Should be able to read from batch 3
+                    let read_filters = ReadFilters::new(1);
+                    let read_result = reader_ref
+                        .read(
+                            writer_ref.minimum_available_event_batch_index,
+                            writer_ref.file_len_metadata,
+                            writer_ref.file_len_event_batch,
+                            &read_filters,
+                            None,
+                        )
+                        .await
+                        .unwrap();
+
+                    assert_eq!(read_result.event_batches.len(), 5);
+                }
+
                 let file_positions = {
                     // Get file positions to trim first 2 batches
                     let reader = aggregate_resources.get_reader(true).await.unwrap();
@@ -175,24 +209,29 @@ mod test_trimming_and_prepending {
                     // Perform trim_start
                     let mut writer = aggregate_resources.get_writer_mut(true).await.unwrap();
                     let writer_ref = writer.as_mut().unwrap();
+                    let mut reader = aggregate_resources.get_reader_mut(true).await.unwrap();
+                    let reader_ref = reader.as_mut().unwrap();
+
                     writer_ref.trim_start(
-                            3,
+                            3, 
+                            reader_ref.metadata_dma_file.as_ref().unwrap(), 
+                            reader_ref.event_batches_dma_file.as_ref().unwrap(),
                             file_positions.metadata_position,
                             file_positions.event_batch_position,
                         )
                         .await
                         .unwrap();
 
-                    // Verify writer cache is now gone
-                    assert_eq!(writer_ref.data_cache.len(), 0);
-
-                    // Update reader with new file handles
-                    let mut reader = aggregate_resources.get_reader_mut(true).await.unwrap();
+                    // Verify writer cache now only has batches 3,4,5
+                    assert_eq!(writer_ref.data_cache.len(), 3);
+                    assert_eq!(writer_ref.data_cache.iter().last().unwrap().event_batch_item.event_batch_index, 5);
                     
-                    reader.as_mut().unwrap().trim_start(
-                        writer_ref.metadata_dma_file.dup().unwrap(),
-                        writer_ref.event_batches_dma_file.dup().unwrap(),
-                    );
+                    let data_requirements = reader_ref.replace_dma_files(
+                        existing_file_read_only_dma(&aggregate_resources.path_metadata).await.unwrap(),
+                        existing_file_read_only_dma(&aggregate_resources.path_event_batches).await.unwrap(),
+                    ).await.unwrap();
+
+                    writer_ref.update_write_operations_data_requirements(data_requirements);
                 }
 
                 // Verify batches 1 and 2 are gone, 3-5 remain
@@ -283,7 +322,7 @@ mod test_trimming_and_prepending {
 
                     //Now lets try and prepend back the trimmed batches
                     //First error condition - creating a gap
-                    let err = writer_ref.prepend_batches(CompressionType::None, &first_batch.event_batches).await.unwrap_err();
+                    let err = writer_ref.prepend_batches(CompressionType::None, &first_batch.event_batches, reader_ref.metadata_dma_file.as_ref().unwrap(), reader_ref.event_batches_dma_file.as_ref().unwrap()).await.unwrap_err();
                     match err {
                         WriteError::PrependCreatesEventBatchIndexGap { 
                             provided_last_batch_index,
@@ -296,7 +335,7 @@ mod test_trimming_and_prepending {
                     }
 
                     //Second error condition - overlap
-                    let err = writer_ref.prepend_batches(CompressionType::None, &first_three_batches.event_batches).await.unwrap_err();
+                    let err = writer_ref.prepend_batches(CompressionType::None, &first_three_batches.event_batches, reader_ref.metadata_dma_file.as_ref().unwrap(), reader_ref.event_batches_dma_file.as_ref().unwrap()).await.unwrap_err();
                     match err {
                         WriteError::PrependCreatesEventBatchIndexGap { 
                             provided_last_batch_index,
@@ -308,11 +347,13 @@ mod test_trimming_and_prepending {
                         _ => panic!("Expected PrependCreatesEventBatchIndexGap error, got {:?}", err),
                     }
 
-                    writer_ref.prepend_batches(CompressionType::Snappy, &first_two_batches.event_batches).await.unwrap();
-                    reader_ref.trim_start(
-                        writer_ref.metadata_dma_file.dup().unwrap(),
-                        writer_ref.event_batches_dma_file.dup().unwrap(),
-                    );
+                    writer_ref.prepend_batches(CompressionType::Snappy, &first_two_batches.event_batches, reader_ref.metadata_dma_file.as_ref().unwrap(), reader_ref.event_batches_dma_file.as_ref().unwrap()).await.unwrap();
+                    let data_requirements = reader_ref.replace_dma_files(
+                        existing_file_read_only_dma(&aggregate_resources.path_metadata).await.unwrap(),
+                        existing_file_read_only_dma(&aggregate_resources.path_event_batches).await.unwrap(),
+                    ).await.unwrap();
+
+                    writer_ref.update_write_operations_data_requirements(data_requirements);
                 }
 
                 {

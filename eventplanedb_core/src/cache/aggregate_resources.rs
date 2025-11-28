@@ -4,17 +4,17 @@ use eventplanedb_structures::{aggregate_key::AggregateKey, eventplanedb_error::E
 use glommio::{sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, Semaphore}, timer::sleep};
 
 use crate::{
-    files::open_dma_files::{read_only_dma, write_only_dma}, local_event::LocalEvent, read_operations::{
-        self, read_error::ReadError, read_operations::{ReadOperations, ReadOperationsWithDmaFiles}, read_structures::AggregateReadConfig
+    files::open_dma_files::{create_and_write_only_dma, existing_file_read_only_dma, existing_file_write_only_dma}, local_event::LocalEvent, read_operations::{
+        read_error::ReadError, read_operations::{ReadOperations, ReadOperationsWithDmaFiles}, read_structures::AggregateReadConfig
     }, sync_result::SyncResult, write_operations::{
-        self, write_operations::{WriteOperations, WriteOperationsWithDmaFile}, write_structures::AggregateWriteConfig
+        write_operations::{WriteOperations, WriteOperationsWithDmaFile}, write_structures::AggregateWriteConfig
     }
 };
 
 pub struct AggregateResources {
-    base_folder: String,
-    path_metadata: String,
-    path_event_batches: String,
+    pub base_folder: String,
+    pub path_metadata: String,
+    pub path_event_batches: String,
     aggregate_read_config: AggregateReadConfig,
     aggregate_write_config: AggregateWriteConfig,
     reader: RwLock<Option<ReadOperationsWithDmaFiles>>,
@@ -67,8 +67,11 @@ impl AggregateResources {
         }
 
         // Don't create files and setup cache if they don't exist
-        if !create_if_not_exists && !std::path::Path::new(&self.path_metadata).exists() {
-            return Ok(());
+        let is_metadata_exists = std::path::Path::new(&self.path_metadata).exists();
+        let is_event_batch_exists = std::path::Path::new(&self.path_event_batches).exists();
+
+        if !create_if_not_exists && (!is_metadata_exists || !is_event_batch_exists) {
+            return Err(ReadError::NotExists);
         }
 
         // Acquire write locks to initialize
@@ -84,10 +87,10 @@ impl AggregateResources {
         std::fs::create_dir_all(&self.base_folder)?;
 
         // Open DMA files - must be done in this order due to direct I/O fs constraints
-        let writer_metadata_dma_file = write_only_dma(&self.path_metadata).await.unwrap();
-        let reader_metadata_dma_file = read_only_dma(&self.path_metadata).await.unwrap();
-        let writer_event_batch_dma_file = write_only_dma(&self.path_event_batches).await.unwrap();
-        let reader_event_batch_dma_file = read_only_dma(&self.path_event_batches).await.unwrap();
+        let writer_metadata_dma_file = if !is_metadata_exists { create_and_write_only_dma(&self.path_metadata).await? } else { existing_file_write_only_dma(&self.path_metadata).await?};
+        let reader_metadata_dma_file = existing_file_read_only_dma(&self.path_metadata).await?;
+        let writer_event_batch_dma_file = if !is_event_batch_exists { create_and_write_only_dma(&self.path_event_batches).await? } else { existing_file_write_only_dma(&self.path_event_batches).await?};
+        let reader_event_batch_dma_file = existing_file_read_only_dma(&self.path_event_batches).await?;
 
         let read_operations = ReadOperationsWithDmaFiles::new(
             reader_metadata_dma_file, reader_event_batch_dma_file, self.aggregate_read_config.clone());

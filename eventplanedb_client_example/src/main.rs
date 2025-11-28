@@ -15,7 +15,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         correlation_id: Some(999), 
         org_id: 1, 
         aggregate_type_id: 3, 
-        aggregate_id: 4, 
+        aggregate_id: 6, 
         client_id: 123, 
         user_id: None, 
         events: vec![
@@ -49,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         correlation_id:Some(1000),
         org_id:1,
         aggregate_type_id:3,
-        aggregate_id:4,
+        aggregate_id:6,
         filters: ReadFilters::new(1) 
     });
     

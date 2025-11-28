@@ -46,7 +46,7 @@ Simple, immutable, per-aggregate event storage on local disk.
 - [ ] https://vvvvalvalval.github.io/posts/2018-11-12-datomic-event-sourcing-without-the-hassle.html
 
 
-# Running client
+# Running performance client - amortized fysnc, durable write before ack
 cargo run -p eventplanedb_performanceclient --release -- 127.0.0.1:10000 11000 16 10 10
 
 TCP Client (minimal work)
@@ -55,7 +55,22 @@ Connections: 11000
 Aggregates: 16
 Sync delay (us): 10
 Duration (s): 10
-Completed: 3268515 requests in 10.21s -> 320179.7 RPS
+Completed: 3190109 requests in 10.22s -> 312231.4 RPS
+
+When forcing durable writes before ack to clients, the server bottleneck is the nvme.
+
+# Running performance client - async fsync, ack before durable
+cargo run -p eventplanedb_performanceclient --release -- 127.0.0.1:10000 256 32 0 20
+
+TCP Client (minimal work)
+Server: 127.0.0.1:10000
+Connections: 256
+Aggregates: 32
+Sync delay (us): 0
+Duration (s): 20
+Completed: 50556524 requests in 20.05s -> 2522091.9 RPS
+
+When forcing durable writes before ack to clients, the server bottleneck is the cpu.
 
 # Running EventStoreDB to compare
 docker run -d   --name esdb-node   -p 2113:2113   -p 1113:1113   -v esdb-data:/var/lib/eventstore   eventstore/eventstore:latest   --insecure   --enable-atom-pub-over-http   --run-projections=None   --unsafe-disable-flush-to-disk=false   --write-through=true   --unbuffered=true   --cluster-size=1   --log-level=Information

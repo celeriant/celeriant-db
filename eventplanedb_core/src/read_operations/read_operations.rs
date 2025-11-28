@@ -3,12 +3,12 @@ use eventplanedb_structures::{
         deserialize_event_batch_metadata_versioned, deserialize_event_batch_versioned,
     }
 };
-use glommio::io::{DmaFile, OpenOptions};
-use std::{collections::HashMap, path::Path};
+use glommio::{GlommioError, io::DmaFile};
+use std::collections::HashMap;
 
 use crate::{
     files::{
-        open_dma_files::read_only_dma, read_fixed_records_visit_const, read_objects_absolute::{self, AbsoluteObjectPosition}
+        read_fixed_records_visit_const, read_objects_absolute::{self, AbsoluteObjectPosition}
     },
     read_operations::read_structures::{
         AggregateReadConfig, MetadataWithAbsolutePosition,
@@ -24,8 +24,8 @@ use crate::{
 };
 
 pub struct ReadOperationsWithDmaFiles {
-    pub metadata_dma_file: DmaFile,
-    pub event_batches_dma_file: DmaFile,
+    pub metadata_dma_file: Option<DmaFile>,
+    pub event_batches_dma_file: Option<DmaFile>,
     pub config: AggregateReadConfig,
 }
 
@@ -53,7 +53,7 @@ pub trait ReadOperations {
         file_len_event_batch: u64,
     ) -> Result<FilePositions, ReadError>;
 
-    /// Updates internal file handles after a trim operation.
+    /// Updates internal file handles after a trim or prepend operation.
     ///
     /// Called after the writer has trimmed files to update this reader's
     /// file handles and clear any invalidated cache entries.
@@ -61,7 +61,7 @@ pub trait ReadOperations {
     /// # Parameters
     /// * `metadata_dma_file` - New DMA file handle for metadata
     /// * `event_batches_dma_file` - New DMA file handle for event batches
-    fn trim_start(&mut self, metadata_dma_file: DmaFile, event_batches_dma_file: DmaFile);
+    async fn replace_dma_files(&mut self, metadata_dma_file: DmaFile, event_batches_dma_file: DmaFile) -> Result<WriteOperationsDataRequirements, ReadError>;
 
     /// Retrieves state information required by write operations.
     ///
@@ -95,9 +95,12 @@ pub trait ReadOperations {
         read_filters: &ReadFilters,
         max_bytes: Option<usize>,
     ) -> Result<ReadResult, ReadError>;
+
+    async fn close(&mut self) -> Result<(), GlommioError<()>>;
 }
 
 impl ReadOperationsWithDmaFiles {
+
     /// Opens an existing aggregate for reading.
     ///
     /// # Parameters
@@ -113,8 +116,8 @@ impl ReadOperationsWithDmaFiles {
         aggregate_read_config: AggregateReadConfig,
     ) -> ReadOperationsWithDmaFiles {
         ReadOperationsWithDmaFiles {
-            metadata_dma_file,
-            event_batches_dma_file,
+            metadata_dma_file: Some(metadata_dma_file),
+            event_batches_dma_file: Some(event_batches_dma_file),
             config: aggregate_read_config,
         }
     }
@@ -127,6 +130,12 @@ impl ReadOperationsWithDmaFiles {
         file_len_event_batch: u64,
         to_event_batch_index: Option<u64>, // None means read to end of file
     ) -> Result<Vec<MetadataWithAbsolutePosition>, ReadError> {
+
+        if self.metadata_dma_file.is_none() {
+            return Err(ReadError::NotExists);
+        }
+        let metadata_dma_file = self.metadata_dma_file.as_ref().unwrap();
+
         if minimum_available_event_batch_index > from_event_batch_index {
             return Err(ReadError::UnavailableBatchIndex {
                 minimum_available_event_batch_index,
@@ -144,38 +153,38 @@ impl ReadOperationsWithDmaFiles {
         }
 
         // Calculate read boundaries
-        let metadata_read_to_bytes = if let Some(to_index) = to_event_batch_index {
-            let to_bytes = (to_index.saturating_sub(minimum_available_event_batch_index) + 1)
-                * METADATA_BATCH_SIZE_BYTES as u64;
-            std::cmp::min(to_bytes, file_len_metadata)
-        } else {
-            file_len_metadata
-        };
+        // let metadata_read_to_bytes = if let Some(to_index) = to_event_batch_index {
+        //     let to_bytes = (to_index.saturating_sub(minimum_available_event_batch_index) + 1)
+        //         * METADATA_BATCH_SIZE_BYTES as u64;
+        //     std::cmp::min(to_bytes, file_len_metadata)
+        // } else {
+        //     file_len_metadata
+        // };
 
-        let actual_read_to = std::cmp::min(metadata_read_to_bytes, file_len_metadata);
-        let uncached_metadata_count = ((actual_read_to.saturating_sub(metadata_read_from_bytes))
+        // let actual_read_to = std::cmp::min(metadata_read_to_bytes, file_len_metadata);
+        let metadata_count = ((file_len_metadata.saturating_sub(metadata_read_from_bytes))
             / METADATA_BATCH_SIZE_BYTES as u64) as usize;
-        let mut uncached_metadata_set: Vec<MetadataWithAbsolutePosition> =
-            Vec::with_capacity(uncached_metadata_count);
+        let mut metadata_set: Vec<MetadataWithAbsolutePosition> =
+            Vec::with_capacity(metadata_count);
 
         // Absolute position reference from cache
         let mut event_batch_absolute_position = file_len_event_batch;
 
         // Read uncached metadata from disk
-        if uncached_metadata_count > 0 {
+        if metadata_count > 0 {
             read_fixed_records_visit_const::read_fixed_records_visit_const::<
                 METADATA_BATCH_SIZE_BYTES,
                 ReadError,
             >(
-                &self.metadata_dma_file,
+                metadata_dma_file,
                 file_len_metadata,
                 metadata_read_from_bytes,
-                Some(actual_read_to),
+                Some(file_len_metadata),
                 self.config.max_chunk_size,
                 |metadata_bytes| {
                     let (event_batch_metadata, format_version_on_disk) =
                         deserialize_event_batch_metadata_versioned(metadata_bytes)?;
-                    uncached_metadata_set.push(MetadataWithAbsolutePosition {
+                    metadata_set.push(MetadataWithAbsolutePosition {
                         event_batch_metadata,
                         event_batch_absolute_position: 0,
                         format_version_on_disk,
@@ -187,7 +196,7 @@ impl ReadOperationsWithDmaFiles {
         }
 
         // Calculate absolute positions
-        for metadata_with_absolute_position in uncached_metadata_set.iter_mut().rev() {
+        for metadata_with_absolute_position in metadata_set.iter_mut().rev() {
             event_batch_absolute_position -= metadata_with_absolute_position
                 .event_batch_metadata
                 .compressed_size;
@@ -195,11 +204,28 @@ impl ReadOperationsWithDmaFiles {
                 event_batch_absolute_position;
         }
 
-        Ok(uncached_metadata_set)
+        // Remove any metadata entries beyond to_event_batch_index
+        if let Some(to_index) = to_event_batch_index {
+            metadata_set.retain(|m| m.event_batch_metadata.event_batch_index <= to_index);
+        }
+
+        Ok(metadata_set)
     }
 }
 
 impl ReadOperations for ReadOperationsWithDmaFiles {
+    
+    async fn close(&mut self) -> Result<(), GlommioError<()>> {
+        if let Some(metadata_dma_file) = self.metadata_dma_file.take() {
+            metadata_dma_file.close().await?;
+        }
+
+        if let Some(event_batches_dma_file) = self.event_batches_dma_file.take() {
+            event_batches_dma_file.close().await?;
+        }
+
+        Ok(())
+    }
 
     async fn get_file_positions(
         &self,
@@ -235,25 +261,36 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
         })
     }
 
-    fn trim_start(&mut self, metadata_dma_file: DmaFile, event_batches_dma_file: DmaFile) {
-        self.metadata_dma_file = metadata_dma_file;
-        self.event_batches_dma_file = event_batches_dma_file;
+    async fn replace_dma_files(&mut self, metadata_dma_file: DmaFile, event_batches_dma_file: DmaFile) -> Result<WriteOperationsDataRequirements, ReadError> {
+        let old_metadata_file = std::mem::replace(&mut self.metadata_dma_file, Some(metadata_dma_file));
+        if let Some(old_metadata_file) = old_metadata_file { old_metadata_file.close().await?; }
+
+        let old_event_batch_file = std::mem::replace(&mut self.event_batches_dma_file, Some(event_batches_dma_file));
+        if let Some(old_event_batch_file) = old_event_batch_file { old_event_batch_file.close().await?; }
+
+        Ok(self.get_write_operations_data_requirements().await?)
     }
 
     async fn get_write_operations_data_requirements(
         &self,
     ) -> Result<WriteOperationsDataRequirements, ReadError> {
-        let file_len_metadata = self.metadata_dma_file.file_size().await?;
-        let mut file_len_event_batch = self.event_batches_dma_file.file_size().await?;
+        if self.metadata_dma_file.is_none() || self.event_batches_dma_file.is_none() {
+            return Err(ReadError::NotExists);
+        }
+
+        let metadata_dma_file = self.metadata_dma_file.as_ref().unwrap();
+        let event_batches_dma_file = self.event_batches_dma_file.as_ref().unwrap();
+
+        let file_len_metadata = metadata_dma_file.file_size().await?;
 
         // No metadata in file => initial state
         if file_len_metadata == 0 {
 
-            let metadata_buffer = vec![0u8; self.metadata_dma_file.alignment() as usize];
-            let event_batch_buffer = vec![0u8; self.event_batches_dma_file.alignment() as usize];
+            let metadata_buffer = vec![0u8; metadata_dma_file.alignment() as usize];
+            let event_batch_buffer = vec![0u8; event_batches_dma_file.alignment() as usize];
 
             let write_operations_data_requirements = WriteOperationsDataRequirements {
-                file_len_event_batch,
+                file_len_event_batch: 0,
                 file_len_metadata,
                 metadata_buffer,
                 event_batch_buffer,
@@ -289,14 +326,26 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
             METADATA_BATCH_SIZE_BYTES,
             ReadError,
         >(
-            &self.metadata_dma_file,
+            metadata_dma_file,
             file_len_metadata,
             0,
             Some(file_len_metadata),
             self.config.max_chunk_size,
             |metadata_bytes| {
-                let (event_batch_metadata, format_version_on_disk) =
-                    deserialize_event_batch_metadata_versioned(metadata_bytes)?;
+                let try_deser = deserialize_event_batch_metadata_versioned(metadata_bytes);
+
+                // Check if the metadata_bytes buffer is all zeros
+                if try_deser.is_err() {
+                    if metadata_bytes.iter().all(|&byte| byte == 0) {
+                        // Skip this entry as it is preallocated but unwritten space
+                        return Ok(());
+                    } else {
+                        // Return the deserialization error if the buffer is not all zeros
+                        return Err(try_deser.unwrap_err())?;
+                    }
+                }
+                
+                let (event_batch_metadata, format_version_on_disk) = try_deser.unwrap();
 
                 if minimum_available_event_batch_index.is_none() {
                     minimum_available_event_batch_index = Some(event_batch_metadata.event_batch_index);
@@ -327,51 +376,22 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
         )
         .await?;
 
-        let last_meta = metadata_entries.last().unwrap();
-        if last_meta.event_batch_absolute_position + last_meta.event_batch_metadata.compressed_size < file_len_event_batch {
-            // Partial write on power failure or server crash
-            // This is because we write batch file first then metadata
-            // Check the crc is correct first for the last metadata entry, if yes we can trim event batch file
-
-            let last_batch_pos = AbsoluteObjectPosition {
-                start_pos: last_meta.event_batch_absolute_position,
-                end_pos: last_meta.event_batch_absolute_position
-                    + last_meta.event_batch_metadata.compressed_size,
-            };
-
-            let last_batch_bytes = read_objects_absolute::read_objects_absolute(
-                &self.event_batches_dma_file,
-                file_len_event_batch,
-                &[last_batch_pos],
-                self.config.max_chunk_size,
-            )
-            .await?;
-
-            let last_actual_crc = crc32c::crc32c(&last_batch_bytes[0]);
-            if last_meta.event_batch_metadata.events_crc != last_actual_crc {
-                return Err(ReadError::CorruptEventBatch {
-                    expected_crc: last_meta.event_batch_metadata.events_crc,
-                    actual_crc: last_actual_crc,
-                    event_batch_index: last_meta.event_batch_metadata.event_batch_index,
-                    file_pos_event_batch: last_meta.event_batch_absolute_position,
-                    file_pos_metadata: file_len_metadata - rec_size,
-                });
-            }
-
-            let trim_event_batch_pos = last_meta.event_batch_absolute_position + last_meta.event_batch_metadata.compressed_size;
-            self.event_batches_dma_file
-                .truncate(trim_event_batch_pos)
-                .await?;
-
-            file_len_event_batch = trim_event_batch_pos
-        }
+        let last_meta = metadata_entries
+            .last()
+            .expect("At least one metadata entry should exist");
 
         // Get remaining bytes from both files for writer buffers to satisfy alignment constraints
-        let metadata_buffer = self.metadata_dma_file.read_at_aligned(self.metadata_dma_file.align_down(file_len_metadata), self.metadata_dma_file.alignment() as usize).await?;
-        let event_batch_buffer = self.event_batches_dma_file.read_at_aligned(self.event_batches_dma_file.align_down(file_len_event_batch), self.event_batches_dma_file.alignment() as usize).await?;
+        let metadata_aligned_end = metadata_dma_file.align_down(file_len_metadata);
+        let metadata_remainder_bytes = file_len_metadata.saturating_sub(metadata_aligned_end) as usize;
+        let metadata_buffer = metadata_dma_file.read_at(metadata_aligned_end, metadata_remainder_bytes).await?;
+
+        let last_event_batch_end_position = last_meta.event_batch_absolute_position + last_meta.event_batch_metadata.compressed_size;
+        let event_batch_aligned_end = event_batches_dma_file.align_down(last_event_batch_end_position);
+        let event_batch_remainder_bytes = last_event_batch_end_position.saturating_sub(event_batch_aligned_end) as usize;
+        let event_batch_buffer = event_batches_dma_file.read_at(event_batch_aligned_end, event_batch_remainder_bytes).await?;
 
         let write_operations_data_requirements = WriteOperationsDataRequirements {
-            file_len_event_batch,
+            file_len_event_batch: last_event_batch_end_position,
             file_len_metadata,
             metadata_buffer: metadata_buffer.to_vec(),
             event_batch_buffer: event_batch_buffer.to_vec(),
@@ -393,6 +413,12 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
         read_filters: &ReadFilters,
         max_bytes: Option<usize>,
     ) -> Result<ReadResult, ReadError> {
+
+        if self.event_batches_dma_file.is_none() {
+            return Err(ReadError::NotExists);
+        }
+        let event_batches_dma_file = self.event_batches_dma_file.as_ref().unwrap();
+
         // Use the helper to get metadata range
         let mut metadata_for_reading = self
             .get_metadata_range(
@@ -426,7 +452,7 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
             .collect();
 
         let event_batches_bytes_set = read_objects_absolute::read_objects_absolute(
-            &self.event_batches_dma_file,
+            event_batches_dma_file,
             file_len_event_batch,
             &object_positions,
             self.config.max_chunk_size,

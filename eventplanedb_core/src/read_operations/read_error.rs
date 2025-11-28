@@ -5,6 +5,7 @@ use crate::files::read_fixed_records_visit_const::ReadVisitError;
 
 #[derive(Debug)]
 pub enum ReadError {
+    NotExists,
     CreateFile(std::io::Error),
     IoError(GlommioError<()>),
     CannotCreateFolders {

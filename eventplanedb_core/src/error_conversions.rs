@@ -21,6 +21,10 @@ impl From<ReadError> for EventPlaneDBError {
                 EventPlaneDBError::corrupt_metadata()
             }
             ReadError::CreateFile(_io_err) => EventPlaneDBError::io_error(),
+            ReadError::NotExists => EventPlaneDBError {
+                code: ErrorCode::NotFound,
+                ..Default::default()
+            },
         }
     }
 }
@@ -63,6 +67,8 @@ impl From<WriteError> for EventPlaneDBError {
             WriteError::ZeroEventType { client_event_index } => {
                 EventPlaneDBError::zero_event_type(client_event_index)
             },
+            WriteError::DmaFileNotInitialized => EventPlaneDBError::io_error(),
+            WriteError::GlommioError(_glommio_error) => EventPlaneDBError::io_error(),
         }
     }
 }

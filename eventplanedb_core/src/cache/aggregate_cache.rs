@@ -6,7 +6,10 @@ use eventplanedb_structures::aggregate_key::AggregateKey;
 use lru::LruCache;
 
 use crate::cache::aggregate_resources::AggregateResources;
+use crate::read_operations::read_error::ReadError;
+use crate::read_operations::read_operations::ReadOperations;
 use crate::read_operations::read_structures::AggregateReadConfig;
+use crate::write_operations::write_operations::WriteOperations;
 use crate::write_operations::write_structures::AggregateWriteConfig;
 
 pub struct AggregateCache {
@@ -48,9 +51,18 @@ impl AggregateCache {
         resources
     }
     
-    pub fn pop(&self, aggregate_key: &AggregateKey) {
+    pub async fn pop(&self, aggregate_key: &AggregateKey) -> Result<(), ReadError> {
         let mut cache = self.aggregates_cache.borrow_mut();
-        cache.pop(aggregate_key);
+        let aggregate_resources = cache.pop(aggregate_key);
+        if let Some(aggregate_resources) = aggregate_resources {
+            let mut reader = aggregate_resources.get_reader_mut(false).await?;
+            let mut writer = aggregate_resources.get_writer_mut(false).await?;
+
+            reader.as_mut().unwrap().close().await?;
+            writer.as_mut().unwrap().close().await?;
+        }
+
+        Ok(())
     }
 
     pub fn get_all_keys(&self) -> Vec<AggregateKey> {

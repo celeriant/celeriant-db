@@ -37,11 +37,11 @@ fn build_combined_request_bytes(
     let encoded = bincode::encode_to_vec(&request, BINCODE_CONFIG_VARIABLE).unwrap();
     
     // Compress the encoded data (V2 protocol uses snap compression)
-    let compressed = snap::raw::Encoder::new()
+    let _compressed = snap::raw::Encoder::new()
         .compress_vec(&encoded)
         .unwrap();
 
-    let (type_id, _) = eventplanedb_structures::compression_type::CompressionType::Snappy.to_tuple();
+    let (_type_id, _) = eventplanedb_structures::compression_type::CompressionType::Snappy.to_tuple();
 
     let protocol_version = 2u32;
     let header_size = 17;
@@ -169,7 +169,7 @@ fn main() {
             0,
             1,
             0,
-            b" Lorem ipsum dolor sit amet, consectetur adipiscing elit. Phasellus sed turpis nec ex congue dictum. Praesent molestie porttitor diam, eget porttitor erat pharetra at. Sed ornare imperdiet diam faucibus tristique. Quisque sed lectus vel risus vestibulum pretium. Duis ut leo convallis, euismod mi sed, posuere ipsum. Aliquam iaculis dignissim urna quis luctus. Suspendisse tincidunt dolor gravida risus faucibus, sed ultricies leo rhoncus. In tempus, augue nec iaculis pulvinar, diam velit fringilla justo, non sodales eros neque eget eros. Maecenas nec pellentesque sem. In eget purus enim. Aliquam id nibh a justo dictum viverra. Sed consectetur arcu at ullamcorper imperdiet. Ut gravida nisi quis condimentum egestas. Suspendisse ac ipsum vestibulum, ultrices elit vitae, aliquam risus. Quisque fermentum ex id sem tincidunt, vitae tempor ligula semper. Praesent bibendum nibh in turpis viverra, et lobortis turpis pellentesque.".to_vec(),
+            b"a".to_vec(),
         ),
     ];
     // let base_events = vec![

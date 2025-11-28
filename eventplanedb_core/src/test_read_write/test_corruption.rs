@@ -11,7 +11,6 @@ pub mod test_corruption {
     use crate::{
         cache::aggregate_cache::AggregateCache,
         read_operations::{
-            read_error::ReadError,
             read_operations::ReadOperations,
             read_structures::AggregateReadConfig,
         },
@@ -27,6 +26,7 @@ pub mod test_corruption {
         client_id: u128,
         client_event_index: u64,
         expected_batch_index: u64,
+        skip_close: bool,
     ) {
         let events = vec![EventItem::new(
             client_event_index,
@@ -57,6 +57,10 @@ pub mod test_corruption {
             .unwrap();
 
         writer.as_mut().unwrap().sync_with_rollback().await.unwrap();
+
+        if !skip_close {
+            writer.as_mut().unwrap().close().await.unwrap();
+        }
     }
 
     fn corrupt_event_batches_file(data_folder: &str, append_bytes: u64) {
@@ -102,6 +106,8 @@ pub mod test_corruption {
         file.close().await.unwrap();
     }
 
+    //TODO: Handle the scenarios where we were unable to truncate either file (unexpected power failure or process killed)
+
     #[test]
     fn test_1_single_batch_no_corruption() {
         let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
@@ -129,7 +135,55 @@ pub mod test_corruption {
                 let aggregate_key = AggregateKey::new(1, 1, 1);
 
                 // Write a single batch
-                write_batch(&aggregates_cache, &aggregate_key, 123, 45, 1).await;
+                write_batch(&aggregates_cache, &aggregate_key, 123, 45, 1, false).await;
+
+                // Verify no corruption
+                let aggregate_resources = aggregates_cache.get(&aggregate_key);
+                let reader = aggregate_resources.get_reader(true).await.unwrap();
+                let result = reader
+                    .as_ref()
+                    .unwrap()
+                    .get_write_operations_data_requirements()
+                    .await
+                    .unwrap();
+
+                assert_eq!(result.next_event_batch_index, 2);
+                assert_eq!(result.next_event_index, 2);
+                assert_eq!(result.minimum_available_event_batch_index, 1);
+            })
+            .unwrap();
+        handle.join().unwrap();
+    }
+
+
+    #[test]
+    fn test_1_single_batch_no_close_auto_trim() {
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
+            .spawn(|| async move {
+                let aggregate_read_config = AggregateReadConfig {
+                    max_chunk_size: 1 << 20,
+                    
+                };
+
+                let aggregate_write_config = AggregateWriteConfig {
+                    max_data_cache_size_bytes: 1 << 25,
+                    cache_trim_factor: 25,
+                    max_chunk_size: 1 << 20,
+                };
+
+                let tempdir = tempfile::tempdir().unwrap();
+                let data_root_folder = tempdir.path().to_str().unwrap();
+
+                let aggregates_cache = AggregateCache::new(
+                    NonZeroUsize::new(1000).unwrap(),
+                    data_root_folder.to_string(),
+                    aggregate_read_config,
+                    aggregate_write_config,
+                );
+                let aggregate_key = AggregateKey::new(1, 1, 1);
+
+                // Write a single batch
+                write_batch(&aggregates_cache, &aggregate_key, 123, 45, 1, true).await;
 
                 // Verify no corruption
                 let aggregate_resources = aggregates_cache.get(&aggregate_key);
@@ -176,12 +230,12 @@ pub mod test_corruption {
                 let aggregate_key = AggregateKey::new(1, 1, 1);
 
                 // Write a single batch
-                write_batch(&aggregates_cache, &aggregate_key, 123, 45, 1).await;
+                write_batch(&aggregates_cache, &aggregate_key, 123, 45, 1, false).await;
 
                 // Corrupt the event batches file
                 corrupt_event_batches_file(data_root_folder, 5);
 
-                aggregates_cache.pop(&aggregate_key);
+                aggregates_cache.pop(&aggregate_key).await.unwrap();
 
                 // Should fail with CorruptEventBatch error (no auto-repair possible)
                 let aggregate_resources = aggregates_cache.get(&aggregate_key);
@@ -224,13 +278,13 @@ pub mod test_corruption {
                 let aggregate_key = AggregateKey::new(1, 1, 1);
 
                 // Write two batches
-                write_batch(&aggregates_cache, &aggregate_key, 123, 45, 1).await;
-                write_batch(&aggregates_cache, &aggregate_key, 123, 46, 2).await;
+                write_batch(&aggregates_cache, &aggregate_key, 123, 45, 1, true).await;
+                write_batch(&aggregates_cache, &aggregate_key, 123, 46, 2, false).await;
 
                 // Corrupt the last event batch
                 corrupt_event_batches_file(data_root_folder, 5);
 
-                aggregates_cache.pop(&aggregate_key);
+                aggregates_cache.pop(&aggregate_key).await.unwrap();
 
                 // Should auto-repair by truncating the last batch
                 let aggregate_resources = aggregates_cache.get(&aggregate_key);

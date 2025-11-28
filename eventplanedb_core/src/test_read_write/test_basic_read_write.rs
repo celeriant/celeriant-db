@@ -11,7 +11,7 @@ mod test_basic_read_write {
     use glommio::{LocalExecutorBuilder, Placement};
 
     use crate::{
-        cache::aggregate_cache::AggregateCache, files::open_dma_files::{read_only_dma, write_only_dma}, read_operations::{
+        cache::aggregate_cache::AggregateCache, files::open_dma_files::{existing_file_read_only_dma, create_and_write_only_dma}, read_operations::{
             read_operations::{ReadOperations, ReadOperationsWithDmaFiles},
             read_structures::AggregateReadConfig,
         }, write_operations::{
@@ -287,9 +287,9 @@ mod test_basic_read_write {
                 std::fs::create_dir_all(&base_folder).unwrap();
                 // std::fs::File::create(&path_metadata).unwrap();
 
-                let writer_metadata_dma_file = write_only_dma(&path_metadata).await.unwrap();
+                let writer_metadata_dma_file = create_and_write_only_dma(&path_metadata).await.unwrap();
                 writer_metadata_dma_file.pre_allocate(512, false).await.unwrap();
-                let reader_metadata_dma_file = read_only_dma(&path_metadata).await.unwrap();
+                let reader_metadata_dma_file = existing_file_read_only_dma(&path_metadata).await.unwrap();
 
                 let buffer_size = writer_metadata_dma_file.alignment();
                 let mut buf = writer_metadata_dma_file.alloc_dma_buffer(buffer_size as usize);
@@ -341,10 +341,10 @@ mod test_basic_read_write {
                 std::fs::create_dir_all(&base_folder).unwrap();
 
                 // Open DMA files - must be done in this order due to direct I/O fs constraints
-                let writer_metadata_dma_file = write_only_dma(&path_metadata).await.unwrap();
-                let reader_metadata_dma_file = read_only_dma(&path_metadata).await.unwrap();
-                let writer_event_batch_dma_file = write_only_dma(&path_event_batches).await.unwrap();
-                let reader_event_batch_dma_file = read_only_dma(&path_event_batches).await.unwrap();
+                let writer_metadata_dma_file = create_and_write_only_dma(&path_metadata).await.unwrap();
+                let reader_metadata_dma_file = existing_file_read_only_dma(&path_metadata).await.unwrap();
+                let writer_event_batch_dma_file = create_and_write_only_dma(&path_event_batches).await.unwrap();
+                let reader_event_batch_dma_file = existing_file_read_only_dma(&path_event_batches).await.unwrap();
 
                 let read_operations = ReadOperationsWithDmaFiles::new(
                     reader_metadata_dma_file, reader_event_batch_dma_file, aggregate_read_config.clone());

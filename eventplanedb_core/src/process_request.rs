@@ -22,12 +22,10 @@ use glommio::spawn_local;
 use log::error;
 
 use crate::{
-    cache::aggregate_cache::AggregateCache,
-    read_operations::{read_operations::ReadOperations, read_structures::AggregateReadConfig},
-    write_operations::{
+    cache::aggregate_cache::AggregateCache, files::open_dma_files::existing_file_read_only_dma, read_operations::{read_error::ReadError, read_operations::ReadOperations, read_structures::AggregateReadConfig}, write_operations::{
         write_operations::WriteOperations,
         write_structures::{AggregateWriteConfig, WriteOptions},
-    },
+    }
 };
 
 pub struct ProcessRequest {
@@ -134,14 +132,29 @@ impl ProcessRequest {
                     request.aggregate_id,
                 );
                 let aggregate_resources = self.aggregate_cache.get(&aggregate_key);
-                let exists = aggregate_resources.get_reader(false).await;
-                let exists = exists.is_ok() && exists.unwrap().is_some();
 
-                Response::Exists(ExistsResponse {
-                    correlation_id: request.correlation_id,
-                    error: None,
-                    exists,
-                })
+                match aggregate_resources.get_reader(false).await {
+                    Ok(reader) => {
+                        let exists = reader.is_some();
+                        Response::Exists(ExistsResponse {
+                            correlation_id: request.correlation_id,
+                            error: None,
+                            exists,
+                        })
+                    }
+                    Err(err) => match err {
+                        ReadError::NotExists => Response::Exists(ExistsResponse {
+                            correlation_id: request.correlation_id,
+                            error: None,
+                            exists: false,
+                        }),
+                        _ => Response::Exists(ExistsResponse {
+                            correlation_id: request.correlation_id,
+                            error: Some(err.into()),
+                            exists: false,
+                        }),
+                    },
+                }
             }
 
             Request::TrimStart(request) => {
@@ -230,6 +243,16 @@ impl ProcessRequest {
         }
     }
 
+    pub async fn handle_shutdown(&self) -> Result<(), ReadError> {
+        let keys = self.aggregate_cache.get_all_keys();
+
+        for key in keys {
+            self.aggregate_cache.pop(&key).await?;
+        }
+
+        Ok(())
+    }
+
     async fn handle_update_cache_limits(
         &self,
         request: UpdateCacheLimitsRequest,
@@ -298,12 +321,20 @@ impl ProcessRequest {
             .await?;
         let reader_ref = reader.as_mut().unwrap();
         let writer_ref = writer.as_mut().unwrap();
-        writer_ref.prepend_batches(request.compression_type, &request.batches)
+
+        if reader_ref.metadata_dma_file.is_none() || reader_ref.event_batches_dma_file.is_none() {
+            return Err(EventPlaneDBError::io_error());
+        }
+
+        writer_ref.prepend_batches(request.compression_type, &request.batches, reader_ref.metadata_dma_file.as_ref().unwrap(), reader_ref.event_batches_dma_file.as_ref().unwrap())
             .await?;
-        reader_ref.trim_start(
-            writer_ref.metadata_dma_file.dup().unwrap(),
-            writer_ref.event_batches_dma_file.dup().unwrap(),
-        );
+
+        let data_requirements = reader_ref.replace_dma_files(
+            existing_file_read_only_dma(&aggregate_resources.path_metadata).await.map_err(|_e| EventPlaneDBError::io_error())?,
+            existing_file_read_only_dma(&aggregate_resources.path_event_batches).await.map_err(|_e| EventPlaneDBError::io_error())?,
+        ).await?;
+
+        writer_ref.update_write_operations_data_requirements(data_requirements);
 
         Ok(())
     }
@@ -576,6 +607,10 @@ impl ProcessRequest {
         let mut reader = aggregate_resources.get_reader_mut(false).await?;
         let r_reader = reader.as_mut().unwrap();
 
+        if r_reader.metadata_dma_file.is_none() || r_reader.event_batches_dma_file.is_none() {
+            return Err(EventPlaneDBError::io_error());
+        }
+
         let file_positions = r_reader
             .get_file_positions(
                 r_writer.minimum_available_event_batch_index,
@@ -588,21 +623,19 @@ impl ProcessRequest {
         r_writer
             .trim_start(
                 request.keep_from_event_batch_index,
+                r_reader.metadata_dma_file.as_ref().unwrap(),
+                &r_reader.event_batches_dma_file.as_ref().unwrap(),
                 file_positions.metadata_position,
                 file_positions.event_batch_position,
             )
             .await?;
 
-        let metadata_dma_file = r_writer
-            .metadata_dma_file
-            .dup()
-            .map_err(|_e| EventPlaneDBError::io_error())?;
-        let event_batches_dma_file = r_writer
-            .event_batches_dma_file
-            .dup()
-            .map_err(|_e| EventPlaneDBError::io_error())?;
+        let data_requirements = r_reader.replace_dma_files(
+            existing_file_read_only_dma(&aggregate_resources.path_metadata).await.map_err(|_e| EventPlaneDBError::io_error())?,
+            existing_file_read_only_dma(&aggregate_resources.path_event_batches).await.map_err(|_e| EventPlaneDBError::io_error())?,
+        ).await?;
 
-        r_reader.trim_start(metadata_dma_file, event_batches_dma_file);
+        r_writer.update_write_operations_data_requirements(data_requirements);
 
         Ok(())
     }
@@ -613,7 +646,7 @@ impl ProcessRequest {
             request.aggregate_type_id,
             request.aggregate_id,
         );
-        self.aggregate_cache.pop(&aggregate_key);
+        self.aggregate_cache.pop(&aggregate_key).await?;
 
         // Delete files
         let data_root_folder = Path::new(&self.data_root_folder).to_path_buf();
