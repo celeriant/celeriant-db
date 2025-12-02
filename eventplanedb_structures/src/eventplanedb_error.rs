@@ -11,6 +11,9 @@ pub struct EventPlaneDBError {
     // Optional typed fields for structured error data
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_id: Option<u128>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub leader_node_id: Option<u128>,
     
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_event_batch_index: Option<u64>,
@@ -65,6 +68,28 @@ pub struct EventPlaneDBError {
 }
 
 impl EventPlaneDBError {
+
+    pub fn cannot_be_leader() -> Self {
+        Self {
+            code: ErrorCode::CannotBeLeader,
+            ..Default::default()
+        }
+    }
+
+    pub fn not_leader(leader_node_id: u128) -> Self {
+        Self {
+            code: ErrorCode::NotLeader,
+            leader_node_id: Some(leader_node_id),
+            ..Default::default()
+        }
+    }
+
+    pub fn control_plane_offline() -> Self {
+        Self {
+            code: ErrorCode::ControlPlaneOffline,
+            ..Default::default()
+        }
+    }
 
     pub fn invalid_request() -> Self {
         Self {
@@ -285,6 +310,7 @@ impl Default for EventPlaneDBError {
             to_event_batch_index: None,
             provided_last_batch_index: None,
             current_first_event_batch_index: None,
+            leader_node_id: None
         }
     }
 }

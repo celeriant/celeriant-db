@@ -37,4 +37,10 @@ pub enum ErrorCode {
     ResourceExhausted,
     Internal,
     InvalidRequest,
+
+    // Replication errors
+    NotLeader,
+    ControlPlaneOffline,
+    MissingBatches,
+    CannotBeLeader,
 }

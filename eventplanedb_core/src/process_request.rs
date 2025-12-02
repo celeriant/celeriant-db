@@ -22,36 +22,32 @@ use glommio::spawn_local;
 use log::error;
 
 use crate::{
-    cache::aggregate_cache::AggregateCache, files::open_dma_files::existing_file_read_only_dma, read_operations::{read_error::ReadError, read_operations::ReadOperations, read_structures::AggregateReadConfig}, write_operations::{
+    cache::aggregate_cache::AggregateCache, files::open_dma_files::existing_file_read_only_dma, node_config::{self, NodeConfig}, read_operations::{read_error::ReadError, read_operations::ReadOperations, read_structures::AggregateReadConfig}, write_operations::{
         write_operations::WriteOperations,
         write_structures::{AggregateWriteConfig, WriteOptions},
     }
 };
 
 pub struct ProcessRequest {
-    data_root_folder: String,
-    async_flush_ms: u64,
     aggregate_cache: AggregateCache,
+    node_config: NodeConfig,
 }
 
 impl ProcessRequest {
     pub fn new(
-        data_root_folder: String,
-        async_flush_ms: u64,
         aggregate_read_config: AggregateReadConfig,
         aggregate_write_config: AggregateWriteConfig,
-        max_open_aggregates: usize,
+        node_config: NodeConfig,
     ) -> Self {
-        let capacity = NonZeroUsize::new(max_open_aggregates).unwrap();
+        let capacity = NonZeroUsize::new(node_config.max_open_aggregates).unwrap();
         Self {
-            data_root_folder: data_root_folder.clone(),
-            async_flush_ms,
             aggregate_cache: AggregateCache::new(
                 capacity,
-                data_root_folder,
+                node_config.clone(),
                 aggregate_read_config,
                 aggregate_write_config,
             ),
+            node_config
         }
     }
 
@@ -66,7 +62,6 @@ impl ProcessRequest {
     pub async fn process(
         &self,
         request: Request,
-        max_event_batches_response_size: Option<usize>,
     ) -> Response {
         match request {
             Request::UpdateCacheLimits(request) => {
@@ -108,7 +103,7 @@ impl ProcessRequest {
             Request::Read(request) => {
                 let correlation_id = request.correlation_id;
                 let result = self
-                    .handle_read(request, max_event_batches_response_size)
+                    .handle_read(request, self.node_config.max_event_batches_response_size)
                     .await;
 
                 match result {
@@ -131,7 +126,7 @@ impl ProcessRequest {
                     request.aggregate_type_id,
                     request.aggregate_id,
                 );
-                let aggregate_resources = self.aggregate_cache.get(&aggregate_key);
+                let aggregate_resources = self.aggregate_cache.get_aggregate_resources(&aggregate_key);
 
                 match aggregate_resources.get_reader(false).await {
                     Ok(reader) => {
@@ -288,7 +283,7 @@ impl ProcessRequest {
         let keys = self.aggregate_cache.get_all_keys();
 
         for key in keys {
-            let aggregate_resources = self.aggregate_cache.get(&key);
+            let aggregate_resources = self.aggregate_cache.get_aggregate_resources(&key);
 
             // Update writer cache limit
             if let Ok(mut writer) = aggregate_resources.get_writer_mut(false).await {
@@ -312,7 +307,7 @@ impl ProcessRequest {
             request.aggregate_type_id,
             request.aggregate_id,
         );
-        let aggregate_resources = self.aggregate_cache.get(&aggregate_key);
+        let aggregate_resources = self.aggregate_cache.get_aggregate_resources(&aggregate_key);
         let mut reader = aggregate_resources
             .get_reader_mut(request.allow_create)
             .await?;
@@ -345,7 +340,7 @@ impl ProcessRequest {
     ) -> Result<Vec<Organisation>, EventPlaneDBError> {
         let mut orgs = Vec::new();
 
-        let data_root_folder = Path::new(&self.data_root_folder).to_path_buf();
+        let data_root_folder = Path::new(&self.node_config.data_root_folder).to_path_buf();
 
         let entries =
             std::fs::read_dir(&data_root_folder).map_err(|_| EventPlaneDBError::io_error())?;
@@ -444,7 +439,7 @@ impl ProcessRequest {
 
         let mut aggregates = Vec::new();
 
-        let data_root_folder = Path::new(&self.data_root_folder).to_path_buf();
+        let data_root_folder = Path::new(&self.node_config.data_root_folder).to_path_buf();
 
         let base_path = if let Some(type_id) = aggregate_type_id {
             // List specific aggregate type
@@ -505,7 +500,14 @@ impl ProcessRequest {
             request.aggregate_type_id,
             request.aggregate_id,
         );
-        let aggregate_resources = self.aggregate_cache.get(&aggregate_key);
+        let aggregate_resources = self.aggregate_cache.get_aggregate_resources(&aggregate_key);
+
+        // Check who has the current lease for this aggregate. Calls off to the control plane if we don't have it.
+        let (lease_index, taking_lease_from_other_node) = self.aggregate_cache.get_aggregate_lease(&aggregate_key).must_be_leader().await?;
+
+        if taking_lease_from_other_node {
+            //TODO: need to check for any batches on s3 (degraded mode replication) and update disk+cache
+        }
 
         let append_result = {
             let mut writer = aggregate_resources
@@ -521,7 +523,7 @@ impl ProcessRequest {
                 server_timestamp_millis: Self::get_server_timestamp_millis(),
                 compression_type: request.compression_type,
             };
-            r_writer.queue_events_in_memory(request.events, &append_options)?
+            r_writer.queue_events_in_memory(self.node_config.node_id, lease_index, request.events, &append_options)?
         };
 
         if let Some(delay_us) = request.durable_write_with_delay_us {
@@ -530,7 +532,7 @@ impl ProcessRequest {
                 .await?;
         } else {
             let aggregate_resources = aggregate_resources.clone();
-            let async_flush_ms = self.async_flush_ms;
+            let async_flush_ms = self.node_config.async_flush_ms;
 
             spawn_local(async move {
                 let sync_result = aggregate_resources
@@ -542,6 +544,8 @@ impl ProcessRequest {
             })
             .detach();
         }
+
+        //TODO: Replicate to followers
 
         Ok(append_result)
     }
@@ -556,7 +560,7 @@ impl ProcessRequest {
             request.aggregate_type_id,
             request.aggregate_id,
         );
-        let aggregate_resources = self.aggregate_cache.get(&aggregate_key);
+        let aggregate_resources = self.aggregate_cache.get_aggregate_resources(&aggregate_key);
 
         let (file_len_metadata, file_len_event_batch, minimum_available_event_batch_index) = {
             let writer = aggregate_resources.get_writer(false).await?;
@@ -600,7 +604,7 @@ impl ProcessRequest {
             request.aggregate_type_id,
             request.aggregate_id,
         );
-        let aggregate_resources = self.aggregate_cache.get(&aggregate_key);
+        let aggregate_resources = self.aggregate_cache.get_aggregate_resources(&aggregate_key);
 
         let mut writer = aggregate_resources.get_writer_mut(false).await?;
         let r_writer = writer.as_mut().unwrap();
@@ -649,7 +653,7 @@ impl ProcessRequest {
         self.aggregate_cache.pop(&aggregate_key).await?;
 
         // Delete files
-        let data_root_folder = Path::new(&self.data_root_folder).to_path_buf();
+        let data_root_folder = Path::new(&self.node_config.data_root_folder).to_path_buf();
         let metadata_path = data_root_folder.join(format!(
             "{}/{}/{}/metadata.bin",
             request.org_id, request.aggregate_type_id, request.aggregate_id

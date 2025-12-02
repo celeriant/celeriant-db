@@ -9,15 +9,13 @@ pub mod test_corruption {
     use glommio::{io::OpenOptions, LocalExecutorBuilder, Placement};
 
     use crate::{
-        cache::aggregate_cache::AggregateCache,
-        read_operations::{
+        cache::aggregate_cache::AggregateCache, node_config::test_node_config::test_config, read_operations::{
             read_operations::ReadOperations,
             read_structures::AggregateReadConfig,
-        },
-        write_operations::{
+        }, write_operations::{
             write_operations::WriteOperations,
             write_structures::{AggregateWriteConfig, WriteOptions},
-        },
+        }
     };
 
     pub async fn write_batch(
@@ -47,13 +45,13 @@ pub mod test_corruption {
             user_id: None,
         };
 
-        let aggregate_resources = aggregates_cache.get(aggregate_key);
+        let aggregate_resources = aggregates_cache.get_aggregate_resources(aggregate_key);
         let mut writer = aggregate_resources.get_writer_mut(true).await.unwrap();
 
         writer
             .as_mut()
             .unwrap()
-            .queue_events_in_memory(events, &append_options)
+            .queue_events_in_memory(0, 0,  events, &append_options)
             .unwrap();
 
         writer.as_mut().unwrap().sync_with_rollback().await.unwrap();
@@ -128,7 +126,7 @@ pub mod test_corruption {
 
                 let aggregates_cache = AggregateCache::new(
                     NonZeroUsize::new(1000).unwrap(),
-                    data_root_folder.to_string(),
+                    test_config(data_root_folder),
                     aggregate_read_config,
                     aggregate_write_config,
                 );
@@ -138,7 +136,7 @@ pub mod test_corruption {
                 write_batch(&aggregates_cache, &aggregate_key, 123, 45, 1, false).await;
 
                 // Verify no corruption
-                let aggregate_resources = aggregates_cache.get(&aggregate_key);
+                let aggregate_resources = aggregates_cache.get_aggregate_resources(&aggregate_key);
                 let reader = aggregate_resources.get_reader(true).await.unwrap();
                 let result = reader
                     .as_ref()
@@ -176,7 +174,7 @@ pub mod test_corruption {
 
                 let aggregates_cache = AggregateCache::new(
                     NonZeroUsize::new(1000).unwrap(),
-                    data_root_folder.to_string(),
+                    test_config(data_root_folder),
                     aggregate_read_config,
                     aggregate_write_config,
                 );
@@ -186,7 +184,7 @@ pub mod test_corruption {
                 write_batch(&aggregates_cache, &aggregate_key, 123, 45, 1, true).await;
 
                 // Verify no corruption
-                let aggregate_resources = aggregates_cache.get(&aggregate_key);
+                let aggregate_resources = aggregates_cache.get_aggregate_resources(&aggregate_key);
                 let reader = aggregate_resources.get_reader(true).await.unwrap();
                 let result = reader
                     .as_ref()
@@ -195,7 +193,7 @@ pub mod test_corruption {
                     .await
                     .unwrap();
 
-                assert_eq!(result.file_len_event_batch, 22);
+                assert_eq!(result.file_len_event_batch, 24);
                 assert_eq!(result.file_len_metadata, 256);
                 assert_eq!(result.next_event_batch_index, 2);
                 assert_eq!(result.next_event_index, 2);
@@ -225,7 +223,7 @@ pub mod test_corruption {
 
                 let aggregates_cache = AggregateCache::new(
                     NonZeroUsize::new(1000).unwrap(),
-                    data_root_folder.to_string(),
+                    test_config(data_root_folder),
                     aggregate_read_config,
                     aggregate_write_config,
                 );
@@ -240,7 +238,7 @@ pub mod test_corruption {
                 aggregates_cache.pop(&aggregate_key).await.unwrap();
 
                 // Should fail with CorruptEventBatch error (no auto-repair possible)
-                let aggregate_resources = aggregates_cache.get(&aggregate_key);
+                let aggregate_resources = aggregates_cache.get_aggregate_resources(&aggregate_key);
                 let reader = aggregate_resources.get_reader(true).await.unwrap();
                 let result = reader
                     .as_ref()
@@ -273,7 +271,7 @@ pub mod test_corruption {
 
                 let aggregates_cache = AggregateCache::new(
                     NonZeroUsize::new(1000).unwrap(),
-                    data_root_folder.to_string(),
+                    test_config(data_root_folder),
                     aggregate_read_config,
                     aggregate_write_config,
                 );
@@ -289,7 +287,7 @@ pub mod test_corruption {
                 aggregates_cache.pop(&aggregate_key).await.unwrap();
 
                 // Should auto-repair by truncating the last batch
-                let aggregate_resources = aggregates_cache.get(&aggregate_key);
+                let aggregate_resources = aggregates_cache.get_aggregate_resources(&aggregate_key);
                 let reader = aggregate_resources.get_reader(true).await.unwrap();
                 let result = reader
                     .as_ref()

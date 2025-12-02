@@ -11,9 +11,7 @@ mod test_process_request_integration {
     use glommio::{LocalExecutorBuilder, Placement};
 
     use crate::{
-        process_request::ProcessRequest,
-        read_operations::read_structures::AggregateReadConfig,
-        write_operations::write_structures::AggregateWriteConfig,
+        node_config::test_node_config::test_config, process_request::ProcessRequest, read_operations::read_structures::AggregateReadConfig, write_operations::write_structures::AggregateWriteConfig
     };
 
     /// Helper to create test events
@@ -52,11 +50,9 @@ mod test_process_request_integration {
                 };
 
                 let processor = ProcessRequest::new(
-                    data_root.to_string(),
-                    100,
                     read_config,
                     write_config,
-                    1000,
+                    test_config(data_root),
                 );
 
                 let org_id = 1;
@@ -71,7 +67,7 @@ mod test_process_request_integration {
                     aggregate_id,
                 });
 
-                let response = processor.process(exists_request, None).await;
+                let response = processor.process(exists_request).await;
                 match response {
                     Response::Exists(r) => {
                         assert_eq!(r.correlation_id, Some(1));
@@ -97,7 +93,7 @@ mod test_process_request_integration {
                     compression_type: CompressionType::None,
                 });
 
-                let response = processor.process(write_request, None).await;
+                let response = processor.process(write_request).await;
                 match response {
                     Response::Write(r) => {
                         assert_eq!(r.correlation_id, Some(2));
@@ -116,7 +112,7 @@ mod test_process_request_integration {
                     aggregate_id,
                 });
 
-                let response = processor.process(exists_request, None).await;
+                let response = processor.process(exists_request).await;
                 match response {
                     Response::Exists(r) => {
                         assert_eq!(r.correlation_id, Some(3));
@@ -141,7 +137,7 @@ mod test_process_request_integration {
                     compression_type: CompressionType::None,
                 });
 
-                let response = processor.process(write_request, None).await;
+                let response = processor.process(write_request).await;
                 match response {
                     Response::Write(r) => {
                         assert_eq!(r.correlation_id, Some(4));
@@ -160,7 +156,7 @@ mod test_process_request_integration {
                     filters: ReadFilters::new(1),
                 });
 
-                let response = processor.process(read_request, None).await;
+                let response = processor.process(read_request).await;
                 match response {
                     Response::Read(r) => {
                         assert_eq!(r.correlation_id, Some(5));
@@ -183,7 +179,7 @@ mod test_process_request_integration {
                     filters: ReadFilters::new(1).min_event_timestamp(2000),
                 });
 
-                let response = processor.process(read_request, None).await;
+                let response = processor.process(read_request).await;
                 match response {
                     Response::Read(r) => {
                         assert_eq!(r.correlation_id, Some(6));
@@ -206,8 +202,6 @@ mod test_process_request_integration {
                 let data_root = tempdir.path().to_str().unwrap();
 
                 let processor = ProcessRequest::new(
-                    data_root.to_string(),
-                    100,
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
                         
@@ -217,7 +211,7 @@ mod test_process_request_integration {
                         cache_trim_factor: 25,
                         max_chunk_size: 1 << 20,
                     },
-                    1000,
+                    test_config(data_root),
                 );
 
                 // Write to aggregate 1
@@ -236,7 +230,7 @@ mod test_process_request_integration {
                     compression_type: CompressionType::None,
                 });
 
-                let response = processor.process(write_req1, None).await;
+                let response = processor.process(write_req1).await;
                 assert!(matches!(response, Response::Write(_)));
 
                 // Write to aggregate 2
@@ -255,7 +249,7 @@ mod test_process_request_integration {
                     compression_type: CompressionType::None,
                 });
 
-                let response = processor.process(write_req2, None).await;
+                let response = processor.process(write_req2).await;
                 assert!(matches!(response, Response::Write(_)));
 
                 // Read from aggregate 1 - should only get its events
@@ -267,7 +261,7 @@ mod test_process_request_integration {
                     filters: ReadFilters::new(1),
                 });
 
-                let response = processor.process(read_req1, None).await;
+                let response = processor.process(read_req1).await;
                 match response {
                     Response::Read(r) => {
                         let result = r.result.unwrap();
@@ -287,7 +281,7 @@ mod test_process_request_integration {
                     filters: ReadFilters::new(1),
                 });
 
-                let response = processor.process(read_req2, None).await;
+                let response = processor.process(read_req2).await;
                 match response {
                     Response::Read(r) => {
                         let result = r.result.unwrap();
@@ -310,8 +304,6 @@ mod test_process_request_integration {
                 let data_root = tempdir.path().to_str().unwrap();
 
                 let processor = ProcessRequest::new(
-                    data_root.to_string(),
-                    100,
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
                         
@@ -321,7 +313,7 @@ mod test_process_request_integration {
                         cache_trim_factor: 25,
                         max_chunk_size: 1 << 20,
                     },
-                    1000,
+                    test_config(data_root),
                 );
 
                 // Write first batch
@@ -340,7 +332,7 @@ mod test_process_request_integration {
                     compression_type: CompressionType::None,
                 });
 
-                processor.process(write_req, None).await;
+                processor.process(write_req).await;
 
                 // Try to write with wrong expected index - should fail
                 let write_req = Request::Write(WriteRequest {
@@ -358,7 +350,7 @@ mod test_process_request_integration {
                     compression_type: CompressionType::None,
                 });
 
-                let response = processor.process(write_req, None).await;
+                let response = processor.process(write_req).await;
                 match response {
                     Response::Write(r) => {
                         assert!(r.error.is_some());
@@ -383,7 +375,7 @@ mod test_process_request_integration {
                     compression_type: CompressionType::None,
                 });
 
-                let response = processor.process(write_req, None).await;
+                let response = processor.process(write_req).await;
                 match response {
                     Response::Write(r) => {
                         assert!(r.error.is_some());
@@ -403,8 +395,6 @@ mod test_process_request_integration {
                 let data_root = tempdir.path().to_str().unwrap();
 
                 let processor = ProcessRequest::new(
-                    data_root.to_string(),
-                    100,
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
                         
@@ -414,7 +404,7 @@ mod test_process_request_integration {
                         cache_trim_factor: 25,
                         max_chunk_size: 1 << 20,
                     },
-                    1000,
+                    test_config(data_root),
                 );
 
                 let org_id = 1;
@@ -438,7 +428,7 @@ mod test_process_request_integration {
                         compression_type: CompressionType::None,
                     });
 
-                    processor.process(write_req, None).await;
+                    processor.process(write_req).await;
                 }
 
                 // Verify all batches exist
@@ -450,7 +440,7 @@ mod test_process_request_integration {
                     filters: ReadFilters::new(1),
                 });
 
-                let response = processor.process(read_req, None).await;
+                let response = processor.process(read_req).await;
                 match response {
                     Response::Read(r) => {
                         assert_eq!(r.result.unwrap().event_batches.len(), 5);
@@ -467,7 +457,7 @@ mod test_process_request_integration {
                     keep_from_event_batch_index: 3,
                 });
 
-                let response = processor.process(trim_req, None).await;
+                let response = processor.process(trim_req).await;
                 match response {
                     Response::TrimStart(r) => {
                         assert_eq!(r.correlation_id, Some(11));
@@ -485,7 +475,7 @@ mod test_process_request_integration {
                     filters: ReadFilters::new(3),
                 });
 
-                let response = processor.process(read_req, None).await;
+                let response = processor.process(read_req).await;
                 match response {
                     Response::Read(r) => {
                         let result = r.result.unwrap();
@@ -504,7 +494,7 @@ mod test_process_request_integration {
                     filters: ReadFilters::new(1),
                 });
 
-                let response = processor.process(read_req, None).await;
+                let response = processor.process(read_req).await;
                 match response {
                     Response::Read(r) => {
                         assert!(r.error.is_some());
@@ -524,8 +514,6 @@ mod test_process_request_integration {
                 let data_root = tempdir.path().to_str().unwrap();
 
                 let processor = ProcessRequest::new(
-                    data_root.to_string(),
-                    100,
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
                         
@@ -535,7 +523,7 @@ mod test_process_request_integration {
                         cache_trim_factor: 25,
                         max_chunk_size: 1 << 20,
                     },
-                    1000,
+                    test_config(data_root),
                 );
 
                 let org_id = 1;
@@ -558,7 +546,7 @@ mod test_process_request_integration {
                     compression_type: CompressionType::None,
                 });
 
-                processor.process(write_req, None).await;
+                processor.process(write_req).await;
 
                 // Verify it exists
                 let exists_req = Request::Exists(ExistsRequest {
@@ -568,7 +556,7 @@ mod test_process_request_integration {
                     aggregate_id,
                 });
 
-                let response = processor.process(exists_req, None).await;
+                let response = processor.process(exists_req).await;
                 match response {
                     Response::Exists(r) => assert!(r.exists),
                     _ => panic!("Expected ExistsResponse"),
@@ -582,7 +570,7 @@ mod test_process_request_integration {
                     aggregate_id,
                 });
 
-                let response = processor.process(delete_req, None).await;
+                let response = processor.process(delete_req).await;
                 match response {
                     Response::Delete(r) => {
                         assert_eq!(r.correlation_id, Some(3));
@@ -599,7 +587,7 @@ mod test_process_request_integration {
                     aggregate_id,
                 });
 
-                let response = processor.process(exists_req, None).await;
+                let response = processor.process(exists_req).await;
                 match response {
                     Response::Exists(r) => assert!(!r.exists),
                     _ => panic!("Expected ExistsResponse"),
@@ -617,8 +605,6 @@ mod test_process_request_integration {
                 let data_root = tempdir.path().to_str().unwrap();
 
                 let processor = ProcessRequest::new(
-                    data_root.to_string(),
-                    100,
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
                         
@@ -628,7 +614,7 @@ mod test_process_request_integration {
                         cache_trim_factor: 25,
                         max_chunk_size: 1 << 20,
                     },
-                    1000,
+                    test_config(data_root),
                 );
 
                 // Create an aggregate first
@@ -647,7 +633,7 @@ mod test_process_request_integration {
                     compression_type: CompressionType::None,
                 });
 
-                processor.process(write_req, None).await;
+                processor.process(write_req).await;
 
                 // Update cache limits
                 let update_req = Request::UpdateCacheLimits(UpdateCacheLimitsRequest {
@@ -655,7 +641,7 @@ mod test_process_request_integration {
                     aggregate_write_max_data_cache_size_bytes: 1 << 26,
                 });
 
-                let response = processor.process(update_req, None).await;
+                let response = processor.process(update_req).await;
                 match response {
                     Response::UpdateCacheLimits(r) => {
                         assert_eq!(r.correlation_id, Some(2));
@@ -681,7 +667,7 @@ mod test_process_request_integration {
                     compression_type: CompressionType::None,
                 });
 
-                let response = processor.process(write_req, None).await;
+                let response = processor.process(write_req).await;
                 match response {
                     Response::Write(r) => {
                         assert!(r.error.is_none());
@@ -700,9 +686,9 @@ mod test_process_request_integration {
                 let tempdir = tempfile::tempdir().unwrap();
                 let data_root = tempdir.path().to_str().unwrap();
 
+                let mut node_config = test_config(data_root);
+                node_config.max_event_batches_response_size = Some(300);
                 let processor = ProcessRequest::new(
-                    data_root.to_string(),
-                    100,
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
                         
@@ -712,7 +698,7 @@ mod test_process_request_integration {
                         cache_trim_factor: 25,
                         max_chunk_size: 1 << 20,
                     },
-                    1000,
+                    node_config,
                 );
 
                 let org_id = 1;
@@ -736,7 +722,7 @@ mod test_process_request_integration {
                         compression_type: CompressionType::None,
                     });
 
-                    processor.process(write_req, None).await;
+                    processor.process(write_req).await;
                 }
 
                 // Read first page with limit
@@ -748,7 +734,7 @@ mod test_process_request_integration {
                     filters: ReadFilters::new(1),
                 });
 
-                let response = processor.process(read_req, Some(300)).await;
+                let response = processor.process(read_req).await;
                 let next_batch_index = match response {
                     Response::Read(r) => {
                         let result = r.result.unwrap();
@@ -768,7 +754,7 @@ mod test_process_request_integration {
                     filters: ReadFilters::new(next_batch_index),
                 });
 
-                let response = processor.process(read_req, Some(300)).await;
+                let response = processor.process(read_req).await;
                 match response {
                     Response::Read(r) => {
                         let result = r.result.unwrap();
@@ -790,8 +776,6 @@ mod test_process_request_integration {
                 let data_root = tempdir.path().to_str().unwrap();
 
                 let processor = ProcessRequest::new(
-                    data_root.to_string(),
-                    100,
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
                         
@@ -801,7 +785,7 @@ mod test_process_request_integration {
                         cache_trim_factor: 25,
                                         max_chunk_size: 1 << 20,
                     },
-                    1000,
+                    test_config(data_root),
                 );
 
                 let org_id = 1;
@@ -825,7 +809,7 @@ mod test_process_request_integration {
                         compression_type: CompressionType::None,
                     });
 
-                    processor.process(write_req, None).await;
+                    processor.process(write_req).await;
                 }
 
                 // Read to get batches we'll later prepend
@@ -837,7 +821,7 @@ mod test_process_request_integration {
                     filters: ReadFilters::new(3),
                 });
 
-                let batches_to_prepend = match processor.process(read_req, None).await {
+                let batches_to_prepend = match processor.process(read_req).await {
                     Response::Read(r) => {
                         r.result.unwrap().event_batches
                     }
@@ -853,7 +837,7 @@ mod test_process_request_integration {
                     keep_from_event_batch_index: 5,
                 });
 
-                processor.process(trim_req, None).await;
+                processor.process(trim_req).await;
 
                 // Now prepend batches 3-4
                 let prepend_batches = batches_to_prepend[0..2].to_vec();
@@ -868,7 +852,7 @@ mod test_process_request_integration {
                     batches: prepend_batches,
                 });
 
-                let response = processor.process(write_batches_req, None).await;
+                let response = processor.process(write_batches_req).await;
                 match response {
                     Response::WriteBatches(r) => {
                         assert_eq!(r.correlation_id, Some(12));
@@ -886,7 +870,7 @@ mod test_process_request_integration {
                     filters: ReadFilters::new(3),
                 });
 
-                let response = processor.process(read_req, None).await;
+                let response = processor.process(read_req).await;
                 match response {
                     Response::Read(r) => {
                         let result = r.result.unwrap();
@@ -910,8 +894,6 @@ mod test_process_request_integration {
                 let data_root = tempdir.path().to_str().unwrap();
 
                 let processor = ProcessRequest::new(
-                    data_root.to_string(),
-                    100,
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
                         
@@ -921,7 +903,7 @@ mod test_process_request_integration {
                         cache_trim_factor: 25,
                         max_chunk_size: 1 << 20,
                     },
-                    1000,
+                    test_config(data_root),
                 );
 
                 let org_id = 1;
@@ -944,7 +926,7 @@ mod test_process_request_integration {
                     compression_type: CompressionType::None,
                 });
 
-                processor.process(write_req, None).await;
+                processor.process(write_req).await;
 
                 // Client 200 writes - different client, same client_event_index is OK
                 let write_req = Request::Write(WriteRequest {
@@ -962,7 +944,7 @@ mod test_process_request_integration {
                     compression_type: CompressionType::None,
                 });
 
-                let response = processor.process(write_req, None).await;
+                let response = processor.process(write_req).await;
                 match response {
                     Response::Write(r) => {
                         assert!(r.error.is_none());
@@ -987,7 +969,7 @@ mod test_process_request_integration {
                     compression_type: CompressionType::None,
                 });
 
-                let response = processor.process(write_req, None).await;
+                let response = processor.process(write_req).await;
                 match response {
                     Response::Write(r) => {
                         assert!(r.error.is_none());
@@ -1004,7 +986,7 @@ mod test_process_request_integration {
                     filters: ReadFilters::new(1),
                 });
 
-                let response = processor.process(read_req, None).await;
+                let response = processor.process(read_req).await;
                 match response {
                     Response::Read(r) => {
                         let result = r.result.unwrap();
@@ -1028,8 +1010,6 @@ mod test_process_request_integration {
                 let data_root = tempdir.path().to_str().unwrap();
 
                 let processor = ProcessRequest::new(
-                    data_root.to_string(),
-                    100,
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
                         
@@ -1039,7 +1019,7 @@ mod test_process_request_integration {
                         cache_trim_factor: 25,
                         max_chunk_size: 1 << 20,
                     },
-                    1000,
+                    test_config(data_root),
                 );
 
                 // Create aggregates in different organisations
@@ -1060,7 +1040,7 @@ mod test_process_request_integration {
                             compression_type: CompressionType::None,
                         });
 
-                        processor.process(write_req, None).await;
+                        processor.process(write_req).await;
                     }
                 }
 
@@ -1070,7 +1050,7 @@ mod test_process_request_integration {
                     filters: eventplanedb_structures::directory_filters::DirectoryFilters::default(),
                 });
 
-                let response = processor.process(list_orgs_req, None).await;
+                let response = processor.process(list_orgs_req).await;
                 match response {
                     Response::ListOrganisations(r) => {
                         assert_eq!(r.correlation_id, Some(100));
@@ -1091,7 +1071,7 @@ mod test_process_request_integration {
                     filters: eventplanedb_structures::directory_filters::DirectoryFilters::default(),
                 });
 
-                let response = processor.process(list_aggs_req, None).await;
+                let response = processor.process(list_aggs_req).await;
                 match response {
                     Response::ListAggregates(r) => {
                         assert_eq!(r.correlation_id, Some(101));
@@ -1114,7 +1094,7 @@ mod test_process_request_integration {
                     filters: eventplanedb_structures::directory_filters::DirectoryFilters::default(),
                 });
 
-                let response = processor.process(list_aggs_req, None).await;
+                let response = processor.process(list_aggs_req).await;
                 match response {
                     Response::ListAggregates(r) => {
                         assert_eq!(r.aggregates.len(), 2);
@@ -1137,8 +1117,6 @@ mod test_process_request_integration {
                 let data_root = tempdir.path().to_str().unwrap();
 
                 let processor = ProcessRequest::new(
-                    data_root.to_string(),
-                    100,
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
                         
@@ -1148,7 +1126,7 @@ mod test_process_request_integration {
                         cache_trim_factor: 25,
                         max_chunk_size: 1 << 20,
                     },
-                    1000,
+                    test_config(data_root),
                 );
 
                 let org_id = 1;
@@ -1171,7 +1149,7 @@ mod test_process_request_integration {
                     compression_type: CompressionType::None,
                 });
 
-                processor.process(write_req, None).await;
+                processor.process(write_req).await;
 
                 // Write with background sync (simulated by None)
                 let write_req = Request::Write(WriteRequest {
@@ -1189,7 +1167,7 @@ mod test_process_request_integration {
                     compression_type: CompressionType::None,
                 });
 
-                processor.process(write_req, None).await;
+                processor.process(write_req).await;
 
                 // Give background sync time to complete
                 glommio::timer::sleep(std::time::Duration::from_millis(300)).await;
@@ -1203,7 +1181,7 @@ mod test_process_request_integration {
                     filters: ReadFilters::new(1),
                 });
 
-                let response = processor.process(read_req, None).await;
+                let response = processor.process(read_req).await;
                 match response {
                     Response::Read(r) => {
                         let result = r.result.unwrap();
@@ -1224,8 +1202,6 @@ mod test_process_request_integration {
                 let data_root = tempdir.path().to_str().unwrap();
 
                 let processor = ProcessRequest::new(
-                    data_root.to_string(),
-                    100,
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
                         
@@ -1235,7 +1211,7 @@ mod test_process_request_integration {
                         cache_trim_factor: 25,
                         max_chunk_size: 1 << 20,
                     },
-                    1000,
+                    test_config(data_root),
                 );
 
                 // Try to read from non-existent aggregate
@@ -1247,7 +1223,7 @@ mod test_process_request_integration {
                     filters: ReadFilters::new(1),
                 });
 
-                let response = processor.process(read_req, None).await;
+                let response = processor.process(read_req).await;
                 match response {
                     Response::Read(r) => {
                         assert!(r.error.is_some());
@@ -1272,7 +1248,7 @@ mod test_process_request_integration {
                     compression_type: CompressionType::None,
                 });
 
-                let response = processor.process(write_req, None).await;
+                let response = processor.process(write_req).await;
                 match response {
                     Response::Write(r) => {
                         assert!(r.error.is_some());
@@ -1290,7 +1266,7 @@ mod test_process_request_integration {
                     keep_from_event_batch_index: 1,
                 });
 
-                let response = processor.process(trim_req, None).await;
+                let response = processor.process(trim_req).await;
                 match response {
                     Response::TrimStart(r) => {
                         assert!(r.error.is_some());
@@ -1311,8 +1287,6 @@ mod test_process_request_integration {
                 let data_root = tempdir.path().to_str().unwrap();
 
                 let processor = ProcessRequest::new(
-                    data_root.to_string(),
-                    100,
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
                         
@@ -1322,7 +1296,7 @@ mod test_process_request_integration {
                         cache_trim_factor: 25,
                         max_chunk_size: 1 << 20,
                     },
-                    1000,
+                    test_config(data_root),
                 );
 
                 // Scenario: 3 users (aggregates) in a collaborative app
@@ -1344,7 +1318,7 @@ mod test_process_request_integration {
                         compression_type: CompressionType::None,
                     });
 
-                    processor.process(write_req, None).await;
+                    processor.process(write_req).await;
                 }
 
                 // All users perform more writes
@@ -1365,7 +1339,7 @@ mod test_process_request_integration {
                             compression_type: CompressionType::None,
                         });
 
-                        processor.process(write_req, None).await;
+                        processor.process(write_req).await;
                     }
                 }
 
@@ -1381,7 +1355,7 @@ mod test_process_request_integration {
                     filters: ReadFilters::new(1),
                 });
 
-                let response = processor.process(read_req, None).await;
+                let response = processor.process(read_req).await;
                 match response {
                     Response::Read(r) => {
                         let result = r.result.unwrap();
@@ -1403,7 +1377,7 @@ mod test_process_request_integration {
                     keep_from_event_batch_index: 3,
                 });
 
-                processor.process(trim_req, None).await;
+                processor.process(trim_req).await;
 
                 // Verify user 2 only has recent data
                 let read_req = Request::Read(ReadRequest {
@@ -1414,7 +1388,7 @@ mod test_process_request_integration {
                     filters: ReadFilters::new(1),
                 });
 
-                let response = processor.process(read_req, None).await;
+                let response = processor.process(read_req).await;
                 match response {
                     Response::Read(r) => {
                         assert!(r.error.is_some()); // Should error on batch 1
@@ -1431,7 +1405,7 @@ mod test_process_request_integration {
                     filters: ReadFilters::new(1),
                 });
 
-                let response = processor.process(read_req, None).await;
+                let response = processor.process(read_req).await;
                 match response {
                     Response::Read(r) => {
                         let result = r.result.unwrap();
@@ -1448,7 +1422,7 @@ mod test_process_request_integration {
                     filters: eventplanedb_structures::directory_filters::DirectoryFilters::default(),
                 });
 
-                let response = processor.process(list_req, None).await;
+                let response = processor.process(list_req).await;
                 match response {
                     Response::ListAggregates(r) => {
                         assert_eq!(r.aggregates.len(), 3);

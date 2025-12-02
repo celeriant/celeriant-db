@@ -24,6 +24,12 @@ pub struct EventBatchMetadata {
     /// Optional user ID
     #[serde(with = "serde_u128_base64", rename = "ui")]
     pub user_id: u128,
+    /// ID of the node that wrote this batch
+    #[serde(rename = "ni")]
+    pub node_id: u128,
+    /// Lease index at time of write
+    #[serde(rename = "lx")]
+    pub lease_index: u64,
     /// Server timestamp when batch was processed
     #[serde(rename = "st")]
     pub server_timestamp: u64,
@@ -59,6 +65,8 @@ impl Default for EventBatchMetadata {
             event_batch_index: 0,
             client_id: 0,
             user_id: 0,
+            node_id: 0,
+            lease_index: 0,
             server_timestamp: 0,
             compressed_size: 0,
             compression_type: 0,
@@ -138,6 +146,8 @@ impl EventBatchMetadata {
             event_batch_index: event_batch_item.event_batch_index,
             client_id: event_batch_item.client_id,
             user_id: event_batch_item.user_id.unwrap_or_default(),
+            node_id: event_batch_item.node_id,
+            lease_index: event_batch_item.lease_index,
             server_timestamp: event_batch_item.server_timestamp,
             compressed_size,
             compression_type: compression_type.to_tuple().0,
@@ -188,6 +198,8 @@ mod tests {
             event_batch_index: 42,
             server_timestamp: 9_999,
             client_id: 0xA,
+            node_id: 99,
+            lease_index: 43,
             user_id: Some(0xB),
             events,
         };
@@ -205,6 +217,8 @@ mod tests {
         assert_eq!(meta.server_timestamp, 9_999);
         assert_eq!(meta.client_id, 0xA);
         assert_eq!(meta.user_id, 0xB);
+        assert_eq!(meta.node_id, 99);
+        assert_eq!(meta.lease_index, 43);
         assert_eq!(meta.uncompressed_size, 1234);
         assert_eq!(meta.compressed_size, 567);        
         assert_eq!(meta.compression_type, 2);
@@ -225,6 +239,8 @@ mod tests {
             event_batch_index: 7,
             server_timestamp: 77,
             client_id: 0x1,
+            node_id: 99,
+            lease_index: 43,
             user_id: None,
             events: vec![],
         };
@@ -244,5 +260,7 @@ mod tests {
         assert_eq!(meta.max_client_event_index, 0);
         assert_eq!(meta.max_event_timestamp, 0);
         assert_eq!(meta.max_event_index, 0);
+        assert_eq!(meta.node_id, 99);
+        assert_eq!(meta.lease_index, 43);
     }
 }

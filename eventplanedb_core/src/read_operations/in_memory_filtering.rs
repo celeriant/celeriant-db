@@ -284,6 +284,8 @@ mod tests {
             event_batch_index,
             client_id,
             user_id,
+            node_id: 0,
+            lease_index: 0,
             server_timestamp,
             compressed_size,
             compression_type: 0,
@@ -331,6 +333,8 @@ mod tests {
             event_batch_index,
             client_id,
             user_id,
+            node_id: 0,
+            lease_index: 0,
             server_timestamp,
             compressed_size,
             compression_type: 0,
@@ -525,6 +529,8 @@ mod tests {
             server_timestamp: 1,
             client_id: 1,
             user_id: Some(2),
+            node_id: 0,
+            lease_index: 0,
             events: vec![
                 mk_event(1, 9, 99, 999),
                 mk_event(2, 10, 100, 1000),
@@ -565,6 +571,8 @@ mod tests {
             server_timestamp: 1,
             client_id: 1,
             user_id: None,
+            node_id: 0,
+            lease_index: 0,
             events: vec![mk_event(1, 1, 1, 1), mk_event(2, 2, 2, 2), mk_event(3, 3, 3, 3)],
         };
 
@@ -644,6 +652,8 @@ mod tests {
             server_timestamp: 1,
             client_id: 1,
             user_id: None,
+            node_id: 0,
+            lease_index: 0,
             events: vec![mk_event(1, 1, 1, 1), mk_event(2, 2, 2, 2)],
         };
         apply_event_filters(&mut batch, &filters);

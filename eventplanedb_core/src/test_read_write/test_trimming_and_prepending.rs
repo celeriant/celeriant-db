@@ -8,7 +8,7 @@ mod test_trimming_and_prepending {
     use glommio::{LocalExecutorBuilder, Placement};
 
     use crate::{
-        cache::aggregate_cache::AggregateCache, files::open_dma_files::existing_file_read_only_dma, read_operations::{
+        cache::aggregate_cache::AggregateCache, files::open_dma_files::existing_file_read_only_dma, node_config::test_node_config::test_config, read_operations::{
             read_error::ReadError, read_operations::ReadOperations,
             read_structures::AggregateReadConfig,
         }, write_operations::{
@@ -74,13 +74,13 @@ mod test_trimming_and_prepending {
             user_id: None,
         };
 
-        let aggregate_resources = aggregates_cache.get(aggregate_key);
+        let aggregate_resources = aggregates_cache.get_aggregate_resources(aggregate_key);
         let mut writer = aggregate_resources.get_writer_mut(true).await.unwrap();
 
         writer
             .as_mut()
             .unwrap()
-            .queue_events_in_memory(events, &append_options)
+            .queue_events_in_memory(0, 0,  events, &append_options)
             .unwrap();
 
         writer.as_mut().unwrap().sync_with_rollback().await.unwrap();
@@ -107,7 +107,7 @@ mod test_trimming_and_prepending {
 
                 let aggregates_cache = AggregateCache::new(
                     NonZeroUsize::new(1000).unwrap(),
-                    data_root_folder.to_string(),
+                    test_config(data_root_folder),
                     aggregate_read_config,
                     aggregate_write_config,
                 );
@@ -127,7 +127,7 @@ mod test_trimming_and_prepending {
                     .await;
                 }
                 
-                let aggregate_resources = aggregates_cache.get(&aggregate_key);
+                let aggregate_resources = aggregates_cache.get_aggregate_resources(&aggregate_key);
 
                 let first_batch = {
                     let writer = aggregate_resources.get_writer(true).await.unwrap();
@@ -308,7 +308,7 @@ mod test_trimming_and_prepending {
                         server_timestamp_millis: 8779,
                         user_id: None,
                     };
-                    writer_ref.queue_events_in_memory(events, &write_options).unwrap();
+                    writer_ref.queue_events_in_memory(0, 0,  events, &write_options).unwrap();
 
                     writer_ref.sync_with_rollback().await.unwrap();
                 }

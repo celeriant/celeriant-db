@@ -1,7 +1,7 @@
 use clap::Parser;
 use std::{cell::{Cell, RefCell}, os::fd::{FromRawFd, IntoRawFd}, rc::Rc, time::Duration};
 
-use eventplanedb_core::{process_request::ProcessRequest, read_operations::read_structures::AggregateReadConfig, write_operations::write_structures::AggregateWriteConfig};
+use eventplanedb_core::{node_config::NodeConfig, process_request::ProcessRequest, read_operations::read_structures::AggregateReadConfig, write_operations::write_structures::AggregateWriteConfig};
 use eventplanedb_structures::{request::{Request, read_request}, response::{ProtocolErrorResponse, Response, write_response}, wire_error::WireError};
 use glommio::{CpuSet, LocalExecutorPoolBuilder, PoolPlacement, channels::channel_mesh::{Full, MeshBuilder, Senders}, enclose, net::TcpListener, spawn_local};
 use futures_lite::AsyncWriteExt;
@@ -57,12 +57,18 @@ fn main() {
     // A full mesh channel is required to allow any shard to communicate with any other shard without locking primitives
     let mesh = MeshBuilder::<Msg, Full>::full(nbr_shards, config.mesh_channel_size);
     
-    let listen_address = config.listen_address.clone();
-    let data_root = config.data_root.clone();
-    let async_flush_ms = config.async_flush_ms;
-    let max_request_size = config.max_request_size;
-    let max_event_batches_response_size = config.max_event_batches_response_size.map(|v| v as usize);
-    let max_open_aggregates = config.max_open_aggregates;
+    let node_config = NodeConfig {
+        data_root_folder: config.data_root.to_string_lossy().to_string(),
+        node_id: todo!(),
+        margin_ms: todo!(),
+        lease_expiry_ms: todo!(),
+        async_flush_ms: config.async_flush_ms,
+        max_open_aggregates: config.max_open_aggregates,
+        max_request_size: config.max_request_size,
+        listen_address: config.listen_address.clone(),
+        max_event_batches_response_size: config.max_event_batches_response_size.map(|v| v as usize),
+        s3_enabled: config.s3_enabled,
+    };
 
     // Create a pool of executors, one per shard
     // Each executor will run threads pinned to a single core
@@ -71,7 +77,7 @@ fn main() {
         nbr_shards,
         online_cpus,
     ))
-    .on_all_shards(enclose!((mesh, listen_address, data_root, async_flush_ms, max_request_size, max_event_batches_response_size, max_open_aggregates) move || async move {
+    .on_all_shards(enclose!((mesh, node_config) move || async move {
 
         // Join the full mesh to get this shard's sender and all receivers
         // The receivers are for receiving messages from other shards (synonymous with executors)
@@ -92,11 +98,9 @@ fn main() {
         // Our stateful request processor, pinned per shard
         // Each shard has its own instance of the engine
         let process_request = Rc::new(ProcessRequest::new(
-            data_root.to_string_lossy().to_string(),
-            async_flush_ms,
             aggregate_read_config.clone(),
             aggregate_write_config.clone(),
-            max_open_aggregates,
+            node_config.clone()
         ));
 
         // Shard 0 sets up signal handler with polling loop
@@ -185,7 +189,7 @@ fn main() {
                     // Process it locally without responding to a client
                     if msg.fd == -1 {
                         debug!("Shard {shard_id} processing broadcast message");
-                        let _ = process_request.process(msg.value.unwrap(), max_event_batches_response_size).await;
+                        let _ = process_request.process(msg.value.unwrap()).await;
                         continue;
                     }
                     
@@ -198,12 +202,12 @@ fn main() {
                     // Other shard has accepted and already read the request data.
                     // So we can process it immediately and write the response back
                     debug!("Shard {shard_id} processing forwarded request for client");
-                    let response = process_request.process(msg.value.unwrap(), max_event_batches_response_size).await;
+                    let response = process_request.process(msg.value.unwrap()).await;
                     write_to_tcp_stream(response, &mut tcp_stream, msg.message_version).await;
 
                     if !shutdown_flag.get() {
                         debug!("Shard {shard_id} keeping client alive for pipelining");
-                        process_tcp_stream(shard_id, nbr_shards, tcp_stream, sender_clone.clone(), process_request.clone(), max_request_size, max_event_batches_response_size, shutdown_flag.clone()).await;
+                        process_tcp_stream(shard_id, nbr_shards, tcp_stream, sender_clone.clone(), process_request.clone(), node_config.max_request_size, node_config.max_event_batches_response_size, shutdown_flag.clone()).await;
                     } else {
                         debug!("Shard {shard_id} closing connection due to shutdown");
                     }
@@ -212,10 +216,10 @@ fn main() {
         }
 
         // Now that we have setup our listeners for other shards, we can start accepting TCP connections from clients
-        let listener = match TcpListener::bind(&listen_address) {
+        let listener = match TcpListener::bind(&node_config.listen_address) {
             Ok(l) => l,
             Err(e) => {
-                error!("Shard {shard_id} failed to bind to address {}: {}", listen_address, e);
+                error!("Shard {shard_id} failed to bind to address {}: {}", node_config.listen_address, e);
                 return;
             }
         };
@@ -244,7 +248,7 @@ fn main() {
                         Ok(addr) => debug!("Shard {shard_id} accepted connection from {addr}"),
                         Err(_) => error!("Shard {shard_id} accepted connection from unknown address"),
                     }
-                    process_tcp_stream(shard_id, nbr_shards, tcp_stream.buffered(), sender.clone(), process_request.clone(), max_request_size, max_event_batches_response_size, shutdown_flag.clone()).await;
+                    process_tcp_stream(shard_id, nbr_shards, tcp_stream.buffered(), sender.clone(), process_request.clone(), node_config.max_request_size, node_config.max_event_batches_response_size, shutdown_flag.clone()).await;
                 }
                 Err(_) => {
                     debug!("Shard {shard_id} timed out waiting for connection. Could also be error due to tcp connection limit on OS");
@@ -290,7 +294,7 @@ async fn process_and_maybe_broadcast_request(
     }
     
     // Process locally and return response
-    process_request.process(request, max_event_batches_response_size).await
+    process_request.process(request).await
 }
 
 async fn process_tcp_stream(

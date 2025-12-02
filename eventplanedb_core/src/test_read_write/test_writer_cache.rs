@@ -9,13 +9,11 @@ mod test_writer_cache {
     use glommio::{LocalExecutorBuilder, Placement};
 
     use crate::{
-        cache::aggregate_cache::AggregateCache,
-        read_operations::read_structures::AggregateReadConfig,
-        write_operations::{
+        cache::aggregate_cache::AggregateCache, node_config::test_node_config::test_config, read_operations::read_structures::AggregateReadConfig, write_operations::{
             write_error::WriteError,
             write_operations::WriteOperations,
             write_structures::{AggregateWriteConfig, WriteOptions},
-        },
+        }
     };
 
     /// Helper to write a batch with specific parameters
@@ -51,13 +49,13 @@ mod test_writer_cache {
             user_id: None,
         };
 
-        let aggregate_resources = aggregates_cache.get(aggregate_key);
+        let aggregate_resources = aggregates_cache.get_aggregate_resources(aggregate_key);
         let mut writer = aggregate_resources.get_writer_mut(true).await.unwrap();
 
         writer
             .as_mut()
             .unwrap()
-            .queue_events_in_memory(events, &append_options)
+            .queue_events_in_memory(0, 0,  events, &append_options)
             .unwrap();
 
         writer.as_mut().unwrap().sync_with_rollback().await.unwrap();
@@ -83,7 +81,7 @@ mod test_writer_cache {
 
                 let aggregates_cache = AggregateCache::new(
                     NonZeroUsize::new(1000).unwrap(),
-                    data_root_folder.to_string(),
+                    test_config(data_root_folder),
                     aggregate_read_config,
                     aggregate_write_config,
                 );
@@ -101,7 +99,7 @@ mod test_writer_cache {
                 write_batch_with_params(&aggregates_cache, &aggregate_key, 100, 7, 3, 5, 5000, 2)
                     .await;
 
-                let aggregate_resources = aggregates_cache.get(&aggregate_key);
+                let aggregate_resources = aggregates_cache.get_aggregate_resources(&aggregate_key);
                 let writer = aggregate_resources.get_writer(true).await.unwrap();
                 let writer_ref = writer.as_ref().unwrap();
 
@@ -178,7 +176,7 @@ mod test_writer_cache {
 
                 let aggregates_cache = AggregateCache::new(
                     NonZeroUsize::new(1000).unwrap(),
-                    data_root_folder.to_string(),
+                    test_config(data_root_folder),
                     aggregate_read_config,
                     aggregate_write_config,
                 );
@@ -218,7 +216,7 @@ mod test_writer_cache {
                 }
 
                 // Attempt to read from batch 5 - should get cache miss
-                let aggregate_resources = aggregates_cache.get(&aggregate_key);
+                let aggregate_resources = aggregates_cache.get_aggregate_resources(&aggregate_key);
                 let writer = aggregate_resources.get_writer(true).await.unwrap();
                 let writer_ref = writer.as_ref().unwrap();
 
@@ -262,7 +260,7 @@ mod test_writer_cache {
 
                 let aggregates_cache = AggregateCache::new(
                     NonZeroUsize::new(1000).unwrap(),
-                    data_root_folder.to_string(),
+                    test_config(data_root_folder),
                     aggregate_read_config,
                     aggregate_write_config,
                 );
@@ -283,7 +281,7 @@ mod test_writer_cache {
                     .await;
                 }
 
-                let aggregate_resources = aggregates_cache.get(&aggregate_key);
+                let aggregate_resources = aggregates_cache.get_aggregate_resources(&aggregate_key);
 
                 // Verify cache hit before clearing
                 {
@@ -350,7 +348,7 @@ mod test_writer_cache {
 
                 let aggregates_cache = AggregateCache::new(
                     NonZeroUsize::new(1000).unwrap(),
-                    data_root_folder.to_string(),
+                    test_config(data_root_folder),
                     aggregate_read_config,
                     aggregate_write_config,
                 );
@@ -380,20 +378,20 @@ mod test_writer_cache {
                         user_id: None,
                     };
 
-                    let aggregate_resources = aggregates_cache.get(&aggregate_key);
+                    let aggregate_resources = aggregates_cache.get_aggregate_resources(&aggregate_key);
                     let mut writer = aggregate_resources.get_writer_mut(true).await.unwrap();
 
                     writer
                         .as_mut()
                         .unwrap()
-                        .queue_events_in_memory(events, &append_options)
+                        .queue_events_in_memory(0, 0,  events, &append_options)
                         .unwrap();
 
                     writer.as_mut().unwrap().sync_with_rollback().await.unwrap();
                 }
 
                 // Verify that cache was trimmed
-                let aggregate_resources = aggregates_cache.get(&aggregate_key);
+                let aggregate_resources = aggregates_cache.get_aggregate_resources(&aggregate_key);
                 let writer = aggregate_resources.get_writer(true).await.unwrap();
                 let writer_ref = writer.as_ref().unwrap();
 
@@ -453,7 +451,7 @@ mod test_writer_cache {
 
                 let aggregates_cache = AggregateCache::new(
                     NonZeroUsize::new(1000).unwrap(),
-                    data_root_folder.to_string(),
+                    test_config(data_root_folder),
                     aggregate_read_config,
                     aggregate_write_config,
                 );
@@ -463,7 +461,7 @@ mod test_writer_cache {
                 write_batch_with_params(&aggregates_cache, &aggregate_key, 100, 1, 2, 1, 1000, 1)
                     .await;
 
-                let aggregate_resources = aggregates_cache.get(&aggregate_key);
+                let aggregate_resources = aggregates_cache.get_aggregate_resources(&aggregate_key);
 
                 // Queue a second batch but don't sync yet
                 let events = vec![
@@ -494,7 +492,7 @@ mod test_writer_cache {
                         .unwrap_or(0);
 
                     writer_ref
-                        .queue_events_in_memory(events, &append_options)
+                        .queue_events_in_memory(0, 0,  events, &append_options)
                         .unwrap();
 
                     // State should be updated after queuing
@@ -551,7 +549,7 @@ mod test_writer_cache {
 
                 let aggregates_cache = AggregateCache::new(
                     NonZeroUsize::new(1000).unwrap(),
-                    data_root_folder.to_string(),
+                    test_config(data_root_folder),
                     aggregate_read_config,
                     aggregate_write_config,
                 );
@@ -572,7 +570,7 @@ mod test_writer_cache {
                     .await;
                 }
 
-                let aggregate_resources = aggregates_cache.get(&aggregate_key);
+                let aggregate_resources = aggregates_cache.get_aggregate_resources(&aggregate_key);
 
                 // Verify all batches are cached
                 {

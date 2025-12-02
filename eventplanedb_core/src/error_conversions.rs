@@ -1,6 +1,6 @@
 use eventplanedb_structures::{error_code::ErrorCode, eventplanedb_error::EventPlaneDBError};
 
-use crate::{read_operations::read_error::ReadError, write_operations::write_error::WriteError};
+use crate::{cache::lease_error::LeaseError, read_operations::read_error::ReadError, write_operations::write_error::WriteError};
 
 impl From<ReadError> for EventPlaneDBError {
     fn from(e: ReadError) -> Self {
@@ -69,6 +69,17 @@ impl From<WriteError> for EventPlaneDBError {
             },
             WriteError::DmaFileNotInitialized => EventPlaneDBError::io_error(),
             WriteError::GlommioError(_glommio_error) => EventPlaneDBError::io_error(),
+        }
+    }
+}
+
+impl From<LeaseError> for EventPlaneDBError {
+    fn from(e: LeaseError) -> Self {        
+        match e {
+            LeaseError::ControlPlaneOffline => EventPlaneDBError::control_plane_offline(),
+            LeaseError::GlommioError(_glommio_error) => EventPlaneDBError::io_error(),
+            LeaseError::NotLeader { leader_node_id } => EventPlaneDBError::not_leader(leader_node_id),
+            LeaseError::CannotBeLeader => EventPlaneDBError::cannot_be_leader(),
         }
     }
 }

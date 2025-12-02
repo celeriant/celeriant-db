@@ -27,6 +27,14 @@ pub struct EventBatchItem {
     )]
     pub user_id: Option<u128>,
 
+    /// ID of the node that wrote this batch
+    #[serde(rename = "ni")]
+    pub node_id: u128,
+
+    /// Lease index at time of write
+    #[serde(rename = "lx")]
+    pub lease_index: u64,
+
     /// Events present in this batch, all from the same client / user
     #[serde(rename = "ev")]
     pub events: Vec<EventItem>,
@@ -38,6 +46,8 @@ impl EventBatchItem {
         server_time: u64,
         client_id: u128,
         user_id: Option<u128>,
+        node_id: u128,
+        lease_index: u64,
         events: Vec<EventItem>,
     ) -> Self {
         Self {
@@ -45,6 +55,8 @@ impl EventBatchItem {
             server_timestamp: server_time,
             client_id,
             user_id,
+            node_id,
+            lease_index,
             events,
         }
     }

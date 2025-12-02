@@ -8,13 +8,11 @@ mod test_concurrency_and_idempotency {
     use glommio::{LocalExecutorBuilder, Placement};
 
     use crate::{
-        cache::aggregate_cache::AggregateCache,
-        read_operations::read_structures::AggregateReadConfig,
-        write_operations::{
+        cache::aggregate_cache::AggregateCache, node_config::test_node_config::test_config, read_operations::read_structures::AggregateReadConfig, write_operations::{
             write_error::WriteError,
             write_operations::WriteOperations,
             write_structures::{AggregateWriteConfig, WriteOptions},
-        },
+        }
     };
 
     /// Helper to create test events
@@ -57,13 +55,13 @@ mod test_concurrency_and_idempotency {
 
                 let aggregates_cache = AggregateCache::new(
                     NonZeroUsize::new(1000).unwrap(),
-                    data_root_folder.to_string(),
+                    test_config(data_root_folder),
                     aggregate_read_config,
                     aggregate_write_config,
                 );
                 let aggregate_key = AggregateKey::new(1, 1, 1);
 
-                let aggregate_resources = aggregates_cache.get(&aggregate_key);
+                let aggregate_resources = aggregates_cache.get_aggregate_resources(&aggregate_key);
 
                 // Write first batch with concurrency check
                 let events1 = create_test_events(1, 2, 1000);
@@ -81,7 +79,7 @@ mod test_concurrency_and_idempotency {
                     let result = writer
                         .as_mut()
                         .unwrap()
-                        .queue_events_in_memory(events1, &write_options1)
+                        .queue_events_in_memory(0, 0,  events1, &write_options1)
                         .unwrap();
                     assert_eq!(result.next_event_batch_index, 2);
                     writer.as_mut().unwrap().sync_with_rollback().await.unwrap();
@@ -104,7 +102,7 @@ mod test_concurrency_and_idempotency {
                     let result = writer
                         .as_mut()
                         .unwrap()
-                        .queue_events_in_memory(events2, &write_options2);
+                        .queue_events_in_memory(0, 0,  events2, &write_options2);
                     
                     // Should succeed since no concurrency check is performed
                     assert!(result.is_ok());
@@ -134,7 +132,7 @@ mod test_concurrency_and_idempotency {
 
                 let aggregates_cache = AggregateCache::new(
                     NonZeroUsize::new(1000).unwrap(),
-                    data_root_folder.to_string(),
+                    test_config(data_root_folder),
                     aggregate_read_config,
                     aggregate_write_config,
                 );
@@ -151,7 +149,7 @@ mod test_concurrency_and_idempotency {
                     user_id: None,
                 };
 
-                let aggregate_resources = aggregates_cache.get(&aggregate_key);
+                let aggregate_resources = aggregates_cache.get_aggregate_resources(&aggregate_key);
                 
                 // First write succeeds
                 {
@@ -159,7 +157,7 @@ mod test_concurrency_and_idempotency {
                     let result = writer
                         .as_mut()
                         .unwrap()
-                        .queue_events_in_memory(events.clone(), &write_options)
+                        .queue_events_in_memory(0, 0,  events.clone(), &write_options)
                         .unwrap();
                     assert_eq!(result.next_event_batch_index, 2);
                     writer.as_mut().unwrap().sync_with_rollback().await.unwrap();
@@ -172,7 +170,7 @@ mod test_concurrency_and_idempotency {
                     let result = writer
                         .as_mut()
                         .unwrap()
-                        .queue_events_in_memory(events2, &write_options);
+                        .queue_events_in_memory(0, 0,  events2, &write_options);
 
                     match result {
                         Err(WriteError::OptimisticConcurrencyViolation {
@@ -211,13 +209,13 @@ mod test_concurrency_and_idempotency {
 
                 let aggregates_cache = AggregateCache::new(
                     NonZeroUsize::new(1000).unwrap(),
-                    data_root_folder.to_string(),
+                    test_config(data_root_folder),
                     aggregate_read_config,
                     aggregate_write_config,
                 );
                 let aggregate_key = AggregateKey::new(1, 1, 1);
 
-                let aggregate_resources = aggregates_cache.get(&aggregate_key);
+                let aggregate_resources = aggregates_cache.get_aggregate_resources(&aggregate_key);
 
                 // Write first batch with client_event_index 1-3
                 let events = create_test_events(1, 3, 1000);
@@ -235,7 +233,7 @@ mod test_concurrency_and_idempotency {
                     writer
                         .as_mut()
                         .unwrap()
-                        .queue_events_in_memory(events, &write_options)
+                        .queue_events_in_memory(0, 0,  events, &write_options)
                         .unwrap();
                     writer.as_mut().unwrap().sync_with_rollback().await.unwrap();
                 }
@@ -256,7 +254,7 @@ mod test_concurrency_and_idempotency {
                     let result = writer
                         .as_mut()
                         .unwrap()
-                        .queue_events_in_memory(events2, &write_options2);
+                        .queue_events_in_memory(0, 0,  events2, &write_options2);
 
                     match result {
                         Err(WriteError::ClientIdempotencyViolation {
@@ -295,7 +293,7 @@ mod test_concurrency_and_idempotency {
 
                 let aggregates_cache = Arc::new(AggregateCache::new(
                     NonZeroUsize::new(1000).unwrap(),
-                    data_root_folder.to_string(),
+                    test_config(data_root_folder),
                     aggregate_read_config,
                     aggregate_write_config,
                 ));
@@ -308,7 +306,7 @@ mod test_concurrency_and_idempotency {
                     let key = aggregate_key.clone();
                     
                     let task = glommio::spawn_local(async move {
-                        let resources = cache.get(&key);
+                        let resources = cache.get_aggregate_resources(&key);
                         let reader = resources.get_reader(true).await.unwrap();
                         // Verify reader was initialized
                         assert!(reader.is_some());
@@ -358,7 +356,7 @@ mod test_concurrency_and_idempotency {
 
                 let aggregates_cache = Arc::new(AggregateCache::new(
                     NonZeroUsize::new(1000).unwrap(),
-                    data_root_folder.to_string(),
+                    test_config(data_root_folder),
                     aggregate_read_config,
                     aggregate_write_config,
                 ));
@@ -371,7 +369,7 @@ mod test_concurrency_and_idempotency {
                     let key = aggregate_key.clone();
                     
                     let task = glommio::spawn_local(async move {
-                        let resources = cache.get(&key);
+                        let resources = cache.get_aggregate_resources(&key);
                         let writer = resources.get_writer(true).await.unwrap();
                         // Verify writer was initialized
                         assert!(writer.is_some());
@@ -421,13 +419,13 @@ mod test_concurrency_and_idempotency {
 
                 let aggregates_cache = Arc::new(AggregateCache::new(
                     NonZeroUsize::new(1000).unwrap(),
-                    data_root_folder.to_string(),
+                    test_config(data_root_folder),
                     aggregate_read_config,
                     aggregate_write_config,
                 ));
                 let aggregate_key = AggregateKey::new(1, 1, 1);
 
-                let aggregate_resources = aggregates_cache.get(&aggregate_key);
+                let aggregate_resources = aggregates_cache.get_aggregate_resources(&aggregate_key);
 
                 // Queue some events first
                 let events = create_test_events(1, 2, 1000);
@@ -445,7 +443,7 @@ mod test_concurrency_and_idempotency {
                     writer
                         .as_mut()
                         .unwrap()
-                        .queue_events_in_memory(events, &write_options)
+                        .queue_events_in_memory(0, 0,  events, &write_options)
                         .unwrap();
                 }
 
@@ -500,13 +498,13 @@ mod test_concurrency_and_idempotency {
 
                 let aggregates_cache = AggregateCache::new(
                     NonZeroUsize::new(1000).unwrap(),
-                    data_root_folder.to_string(),
+                    test_config(data_root_folder),
                     aggregate_read_config,
                     aggregate_write_config,
                 );
                 let aggregate_key = AggregateKey::new(1, 1, 1);
 
-                let aggregate_resources = aggregates_cache.get(&aggregate_key);
+                let aggregate_resources = aggregates_cache.get_aggregate_resources(&aggregate_key);
 
                 // Client 100 writes events with client_event_index 1-3
                 let events1 = create_test_events(1, 3, 1000);
@@ -524,7 +522,7 @@ mod test_concurrency_and_idempotency {
                     writer
                         .as_mut()
                         .unwrap()
-                        .queue_events_in_memory(events1, &write_options1)
+                        .queue_events_in_memory(0, 0,  events1, &write_options1)
                         .unwrap();
                     writer.as_mut().unwrap().sync_with_rollback().await.unwrap();
                 }
@@ -545,7 +543,7 @@ mod test_concurrency_and_idempotency {
                     let result = writer
                         .as_mut()
                         .unwrap()
-                        .queue_events_in_memory(events2, &write_options2);
+                        .queue_events_in_memory(0, 0,  events2, &write_options2);
                     
                     // Should succeed since it's a different client
                     assert!(result.is_ok());
@@ -575,13 +573,13 @@ mod test_concurrency_and_idempotency {
 
                 let aggregates_cache = AggregateCache::new(
                     NonZeroUsize::new(1000).unwrap(),
-                    data_root_folder.to_string(),
+                    test_config(data_root_folder),
                     aggregate_read_config,
                     aggregate_write_config,
                 );
                 let aggregate_key = AggregateKey::new(1, 1, 1);
 
-                let aggregate_resources = aggregates_cache.get(&aggregate_key);
+                let aggregate_resources = aggregates_cache.get_aggregate_resources(&aggregate_key);
 
                 // Write first batch with client_event_index 1-3
                 let events1 = create_test_events(1, 3, 1000);
@@ -599,7 +597,7 @@ mod test_concurrency_and_idempotency {
                     writer
                         .as_mut()
                         .unwrap()
-                        .queue_events_in_memory(events1, &write_options1)
+                        .queue_events_in_memory(0, 0,  events1, &write_options1)
                         .unwrap();
                     writer.as_mut().unwrap().sync_with_rollback().await.unwrap();
                 }
@@ -620,7 +618,7 @@ mod test_concurrency_and_idempotency {
                     let result = writer
                         .as_mut()
                         .unwrap()
-                        .queue_events_in_memory(events2, &write_options2);
+                        .queue_events_in_memory(0, 0,  events2, &write_options2);
                     
                     // Should succeed since idempotency checking is disabled
                     assert!(result.is_ok());

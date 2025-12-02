@@ -390,6 +390,8 @@ pub trait WriteOperations {
     /// The events are also mutable as we need to filter out events for client idempotency requirements
     fn queue_events_in_memory(
         &mut self,
+        node_id: u128,
+        lease_index: u64,
         events: Vec<EventItem>,
         write_options: &WriteOptions,
     ) -> Result<WriteResult, WriteError>;
@@ -504,6 +506,8 @@ impl WriteOperations for WriteOperationsWithDmaFile {
     /// The events are also mutable as we need to filter out events for client idempotency requirements
     fn queue_events_in_memory(
         &mut self,
+        node_id: u128,
+        lease_index: u64,
         mut events: Vec<EventItem>,
         write_options: &WriteOptions,
     ) -> Result<WriteResult, WriteError> {
@@ -563,6 +567,8 @@ impl WriteOperations for WriteOperationsWithDmaFile {
             write_options.server_timestamp_millis,
             write_options.client_id,
             write_options.user_id,
+            node_id,
+            lease_index,
             events,
         );
 

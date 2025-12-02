@@ -49,6 +49,25 @@ pub struct EventPlaneDBConfig {
     // Misc / logging
     #[arg(long, default_value = "info", help = "Default log level (trace, debug, info, warn, error)")]
     pub default_log_level: String,
+
+    // S3 object-store integration
+    #[arg(long, default_value_t = false, help = "Enable Amazon S3 object-store integration")]
+    pub s3_enabled: bool,
+
+    #[arg(long, requires = "s3_enabled", help = "Amazon S3 region (e.g. us-east-1)")]
+    pub s3_region: Option<String>,
+
+    #[arg(long, requires = "s3_enabled", help = "Amazon S3 bucket name")]
+    pub s3_bucket: Option<String>,
+
+    #[arg(long, requires = "s3_enabled", help = "AWS access key ID for S3 object store")]
+    pub s3_access_key_id: Option<String>,
+
+    #[arg(long, requires = "s3_enabled", help = "AWS secret access key for S3 object store")]
+    pub s3_secret_access_key: Option<String>,
+
+    #[arg(long, requires = "s3_enabled", help = "Single-level subfolder to isolate cluster data inside the bucket")]
+    pub s3_subfolder: Option<String>,
 }
 
 impl Default for EventPlaneDBConfig {
@@ -67,6 +86,12 @@ impl Default for EventPlaneDBConfig {
             max_request_size: Some(16 * 1024 * 1024),
             max_event_batches_response_size: Some(64 * 1024 * 1024),
             default_log_level: "info".to_string(),
+            s3_enabled: false,
+            s3_region: None,
+            s3_bucket: None,
+            s3_access_key_id: None,
+            s3_secret_access_key: None,
+            s3_subfolder: None,
         }
     }
 }

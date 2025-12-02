@@ -1,121 +1,281 @@
-# eventplanedb-storage
-Simple, immutable, per-aggregate event storage on local disk.
+# EventPlaneDB
 
-# Storing State with Events
-- Eventual consistency of the projection(s). Use DuckDB and a python/node plugin style runtime (similar to InfluxDB 3) to avoid this problem?
+A distributed, append-only event store with per-aggregate leadership. Built for teams who need a fast, correct WAL substrate for event sourcing without the complexity of traditional distributed databases.
 
-# Data Modelling and Validation
-- Data tiering - keeping disk space available by offloading old events and aggregates off to object storage, even glacier
-- Support for nanosecond timing of events? Is it relevant?
-- Event Schema validation
+## What It Is
 
-# Auditing, Migration and Controlling The System
-- Logging client interactions (position in stream of each client, metadata, what writes, etc)
-- 'Locking' an aggregate (either permanantly or temporarialy)
-- Migration tooling to 'fix' old event structures and aggregates, garbage collect events essentially
-- Data backup to S3, AutoMQ/InfluxDB style. Separate process?
+EventPlaneDB is a write-ahead log designed specifically for event sourcing workloads. Think of it as a distributed, redundant WAL with per-aggregate total ordering and optimistic concurrency control.
 
-# Multiple servers in a Cluster
-- Clusters of multiple servers. Centralising control at the object storage level with the new concurrency features in S3. No control layer.
-- Replication to another server (not S3)
-- Failover mechanisms when primary goes down?
+It is **not** a general-purpose database. It stores opaque byte arrays organised by aggregate. No indexes. No query language. No read-side projections. Just a fast, correct log you can build on top of.
 
-# Cross-Aggregate Consistency
-- Cross aggregate concurrency. Can a request 'borrow' locks on multiple aggregates for invariant/concurrency purposes when writing events?
-- Cross aggregate concurrency across multiple machines in cluster
-- Does TigerBeetle have a role to play in cross-aggregate consistency?
+```
+org_id / aggregate_type_id / aggregate_id → append-only event stream
+```
 
-# FSync Implementation
-- Fsync but maintain throughput. Can we implement something similar to dbeel using glommio io async? Forcing fsync on each write kills throughput.
-- How does use of async io affect read and write isolation? Eg. Getting the next incremented event id, partial reads
-- FDataSync vs FSync and pre-allocation of file space. How does it impact performance?
-- Does use of glommio io affect the upstream eventplanedb-localfirst crate? Need glommio runtime/executor in each pinned thread?
+Each aggregate is an independent, totally-ordered event stream. Different aggregates can have different leaders across the cluster. Writes are acknowledged only after fsync and replication.
 
-# To Read
-- [ ] https://martinfowler.com/articles/lmax.html
-- [ ] https://chriskiehl.com/article/event-sourcing-is-hard
-- [c] https://news.ycombinator.com/item?id=19072850
-- [x] https://old.reddit.com/r/programming/comments/amvde6/deleted_by_user/
-- [c] https://lukasniessen.medium.com/this-is-a-detailed-breakdown-of-a-fintech-project-from-my-consulting-career-9ec61603709c
-- [ ] Compare KurrentDB with this implementation!
-- [ ] https://www.confluent.io/blog/turning-the-database-inside-out-with-apache-samza/
-- [ ] https://martinfowler.com/eaaDev/EventSourcing.html
-- [ ] https://www.microsoft.com/en-ca/download/details.aspx?id=34774
-- [ ] https://leanpub.com/esversioning/read
-- [ ] Talks from Greg Young (eg. https://www.youtube.com/watch?v=JHGkaShoyNs)
-- [ ] https://vvvvalvalval.github.io/posts/2018-11-12-datomic-event-sourcing-without-the-hassle.html
+## Why It Exists
 
+Event sourcing has a tooling problem.
 
-# Running performance client - amortized fysnc, durable write before ack
-cargo run -p eventplanedb_performanceclient --release -- 127.0.0.1:10000 11000 16 10 10
+**PostgreSQL** - Teams reach for it because they need transactions and OCC. But Postgres wasn't built for append-only workloads with millions of small writes. You end up fighting WAL amplification, vacuum pressure, and replication lag.
 
-TCP Client (minimal work)
-Server: 127.0.0.1:10000
-Connections: 11000
-Aggregates: 16
-Sync delay (us): 10
-Duration (s): 10
-Completed: 3190109 requests in 10.22s -> 312231.4 RPS
+**EventStoreDB** - The closest competitor. But it conflates write and read concerns, the OSS version is crippled, and it's built on .NET with all the operational baggage that entails. Including projections in the core was a design mistake.
 
-When forcing durable writes before ack to clients, the server bottleneck is the nvme.
+**Kafka** - Great for streaming, wrong abstraction for event sourcing. No per-aggregate ordering guarantees without careful partitioning. No optimistic concurrency control. Consumer groups are opaque broker magic. No fsync by default (dangerous). No filtering by aggregate or event type.
 
-# Running performance client - async fsync, ack before durable
-cargo run -p eventplanedb_performanceclient --release -- 127.0.0.1:10000 256 32 0 20
+**RDBMS + Event Tables** - Works, but heavy. Chatty commit protocols. Not serverless-friendly. You're paying for B-trees and query planners you don't need.
 
-TCP Client (minimal work)
-Server: 127.0.0.1:10000
-Connections: 256
-Aggregates: 32
-Sync delay (us): 0
-Duration (s): 20
-Completed: 50556524 requests in 20.05s -> 2522091.9 RPS
+EventPlaneDB solves the write side of CQRS. Nothing more.
 
-When forcing durable writes before ack to clients, the server bottleneck is the cpu.
+## Architecture
 
-# Running EventStoreDB to compare
-docker run -d   --name esdb-node   -p 2113:2113   -p 1113:1113   -v esdb-data:/var/lib/eventstore   eventstore/eventstore:latest   --insecure   --enable-atom-pub-over-http   --run-projections=None   --unsafe-disable-flush-to-disk=false   --write-through=true   --unbuffered=true   --cluster-size=1   --log-level=Information
-cargo run -p eventstoredb_client --release -- esdb://admin:changeit@localhost:2113?tls=false 512 16 30
+### Thread-Per-Core, Share Nothing
 
+Each server runs one executor per CPU core. Each core owns a subset of aggregates. No locks. No cross-thread coordination for hot-path operations. Similar to ScyllaDB and TigerBeetle's approach.
 
-# Running RedPanda to compare
+### Per-Aggregate Leadership
+
+Leadership operates at the aggregate level, not the node level. Different aggregates can have different leaders across the cluster. This distributes load and limits blast radius.
+
+### S3 as Control Plane
+
+We don't implement Raft or Paxos. Instead, we use S3's conditional writes (If-Match/If-None-Match) for lease-based coordination. This sounds crazy until you realise:
+
+1. S3 provides strong read-after-write consistency
+2. Conditional writes give you compare-and-swap semantics
+3. S3 is more available than your cluster will ever be
+
+Leases are stored in S3. Data replication is synchronous TCP to all followers. If followers are unreachable, we fall back to S3 for durability (degraded mode).
+
+This gives us two-node clusters that actually work, without the odd-number quorum requirement of consensus algorithms.
+
+### Data Path
+
+```
+Write Request
+    │
+    ▼
+Lease Check (cached, validated against S3)
+    │
+    ▼
+Local Append + Parallel Replication to Followers
+    │
+    ▼
+All ACK'd? → fsync → ACK to client
+    │
+    └─ Timeout? → Write to S3 (degraded) → fsync → ACK
+```
+
+Clients get explicit control. No broker-managed offsets. No consumer groups. You read from a batch index, you get events from that point forward.
+
+## Performance
+
+Single node, NVMe, 16 cores:
+
+| Mode | Throughput | Notes |
+|------|------------|-------|
+| Durable (fsync before ACK) | 310,000 writes/sec | Amortized fsync via batching |
+| Async (fsync in background) | 2,500,000 writes/sec | For when durability can lag |
+
+Latency (durable mode, p99): < 10ms
+
+For comparison, Kafka on the same hardware with default settings (no fsync): ~40,000 writes/sec.
+
+The throughput difference comes from our batching strategy. NVMe fsync costs ~100μs regardless of batch size. We batch writes across a time window (default 1ms), amortizing the fsync cost across many events.
+
+## Features
+
+### What You Get
+
+- **Per-aggregate total ordering** - Events within an aggregate are strictly ordered
+- **Optimistic concurrency control** - Writes can specify expected batch index
+- **Client idempotency** - Deduplication via client-assigned event indexes
+- **Event type filtering** - Read only events of specific types, bloom filter acceleration
+- **Compression** - Zstd, Snappy, Brotli, Gzip per-batch
+- **In-memory read cache** - Recent events served from memory
+- **Explicit offsets** - You control your read position
+- **Replication** - Synchronous to all replicas or S3 fallback
+- **Lease-based leadership** - Per-aggregate, automatic failover
+
+### What You Don't Get
+
+- Query language
+- Indexes
+- Projections / read models
+- Consumer groups
+- Automatic offset management
+- Transactions across aggregates
+- Data tiering (yet)
+- Hosted service (yet)
+- Admin UI (yet)
+- Fine-grained permissions (yet)
+
+This is intentional. We're a primitive you build on, not a complete platform.
+
+## API
+
+The protocol is binary over TCP. Request types:
+
+| Operation | Description |
+|-----------|-------------|
+| `Write` | Append events to an aggregate |
+| `Read` | Read events with filters |
+| `Exists` | Check if aggregate exists |
+| `TrimStart` | Remove old events (retention) |
+| `Delete` | Remove entire aggregate |
+| `WriteBatches` | Prepend historical batches |
+
+Events are opaque `Vec<u8>` payloads. You handle serialization.
+
+```rust
+// Rust client example
+let request = Request::Write(WriteRequest {
+    org_id: 1,
+    aggregate_type_id: 3,
+    aggregate_id: 6,
+    client_id: 123,
+    events: vec![
+        EventItem::new(
+            0,                              // client_event_index
+            0,                              // event_index (server assigns)
+            None,                           // event_id
+            timestamp_ms,                   // event_timestamp
+            1,                              // event_type_major
+            0,                              // event_type_minor
+            payload.to_vec(),               // event_value
+        ),
+    ],
+    allow_create: true,
+    expected_event_batch_index: None,       // OCC: set to enforce ordering
+    enforce_client_idempotency: false,
+    durable_write_with_delay_us: Some(20),  // fsync before ACK
+    compression_type: CompressionType::Zstd { level: 3 },
+    ..Default::default()
+});
+
+let response = client.send_request(&request).await?;
+```
+
+## Client Libraries
+
+| Language | Package |
+|----------|---------|
+| Rust | `eventplanedb_client` |
+| Go | `github.com/eventplanedb/go-client` |
+| Java | `io.eventplanedb:client` |
+| .NET | `EventPlaneDB.Client` |
+| Node.js | `@eventplanedb/client` |
+| C++ | `eventplanedb-cpp` |
+
+All clients support automatic leader discovery, connection pooling, and retry with backoff.
+
+## Deployment
+
+### Single Node
+
+```bash
+./eventplanedb_server \
+    --data-root /var/lib/eventplanedb \
+    --listen-address 0.0.0.0:10000
+```
+
+### Replicated Cluster
+
+```bash
+./eventplanedb_server \
+    --data-root /var/lib/eventplanedb \
+    --listen-address 0.0.0.0:10000 \
+    --replication-enabled \
+    --replication-port 10001 \
+    --s3-bucket my-eventplanedb-cluster \
+    --s3-region ap-southeast-2 \
+    --s3-cluster-prefix prod
+```
+
+Nodes discover each other via S3 membership. No static configuration required.
+
+### Docker
+
+```bash
 docker run -d \
-  --name redpanda \
-  --restart unless-stopped \
-  --cpus 16 \
-  --memory 7G \
-  -p 9092:9092 \
-  -p 9644:9644 \
-  -p 8081:8081 \
-  -p 8082:8082 \
-  -p 19092:19092 \
-  -v redpanda-data:/var/lib/redpanda/data \
-  docker.redpanda.com/redpandadata/redpanda:v25.2.10 \
-  redpanda start \
-    --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092 \
-    --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092 \
-    --pandaproxy-addr internal://0.0.0.0:8082,external://0.0.0.0:18082 \
-    --advertise-pandaproxy-addr internal://redpanda:8082,external://localhost:18082 \
-    --schema-registry-addr internal://0.0.0.0:8081,external://0.0.0.0:18081 \
-    --advertise-rpc-addr redpanda:33145 \
-    --rpc-addr 0.0.0.0:33145 \
-    --mode dev-container \
-    --smp 16 \
-    --memory 4G \
-    --default-log-level=info \
-    --set redpanda.enable_idempotence=true \
-    --set redpanda.enable_transactions=false \
-    --set redpanda.auto_create_topics_enabled=true \
-    --set redpanda.default_topic_partitions=1 \
-    --set redpanda.default_topic_replications=1 \
-    --set redpanda.enable_coproc=false \
-    --set redpanda.developer_mode=true
+    --name eventplanedb \
+    -p 10000:10000 \
+    -v eventplanedb-data:/app/data \
+    eventplanedb/eventplanedb:latest
+```
 
-cargo run -p redpanda_client --release -- 127.0.0.1:19092 bench-agg 512 16 30
+## Replication Model
 
-Redpanda Client (one topic per aggregate, durable-ish ack)
-Brokers: 127.0.0.1:19092
-Topic prefix: bench-agg
-Connections (tasks): 512
-Aggregates (topics): 16
-Duration (s): 30
-Completed: 967498 appends in 30.01s -> 32234.0 RPS
+- **Synchronous replication** to all followers before ACK
+- **S3 degraded mode** when followers unreachable (maintains durability)
+- **Lease-based leadership** with 30s default TTL
+- **Automatic failover** when leader lease expires (~32s)
+- **Per-aggregate fencing** prevents split-brain writes
+
+Two-node clusters are viable. S3 acts as the third vote. When one node is down, the other continues with degraded mode writes to S3.
+
+Detailed design: [replication-design.md](./docs/replication-design.md)
+
+## Use Cases
+
+EventPlaneDB is the write side for:
+
+- **Event-sourced microservices** - Each aggregate type maps to a service
+- **Financial systems** - Per-account event logs with strict ordering
+- **Audit trails** - Immutable, append-only records
+- **Game state** - Per-player or per-match event streams
+- **IoT event ingestion** - Per-device event series
+- **Collaborative applications** - Per-document operation logs (CRDT-style)
+
+If you need a fast, correct log per "thing" and you'll build the read side yourself, this is for you.
+
+## When Not to Use It
+
+- You need ad-hoc queries over events (use a read database)
+- You need cross-aggregate transactions (use a different architecture)
+- You want managed consumer groups (use Kafka)
+- You need sub-millisecond latency (we fsync)
+- You want a complete event sourcing platform (we're just the log)
+
+## Status
+
+**Alpha**. The core is stable and we're running it in production, but the API may change.
+
+Production:
+- Single-node operation
+- TCP protocol
+- All client libraries
+- Compression
+- Event filtering
+- In-memory caching
+
+In Development:
+- Replication (S3-coordinated)
+- Automatic failover
+
+Roadmap:
+- Data tiering to object storage
+- Hosted service
+- Admin UI
+- Fine-grained access control
+
+## Building
+
+Requires Rust 1.91+ and Linux (for io_uring via glommio).
+
+```bash
+cargo build --release -p eventplanedb_server
+```
+
+## Contributing
+
+Issues and PRs welcome. The codebase prioritises correctness and simplicity over micro-optimisation. If you're proposing a change, include tests.
+
+## License
+
+MIT OR Apache-2.0
+
+---
+
+EventPlaneDB is built by [UtilityDelta](https://utilitydelta.io). We're building the infrastructure layer for event-sourced systems.

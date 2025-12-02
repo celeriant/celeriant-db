@@ -19,3 +19,5 @@ pub mod eventplanedb_error;
 pub mod wire_error;
 pub mod wire_header;
 pub mod version_aware_wire_format;
+pub mod cluster;
+pub mod lease_info;

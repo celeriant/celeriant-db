@@ -11,7 +11,7 @@ mod test_basic_read_write {
     use glommio::{LocalExecutorBuilder, Placement};
 
     use crate::{
-        cache::aggregate_cache::AggregateCache, files::open_dma_files::{existing_file_read_only_dma, create_and_write_only_dma}, read_operations::{
+        cache::aggregate_cache::AggregateCache, files::open_dma_files::{create_and_write_only_dma, existing_file_read_only_dma}, node_config::{self, NodeConfig, test_node_config::test_config}, read_operations::{
             read_operations::{ReadOperations, ReadOperationsWithDmaFiles},
             read_structures::AggregateReadConfig,
         }, write_operations::{
@@ -169,15 +169,15 @@ mod test_basic_read_write {
                 // Create the files and a writer
                 let tempdir = tempfile::tempdir().unwrap();
                 let data_root_folder = tempdir.path().to_str().unwrap();
-
+                
                 let aggregates_cache = AggregateCache::new(
                     NonZeroUsize::new(1000).unwrap(),
-                    data_root_folder.to_string(),
+                    test_config(data_root_folder),
                     aggregate_read_config,
                     aggregate_write_config,
                 );
                 let aggregate_key = AggregateKey::new(1, 1, 1);
-                let aggregate_resources = aggregates_cache.get(&aggregate_key);
+                let aggregate_resources = aggregates_cache.get_aggregate_resources(&aggregate_key);
 
                 {
                     // Write some event batches
@@ -200,7 +200,7 @@ mod test_basic_read_write {
                     let append_result = writer
                         .as_mut()
                         .unwrap()
-                        .queue_events_in_memory(events, &append_options)
+                        .queue_events_in_memory(0, 0,  events, &append_options)
                         .unwrap();
                     assert_eq!(append_result.next_event_batch_index, 2);
 
@@ -236,7 +236,7 @@ mod test_basic_read_write {
                     let append_result = writer
                         .as_mut()
                         .unwrap()
-                        .queue_events_in_memory(events, &append_options)
+                        .queue_events_in_memory(0, 0,  events, &append_options)
                         .unwrap();
                     assert_eq!(append_result.next_event_batch_index, 3);
 
@@ -369,7 +369,7 @@ mod test_basic_read_write {
                 };
 
                 let append_result = write_operations
-                    .queue_events_in_memory(events, &append_options)
+                    .queue_events_in_memory(0, 0,  events, &append_options)
                     .unwrap();
                 assert_eq!(append_result.next_event_batch_index, 2);
                 write_operations.sync_with_rollback().await.unwrap();
@@ -410,12 +410,12 @@ mod test_basic_read_write {
 
                 let aggregates_cache = AggregateCache::new(
                     NonZeroUsize::new(1000).unwrap(),
-                    data_root_folder.to_string(),
+                    test_config(data_root_folder),
                     aggregate_read_config,
                     aggregate_write_config,
                 );
                 let aggregate_key = AggregateKey::new(1, 1, 1);
-                let aggregate_resources = aggregates_cache.get(&aggregate_key);
+                let aggregate_resources = aggregates_cache.get_aggregate_resources(&aggregate_key);
 
                 // Write some event batches
                 let events = vec![
@@ -441,7 +441,7 @@ mod test_basic_read_write {
                     let append_result = writer
                         .as_mut()
                         .unwrap()
-                        .queue_events_in_memory(events, &append_options)
+                        .queue_events_in_memory(0, 0,  events, &append_options)
                         .unwrap();
                     assert_eq!(append_result.next_event_batch_index, 2);
 
@@ -466,7 +466,7 @@ mod test_basic_read_write {
                     let append_result = writer
                         .as_mut()
                         .unwrap()
-                        .queue_events_in_memory(events, &append_options)
+                        .queue_events_in_memory(0, 0,  events, &append_options)
                         .unwrap();
                     assert_eq!(append_result.next_event_batch_index, 3);
                 }

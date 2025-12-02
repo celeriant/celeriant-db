@@ -8,7 +8,7 @@ mod test_write_updates_metadata_cache {
     use glommio::{LocalExecutorBuilder, Placement};
 
     use crate::{
-        cache::{aggregate_cache::AggregateCache, aggregate_resources::AggregateResources}, read_operations::{
+        cache::{aggregate_cache::AggregateCache, aggregate_resources::AggregateResources}, node_config::test_node_config::test_config, read_operations::{
             read_operations::ReadOperations,
             read_structures::AggregateReadConfig,
         }, write_operations::{
@@ -74,11 +74,11 @@ mod test_write_updates_metadata_cache {
             user_id: None,
         };
 
-        let aggregate_resources = aggregates_cache.get(aggregate_key);
+        let aggregate_resources = aggregates_cache.get_aggregate_resources(aggregate_key);
         let mut writer = aggregate_resources.get_writer_mut(true).await.unwrap();
         let writer_ref = writer.as_mut().unwrap();
 
-        writer_ref.queue_events_in_memory(events, &append_options)
+        writer_ref.queue_events_in_memory(0, 0,  events, &append_options)
             .unwrap();
 
         writer_ref.sync_with_rollback().await.unwrap();
@@ -123,7 +123,7 @@ mod test_write_updates_metadata_cache {
 
                 let aggregates_cache = AggregateCache::new(
                     NonZeroUsize::new(1000).unwrap(),
-                    data_root_folder.to_string(),
+                    test_config(data_root_folder),
                     aggregate_read_config,
                     aggregate_write_config,
                 );
@@ -140,7 +140,7 @@ mod test_write_updates_metadata_cache {
                 )
                 .await;
                 
-                let aggregate_resources = aggregates_cache.get(&aggregate_key);
+                let aggregate_resources = aggregates_cache.get_aggregate_resources(&aggregate_key);
 
                 read_with_expected_len(&aggregate_resources, 1).await;
 
