@@ -4,6 +4,31 @@
         {
             "type": "lldb",
             "request": "launch",
+            "name": "Debug eventplanedb_server (S3)",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=eventplanedb_server",
+                    "--package=eventplanedb_server"
+                ],
+                "filter": {
+                    "name": "eventplanedb_server",
+                    "kind": "bin"
+                }
+            },
+            "args": [
+                "--s3-enabled",
+                "--s3-region", "ap-southeast-2",
+                "--s3-bucket", "eventplanedb-testing",
+                "--s3-access-key-id", "AWS_ACCESS_KEY_ID_REDACTED_PRE_PUBLICATION_SEE_PROVENANCE_MD",
+                "--s3-secret-access-key", "AWS_SECRET_ACCESS_KEY_REDACTED_PRE_PUBLICATION_SEE_PROVENANCE_MD",
+                "--s3-subfolder", "test-ubuntu-pc"
+            ],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
             "name": "Debug simple_client",
             "cargo": {
                 "args": [
@@ -36,6 +61,29 @@
             },
             "args": [],
             "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug test-object-store",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=s3_write_example",
+                    "--package=s3_write_example"
+                ],
+                "filter": {
+                    "name": "s3_write_example",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "AWS_ACCESS_KEY_ID": "AWS_ACCESS_KEY_ID_REDACTED_PRE_PUBLICATION_SEE_PROVENANCE_MD",
+                "AWS_SECRET_ACCESS_KEY": "AWS_SECRET_ACCESS_KEY_REDACTED_PRE_PUBLICATION_SEE_PROVENANCE_MD",
+                "AWS_DEFAULT_REGION": "ap-southeast-2"
+            }
         }
     ]
 }

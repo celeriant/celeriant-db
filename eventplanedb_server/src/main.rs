@@ -1,22 +1,39 @@
 use clap::Parser;
-use std::{cell::{Cell, RefCell}, os::fd::{FromRawFd, IntoRawFd}, rc::Rc, time::Duration};
+use std::{cell::{Cell, RefCell}, os::fd::{FromRawFd, IntoRawFd}, rc::Rc, sync::Arc, time::Duration};
 
-use eventplanedb_core::{node_config::NodeConfig, process_request::ProcessRequest, read_operations::read_structures::AggregateReadConfig, write_operations::write_structures::AggregateWriteConfig};
-use eventplanedb_structures::{request::{Request, read_request}, response::{ProtocolErrorResponse, Response, write_response}, wire_error::WireError};
-use glommio::{CpuSet, LocalExecutorPoolBuilder, PoolPlacement, channels::channel_mesh::{Full, MeshBuilder, Senders}, enclose, net::TcpListener, spawn_local};
+use eventplanedb_core::{
+    node_config::NodeConfig,
+    object_store::{
+        ObjectStoreGateway, ObjectStoreRuntime, ObjectStoreRuntimeConfig,
+        ObjectStoreRetryConfig, S3Config,
+    },
+    process_request::ProcessRequest,
+    read_operations::read_structures::AggregateReadConfig,
+    write_operations::write_structures::AggregateWriteConfig,
+};
+use eventplanedb_structures::{
+    request::{read_request, Request},
+    response::{write_response, ProtocolErrorResponse, Response},
+    wire_error::WireError,
+};
+use glommio::{
+    channels::channel_mesh::{Full, MeshBuilder, Senders},
+    enclose,
+    net::TcpListener,
+    spawn_local,
+    CpuSet, LocalExecutorPoolBuilder, PoolPlacement,
+};
 use futures_lite::AsyncWriteExt;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 
 mod config;
 mod signal_handler;
 
+use config::EventPlaneDBConfig;
 use signal_handler::SignalHandler;
 
 use mimalloc::MiMalloc;
 
-use crate::{config::EventPlaneDBConfig};
-
-//TODO: Compare with default allocator in benchmarks
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
@@ -27,15 +44,21 @@ struct Msg {
     require_shutdown: bool,
 }
 
+/// Holds the object store sidecar runtime (lives on the main thread, outside Glommio).
+struct SidecarHandle {
+    runtime: Option<ObjectStoreRuntime>,
+    gateway: ObjectStoreGateway,
+}
+
 fn main() {
     // Parse CLI arguments
     let config = EventPlaneDBConfig::parse();
-    
+
     // Initialize logger with configured level
     env_logger::Builder::from_default_env()
         .filter_level(config.default_log_level.parse().unwrap_or(log::LevelFilter::Info))
         .init();
-    
+
     info!("Starting EventPlaneDB Server...");
     info!("Configuration: data_root={:?}, listen_address={}", config.data_root, config.listen_address);
 
@@ -43,6 +66,16 @@ fn main() {
     let nbr_shards = config.num_shards.unwrap_or_else(num_cpus::get);
     let online_cpus = CpuSet::online().ok();
     info!("Number of shards: {nbr_shards}, Online CPUs: {online_cpus:?}");
+
+    // Load or generate a persistent node ID
+    let node_id = match load_or_generate_node_id(&config.data_root) {
+        Ok(id) => id,
+        Err(e) => {
+            error!("Failed to initialize node ID: {}", e);
+            std::process::exit(1);
+        }
+    };
+    info!("Node ID: {}", node_id);
 
     let aggregate_read_config = AggregateReadConfig {
         max_chunk_size: config.aggregate_read_max_chunk_size,
@@ -54,215 +87,346 @@ fn main() {
         max_chunk_size: config.aggregate_write_max_chunk_size,
     };
 
-    // A full mesh channel is required to allow any shard to communicate with any other shard without locking primitives
+    // Initialize object store sidecar if S3 is enabled
+    let sidecar_handle: Option<SidecarHandle> = if config.s3_enabled {
+        match initialize_object_store_sidecar(&config, nbr_shards) {
+            Ok(handle) => {
+                info!("Object store sidecar initialized successfully");
+                Some(handle)
+            }
+            Err(e) => {
+                error!("Failed to initialize object store sidecar: {}. S3 features will be disabled.", e);
+                None
+            }
+        }
+    } else {
+        info!("S3 integration is disabled");
+        None
+    };
+
+    // Extract gateway for sharing with shards (if available)
+    let gateway = sidecar_handle.as_ref().map(|h| h.gateway.clone());
+    let s3_subfolder = config.s3_subfolder.clone();
+
+    // A full mesh channel is required to allow any shard to communicate with any other shard
     let mesh = MeshBuilder::<Msg, Full>::full(nbr_shards, config.mesh_channel_size);
-    
+
     let node_config = NodeConfig {
         data_root_folder: config.data_root.to_string_lossy().to_string(),
-        node_id: todo!(),
-        margin_ms: todo!(),
-        lease_expiry_ms: todo!(),
+        node_id,
+        margin_ms: 2500, // 500ms safety margin before lease expiry
+        lease_expiry_ms: 10000, // 10 second lease duration
         async_flush_ms: config.async_flush_ms,
         max_open_aggregates: config.max_open_aggregates,
         max_request_size: config.max_request_size,
         listen_address: config.listen_address.clone(),
         max_event_batches_response_size: config.max_event_batches_response_size.map(|v| v as usize),
-        s3_enabled: config.s3_enabled,
+        s3_enabled: config.s3_enabled && sidecar_handle.is_some(),
     };
 
     // Create a pool of executors, one per shard
-    // Each executor will run threads pinned to a single core
-    // The mesh BUILDER is copied in to each shard so they can all join the full mesh
-    LocalExecutorPoolBuilder::new(PoolPlacement::MaxSpread(
-        nbr_shards,
-        online_cpus,
-    ))
-    .on_all_shards(enclose!((mesh, node_config) move || async move {
+    LocalExecutorPoolBuilder::new(PoolPlacement::MaxSpread(nbr_shards, online_cpus))
+        .on_all_shards(enclose!((mesh, node_config, gateway, s3_subfolder) move || async move {
+            // Join the full mesh to get this shard's sender and all receivers
+            let (sender, mut receivers) = mesh.join().await.unwrap();
+            let shard_id = sender.peer_id();
 
-        // Join the full mesh to get this shard's sender and all receivers
-        // The receivers are for receiving messages from other shards (synonymous with executors)
-        let (sender, mut receivers) = mesh.join().await.unwrap();
-        let shard_id = sender.peer_id();
+            let executor_id = glommio::executor().id();
+            info!("Starting executor {executor_id} with shard id {shard_id}");
 
-        // Should be equivalent - just executor id is 1 based while peer id is 0 based
-        let executor_id = glommio::executor().id();
-        info!("Starting executor {executor_id} with shard id {shard_id}");
+            // Local shutdown flag
+            let shutdown_flag = Rc::new(Cell::new(false));
 
-        // Local shutdown flag to avoid cross-thread contention
-        let shutdown_flag = Rc::new(Cell::new(false));
+            let sender = Rc::new(RefCell::new(sender));
 
-        // The same sender is used in multiple threads so we need to wrap it in a RefCell and Rc
-        // This is safe because we are in a single threaded executor
-        let sender = Rc::new(RefCell::new(sender));
+            // Create the request processor with or without object store
+            let process_request = Rc::new(match gateway.clone() {
+                Some(gw) => ProcessRequest::with_object_store(
+                    aggregate_read_config.clone(),
+                    aggregate_write_config.clone(),
+                    node_config.clone(),
+                    gw,
+                    s3_subfolder.clone(),
+                ),
+                None => ProcessRequest::new(
+                    aggregate_read_config.clone(),
+                    aggregate_write_config.clone(),
+                    node_config.clone(),
+                ),
+            });
 
-        // Our stateful request processor, pinned per shard
-        // Each shard has its own instance of the engine
-        let process_request = Rc::new(ProcessRequest::new(
-            aggregate_read_config.clone(),
-            aggregate_write_config.clone(),
-            node_config.clone()
-        ));
+            // Shard 0 sets up signal handler with polling loop
+            if shard_id == 0 {
+                let mut signal_handler = SignalHandler::new()
+                    .expect("Failed to initialize signal handler");
 
-        // Shard 0 sets up signal handler with polling loop
-        if shard_id == 0 {
-            let mut signal_handler = SignalHandler::new()
-                .expect("Failed to initialize signal handler");
-            
-            let sender_clone = sender.clone();
-            let shutdown_flag_clone = shutdown_flag.clone();
-            
-            spawn_local(async move {
-                loop {
-                    // Check for signal FIRST
-                    match signal_handler.poll_signal() {
-                        Ok(Some(sig)) => {
-                            info!("Received shutdown signal ({:?}). Initiating graceful shutdown...", sig);
-                            shutdown_flag_clone.set(true);
-                            
-                            // Broadcast shutdown to all other shards
-                            for peer in 0..sender_clone.borrow().nr_consumers() {
-                                if peer != shard_id {
-                                    let shutdown_msg = Msg {
-                                        fd: -1,
-                                        value: None,
-                                        message_version: 0,
-                                        require_shutdown: true,
-                                    };
-                                    if let Err(e) = sender_clone.borrow().try_send_to(peer, shutdown_msg) {
-                                        error!("Failed to send shutdown signal to shard {peer}: {e:?}");
+                let sender_clone = sender.clone();
+                let shutdown_flag_clone = shutdown_flag.clone();
+
+                spawn_local(async move {
+                    loop {
+                        match signal_handler.poll_signal() {
+                            Ok(Some(sig)) => {
+                                info!("Received shutdown signal ({:?}). Initiating graceful shutdown...", sig);
+                                shutdown_flag_clone.set(true);
+
+                                // Broadcast shutdown to all other shards
+                                for peer in 0..sender_clone.borrow().nr_consumers() {
+                                    if peer != shard_id {
+                                        let shutdown_msg = Msg {
+                                            fd: -1,
+                                            value: None,
+                                            message_version: 0,
+                                            require_shutdown: true,
+                                        };
+                                        if let Err(e) = sender_clone.borrow().try_send_to(peer, shutdown_msg) {
+                                            error!("Failed to send shutdown signal to shard {peer}: {e:?}");
+                                        }
                                     }
                                 }
+                                break;
                             }
-                            break;
+                            Ok(None) => {}
+                            Err(e) => {
+                                error!("Error polling for signals: {e}");
+                                break;
+                            }
                         }
-                        Ok(None) => {
-                            // No signal yet, sleep and check again
+
+                        glommio::timer::sleep(Duration::from_secs(1)).await;
+                    }
+                }).detach();
+            }
+
+            // Set up receivers for messages from other shards
+            for (_src_shard, stream) in receivers.streams() {
+                let sender_clone = sender.clone();
+                let process_request = process_request.clone();
+                let shutdown_flag = shutdown_flag.clone();
+
+                spawn_local(async move {
+                    while let Some(msg) = stream.recv().await {
+                        if msg.require_shutdown {
+                            info!("Shard {shard_id} received shutdown signal");
+                            shutdown_flag.set(true);
+                            let cache_clear = process_request.handle_shutdown().await;
+                            if let Err(e) = cache_clear {
+                                error!("Error during shard {shard_id} shutdown: {:?}", e);
+                            }
+                            continue;
                         }
-                        Err(e) => {
-                            error!("Error polling for signals: {e}");
-                            break;
+
+                        if shutdown_flag.get() {
+                            info!("Shard {shard_id} rejecting forwarded message due to shutdown");
+                            if msg.fd >= 0 {
+                                let mut tcp_stream = unsafe { glommio::net::TcpStream::from_raw_fd(msg.fd) };
+                                let error_msg = "Server is shutting down. Please reconnect.\n";
+                                let _ = tcp_stream.write_all(error_msg.as_bytes()).await;
+                            }
+                            continue;
+                        }
+
+                        debug!("Shard {shard_id} received forwarded message");
+
+                        if msg.fd == -1 {
+                            debug!("Shard {shard_id} processing broadcast message");
+                            let _ = process_request.process(msg.value.unwrap()).await;
+                            continue;
+                        }
+
+                        let tcp_stream = unsafe { glommio::net::TcpStream::from_raw_fd(msg.fd) };
+                        let mut tcp_stream = tcp_stream.buffered();
+
+                        debug!("Shard {shard_id} processing forwarded request for client");
+                        let response = process_request.process(msg.value.unwrap()).await;
+                        write_to_tcp_stream(response, &mut tcp_stream, msg.message_version).await;
+
+                        if !shutdown_flag.get() {
+                            debug!("Shard {shard_id} keeping client alive for pipelining");
+                            process_tcp_stream(
+                                shard_id,
+                                nbr_shards,
+                                tcp_stream,
+                                sender_clone.clone(),
+                                process_request.clone(),
+                                node_config.max_request_size,
+                                node_config.max_event_batches_response_size,
+                                shutdown_flag.clone(),
+                            ).await;
+                        } else {
+                            debug!("Shard {shard_id} closing connection due to shutdown");
                         }
                     }
-                    
-                    // Sleep at the END of the loop
-                    glommio::timer::sleep(Duration::from_secs(1)).await;
+                }).detach();
+            }
+
+            // Accept TCP connections
+            let listener = match TcpListener::bind(&node_config.listen_address) {
+                Ok(l) => l,
+                Err(e) => {
+                    error!("Shard {shard_id} failed to bind to address {}: {}", node_config.listen_address, e);
+                    return;
                 }
-            }).detach();
-        }
+            };
+            let local_addr = listener.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| "unknown".to_string());
+            info!("Shard {shard_id} listening on {}", local_addr);
 
-        // There is a receiver for each other shard that we must listen to
-        // So we can spin up a thread for each of these, to allow concurrent processing from other shards
-        // We still need the sender for THIS shard though as we may have to forward requests from clients to other shards
-        // This is because we allow clients to have a persistent TCP connection to the server (pipelining)
-        for (_src_shard, stream) in receivers.streams() {
-            let sender_clone = sender.clone();
-            let process_request = process_request.clone();
-            let shutdown_flag = shutdown_flag.clone();
+            loop {
+                if shutdown_flag.get() {
+                    info!("Shard {shard_id} stopping acceptance of new connections");
+                    break;
+                }
 
-            spawn_local(async move {
-                while let Some(msg) = stream.recv().await {
-                    // Check if this is a shutdown signal
-                    if msg.require_shutdown {
-                        info!("Shard {shard_id} received shutdown signal");
-                        shutdown_flag.set(true);
-                        let cache_clear = process_request.handle_shutdown().await;
-                        if let Err(e) = cache_clear {
-                            error!("Error during shard {shard_id} shutdown: {:?}", e);
-                        }
-                        continue;
-                    }
-
-                    // Check local shutdown flag
-                    if shutdown_flag.get() {
-                        info!("Shard {shard_id} rejecting forwarded message due to shutdown");
-                        if msg.fd >= 0 {
-                            let mut tcp_stream = unsafe { glommio::net::TcpStream::from_raw_fd(msg.fd) };
+                match glommio::timer::timeout(Duration::from_millis(100), listener.accept()).await {
+                    Ok(tcp_stream) => {
+                        if shutdown_flag.get() {
+                            info!("Shard {shard_id} rejecting connection due to shutdown");
+                            let mut stream = tcp_stream;
                             let error_msg = "Server is shutting down. Please reconnect.\n";
-                            let _ = tcp_stream.write_all(error_msg.as_bytes()).await;
+                            let _ = stream.write_all(error_msg.as_bytes()).await;
+                            continue;
                         }
-                        continue;
+
+                        match tcp_stream.peer_addr() {
+                            Ok(addr) => debug!("Shard {shard_id} accepted connection from {addr}"),
+                            Err(_) => error!("Shard {shard_id} accepted connection from unknown address"),
+                        }
+                        process_tcp_stream(
+                            shard_id,
+                            nbr_shards,
+                            tcp_stream.buffered(),
+                            sender.clone(),
+                            process_request.clone(),
+                            node_config.max_request_size,
+                            node_config.max_event_batches_response_size,
+                            shutdown_flag.clone(),
+                        ).await;
                     }
-
-                    debug!("Shard {shard_id} received forwarded message");
-                    
-                    // If fd is -1, this is a broadcast message (e.g., UpdateCacheLimits)
-                    // Process it locally without responding to a client
-                    if msg.fd == -1 {
-                        debug!("Shard {shard_id} processing broadcast message");
-                        let _ = process_request.process(msg.value.unwrap()).await;
-                        continue;
-                    }
-                    
-                    // Reconstruct TcpStream from raw fd
-                    // Ensure to use a glommio TcpStream
-                    // We can do this because the sender has forgotten the fd keeping it open
-                    let tcp_stream = unsafe { glommio::net::TcpStream::from_raw_fd(msg.fd) };
-                    let mut tcp_stream = tcp_stream.buffered();
-
-                    // Other shard has accepted and already read the request data.
-                    // So we can process it immediately and write the response back
-                    debug!("Shard {shard_id} processing forwarded request for client");
-                    let response = process_request.process(msg.value.unwrap()).await;
-                    write_to_tcp_stream(response, &mut tcp_stream, msg.message_version).await;
-
-                    if !shutdown_flag.get() {
-                        debug!("Shard {shard_id} keeping client alive for pipelining");
-                        process_tcp_stream(shard_id, nbr_shards, tcp_stream, sender_clone.clone(), process_request.clone(), node_config.max_request_size, node_config.max_event_batches_response_size, shutdown_flag.clone()).await;
-                    } else {
-                        debug!("Shard {shard_id} closing connection due to shutdown");
+                    Err(_) => {
+                        debug!("Shard {shard_id} timed out waiting for connection");
+                        glommio::timer::sleep(Duration::from_millis(10)).await;
                     }
                 }
-            }).detach();
+            }
+
+            info!("Shard {shard_id} shutdown complete");
+        }))
+        .unwrap()
+        .join_all();
+
+    // Shutdown the sidecar after all Glommio executors have stopped
+    if let Some(handle) = sidecar_handle {
+        if let Some(runtime) = handle.runtime {
+            info!("Shutting down object store sidecar...");
+            runtime.shutdown();
+            info!("Object store sidecar shutdown complete");
         }
-
-        // Now that we have setup our listeners for other shards, we can start accepting TCP connections from clients
-        let listener = match TcpListener::bind(&node_config.listen_address) {
-            Ok(l) => l,
-            Err(e) => {
-                error!("Shard {shard_id} failed to bind to address {}: {}", node_config.listen_address, e);
-                return;
-            }
-        };
-        let local_addr = listener.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| "unknown".to_string());
-        info!("Shard {shard_id} listening on {}", local_addr);
-
-        // An infinite loop to accept incoming TCP connections
-        // Essentially a fire + forget model where each connection is handled in its own task
-        loop {
-            if shutdown_flag.get() {
-                info!("Shard {shard_id} stopping acceptance of new connections");
-                break;
-            }
-
-            match glommio::timer::timeout(Duration::from_millis(100), listener.accept()).await {
-                Ok(tcp_stream) => {
-                    if shutdown_flag.get() {
-                        info!("Shard {shard_id} rejecting connection due to shutdown");
-                        let mut stream = tcp_stream;
-                        let error_msg = "Server is shutting down. Please reconnect.\n";
-                        let _ = stream.write_all(error_msg.as_bytes()).await;
-                        continue;
-                    }
-
-                    match tcp_stream.peer_addr() {
-                        Ok(addr) => debug!("Shard {shard_id} accepted connection from {addr}"),
-                        Err(_) => error!("Shard {shard_id} accepted connection from unknown address"),
-                    }
-                    process_tcp_stream(shard_id, nbr_shards, tcp_stream.buffered(), sender.clone(), process_request.clone(), node_config.max_request_size, node_config.max_event_batches_response_size, shutdown_flag.clone()).await;
-                }
-                Err(_) => {
-                    debug!("Shard {shard_id} timed out waiting for connection. Could also be error due to tcp connection limit on OS");
-                    glommio::timer::sleep(Duration::from_millis(10)).await;
-                },
-            }
-        }
-
-        info!("Shard {shard_id} shutdown complete");
-    }))
-    .unwrap()
-    .join_all();
+    }
 
     info!("EventPlaneDB Server shutdown complete");
+}
+
+/// Initialize the object store sidecar runtime.
+fn initialize_object_store_sidecar(
+    config: &EventPlaneDBConfig,
+    num_shards: usize,
+) -> Result<SidecarHandle, String> {
+    let s3_bucket = config.s3_bucket.as_ref()
+        .ok_or("S3 bucket name is required when s3_enabled is true")?;
+
+    let s3_config = S3Config {
+        bucket: s3_bucket.clone(),
+        region: config.s3_region.clone(),
+        access_key_id: config.s3_access_key_id.clone(),
+        secret_access_key: config.s3_secret_access_key.clone(),
+        subfolder: config.s3_subfolder.clone(),
+    };
+
+    let runtime_config = ObjectStoreRuntimeConfig::with_num_shards(num_shards);
+    let retry_config = ObjectStoreRetryConfig::default();
+
+    let (gateway, receivers) = ObjectStoreGateway::new(&runtime_config);
+
+    let runtime = ObjectStoreRuntime::spawn(runtime_config, retry_config, s3_config, receivers)
+        .map_err(|e| format!("Failed to spawn object store runtime: {}", e))?;
+
+    Ok(SidecarHandle {
+        runtime: Some(runtime),
+        gateway,
+    })
+}
+
+/// Generate a unique node ID based on hostname and timestamp.
+fn generate_node_id() -> u128 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let mut hasher = DefaultHasher::new();
+
+    // Include hostname
+    if let Ok(hostname) = hostname::get() {
+        hostname.hash(&mut hasher);
+    }
+
+    // Include process ID
+    std::process::id().hash(&mut hasher);
+
+    // Include timestamp for uniqueness across restarts
+    if let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) {
+        duration.as_nanos().hash(&mut hasher);
+    }
+
+    // Extend to u128 by hashing again with a different seed
+    let hash1 = hasher.finish();
+    hasher.write_u64(hash1);
+    let hash2 = hasher.finish();
+
+    ((hash1 as u128) << 64) | (hash2 as u128)
+}
+
+/// Load an existing node ID from disk, or generate and persist a new one.
+fn load_or_generate_node_id(data_root: &std::path::Path) -> Result<u128, String> {
+    use std::fs;
+    use std::io::{Read, Write};
+
+    let node_id_path = data_root.join("node_id");
+
+    // Try to read existing node ID
+    if node_id_path.exists() {
+        let mut file = fs::File::open(&node_id_path)
+            .map_err(|e| format!("Failed to open node_id file: {}", e))?;
+        
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .map_err(|e| format!("Failed to read node_id file: {}", e))?;
+        
+        let node_id = contents.trim().parse::<u128>()
+            .map_err(|e| format!("Failed to parse node_id: {}", e))?;
+        
+        info!("Loaded existing node ID from {:?}", node_id_path);
+        return Ok(node_id);
+    }
+
+    // Generate new node ID
+    let node_id = generate_node_id();
+
+    // Ensure data_root exists
+    fs::create_dir_all(data_root)
+        .map_err(|e| format!("Failed to create data root directory: {}", e))?;
+
+    // Persist to disk
+    let mut file = fs::File::create(&node_id_path)
+        .map_err(|e| format!("Failed to create node_id file: {}", e))?;
+    
+    file.write_all(node_id.to_string().as_bytes())
+        .map_err(|e| format!("Failed to write node_id file: {}", e))?;
+    
+    file.sync_all()
+        .map_err(|e| format!("Failed to sync node_id file: {}", e))?;
+
+    info!("Generated and saved new node ID to {:?}", node_id_path);
+    Ok(node_id)
 }
 
 async fn process_and_maybe_broadcast_request(

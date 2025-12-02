@@ -10,3 +10,4 @@ pub mod error_conversions;
 mod test_process_request_integration;
 pub mod replication;
 pub mod node_config;
+pub mod object_store;

@@ -27,3 +27,4 @@ clap.workspace = true
 ctrlc.workspace = true
 nix.workspace = true
 signal-hook.workspace = true
+hostname.workspace = true

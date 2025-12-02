@@ -6,6 +6,7 @@ members = [
     "eventplanedb_client",
     "eventplanedb_client_example",
     "eventplanedb_performanceclient",
+    "test-object-store"
 ]
 
 resolver = "2"
@@ -50,7 +51,11 @@ nix = "0.30.1"
 signal-hook = "0.3.18"
 futures-util = "0.3.31"
 serde_json = "1.0.145"
-tokio = { version = "1.48.0", features = ["net", "io-util"]}
+tokio = { version = "1.48.0", features = ["full"] }
 chrono = "0.4.42"
 tokio-util = { version = "0.7.17", features = ["compat"]}
 futures = "0.3.31"
+flume = "0.11.1"
+bytes = "1.11.0"
+object_store = { version = "0.12.4", features = ["aws"] }
+hostname = "0.4.2"

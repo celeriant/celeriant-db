@@ -22,7 +22,7 @@ use glommio::spawn_local;
 use log::error;
 
 use crate::{
-    cache::aggregate_cache::AggregateCache, files::open_dma_files::existing_file_read_only_dma, node_config::{self, NodeConfig}, read_operations::{read_error::ReadError, read_operations::ReadOperations, read_structures::AggregateReadConfig}, write_operations::{
+    cache::aggregate_cache::AggregateCache, files::open_dma_files::existing_file_read_only_dma, node_config::{NodeConfig}, object_store::ObjectStoreGateway, read_operations::{read_error::ReadError, read_operations::ReadOperations, read_structures::AggregateReadConfig}, write_operations::{
         write_operations::WriteOperations,
         write_structures::{AggregateWriteConfig, WriteOptions},
     }
@@ -48,6 +48,27 @@ impl ProcessRequest {
                 aggregate_write_config,
             ),
             node_config
+        }
+    }
+
+    pub fn with_object_store(
+        aggregate_read_config: AggregateReadConfig,
+        aggregate_write_config: AggregateWriteConfig,
+        node_config: NodeConfig,
+        gateway: ObjectStoreGateway,
+        s3_subfolder: Option<String>,
+    ) -> Self {
+        let capacity = NonZeroUsize::new(node_config.max_open_aggregates).unwrap();
+        Self {
+            aggregate_cache: AggregateCache::with_object_store(
+                capacity,
+                node_config.clone(),
+                aggregate_read_config,
+                aggregate_write_config,
+                gateway,
+                s3_subfolder,
+            ),
+            node_config,
         }
     }
 
