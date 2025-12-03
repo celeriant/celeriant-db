@@ -1,8 +1,0 @@
-[package]
-name = "redpanda_client"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
-rdkafka = { version = "0.38", features = ["tokio"] }

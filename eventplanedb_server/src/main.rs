@@ -1,5 +1,5 @@
 use clap::Parser;
-use std::{cell::{Cell, RefCell}, os::fd::{FromRawFd, IntoRawFd}, rc::Rc, sync::Arc, time::Duration};
+use std::{cell::{Cell, RefCell}, os::fd::{FromRawFd, IntoRawFd}, rc::Rc, time::Duration};
 
 use eventplanedb_core::{
     node_config::NodeConfig,
@@ -24,7 +24,7 @@ use glommio::{
     CpuSet, LocalExecutorPoolBuilder, PoolPlacement,
 };
 use futures_lite::AsyncWriteExt;
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 
 mod config;
 mod signal_handler;
@@ -106,7 +106,12 @@ fn main() {
 
     // Extract gateway for sharing with shards (if available)
     let gateway = sidecar_handle.as_ref().map(|h| h.gateway.clone());
-    let s3_subfolder = config.s3_subfolder.clone();
+    
+    let s3_subfolder = config
+        .s3_subfolder
+        .as_ref()
+        .filter(|s| !s.is_empty())
+        .cloned();
 
     // A full mesh channel is required to allow any shard to communicate with any other shard
     let mesh = MeshBuilder::<Msg, Full>::full(nbr_shards, config.mesh_channel_size);
@@ -114,8 +119,8 @@ fn main() {
     let node_config = NodeConfig {
         data_root_folder: config.data_root.to_string_lossy().to_string(),
         node_id,
-        margin_ms: 2500, // 500ms safety margin before lease expiry
-        lease_expiry_ms: 10000, // 10 second lease duration
+        margin_ms: 500, // 500ms safety margin before lease expiry
+        lease_expiry_ms: 90000, // 90 second lease duration
         async_flush_ms: config.async_flush_ms,
         max_open_aggregates: config.max_open_aggregates,
         max_request_size: config.max_request_size,

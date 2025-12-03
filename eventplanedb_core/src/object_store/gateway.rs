@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use flume::{Receiver, Sender, TrySendError};
 
 use super::config::ObjectStoreRuntimeConfig;
-use super::error::{ErrorKind, ObjectStoreError};
+use super::error::ObjectStoreError;
 use super::ops::{ObjectStoreOp, ObjectStoreResult, ObjectStoreTarget, QoSClass};
 
 /// Internal request envelope sent through the channel.

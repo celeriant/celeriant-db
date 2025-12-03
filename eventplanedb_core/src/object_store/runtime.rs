@@ -4,7 +4,6 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use bytes::Bytes;
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, PutMode, PutOptions, UpdateVersion};
@@ -12,7 +11,7 @@ use tokio::runtime::{Builder, Runtime};
 use tokio::sync::Semaphore;
 
 use super::config::{ObjectStoreRetryConfig, ObjectStoreRuntimeConfig};
-use super::error::{ErrorKind, ObjectStoreError};
+use super::error::ObjectStoreError;
 use super::gateway::{GatewayReceivers, ObjectStoreRequest, SharedState};
 use super::ops::{ObjectMetadata, ObjectStoreOp, ObjectStoreResult, PutCondition, QoSClass};
 
@@ -121,7 +120,7 @@ async fn run_sidecar(
     store: Arc<impl ObjectStore + 'static>,
     retry_config: Arc<ObjectStoreRetryConfig>,
     receivers: GatewayReceivers,
-    mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     inflight_semaphore: Arc<Semaphore>,
     heartbeat_interval: Duration,
 ) {

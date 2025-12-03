@@ -107,9 +107,16 @@ impl AggregateLease {
             None => return Ok((1, String::new())),
         };
 
+        //TODO: What is this deadline for? Is it a s3 timeout? Why use margin_ms which is the leader renewal margin before expiry?
         let deadline = Some(Instant::now() + Duration::from_millis(self.node_config.margin_ms));
-        let mut available_leaders = HashSet::new();
-        available_leaders.insert(self.node_config.node_id);
+        
+        let available_leaders = current_lease
+            .map(|lease| lease.info.available_leaders.clone())
+            .unwrap_or_else(|| {
+                let mut set = HashSet::new();
+                set.insert(self.node_config.node_id);
+                set
+            });
 
         let result = match current_lease {
             Some(cached) => {
@@ -173,16 +180,23 @@ impl AggregateLease {
             }
         }
 
+        // Exclusive write lock to avoid multiple connections for same aggregate contention
+        let mut writer = self.lease_info.write().await?;
+
+        // Now we have write guard, check cache again!
+        if let Some(cached) = writer.as_ref() {
+            if let Some(lease_index) = self.check_is_leader(&cached.info, false)? {
+                return Ok((lease_index, false));
+            }
+        }
+
         // No cached lease or it's expired. Fetch from S3.
         let mut taking_lease_from_other_node = false;
         let fetched_lease = self.get_active_lease().await?;
 
         if let Some(ref cached) = fetched_lease {
             // Update cache
-            {
-                let mut writer = self.lease_info.write().await?;
-                *writer = Some(cached.clone());
-            }
+            *writer = Some(cached.clone());
 
             if let Some(lease_index) = self.check_is_leader(&cached.info, true)? {
                 return Ok((lease_index, false));
@@ -195,26 +209,23 @@ impl AggregateLease {
         let (lease_index, new_etag) = self.try_take_lease(fetched_lease.as_ref()).await?;
 
         // Update cache with new lease
-        {
-            let mut writer = self.lease_info.write().await?;
-            let mut available_leaders = HashSet::new();
-            available_leaders.insert(self.node_config.node_id);
-            
-            let current_time_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64;
+        let mut available_leaders = HashSet::new();
+        available_leaders.insert(self.node_config.node_id);
+        
+        let current_time_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
 
-            *writer = Some(CachedLease {
-                info: LeaseInfo::new(
-                    lease_index,
-                    self.node_config.node_id,
-                    current_time_ms + self.node_config.lease_expiry_ms,
-                    available_leaders,
-                ),
-                etag: new_etag,
-            });
-        }
+        *writer = Some(CachedLease {
+            info: LeaseInfo::new(
+                lease_index,
+                self.node_config.node_id,
+                current_time_ms + self.node_config.lease_expiry_ms,
+                available_leaders,
+            ),
+            etag: new_etag,
+        });
 
         Ok((lease_index, taking_lease_from_other_node))
     }

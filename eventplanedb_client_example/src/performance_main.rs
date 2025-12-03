@@ -169,7 +169,7 @@ fn main() {
             0,
             1,
             0,
-            b"a".to_vec(),
+            b"Hello World".to_vec(),
         ),
     ];
     // let base_events = vec![

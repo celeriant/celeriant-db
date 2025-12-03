@@ -45,6 +45,15 @@ Simple, immutable, per-aggregate event storage on local disk.
 - [ ] Talks from Greg Young (eg. https://www.youtube.com/watch?v=JHGkaShoyNs)
 - [ ] https://vvvvalvalval.github.io/posts/2018-11-12-datomic-event-sourcing-without-the-hassle.html
 
+# Testing with s3
+
+cargo run -p eventplanedb_server --release -- \
+  --s3-enabled \
+  --s3-region ap-southeast-2 \
+  --s3-bucket eventplanedb-testing \
+  --s3-access-key-id xxx \
+  --s3-secret-access-key yyy \
+  --s3-subfolder test-ubuntu-pc
 
 # Running performance client - amortized fysnc, durable write before ack
 cargo run -p eventplanedb_performanceclient --release -- 127.0.0.1:10000 11000 16 10 10

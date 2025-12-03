@@ -92,9 +92,9 @@ async fn run_connection_benchmark(connection_id: usize) -> Result<TaskStats, Str
     // Prepare the write request (reused for all requests)
     let request = Request::Write(WriteRequest { 
         correlation_id: Some(connection_id as u128), 
-        org_id: 2, 
-        aggregate_type_id: 1, 
-        aggregate_id: (connection_id % NUM_AGGREGATES) as u128, // Spread across 1000 aggregates
+        org_id: 1, 
+        aggregate_type_id: 3, 
+        aggregate_id: (connection_id % NUM_AGGREGATES) as u128,
         client_id: connection_id as u128, 
         user_id: None, 
         events: vec![

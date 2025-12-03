@@ -5,8 +5,6 @@ members = [
     "eventplanedb_server",
     "eventplanedb_client",
     "eventplanedb_client_example",
-    "eventplanedb_performanceclient",
-    "test-object-store"
 ]
 
 resolver = "2"

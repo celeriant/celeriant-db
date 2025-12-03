@@ -4,11 +4,21 @@ version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "eventplanedb_client_example"
-path = "src/main.rs"
+name = "batch_main"
+path = "src/batch_main.rs"
+
+[[bin]]
+name = "single_main"
+path = "src/single_main.rs"
+
+[[bin]]
+name = "performance_main"
+path = "src/performance_main.rs"
 
 [dependencies]
 eventplanedb_client = { path = "../eventplanedb_client" }
 eventplanedb_structures = { path = "../eventplanedb_structures" }
 tokio = { version = "1.48.0", features = ["full"]}
 chrono.workspace = true
+bincode.workspace = true
+snap.workspace = true
