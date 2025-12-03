@@ -1,5 +1,7 @@
+use base64::{Engine, engine::general_purpose};
 use clap::Parser;
-use std::{cell::{Cell, RefCell}, os::fd::{FromRawFd, IntoRawFd}, rc::Rc, time::Duration};
+use eventplanedb_crypto::Crypto;
+use std::{cell::{Cell, RefCell}, fs, io::{Read, Write}, os::fd::{FromRawFd, IntoRawFd}, rc::Rc, time::Duration};
 
 use eventplanedb_core::{
     node_config::NodeConfig,
@@ -361,76 +363,66 @@ fn initialize_object_store_sidecar(
     })
 }
 
-/// Generate a unique node ID based on hostname and timestamp.
-fn generate_node_id() -> u128 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let mut hasher = DefaultHasher::new();
-
-    // Include hostname
-    if let Ok(hostname) = hostname::get() {
-        hostname.hash(&mut hasher);
-    }
-
-    // Include process ID
-    std::process::id().hash(&mut hasher);
-
-    // Include timestamp for uniqueness across restarts
-    if let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) {
-        duration.as_nanos().hash(&mut hasher);
-    }
-
-    // Extend to u128 by hashing again with a different seed
-    let hash1 = hasher.finish();
-    hasher.write_u64(hash1);
-    let hash2 = hasher.finish();
-
-    ((hash1 as u128) << 64) | (hash2 as u128)
-}
-
-/// Load an existing node ID from disk, or generate and persist a new one.
+/// Load existing keys from disk or generate and persist a new keypair.
+/// Returns the node ID derived from the public key.
 fn load_or_generate_node_id(data_root: &std::path::Path) -> Result<u128, String> {
-    use std::fs;
-    use std::io::{Read, Write};
+    let private_key_path = data_root.join("private_key");
+    let public_key_path = data_root.join("public_key");
 
-    let node_id_path = data_root.join("node_id");
-
-    // Try to read existing node ID
-    if node_id_path.exists() {
-        let mut file = fs::File::open(&node_id_path)
-            .map_err(|e| format!("Failed to open node_id file: {}", e))?;
+    // Try to load existing keys
+    if private_key_path.exists() && public_key_path.exists() {
+        let mut public_key_file = fs::File::open(&public_key_path)
+            .map_err(|e| format!("Failed to open public_key file: {}", e))?;
         
-        let mut contents = String::new();
-        file.read_to_string(&mut contents)
-            .map_err(|e| format!("Failed to read node_id file: {}", e))?;
+        let mut public_key_base64 = String::new();
+        public_key_file.read_to_string(&mut public_key_base64)
+            .map_err(|e| format!("Failed to read public_key file: {}", e))?;
         
-        let node_id = contents.trim().parse::<u128>()
-            .map_err(|e| format!("Failed to parse node_id: {}", e))?;
+        let public_key_base64 = public_key_base64.trim();
         
-        info!("Loaded existing node ID from {:?}", node_id_path);
+        // Decode public key from base64 to get raw bytes for identity generation
+        let public_key_bytes = general_purpose::STANDARD
+            .decode(public_key_base64)
+            .map_err(|e| format!("Failed to decode public key: {}", e))?;
+        
+        let node_id = Crypto::generate_short_client_identity(&public_key_bytes);
+        
+        info!("Loaded existing keypair from {:?}", data_root);
         return Ok(node_id);
     }
 
-    // Generate new node ID
-    let node_id = generate_node_id();
+    // Generate new keypair
+    let keypair = Crypto::generate_keypair(None)
+        .map_err(|e| format!("Failed to generate keypair: {}", e))?;
 
     // Ensure data_root exists
     fs::create_dir_all(data_root)
         .map_err(|e| format!("Failed to create data root directory: {}", e))?;
 
-    // Persist to disk
-    let mut file = fs::File::create(&node_id_path)
-        .map_err(|e| format!("Failed to create node_id file: {}", e))?;
-    
-    file.write_all(node_id.to_string().as_bytes())
-        .map_err(|e| format!("Failed to write node_id file: {}", e))?;
-    
-    file.sync_all()
-        .map_err(|e| format!("Failed to sync node_id file: {}", e))?;
+    // Save private key
+    let mut private_key_file = fs::File::create(&private_key_path)
+        .map_err(|e| format!("Failed to create private_key file: {}", e))?;
+    private_key_file.write_all(keypair.private_key_base64.as_bytes())
+        .map_err(|e| format!("Failed to write private_key file: {}", e))?;
+    private_key_file.sync_all()
+        .map_err(|e| format!("Failed to sync private_key file: {}", e))?;
 
-    info!("Generated and saved new node ID to {:?}", node_id_path);
+    // Save public key
+    let mut public_key_file = fs::File::create(&public_key_path)
+        .map_err(|e| format!("Failed to create public_key file: {}", e))?;
+    public_key_file.write_all(keypair.public_key_base64.as_bytes())
+        .map_err(|e| format!("Failed to write public_key file: {}", e))?;
+    public_key_file.sync_all()
+        .map_err(|e| format!("Failed to sync public_key file: {}", e))?;
+
+    // Decode public key from base64 to get raw bytes for identity generation
+    let public_key_bytes = general_purpose::STANDARD
+        .decode(&keypair.public_key_base64)
+        .map_err(|e| format!("Failed to decode public key: {}", e))?;
+
+    let node_id = Crypto::generate_short_client_identity(&public_key_bytes);
+
+    info!("Generated and saved new keypair to {:?}", data_root);
     Ok(node_id)
 }
 

@@ -5,6 +5,7 @@ members = [
     "eventplanedb_server",
     "eventplanedb_client",
     "eventplanedb_client_example",
+    "eventplanedb_crypto",
 ]
 
 resolver = "2"
@@ -16,6 +17,8 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
+rsa = { version = "0.9.9", features = ["sha2", "pem"] }
+sha2 = "0.10.9"
 lru = "0.16.2"
 fastbloom = "0.14.0"
 crc32c = "0.6.8"
@@ -28,7 +31,7 @@ serde = { version = "1.0.219", features = ["derive", "rc"] }
 base64 = "0.22.1"
 io-uring = "0.7.9"
 tempfile = "3.21.0"
-rand = "0.9.2"
+rand = "0.8.5"
 glommio = { git = "https://github.com/utilitydelta/glommio", branch = "tcp-into-raw-fd-support" }
 futures-lite = "2.6.1"
 async-trait = "0.1.89"
