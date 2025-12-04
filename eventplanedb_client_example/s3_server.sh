@@ -61,4 +61,7 @@ if [ -n "$S3_SUBFOLDER" ]; then
     CMD_ARGS="$CMD_ARGS --s3-subfolder $S3_SUBFOLDER"
 fi
 
-cargo run -p eventplanedb_server --release -- $CMD_ARGS
+# Shift past the first two positional arguments (bucket and subfolder)
+shift 2 2>/dev/null || shift 1 2>/dev/null || true
+
+cargo run -p eventplanedb_server --release -- $CMD_ARGS "$@"

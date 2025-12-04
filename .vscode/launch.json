@@ -22,68 +22,28 @@
                 "--s3-bucket", "eventplanedb-testing",
                 "--s3-access-key-id", "AWS_ACCESS_KEY_ID_REDACTED_PRE_PUBLICATION_SEE_PROVENANCE_MD",
                 "--s3-secret-access-key", "AWS_SECRET_ACCESS_KEY_REDACTED_PRE_PUBLICATION_SEE_PROVENANCE_MD",
-                "--s3-subfolder", "test-ubuntu-pc"
+                "--s3-subfolder", "test-ubuntu-pc",
+                "--num-shards", "1"
             ],
             "cwd": "${workspaceFolder}"
         },
         {
             "type": "lldb",
             "request": "launch",
-            "name": "Debug simple_client",
+            "name": "Debug single_main",
             "cargo": {
                 "args": [
                     "build",
-                    "--bin=simple_client",
+                    "--bin=single_main",
                     "--package=eventplanedb_client_example"
                 ],
                 "filter": {
-                    "name": "simple_client",
+                    "name": "single_main",
                     "kind": "bin"
                 }
             },
             "args": [],
             "cwd": "${workspaceFolder}"
-        },
-        {
-            "type": "lldb",
-            "request": "launch",
-            "name": "Debug high_throughput",
-            "cargo": {
-                "args": [
-                    "build",
-                    "--bin=high_throughput",
-                    "--package=eventplanedb_client_example"
-                ],
-                "filter": {
-                    "name": "high_throughput",
-                    "kind": "bin"
-                }
-            },
-            "args": [],
-            "cwd": "${workspaceFolder}"
-        },
-        {
-            "type": "lldb",
-            "request": "launch",
-            "name": "Debug test-object-store",
-            "cargo": {
-                "args": [
-                    "build",
-                    "--bin=s3_write_example",
-                    "--package=s3_write_example"
-                ],
-                "filter": {
-                    "name": "s3_write_example",
-                    "kind": "bin"
-                }
-            },
-            "args": [],
-            "cwd": "${workspaceFolder}",
-            "env": {
-                "AWS_ACCESS_KEY_ID": "AWS_ACCESS_KEY_ID_REDACTED_PRE_PUBLICATION_SEE_PROVENANCE_MD",
-                "AWS_SECRET_ACCESS_KEY": "AWS_SECRET_ACCESS_KEY_REDACTED_PRE_PUBLICATION_SEE_PROVENANCE_MD",
-                "AWS_DEFAULT_REGION": "ap-southeast-2"
-            }
         }
     ]
 }

@@ -54,6 +54,11 @@ Run the server with s3 as the control plane (specify bucket and optional subfold
 ./eventplanedb_client_example/s3_server.sh eventplanedb-testing test-ubuntu-pc
 ```
 
+To run a second server that is effectively a different node you can pass additional parameters to the server startup:
+```
+./eventplanedb_client_example/s3_server.sh eventplanedb-testing test-ubuntu-pc --listen-address 0.0.0.0:9000 --data-root data2
+```
+
 # AWS S3 Setup Prerequisites
 
 To run the S3 control plane server (`./eventplanedb_client_example/s3_server.sh`), you must have the AWS CLI configured with credentials that have read/write access to a specified S3 bucket. The script uses the `default` AWS CLI profile.
