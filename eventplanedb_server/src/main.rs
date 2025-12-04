@@ -147,23 +147,23 @@ fn main() {
             // Create the leasing channel
             let leasing_channel = Rc::new(LeasingChannel::new());
 
-            // Initialize NodeLease only on shard 0
-            // if shard_id == LEADER_SHARD_ID {
-            //     if let Some(ref gw) = gateway {
-            //         let node_lease = Rc::new(NodeLease::new(
-            //             node_config.clone(),
-            //             gw.clone(),
-            //             s3_subfolder.clone(),
-            //         ));
-            //         leasing_channel.initialize_leader(shard_id, sender.clone(), node_lease).await;
-            //         info!("Shard {} initialized as lease leader", shard_id);
-            //     } else {
-            //         // No S3, initialize as follower (leasing will be no-op)
-            //         leasing_channel.initialize_follower(shard_id, sender.clone()).await;
-            //     }
-            // } else {
-            //     leasing_channel.initialize_follower(shard_id, sender.clone()).await;
-            // }
+            //Initialize NodeLease only on shard 0
+            if shard_id == LEADER_SHARD_ID {
+                if let Some(ref gw) = gateway {
+                    let node_lease = Rc::new(NodeLease::new(
+                        node_config.clone(),
+                        gw.clone(),
+                        s3_subfolder.clone(),
+                    ));
+                    leasing_channel.initialize_leader(shard_id, sender.clone(), node_lease).await;
+                    info!("Shard {} initialized as lease leader", shard_id);
+                } else {
+                    // No S3, initialize as follower (leasing will be no-op)
+                    leasing_channel.initialize_follower(shard_id, sender.clone()).await;
+                }
+            } else {
+                leasing_channel.initialize_follower(shard_id, sender.clone()).await;
+            }
 
             // Create the request processor
             let process_request = Rc::new(ProcessRequest::new(

@@ -556,8 +556,6 @@ impl<L: LeasingChannelTrait + 'static> ProcessRequest<L> {
             return Ok(0);
         }
         
-        return Ok(0);
-        
         let leasing_channel = self.leasing_channel.as_ref();
 
         {
@@ -570,9 +568,9 @@ impl<L: LeasingChannelTrait + 'static> ProcessRequest<L> {
 
                     // We are the active leader, but the lease is about to expire. 
                     // We can proactively try to renew the lease in the background without delaying the hot path
-                    // if lease_info.is_expiring_soon(server_timestamp_millis, self.node_config.margin_ms) {
-                    //     self.background_early_renew_lease(server_timestamp_millis);
-                    // }
+                    if lease_info.is_expiring_soon(server_timestamp_millis, self.node_config.margin_ms) {
+                        self.background_early_renew_lease(server_timestamp_millis);
+                    }
 
                     return Ok(lease_info.lease_index);
 
