@@ -15,6 +15,7 @@ pub async fn create_and_write_only_dma<P: AsRef<Path>>(
     path: P,
 ) -> Result<DmaFile, GlommioError<()>> {
     let file = OpenOptions::new()
+        .read(true)
         .write(true)
         .create_new(true)
         .truncate(true)
