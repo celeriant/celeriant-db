@@ -8,14 +8,18 @@ pub struct ClusterMember {
     pub node_id: u128,
 
     /// Network address for client connections (e.g., "10.0.1.5:10000")
-    pub address: String,
+    pub client_address: String,
+
+    /// Network address for inter-node connections (e.g., "10.0.1.5:10000")
+    pub replication_address: String,
 }
 
 impl ClusterMember {
-    pub fn new(node_id: u128, address: String) -> Self {
+    pub fn new(node_id: u128, client_address: String, replication_address: String) -> Self {
         Self {
             node_id,
-            address,
+            client_address,
+            replication_address
         }
     }
 }

@@ -1,43 +1,47 @@
-use std::{num::NonZeroUsize, path::Path, time::Duration};
+use std::{cell::RefCell, num::NonZeroUsize, path::Path, rc::Rc, time::Duration};
 
 use eventplanedb_structures::{
-    aggregate_info::AggregateInfo,
-    aggregate_key::AggregateKey,
-    directory_filters::DirectoryFilters,
-    eventplanedb_error::EventPlaneDBError,
-    organisation::Organisation,
-    read_result::ReadResult,
-    request::{
+    aggregate_info::AggregateInfo, aggregate_key::AggregateKey, directory_filters::DirectoryFilters, eventplanedb_error::EventPlaneDBError, lease_info::{LeaseInfo}, organisation::Organisation, read_result::ReadResult, request::{
         DeleteRequest, ListAggregatesRequest, ListOrganisationsRequest,
         ReadRequest, Request, TrimStartRequest, UpdateCacheLimitsRequest, WriteBatchesRequest,
         WriteRequest,
-    },
-    response::{
+    }, response::{
         DeleteResponse, ExistsResponse, ListAggregatesResponse, ListOrganisationsResponse,
         ReadResponse, Response, TrimStartResponse, UpdateCacheLimitsResponse, WriteBatchesResponse,
         WriteResponse,
-    },
+    }
 };
-use glommio::spawn_local;
+use glommio::{spawn_local, sync::RwLock};
 use log::error;
 
 use crate::{
-    cache::aggregate_cache::AggregateCache, files::open_dma_files::existing_file_read_only_dma, node_config::{NodeConfig}, object_store::ObjectStoreGateway, read_operations::{read_error::ReadError, read_operations::ReadOperations, read_structures::AggregateReadConfig}, write_operations::{
+    cache::{aggregate_cache::AggregateCache, lease_error::LeaseError}, files::open_dma_files::existing_file_read_only_dma, node_config::NodeConfig, read_operations::{read_error::ReadError, read_operations::ReadOperations, read_structures::AggregateReadConfig}, write_operations::{
         write_operations::WriteOperations,
         write_structures::{AggregateWriteConfig, WriteOptions},
     }
 };
 
-pub struct ProcessRequest {
+pub struct ProcessRequest<L: LeasingChannelTrait> {
     aggregate_cache: AggregateCache,
     node_config: NodeConfig,
+    lease_info: Rc<RwLock<Option<LeaseInfo>>>,
+    leasing_channel: Rc<L>,
+    lease_renewal_in_progress: Rc<RefCell<bool>>
 }
 
-impl ProcessRequest {
+pub trait LeasingChannelTrait {
+
+    fn try_early_renew_lease(&self) -> impl std::future::Future<Output = Result<LeaseInfo, LeaseError>>;
+
+    fn request_or_get_lease(&self) -> impl std::future::Future<Output = Result<LeaseInfo, LeaseError>>;
+}
+
+impl<L: LeasingChannelTrait + 'static> ProcessRequest<L> {
     pub fn new(
         aggregate_read_config: AggregateReadConfig,
         aggregate_write_config: AggregateWriteConfig,
         node_config: NodeConfig,
+        leasing_channel: Rc<L>,
     ) -> Self {
         let capacity = NonZeroUsize::new(node_config.max_open_aggregates).unwrap();
         Self {
@@ -47,28 +51,10 @@ impl ProcessRequest {
                 aggregate_read_config,
                 aggregate_write_config,
             ),
-            node_config
-        }
-    }
-
-    pub fn with_object_store(
-        aggregate_read_config: AggregateReadConfig,
-        aggregate_write_config: AggregateWriteConfig,
-        node_config: NodeConfig,
-        gateway: ObjectStoreGateway,
-        s3_subfolder: Option<String>,
-    ) -> Self {
-        let capacity = NonZeroUsize::new(node_config.max_open_aggregates).unwrap();
-        Self {
-            aggregate_cache: AggregateCache::with_object_store(
-                capacity,
-                node_config.clone(),
-                aggregate_read_config,
-                aggregate_write_config,
-                gateway,
-                s3_subfolder,
-            ),
             node_config,
+            lease_info: Rc::new(RwLock::new(None)),
+            leasing_channel: leasing_channel,
+             lease_renewal_in_progress: Rc::new(RefCell::new(false)),
         }
     }
 
@@ -512,6 +498,122 @@ impl ProcessRequest {
         Ok(aggregates)
     }
 
+    fn background_early_renew_lease(&self, server_timestamp_millis: u64) {
+        // Check and set the flag - if already in progress, return immediately
+        {
+            let mut in_progress = self.lease_renewal_in_progress.borrow_mut();
+            if *in_progress {
+                return;
+            }
+            *in_progress = true;
+        }
+
+        let leasing_channel = self.leasing_channel.clone();
+        let lease_info = self.lease_info.clone();
+        let renewal_in_progress = self.lease_renewal_in_progress.clone();
+        let margin_ms = self.node_config.margin_ms;
+        let node_id = self.node_config.node_id;
+
+        spawn_local(async move {
+            // Read lock only to verify renewal is still needed - doesn't block writes
+            {
+                let Ok(r_lease_info) = lease_info.read().await else {
+                    *renewal_in_progress.borrow_mut() = false;
+                    return;
+                };
+
+                if let Some(current_lease) = r_lease_info.as_ref() {
+                    if !current_lease.is_active_leader(node_id, server_timestamp_millis)
+                        || !current_lease.is_expiring_soon(server_timestamp_millis, margin_ms)
+                    {
+                        *renewal_in_progress.borrow_mut() = false;
+                        return;
+                    }
+                } else {
+                    *renewal_in_progress.borrow_mut() = false;
+                    return;
+                }
+            }
+            // Read lock released here - renewal request happens without holding any lock
+
+            let result: Result<LeaseInfo, LeaseError> = leasing_channel.try_early_renew_lease().await;
+
+            if let Ok(new_lease_info) = result {
+                // Only acquire write lock after successful renewal
+                if let Ok(mut w_lease_info) = lease_info.write().await {
+                    *w_lease_info = Some(new_lease_info);
+                }
+            }
+
+            *renewal_in_progress.borrow_mut() = false;
+        })
+        .detach();
+    }
+        
+
+    async fn must_be_leader(&self, server_timestamp_millis: u64) -> Result<u64, LeaseError> {
+        if !self.node_config.s3_enabled {
+            return Ok(0);
+        }
+        
+        return Ok(0);
+        
+        let leasing_channel = self.leasing_channel.as_ref();
+
+        {
+            // First preference is just to read the lease info from the local thread cache
+            let r_lease_info = self.lease_info.read().await?;
+            if let Some(lease_info) = r_lease_info.as_ref() {
+
+                // Scenario 1 - we are the active leader
+                if lease_info.is_active_leader(self.node_config.node_id, server_timestamp_millis) {
+
+                    // We are the active leader, but the lease is about to expire. 
+                    // We can proactively try to renew the lease in the background without delaying the hot path
+                    // if lease_info.is_expiring_soon(server_timestamp_millis, self.node_config.margin_ms) {
+                    //     self.background_early_renew_lease(server_timestamp_millis);
+                    // }
+
+                    return Ok(lease_info.lease_index);
+
+                // Scenario 2 - another node is the active leader still
+                } else if !lease_info.is_expired(server_timestamp_millis) {
+                    return Err(LeaseError::NotLeader { leader_node_id: lease_info.node_id });
+                }
+            }
+        }
+
+        {
+            // There is either no lease in the cache, or it has expired. We can submit a request to take it over!
+            let mut w_lease_info = self.lease_info.write().await?;
+            let lease_info = w_lease_info.as_mut();
+
+            // Now we have gained a local write lock, double check if we need to do anything (concurrent applications happen)
+            if let Some(lease_info) = lease_info {
+                if lease_info.is_active_leader(self.node_config.node_id, server_timestamp_millis) {
+                    return Ok(lease_info.lease_index);
+                } else if !lease_info.is_expired(server_timestamp_millis) {
+                    return Err(LeaseError::NotLeader { leader_node_id: lease_info.node_id });
+                }
+            }
+
+            // Let's apply for a lease
+            let lease_info: LeaseInfo = leasing_channel.request_or_get_lease().await?;
+            let lease_index = lease_info.lease_index;
+
+            let is_active_leader = lease_info.is_active_leader(self.node_config.node_id, server_timestamp_millis);
+            let node_id = lease_info.node_id;
+
+            *w_lease_info = Some(lease_info);
+
+            if !is_active_leader {
+                return Err(LeaseError::NotLeader { leader_node_id: node_id });
+            }
+
+            Ok(lease_index)
+        }
+    }
+
     async fn handle_write(
         &self,
         request: WriteRequest,
@@ -522,13 +624,11 @@ impl ProcessRequest {
             request.aggregate_id,
         );
         let aggregate_resources = self.aggregate_cache.get_aggregate_resources(&aggregate_key);
+        let server_timestamp_millis = Self::get_server_timestamp_millis();
 
-        // Check who has the current lease for this aggregate. Calls off to the control plane if we don't have it.
-        let (lease_index, taking_lease_from_other_node) = self.aggregate_cache.get_aggregate_lease(&aggregate_key).must_be_leader().await?;
+        let lease_index = self.must_be_leader(server_timestamp_millis).await?;
 
-        if taking_lease_from_other_node {
-            //TODO: need to check for any batches on s3 (degraded mode replication) and update disk+cache
-        }
+        //TODO: Checks to make sure if we are a new leader we have the most up-to-date WAL for this aggregate
 
         let append_result = {
             let mut writer = aggregate_resources
@@ -541,7 +641,7 @@ impl ProcessRequest {
                 user_id: request.user_id,
                 expected_event_batch_index: request.expected_event_batch_index,
                 enforce_client_idempotency: request.enforce_client_idempotency,
-                server_timestamp_millis: Self::get_server_timestamp_millis(),
+                server_timestamp_millis,
                 compression_type: request.compression_type,
             };
             r_writer.queue_events_in_memory(self.node_config.node_id, lease_index, request.events, &append_options)?

@@ -1,17 +1,39 @@
 #[cfg(test)]
 mod test_process_request_integration {
 
+    struct LeasingChannelTester {
+        
+    }
+
+    impl LeasingChannelTester {
+
+        pub fn new() -> Self {
+            Self {
+
+            }
+        }
+    }
+    
+    impl LeasingChannelTrait for LeasingChannelTester  {
+        async fn try_early_renew_lease(&self) -> Result<LeaseInfo, LeaseError> {
+            Ok(LeaseInfo::default())
+        }
+
+        async fn request_or_get_lease(&self) -> Result<LeaseInfo, LeaseError> {
+            // dummy implementation
+            Ok(LeaseInfo::default())
+        }
+    }
+
+    use std::rc::Rc;
+
     use eventplanedb_structures::{
-        compression_type::CompressionType,
-        event_item::EventItem,
-        read_filters::ReadFilters,
-        request::*,
-        response::Response,
+        compression_type::CompressionType, event_item::EventItem, lease_info::LeaseInfo, read_filters::ReadFilters, request::*, response::Response
     };
     use glommio::{LocalExecutorBuilder, Placement};
 
     use crate::{
-        node_config::test_node_config::test_config, process_request::ProcessRequest, read_operations::read_structures::AggregateReadConfig, write_operations::write_structures::AggregateWriteConfig
+        cache::lease_error::LeaseError, node_config::test_node_config::test_config, process_request::{LeasingChannelTrait, ProcessRequest}, read_operations::read_structures::AggregateReadConfig, write_operations::write_structures::AggregateWriteConfig
     };
 
     /// Helper to create test events
@@ -49,10 +71,11 @@ mod test_process_request_integration {
                     max_chunk_size: 1 << 20,
                 };
 
-                let processor = ProcessRequest::new(
+                let processor: ProcessRequest<LeasingChannelTester> = ProcessRequest::new(
                     read_config,
                     write_config,
                     test_config(data_root),
+                    Rc::new(LeasingChannelTester::new())
                 );
 
                 let org_id = 1;
@@ -201,7 +224,7 @@ mod test_process_request_integration {
                 let tempdir = tempfile::tempdir().unwrap();
                 let data_root = tempdir.path().to_str().unwrap();
 
-                let processor = ProcessRequest::new(
+                let processor: ProcessRequest<LeasingChannelTester> = ProcessRequest::new(
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
                         
@@ -212,6 +235,7 @@ mod test_process_request_integration {
                         max_chunk_size: 1 << 20,
                     },
                     test_config(data_root),
+                    Rc::new(LeasingChannelTester::new())
                 );
 
                 // Write to aggregate 1
@@ -303,10 +327,9 @@ mod test_process_request_integration {
                 let tempdir = tempfile::tempdir().unwrap();
                 let data_root = tempdir.path().to_str().unwrap();
 
-                let processor = ProcessRequest::new(
+                let processor: ProcessRequest<LeasingChannelTester> = ProcessRequest::new(
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
-                        
                     },
                     AggregateWriteConfig {
                         max_data_cache_size_bytes: 1 << 25,
@@ -314,6 +337,7 @@ mod test_process_request_integration {
                         max_chunk_size: 1 << 20,
                     },
                     test_config(data_root),
+                    Rc::new(LeasingChannelTester::new())
                 );
 
                 // Write first batch
@@ -394,7 +418,7 @@ mod test_process_request_integration {
                 let tempdir = tempfile::tempdir().unwrap();
                 let data_root = tempdir.path().to_str().unwrap();
 
-                let processor = ProcessRequest::new(
+                let processor: ProcessRequest<LeasingChannelTester> = ProcessRequest::new(
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
                         
@@ -405,6 +429,7 @@ mod test_process_request_integration {
                         max_chunk_size: 1 << 20,
                     },
                     test_config(data_root),
+                    Rc::new(LeasingChannelTester::new())
                 );
 
                 let org_id = 1;
@@ -513,7 +538,7 @@ mod test_process_request_integration {
                 let tempdir = tempfile::tempdir().unwrap();
                 let data_root = tempdir.path().to_str().unwrap();
 
-                let processor = ProcessRequest::new(
+                let processor: ProcessRequest<LeasingChannelTester> = ProcessRequest::new(
                     AggregateReadConfig {
                         max_chunk_size: 1 << 20,
                         
@@ -524,6 +549,7 @@ mod test_process_request_integration {
                         max_chunk_size: 1 << 20,
                     },
                     test_config(data_root),
+                    Rc::new(LeasingChannelTester::new())
                 );
 
                 let org_id = 1;
@@ -604,10 +630,9 @@ mod test_process_request_integration {
                 let tempdir = tempfile::tempdir().unwrap();
                 let data_root = tempdir.path().to_str().unwrap();
 
-                let processor = ProcessRequest::new(
+                let processor: ProcessRequest<LeasingChannelTester> = ProcessRequest::new(
                     AggregateReadConfig {
-                        max_chunk_size: 1 << 20,
-                        
+                        max_chunk_size: 1 << 20,                        
                     },
                     AggregateWriteConfig {
                         max_data_cache_size_bytes: 1 << 25,
@@ -615,6 +640,7 @@ mod test_process_request_integration {
                         max_chunk_size: 1 << 20,
                     },
                     test_config(data_root),
+                    Rc::new(LeasingChannelTester::new())
                 );
 
                 // Create an aggregate first
@@ -688,10 +714,9 @@ mod test_process_request_integration {
 
                 let mut node_config = test_config(data_root);
                 node_config.max_event_batches_response_size = Some(300);
-                let processor = ProcessRequest::new(
+                let processor: ProcessRequest<LeasingChannelTester> = ProcessRequest::new(
                     AggregateReadConfig {
-                        max_chunk_size: 1 << 20,
-                        
+                        max_chunk_size: 1 << 20,                        
                     },
                     AggregateWriteConfig {
                         max_data_cache_size_bytes: 1 << 25,
@@ -699,6 +724,7 @@ mod test_process_request_integration {
                         max_chunk_size: 1 << 20,
                     },
                     node_config,
+                    Rc::new(LeasingChannelTester::new())
                 );
 
                 let org_id = 1;
@@ -775,10 +801,9 @@ mod test_process_request_integration {
                 let tempdir = tempfile::tempdir().unwrap();
                 let data_root = tempdir.path().to_str().unwrap();
 
-                let processor = ProcessRequest::new(
+                let processor: ProcessRequest<LeasingChannelTester> = ProcessRequest::new(
                     AggregateReadConfig {
-                        max_chunk_size: 1 << 20,
-                        
+                        max_chunk_size: 1 << 20,                        
                     },
                     AggregateWriteConfig {
                         max_data_cache_size_bytes: 1 << 25,
@@ -786,6 +811,7 @@ mod test_process_request_integration {
                                         max_chunk_size: 1 << 20,
                     },
                     test_config(data_root),
+                    Rc::new(LeasingChannelTester::new())
                 );
 
                 let org_id = 1;
@@ -893,10 +919,9 @@ mod test_process_request_integration {
                 let tempdir = tempfile::tempdir().unwrap();
                 let data_root = tempdir.path().to_str().unwrap();
 
-                let processor = ProcessRequest::new(
+                let processor: ProcessRequest<LeasingChannelTester> = ProcessRequest::new(
                     AggregateReadConfig {
-                        max_chunk_size: 1 << 20,
-                        
+                        max_chunk_size: 1 << 20,                        
                     },
                     AggregateWriteConfig {
                         max_data_cache_size_bytes: 1 << 25,
@@ -904,6 +929,7 @@ mod test_process_request_integration {
                         max_chunk_size: 1 << 20,
                     },
                     test_config(data_root),
+                    Rc::new(LeasingChannelTester::new())
                 );
 
                 let org_id = 1;
@@ -1009,10 +1035,9 @@ mod test_process_request_integration {
                 let tempdir = tempfile::tempdir().unwrap();
                 let data_root = tempdir.path().to_str().unwrap();
 
-                let processor = ProcessRequest::new(
+                let processor: ProcessRequest<LeasingChannelTester> = ProcessRequest::new(
                     AggregateReadConfig {
-                        max_chunk_size: 1 << 20,
-                        
+                        max_chunk_size: 1 << 20,                        
                     },
                     AggregateWriteConfig {
                         max_data_cache_size_bytes: 1 << 25,
@@ -1020,6 +1045,7 @@ mod test_process_request_integration {
                         max_chunk_size: 1 << 20,
                     },
                     test_config(data_root),
+                    Rc::new(LeasingChannelTester::new())
                 );
 
                 // Create aggregates in different organisations
@@ -1116,10 +1142,9 @@ mod test_process_request_integration {
                 let tempdir = tempfile::tempdir().unwrap();
                 let data_root = tempdir.path().to_str().unwrap();
 
-                let processor = ProcessRequest::new(
+                let processor: ProcessRequest<LeasingChannelTester> = ProcessRequest::new(
                     AggregateReadConfig {
-                        max_chunk_size: 1 << 20,
-                        
+                        max_chunk_size: 1 << 20,                        
                     },
                     AggregateWriteConfig {
                         max_data_cache_size_bytes: 1 << 25,
@@ -1127,6 +1152,7 @@ mod test_process_request_integration {
                         max_chunk_size: 1 << 20,
                     },
                     test_config(data_root),
+                    Rc::new(LeasingChannelTester::new())
                 );
 
                 let org_id = 1;
@@ -1201,10 +1227,9 @@ mod test_process_request_integration {
                 let tempdir = tempfile::tempdir().unwrap();
                 let data_root = tempdir.path().to_str().unwrap();
 
-                let processor = ProcessRequest::new(
+                let processor: ProcessRequest<LeasingChannelTester> = ProcessRequest::new(
                     AggregateReadConfig {
-                        max_chunk_size: 1 << 20,
-                        
+                        max_chunk_size: 1 << 20,                        
                     },
                     AggregateWriteConfig {
                         max_data_cache_size_bytes: 1 << 25,
@@ -1212,6 +1237,7 @@ mod test_process_request_integration {
                         max_chunk_size: 1 << 20,
                     },
                     test_config(data_root),
+                    Rc::new(LeasingChannelTester::new())
                 );
 
                 // Try to read from non-existent aggregate
@@ -1286,10 +1312,9 @@ mod test_process_request_integration {
                 let tempdir = tempfile::tempdir().unwrap();
                 let data_root = tempdir.path().to_str().unwrap();
 
-                let processor = ProcessRequest::new(
+                let processor: ProcessRequest<LeasingChannelTester> = ProcessRequest::new(
                     AggregateReadConfig {
-                        max_chunk_size: 1 << 20,
-                        
+                        max_chunk_size: 1 << 20,                        
                     },
                     AggregateWriteConfig {
                         max_data_cache_size_bytes: 1 << 25,
@@ -1297,6 +1322,7 @@ mod test_process_request_integration {
                         max_chunk_size: 1 << 20,
                     },
                     test_config(data_root),
+                    Rc::new(LeasingChannelTester::new())
                 );
 
                 // Scenario: 3 users (aggregates) in a collaborative app

@@ -1,1 +1,1 @@
-pub mod aggregate_lease;
+pub mod node_lease;

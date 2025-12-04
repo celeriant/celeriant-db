@@ -5,7 +5,7 @@ use eventplanedb_structures::{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = EventPlaneDBClient::connect("127.0.0.1:10000")
+    let mut client = EventPlaneDBClient::connect("0.0.0.0:10000")
         .await?;
         // .with_timeout(Duration::from_secs(25));
 
@@ -13,7 +13,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         correlation_id: Some(999), 
         org_id: 1, 
         aggregate_type_id: 2, 
-        aggregate_id: 1, 
+        aggregate_id: 2, 
         client_id: 123, 
         user_id: None, 
         events: vec![
@@ -47,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         correlation_id:Some(1000),
         org_id:1,
         aggregate_type_id:2,
-        aggregate_id:1,
+        aggregate_id:2,
         filters: ReadFilters::new(1) 
     });
     

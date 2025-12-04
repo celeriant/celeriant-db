@@ -77,7 +77,7 @@ impl From<LeaseError> for EventPlaneDBError {
     fn from(e: LeaseError) -> Self {        
         match e {
             LeaseError::ControlPlaneOffline => EventPlaneDBError::control_plane_offline(),
-            LeaseError::GlommioError(_glommio_error) => EventPlaneDBError::io_error(),
+            LeaseError::GlommioError => EventPlaneDBError::io_error(),
             LeaseError::NotLeader { leader_node_id } => EventPlaneDBError::not_leader(leader_node_id),
             LeaseError::CannotBeLeader => EventPlaneDBError::cannot_be_leader(),
             LeaseError::ObjectStoreError(_object_store_error) => EventPlaneDBError::io_error(),

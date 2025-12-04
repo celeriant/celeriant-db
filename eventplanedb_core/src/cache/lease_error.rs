@@ -2,9 +2,9 @@ use glommio::GlommioError;
 
 use crate::object_store::ObjectStoreError;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum LeaseError {
-    GlommioError(GlommioError<()>),
+    GlommioError,
     ObjectStoreError(ObjectStoreError),
     ControlPlaneOffline,
     NotLeader {
@@ -14,8 +14,8 @@ pub enum LeaseError {
 }
 
 impl From<GlommioError<()>> for LeaseError {
-    fn from(error: GlommioError<()>) -> Self {
-        LeaseError::GlommioError(error)
+    fn from(_error: GlommioError<()>) -> Self {
+        LeaseError::GlommioError
     }
 }
 

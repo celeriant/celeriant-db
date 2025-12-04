@@ -1,11 +1,6 @@
-//! Lease operations over S3 using the object store gateway.
-
-use std::collections::HashSet;
-use std::time::Instant;
-
 use bytes::Bytes;
-use eventplanedb_structures::aggregate_key::AggregateKey;
-use eventplanedb_structures::lease_info::LeaseInfo;
+use eventplanedb_structures::lease_info::{CachedLease, LeaseInfo};
+use std::time::Instant;
 
 use super::error::ObjectStoreError;
 use super::gateway::ObjectStoreGateway;
@@ -19,7 +14,11 @@ pub struct LeaseOps {
 }
 
 impl LeaseOps {
-    pub fn new(gateway: ObjectStoreGateway, subfolder: Option<String>, lease_duration_ms: u64) -> Self {
+    pub fn new(
+        gateway: ObjectStoreGateway,
+        subfolder: Option<String>,
+        lease_duration_ms: u64,
+    ) -> Self {
         Self {
             gateway,
             subfolder,
@@ -27,24 +26,20 @@ impl LeaseOps {
         }
     }
 
-    fn lease_path(&self, aggregate_key: &AggregateKey) -> String {
-        let base = format!(
-            "leases/{}/{}/{}",
-            aggregate_key.org_id, aggregate_key.aggregate_type_id, aggregate_key.aggregate_id
-        );
+    fn lease_path(&self) -> String {
+        let base = "lease.json";
         match &self.subfolder {
             Some(folder) => format!("{}/{}", folder, base),
-            None => base,
+            None => base.to_string(),
         }
     }
 
-    /// Get the current lease for an aggregate, if one exists.
+    /// Get the current lease, if one exists.
     pub async fn get_lease(
         &self,
-        aggregate_key: &AggregateKey,
         deadline: Option<Instant>,
-    ) -> Result<Option<(LeaseInfo, String)>, ObjectStoreError> {
-        let path = self.lease_path(aggregate_key);
+    ) -> Result<Option<CachedLease>, ObjectStoreError> {
+        let path = self.lease_path();
 
         let result = self
             .gateway
@@ -61,7 +56,7 @@ impl LeaseOps {
                 let etag = e_tag.ok_or_else(|| {
                     ObjectStoreError::permanent("S3 returned no ETag for lease object")
                 })?;
-                Ok(Some((lease_info, etag)))
+                Ok(Some(CachedLease {lease_info, etag}))
             }
             Err(e) if e.kind == super::error::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
@@ -72,15 +67,14 @@ impl LeaseOps {
     /// Try to acquire a new lease (create-only, fails if lease exists).
     pub async fn try_create_lease(
         &self,
-        aggregate_key: &AggregateKey,
         node_id: u128,
-        available_leaders: HashSet<u128>,
         deadline: Option<Instant>,
-    ) -> Result<(u64, String), ObjectStoreError> {
-        let path = self.lease_path(aggregate_key);
-        let lease_expiry_ms = current_time_ms() + self.lease_duration_ms;
+    ) -> Result<CachedLease, ObjectStoreError> {
+        let path = self.lease_path();
+        let lease_started_on = current_time_ms();
+        let lease_expires_on = lease_started_on + self.lease_duration_ms;
 
-        let lease_info = LeaseInfo::new(1, node_id, lease_expiry_ms, available_leaders);
+        let lease_info = LeaseInfo::new(1, node_id, lease_expires_on, lease_started_on);
         let data = serialize_lease(&lease_info)?;
 
         let result = self
@@ -98,10 +92,9 @@ impl LeaseOps {
 
         match result {
             ObjectStoreResult::Put { e_tag } => {
-                let etag = e_tag.ok_or_else(|| {
-                    ObjectStoreError::permanent("S3 returned no ETag after PUT")
-                })?;
-                Ok((lease_info.lease_index, etag))
+                let etag = e_tag
+                    .ok_or_else(|| ObjectStoreError::permanent("S3 returned no ETag after PUT"))?;
+                Ok(CachedLease {lease_info, etag })
             }
             _ => Err(ObjectStoreError::permanent("Unexpected response type")),
         }
@@ -110,17 +103,22 @@ impl LeaseOps {
     /// Try to update an existing lease (conditional on ETag).
     pub async fn try_update_lease(
         &self,
-        aggregate_key: &AggregateKey,
+        existing_lease: &CachedLease,
         node_id: u128,
-        new_lease_index: u64,
-        available_leaders: HashSet<u128>,
-        expected_etag: &str,
         deadline: Option<Instant>,
-    ) -> Result<(u64, String), ObjectStoreError> {
-        let path = self.lease_path(aggregate_key);
-        let lease_expiry_ms = current_time_ms() + self.lease_duration_ms;
+    ) -> Result<CachedLease, ObjectStoreError> {
+        let path = self.lease_path();
+        let current_time = current_time_ms();
+        let lease_started_on = if existing_lease.lease_info.node_id == node_id {
+            existing_lease.lease_info.lease_started_on
+        } else {
+            current_time
+        };
+        let lease_expiry_ms = current_time + self.lease_duration_ms;
+        let new_lease_index = existing_lease.lease_info.lease_index + 1;
 
-        let lease_info = LeaseInfo::new(new_lease_index, node_id, lease_expiry_ms, available_leaders);
+        let lease_info =
+            LeaseInfo::new(new_lease_index, node_id, lease_expiry_ms, lease_started_on);
         let data = serialize_lease(&lease_info)?;
 
         let result = self
@@ -130,7 +128,7 @@ impl LeaseOps {
                 ObjectStoreOp::Put {
                     path,
                     data,
-                    condition: PutCondition::IfMatchETag(expected_etag.to_string()),
+                    condition: PutCondition::IfMatchETag(existing_lease.etag.to_string()),
                 },
                 deadline,
             )
@@ -138,32 +136,12 @@ impl LeaseOps {
 
         match result {
             ObjectStoreResult::Put { e_tag } => {
-                let etag = e_tag.ok_or_else(|| {
-                    ObjectStoreError::permanent("S3 returned no ETag after PUT")
-                })?;
-                Ok((lease_info.lease_index, etag))
+                let etag = e_tag
+                    .ok_or_else(|| ObjectStoreError::permanent("S3 returned no ETag after PUT"))?;
+                Ok(CachedLease { lease_info, etag })
             }
             _ => Err(ObjectStoreError::permanent("Unexpected response type")),
         }
-    }
-
-    /// Release a lease by deleting it.
-    pub async fn release_lease(
-        &self,
-        aggregate_key: &AggregateKey,
-        deadline: Option<Instant>,
-    ) -> Result<(), ObjectStoreError> {
-        let path = self.lease_path(aggregate_key);
-
-        self.gateway
-            .execute(
-                ObjectStoreTarget::ControlPlaneLease,
-                ObjectStoreOp::Delete { path },
-                deadline,
-            )
-            .await?;
-
-        Ok(())
     }
 }
 
@@ -177,10 +155,11 @@ fn current_time_ms() -> u64 {
 fn serialize_lease(lease: &LeaseInfo) -> Result<Bytes, ObjectStoreError> {
     // Simple JSON serialization for leases
     let json = serde_json::json!({
+        "version": 1,
         "lease_index": lease.lease_index,
         "node_id": lease.node_id.to_string(),
-        "lease_expiry_ms": lease.lease_expiry_ms,
-        "available_leaders": lease.available_leaders.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+        "lease_started_on": lease.lease_started_on,
+        "lease_expires_on": lease.lease_expires_on,
     });
 
     serde_json::to_vec(&json)
@@ -203,16 +182,18 @@ fn deserialize_lease(data: &Bytes) -> Result<LeaseInfo, ObjectStoreError> {
         .parse()
         .map_err(|_| ObjectStoreError::permanent("Invalid node_id"))?;
 
-    let lease_expiry_ms = json["lease_expiry_ms"]
+    let lease_expires_on = json["lease_expires_on"]
         .as_u64()
-        .ok_or_else(|| ObjectStoreError::permanent("Missing lease_expiry_ms"))?;
+        .ok_or_else(|| ObjectStoreError::permanent("Missing lease_expires_on"))?;
 
-    let available_leaders: HashSet<u128> = json["available_leaders"]
-        .as_array()
-        .ok_or_else(|| ObjectStoreError::permanent("Missing available_leaders"))?
-        .iter()
-        .filter_map(|v| v.as_str()?.parse().ok())
-        .collect();
+    let lease_started_on = json["lease_started_on"]
+        .as_u64()
+        .ok_or_else(|| ObjectStoreError::permanent("Missing lease_started_on"))?;
 
-    Ok(LeaseInfo::new(lease_index, node_id, lease_expiry_ms, available_leaders))
+    Ok(LeaseInfo::new(
+        lease_index,
+        node_id,
+        lease_expires_on,
+        lease_started_on,
+    ))
 }

@@ -4,19 +4,12 @@ use eventplanedb_crypto::Crypto;
 use std::{cell::{Cell, RefCell}, fs, io::{Read, Write}, os::fd::{FromRawFd, IntoRawFd}, rc::Rc, time::Duration};
 
 use eventplanedb_core::{
-    node_config::NodeConfig,
-    object_store::{
-        ObjectStoreGateway, ObjectStoreRuntime, ObjectStoreRuntimeConfig,
-        ObjectStoreRetryConfig, S3Config,
-    },
-    process_request::ProcessRequest,
-    read_operations::read_structures::AggregateReadConfig,
-    write_operations::write_structures::AggregateWriteConfig,
+    cache::lease_error::LeaseError, node_config::NodeConfig, object_store::{
+        ObjectStoreGateway, ObjectStoreRetryConfig, ObjectStoreRuntime, ObjectStoreRuntimeConfig, S3Config
+    }, process_request::{LeasingChannelTrait, ProcessRequest}, read_operations::read_structures::AggregateReadConfig, replication::node_lease::NodeLease, write_operations::write_structures::AggregateWriteConfig
 };
 use eventplanedb_structures::{
-    request::{read_request, Request},
-    response::{write_response, ProtocolErrorResponse, Response},
-    wire_error::WireError,
+    lease_info::LeaseInfo, request::{Request, read_request}, response::{ProtocolErrorResponse, Response, write_response}, wire_error::WireError
 };
 use glommio::{
     channels::channel_mesh::{Full, MeshBuilder, Senders},
@@ -30,11 +23,14 @@ use log::{debug, error, info};
 
 mod config;
 mod signal_handler;
+mod leasing_channel;
 
 use config::EventPlaneDBConfig;
 use signal_handler::SignalHandler;
 
 use mimalloc::MiMalloc;
+
+use crate::leasing_channel::{LeasingChannel, LeaseRequestMsg, LeaseResponseMsg, LEADER_SHARD_ID};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -44,6 +40,8 @@ struct Msg {
     value: Option<Request>,
     message_version: u32,
     require_shutdown: bool,
+    lease_request: Option<LeaseRequestMsg>,
+    lease_response: Option<LeaseResponseMsg>,
 }
 
 /// Holds the object store sidecar runtime (lives on the main thread, outside Glommio).
@@ -121,8 +119,8 @@ fn main() {
     let node_config = NodeConfig {
         data_root_folder: config.data_root.to_string_lossy().to_string(),
         node_id,
-        margin_ms: 500, // 500ms safety margin before lease expiry
-        lease_expiry_ms: 90000, // 90 second lease duration
+        margin_ms: 1500, // 1.5 second safety margin before lease expiry
+        lease_expiry_ms: 10000, // 10 second lease duration
         async_flush_ms: config.async_flush_ms,
         max_open_aggregates: config.max_open_aggregates,
         max_request_size: config.max_request_size,
@@ -146,21 +144,34 @@ fn main() {
 
             let sender = Rc::new(RefCell::new(sender));
 
-            // Create the request processor with or without object store
-            let process_request = Rc::new(match gateway.clone() {
-                Some(gw) => ProcessRequest::with_object_store(
-                    aggregate_read_config.clone(),
-                    aggregate_write_config.clone(),
-                    node_config.clone(),
-                    gw,
-                    s3_subfolder.clone(),
-                ),
-                None => ProcessRequest::new(
-                    aggregate_read_config.clone(),
-                    aggregate_write_config.clone(),
-                    node_config.clone(),
-                ),
-            });
+            // Create the leasing channel
+            let leasing_channel = Rc::new(LeasingChannel::new());
+
+            // Initialize NodeLease only on shard 0
+            // if shard_id == LEADER_SHARD_ID {
+            //     if let Some(ref gw) = gateway {
+            //         let node_lease = Rc::new(NodeLease::new(
+            //             node_config.clone(),
+            //             gw.clone(),
+            //             s3_subfolder.clone(),
+            //         ));
+            //         leasing_channel.initialize_leader(shard_id, sender.clone(), node_lease).await;
+            //         info!("Shard {} initialized as lease leader", shard_id);
+            //     } else {
+            //         // No S3, initialize as follower (leasing will be no-op)
+            //         leasing_channel.initialize_follower(shard_id, sender.clone()).await;
+            //     }
+            // } else {
+            //     leasing_channel.initialize_follower(shard_id, sender.clone()).await;
+            // }
+
+            // Create the request processor
+            let process_request = Rc::new(ProcessRequest::new(
+                aggregate_read_config.clone(),
+                aggregate_write_config.clone(),
+                node_config.clone(),
+                leasing_channel.clone(),
+            ));
 
             // Shard 0 sets up signal handler with polling loop
             if shard_id == 0 {
@@ -185,6 +196,8 @@ fn main() {
                                             value: None,
                                             message_version: 0,
                                             require_shutdown: true,
+                                            lease_request: None,
+                                            lease_response: None,
                                         };
                                         if let Err(e) = sender_clone.borrow().try_send_to(peer, shutdown_msg) {
                                             error!("Failed to send shutdown signal to shard {peer}: {e:?}");
@@ -210,9 +223,11 @@ fn main() {
                 let sender_clone = sender.clone();
                 let process_request = process_request.clone();
                 let shutdown_flag = shutdown_flag.clone();
+                let leasing_channel = leasing_channel.clone();
 
                 spawn_local(async move {
                     while let Some(msg) = stream.recv().await {
+                        // Handle shutdown messages
                         if msg.require_shutdown {
                             info!("Shard {shard_id} received shutdown signal");
                             shutdown_flag.set(true);
@@ -220,6 +235,38 @@ fn main() {
                             if let Err(e) = cache_clear {
                                 error!("Error during shard {shard_id} shutdown: {:?}", e);
                             }
+                            continue;
+                        }
+
+                        // Handle lease requests (only on leader shard)
+                        if let Some(lease_request) = msg.lease_request {
+                            if shard_id == LEADER_SHARD_ID {
+                                debug!("Shard {} handling lease request from shard {}", shard_id, lease_request.from_shard);
+                                let from_shard = lease_request.from_shard;
+                                let response = leasing_channel.handle_lease_request(lease_request).await;
+                                
+                                // Send response back to requesting shard
+                                let response_msg = Msg {
+                                    fd: -1,
+                                    value: None,
+                                    message_version: 0,
+                                    require_shutdown: false,
+                                    lease_request: None,
+                                    lease_response: Some(response),
+                                };
+                                if let Err(e) = sender_clone.borrow().try_send_to(from_shard, response_msg) {
+                                    error!("Failed to send lease response to shard {}: {:?}", from_shard, e);
+                                }
+                            } else {
+                                error!("Shard {} received lease request but is not leader", shard_id);
+                            }
+                            continue;
+                        }
+
+                        // Handle lease responses (on follower shards)
+                        if let Some(lease_response) = msg.lease_response {
+                            debug!("Shard {} received lease response for request {}", shard_id, lease_response.request_id);
+                            leasing_channel.deliver_response(lease_response).await;
                             continue;
                         }
 
@@ -237,7 +284,9 @@ fn main() {
 
                         if msg.fd == -1 {
                             debug!("Shard {shard_id} processing broadcast message");
-                            let _ = process_request.process(msg.value.unwrap()).await;
+                            if let Some(request) = msg.value {
+                                let _ = process_request.process(request).await;
+                            }
                             continue;
                         }
 
@@ -310,7 +359,6 @@ fn main() {
                         ).await;
                     }
                     Err(_) => {
-                        debug!("Shard {shard_id} timed out waiting for connection");
                         glommio::timer::sleep(Duration::from_millis(10)).await;
                     }
                 }
@@ -430,7 +478,7 @@ async fn process_and_maybe_broadcast_request(
     request: Request,
     shard_id: usize,
     nbr_shards: usize,
-    process_request: Rc<ProcessRequest>,
+    process_request: Rc<ProcessRequest<LeasingChannel>>,
     sender: Rc<RefCell<Senders<Msg>>>,
     max_event_batches_response_size: Option<usize>,
 ) -> Response {
@@ -446,6 +494,8 @@ async fn process_and_maybe_broadcast_request(
                     value: Some(request.clone()),
                     message_version: 0,
                     require_shutdown: false,
+                    lease_request: None,
+                    lease_response: None,
                 };
                 if let Err(e) = sender.borrow().try_send_to(peer, broadcast_msg) {
                     error!("Failed to broadcast UpdateCacheLimits to shard {peer}: {e:?}");
@@ -463,7 +513,7 @@ async fn process_tcp_stream(
     nbr_shards: usize, 
     mut tcp_stream: glommio::net::TcpStream<glommio::net::Preallocated>, 
     sender: Rc<RefCell<Senders<Msg>>>,
-    process_request: Rc<ProcessRequest>,
+    process_request: Rc<ProcessRequest<LeasingChannel>>,
     max_request_size: Option<u32>, 
     max_event_batches_response_size: Option<usize>,
     shutdown_flag: Rc<Cell<bool>>,
@@ -492,6 +542,8 @@ async fn process_tcp_stream(
                     fd, 
                     message_version,
                     require_shutdown: false,
+                    lease_request: None,
+                    lease_response: None,
                 };
                 
                 match sender.borrow().try_send_to(idx, msg) {

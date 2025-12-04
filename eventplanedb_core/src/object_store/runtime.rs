@@ -55,7 +55,6 @@ impl ObjectStoreRuntime {
 
         let store = Arc::new(store);
         let retry_config = Arc::new(retry_config);
-        let shared_state = receivers.shared_state.clone();
         let inflight_semaphore = Arc::new(Semaphore::new(runtime_config.max_inflight_ops));
         let heartbeat_interval = Duration::from_millis(runtime_config.heartbeat_interval_ms);
 

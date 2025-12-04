@@ -6,9 +6,9 @@ use eventplanedb_structures::{
 };
 use tokio::time::Instant;
 
-const NUM_CONNECTIONS: usize = 8000;
-const TEST_DURATION_SECS: u64 = 30;
-const NUM_AGGREGATES: usize = 16;
+const NUM_CONNECTIONS: usize = 1;
+const TEST_DURATION_SECS: u64 = 20;
+const NUM_AGGREGATES: usize = 1;
 const SYNC_DELAY_US: u64 = 30;
 
 struct TaskStats {
