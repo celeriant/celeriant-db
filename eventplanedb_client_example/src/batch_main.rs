@@ -6,9 +6,9 @@ use eventplanedb_structures::{
 };
 use tokio::time::Instant;
 
-const NUM_CONNECTIONS: usize = 1;
-const TEST_DURATION_SECS: u64 = 20;
-const NUM_AGGREGATES: usize = 1;
+const NUM_CONNECTIONS: usize = 8000;
+const TEST_DURATION_SECS: u64 = 30;
+const NUM_AGGREGATES: usize = 16;
 const SYNC_DELAY_US: u64 = 30;
 
 struct TaskStats {
@@ -84,7 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run_connection_benchmark(connection_id: usize) -> Result<TaskStats, String> {
     // Connect to the server
-    let mut client = EventPlaneDBClient::connect("127.0.0.1:10000")
+    let mut client = EventPlaneDBClient::connect("127.0.0.1:9002")
         .await
         .map_err(|e| format!("Connection error: {}", e))?
         .with_timeout(Duration::from_secs(5));

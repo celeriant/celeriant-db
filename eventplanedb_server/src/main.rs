@@ -4,7 +4,7 @@ use eventplanedb_crypto::Crypto;
 use std::{cell::{Cell, RefCell}, fs, io::{Read, Write}, os::fd::{FromRawFd, IntoRawFd}, rc::Rc, time::Duration};
 
 use eventplanedb_core::{
-    cache::lease_error::LeaseError, node_config::NodeConfig, object_store::{
+    cache::lease_error::LeaseError, msg::Msg, node_config::NodeConfig, object_store::{
         ObjectStoreGateway, ObjectStoreRetryConfig, ObjectStoreRuntime, ObjectStoreRuntimeConfig, S3Config
     }, process_request::{LeasingChannelTrait, ProcessRequest}, read_operations::read_structures::AggregateReadConfig, replication::node_lease::NodeLease, write_operations::write_structures::AggregateWriteConfig
 };
@@ -23,26 +23,17 @@ use log::{debug, error, info};
 
 mod config;
 mod signal_handler;
-mod leasing_channel;
 
 use config::EventPlaneDBConfig;
 use signal_handler::SignalHandler;
 
 use mimalloc::MiMalloc;
 
-use crate::leasing_channel::{LeasingChannel, LeaseRequestMsg, LeaseResponseMsg, LEADER_SHARD_ID};
+use eventplanedb_core::leasing_channel::{LeasingChannel, LeaseRequestMsg, LeaseResponseMsg, LEADER_SHARD_ID};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-struct Msg {
-    fd: i32,
-    value: Option<Request>,
-    message_version: u32,
-    require_shutdown: bool,
-    lease_request: Option<LeaseRequestMsg>,
-    lease_response: Option<LeaseResponseMsg>,
-}
 
 /// Holds the object store sidecar runtime (lives on the main thread, outside Glommio).
 struct SidecarHandle {

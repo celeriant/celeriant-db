@@ -5,7 +5,7 @@ use eventplanedb_structures::{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = EventPlaneDBClient::connect("0.0.0.0:10000")
+    let mut client = EventPlaneDBClient::connect("0.0.0.0:9000")
         .await?;
         // .with_timeout(Duration::from_secs(25));
 
@@ -53,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     match client.send_request(&request, CompressionType::Zstd { level: 6 }).await {
         Ok(response) => {
-            println!("Success: {:?}", response);
+            // println!("Success: {:?}", response);
             match  response {
                 eventplanedb_structures::response::Response::ListOrganisations(_list_organisations_response) => todo!(),
                 eventplanedb_structures::response::Response::ListAggregates(_list_aggregates_response) => todo!(),

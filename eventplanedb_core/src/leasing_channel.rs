@@ -2,16 +2,16 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use eventplanedb_core::cache::lease_error::LeaseError;
-use eventplanedb_core::process_request::LeasingChannelTrait;
-use eventplanedb_core::replication::node_lease::NodeLease;
+use crate::cache::lease_error::LeaseError;
+use crate::msg::Msg;
+use crate::process_request::LeasingChannelTrait;
+use crate::replication::node_lease::NodeLease;
 use eventplanedb_structures::lease_info::LeaseInfo;
 use glommio::channels::channel_mesh::Senders;
 use glommio::channels::local_channel::{new_bounded, LocalSender};
 use glommio::sync::RwLock;
 use log::{debug, error};
 
-use crate::Msg;
 
 pub const LEADER_SHARD_ID: usize = 0;
 
