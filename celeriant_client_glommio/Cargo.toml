@@ -1,0 +1,13 @@
+[package]
+name = "celeriant_client_glommio"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+celeriant_msg = { path = "../celeriant_msg" }
+celeriant_wire = { path = "../celeriant_wire" }
+celeriant_wal = { path = "../celeriant_wal" }
+glommio.workspace = true
+futures-lite.workspace = true

@@ -1,0 +1,31 @@
+[package]
+name = "celeriant_wire"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+celeriant_wal = { path = "../celeriant_wal" }
+bincode.workspace = true
+serde.workspace = true
+snap.workspace = true
+rmp-serde.workspace = true
+zstd.workspace = true
+brotli.workspace = true
+flate2.workspace = true
+futures-lite.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[lib]
+bench = false
+
+[[bench]]
+name = "wire_format_benchmark"
+harness = false
+
+[[bench]]
+name = "wire_header_benchmark"
+harness = false

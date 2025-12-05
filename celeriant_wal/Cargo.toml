@@ -1,0 +1,11 @@
+[package]
+name = "celeriant_wal"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+base64.workspace = true
+bincode.workspace = true
+serde.workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "celeriant_client_tokio"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+celeriant_msg = { path = "../celeriant_msg" }
+celeriant_wire = { path = "../celeriant_wire" }
+celeriant_wal = { path = "../celeriant_wal" }
+tokio.workspace = true
+futures-util.workspace = true
+tokio-util.workspace = true
+futures-lite.workspace = true

@@ -1,0 +1,3783 @@
+{
+  "name": "celeriant_wire",
+  "benchmarks": {
+    "event_batch/bincode/brotli_4/large_100x1024": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/bincode/brotli_4/large_100x1024",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "bincode/brotli_4",
+        "value_str": "large_100x1024",
+        "throughput": {
+          "Bytes": 102400,
+          "Elements": null
+        },
+        "full_id": "event_batch/bincode/brotli_4/large_100x1024",
+        "directory_name": "event_batch/bincode_brotli_4/large_100x1024"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 235697.20294276404,
+            "upper_bound": 236757.27148620077
+          },
+          "point_estimate": 236173.8940811554,
+          "standard_error": 272.206206923427
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 235372.40357142856,
+            "upper_bound": 235860.117989418
+          },
+          "point_estimate": 235585.833938294,
+          "standard_error": 120.2212441098548
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 371.4631855036661,
+            "upper_bound": 922.1197512786816
+          },
+          "point_estimate": 631.6967598276117,
+          "standard_error": 128.63294779233632
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 235567.14395461095,
+            "upper_bound": 237449.39526577052
+          },
+          "point_estimate": 236417.70663782343,
+          "standard_error": 488.6033642152257
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 856.1477860906309,
+            "upper_bound": 2760.2431724888893
+          },
+          "point_estimate": 1956.7672508197656,
+          "standard_error": 489.7673164051775
+        }
+      }
+    },
+    "event_batch/bincode/brotli_4/medium_10x256": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/bincode/brotli_4/medium_10x256",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "bincode/brotli_4",
+        "value_str": "medium_10x256",
+        "throughput": {
+          "Bytes": 2560,
+          "Elements": null
+        },
+        "full_id": "event_batch/bincode/brotli_4/medium_10x256",
+        "directory_name": "event_batch/bincode_brotli_4/medium_10x256"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 15283.100901591986,
+            "upper_bound": 15320.477566153208
+          },
+          "point_estimate": 15299.535852142915,
+          "standard_error": 9.603256269202424
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 15270.858825479518,
+            "upper_bound": 15294.955520433508
+          },
+          "point_estimate": 15282.99555876885,
+          "standard_error": 6.151851717849849
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 21.11753779879651,
+            "upper_bound": 45.57652581997211
+          },
+          "point_estimate": 30.335485020783032,
+          "standard_error": 6.1772942709516725
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 15269.90847794003,
+            "upper_bound": 15286.212957135403
+          },
+          "point_estimate": 15277.56382220061,
+          "standard_error": 4.1549401760120865
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 32.30913096773928,
+            "upper_bound": 99.87052994192064
+          },
+          "point_estimate": 68.43243361646554,
+          "standard_error": 18.564384199698516
+        }
+      }
+    },
+    "event_batch/bincode/brotli_4/small_1x64": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/bincode/brotli_4/small_1x64",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "bincode/brotli_4",
+        "value_str": "small_1x64",
+        "throughput": {
+          "Bytes": 64,
+          "Elements": null
+        },
+        "full_id": "event_batch/bincode/brotli_4/small_1x64",
+        "directory_name": "event_batch/bincode_brotli_4/small_1x64"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 11496.828597583311,
+            "upper_bound": 11531.51374088151
+          },
+          "point_estimate": 11512.998038496176,
+          "standard_error": 8.839405969748269
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 11487.666402592888,
+            "upper_bound": 11511.789863192043
+          },
+          "point_estimate": 11497.404058429942,
+          "standard_error": 6.5607886799997335
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 24.823147968983417,
+            "upper_bound": 66.2598537684621
+          },
+          "point_estimate": 45.37771335807429,
+          "standard_error": 10.365313904600503
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 11486.22187203305,
+            "upper_bound": 11505.41977568496
+          },
+          "point_estimate": 11496.097053679609,
+          "standard_error": 4.90414134802422
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 39.44930472544875,
+            "upper_bound": 83.22823617343721
+          },
+          "point_estimate": 62.76568882236085,
+          "standard_error": 11.353440992557283
+        }
+      }
+    },
+    "event_batch/bincode/brotli_4/xlarge_500x2048": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/bincode/brotli_4/xlarge_500x2048",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "bincode/brotli_4",
+        "value_str": "xlarge_500x2048",
+        "throughput": {
+          "Bytes": 1024000,
+          "Elements": null
+        },
+        "full_id": "event_batch/bincode/brotli_4/xlarge_500x2048",
+        "directory_name": "event_batch/bincode_brotli_4/xlarge_500x2048"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 937657.367965151,
+            "upper_bound": 939191.5710988316
+          },
+          "point_estimate": 938346.8927886972,
+          "standard_error": 394.3121100207736
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 937152.137254902,
+            "upper_bound": 937924.5833333334
+          },
+          "point_estimate": 937413.954135954,
+          "standard_error": 203.532195955582
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 670.1317630154333,
+            "upper_bound": 1805.4299736594528
+          },
+          "point_estimate": 1200.1990961922263,
+          "standard_error": 294.5570324057044
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 937173.8249320023,
+            "upper_bound": 937869.4150401308
+          },
+          "point_estimate": 937500.82760629,
+          "standard_error": 177.43702125377806
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1411.8221561447044,
+            "upper_bound": 3986.718326085692
+          },
+          "point_estimate": 2819.40535891206,
+          "standard_error": 676.0481948925602
+        }
+      }
+    },
+    "event_batch/bincode/gzip_6/large_100x1024": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/bincode/gzip_6/large_100x1024",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "bincode/gzip_6",
+        "value_str": "large_100x1024",
+        "throughput": {
+          "Bytes": 102400,
+          "Elements": null
+        },
+        "full_id": "event_batch/bincode/gzip_6/large_100x1024",
+        "directory_name": "event_batch/bincode_gzip_6/large_100x1024"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 143367.2118922488,
+            "upper_bound": 143576.35187011695
+          },
+          "point_estimate": 143467.86997770914,
+          "standard_error": 53.63457100021335
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 143304.16883116882,
+            "upper_bound": 143525.52833530106
+          },
+          "point_estimate": 143436.32336523125,
+          "standard_error": 65.11817183279392
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 223.2524271214163,
+            "upper_bound": 446.0349999760414
+          },
+          "point_estimate": 330.66022867507616,
+          "standard_error": 55.975204175818874
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 143162.3524927885,
+            "upper_bound": 143370.6706083159
+          },
+          "point_estimate": 143256.39090379627,
+          "standard_error": 53.22698534213243
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 283.1460157203732,
+            "upper_bound": 468.7779936503274
+          },
+          "point_estimate": 382.8534783622489,
+          "standard_error": 47.4216060790324
+        }
+      }
+    },
+    "event_batch/bincode/gzip_6/medium_10x256": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/bincode/gzip_6/medium_10x256",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "bincode/gzip_6",
+        "value_str": "medium_10x256",
+        "throughput": {
+          "Bytes": 2560,
+          "Elements": null
+        },
+        "full_id": "event_batch/bincode/gzip_6/medium_10x256",
+        "directory_name": "event_batch/bincode_gzip_6/medium_10x256"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 12293.759118096195,
+            "upper_bound": 12319.487866266843
+          },
+          "point_estimate": 12305.4020474356,
+          "standard_error": 6.6159958464119315
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 12287.181949013157,
+            "upper_bound": 12298.951231398809
+          },
+          "point_estimate": 12293.629175158516,
+          "standard_error": 2.910100909579989
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 11.247527108910706,
+            "upper_bound": 28.01706142198513
+          },
+          "point_estimate": 20.195806872454092,
+          "standard_error": 4.086711263456919
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 12290.389498616032,
+            "upper_bound": 12300.421206464503
+          },
+          "point_estimate": 12295.386694452534,
+          "standard_error": 2.5578662504579968
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 17.958751446903744,
+            "upper_bound": 65.19463535334371
+          },
+          "point_estimate": 47.21736198603731,
+          "standard_error": 11.273281405470591
+        }
+      }
+    },
+    "event_batch/bincode/gzip_6/small_1x64": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/bincode/gzip_6/small_1x64",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "bincode/gzip_6",
+        "value_str": "small_1x64",
+        "throughput": {
+          "Bytes": 64,
+          "Elements": null
+        },
+        "full_id": "event_batch/bincode/gzip_6/small_1x64",
+        "directory_name": "event_batch/bincode_gzip_6/small_1x64"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 6269.810248504819,
+            "upper_bound": 6281.782054122638
+          },
+          "point_estimate": 6275.37819137623,
+          "standard_error": 3.072080843477552
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 6264.838518018018,
+            "upper_bound": 6271.845952380952
+          },
+          "point_estimate": 6268.164099907493,
+          "standard_error": 2.210275704126288
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 6.387119758605746,
+            "upper_bound": 15.042539030017108
+          },
+          "point_estimate": 10.866021212082456,
+          "standard_error": 2.3297566156624487
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 6265.91455546228,
+            "upper_bound": 6272.554235330635
+          },
+          "point_estimate": 6268.947303715783,
+          "standard_error": 1.6878427353875949
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 12.602537540665864,
+            "upper_bound": 28.701155267721884
+          },
+          "point_estimate": 21.857774505611665,
+          "standard_error": 4.065771418987941
+        }
+      }
+    },
+    "event_batch/bincode/gzip_6/xlarge_500x2048": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/bincode/gzip_6/xlarge_500x2048",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "bincode/gzip_6",
+        "value_str": "xlarge_500x2048",
+        "throughput": {
+          "Bytes": 1024000,
+          "Elements": null
+        },
+        "full_id": "event_batch/bincode/gzip_6/xlarge_500x2048",
+        "directory_name": "event_batch/bincode_gzip_6/xlarge_500x2048"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1311007.2371362203,
+            "upper_bound": 1312662.4486844153
+          },
+          "point_estimate": 1311801.9783065442,
+          "standard_error": 421.0513916272323
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1310465.7542735045,
+            "upper_bound": 1312742.4166666667
+          },
+          "point_estimate": 1311314.46875,
+          "standard_error": 733.8174420627527
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1991.4071733580015,
+            "upper_bound": 3575.026903442488
+          },
+          "point_estimate": 2932.6915044473885,
+          "standard_error": 388.7837583590018
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1310501.201280758,
+            "upper_bound": 1312506.9753955563
+          },
+          "point_estimate": 1311444.970320326,
+          "standard_error": 512.6267378125785
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2173.566823722479,
+            "upper_bound": 3833.303232049352
+          },
+          "point_estimate": 2995.186288666154,
+          "standard_error": 437.69720901436983
+        }
+      }
+    },
+    "event_batch/bincode/none/large_100x1024": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/bincode/none/large_100x1024",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "bincode/none",
+        "value_str": "large_100x1024",
+        "throughput": {
+          "Bytes": 102400,
+          "Elements": null
+        },
+        "full_id": "event_batch/bincode/none/large_100x1024",
+        "directory_name": "event_batch/bincode_none/large_100x1024"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 12559.869856682142,
+            "upper_bound": 12588.812465165478
+          },
+          "point_estimate": 12574.137217308362,
+          "standard_error": 7.375757573100573
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 12546.176,
+            "upper_bound": 12586.661892857144
+          },
+          "point_estimate": 12575.098307692308,
+          "standard_error": 12.977645597322011
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 38.948434511323235,
+            "upper_bound": 72.35722313933809
+          },
+          "point_estimate": 54.30068999596964,
+          "standard_error": 8.153296457765201
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 12571.641083445096,
+            "upper_bound": 12611.028963932207
+          },
+          "point_estimate": 12591.11143678509,
+          "standard_error": 10.048395875470716
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 42.45070295732987,
+            "upper_bound": 61.092265131013576
+          },
+          "point_estimate": 52.472436898033415,
+          "standard_error": 4.755054232744077
+        }
+      }
+    },
+    "event_batch/bincode/none/medium_10x256": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/bincode/none/medium_10x256",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "bincode/none",
+        "value_str": "medium_10x256",
+        "throughput": {
+          "Bytes": 2560,
+          "Elements": null
+        },
+        "full_id": "event_batch/bincode/none/medium_10x256",
+        "directory_name": "event_batch/bincode_none/medium_10x256"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 937.4076333225216,
+            "upper_bound": 938.71784460014
+          },
+          "point_estimate": 938.0580044401228,
+          "standard_error": 0.33622987223188594
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 936.8537163707292,
+            "upper_bound": 938.9436229517428
+          },
+          "point_estimate": 937.5786465339432,
+          "standard_error": 0.5418418974597862
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1.8328111400158549,
+            "upper_bound": 3.550806336228594
+          },
+          "point_estimate": 2.688589894252058,
+          "standard_error": 0.4332473987136621
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 936.303784684742,
+            "upper_bound": 937.4053903075962
+          },
+          "point_estimate": 936.8486658412317,
+          "standard_error": 0.2814678891246454
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2.0007334095394222,
+            "upper_bound": 2.6950379387429324
+          },
+          "point_estimate": 2.3890124955777834,
+          "standard_error": 0.17711881739340515
+        }
+      }
+    },
+    "event_batch/bincode/none/small_1x64": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/bincode/none/small_1x64",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "bincode/none",
+        "value_str": "small_1x64",
+        "throughput": {
+          "Bytes": 64,
+          "Elements": null
+        },
+        "full_id": "event_batch/bincode/none/small_1x64",
+        "directory_name": "event_batch/bincode_none/small_1x64"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 115.96054450403076,
+            "upper_bound": 116.22831965366538
+          },
+          "point_estimate": 116.09347726942757,
+          "standard_error": 0.06767240117892205
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 115.98919652160572,
+            "upper_bound": 116.2063180977951
+          },
+          "point_estimate": 116.0772797578838,
+          "standard_error": 0.05752950623991309
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 0.28795065393945635,
+            "upper_bound": 0.6676519397345848
+          },
+          "point_estimate": 0.5595864969519441,
+          "standard_error": 0.09623356923399294
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 116.17913991264722,
+            "upper_bound": 116.36978196181352
+          },
+          "point_estimate": 116.27496566449364,
+          "standard_error": 0.048403073985332376
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 0.38554745812393953,
+            "upper_bound": 0.5583309822677416
+          },
+          "point_estimate": 0.4778762622733728,
+          "standard_error": 0.04373695153246815
+        }
+      }
+    },
+    "event_batch/bincode/none/xlarge_500x2048": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/bincode/none/xlarge_500x2048",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "bincode/none",
+        "value_str": "xlarge_500x2048",
+        "throughput": {
+          "Bytes": 1024000,
+          "Elements": null
+        },
+        "full_id": "event_batch/bincode/none/xlarge_500x2048",
+        "directory_name": "event_batch/bincode_none/xlarge_500x2048"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 84043.90403211514,
+            "upper_bound": 84136.65855110879
+          },
+          "point_estimate": 84088.0283509793,
+          "standard_error": 23.8031639700463
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 84001.39710526317,
+            "upper_bound": 84074.8947368421
+          },
+          "point_estimate": 84038.98787280702,
+          "standard_error": 21.270679421636768
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 72.67359502556947,
+            "upper_bound": 164.7133623863604
+          },
+          "point_estimate": 107.45193936866346,
+          "standard_error": 25.3757050296746
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 84005.36725463008,
+            "upper_bound": 84089.18189624397
+          },
+          "point_estimate": 84043.07583484045,
+          "standard_error": 21.46904005175388
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 117.24173032311052,
+            "upper_bound": 216.369335755718
+          },
+          "point_estimate": 171.154993671889,
+          "standard_error": 25.44825849461389
+        }
+      }
+    },
+    "event_batch/bincode/snappy/large_100x1024": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/bincode/snappy/large_100x1024",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "bincode/snappy",
+        "value_str": "large_100x1024",
+        "throughput": {
+          "Bytes": 102400,
+          "Elements": null
+        },
+        "full_id": "event_batch/bincode/snappy/large_100x1024",
+        "directory_name": "event_batch/bincode_snappy/large_100x1024"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 21240.783561349348,
+            "upper_bound": 21256.416157298416
+          },
+          "point_estimate": 21248.524299688735,
+          "standard_error": 3.959517170538657
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 21239.004700352525,
+            "upper_bound": 21259.641202426916
+          },
+          "point_estimate": 21250.890444015444,
+          "standard_error": 4.3167751337962
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 15.828719719286914,
+            "upper_bound": 34.63797531410834
+          },
+          "point_estimate": 26.412628247298272,
+          "standard_error": 4.630520822115477
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 21237.84389747817,
+            "upper_bound": 21257.77541339396
+          },
+          "point_estimate": 21247.701628232775,
+          "standard_error": 5.093817127462541
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 22.05495837238327,
+            "upper_bound": 33.74213707102201
+          },
+          "point_estimate": 28.315580778949375,
+          "standard_error": 2.993996934876311
+        }
+      }
+    },
+    "event_batch/bincode/snappy/medium_10x256": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/bincode/snappy/medium_10x256",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "bincode/snappy",
+        "value_str": "medium_10x256",
+        "throughput": {
+          "Bytes": 2560,
+          "Elements": null
+        },
+        "full_id": "event_batch/bincode/snappy/medium_10x256",
+        "directory_name": "event_batch/bincode_snappy/medium_10x256"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1518.853837364505,
+            "upper_bound": 1532.2528976680387
+          },
+          "point_estimate": 1524.1767504077195,
+          "standard_error": 3.562257384170513
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1517.1165113367645,
+            "upper_bound": 1520.7113107729242
+          },
+          "point_estimate": 1518.0408687655522,
+          "standard_error": 0.9162894460964518
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 3.240680453602099,
+            "upper_bound": 6.809953438549419
+          },
+          "point_estimate": 5.068031455633356,
+          "standard_error": 0.8893830519510768
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1517.1715935797208,
+            "upper_bound": 1520.284026421826
+          },
+          "point_estimate": 1518.733341650793,
+          "standard_error": 0.7960617462340261
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 4.696248236069406,
+            "upper_bound": 41.07070569230735
+          },
+          "point_estimate": 25.39901712502033,
+          "standard_error": 10.902011679109036
+        }
+      }
+    },
+    "event_batch/bincode/snappy/small_1x64": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/bincode/snappy/small_1x64",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "bincode/snappy",
+        "value_str": "small_1x64",
+        "throughput": {
+          "Bytes": 64,
+          "Elements": null
+        },
+        "full_id": "event_batch/bincode/snappy/small_1x64",
+        "directory_name": "event_batch/bincode_snappy/small_1x64"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 306.2519484117288,
+            "upper_bound": 306.99138127473907
+          },
+          "point_estimate": 306.61699339562233,
+          "standard_error": 0.18757477169054643
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 305.8710352964198,
+            "upper_bound": 306.952422279976
+          },
+          "point_estimate": 306.3261364602294,
+          "standard_error": 0.27758606982804523
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 0.7719823263797936,
+            "upper_bound": 1.7645314203003717
+          },
+          "point_estimate": 1.3496334996564887,
+          "standard_error": 0.2673399058269705
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 305.7128332821776,
+            "upper_bound": 306.464231157467
+          },
+          "point_estimate": 306.1185386040851,
+          "standard_error": 0.19310494202894465
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1.0601264236661077,
+            "upper_bound": 1.6138910510565865
+          },
+          "point_estimate": 1.3509872168762145,
+          "standard_error": 0.14167256659670832
+        }
+      }
+    },
+    "event_batch/bincode/snappy/xlarge_500x2048": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/bincode/snappy/xlarge_500x2048",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "bincode/snappy",
+        "value_str": "xlarge_500x2048",
+        "throughput": {
+          "Bytes": 1024000,
+          "Elements": null
+        },
+        "full_id": "event_batch/bincode/snappy/xlarge_500x2048",
+        "directory_name": "event_batch/bincode_snappy/xlarge_500x2048"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 190767.50606616645,
+            "upper_bound": 191364.20654609537
+          },
+          "point_estimate": 191016.39057106976,
+          "standard_error": 154.33991125164314
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 190604.1937984496,
+            "upper_bound": 190863.0511111111
+          },
+          "point_estimate": 190755.82945261436,
+          "standard_error": 80.3410513096067
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 214.43303299861145,
+            "upper_bound": 450.6345427626933
+          },
+          "point_estimate": 290.769416385072,
+          "standard_error": 63.60025609348887
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 190628.8611245682,
+            "upper_bound": 190908.95614818053
+          },
+          "point_estimate": 190762.45678638451,
+          "standard_error": 71.72006742782816
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 401.9964458613036,
+            "upper_bound": 1707.363322582821
+          },
+          "point_estimate": 1097.52109535644,
+          "standard_error": 392.73302833988544
+        }
+      }
+    },
+    "event_batch/bincode/zstd_3/large_100x1024": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/bincode/zstd_3/large_100x1024",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "bincode/zstd_3",
+        "value_str": "large_100x1024",
+        "throughput": {
+          "Bytes": 102400,
+          "Elements": null
+        },
+        "full_id": "event_batch/bincode/zstd_3/large_100x1024",
+        "directory_name": "event_batch/bincode_zstd_3/large_100x1024"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 26394.972377808528,
+            "upper_bound": 26432.806285524795
+          },
+          "point_estimate": 26413.3876080943,
+          "standard_error": 9.677943868591578
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 26387.208963585435,
+            "upper_bound": 26437.444444444445
+          },
+          "point_estimate": 26406.286805555555,
+          "standard_error": 15.1877636390482
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 44.13989988943321,
+            "upper_bound": 85.5965472624078
+          },
+          "point_estimate": 65.45412445534745,
+          "standard_error": 10.999026560273675
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 26387.791159277636,
+            "upper_bound": 26424.75177488187
+          },
+          "point_estimate": 26407.12511978257,
+          "standard_error": 9.473593639296684
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 52.736378948070886,
+            "upper_bound": 82.64303157861654
+          },
+          "point_estimate": 69.0192747200839,
+          "standard_error": 7.659923773345304
+        }
+      }
+    },
+    "event_batch/bincode/zstd_3/medium_10x256": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/bincode/zstd_3/medium_10x256",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "bincode/zstd_3",
+        "value_str": "medium_10x256",
+        "throughput": {
+          "Bytes": 2560,
+          "Elements": null
+        },
+        "full_id": "event_batch/bincode/zstd_3/medium_10x256",
+        "directory_name": "event_batch/bincode_zstd_3/medium_10x256"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 5639.016760421649,
+            "upper_bound": 5643.058399571609
+          },
+          "point_estimate": 5640.836256601582,
+          "standard_error": 1.0351696538923365
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 5638.2717609306055,
+            "upper_bound": 5641.032933463699
+          },
+          "point_estimate": 5639.798225472499,
+          "standard_error": 0.5899278170192221
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2.360066134797066,
+            "upper_bound": 5.1278311163434225
+          },
+          "point_estimate": 3.513993216707967,
+          "standard_error": 0.7417493564338863
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 5637.543229725871,
+            "upper_bound": 5641.950208291871
+          },
+          "point_estimate": 5639.623191907638,
+          "standard_error": 1.1261190623212427
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 3.963370291311156,
+            "upper_bound": 10.649499311528626
+          },
+          "point_estimate": 7.36412985441934,
+          "standard_error": 1.868800593180266
+        }
+      }
+    },
+    "event_batch/bincode/zstd_3/small_1x64": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/bincode/zstd_3/small_1x64",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "bincode/zstd_3",
+        "value_str": "small_1x64",
+        "throughput": {
+          "Bytes": 64,
+          "Elements": null
+        },
+        "full_id": "event_batch/bincode/zstd_3/small_1x64",
+        "directory_name": "event_batch/bincode_zstd_3/small_1x64"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1257.154651451228,
+            "upper_bound": 1261.0159585974422
+          },
+          "point_estimate": 1258.847244302611,
+          "standard_error": 0.9927658442708258
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1256.3130253227598,
+            "upper_bound": 1257.6514406602903
+          },
+          "point_estimate": 1256.607532765098,
+          "standard_error": 0.3263454434688949
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 0.862710341630012,
+            "upper_bound": 2.654132705181536
+          },
+          "point_estimate": 1.7170363258706869,
+          "standard_error": 0.4216857613009467
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1255.3325722484583,
+            "upper_bound": 1256.7649190725435
+          },
+          "point_estimate": 1256.0544657818202,
+          "standard_error": 0.3675123780786813
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2.6392873714451945,
+            "upper_bound": 10.381231266497158
+          },
+          "point_estimate": 7.080022827800982,
+          "standard_error": 2.0098879533731147
+        }
+      }
+    },
+    "event_batch/bincode/zstd_3/xlarge_500x2048": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/bincode/zstd_3/xlarge_500x2048",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "bincode/zstd_3",
+        "value_str": "xlarge_500x2048",
+        "throughput": {
+          "Bytes": 1024000,
+          "Elements": null
+        },
+        "full_id": "event_batch/bincode/zstd_3/xlarge_500x2048",
+        "directory_name": "event_batch/bincode_zstd_3/xlarge_500x2048"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 222051.20794184945,
+            "upper_bound": 222755.99848707893
+          },
+          "point_estimate": 222383.7621599907,
+          "standard_error": 180.00195584358542
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 221721.055,
+            "upper_bound": 222823.3689732143
+          },
+          "point_estimate": 222207.74136800697,
+          "standard_error": 325.6911261443081
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 835.8831260692009,
+            "upper_bound": 1556.6147860577616
+          },
+          "point_estimate": 1283.076835857207,
+          "standard_error": 184.0852409239407
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 221875.6926908682,
+            "upper_bound": 222805.72376759132
+          },
+          "point_estimate": 222337.73701223065,
+          "standard_error": 237.77548307637628
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 903.7322230659012,
+            "upper_bound": 1715.0906061783437
+          },
+          "point_estimate": 1287.961696672474,
+          "standard_error": 225.2629411514575
+        }
+      }
+    },
+    "event_batch/msgpack/brotli_4/large_100x1024": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/msgpack/brotli_4/large_100x1024",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "msgpack/brotli_4",
+        "value_str": "large_100x1024",
+        "throughput": {
+          "Bytes": 102400,
+          "Elements": null
+        },
+        "full_id": "event_batch/msgpack/brotli_4/large_100x1024",
+        "directory_name": "event_batch/msgpack_brotli_4/large_100x1024"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 340440.4176413233,
+            "upper_bound": 342437.0965334245
+          },
+          "point_estimate": 341373.4967363406,
+          "standard_error": 510.2851082954275
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 339639.89714285714,
+            "upper_bound": 341513.8761904762
+          },
+          "point_estimate": 340914.97376344085,
+          "standard_error": 496.1902068884899
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1792.1694221409678,
+            "upper_bound": 3477.8326341892966
+          },
+          "point_estimate": 2690.1640365257413,
+          "standard_error": 433.4677438115016
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 341187.5119025996,
+            "upper_bound": 343370.4008850561
+          },
+          "point_estimate": 342161.1428025626,
+          "standard_error": 560.8079135449636
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2239.7693319794844,
+            "upper_bound": 4858.491675964812
+          },
+          "point_estimate": 3638.0890000362633,
+          "standard_error": 680.7357825471094
+        }
+      }
+    },
+    "event_batch/msgpack/brotli_4/medium_10x256": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/msgpack/brotli_4/medium_10x256",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "msgpack/brotli_4",
+        "value_str": "medium_10x256",
+        "throughput": {
+          "Bytes": 2560,
+          "Elements": null
+        },
+        "full_id": "event_batch/msgpack/brotli_4/medium_10x256",
+        "directory_name": "event_batch/msgpack_brotli_4/medium_10x256"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 21386.60921426767,
+            "upper_bound": 21458.85724063834
+          },
+          "point_estimate": 21417.063300330952,
+          "standard_error": 18.78674840789063
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 21365.21079116578,
+            "upper_bound": 21404.630136986303
+          },
+          "point_estimate": 21383.0156441997,
+          "standard_error": 11.59399962696731
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 25.666065389083784,
+            "upper_bound": 64.61542327419667
+          },
+          "point_estimate": 40.28159554408069,
+          "standard_error": 10.193605952028774
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 21370.15574660594,
+            "upper_bound": 21393.52457349291
+          },
+          "point_estimate": 21381.30457934754,
+          "standard_error": 5.957914340535021
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 41.780854370911335,
+            "upper_bound": 207.17483211507067
+          },
+          "point_estimate": 133.61478278949053,
+          "standard_error": 45.591447226812754
+        }
+      }
+    },
+    "event_batch/msgpack/brotli_4/small_1x64": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/msgpack/brotli_4/small_1x64",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "msgpack/brotli_4",
+        "value_str": "small_1x64",
+        "throughput": {
+          "Bytes": 64,
+          "Elements": null
+        },
+        "full_id": "event_batch/msgpack/brotli_4/small_1x64",
+        "directory_name": "event_batch/msgpack_brotli_4/small_1x64"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 13569.837316253332,
+            "upper_bound": 13589.719821498602
+          },
+          "point_estimate": 13579.093546230544,
+          "standard_error": 5.085209517614755
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 13558.802086956524,
+            "upper_bound": 13587.237101449276
+          },
+          "point_estimate": 13578.690579710144,
+          "standard_error": 7.030821136848928
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 20.3910524156008,
+            "upper_bound": 37.8323239030102
+          },
+          "point_estimate": 32.42521904884333,
+          "standard_error": 4.640073532403542
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 13558.05281221825,
+            "upper_bound": 13585.469457027391
+          },
+          "point_estimate": 13570.48186675445,
+          "standard_error": 7.056937124372907
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 23.386443115200052,
+            "upper_bound": 49.45076022350271
+          },
+          "point_estimate": 36.26671942676625,
+          "standard_error": 7.123965223153228
+        }
+      }
+    },
+    "event_batch/msgpack/brotli_4/xlarge_500x2048": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/msgpack/brotli_4/xlarge_500x2048",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "msgpack/brotli_4",
+        "value_str": "xlarge_500x2048",
+        "throughput": {
+          "Bytes": 1024000,
+          "Elements": null
+        },
+        "full_id": "event_batch/msgpack/brotli_4/xlarge_500x2048",
+        "directory_name": "event_batch/msgpack_brotli_4/xlarge_500x2048"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1904013.1107347168,
+            "upper_bound": 1909626.9567534924
+          },
+          "point_estimate": 1906801.3238032064,
+          "standard_error": 1440.111559005127
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1900852.5128205128,
+            "upper_bound": 1912849.0
+          },
+          "point_estimate": 1902591.9696969695,
+          "standard_error": 4154.0667468754145
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 7021.67282508873,
+            "upper_bound": 15386.416279503692
+          },
+          "point_estimate": 13121.62555593347,
+          "standard_error": 1976.1822672594728
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1899618.5708587137,
+            "upper_bound": 1902725.2384111688
+          },
+          "point_estimate": 1901009.4181013396,
+          "standard_error": 792.0885929095485
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 8779.53416729015,
+            "upper_bound": 11485.476098332005
+          },
+          "point_estimate": 10260.892815429968,
+          "standard_error": 688.6726973685201
+        }
+      }
+    },
+    "event_batch/msgpack/gzip_6/large_100x1024": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/msgpack/gzip_6/large_100x1024",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "msgpack/gzip_6",
+        "value_str": "large_100x1024",
+        "throughput": {
+          "Bytes": 102400,
+          "Elements": null
+        },
+        "full_id": "event_batch/msgpack/gzip_6/large_100x1024",
+        "directory_name": "event_batch/msgpack_gzip_6/large_100x1024"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 282825.2807893007,
+            "upper_bound": 283684.84787770425
+          },
+          "point_estimate": 283233.3312730638,
+          "standard_error": 219.38918730177767
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 282532.84055059525,
+            "upper_bound": 283445.13333333336
+          },
+          "point_estimate": 282796.80149572645,
+          "standard_error": 268.88764345947794
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 901.2155304822644,
+            "upper_bound": 1627.6931654992577
+          },
+          "point_estimate": 1294.9929811497675,
+          "standard_error": 182.79657273438852
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 282263.09768788057,
+            "upper_bound": 283211.0737099368
+          },
+          "point_estimate": 282644.58298194525,
+          "standard_error": 247.26530320501783
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1081.392972822663,
+            "upper_bound": 1949.5696570598816
+          },
+          "point_estimate": 1568.2577728106205,
+          "standard_error": 222.24510154945168
+        }
+      }
+    },
+    "event_batch/msgpack/gzip_6/medium_10x256": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/msgpack/gzip_6/medium_10x256",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "msgpack/gzip_6",
+        "value_str": "medium_10x256",
+        "throughput": {
+          "Bytes": 2560,
+          "Elements": null
+        },
+        "full_id": "event_batch/msgpack/gzip_6/medium_10x256",
+        "directory_name": "event_batch/msgpack_gzip_6/medium_10x256"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 17899.4866269127,
+            "upper_bound": 17954.49787455031
+          },
+          "point_estimate": 17923.34956592496,
+          "standard_error": 14.196309227252634
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 17888.939400088548,
+            "upper_bound": 17906.71764520202
+          },
+          "point_estimate": 17895.328832351857,
+          "standard_error": 4.147082838030859
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 15.998231383565068,
+            "upper_bound": 33.44782058783136
+          },
+          "point_estimate": 23.507200553307815,
+          "standard_error": 4.247465734215608
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 17884.62851986889,
+            "upper_bound": 17895.97369381526
+          },
+          "point_estimate": 17890.038272356647,
+          "standard_error": 2.8990894740112747
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 29.8430479261163,
+            "upper_bound": 152.28838300360007
+          },
+          "point_estimate": 101.507891992576,
+          "standard_error": 31.2609549478881
+        }
+      }
+    },
+    "event_batch/msgpack/gzip_6/small_1x64": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/msgpack/gzip_6/small_1x64",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "msgpack/gzip_6",
+        "value_str": "small_1x64",
+        "throughput": {
+          "Bytes": 64,
+          "Elements": null
+        },
+        "full_id": "event_batch/msgpack/gzip_6/small_1x64",
+        "directory_name": "event_batch/msgpack_gzip_6/small_1x64"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 7245.814903826023,
+            "upper_bound": 7252.659836985036
+          },
+          "point_estimate": 7249.093247790018,
+          "standard_error": 1.7428313376119997
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 7246.110384739042,
+            "upper_bound": 7250.302172481896
+          },
+          "point_estimate": 7248.028535980149,
+          "standard_error": 1.0040477746427
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 5.600889854480357,
+            "upper_bound": 11.642199166069032
+          },
+          "point_estimate": 7.907756557140558,
+          "standard_error": 1.5382459715409167
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 7248.055485580477,
+            "upper_bound": 7253.140575812155
+          },
+          "point_estimate": 7250.531226740457,
+          "standard_error": 1.3027762952672193
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 8.272510996137754,
+            "upper_bound": 16.35632029101929
+          },
+          "point_estimate": 12.408744894051557,
+          "standard_error": 2.123529643642996
+        }
+      }
+    },
+    "event_batch/msgpack/gzip_6/xlarge_500x2048": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/msgpack/gzip_6/xlarge_500x2048",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "msgpack/gzip_6",
+        "value_str": "xlarge_500x2048",
+        "throughput": {
+          "Bytes": 1024000,
+          "Elements": null
+        },
+        "full_id": "event_batch/msgpack/gzip_6/xlarge_500x2048",
+        "directory_name": "event_batch/msgpack_gzip_6/xlarge_500x2048"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2478255.271042381,
+            "upper_bound": 2482686.9828900606
+          },
+          "point_estimate": 2480323.399394811,
+          "standard_error": 1133.8923665694117
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2477383.6,
+            "upper_bound": 2480655.784897025
+          },
+          "point_estimate": 2478652.952702703,
+          "standard_error": 795.7537156872143
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2757.20580197125,
+            "upper_bound": 6173.745198220246
+          },
+          "point_estimate": 4661.572605268095,
+          "standard_error": 893.0537760815658
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2477965.93908551,
+            "upper_bound": 2480997.047433632
+          },
+          "point_estimate": 2479625.0472684917,
+          "standard_error": 771.0848208711017
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 4631.481889345435,
+            "upper_bound": 11253.263166495197
+          },
+          "point_estimate": 8064.6589131459405,
+          "standard_error": 1751.9011985043744
+        }
+      }
+    },
+    "event_batch/msgpack/none/large_100x1024": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/msgpack/none/large_100x1024",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "msgpack/none",
+        "value_str": "large_100x1024",
+        "throughput": {
+          "Bytes": 102400,
+          "Elements": null
+        },
+        "full_id": "event_batch/msgpack/none/large_100x1024",
+        "directory_name": "event_batch/msgpack_none/large_100x1024"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 86982.04859323056,
+            "upper_bound": 87555.31705949896
+          },
+          "point_estimate": 87221.59196713209,
+          "standard_error": 149.50803688015716
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 86815.5202020202,
+            "upper_bound": 87048.70546804427
+          },
+          "point_estimate": 86946.11626868095,
+          "standard_error": 56.60959383244855
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 184.82905291984488,
+            "upper_bound": 461.94945310918297
+          },
+          "point_estimate": 317.3938632004058,
+          "standard_error": 69.50689109090034
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 86834.6876978926,
+            "upper_bound": 86989.72670595009
+          },
+          "point_estimate": 86902.33482430596,
+          "standard_error": 39.313101830766094
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 421.08408312974615,
+            "upper_bound": 1665.6741277477431
+          },
+          "point_estimate": 1062.2209063923444,
+          "standard_error": 393.3507399967622
+        }
+      }
+    },
+    "event_batch/msgpack/none/medium_10x256": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/msgpack/none/medium_10x256",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "msgpack/none",
+        "value_str": "medium_10x256",
+        "throughput": {
+          "Bytes": 2560,
+          "Elements": null
+        },
+        "full_id": "event_batch/msgpack/none/medium_10x256",
+        "directory_name": "event_batch/msgpack_none/medium_10x256"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 4012.224575552459,
+            "upper_bound": 4032.310717863328
+          },
+          "point_estimate": 4022.015956876166,
+          "standard_error": 5.128347753025575
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 4001.8787624834135,
+            "upper_bound": 4033.360895779501
+          },
+          "point_estimate": 4007.26426547562,
+          "standard_error": 6.895643431353108
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 19.7975840436028,
+            "upper_bound": 46.6086779839002
+          },
+          "point_estimate": 31.16834387879012,
+          "standard_error": 6.097996355995705
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 3997.12137133629,
+            "upper_bound": 4011.3835280923
+          },
+          "point_estimate": 4003.5238046048103,
+          "standard_error": 3.6693814665250817
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 28.35395983018685,
+            "upper_bound": 43.1305509530101
+          },
+          "point_estimate": 36.469716537221586,
+          "standard_error": 3.777084517276585
+        }
+      }
+    },
+    "event_batch/msgpack/none/small_1x64": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/msgpack/none/small_1x64",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "msgpack/none",
+        "value_str": "small_1x64",
+        "throughput": {
+          "Bytes": 64,
+          "Elements": null
+        },
+        "full_id": "event_batch/msgpack/none/small_1x64",
+        "directory_name": "event_batch/msgpack_none/small_1x64"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 564.9711252138782,
+            "upper_bound": 566.2424105314936
+          },
+          "point_estimate": 565.6035810741913,
+          "standard_error": 0.3249075394643593
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 564.8658784253721,
+            "upper_bound": 566.5076771329935
+          },
+          "point_estimate": 565.4247660979637,
+          "standard_error": 0.3402662967106481
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1.2860876157010377,
+            "upper_bound": 3.3243057871825448
+          },
+          "point_estimate": 2.637937389970936,
+          "standard_error": 0.5387799971886815
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 565.3345700624407,
+            "upper_bound": 566.5170153391151
+          },
+          "point_estimate": 565.8985832937511,
+          "standard_error": 0.3022470176808961
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1.8563194854322231,
+            "upper_bound": 2.729057250314208
+          },
+          "point_estimate": 2.3185759705517235,
+          "standard_error": 0.22190691295998705
+        }
+      }
+    },
+    "event_batch/msgpack/none/xlarge_500x2048": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/msgpack/none/xlarge_500x2048",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "msgpack/none",
+        "value_str": "xlarge_500x2048",
+        "throughput": {
+          "Bytes": 1024000,
+          "Elements": null
+        },
+        "full_id": "event_batch/msgpack/none/xlarge_500x2048",
+        "directory_name": "event_batch/msgpack_none/xlarge_500x2048"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 710569.3782341662,
+            "upper_bound": 713581.6435228918
+          },
+          "point_estimate": 711855.4147727963,
+          "standard_error": 782.0443387843803
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 710008.286111111,
+            "upper_bound": 710793.5909090909
+          },
+          "point_estimate": 710248.8467014714,
+          "standard_error": 177.8140533051514
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 611.6315363144014,
+            "upper_bound": 1601.6679543067632
+          },
+          "point_estimate": 1085.9842420532743,
+          "standard_error": 241.69420275249695
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 710017.676023364,
+            "upper_bound": 711362.4279820812
+          },
+          "point_estimate": 710564.0145059212,
+          "standard_error": 344.2036000944749
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1948.026714679443,
+            "upper_bound": 8632.421666419363
+          },
+          "point_estimate": 5616.6358238399725,
+          "standard_error": 1909.604885192351
+        }
+      }
+    },
+    "event_batch/msgpack/snappy/large_100x1024": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/msgpack/snappy/large_100x1024",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "msgpack/snappy",
+        "value_str": "large_100x1024",
+        "throughput": {
+          "Bytes": 102400,
+          "Elements": null
+        },
+        "full_id": "event_batch/msgpack/snappy/large_100x1024",
+        "directory_name": "event_batch/msgpack_snappy/large_100x1024"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 102694.48567310003,
+            "upper_bound": 103028.11682003833
+          },
+          "point_estimate": 102860.48175829645,
+          "standard_error": 84.97906765869782
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 102744.74842087766,
+            "upper_bound": 103018.19556451614
+          },
+          "point_estimate": 102850.05974264703,
+          "standard_error": 74.76653090553005
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 260.20066330981086,
+            "upper_bound": 663.4734531168243
+          },
+          "point_estimate": 378.3857111508623,
+          "standard_error": 104.16577742740614
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 102925.37002807086,
+            "upper_bound": 103214.62581177942
+          },
+          "point_estimate": 103066.44296447292,
+          "standard_error": 73.5914074981148
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 443.18110083022384,
+            "upper_bound": 746.3630752621813
+          },
+          "point_estimate": 602.548769353404,
+          "standard_error": 77.44513395774054
+        }
+      }
+    },
+    "event_batch/msgpack/snappy/medium_10x256": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/msgpack/snappy/medium_10x256",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "msgpack/snappy",
+        "value_str": "medium_10x256",
+        "throughput": {
+          "Bytes": 2560,
+          "Elements": null
+        },
+        "full_id": "event_batch/msgpack/snappy/medium_10x256",
+        "directory_name": "event_batch/msgpack_snappy/medium_10x256"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 4952.728114902698,
+            "upper_bound": 4965.155626326048
+          },
+          "point_estimate": 4958.40288782787,
+          "standard_error": 3.1840067944443833
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 4948.3140078113265,
+            "upper_bound": 4957.707700028678
+          },
+          "point_estimate": 4954.671016670292,
+          "standard_error": 2.0689599522190414
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 9.583758038382475,
+            "upper_bound": 18.78260426648377
+          },
+          "point_estimate": 13.67035471699425,
+          "standard_error": 2.2776499828402437
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 4946.363929707908,
+            "upper_bound": 4951.938008747838
+          },
+          "point_estimate": 4949.062302269566,
+          "standard_error": 1.417035050249105
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 12.51057440606396,
+            "upper_bound": 30.569869409727236
+          },
+          "point_estimate": 22.729854978911057,
+          "standard_error": 4.580492043523927
+        }
+      }
+    },
+    "event_batch/msgpack/snappy/small_1x64": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/msgpack/snappy/small_1x64",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "msgpack/snappy",
+        "value_str": "small_1x64",
+        "throughput": {
+          "Bytes": 64,
+          "Elements": null
+        },
+        "full_id": "event_batch/msgpack/snappy/small_1x64",
+        "directory_name": "event_batch/msgpack_snappy/small_1x64"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 810.2726241438772,
+            "upper_bound": 814.3098551097598
+          },
+          "point_estimate": 812.1969970556053,
+          "standard_error": 1.0330715173313685
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 807.5545666839648,
+            "upper_bound": 814.1389283955968
+          },
+          "point_estimate": 808.9191316381249,
+          "standard_error": 1.9263554188618075
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2.9457468116454715,
+            "upper_bound": 8.765561699123054
+          },
+          "point_estimate": 5.583023248854592,
+          "standard_error": 1.5585029049410293
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 812.589533370695,
+            "upper_bound": 817.9401377586302
+          },
+          "point_estimate": 815.222879589586,
+          "standard_error": 1.366536556761479
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 5.2775216071429405,
+            "upper_bound": 9.196274067825264
+          },
+          "point_estimate": 7.373791348753166,
+          "standard_error": 1.002577361281645
+        }
+      }
+    },
+    "event_batch/msgpack/snappy/xlarge_500x2048": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/msgpack/snappy/xlarge_500x2048",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "msgpack/snappy",
+        "value_str": "xlarge_500x2048",
+        "throughput": {
+          "Bytes": 1024000,
+          "Elements": null
+        },
+        "full_id": "event_batch/msgpack/snappy/xlarge_500x2048",
+        "directory_name": "event_batch/msgpack_snappy/xlarge_500x2048"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 851494.9983684294,
+            "upper_bound": 856791.713136039
+          },
+          "point_estimate": 853877.5047846012,
+          "standard_error": 1360.732388950301
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 849795.5666666667,
+            "upper_bound": 852529.0444444445
+          },
+          "point_estimate": 851765.1306818181,
+          "standard_error": 598.5273434771893
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2165.998254045885,
+            "upper_bound": 4740.872027828272
+          },
+          "point_estimate": 3607.175489907189,
+          "standard_error": 667.1483154696763
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 851503.2855822722,
+            "upper_bound": 852890.3627396043
+          },
+          "point_estimate": 852223.9867443215,
+          "standard_error": 352.7832927339611
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 4223.671871360001,
+            "upper_bound": 13418.396661650686
+          },
+          "point_estimate": 9696.17635958253,
+          "standard_error": 2266.0277919638393
+        }
+      }
+    },
+    "event_batch/msgpack/zstd_3/large_100x1024": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/msgpack/zstd_3/large_100x1024",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "msgpack/zstd_3",
+        "value_str": "large_100x1024",
+        "throughput": {
+          "Bytes": 102400,
+          "Elements": null
+        },
+        "full_id": "event_batch/msgpack/zstd_3/large_100x1024",
+        "directory_name": "event_batch/msgpack_zstd_3/large_100x1024"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 110109.9618267222,
+            "upper_bound": 110876.46701163946
+          },
+          "point_estimate": 110460.16627441552,
+          "standard_error": 197.1383727558797
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 109872.30579710144,
+            "upper_bound": 110280.43150183152
+          },
+          "point_estimate": 110109.9562962963,
+          "standard_error": 96.14131479350584
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 439.768666914761,
+            "upper_bound": 1038.8575645066317
+          },
+          "point_estimate": 607.140102505719,
+          "standard_error": 167.65115282790288
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 109842.647383951,
+            "upper_bound": 110194.8931543085
+          },
+          "point_estimate": 110008.684249272,
+          "standard_error": 89.83515991205644
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 790.550296658469,
+            "upper_bound": 1945.021761220388
+          },
+          "point_estimate": 1413.2130519413945,
+          "standard_error": 301.27929353727035
+        }
+      }
+    },
+    "event_batch/msgpack/zstd_3/medium_10x256": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/msgpack/zstd_3/medium_10x256",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "msgpack/zstd_3",
+        "value_str": "medium_10x256",
+        "throughput": {
+          "Bytes": 2560,
+          "Elements": null
+        },
+        "full_id": "event_batch/msgpack/zstd_3/medium_10x256",
+        "directory_name": "event_batch/msgpack_zstd_3/medium_10x256"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 7879.122146952924,
+            "upper_bound": 7895.563530557494
+          },
+          "point_estimate": 7886.797338867193,
+          "standard_error": 4.197235325512936
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 7872.087499829772,
+            "upper_bound": 7887.449204225461
+          },
+          "point_estimate": 7877.5613883525875,
+          "standard_error": 4.145553880689079
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 10.70634163630771,
+            "upper_bound": 27.580696620897452
+          },
+          "point_estimate": 20.820525007246435,
+          "standard_error": 4.398117402621083
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 7871.565548109258,
+            "upper_bound": 7879.973564161097
+          },
+          "point_estimate": 7875.725629194311,
+          "standard_error": 2.133544728742429
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 19.07111045825335,
+            "upper_bound": 39.892012334426745
+          },
+          "point_estimate": 29.986511124418225,
+          "standard_error": 5.451199955397156
+        }
+      }
+    },
+    "event_batch/msgpack/zstd_3/small_1x64": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/msgpack/zstd_3/small_1x64",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "msgpack/zstd_3",
+        "value_str": "small_1x64",
+        "throughput": {
+          "Bytes": 64,
+          "Elements": null
+        },
+        "full_id": "event_batch/msgpack/zstd_3/small_1x64",
+        "directory_name": "event_batch/msgpack_zstd_3/small_1x64"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 3567.576446721349,
+            "upper_bound": 3574.016436733097
+          },
+          "point_estimate": 3570.354665703615,
+          "standard_error": 1.6513134681010977
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 3565.870143011333,
+            "upper_bound": 3568.084528185944
+          },
+          "point_estimate": 3566.8241896024465,
+          "standard_error": 0.6928065123772993
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2.527021535332407,
+            "upper_bound": 9.635813195858658
+          },
+          "point_estimate": 4.843248403225019,
+          "standard_error": 1.735338102732426
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 3570.03107036237,
+            "upper_bound": 3575.2821658355865
+          },
+          "point_estimate": 3572.947945744925,
+          "standard_error": 1.341406204810893
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 5.999371833989432,
+            "upper_bound": 17.77438789261296
+          },
+          "point_estimate": 11.77713458874681,
+          "standard_error": 3.700672228998299
+        }
+      }
+    },
+    "event_batch/msgpack/zstd_3/xlarge_500x2048": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/event_batch/msgpack/zstd_3/xlarge_500x2048",
+      "criterion_benchmark_v1": {
+        "group_id": "event_batch",
+        "function_id": "msgpack/zstd_3",
+        "value_str": "xlarge_500x2048",
+        "throughput": {
+          "Bytes": 1024000,
+          "Elements": null
+        },
+        "full_id": "event_batch/msgpack/zstd_3/xlarge_500x2048",
+        "directory_name": "event_batch/msgpack_zstd_3/xlarge_500x2048"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 877645.9007624353,
+            "upper_bound": 878287.3940361077
+          },
+          "point_estimate": 877961.2242887195,
+          "standard_error": 162.97464866660255
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 877685.1428571428,
+            "upper_bound": 878300.9868421053
+          },
+          "point_estimate": 877835.1753246754,
+          "standard_error": 161.34602288216288
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 627.462661980508,
+            "upper_bound": 1629.5935835689015
+          },
+          "point_estimate": 1138.2966161548895,
+          "standard_error": 257.8661993390381
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 877666.6196119504,
+            "upper_bound": 878387.3288060164
+          },
+          "point_estimate": 878021.2061968549,
+          "standard_error": 183.21118932240003
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 907.5759418002976,
+            "upper_bound": 1397.0481108349925
+          },
+          "point_estimate": 1164.6162854623958,
+          "standard_error": 125.49209875568046
+        }
+      }
+    },
+    "metadata/bincode/brotli_4": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/metadata/bincode/brotli_4",
+      "criterion_benchmark_v1": {
+        "group_id": "metadata",
+        "function_id": "bincode",
+        "value_str": "brotli_4",
+        "throughput": null,
+        "full_id": "metadata/bincode/brotli_4",
+        "directory_name": "metadata/bincode/brotli_4"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 9166.343075764991,
+            "upper_bound": 9185.279263118371
+          },
+          "point_estimate": 9174.96033176345,
+          "standard_error": 4.838658678016487
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 9155.198813073526,
+            "upper_bound": 9172.932121971597
+          },
+          "point_estimate": 9165.131703168598,
+          "standard_error": 4.630437483601212
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 10.377030997939327,
+            "upper_bound": 30.149260054622175
+          },
+          "point_estimate": 20.356849053798783,
+          "standard_error": 5.135751026796898
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 9165.355177822466,
+            "upper_bound": 9175.789108282816
+          },
+          "point_estimate": 9170.45518437912,
+          "standard_error": 2.6515286301416214
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 19.225150030256376,
+            "upper_bound": 48.61585495744257
+          },
+          "point_estimate": 34.67542687418477,
+          "standard_error": 7.7859267106358
+        }
+      }
+    },
+    "metadata/bincode/gzip_6": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/metadata/bincode/gzip_6",
+      "criterion_benchmark_v1": {
+        "group_id": "metadata",
+        "function_id": "bincode",
+        "value_str": "gzip_6",
+        "throughput": null,
+        "full_id": "metadata/bincode/gzip_6",
+        "directory_name": "metadata/bincode/gzip_6"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 4621.774515495569,
+            "upper_bound": 4641.702096864469
+          },
+          "point_estimate": 4630.420535477249,
+          "standard_error": 5.1272537169648835
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 4623.1837535014,
+            "upper_bound": 4634.001766791824
+          },
+          "point_estimate": 4628.783723262031,
+          "standard_error": 2.4035880060908346
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 10.116539438222208,
+            "upper_bound": 24.592247950211057
+          },
+          "point_estimate": 15.77617189638719,
+          "standard_error": 3.550406913888662
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 4629.845993495796,
+            "upper_bound": 4634.699704097069
+          },
+          "point_estimate": 4632.38504224194,
+          "standard_error": 1.2278564282370308
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 16.45013450755965,
+            "upper_bound": 56.0907374161238
+          },
+          "point_estimate": 36.746630835221296,
+          "standard_error": 11.672943719838148
+        }
+      }
+    },
+    "metadata/bincode/none": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/metadata/bincode/none",
+      "criterion_benchmark_v1": {
+        "group_id": "metadata",
+        "function_id": "bincode",
+        "value_str": "none",
+        "throughput": null,
+        "full_id": "metadata/bincode/none",
+        "directory_name": "metadata/bincode/none"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 86.88990665954502,
+            "upper_bound": 87.16903365338396
+          },
+          "point_estimate": 87.02625323663398,
+          "standard_error": 0.07072465242501136
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 86.95945765956269,
+            "upper_bound": 87.11435910916248
+          },
+          "point_estimate": 87.02512577998701,
+          "standard_error": 0.038960771304283326
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 0.15112190930715289,
+            "upper_bound": 0.4359347089701256
+          },
+          "point_estimate": 0.2321572941078919,
+          "standard_error": 0.06925984857365096
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 86.559502676153,
+            "upper_bound": 86.91969051326167
+          },
+          "point_estimate": 86.75153116128905,
+          "standard_error": 0.0926897967114915
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 0.3130860185655173,
+            "upper_bound": 0.6787756967260166
+          },
+          "point_estimate": 0.5060860401919083,
+          "standard_error": 0.09370694965539178
+        }
+      }
+    },
+    "metadata/bincode/snappy": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/metadata/bincode/snappy",
+      "criterion_benchmark_v1": {
+        "group_id": "metadata",
+        "function_id": "bincode",
+        "value_str": "snappy",
+        "throughput": null,
+        "full_id": "metadata/bincode/snappy",
+        "directory_name": "metadata/bincode/snappy"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 180.2815937607297,
+            "upper_bound": 180.97114736823315
+          },
+          "point_estimate": 180.61789153244592,
+          "standard_error": 0.17629718835450275
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 180.20043915112143,
+            "upper_bound": 180.98762517250356
+          },
+          "point_estimate": 180.4837038292104,
+          "standard_error": 0.1922806634809123
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 0.952039747019744,
+            "upper_bound": 1.8668701164205332
+          },
+          "point_estimate": 1.5667330344237125,
+          "standard_error": 0.2424455372221785
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 179.51752642880948,
+            "upper_bound": 180.0029789369053
+          },
+          "point_estimate": 179.72827118348806,
+          "standard_error": 0.1242372018215066
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1.0154120172175538,
+            "upper_bound": 1.4677851092289056
+          },
+          "point_estimate": 1.2598364433092235,
+          "standard_error": 0.11559031162952912
+        }
+      }
+    },
+    "metadata/bincode/zstd_3": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/metadata/bincode/zstd_3",
+      "criterion_benchmark_v1": {
+        "group_id": "metadata",
+        "function_id": "bincode",
+        "value_str": "zstd_3",
+        "throughput": null,
+        "full_id": "metadata/bincode/zstd_3",
+        "directory_name": "metadata/bincode/zstd_3"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 3043.587634777763,
+            "upper_bound": 3050.869770129823
+          },
+          "point_estimate": 3046.89002550187,
+          "standard_error": 1.8704681603085085
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 3041.974059579087,
+            "upper_bound": 3044.7837841348182
+          },
+          "point_estimate": 3043.7220775499595,
+          "standard_error": 0.7299254107516794
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 3.274218883618488,
+            "upper_bound": 8.836910866943803
+          },
+          "point_estimate": 5.96191853006816,
+          "standard_error": 1.4441920359880538
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 3042.910192293514,
+            "upper_bound": 3047.018998483072
+          },
+          "point_estimate": 3044.839177838972,
+          "standard_error": 1.0495281359977742
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 6.734289321306928,
+            "upper_bound": 18.1907961534362
+          },
+          "point_estimate": 13.323981218937512,
+          "standard_error": 2.8632404641017866
+        }
+      }
+    },
+    "metadata/msgpack/brotli_4": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/metadata/msgpack/brotli_4",
+      "criterion_benchmark_v1": {
+        "group_id": "metadata",
+        "function_id": "msgpack",
+        "value_str": "brotli_4",
+        "throughput": null,
+        "full_id": "metadata/msgpack/brotli_4",
+        "directory_name": "metadata/msgpack/brotli_4"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 13595.222462440704,
+            "upper_bound": 13606.654887654093
+          },
+          "point_estimate": 13600.874233500484,
+          "standard_error": 2.914659347360027
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 13593.152173913044,
+            "upper_bound": 13606.163304036712
+          },
+          "point_estimate": 13598.940144927536,
+          "standard_error": 3.2188487968551263
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 11.957090389363602,
+            "upper_bound": 26.28753281393484
+          },
+          "point_estimate": 21.19924579755207,
+          "standard_error": 3.7124199926549015
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 13586.065271650516,
+            "upper_bound": 13601.999322457672
+          },
+          "point_estimate": 13594.14741465144,
+          "standard_error": 4.073752369216114
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 15.974540924997283,
+            "upper_bound": 25.30135126788958
+          },
+          "point_estimate": 20.79586495746771,
+          "standard_error": 2.397579705299089
+        }
+      }
+    },
+    "metadata/msgpack/gzip_6": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/metadata/msgpack/gzip_6",
+      "criterion_benchmark_v1": {
+        "group_id": "metadata",
+        "function_id": "msgpack",
+        "value_str": "gzip_6",
+        "throughput": null,
+        "full_id": "metadata/msgpack/gzip_6",
+        "directory_name": "metadata/msgpack/gzip_6"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 7116.856199964914,
+            "upper_bound": 7129.89958730111
+          },
+          "point_estimate": 7122.988986916885,
+          "standard_error": 3.3296317449824624
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 7119.095248868778,
+            "upper_bound": 7129.866063348416
+          },
+          "point_estimate": 7123.3611995004785,
+          "standard_error": 2.1496843006307347
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 8.987194332020238,
+            "upper_bound": 19.60950904100189
+          },
+          "point_estimate": 13.155382739976911,
+          "standard_error": 2.810465074880109
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 7125.933345558237,
+            "upper_bound": 7131.898684619144
+          },
+          "point_estimate": 7128.907906086855,
+          "standard_error": 1.5087794871916578
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 14.618778594031491,
+            "upper_bound": 33.17699769255016
+          },
+          "point_estimate": 23.726540611046534,
+          "standard_error": 5.073586838914976
+        }
+      }
+    },
+    "metadata/msgpack/none": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/metadata/msgpack/none",
+      "criterion_benchmark_v1": {
+        "group_id": "metadata",
+        "function_id": "msgpack",
+        "value_str": "none",
+        "throughput": null,
+        "full_id": "metadata/msgpack/none",
+        "directory_name": "metadata/msgpack/none"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 363.3749025385162,
+            "upper_bound": 363.86659584751914
+          },
+          "point_estimate": 363.60466386453186,
+          "standard_error": 0.12603084910834148
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 363.23949314783226,
+            "upper_bound": 363.48904893279735
+          },
+          "point_estimate": 363.3346901850724,
+          "standard_error": 0.06845128454138295
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 0.278457126780902,
+            "upper_bound": 0.7368896771786967
+          },
+          "point_estimate": 0.4296196678720095,
+          "standard_error": 0.12347913418649384
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 363.1104946210244,
+            "upper_bound": 363.30487456995786
+          },
+          "point_estimate": 363.20087491461817,
+          "standard_error": 0.04930468583613013
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 0.5312754266354607,
+            "upper_bound": 1.1885152860396018
+          },
+          "point_estimate": 0.9003707082996393,
+          "standard_error": 0.16729793134853418
+        }
+      }
+    },
+    "metadata/msgpack/snappy": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/metadata/msgpack/snappy",
+      "criterion_benchmark_v1": {
+        "group_id": "metadata",
+        "function_id": "msgpack",
+        "value_str": "snappy",
+        "throughput": null,
+        "full_id": "metadata/msgpack/snappy",
+        "directory_name": "metadata/msgpack/snappy"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 518.429324063035,
+            "upper_bound": 522.1492233736659
+          },
+          "point_estimate": 520.1812727879628,
+          "standard_error": 0.95140683368032
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 516.5718942686748,
+            "upper_bound": 518.2407194480946
+          },
+          "point_estimate": 517.0380653639099,
+          "standard_error": 0.4785634770461695
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1.3768619462574363,
+            "upper_bound": 3.688669945874164
+          },
+          "point_estimate": 2.0723670238938197,
+          "standard_error": 0.5513707827999306
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 520.8030203345345,
+            "upper_bound": 527.2035817245104
+          },
+          "point_estimate": 524.2093027290671,
+          "standard_error": 1.6354780451677329
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 4.629227833695656,
+            "upper_bound": 8.382695050707952
+          },
+          "point_estimate": 6.803663856810215,
+          "standard_error": 0.9593316506299232
+        }
+      }
+    },
+    "metadata/msgpack/zstd_3": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/metadata/msgpack/zstd_3",
+      "criterion_benchmark_v1": {
+        "group_id": "metadata",
+        "function_id": "msgpack",
+        "value_str": "zstd_3",
+        "throughput": null,
+        "full_id": "metadata/msgpack/zstd_3",
+        "directory_name": "metadata/msgpack/zstd_3"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 3441.480508425687,
+            "upper_bound": 3446.06584679461
+          },
+          "point_estimate": 3443.724334891318,
+          "standard_error": 1.171471268825808
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 3440.5978556841387,
+            "upper_bound": 3446.0687684365785
+          },
+          "point_estimate": 3441.9678338095896,
+          "standard_error": 1.2113543122403925
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 6.483622279442092,
+            "upper_bound": 12.22936917632272
+          },
+          "point_estimate": 10.533132479421544,
+          "standard_error": 1.3542381981375853
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 3436.508591378456,
+            "upper_bound": 3439.672418467768
+          },
+          "point_estimate": 3437.9335129702454,
+          "standard_error": 0.8078246524428847
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 6.766269566913195,
+            "upper_bound": 9.836141280431232
+          },
+          "point_estimate": 8.37949449964511,
+          "standard_error": 0.7891378585383529
+        }
+      }
+    },
+    "wire_header/fixed_vs_variable/read/fixed/v2_bincode": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/wire_header/fixed_vs_variable/read/fixed/v2_bincode",
+      "criterion_benchmark_v1": {
+        "group_id": "wire_header/fixed_vs_variable",
+        "function_id": "read/fixed",
+        "value_str": "v2_bincode",
+        "throughput": null,
+        "full_id": "wire_header/fixed_vs_variable/read/fixed/v2_bincode",
+        "directory_name": "wire_header_fixed_vs_variable/read_fixed/v2_bincode"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 38.258398982506186,
+            "upper_bound": 38.4197737591466
+          },
+          "point_estimate": 38.33801427084502,
+          "standard_error": 0.041249060285192915
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 38.0802734006912,
+            "upper_bound": 38.2880113497141
+          },
+          "point_estimate": 38.23169276656025,
+          "standard_error": 0.05040567412309956
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 0.2173088068167812,
+            "upper_bound": 0.4704499330666871
+          },
+          "point_estimate": 0.3789154726993131,
+          "standard_error": 0.06423856481245808
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 38.1642116880621,
+            "upper_bound": 38.35409944857254
+          },
+          "point_estimate": 38.25481570857578,
+          "standard_error": 0.04873314150208024
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 0.367375075897267,
+            "upper_bound": 0.4508943319661041
+          },
+          "point_estimate": 0.4141522365878505,
+          "standard_error": 0.02131223588232873
+        }
+      }
+    },
+    "wire_header/fixed_vs_variable/read/fixed/v3_msgpack": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/wire_header/fixed_vs_variable/read/fixed/v3_msgpack",
+      "criterion_benchmark_v1": {
+        "group_id": "wire_header/fixed_vs_variable",
+        "function_id": "read/fixed",
+        "value_str": "v3_msgpack",
+        "throughput": null,
+        "full_id": "wire_header/fixed_vs_variable/read/fixed/v3_msgpack",
+        "directory_name": "wire_header_fixed_vs_variable/read_fixed/v3_msgpack"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 47.9097761451821,
+            "upper_bound": 48.10340186948772
+          },
+          "point_estimate": 48.00518080419352,
+          "standard_error": 0.04928573174820923
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 47.80300424054799,
+            "upper_bound": 48.12277067039589
+          },
+          "point_estimate": 47.87515264732148,
+          "standard_error": 0.08215283915969683
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 0.4160456867479264,
+            "upper_bound": 0.6614648583383141
+          },
+          "point_estimate": 0.561478330789007,
+          "standard_error": 0.0646673164061915
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 47.85145678221352,
+            "upper_bound": 48.06350682760398
+          },
+          "point_estimate": 47.95356919782661,
+          "standard_error": 0.0539809324363707
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 0.4361505878771701,
+            "upper_bound": 0.5469170359309181
+          },
+          "point_estimate": 0.4953571329624958,
+          "standard_error": 0.02813536878858537
+        }
+      }
+    },
+    "wire_header/fixed_vs_variable/read/variable/v2_bincode": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/wire_header/fixed_vs_variable/read/variable/v2_bincode",
+      "criterion_benchmark_v1": {
+        "group_id": "wire_header/fixed_vs_variable",
+        "function_id": "read/variable",
+        "value_str": "v2_bincode",
+        "throughput": null,
+        "full_id": "wire_header/fixed_vs_variable/read/variable/v2_bincode",
+        "directory_name": "wire_header_fixed_vs_variable/read_variable/v2_bincode"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 59.75534466057019,
+            "upper_bound": 60.09588003827841
+          },
+          "point_estimate": 59.92654207507712,
+          "standard_error": 0.08678873681263939
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 59.69430226636109,
+            "upper_bound": 59.9831212687095
+          },
+          "point_estimate": 59.80521975548714,
+          "standard_error": 0.09355373478973822
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 0.3884086289337618,
+            "upper_bound": 1.693185359109604
+          },
+          "point_estimate": 1.528407279338462,
+          "standard_error": 0.4697956432404046
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 59.60499534309969,
+            "upper_bound": 60.009243295282154
+          },
+          "point_estimate": 59.80596651412288,
+          "standard_error": 0.10315695887658811
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 0.7811744595045352,
+            "upper_bound": 0.9470786260094562
+          },
+          "point_estimate": 0.8721799830972472,
+          "standard_error": 0.04221172049296845
+        }
+      }
+    },
+    "wire_header/fixed_vs_variable/read/variable/v3_msgpack": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/wire_header/fixed_vs_variable/read/variable/v3_msgpack",
+      "criterion_benchmark_v1": {
+        "group_id": "wire_header/fixed_vs_variable",
+        "function_id": "read/variable",
+        "value_str": "v3_msgpack",
+        "throughput": null,
+        "full_id": "wire_header/fixed_vs_variable/read/variable/v3_msgpack",
+        "directory_name": "wire_header_fixed_vs_variable/read_variable/v3_msgpack"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 66.29049148059968,
+            "upper_bound": 66.6801828305857
+          },
+          "point_estimate": 66.4830085033521,
+          "standard_error": 0.0994216675706917
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 65.83019005343078,
+            "upper_bound": 66.6926989190147
+          },
+          "point_estimate": 66.49871247194164,
+          "standard_error": 0.3105068543479268
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 0.7467250230859289,
+            "upper_bound": 1.477816757686668
+          },
+          "point_estimate": 1.1740879805523174,
+          "standard_error": 0.1972994849514196
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 66.0079624421436,
+            "upper_bound": 66.5563005714646
+          },
+          "point_estimate": 66.26628377066562,
+          "standard_error": 0.140820888087551
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 0.8854104033745747,
+            "upper_bound": 1.0830695634470553
+          },
+          "point_estimate": 0.9957551845785826,
+          "standard_error": 0.05028658388126931
+        }
+      }
+    },
+    "wire_header/fixed_vs_variable/roundtrip/fixed/v2_bincode": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/wire_header/fixed_vs_variable/roundtrip/fixed/v2_bincode",
+      "criterion_benchmark_v1": {
+        "group_id": "wire_header/fixed_vs_variable",
+        "function_id": "roundtrip/fixed",
+        "value_str": "v2_bincode",
+        "throughput": null,
+        "full_id": "wire_header/fixed_vs_variable/roundtrip/fixed/v2_bincode",
+        "directory_name": "wire_header_fixed_vs_variable/roundtrip_fixed/v2_bincode"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 54.07991434343993,
+            "upper_bound": 54.39488111085866
+          },
+          "point_estimate": 54.235838933385054,
+          "standard_error": 0.08031884091296397
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 53.81636862513457,
+            "upper_bound": 54.12277778753854
+          },
+          "point_estimate": 53.94894468299607,
+          "standard_error": 0.09113352961961951
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 0.5334492363675265,
+            "upper_bound": 1.1514919223311126
+          },
+          "point_estimate": 0.7448275755120677,
+          "standard_error": 0.15798570729335792
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 54.04634447459888,
+            "upper_bound": 54.45871071892969
+          },
+          "point_estimate": 54.24064938892527,
+          "standard_error": 0.10555349765441709
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 0.7385278240555243,
+            "upper_bound": 0.8620437472987525
+          },
+          "point_estimate": 0.8093276798213089,
+          "standard_error": 0.03151313136489738
+        }
+      }
+    },
+    "wire_header/fixed_vs_variable/roundtrip/fixed/v3_msgpack": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/wire_header/fixed_vs_variable/roundtrip/fixed/v3_msgpack",
+      "criterion_benchmark_v1": {
+        "group_id": "wire_header/fixed_vs_variable",
+        "function_id": "roundtrip/fixed",
+        "value_str": "v3_msgpack",
+        "throughput": null,
+        "full_id": "wire_header/fixed_vs_variable/roundtrip/fixed/v3_msgpack",
+        "directory_name": "wire_header_fixed_vs_variable/roundtrip_fixed/v3_msgpack"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 81.05321300298662,
+            "upper_bound": 81.29661459642702
+          },
+          "point_estimate": 81.16772711893422,
+          "standard_error": 0.06212045048576774
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 80.9045329975481,
+            "upper_bound": 81.40286994532858
+          },
+          "point_estimate": 81.25520675763897,
+          "standard_error": 0.18542304367783727
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 0.4217328434246352,
+            "upper_bound": 0.6718263587985301
+          },
+          "point_estimate": 0.597527298399776,
+          "standard_error": 0.05996927228675087
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 80.94686023632565,
+            "upper_bound": 81.1912745127316
+          },
+          "point_estimate": 81.0679529387826,
+          "standard_error": 0.062309041817051915
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 0.4335467992032196,
+            "upper_bound": 0.8603644603945902
+          },
+          "point_estimate": 0.624400206767413,
+          "standard_error": 0.12680613510214675
+        }
+      }
+    },
+    "wire_header/fixed_vs_variable/roundtrip/variable/v2_bincode": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/wire_header/fixed_vs_variable/roundtrip/variable/v2_bincode",
+      "criterion_benchmark_v1": {
+        "group_id": "wire_header/fixed_vs_variable",
+        "function_id": "roundtrip/variable",
+        "value_str": "v2_bincode",
+        "throughput": null,
+        "full_id": "wire_header/fixed_vs_variable/roundtrip/variable/v2_bincode",
+        "directory_name": "wire_header_fixed_vs_variable/roundtrip_variable/v2_bincode"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 93.90198484650831,
+            "upper_bound": 94.35141489706166
+          },
+          "point_estimate": 94.10061170970792,
+          "standard_error": 0.11549749264401526
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 93.89292187531122,
+            "upper_bound": 94.12107895468958
+          },
+          "point_estimate": 94.00973742662224,
+          "standard_error": 0.06309764718277919
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 0.3150611009357323,
+            "upper_bound": 0.6223020631834909
+          },
+          "point_estimate": 0.4367057455986716,
+          "standard_error": 0.07627992603201436
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 93.81162430493812,
+            "upper_bound": 94.97760479024971
+          },
+          "point_estimate": 94.33840735976388,
+          "standard_error": 0.3008337057955312
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 0.4789767102932688,
+            "upper_bound": 1.7034198918574122
+          },
+          "point_estimate": 1.1623315148462494,
+          "standard_error": 0.3118914770492361
+        }
+      }
+    },
+    "wire_header/fixed_vs_variable/roundtrip/variable/v3_msgpack": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/wire_header/fixed_vs_variable/roundtrip/variable/v3_msgpack",
+      "criterion_benchmark_v1": {
+        "group_id": "wire_header/fixed_vs_variable",
+        "function_id": "roundtrip/variable",
+        "value_str": "v3_msgpack",
+        "throughput": null,
+        "full_id": "wire_header/fixed_vs_variable/roundtrip/variable/v3_msgpack",
+        "directory_name": "wire_header_fixed_vs_variable/roundtrip_variable/v3_msgpack"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 124.95184336913388,
+            "upper_bound": 125.4635917542131
+          },
+          "point_estimate": 125.20466960919563,
+          "standard_error": 0.13040568784555168
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 124.37751380639784,
+            "upper_bound": 125.0517765968532
+          },
+          "point_estimate": 124.64195276251914,
+          "standard_error": 0.16408119486385744
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 0.6848119606400311,
+            "upper_bound": 1.583371117030095
+          },
+          "point_estimate": 1.1092187740270658,
+          "standard_error": 0.2212879247049804
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 124.69553895219194,
+            "upper_bound": 125.31313450164976
+          },
+          "point_estimate": 124.98506893940784,
+          "standard_error": 0.15760400073662195
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1.1705129299478287,
+            "upper_bound": 1.4154188271086914
+          },
+          "point_estimate": 1.308934272062319,
+          "standard_error": 0.062489773674865245
+        }
+      }
+    },
+    "wire_header/fixed_vs_variable/write/fixed/v2_bincode": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/wire_header/fixed_vs_variable/write/fixed/v2_bincode",
+      "criterion_benchmark_v1": {
+        "group_id": "wire_header/fixed_vs_variable",
+        "function_id": "write/fixed",
+        "value_str": "v2_bincode",
+        "throughput": null,
+        "full_id": "wire_header/fixed_vs_variable/write/fixed/v2_bincode",
+        "directory_name": "wire_header_fixed_vs_variable/write_fixed/v2_bincode"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 38.08341543227231,
+            "upper_bound": 38.453594946552904
+          },
+          "point_estimate": 38.27026665354825,
+          "standard_error": 0.09360322608863818
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 38.08985915425837,
+            "upper_bound": 38.414701841997875
+          },
+          "point_estimate": 38.202915159530946,
+          "standard_error": 0.09425572171332956
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1.239826546179433,
+            "upper_bound": 1.603516474449674
+          },
+          "point_estimate": 1.5547184664023364,
+          "standard_error": 0.1029761321902854
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 37.97264404056177,
+            "upper_bound": 38.527085854378825
+          },
+          "point_estimate": 38.258658051359106,
+          "standard_error": 0.14173231121551164
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 0.8617648503905743,
+            "upper_bound": 1.001747690634765
+          },
+          "point_estimate": 0.9393193511857532,
+          "standard_error": 0.03551379701029164
+        }
+      }
+    },
+    "wire_header/fixed_vs_variable/write/fixed/v3_msgpack": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/wire_header/fixed_vs_variable/write/fixed/v3_msgpack",
+      "criterion_benchmark_v1": {
+        "group_id": "wire_header/fixed_vs_variable",
+        "function_id": "write/fixed",
+        "value_str": "v3_msgpack",
+        "throughput": null,
+        "full_id": "wire_header/fixed_vs_variable/write/fixed/v3_msgpack",
+        "directory_name": "wire_header_fixed_vs_variable/write_fixed/v3_msgpack"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 53.14916297528437,
+            "upper_bound": 53.352300053314494
+          },
+          "point_estimate": 53.252578642445,
+          "standard_error": 0.05190675846718552
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 53.17958596894767,
+            "upper_bound": 53.320281105724064
+          },
+          "point_estimate": 53.23210263142179,
+          "standard_error": 0.03613919479689165
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 0.18493410049131223,
+            "upper_bound": 0.4268846532353247
+          },
+          "point_estimate": 0.29769355398717967,
+          "standard_error": 0.06395148031686024
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 52.80545506627678,
+            "upper_bound": 53.13721057556185
+          },
+          "point_estimate": 52.964389785457584,
+          "standard_error": 0.08442020625248907
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 0.4393314534925821,
+            "upper_bound": 0.596352480458427
+          },
+          "point_estimate": 0.52388696460213,
+          "standard_error": 0.03975933798427909
+        }
+      }
+    },
+    "wire_header/fixed_vs_variable/write/variable/v2_bincode": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/wire_header/fixed_vs_variable/write/variable/v2_bincode",
+      "criterion_benchmark_v1": {
+        "group_id": "wire_header/fixed_vs_variable",
+        "function_id": "write/variable",
+        "value_str": "v2_bincode",
+        "throughput": null,
+        "full_id": "wire_header/fixed_vs_variable/write/variable/v2_bincode",
+        "directory_name": "wire_header_fixed_vs_variable/write_variable/v2_bincode"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 53.5592554911273,
+            "upper_bound": 54.27216862894365
+          },
+          "point_estimate": 53.90687178539196,
+          "standard_error": 0.18190415616635713
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 53.03114927477841,
+            "upper_bound": 53.11003798779786
+          },
+          "point_estimate": 53.065823932312654,
+          "standard_error": 0.03922013639722089
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 0.19546185540282057,
+            "upper_bound": 1.9675737514645537
+          },
+          "point_estimate": 1.504673911279521,
+          "standard_error": 0.5750806381739476
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 53.04441815127835,
+            "upper_bound": 53.48071882659911
+          },
+          "point_estimate": 53.24639079833994,
+          "standard_error": 0.11111451145248864
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1.6534304347871591,
+            "upper_bound": 1.963392967158457
+          },
+          "point_estimate": 1.8333118781645563,
+          "standard_error": 0.07843951637293105
+        }
+      }
+    },
+    "wire_header/fixed_vs_variable/write/variable/v3_msgpack": {
+      "baseline": "celeriant_wire",
+      "fullname": "celeriant_wire/wire_header/fixed_vs_variable/write/variable/v3_msgpack",
+      "criterion_benchmark_v1": {
+        "group_id": "wire_header/fixed_vs_variable",
+        "function_id": "write/variable",
+        "value_str": "v3_msgpack",
+        "throughput": null,
+        "full_id": "wire_header/fixed_vs_variable/write/variable/v3_msgpack",
+        "directory_name": "wire_header_fixed_vs_variable/write_variable/v3_msgpack"
+      },
+      "criterion_estimates_v1": {
+        "mean": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 77.6203165256442,
+            "upper_bound": 78.27983775092913
+          },
+          "point_estimate": 77.91385274452298,
+          "standard_error": 0.16887073341481415
+        },
+        "median": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 77.22321785286228,
+            "upper_bound": 77.71603658942603
+          },
+          "point_estimate": 77.3120051102262,
+          "standard_error": 0.1572411237954873
+        },
+        "median_abs_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 0.562846182488523,
+            "upper_bound": 1.1711111469817226
+          },
+          "point_estimate": 0.7244600905324664,
+          "standard_error": 0.18261666422419043
+        },
+        "slope": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 77.39171078279504,
+            "upper_bound": 78.56652342965326
+          },
+          "point_estimate": 77.90042434788317,
+          "standard_error": 0.3033436964969623
+        },
+        "std_dev": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 0.8320694619755059,
+            "upper_bound": 2.4429893627331047
+          },
+          "point_estimate": 1.6953840419907396,
+          "standard_error": 0.43137804811868935
+        }
+      }
+    }
+  }
+}

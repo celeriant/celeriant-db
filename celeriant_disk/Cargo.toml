@@ -1,0 +1,21 @@
+[package]
+name = "celeriant_disk"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+glommio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+criterion.workspace = true
+num_cpus.workspace = true
+
+[lib]
+bench = false
+
+[[bench]]
+name = "read_objects_benchmark"
+harness = false
