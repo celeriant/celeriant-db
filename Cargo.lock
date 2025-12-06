@@ -369,6 +369,7 @@ dependencies = [
  "bytes",
  "flume",
  "glommio",
+ "signal-hook",
  "tokio",
  "tracing",
 ]

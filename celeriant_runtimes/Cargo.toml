@@ -11,3 +11,4 @@ tracing.workspace = true
 flume.workspace = true
 bytes.workspace = true
 tokio.workspace = true
+signal-hook.workspace = true

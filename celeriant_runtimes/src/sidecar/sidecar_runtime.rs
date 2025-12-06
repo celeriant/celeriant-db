@@ -77,3 +77,9 @@ fn spawn_lane_processor(
         }
     })
 }
+
+impl Drop for SidecarRuntime {
+    fn drop(&mut self) {
+        tracing::info!("Sidecar runtime shutting down");
+    }
+}

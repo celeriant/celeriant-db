@@ -1,17 +1,30 @@
-use std::time::{Duration, Instant};
+use std::{
+    cell::Cell,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 use glommio::channels::channel_mesh::{Receivers, Senders};
 use tracing::{error, info};
 
-use crate::{sharded::{intrashard_messages::IntrashardMessages, shard_config::ShardConfig}, sidecar::{sidecar_messages::{SidecarOperation, SidecarTarget}, sidecar_senders::SidecarSenders}};
-
+use crate::{
+    sharded::{
+        intrashard_messages::IntrashardMessages, shard_config::ShardConfig,
+        signal_handler::SignalHandler,
+    },
+    sidecar::{
+        sidecar_messages::{SidecarOperation, SidecarTarget},
+        sidecar_senders::SidecarSenders,
+    },
+};
 
 pub struct Shard {
     config: ShardConfig,
     shard_id: usize,
-    intrashard_sender: Senders<IntrashardMessages>,
+    intrashard_sender: Rc<Senders<IntrashardMessages>>,
     intrashard_receivers: Receivers<IntrashardMessages>,
-    sidecar_sender: Option<SidecarSenders>
+    sidecar_sender: Option<SidecarSenders>,
+    shutdown_requested: Rc<Cell<bool>>,
 }
 
 impl Shard {
@@ -20,37 +33,121 @@ impl Shard {
         shard_id: usize,
         sender: Senders<IntrashardMessages>,
         receivers: Receivers<IntrashardMessages>,
-        sidecar_shard_handle: Option<SidecarSenders>
+        sidecar_shard_handle: Option<SidecarSenders>,
     ) -> Self {
         info!("Initializing shard {shard_id}");
         Self {
             config,
             shard_id,
-            intrashard_sender: sender,
+            intrashard_sender: Rc::new(sender),
             intrashard_receivers: receivers,
-            sidecar_sender: sidecar_shard_handle
+            sidecar_sender: sidecar_shard_handle,
+            shutdown_requested: Rc::new(Cell::new(false)),
         }
     }
 
-    pub async fn run(self) {
-        info!("Shard {} starting main loop", self.shard_id);
-        
-        // TODO: Spawn tasks for:
-        // - TCP listener (maybe only on shard 0?)
-        // - Processing mesh messages from other shards
-        // - Periodic flush timer
-        // - etc.
+    fn spawn_shard_zero_background_handler(&mut self) {
+        if self.shard_id != 0 {
+            return;
+        }
 
-        if let Some(sidecar_sender) = self.sidecar_sender {
-            match sidecar_sender.send_request(
-                SidecarTarget::ControlPlaneLease, 
-                SidecarOperation::ObjectGet { path: "foo".to_string() }, 
-                Instant::now() + Duration::from_millis(100)
-            ).await {
+        let mut signal_handler =
+            SignalHandler::new().expect("Failed to initialize signal handler");
+
+        let sender_clone = self.intrashard_sender.clone();
+        let shutdown_requested = self.shutdown_requested.clone();
+        let shard_id = self.shard_id;
+
+        glommio::spawn_local(async move {
+            loop {
+                match signal_handler.poll_signal() {
+                    Ok(Some(sig)) => {
+                        info!(
+                            "Received shutdown signal ({:?}). Initiating graceful shutdown...",
+                            sig
+                        );
+                        shutdown_requested.set(true);
+
+                        // Broadcast shutdown to all other shards
+                        for peer in 0..sender_clone.as_ref().nr_consumers() {
+                            if peer != shard_id {
+                                let shutdown_msg = IntrashardMessages::Shutdown;
+                                if let Err(e) =
+                                    sender_clone.as_ref().try_send_to(peer, shutdown_msg)
+                                {
+                                    error!(
+                                        "Failed to send shutdown signal to shard {peer}: {e:?}"
+                                    );
+                                }
+                            }
+                        }
+
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        error!("Error polling for signals: {e}");
+                        break;
+                    }
+                }
+
+                glommio::timer::sleep(Duration::from_secs(1)).await;
+            }
+        })
+        .detach();
+    }
+
+    fn spawn_intrashard_message_handler(&mut self) {
+        // Set up receivers for messages from other shards
+        for (_src_shard, stream) in self.intrashard_receivers.streams() {
+            let shutdown_flag = self.shutdown_requested.clone();
+            glommio::spawn_local(async move {
+                while let Some(msg) = stream.recv().await {
+                    match msg {
+                        IntrashardMessages::Shutdown => {
+                            shutdown_flag.set(true);
+                        }
+                    }
+                }
+            })
+            .detach();
+        }
+    }
+
+    async fn enter_main_loop_until_shutdown(&self) {
+        loop {
+            if self.shutdown_requested.get() {
+                info!("Shard {} stopping acceptance of new connections due to shutdown", self.shard_id);
+                break;
+            }
+            glommio::timer::sleep(Duration::from_secs(3)).await;
+        }
+    }
+
+    pub async fn run(&mut self) {
+        info!("Shard {} starting main loop", self.shard_id);
+
+        self.spawn_shard_zero_background_handler();
+        self.spawn_intrashard_message_handler();
+
+        // Test sidecar request
+        if let Some(sidecar_sender) = &self.sidecar_sender {
+            match sidecar_sender
+                .send_request(
+                    SidecarTarget::ControlPlaneLease,
+                    SidecarOperation::ObjectGet {
+                        path: "foo".to_string(),
+                    },
+                    Instant::now() + Duration::from_millis(100),
+                )
+                .await
+            {
                 Ok(sidecar_response) => info!("Got response from sidecar: {:?}", sidecar_response),
                 Err(sidecar_error) => error!("Got error from sidecar: {:?}", sidecar_error),
             }
         }
+
+        self.enter_main_loop_until_shutdown().await;
 
         info!("Shard {} shutdown complete", self.shard_id);
     }

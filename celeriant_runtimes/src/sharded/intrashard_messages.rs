@@ -1,3 +1,3 @@
-pub struct IntrashardMessages {
-    pub msg: String,
+pub enum IntrashardMessages {
+    Shutdown,
 }
