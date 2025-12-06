@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use celeriant_runtimes::ShardConfig;
 use clap::Parser;
 
 #[derive(Clone, Debug, Parser)]
@@ -71,6 +72,23 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
+    pub fn to_shard_config(&self, node_id: u128, num_shards: usize) -> ShardConfig {
+        ShardConfig {
+            node_id,
+            num_shards,
+            data_root: self.data_root.clone(),
+            listen_address: self.listen_address.clone(),
+            async_flush_ms: self.async_flush_ms,
+            max_open_aggregates: self.max_open_aggregates,
+            aggregate_read_max_chunk_size: self.aggregate_read_max_chunk_size,
+            aggregate_write_max_chunk_size: self.aggregate_write_max_chunk_size,
+            aggregate_write_max_data_cache_size_bytes: self.aggregate_write_max_data_cache_size_bytes,
+            cache_trim_factor: self.cache_trim_factor,
+            max_request_size: self.max_request_size,
+            max_event_batches_response_size: self.max_event_batches_response_size,
+        }
+    }
+
     /// Returns a list of (field_name, value) pairs for fields that differ from defaults
     pub fn non_default_entries(&self) -> Vec<(&'static str, String)> {
         let defaults = Self::default();

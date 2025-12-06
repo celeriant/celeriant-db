@@ -1,46 +1,55 @@
+use celeriant_crypto::Crypto;
+use celeriant_runtimes::run_executors_and_sidecar;
 use clap::Parser;
 use dotenvy::dotenv;
-use tracing::{info, instrument};
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 use crate::server_config::ServerConfig;
 
 mod server_config;
+mod dio_check;
 
 pub fn startup(args: Vec<String>) -> Result<(), std::io::Error> {
-    #[cfg(unix)]
     install_crash_handler();
 
     load_dotenv();
 
-    let config = ServerConfig::parse_from(args);
+    let server_config = ServerConfig::parse_from(args);
 
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(&config.default_log_level)),
+                .unwrap_or_else(|_| EnvFilter::new(&server_config.default_log_level)),
         )
         .init();
 
-    config.log_non_defaults();
+    server_config.log_non_defaults();
 
-    info!("Starting glommio executors...");
+    // Verify Direct I/O is actually working
+    if let Err(e) = dio_check::verify_direct_io(&server_config.data_root) {
+        error!("Direct I/O verification failed: {}", e);
+        std::process::exit(1);
+    }
+    info!("Direct I/O verification passed");
 
-    glommio::LocalExecutorBuilder::default()
-        .spawn(|| async move {
-            info!("Shard started");
-            handle_request().await;
-        })
-        .unwrap()
-        .join()
-        .unwrap();
+    // Load or generate a persistent node ID
+    let node_id = match Crypto::load_or_generate_node_id(&server_config.data_root) {
+        Ok(id) => id,
+        Err(e) => {
+            error!("Failed to initialize node ID: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    info!("node_id={}, data_root={:?}, listen_address={}", node_id, server_config.data_root, server_config.listen_address);
+    
+    let nbr_shards = server_config.num_shards.unwrap_or_else(num_cpus::get);
+    let shard_config = server_config.to_shard_config(node_id, nbr_shards);
+
+    run_executors_and_sidecar(shard_config, server_config.mesh_channel_size, node_id);
 
     Ok(())
-}
-
-#[instrument]
-async fn handle_request() {
-    info!("Processing");
 }
 
 fn load_dotenv() {
@@ -55,7 +64,6 @@ fn load_dotenv() {
     };
 }
 
-#[cfg(unix)]
 fn install_crash_handler() {
     unsafe {
         set_signal_handler(libc::SIGBUS, signal_handler);
@@ -64,12 +72,10 @@ fn install_crash_handler() {
     }
 }
 
-#[cfg(unix)]
 unsafe extern "C" fn signal_handler(_sig: i32) {
     std::process::abort();
 }
 
-#[cfg(unix)]
 unsafe fn set_signal_handler(signal: libc::c_int, handler: unsafe extern "C" fn(libc::c_int)) {
     use libc::{sigaction, sigfillset, sighandler_t};
     let mut sigset = unsafe { std::mem::zeroed() };

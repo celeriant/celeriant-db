@@ -1,5 +1,16 @@
 [workspace]
-members = ["celeriant", "celeriant_embedded","celeriant_aggregate","celeriant_client_glommio","celeriant_client_tokio","celeriant_disk","celeriant_msg","celeriant_wal", "celeriant_wire"]
+members = [
+    "celeriant",
+    "celeriant_embedded",
+    "celeriant_aggregate",
+    "celeriant_client_glommio",
+    "celeriant_client_tokio",
+    "celeriant_disk",
+    "celeriant_msg",
+    "celeriant_wal",
+    "celeriant_wire",
+    "celeriant_crypto"
+, "celeriant-crypto", "celeriant_runtimes"]
 
 resolver = "2"
 
@@ -36,3 +47,7 @@ libc = "0.2.178"
 dotenvy = "0.15.7"
 tracing = "0.1.43"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+thiserror = "2.0.12"
+rsa = { version = "0.9.9", features = ["sha2", "pem"] }
+sha2 = "0.10.9"
+rand = "0.8.5"
