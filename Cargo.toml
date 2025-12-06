@@ -9,8 +9,9 @@ members = [
     "celeriant_msg",
     "celeriant_wal",
     "celeriant_wire",
-    "celeriant_crypto"
-, "celeriant-crypto", "celeriant_runtimes"]
+    "celeriant_crypto", 
+    "celeriant_runtimes"
+]
 
 resolver = "2"
 
@@ -51,3 +52,5 @@ thiserror = "2.0.12"
 rsa = { version = "0.9.9", features = ["sha2", "pem"] }
 sha2 = "0.10.9"
 rand = "0.8.5"
+flume = "0.11.1"
+bytes = "1.11.0"

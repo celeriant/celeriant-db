@@ -283,10 +283,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "celeriant-crypto"
-version = "0.1.0"
-
-[[package]]
 name = "celeriant_aggregate"
 version = "0.1.0"
 dependencies = [
@@ -370,7 +366,10 @@ dependencies = [
 name = "celeriant_runtimes"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "flume",
  "glommio",
+ "tokio",
  "tracing",
 ]
 

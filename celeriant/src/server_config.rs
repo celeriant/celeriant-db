@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use celeriant_runtimes::ShardConfig;
+use celeriant_runtimes::{ObjectStoreRetryConfig, ShardConfig, SidecarConfig, S3Config};
 use clap::Parser;
 
 #[derive(Clone, Debug, Parser)]
@@ -52,7 +52,13 @@ pub struct ServerConfig {
     pub default_log_level: String,
 
     // S3 object-store integration
-    #[arg(long, default_value_t = false, env = "CELERIANT_S3_ENABLED", help = "Enable Amazon S3 object-store integration")]
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "CELERIANT_S3_ENABLED",
+        help = "Enable Amazon S3 object-store integration",
+        requires_ifs = [("true", "s3_region"), ("true", "s3_bucket")]
+    )]
     pub s3_enabled: bool,
 
     #[arg(long, requires = "s3_enabled", env = "CELERIANT_S3_REGION", help = "Amazon S3 region (e.g. us-east-1)")]
@@ -72,6 +78,37 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
+    pub fn to_sidecar_config(&self, num_shards: usize) -> SidecarConfig {
+        let s3 = if self.s3_enabled {
+
+            let subfolder = self
+                .s3_subfolder
+                .as_ref()
+                .filter(|s| !s.is_empty())
+                .cloned();
+            
+            Some(S3Config {
+                region: self.s3_region.clone().unwrap(),
+                bucket: self.s3_bucket.clone().unwrap(),
+                access_key_id: self.s3_access_key_id.clone(),
+                secret_access_key: self.s3_secret_access_key.clone(),
+                subfolder,
+            })
+        } else {
+            None
+        };
+
+        SidecarConfig {
+            worker_threads: std::cmp::max(2, num_shards / 2),
+            control_lane_capacity: 256,
+            data_lane_capacity: 1024,
+            max_inflight_ops: 2048,
+            heartbeat_interval_ms: 1000,
+            object_store_retry_config: ObjectStoreRetryConfig::default(),
+            s3
+        }
+    }
+
     pub fn to_shard_config(&self, node_id: u128, num_shards: usize) -> ShardConfig {
         ShardConfig {
             node_id,

@@ -46,8 +46,9 @@ pub fn startup(args: Vec<String>) -> Result<(), std::io::Error> {
     
     let nbr_shards = server_config.num_shards.unwrap_or_else(num_cpus::get);
     let shard_config = server_config.to_shard_config(node_id, nbr_shards);
+    let sidecar_config = server_config.to_sidecar_config(nbr_shards);
 
-    run_executors_and_sidecar(shard_config, server_config.mesh_channel_size, node_id);
+    run_executors_and_sidecar(shard_config, sidecar_config, server_config.mesh_channel_size, node_id);
 
     Ok(())
 }

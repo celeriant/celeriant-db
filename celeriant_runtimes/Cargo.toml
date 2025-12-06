@@ -8,3 +8,6 @@ license.workspace = true
 [dependencies]
 glommio.workspace = true
 tracing.workspace = true
+flume.workspace = true
+bytes.workspace = true
+tokio.workspace = true
