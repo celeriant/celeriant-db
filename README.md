@@ -2,11 +2,9 @@
 
 A distributed, append-only event store. Built for teams who need a fast, correct WAL substrate for event sourcing without the complexity of traditional distributed databases or messaging systems.
 
-## What It Is
-
 Celeriant is a write-ahead log designed specifically for event sourcing workloads. Think of it as a distributed, redundant WAL with per-aggregate total ordering and optimistic concurrency control.
 
-It is **not** a general-purpose database. It stores opaque byte arrays organised by aggregate. No indexes. No query language. No read-side projections. Just a fast, correct log you can build on top of. It's the write side of CQRS.
+It is **not** a general-purpose database. It stores opaque byte arrays organised by aggregate. Minimal indexes. No query language. No read-side projections. Just a fast, correct log you can build on top of. It's the write side of CQRS.
 
 ```
 org_id / aggregate_type_id / aggregate_id → append-only event stream
@@ -22,7 +20,7 @@ Event sourcing has a tooling problem.
 
 **EventStoreDB** - The closest competitor. But it conflates write and read concerns, it's not really open source, and it's built on .NET with all the operational baggage that entails. Including projections in the core was a design mistake.
 
-**Kafka** - Great for streaming, wrong abstraction for event sourcing. No per-aggregate ordering guarantees without careful partitioning. No optimistic concurrency control. Consumer groups are opaque broker magic. No fsync by default (dangerous). No filtering by aggregate or event type.
+**Kafka** - Great for streaming, wrong abstraction for event sourcing. No per-aggregate ordering guarantees without careful partitioning. No optimistic concurrency control. Consumer groups are opaque broker magic. No fsync by default. No filtering by aggregate or event type.
 
 Celeriant solves the write side of CQRS. Nothing more.
 
@@ -212,3 +210,4 @@ Apache-2.0
 - Notes on AI usage, best practices
 - Embedding instead of using as server
 - Client use + serverless friendly notes
+- Notes on head-of-line blocking mitigation
