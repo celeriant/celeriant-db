@@ -1,5 +1,6 @@
 use std::path::PathBuf;
-use celeriant_runtimes::{ObjectStoreRetryConfig, ShardConfig, SidecarConfig, S3Config};
+use celeriant_runtimes::{ShardConfig, SidecarConfig};
+use celeriant_sidecar::s3_config::S3Config;
 use clap::Parser;
 
 #[derive(Clone, Debug, Parser)]
@@ -79,6 +80,14 @@ pub struct ServerConfig {
 
 impl ServerConfig {
     pub fn to_sidecar_config(&self, num_shards: usize) -> SidecarConfig {
+        SidecarConfig {
+            worker_threads: std::cmp::max(2, num_shards / 2),
+            control_lane_capacity: 256,
+            data_lane_capacity: 1024,
+        }
+    }
+
+    pub fn to_sidecar_store_config(&self) -> celeriant_sidecar::store_config::StoreConfig {
         let s3 = if self.s3_enabled {
 
             let subfolder = self
@@ -98,13 +107,7 @@ impl ServerConfig {
             None
         };
 
-        SidecarConfig {
-            worker_threads: std::cmp::max(2, num_shards / 2),
-            control_lane_capacity: 256,
-            data_lane_capacity: 1024,
-            max_inflight_ops: 2048,
-            heartbeat_interval_ms: 1000,
-            object_store_retry_config: ObjectStoreRetryConfig::default(),
+        celeriant_sidecar::store_config::StoreConfig {
             s3
         }
     }

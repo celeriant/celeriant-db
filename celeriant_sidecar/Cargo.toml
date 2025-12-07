@@ -1,0 +1,11 @@
+[package]
+name = "celeriant_sidecar"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+tracing.workspace = true

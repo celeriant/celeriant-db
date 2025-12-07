@@ -1,9 +1,10 @@
 use std::{
     cell::Cell,
     rc::Rc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
+use celeriant_sidecar::request::Request;
 use glommio::channels::channel_mesh::{Receivers, Senders};
 use tracing::{error, info};
 
@@ -13,17 +14,17 @@ use crate::{
         signal_handler::SignalHandler,
     },
     sidecar::{
-        sidecar_messages::{SidecarOperation, SidecarTarget},
-        sidecar_senders::SidecarSenders,
+        sidecar_messages::{SidecarTarget},
+        sidecar_channels::SidecarSenders,
     },
 };
 
 pub struct Shard {
-    config: ShardConfig,
+    _config: ShardConfig,
     shard_id: usize,
     intrashard_sender: Rc<Senders<IntrashardMessages>>,
     intrashard_receivers: Receivers<IntrashardMessages>,
-    sidecar_sender: Option<SidecarSenders>,
+    sidecar_senders: SidecarSenders,
     shutdown_requested: Rc<Cell<bool>>,
 }
 
@@ -33,15 +34,15 @@ impl Shard {
         shard_id: usize,
         sender: Senders<IntrashardMessages>,
         receivers: Receivers<IntrashardMessages>,
-        sidecar_shard_handle: Option<SidecarSenders>,
+        sidecar_senders: SidecarSenders,
     ) -> Self {
         info!("Initializing shard {shard_id}");
         Self {
-            config,
+            _config: config,
             shard_id,
             intrashard_sender: Rc::new(sender),
             intrashard_receivers: receivers,
-            sidecar_sender: sidecar_shard_handle,
+            sidecar_senders,
             shutdown_requested: Rc::new(Cell::new(false)),
         }
     }
@@ -131,20 +132,17 @@ impl Shard {
         self.spawn_intrashard_message_handler();
 
         // Test sidecar request
-        if let Some(sidecar_sender) = &self.sidecar_sender {
-            match sidecar_sender
-                .send_request(
-                    SidecarTarget::ControlPlaneLease,
-                    SidecarOperation::ObjectGet {
-                        path: "foo".to_string(),
-                    },
-                    Instant::now() + Duration::from_millis(100),
-                )
-                .await
-            {
-                Ok(sidecar_response) => info!("Got response from sidecar: {:?}", sidecar_response),
-                Err(sidecar_error) => error!("Got error from sidecar: {:?}", sidecar_error),
-            }
+        match self.sidecar_senders
+            .send_async(
+                SidecarTarget::ControlPlaneLease,
+                Request::ObjectGet {
+                    path: "foo".to_string(),
+                },
+            )
+            .await
+        {
+            Ok(sidecar_response) => info!("Got response from sidecar: {:?}", sidecar_response),
+            Err(sidecar_error) => error!("Got error from sidecar: {:?}", sidecar_error),
         }
 
         self.enter_main_loop_until_shutdown().await;

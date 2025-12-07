@@ -1,3 +1,4 @@
+use celeriant_sidecar::store::SidecarStoreTrait;
 use glommio::{
     CpuSet, LocalExecutorPoolBuilder, PoolPlacement,
     channels::channel_mesh::{Full, MeshBuilder},
@@ -5,28 +6,26 @@ use glommio::{
 };
 use tracing::{error, info};
 
-use crate::{sharded::{intrashard_messages::IntrashardMessages, shard::Shard}, sidecar::sidecar_handle::SidecarHandle};
+use crate::{sharded::{intrashard_messages::IntrashardMessages, shard::Shard}, sidecar::{sidecar_channels::{SidecarSenders, create_sidecar_channel}, sidecar_runtime::SidecarRuntime}};
 
 mod sharded;
 mod sidecar;
 
-pub use {sharded::shard_config::ShardConfig, sidecar::sidecar_config::SidecarConfig, sidecar::s3_config::S3Config, sidecar::object_store_retry_config::ObjectStoreRetryConfig};
+pub use {sharded::shard_config::ShardConfig, sidecar::sidecar_config::SidecarConfig};
 
-pub fn run_executors_and_sidecar(shard_config: ShardConfig, sidecar_config: SidecarConfig, mesh_channel_size: usize, node_id: u128) {
+pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig, sidecar_config: SidecarConfig, mesh_channel_size: usize, node_id: u128, sidecar_store: S) {
     info!("Starting {} shard executors on node {}", shard_config.num_shards, node_id);
 
     let mesh =
         MeshBuilder::<IntrashardMessages, Full>::full(shard_config.num_shards, mesh_channel_size);
 
-    let sidecar_handle: Option<SidecarHandle> = match SidecarHandle::new(sidecar_config) {
+    let (sidecar_senders, _sidecar_runtime) = match new_sidecar(sidecar_config, sidecar_store) {
         Ok(sidecar_handle) => sidecar_handle,
         Err(e) => {
             error!("Failed to initialise sidecar: {}", e);
             return;
         },
     };
-
-    let sidecar_senders = sidecar_handle.as_ref().map(|h| h.sidecar_senders.clone());
 
     LocalExecutorPoolBuilder::new(PoolPlacement::MaxSpread(shard_config.num_shards, CpuSet::online().ok()))
         .on_all_shards(enclose!((mesh, shard_config, sidecar_senders) move || async move {
@@ -37,4 +36,13 @@ pub fn run_executors_and_sidecar(shard_config: ShardConfig, sidecar_config: Side
         .join_all();
 
     info!("Finished shutdown of {} shard executors on node {}", shard_config.num_shards, node_id);
+}
+
+pub fn new_sidecar<S: SidecarStoreTrait>(sidecar_config: SidecarConfig, sidecar_store: S) -> Result<(SidecarSenders, SidecarRuntime), String> {
+    let (sidecar_senders, sidecar_receivers) = create_sidecar_channel(&sidecar_config);
+
+    let sidecar_runtime = SidecarRuntime::with_store(sidecar_config, sidecar_receivers, sidecar_store)
+        .map_err(|e| format!("Failed to sidecar runtime: {}", e))?;
+
+    Ok((sidecar_senders, sidecar_runtime))
 }

@@ -1,9 +1,5 @@
-pub mod s3_config;
 pub mod sidecar_config;
-pub mod sidecar_handle;
-pub mod sidecar_senders;
-pub mod object_store_retry_config;
+pub mod sidecar_channels;
 pub mod sidecar_messages;
 pub mod error;
 pub mod sidecar_runtime;
-pub mod sidecar_store;

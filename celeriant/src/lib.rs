@@ -47,8 +47,17 @@ pub fn startup(args: Vec<String>) -> Result<(), std::io::Error> {
     let nbr_shards = server_config.num_shards.unwrap_or_else(num_cpus::get);
     let shard_config = server_config.to_shard_config(node_id, nbr_shards);
     let sidecar_config = server_config.to_sidecar_config(nbr_shards);
+    let sidecar_store_config = server_config.to_sidecar_store_config();
 
-    run_executors_and_sidecar(shard_config, sidecar_config, server_config.mesh_channel_size, node_id);
+    let sidecar_store = match celeriant_sidecar::store::SidecarStore::new(sidecar_store_config) {
+        Ok(sidecar_store) => sidecar_store,
+        Err(e) => {
+            error!("Failed to initialize SidecarStore: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    run_executors_and_sidecar(shard_config, sidecar_config, server_config.mesh_channel_size, node_id, sidecar_store);
 
     Ok(())
 }
