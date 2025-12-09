@@ -144,6 +144,22 @@ impl Response {
         Ok(response)
     }
 
+    pub fn determine_compression_type(response: &Response) -> CompressionType {
+        match response {
+            Response::ListOrganisations(_) => CompressionType::Snappy,
+            Response::ListAggregates(_) => CompressionType::Snappy,
+            Response::Exists(_) => CompressionType::None,
+            Response::Read(_) => CompressionType::Snappy,
+            Response::Write(_) => CompressionType::None,
+            Response::PrependBatches(_) => CompressionType::None,
+            Response::TrimStart(_) => CompressionType::None,
+            Response::Delete(_) => CompressionType::None,
+            Response::ProtocolError(_) => CompressionType::None,
+            Response::UpdateCacheLimits(_) => CompressionType::None,
+            Response::GenericError(_) => CompressionType::None,
+        }
+    }
+
     pub async fn write_response<W>(
         writer: &mut W,
         response: &Response,
@@ -233,7 +249,6 @@ mod tests {
                 correlation_id: Some(102),
                 min_event_batch_index: 0,
                 max_event_batch_index: 10,
-                size_bytes: 1024,
             }),
             ResponseType::Read => Response::Read(ReadResponse {
                 correlation_id: Some(103),
@@ -241,6 +256,7 @@ mod tests {
                 next_event_batch_index: Some(5),
             }),
             ResponseType::Write => Response::Write(WriteResponse {
+                correlation_id: Some(104),
                 event_batch_index: 1,
                 start_event_index: 0,
                 server_timestamp: 1234567890,

@@ -2,23 +2,33 @@
 mod test_basic_read_write {
     use std::num::NonZeroUsize;
 
-    use celeriant_disk::files::open_dma_files::{create_and_write_only_dma, existing_file_read_only_dma};
-    use celeriant_msg::{request::{read_filters::ReadFilters, requests::WriteRequest}, response::responses::ReadResponse};
-    use celeriant_wal::{aggregate_key::AggregateKey, compression_type, wal::event_item::EventItem};
+    use celeriant_disk::files::open_dma_files::{
+        create_and_write_only_dma, existing_file_read_only_dma,
+    };
+    use celeriant_msg::{
+        request::{read_filters::ReadFilters, requests::WriteRequest},
+        response::responses::ReadResponse,
+    };
+    use celeriant_wal::{
+        aggregate_key::AggregateKey, compression_type, wal::event_item::EventItem,
+    };
     use tempfile::tempdir_in;
     use uuid::Uuid;
 
     use glommio::{LocalExecutorBuilder, Placement};
 
     use crate::{
-        cache::aggregate_cache::AggregateCache, node_config::{test_node_config::test_config}, read_operations::{
+        cache::aggregate_cache::AggregateCache,
+        node_config::test_node_config::test_config,
+        read_operations::{
             read_operations::{ReadOperations, ReadOperationsWithDmaFiles},
             read_structures::AggregateReadConfig,
-        }, write_operations::{
+        },
+        write_operations::{
+            aggregate_write_config::AggregateWriteConfig,
             write_error::WriteError,
             write_operations::{WriteOperations, WriteOperationsWithDmaFile},
-            aggregate_write_config::{AggregateWriteConfig},
-        }
+        },
     };
 
     fn check_read_1(read_result: &ReadResponse, event_id: u128) {
@@ -34,26 +44,11 @@ mod test_basic_read_write {
             read_result.event_batches[0].events[0].client_event_index,
             45
         );
-        assert_eq!(
-            read_result.event_batches[0].events[0].event_id,
-            None
-        );
-        assert_eq!(
-            read_result.event_batches[0].events[0].event_index,
-            1
-        );
-        assert_eq!(
-            read_result.event_batches[0].events[0].event_timestamp,
-            333
-        );
-        assert_eq!(
-            read_result.event_batches[0].events[0].event_type_major,
-            2
-        );
-        assert_eq!(
-            read_result.event_batches[0].events[0].event_type_minor,
-            3
-        );
+        assert_eq!(read_result.event_batches[0].events[0].event_id, None);
+        assert_eq!(read_result.event_batches[0].events[0].event_index, 1);
+        assert_eq!(read_result.event_batches[0].events[0].event_timestamp, 333);
+        assert_eq!(read_result.event_batches[0].events[0].event_type_major, 2);
+        assert_eq!(read_result.event_batches[0].events[0].event_type_minor, 3);
         assert_eq!(
             read_result.event_batches[0].events[0].event_value,
             vec![1, 2, 3, 4, 5].into()
@@ -63,26 +58,11 @@ mod test_basic_read_write {
             read_result.event_batches[0].events[1].client_event_index,
             46
         );
-        assert_eq!(
-            read_result.event_batches[0].events[1].event_id,
-            None
-        );
-        assert_eq!(
-            read_result.event_batches[0].events[1].event_index,
-            2
-        );
-        assert_eq!(
-            read_result.event_batches[0].events[1].event_timestamp,
-            334
-        );
-        assert_eq!(
-            read_result.event_batches[0].events[1].event_type_major,
-            4
-        );
-        assert_eq!(
-            read_result.event_batches[0].events[1].event_type_minor,
-            0
-        );
+        assert_eq!(read_result.event_batches[0].events[1].event_id, None);
+        assert_eq!(read_result.event_batches[0].events[1].event_index, 2);
+        assert_eq!(read_result.event_batches[0].events[1].event_timestamp, 334);
+        assert_eq!(read_result.event_batches[0].events[1].event_type_major, 4);
+        assert_eq!(read_result.event_batches[0].events[1].event_type_minor, 0);
         assert_eq!(
             read_result.event_batches[0].events[1].event_value,
             vec![6, 7, 8, 9, 10].into()
@@ -102,22 +82,10 @@ mod test_basic_read_write {
             read_result.event_batches[1].events[0].event_id,
             Some(event_id)
         );
-        assert_eq!(
-            read_result.event_batches[1].events[0].event_index,
-            3
-        );
-        assert_eq!(
-            read_result.event_batches[1].events[0].event_timestamp,
-            339
-        );
-        assert_eq!(
-            read_result.event_batches[1].events[0].event_type_major,
-            2
-        );
-        assert_eq!(
-            read_result.event_batches[1].events[0].event_type_minor,
-            3
-        );
+        assert_eq!(read_result.event_batches[1].events[0].event_index, 3);
+        assert_eq!(read_result.event_batches[1].events[0].event_timestamp, 339);
+        assert_eq!(read_result.event_batches[1].events[0].event_type_major, 2);
+        assert_eq!(read_result.event_batches[1].events[0].event_type_minor, 3);
         assert_eq!(
             read_result.event_batches[1].events[0].event_value,
             vec![11, 12, 13].into()
@@ -169,7 +137,7 @@ mod test_basic_read_write {
                 // Create the files and a writer
                 let tempdir = tempfile::tempdir().unwrap();
                 let data_root_folder = tempdir.path().to_str().unwrap();
-                
+
                 let aggregates_cache = AggregateCache::new(
                     NonZeroUsize::new(1000).unwrap(),
                     test_config(data_root_folder),
@@ -187,8 +155,7 @@ mod test_basic_read_write {
                     ];
                     let mut write_request = WriteRequest {
                         client_id: 123,
-                        compression_type:
-                            compression_type::CompressionType::None,
+                        compression_type: compression_type::CompressionType::None,
                         enforce_client_idempotency: true,
                         expected_event_batch_index: Some(1),
                         user_id: None,
@@ -202,14 +169,12 @@ mod test_basic_read_write {
                     let mut writer = aggregate_resources.get_writer_mut(true).await.unwrap();
 
                     let append_result = writer
-                        .as_mut()
-                        .unwrap()
-                        .queue_events_in_memory(0, 0,  998, &mut write_request)
+                        .queue_events_in_memory(0, 0, 998, &mut write_request)
                         .unwrap();
                     assert_eq!(append_result.event_batch_index, 1);
 
                     //Write to disk
-                    writer.as_mut().unwrap().sync_with_rollback().await.unwrap();
+                    writer.sync_with_rollback().await.unwrap();
                 }
 
                 // Generate a guid and map it to u128
@@ -228,8 +193,7 @@ mod test_basic_read_write {
                     )];
                     let mut write_request = WriteRequest {
                         client_id: 123,
-                        compression_type:
-                            compression_type::CompressionType::None,
+                        compression_type: compression_type::CompressionType::None,
                         enforce_client_idempotency: true,
                         expected_event_batch_index: Some(2),
                         user_id: Some(34343),
@@ -242,14 +206,12 @@ mod test_basic_read_write {
 
                     let mut writer = aggregate_resources.get_writer_mut(true).await.unwrap();
                     let append_result = writer
-                        .as_mut()
-                        .unwrap()
-                        .queue_events_in_memory(0, 0,  999, &mut write_request)
+                        .queue_events_in_memory(0, 0, 999, &mut write_request)
                         .unwrap();
                     assert_eq!(append_result.event_batch_index, 2);
 
                     //Write to disk
-                    writer.as_mut().unwrap().sync_with_rollback().await.unwrap();
+                    writer.sync_with_rollback().await.unwrap();
                 }
 
                 let mut read_filters = ReadFilters::new(1);
@@ -257,16 +219,15 @@ mod test_basic_read_write {
 
                 let writer = aggregate_resources.get_writer(true).await.unwrap();
                 let reader = aggregate_resources.get_reader(true).await.unwrap();
-                let writer_ref = writer.as_ref().unwrap();
-                let reader_ref = reader.as_ref().unwrap();
 
-                let read_result = reader_ref
+                let read_result = reader
                     .read(
-                        writer_ref.minimum_available_event_batch_index,
-                        writer_ref.file_len_metadata,
-                        writer_ref.file_len_event_batch,
+                        None,
+                        writer.minimum_available_event_batch_index,
+                        writer.file_len_metadata,
+                        writer.file_len_event_batch,
                         &read_filters,
-                        None
+                        None,
                     )
                     .await
                     .unwrap();
@@ -295,9 +256,14 @@ mod test_basic_read_write {
                 std::fs::create_dir_all(&base_folder).unwrap();
                 // std::fs::File::create(&path_metadata).unwrap();
 
-                let writer_metadata_dma_file = create_and_write_only_dma(&path_metadata).await.unwrap();
-                writer_metadata_dma_file.pre_allocate(512, false).await.unwrap();
-                let reader_metadata_dma_file = existing_file_read_only_dma(&path_metadata).await.unwrap();
+                let writer_metadata_dma_file =
+                    create_and_write_only_dma(&path_metadata).await.unwrap();
+                writer_metadata_dma_file
+                    .pre_allocate(512, false)
+                    .await
+                    .unwrap();
+                let reader_metadata_dma_file =
+                    existing_file_read_only_dma(&path_metadata).await.unwrap();
 
                 let buffer_size = writer_metadata_dma_file.alignment();
                 let mut buf = writer_metadata_dma_file.alloc_dma_buffer(buffer_size as usize);
@@ -306,7 +272,10 @@ mod test_basic_read_write {
                 let _written = writer_metadata_dma_file.write_at(buf, 0).await.unwrap();
                 writer_metadata_dma_file.fdatasync().await.unwrap();
 
-                let read = reader_metadata_dma_file.read_at_aligned(0, 512).await.unwrap();
+                let read = reader_metadata_dma_file
+                    .read_at_aligned(0, 512)
+                    .await
+                    .unwrap();
                 assert_eq!(read.len(), 512);
                 assert_eq!(
                     &read[0..5],
@@ -314,7 +283,6 @@ mod test_basic_read_write {
                     "{}",
                     String::from_utf8_lossy(&read[0..6])
                 );
-
             })
             .unwrap();
         handle.join().unwrap();
@@ -349,27 +317,38 @@ mod test_basic_read_write {
                 std::fs::create_dir_all(&base_folder).unwrap();
 
                 // Open DMA files - must be done in this order due to direct I/O fs constraints
-                let writer_metadata_dma_file = create_and_write_only_dma(&path_metadata).await.unwrap();
-                let reader_metadata_dma_file = existing_file_read_only_dma(&path_metadata).await.unwrap();
-                let writer_event_batch_dma_file = create_and_write_only_dma(&path_event_batches).await.unwrap();
-                let reader_event_batch_dma_file = existing_file_read_only_dma(&path_event_batches).await.unwrap();
+                let writer_metadata_dma_file =
+                    create_and_write_only_dma(&path_metadata).await.unwrap();
+                let reader_metadata_dma_file =
+                    existing_file_read_only_dma(&path_metadata).await.unwrap();
+                let writer_event_batch_dma_file = create_and_write_only_dma(&path_event_batches)
+                    .await
+                    .unwrap();
+                let reader_event_batch_dma_file = existing_file_read_only_dma(&path_event_batches)
+                    .await
+                    .unwrap();
 
                 let read_operations = ReadOperationsWithDmaFiles::new(
-                    reader_metadata_dma_file, reader_event_batch_dma_file, aggregate_read_config.clone());
-                let data_requirements = read_operations.get_write_operations_data_requirements().await.unwrap();
+                    reader_metadata_dma_file,
+                    reader_event_batch_dma_file,
+                    aggregate_read_config.clone(),
+                );
+                let data_requirements = read_operations
+                    .get_write_operations_data_requirements()
+                    .await
+                    .unwrap();
                 let mut write_operations = WriteOperationsWithDmaFile::new(
-                    writer_metadata_dma_file, writer_event_batch_dma_file, data_requirements,
+                    writer_metadata_dma_file,
+                    writer_event_batch_dma_file,
+                    data_requirements,
                     aggregate_write_config.clone(),
                 );
 
                 // Write some event batches
-                let events = vec![
-                    EventItem::new(45, 0, None, 333, 2, 3, vec![1, 2, 3, 4, 5]),
-                ];
+                let events = vec![EventItem::new(45, 0, None, 333, 2, 3, vec![1, 2, 3, 4, 5])];
                 let mut write_request = WriteRequest {
                     client_id: 123,
-                    compression_type:
-                        compression_type::CompressionType::None,
+                    compression_type: compression_type::CompressionType::None,
                     enforce_client_idempotency: true,
                     expected_event_batch_index: Some(1),
                     user_id: None,
@@ -381,13 +360,14 @@ mod test_basic_read_write {
                 };
 
                 let append_result = write_operations
-                    .queue_events_in_memory(0, 0,  998, &mut write_request)
+                    .queue_events_in_memory(0, 0, 998, &mut write_request)
                     .unwrap();
                 assert_eq!(append_result.event_batch_index, 1);
                 write_operations.sync_with_rollback().await.unwrap();
 
                 let _read_result = read_operations
                     .read(
+                        None,
                         write_operations.minimum_available_event_batch_index,
                         write_operations.file_len_metadata,
                         write_operations.file_len_event_batch,
@@ -396,7 +376,6 @@ mod test_basic_read_write {
                     )
                     .await
                     .unwrap();
-
             })
             .unwrap();
         handle.join().unwrap();
@@ -436,13 +415,12 @@ mod test_basic_read_write {
                 ];
                 let mut write_request = WriteRequest {
                     client_id: 123,
-                    compression_type:
-                        compression_type::CompressionType::None,
+                    compression_type: compression_type::CompressionType::None,
                     enforce_client_idempotency: true,
                     expected_event_batch_index: Some(1),
                     user_id: None,
                     correlation_id: None,
-                        aggregate_key: aggregate_key.clone(),
+                    aggregate_key: aggregate_key.clone(),
                     events,
                     allow_create: false,
                     durable_write_with_delay_us: Some(0),
@@ -455,9 +433,7 @@ mod test_basic_read_write {
                 {
                     let mut writer = aggregate_resources.get_writer_mut(true).await.unwrap();
                     let append_result = writer
-                        .as_mut()
-                        .unwrap()
-                        .queue_events_in_memory(0, 0,  998, &mut write_request)
+                        .queue_events_in_memory(0, 0, 998, &mut write_request)
                         .unwrap();
                     assert_eq!(append_result.event_batch_index, 1);
 
@@ -472,8 +448,7 @@ mod test_basic_read_write {
                     )];
                     let mut write_request = WriteRequest {
                         client_id: 123,
-                        compression_type:
-                            compression_type::CompressionType::None,
+                        compression_type: compression_type::CompressionType::None,
                         enforce_client_idempotency: true,
                         expected_event_batch_index: Some(2),
                         user_id: Some(34343),
@@ -484,9 +459,7 @@ mod test_basic_read_write {
                         durable_write_with_delay_us: Some(0),
                     };
                     let append_result = writer
-                        .as_mut()
-                        .unwrap()
-                        .queue_events_in_memory(0, 0,  999, &mut write_request)
+                        .queue_events_in_memory(0, 0, 999, &mut write_request)
                         .unwrap();
                     assert_eq!(append_result.event_batch_index, 2);
                 }
@@ -495,9 +468,7 @@ mod test_basic_read_write {
                 {
                     let writer = aggregate_resources.get_writer(true).await.unwrap();
                     let cache_read_attempt = writer
-                        .as_ref()
-                        .unwrap()
-                        .maybe_read_cached_events(&read_filters, None)
+                        .maybe_read_cached_events(None, &read_filters, None)
                         .expect_err("Cache did not miss");
 
                     match cache_read_attempt {
@@ -514,32 +485,29 @@ mod test_basic_read_write {
                 {
                     //Write to disk
                     let mut writer = aggregate_resources.get_writer_mut(true).await.unwrap();
-                    writer.as_mut().unwrap().sync_with_rollback().await.unwrap();
+                    writer.sync_with_rollback().await.unwrap();
                 }
 
                 {
                     //Now that we have sync success, it should be in the writer cache
                     let writer = aggregate_resources.get_writer(true).await.unwrap();
                     let cache_read = writer
-                        .as_ref()
-                        .unwrap()
-                        .maybe_read_cached_events(&read_filters, None)
+                        .maybe_read_cached_events(None, &read_filters, None)
                         .unwrap();
                     check_read_1(&cache_read, event_id);
                 }
 
                 let writer = aggregate_resources.get_writer(true).await.unwrap();
-                let writer_ref = writer.as_ref().unwrap();
 
                 {
                     let reader = aggregate_resources.get_reader(true).await.unwrap();
-                    let reader_ref = reader.as_ref().unwrap();
 
-                    let read_result = reader_ref
+                    let read_result = reader
                         .read(
-                            writer_ref.minimum_available_event_batch_index,
-                            writer_ref.file_len_metadata,
-                            writer_ref.file_len_event_batch,
+                            None,
+                            writer.minimum_available_event_batch_index,
+                            writer.file_len_metadata,
+                            writer.file_len_event_batch,
                             &read_filters,
                             None,
                         )
@@ -550,11 +518,12 @@ mod test_basic_read_write {
 
                     //Basic filter on metadata
                     read_filters = read_filters.exclude_client_id(123);
-                    let read_result = reader_ref
+                    let read_result = reader
                         .read(
-                            writer_ref.minimum_available_event_batch_index,
-                            writer_ref.file_len_metadata,
-                            writer_ref.file_len_event_batch,
+                            None,
+                            writer.minimum_available_event_batch_index,
+                            writer.file_len_metadata,
+                            writer.file_len_event_batch,
                             &read_filters,
                             None,
                         )
@@ -562,17 +531,20 @@ mod test_basic_read_write {
                         .unwrap();
                     check_read_2(&read_result);
 
-                    let cache_read = writer_ref.maybe_read_cached_events(&read_filters, None).unwrap();
+                    let cache_read = writer
+                        .maybe_read_cached_events(None, &read_filters, None)
+                        .unwrap();
                     check_read_2(&cache_read);
 
                     //Basic filter on event batches
                     let mut read_filters = ReadFilters::new(1);
                     read_filters = read_filters.min_event_timestamp(334);
-                    let read_result = reader_ref
+                    let read_result = reader
                         .read(
-                            writer_ref.minimum_available_event_batch_index,
-                            writer_ref.file_len_metadata,
-                            writer_ref.file_len_event_batch,
+                            None,
+                            writer.minimum_available_event_batch_index,
+                            writer.file_len_metadata,
+                            writer.file_len_event_batch,
                             &read_filters,
                             None,
                         )
@@ -581,20 +553,22 @@ mod test_basic_read_write {
 
                     check_read_3(&read_result);
 
-                    let cache_result = writer_ref.maybe_read_cached_events(&read_filters, None).unwrap();
+                    let cache_result = writer
+                        .maybe_read_cached_events(None, &read_filters, None)
+                        .unwrap();
                     check_read_3(&cache_result);
                 }
 
                 {
-                    let mut reader = aggregate_resources.get_reader_mut(true).await.unwrap();
-                    let reader_ref = reader.as_mut().unwrap();
+                    let reader = aggregate_resources.get_reader_mut(true).await.unwrap();
                     let mut read_filters = ReadFilters::new(1);
                     read_filters = read_filters.min_event_timestamp(334);
-                    let read_result = reader_ref
+                    let read_result = reader
                         .read(
-                            writer_ref.minimum_available_event_batch_index,
-                            writer_ref.file_len_metadata,
-                            writer_ref.file_len_event_batch,
+                            None,
+                            writer.minimum_available_event_batch_index,
+                            writer.file_len_metadata,
+                            writer.file_len_event_batch,
                             &read_filters,
                             None,
                         )

@@ -30,7 +30,7 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
     LocalExecutorPoolBuilder::new(PoolPlacement::MaxSpread(shard_config.num_shards, CpuSet::online().ok()))
         .on_all_shards(enclose!((mesh, shard_config, sidecar_senders) move || async move {
             let (sender, receivers) = mesh.join().await.unwrap();            
-            Shard::new(shard_config, sender.peer_id(), sender, receivers, sidecar_senders).run().await;
+            Shard::new(shard_config, sender.peer_id(), sender, receivers, sidecar_senders).unwrap().run().await;
         }))
         .unwrap()
         .join_all();

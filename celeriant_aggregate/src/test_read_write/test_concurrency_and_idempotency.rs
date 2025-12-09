@@ -3,15 +3,19 @@ mod test_concurrency_and_idempotency {
     use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 
     use celeriant_msg::request::requests::WriteRequest;
-    use celeriant_wal::{aggregate_key::AggregateKey, compression_type::CompressionType, wal::event_item::EventItem};
+    use celeriant_wal::{
+        aggregate_key::AggregateKey, compression_type::CompressionType, wal::event_item::EventItem,
+    };
     use glommio::{LocalExecutorBuilder, Placement};
 
     use crate::{
-        cache::aggregate_cache::AggregateCache, node_config::test_node_config::test_config, read_operations::read_structures::AggregateReadConfig, write_operations::{
-            write_error::WriteError,
+        cache::aggregate_cache::AggregateCache,
+        node_config::test_node_config::test_config,
+        read_operations::read_structures::AggregateReadConfig,
+        write_operations::{
+            aggregate_write_config::AggregateWriteConfig, write_error::WriteError,
             write_operations::WriteOperations,
-            aggregate_write_config::{AggregateWriteConfig},
-        }
+        },
     };
 
     /// Helper to create test events
@@ -80,12 +84,10 @@ mod test_concurrency_and_idempotency {
                 {
                     let mut writer = aggregate_resources.get_writer_mut(true).await.unwrap();
                     let result = writer
-                        .as_mut()
-                        .unwrap()
-                        .queue_events_in_memory(0, 0,  1000, &mut write_options1)
+                        .queue_events_in_memory(0, 0, 1000, &mut write_options1)
                         .unwrap();
                     assert_eq!(result.event_batch_index, 1);
-                    writer.as_mut().unwrap().sync_with_rollback().await.unwrap();
+                    writer.sync_with_rollback().await.unwrap();
                 }
 
                 // Write second batch with NO concurrency check (expected_event_batch_index = None)
@@ -106,11 +108,8 @@ mod test_concurrency_and_idempotency {
 
                 {
                     let mut writer = aggregate_resources.get_writer_mut(true).await.unwrap();
-                    let result = writer
-                        .as_mut()
-                        .unwrap()
-                        .queue_events_in_memory(0, 0,  2000, &mut write_options2);
-                    
+                    let result = writer.queue_events_in_memory(0, 0, 2000, &mut write_options2);
+
                     // Should succeed since no concurrency check is performed
                     assert!(result.is_ok());
                     assert_eq!(result.unwrap().event_batch_index, 2);
@@ -119,7 +118,7 @@ mod test_concurrency_and_idempotency {
             .unwrap();
         handle.join().unwrap();
     }
-    
+
     #[test]
     fn test_optimistic_concurrency_violation() {
         let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
@@ -161,21 +160,19 @@ mod test_concurrency_and_idempotency {
                 };
 
                 let aggregate_resources = aggregates_cache.get_aggregate_resources(&aggregate_key);
-                
+
                 // First write succeeds
                 {
                     let mut writer = aggregate_resources.get_writer_mut(true).await.unwrap();
                     let result = writer
-                        .as_mut()
-                        .unwrap()
-                        .queue_events_in_memory(0, 0,  1000, &mut write_options)
+                        .queue_events_in_memory(0, 0, 1000, &mut write_options)
                         .unwrap();
                     assert_eq!(result.event_batch_index, 1);
-                    writer.as_mut().unwrap().sync_with_rollback().await.unwrap();
+                    writer.sync_with_rollback().await.unwrap();
                 }
 
                 // Second write with same expected_event_batch_index should fail
-                {                    
+                {
                     let mut writer = aggregate_resources.get_writer_mut(true).await.unwrap();
                     let events2 = create_test_events(3, 2, 2000);
                     let mut write_options = WriteRequest {
@@ -190,10 +187,7 @@ mod test_concurrency_and_idempotency {
                         allow_create: false,
                         durable_write_with_delay_us: None,
                     };
-                    let result = writer
-                        .as_mut()
-                        .unwrap()
-                        .queue_events_in_memory(0, 0,  1000, &mut write_options);
+                    let result = writer.queue_events_in_memory(0, 0, 1000, &mut write_options);
 
                     match result {
                         Err(WriteError::OptimisticConcurrencyViolation {
@@ -258,11 +252,9 @@ mod test_concurrency_and_idempotency {
                 {
                     let mut writer = aggregate_resources.get_writer_mut(true).await.unwrap();
                     writer
-                        .as_mut()
-                        .unwrap()
-                        .queue_events_in_memory(0, 0,  1000, &mut write_options)
+                        .queue_events_in_memory(0, 0, 1000, &mut write_options)
                         .unwrap();
-                    writer.as_mut().unwrap().sync_with_rollback().await.unwrap();
+                    writer.sync_with_rollback().await.unwrap();
                 }
 
                 // Attempt to write overlapping client_event_index (2-4)
@@ -282,10 +274,7 @@ mod test_concurrency_and_idempotency {
 
                 {
                     let mut writer = aggregate_resources.get_writer_mut(true).await.unwrap();
-                    let result = writer
-                        .as_mut()
-                        .unwrap()
-                        .queue_events_in_memory(0, 0,  2000, &mut write_options2);
+                    let result = writer.queue_events_in_memory(0, 0, 2000, &mut write_options2);
 
                     match result {
                         Err(WriteError::ClientIdempotencyViolation {
@@ -335,14 +324,12 @@ mod test_concurrency_and_idempotency {
                 for _ in 0..5 {
                     let cache = aggregates_cache.clone();
                     let key = aggregate_key.clone();
-                    
+
                     let task = glommio::spawn_local(async move {
                         let resources = cache.get_aggregate_resources(&key);
-                        let reader = resources.get_reader(true).await.unwrap();
-                        // Verify reader was initialized
-                        assert!(reader.is_some());
+                        let _ = resources.get_reader(true).await.unwrap();
                     });
-                    
+
                     tasks.push(task);
                 }
 
@@ -352,15 +339,10 @@ mod test_concurrency_and_idempotency {
                 }
 
                 // Verify that the files exist and were only created once
-                let metadata_path = format!(
-                    "{}/{}/{}/{}/metadata.bin",
-                    data_root_folder, 1, 1, 1
-                );
-                let event_batches_path = format!(
-                    "{}/{}/{}/{}/event_batches.bin",
-                    data_root_folder, 1, 1, 1
-                );
-                
+                let metadata_path = format!("{}/{}/{}/{}/metadata.bin", data_root_folder, 1, 1, 1);
+                let event_batches_path =
+                    format!("{}/{}/{}/{}/event_batches.bin", data_root_folder, 1, 1, 1);
+
                 assert!(std::path::Path::new(&metadata_path).exists());
                 assert!(std::path::Path::new(&event_batches_path).exists());
             })
@@ -398,14 +380,12 @@ mod test_concurrency_and_idempotency {
                 for _ in 0..5 {
                     let cache = aggregates_cache.clone();
                     let key = aggregate_key.clone();
-                    
+
                     let task = glommio::spawn_local(async move {
                         let resources = cache.get_aggregate_resources(&key);
-                        let writer = resources.get_writer(true).await.unwrap();
-                        // Verify writer was initialized
-                        assert!(writer.is_some());
+                        let _ = resources.get_writer(true).await.unwrap();
                     });
-                    
+
                     tasks.push(task);
                 }
 
@@ -415,15 +395,10 @@ mod test_concurrency_and_idempotency {
                 }
 
                 // Verify that the files exist and were only created once
-                let metadata_path = format!(
-                    "{}/{}/{}/{}/metadata.bin",
-                    data_root_folder, 1, 1, 1
-                );
-                let event_batches_path = format!(
-                    "{}/{}/{}/{}/event_batches.bin",
-                    data_root_folder, 1, 1, 1
-                );
-                
+                let metadata_path = format!("{}/{}/{}/{}/metadata.bin", data_root_folder, 1, 1, 1);
+                let event_batches_path =
+                    format!("{}/{}/{}/{}/event_batches.bin", data_root_folder, 1, 1, 1);
+
                 assert!(std::path::Path::new(&metadata_path).exists());
                 assert!(std::path::Path::new(&event_batches_path).exists());
             })
@@ -476,25 +451,23 @@ mod test_concurrency_and_idempotency {
                 {
                     let mut writer = aggregate_resources.get_writer_mut(true).await.unwrap();
                     writer
-                        .as_mut()
-                        .unwrap()
-                        .queue_events_in_memory(0, 0,  1000, &mut write_options)
+                        .queue_events_in_memory(0, 0, 1000, &mut write_options)
                         .unwrap();
                 }
 
                 // Spawn multiple concurrent sync_with_delay tasks
                 let mut tasks = Vec::new();
                 let sync_delay = Duration::from_millis(50);
-                
+
                 for _ in 0..5 {
                     let resources = aggregate_resources.clone();
-                    
+
                     let task = glommio::spawn_local(async move {
                         let result = resources.sync_with_delay(Some(sync_delay)).await;
                         // All tasks should complete successfully
                         assert!(result.is_ok());
                     });
-                    
+
                     tasks.push(task);
                 }
 
@@ -506,8 +479,7 @@ mod test_concurrency_and_idempotency {
                 // Verify that data was synced (check that next_event_batch_index advanced)
                 {
                     let writer = aggregate_resources.get_writer(true).await.unwrap();
-                    let writer_ref = writer.as_ref().unwrap();
-                    assert_eq!(writer_ref.next_event_batch_index, 2);
+                    assert_eq!(writer.next_event_batch_index, 2);
                 }
             })
             .unwrap();
@@ -559,11 +531,9 @@ mod test_concurrency_and_idempotency {
                 {
                     let mut writer = aggregate_resources.get_writer_mut(true).await.unwrap();
                     writer
-                        .as_mut()
-                        .unwrap()
-                        .queue_events_in_memory(0, 0,  1000, &mut write_options1)
+                        .queue_events_in_memory(0, 0, 1000, &mut write_options1)
                         .unwrap();
-                    writer.as_mut().unwrap().sync_with_rollback().await.unwrap();
+                    writer.sync_with_rollback().await.unwrap();
                 }
 
                 // Client 200 can use the same client_event_index range (1-3) without conflict
@@ -583,11 +553,8 @@ mod test_concurrency_and_idempotency {
 
                 {
                     let mut writer = aggregate_resources.get_writer_mut(true).await.unwrap();
-                    let result = writer
-                        .as_mut()
-                        .unwrap()
-                        .queue_events_in_memory(0, 0,  2000, &mut write_options2);
-                    
+                    let result = writer.queue_events_in_memory(0, 0, 2000, &mut write_options2);
+
                     // Should succeed since it's a different client
                     assert!(result.is_ok());
                     assert_eq!(result.unwrap().event_batch_index, 2);
@@ -642,11 +609,9 @@ mod test_concurrency_and_idempotency {
                 {
                     let mut writer = aggregate_resources.get_writer_mut(true).await.unwrap();
                     writer
-                        .as_mut()
-                        .unwrap()
-                        .queue_events_in_memory(0, 0,  1000, &mut write_options1)
+                        .queue_events_in_memory(0, 0, 1000, &mut write_options1)
                         .unwrap();
-                    writer.as_mut().unwrap().sync_with_rollback().await.unwrap();
+                    writer.sync_with_rollback().await.unwrap();
                 }
 
                 // Write second batch with overlapping client_event_index (2-4)
@@ -666,11 +631,8 @@ mod test_concurrency_and_idempotency {
 
                 {
                     let mut writer = aggregate_resources.get_writer_mut(true).await.unwrap();
-                    let result = writer
-                        .as_mut()
-                        .unwrap()
-                        .queue_events_in_memory(0, 0,  2000, &mut write_options2);
-                    
+                    let result = writer.queue_events_in_memory(0, 0, 2000, &mut write_options2);
+
                     // Should succeed since idempotency checking is disabled
                     assert!(result.is_ok());
                     assert_eq!(result.unwrap().event_batch_index, 2);

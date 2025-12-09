@@ -1,3 +1,4 @@
+use std::ops::{Deref, DerefMut};
 use celeriant_disk::files::open_dma_files::{
     create_and_write_only_dma, existing_file_read_only_dma, existing_file_write_only_dma,
 };
@@ -147,129 +148,177 @@ impl AggregateResources {
         Ok(())
     }
 
-    pub async fn get_reader(
-        &self,
-        create_if_not_exists: bool,
-    ) -> Result<RwLockReadGuard<'_, Option<ReadOperationsWithDmaFiles>>, ReadError> {
-        // First check with read lock
+    pub async fn get_reader(&self, create: bool) -> Result<ReaderGuard<'_>, ReadError> {
         {
-            let reader = self.reader.read().await?;
-            if reader.is_some() {
-                return Ok(reader);
+            let guard = self.reader.read().await?;
+            if guard.is_some() {
+                return Ok(ReaderGuard { guard });
             }
         }
 
-        self.internal_init(create_if_not_exists).await?;
+        self.internal_init(create).await?;
 
-        self.reader.read().await.map_err(Into::into)
+        Ok(ReaderGuard {
+            guard: self.reader.read().await?,
+        })
     }
 
-    pub async fn get_writer(
-        &self,
-        create_if_not_exists: bool,
-    ) -> Result<RwLockReadGuard<'_, Option<WriteOperationsWithDmaFile>>, ReadError> {
-        // First check with read lock
+    pub async fn get_reader_mut(&self, create: bool) -> Result<ReaderGuardMut<'_>, ReadError> {
         {
-            let writer = self.writer.read().await?;
-            if writer.is_some() {
-                return Ok(writer);
+            let guard = self.reader.write().await?;
+            if guard.is_some() {
+                return Ok(ReaderGuardMut { guard });
             }
         }
 
-        self.internal_init(create_if_not_exists).await?;
+        self.internal_init(create).await?;
 
-        self.writer.read().await.map_err(Into::into)
+        Ok(ReaderGuardMut {
+            guard: self.reader.write().await?,
+        })
     }
 
-    pub async fn get_reader_mut(
-        &self,
-        create_if_not_exists: bool,
-    ) -> Result<RwLockWriteGuard<'_, Option<ReadOperationsWithDmaFiles>>, ReadError> {
+    pub async fn get_writer(&self, create: bool) -> Result<WriterGuard<'_>, ReadError> {
         {
-            let writer_guard = self.reader.write().await?;
-            if writer_guard.is_some() {
-                return Ok(writer_guard);
+            let guard = self.writer.read().await?;
+            if guard.is_some() {
+                return Ok(WriterGuard { guard });
             }
         }
 
-        self.internal_init(create_if_not_exists).await?;
+        self.internal_init(create).await?;
 
-        self.reader.write().await.map_err(Into::into)
+        Ok(WriterGuard {
+            guard: self.writer.read().await?,
+        })
     }
 
-    pub async fn get_writer_mut(
-        &self,
-        create_if_not_exists: bool,
-    ) -> Result<RwLockWriteGuard<'_, Option<WriteOperationsWithDmaFile>>, ReadError> {
+    pub async fn get_writer_mut(&self, create: bool) -> Result<WriterGuardMut<'_>, ReadError> {
         {
-            let writer_guard = self.writer.write().await?;
-            if writer_guard.is_some() {
-                return Ok(writer_guard);
+            let guard = self.writer.write().await?;
+            if guard.is_some() {
+                return Ok(WriterGuardMut { guard });
             }
         }
 
-        self.internal_init(create_if_not_exists).await?;
+        self.internal_init(create).await?;
 
-        self.writer.write().await.map_err(Into::into)
+        Ok(WriterGuardMut {
+            guard: self.writer.write().await?,
+        })
     }
 
     pub async fn sync_with_delay(&self, wal_sync_delay: Option<Duration>) -> SyncResult {
         if wal_sync_delay.is_none() || wal_sync_delay.unwrap().as_micros() == 0 {
             // No delay - do immediate sync
             let mut writer = self.get_writer_mut(false).await?;
-            let r_writer = writer.as_mut().unwrap();
-            return Ok(r_writer.sync_with_rollback().await?);
+            return Ok(writer.sync_with_rollback().await?);
         }
 
         let wal_sync_delay = wal_sync_delay.unwrap();
 
-        // Try to become the sync coordinator
-        match self.wal_sync_event.try_write() {
-            Ok(mut maybe_event) => {
-                // We won! Check if sync is already in progress
-                if let Some(event) = maybe_event.as_ref() {
-                    // Another task beat us between our check and lock acquisition
-                    let event = event.clone();
-                    drop(maybe_event); // Release lock before awaiting
-                    return event.listen().await;
+        loop {
+            match self.wal_sync_event.try_write() {
+                Ok(mut maybe_event) => {
+                    // We won! Check if sync is already in progress
+                    if let Some(event) = maybe_event.as_ref() {
+                        // Another task beat us between our check and lock acquisition
+                        let event = event.clone();
+                        drop(maybe_event); // Release lock before awaiting
+                        return event.listen().await;
+                    }
+
+                    // We're the coordinator - create the event
+                    let event = Rc::new(LocalEvent::new());
+                    *maybe_event = Some(event.clone());
+                    drop(maybe_event); // Release lock while sleeping
+
+                    // Sleep for the delay period
+                    sleep(wal_sync_delay).await;
+
+                    // Clear the event before sync (need write lock again)
+                    self.wal_sync_event.write().await.unwrap().take();
+
+                    // Do the actual sync
+                    let sync_result = {
+                        let mut writer = self.get_writer_mut(false).await?;
+                        writer.sync_with_rollback().await?
+                    };
+
+                    // Notify all waiters
+                    event.notify(Ok(sync_result.clone()));
+
+                    return Ok(sync_result);
                 }
-
-                // We're the coordinator - create the event
-                let event = Rc::new(LocalEvent::new());
-                *maybe_event = Some(event.clone());
-                drop(maybe_event); // Release lock while sleeping
-
-                // Sleep for the delay period
-                sleep(wal_sync_delay).await;
-
-                // Clear the event before sync (need write lock again)
-                self.wal_sync_event.write().await.unwrap().take();
-
-                // Do the actual sync
-                let sync_result = {
-                    let mut writer = self.get_writer_mut(false).await?;
-                    let r_writer = writer.as_mut().unwrap();
-                    r_writer.sync_with_rollback().await?
-                };
-
-                // Notify all waiters
-                event.notify(Ok(sync_result.clone()));
-
-                Ok(sync_result)
-            }
-
-            Err(_) => {
-                // Another task is coordinating the sync - just wait for it
-                let event = {
+                Err(_) => {
                     let maybe_event = self.wal_sync_event.read().await.unwrap();
-                    maybe_event
-                        .as_ref()
-                        .expect("If try_write failed, event should exist")
-                        .clone()
-                };
-
-                event.listen().await
+                    if let Some(event) = maybe_event.as_ref() {
+                        let event = event.clone();
+                        drop(maybe_event);
+                        return event.listen().await;
+                    }
+                    // Retry - coordinator cleared event while we were waiting
+                    drop(maybe_event);
+                    continue;
+                }
             }
         }
+        
+    }
+}
+
+pub struct WriterGuardMut<'a> {
+    guard: RwLockWriteGuard<'a, Option<WriteOperationsWithDmaFile>>,
+}
+
+impl Deref for WriterGuardMut<'_> {
+    type Target = WriteOperationsWithDmaFile;
+    fn deref(&self) -> &Self::Target {
+        self.guard.as_ref().unwrap()
+    }
+}
+
+impl DerefMut for WriterGuardMut<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.guard.as_mut().unwrap()
+    }
+}
+
+pub struct WriterGuard<'a> {
+    guard: RwLockReadGuard<'a, Option<WriteOperationsWithDmaFile>>,
+}
+
+impl Deref for WriterGuard<'_> {
+    type Target = WriteOperationsWithDmaFile;
+    fn deref(&self) -> &Self::Target {
+        self.guard.as_ref().unwrap()
+    }
+}
+
+pub struct ReaderGuardMut<'a> {
+    guard: RwLockWriteGuard<'a, Option<ReadOperationsWithDmaFiles>>,
+}
+
+impl Deref for ReaderGuardMut<'_> {
+    type Target = ReadOperationsWithDmaFiles;
+    fn deref(&self) -> &Self::Target {
+        self.guard.as_ref().unwrap()
+    }
+}
+
+impl DerefMut for ReaderGuardMut<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.guard.as_mut().unwrap()
+    }
+}
+
+pub struct ReaderGuard<'a> {
+    guard: RwLockReadGuard<'a, Option<ReadOperationsWithDmaFiles>>,
+}
+
+impl Deref for ReaderGuard<'_> {
+    type Target = ReadOperationsWithDmaFiles;
+    fn deref(&self) -> &Self::Target {
+        self.guard.as_ref().unwrap()
     }
 }

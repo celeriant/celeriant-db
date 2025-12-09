@@ -21,7 +21,6 @@ pub struct ExistsResponse {
     pub correlation_id: Option<u128>,
     pub min_event_batch_index: u64,
     pub max_event_batch_index: u64,
-    pub size_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
@@ -33,6 +32,7 @@ pub struct ReadResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct WriteResponse {
+    pub correlation_id: Option<u128>,
     pub event_batch_index: u64,
     pub start_event_index: u64,
     pub server_timestamp: u64,

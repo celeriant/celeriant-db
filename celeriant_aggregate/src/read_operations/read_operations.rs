@@ -85,6 +85,7 @@ pub trait ReadOperations {
     /// `ReadResponse` containing filtered events, and pagination info
     async fn read(
         &self,
+        correlation_id: Option<u128>,
         minimum_available_event_batch_index: u64,
         file_len_metadata: u64,
         file_len_event_batch: u64,
@@ -416,6 +417,7 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
     //minimum_available_event_batch_index comes from writer as it only changes during a trim operation
     async fn read(
         &self,
+        correlation_id: Option<u128>,
         minimum_available_event_batch_index: u64,
         file_len_metadata: u64,
         file_len_event_batch: u64,
@@ -442,7 +444,7 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
         // Handle empty result
         if metadata_for_reading.is_empty() {
             return Ok(ReadResponse {
-                correlation_id: None,
+                correlation_id,
                 event_batches: Vec::new(),
                 next_event_batch_index: None,
             });
@@ -509,7 +511,7 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
         }
 
         Ok(ReadResponse {
-            correlation_id: None,
+            correlation_id,
             event_batches: filtered_event_batches,
             next_event_batch_index,
         })

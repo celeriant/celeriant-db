@@ -15,6 +15,7 @@ glommio.workspace = true
 lru.workspace = true
 futures-lite.workspace = true
 crc32c.workspace = true
+walkdir.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -29,6 +29,12 @@ pub enum ReadError {
     },
 }
 
+impl From<walkdir::Error> for ReadError {
+    fn from(error: walkdir::Error) -> Self {
+        ReadError::IoError(error.to_string())
+    }
+}
+
 impl From<std::io::Error> for ReadError {
     fn from(error: std::io::Error) -> Self {
         ReadError::IoError(error.to_string())

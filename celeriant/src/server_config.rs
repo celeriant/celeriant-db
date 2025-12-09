@@ -42,7 +42,7 @@ pub struct ServerConfig {
 
     // Wire protocol constants
     #[arg(long, default_value_t = 1024 * 1024 * 16, env = "CELERIANT_MAX_REQUEST_SIZE", help = "Maximum request message size (16 MiB)")]
-    pub max_request_size: usize,
+    pub max_request_size: u32,
 
     // Wire protocol constants
     #[arg(long, default_value_t = 1024 * 1024 * 64, env = "CELERIANT_MAX_EVENT_BATCHES_RESPONSE_SIZE", help = "Maximum size of event batches set to return (64 MiB)")]
@@ -124,7 +124,7 @@ impl ServerConfig {
             aggregate_write_max_chunk_size: self.aggregate_write_max_chunk_size,
             aggregate_write_max_data_cache_size_bytes: self.aggregate_write_max_data_cache_size_bytes,
             cache_trim_factor: self.cache_trim_factor,
-            max_request_size: self.max_request_size,
+            max_request_size: Some(self.max_request_size),
             max_event_batches_response_size: self.max_event_batches_response_size,
         }
     }

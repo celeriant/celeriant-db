@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use celeriant_aggregate::{
-    local_aggregate::LocalAggregate,
+    local_aggregate::{LocalAggregate, LocalAggregateTrait},
     node_config::NodeConfig,
     read_operations::read_structures::AggregateReadConfig,
     write_operations::aggregate_write_config::AggregateWriteConfig,
@@ -97,14 +97,11 @@ fn create_local_aggregate(
     let node_config = NodeConfig {
         data_root_folder: data_folder.to_string(),
         node_id: 1,
-        margin_ms: 500,
-        lease_expiry_ms: 10000,
         async_flush_ms,
         max_open_aggregates: 1000,
         max_request_size: Some(64 * 1024 * 1024),
         listen_address: "127.0.0.1:0".to_string(),
         max_event_batches_response_size: Some(64 * 1024 * 1024),
-        s3_enabled: false,
     };
 
     let read_config = AggregateReadConfig {
@@ -139,6 +136,7 @@ fn benchmark_write_fsync_modes(c: &mut Criterion) {
 
     let fsync_modes: Vec<(&str, Option<u64>)> = vec![
         ("immediate", Some(0)),
+        ("delay_20us", Some(20)),
         ("delay_100us", Some(100)),
         ("delay_1ms", Some(1000)),
         ("delay_10ms", Some(10000)),
@@ -156,22 +154,26 @@ fn benchmark_write_fsync_modes(c: &mut Criterion) {
 
                     let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
                         .spawn(move || async move {
-                            let local_aggregate = create_local_aggregate(&data_folder, 64 * 1024 * 1024, 50);
+                            let local_aggregate = std::rc::Rc::new(create_local_aggregate(&data_folder, 64 * 1024 * 1024, 50));
                             let aggregate_key = create_aggregate_key(1);
                             let client_id = 100u128;
 
-                            for i in 0..batch_count {
-                                let start_idx = i as u64 * events_per_batch as u64;
-                                let events = create_events_batch(start_idx, events_per_batch, payload_size);
-                                let request = create_write_request(
-                                    aggregate_key.clone(),
-                                    client_id,
-                                    events,
-                                    delay_us,
-                                );
+                            // Spawn multiple concurrent write tasks
+                            let handles: Vec<_> = (0..batch_count).map(|i| {
+                                let local_aggregate = local_aggregate.clone();
+                                let aggregate_key = aggregate_key.clone();
+                                
+                                glommio::spawn_local(async move {
+                                    let events = create_events_batch(i as u64 * events_per_batch as u64, events_per_batch, payload_size);
+                                    let request = create_write_request(aggregate_key, client_id + i as u128, events, delay_us);
+                                    let result = local_aggregate.write(1, request).await;
+                                    black_box(result.unwrap());
+                                })
+                            }).collect();
 
-                                let result = local_aggregate.write(1, request).await;
-                                black_box(result.unwrap());
+                            // Wait for all
+                            for h in handles {
+                                h.await;
                             }
                         })
                         .unwrap();

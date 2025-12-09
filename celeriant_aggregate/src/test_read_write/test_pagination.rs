@@ -3,17 +3,21 @@ mod test_pagination {
     use std::num::NonZeroUsize;
 
     use celeriant_msg::request::{read_filters::ReadFilters, requests::WriteRequest};
-    use celeriant_wal::{aggregate_key::AggregateKey, compression_type::CompressionType, wal::event_item::EventItem};
+    use celeriant_wal::{
+        aggregate_key::AggregateKey, compression_type::CompressionType, wal::event_item::EventItem,
+    };
     use glommio::{LocalExecutorBuilder, Placement};
 
     use crate::{
-        cache::aggregate_cache::AggregateCache, node_config::test_node_config::test_config, read_operations::{
+        cache::aggregate_cache::AggregateCache,
+        node_config::test_node_config::test_config,
+        read_operations::{
             read_error::ReadError, read_operations::ReadOperations,
             read_structures::AggregateReadConfig,
-        }, write_operations::{
-            write_operations::WriteOperations,
-            aggregate_write_config::{AggregateWriteConfig},
-        }
+        },
+        write_operations::{
+            aggregate_write_config::AggregateWriteConfig, write_operations::WriteOperations,
+        },
     };
 
     /// Helper to write a batch with specific parameters
@@ -55,12 +59,10 @@ mod test_pagination {
         let mut writer = aggregate_resources.get_writer_mut(true).await.unwrap();
 
         writer
-            .as_mut()
-            .unwrap()
-            .queue_events_in_memory(0, 0,  base_timestamp, &mut write_request)
+            .queue_events_in_memory(0, 0, base_timestamp, &mut write_request)
             .unwrap();
 
-        writer.as_mut().unwrap().sync_with_rollback().await.unwrap();
+        writer.sync_with_rollback().await.unwrap();
 
         payload_size as u64 + 19
     }
@@ -71,7 +73,6 @@ mod test_pagination {
             .spawn(|| async move {
                 let aggregate_read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
-                    
                 };
 
                 let aggregate_write_config = AggregateWriteConfig {
@@ -110,18 +111,17 @@ mod test_pagination {
                 let aggregate_resources = aggregates_cache.get_aggregate_resources(&aggregate_key);
                 let writer = aggregate_resources.get_writer(true).await.unwrap();
                 let reader = aggregate_resources.get_reader(true).await.unwrap();
-                let writer_ref = writer.as_ref().unwrap();
-                let reader_ref = reader.as_ref().unwrap();
 
                 // Set max_bytes to fit only first 2 batches (approximately)
                 let max_bytes = (total_size / 5 * 2) as usize;
 
                 let read_filters = ReadFilters::new(1);
-                let read_result = reader_ref
+                let read_result = reader
                     .read(
-                        writer_ref.minimum_available_event_batch_index,
-                        writer_ref.file_len_metadata,
-                        writer_ref.file_len_event_batch,
+                        None,
+                        writer.minimum_available_event_batch_index,
+                        writer.file_len_metadata,
+                        writer.file_len_event_batch,
                         &read_filters,
                         Some(max_bytes),
                     )
@@ -136,11 +136,8 @@ mod test_pagination {
                 assert!(read_result.next_event_batch_index.is_some());
 
                 // Verify the next index is correct
-                let last_returned_index = read_result
-                    .event_batches
-                    .last()
-                    .unwrap()
-                    .event_batch_index;
+                let last_returned_index =
+                    read_result.event_batches.last().unwrap().event_batch_index;
                 assert_eq!(
                     read_result.next_event_batch_index.unwrap(),
                     last_returned_index + 1
@@ -156,7 +153,6 @@ mod test_pagination {
             .spawn(|| async move {
                 let aggregate_read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
-                    
                 };
 
                 let aggregate_write_config = AggregateWriteConfig {
@@ -201,14 +197,13 @@ mod test_pagination {
                 let first_page = {
                     let writer = aggregate_resources.get_writer(true).await.unwrap();
                     let reader = aggregate_resources.get_reader(true).await.unwrap();
-                    let writer_ref = writer.as_ref().unwrap();
-                    let reader_ref = reader.as_ref().unwrap();
 
-                    reader_ref
+                    reader
                         .read(
-                            writer_ref.minimum_available_event_batch_index,
-                            writer_ref.file_len_metadata,
-                            writer_ref.file_len_event_batch,
+                            None,
+                            writer.minimum_available_event_batch_index,
+                            writer.file_len_metadata,
+                            writer.file_len_event_batch,
                             &read_filters,
                             Some(max_bytes),
                         )
@@ -225,14 +220,13 @@ mod test_pagination {
                 let second_page = {
                     let writer = aggregate_resources.get_writer(true).await.unwrap();
                     let reader = aggregate_resources.get_reader(true).await.unwrap();
-                    let writer_ref = writer.as_ref().unwrap();
-                    let reader_ref = reader.as_ref().unwrap();
 
-                    reader_ref
+                    reader
                         .read(
-                            writer_ref.minimum_available_event_batch_index,
-                            writer_ref.file_len_metadata,
-                            writer_ref.file_len_event_batch,
+                            None,
+                            writer.minimum_available_event_batch_index,
+                            writer.file_len_metadata,
+                            writer.file_len_event_batch,
                             &read_filters_page_2,
                             Some(max_bytes),
                         )
@@ -263,7 +257,6 @@ mod test_pagination {
             .spawn(|| async move {
                 let aggregate_read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
-                    
                 };
 
                 let aggregate_write_config = AggregateWriteConfig {
@@ -305,18 +298,17 @@ mod test_pagination {
                 let aggregate_resources = aggregates_cache.get_aggregate_resources(&aggregate_key);
                 let writer = aggregate_resources.get_writer(true).await.unwrap();
                 let reader = aggregate_resources.get_reader(true).await.unwrap();
-                let writer_ref = writer.as_ref().unwrap();
-                let reader_ref = reader.as_ref().unwrap();
 
                 // Filter to only client_id 123 and set max_bytes to fit only 1 batch
                 let max_bytes = (total_size / 3) as usize;
                 let read_filters = ReadFilters::new(1).include_client_id(123);
 
-                let read_result = reader_ref
+                let read_result = reader
                     .read(
-                        writer_ref.minimum_available_event_batch_index,
-                        writer_ref.file_len_metadata,
-                        writer_ref.file_len_event_batch,
+                        None,
+                        writer.minimum_available_event_batch_index,
+                        writer.file_len_metadata,
+                        writer.file_len_event_batch,
                         &read_filters,
                         Some(max_bytes),
                     )
@@ -343,7 +335,6 @@ mod test_pagination {
             .spawn(|| async move {
                 let aggregate_read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
-                    
                 };
 
                 let aggregate_write_config = AggregateWriteConfig {
@@ -381,14 +372,13 @@ mod test_pagination {
 
                 let aggregate_resources = aggregates_cache.get_aggregate_resources(&aggregate_key);
                 let writer = aggregate_resources.get_writer(true).await.unwrap();
-                let writer_ref = writer.as_ref().unwrap();
 
                 // Read from writer cache with max_bytes limiting to first 2 batches
                 let max_bytes = (sizes[0] + sizes[1]) as usize + 10;
                 let read_filters = ReadFilters::new(1);
 
-                let cache_read = writer_ref
-                    .maybe_read_cached_events(&read_filters, Some(max_bytes))
+                let cache_read = writer
+                    .maybe_read_cached_events(None, &read_filters, Some(max_bytes))
                     .unwrap();
 
                 // Should return only first 2 batches
@@ -404,10 +394,9 @@ mod test_pagination {
                 }
 
                 // Read next page from cache
-                let next_filters =
-                    ReadFilters::new(cache_read.next_event_batch_index.unwrap());
-                let cache_read_page_2 = writer_ref
-                    .maybe_read_cached_events(&next_filters, Some(max_bytes))
+                let next_filters = ReadFilters::new(cache_read.next_event_batch_index.unwrap());
+                let cache_read_page_2 = writer
+                    .maybe_read_cached_events(None, &next_filters, Some(max_bytes))
                     .unwrap();
 
                 // Verify no overlap
@@ -428,7 +417,6 @@ mod test_pagination {
             .spawn(|| async move {
                 let aggregate_read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
-                    
                 };
 
                 let aggregate_write_config = AggregateWriteConfig {
@@ -449,32 +437,24 @@ mod test_pagination {
                 let aggregate_key = AggregateKey::new(1, 1, 1);
 
                 // Write a batch
-                let compressed_size = write_batch_with_size(
-                    &aggregates_cache,
-                    &aggregate_key,
-                    123,
-                    10,
-                    1,
-                    1000,
-                    200,
-                )
-                .await;
+                let compressed_size =
+                    write_batch_with_size(&aggregates_cache, &aggregate_key, 123, 10, 1, 1000, 200)
+                        .await;
 
                 let aggregate_resources = aggregates_cache.get_aggregate_resources(&aggregate_key);
                 let writer = aggregate_resources.get_writer(true).await.unwrap();
                 let reader = aggregate_resources.get_reader(true).await.unwrap();
-                let writer_ref = writer.as_ref().unwrap();
-                let reader_ref = reader.as_ref().unwrap();
 
                 // Set max_bytes smaller than the first batch
                 let max_bytes = (compressed_size / 2) as usize;
                 let read_filters = ReadFilters::new(1);
 
-                let result = reader_ref
+                let result = reader
                     .read(
-                        writer_ref.minimum_available_event_batch_index,
-                        writer_ref.file_len_metadata,
-                        writer_ref.file_len_event_batch,
+                        None,
+                        writer.minimum_available_event_batch_index,
+                        writer.file_len_metadata,
+                        writer.file_len_event_batch,
                         &read_filters,
                         Some(max_bytes),
                     )
@@ -493,8 +473,7 @@ mod test_pagination {
                 }
 
                 // Test same error from writer cache
-                let cache_result = writer_ref
-                    .maybe_read_cached_events(&read_filters, Some(max_bytes));
+                let cache_result = writer.maybe_read_cached_events(None, &read_filters, Some(max_bytes));
 
                 match cache_result {
                     Err(crate::write_operations::write_error::WriteError::MaxBytesTooSmall {
@@ -517,7 +496,6 @@ mod test_pagination {
             .spawn(|| async move {
                 let aggregate_read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
-                    
                 };
 
                 let aggregate_write_config = AggregateWriteConfig {
@@ -555,18 +533,17 @@ mod test_pagination {
                 let aggregate_resources = aggregates_cache.get_aggregate_resources(&aggregate_key);
                 let writer = aggregate_resources.get_writer(true).await.unwrap();
                 let reader = aggregate_resources.get_reader(true).await.unwrap();
-                let writer_ref = writer.as_ref().unwrap();
-                let reader_ref = reader.as_ref().unwrap();
 
                 // Set max_bytes large enough for all batches
                 let max_bytes = (total_size * 2) as usize;
                 let read_filters = ReadFilters::new(1);
 
-                let read_result = reader_ref
+                let read_result = reader
                     .read(
-                        writer_ref.minimum_available_event_batch_index,
-                        writer_ref.file_len_metadata,
-                        writer_ref.file_len_event_batch,
+                        None,
+                        writer.minimum_available_event_batch_index,
+                        writer.file_len_metadata,
+                        writer.file_len_event_batch,
                         &read_filters,
                         Some(max_bytes),
                     )
@@ -589,7 +566,6 @@ mod test_pagination {
             .spawn(|| async move {
                 let aggregate_read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
-                    
                 };
 
                 let aggregate_write_config = AggregateWriteConfig {
@@ -628,18 +604,17 @@ mod test_pagination {
                 let aggregate_resources = aggregates_cache.get_aggregate_resources(&aggregate_key);
                 let writer = aggregate_resources.get_writer(true).await.unwrap();
                 let reader = aggregate_resources.get_reader(true).await.unwrap();
-                let writer_ref = writer.as_ref().unwrap();
-                let reader_ref = reader.as_ref().unwrap();
 
                 // Filter by timestamp and limit bytes to fit 2 batches
                 let max_bytes = (sizes[0] + sizes[1]) as usize + 10;
                 let read_filters = ReadFilters::new(1).min_event_timestamp(1200);
 
-                let read_result = reader_ref
+                let read_result = reader
                     .read(
-                        writer_ref.minimum_available_event_batch_index,
-                        writer_ref.file_len_metadata,
-                        writer_ref.file_len_event_batch,
+                        None,
+                        writer.minimum_available_event_batch_index,
+                        writer.file_len_metadata,
+                        writer.file_len_event_batch,
                         &read_filters,
                         Some(max_bytes),
                     )

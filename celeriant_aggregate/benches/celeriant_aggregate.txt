@@ -1,0 +1,20 @@
+group                                           celeriant_aggregate
+-----                                           -------------------
+read_cache/config/cache_16mb                    1.00    197.2±5.85ms        ? ?/sec
+read_cache/config/cache_1mb                     1.00    199.8±1.42ms        ? ?/sec
+read_cache/config/cache_64mb                    1.00     68.1±6.23µs        ? ?/sec
+read_cache/config/cache_disabled                1.00  1025.8±38.55µs        ? ?/sec
+read_filters/filter/batch_range_first_half      1.00   368.4±29.83µs        ? ?/sec
+read_filters/filter/batch_range_last_quarter    1.00   236.1±20.73µs        ? ?/sec
+read_filters/filter/client_id_filter            1.00   648.4±24.41µs        ? ?/sec
+read_filters/filter/combined_batch_and_type     1.00   386.3±28.36µs        ? ?/sec
+read_filters/filter/event_type_multiple         1.00   657.5±29.28µs        ? ?/sec
+read_filters/filter/event_type_single           1.00   674.3±42.01µs        ? ?/sec
+read_filters/filter/no_filter                   1.00   646.3±33.93µs        ? ?/sec
+read_filters/filter/timestamp_range             1.00   372.9±46.26µs        ? ?/sec
+write_fsync_modes/mode/background_async         1.00      5.6±0.13ms   437.0 MB/sec
+write_fsync_modes/mode/delay_100us              1.00      9.4±0.23ms   260.5 MB/sec
+write_fsync_modes/mode/delay_10ms               1.00     19.7±0.35ms   124.0 MB/sec
+write_fsync_modes/mode/delay_1ms                1.00      9.4±0.16ms   259.9 MB/sec
+write_fsync_modes/mode/delay_20us               1.00      9.2±0.24ms   264.5 MB/sec
+write_fsync_modes/mode/immediate                1.00  1954.1±23.55ms  1279.4 KB/sec

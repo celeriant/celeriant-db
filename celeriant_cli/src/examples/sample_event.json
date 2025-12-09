@@ -1,0 +1,19 @@
+{
+    "order_id": "ORD-12345",
+    "customer_id": "CUST-001",
+    "items": [
+        {
+            "product_id": "PROD-A",
+            "quantity": 2,
+            "price": 29.99
+        },
+        {
+            "product_id": "PROD-B", 
+            "quantity": 1,
+            "price": 49.99
+        }
+    ],
+    "total": 109.97,
+    "status": "created",
+    "timestamp": "2024-01-15T10:30:00Z"
+}

@@ -16,6 +16,7 @@ pub enum RequestType {
     TrimStart = 7,
     Delete = 8,
     UpdateCacheLimits = 9,
+    Watch = 10,
 }
 
 impl RequestType {
@@ -30,6 +31,7 @@ impl RequestType {
             7 => Ok(RequestType::TrimStart),
             8 => Ok(RequestType::Delete),
             9 => Ok(RequestType::UpdateCacheLimits),
+            10 => Ok(RequestType::Watch),
             _ => Err(WireError::UnknownRequestType(value)),
         }
     }
@@ -44,6 +46,7 @@ impl RequestType {
                 | RequestType::TrimStart
                 | RequestType::Delete
                 | RequestType::UpdateCacheLimits
+                | RequestType::Watch
         )
     }
 }
@@ -60,6 +63,7 @@ pub enum Request {
     TrimStart(TrimStartRequest),
     Delete(DeleteRequest),
     UpdateCacheLimits(UpdateCacheLimitsRequest),
+    Watch(ReadRequest),
 }
 
 impl Request {
@@ -74,6 +78,22 @@ impl Request {
             Request::TrimStart(_) => RequestType::TrimStart,
             Request::Delete(_) => RequestType::Delete,
             Request::UpdateCacheLimits(_) => RequestType::UpdateCacheLimits,
+            Request::Watch(_) => RequestType::Watch,
+        }
+    }
+
+    pub fn correlation_id(&self) -> Option<u128> {
+        match self {
+            Request::ListOrganisations(req) => req.correlation_id,
+            Request::ListAggregates(req) => req.correlation_id,
+            Request::UpdateCacheLimits(req) => req.correlation_id,
+            Request::Exists(req) => req.correlation_id,
+            Request::Read(req) => req.correlation_id,
+            Request::Write(req) => req.correlation_id,
+            Request::PrependBatches(req) => req.correlation_id,
+            Request::TrimStart(req) => req.correlation_id,
+            Request::Delete(req) => req.correlation_id,
+            Request::Watch(req) => req.correlation_id,
         }
     }
 
@@ -90,6 +110,7 @@ impl Request {
             Request::PrependBatches(req) => req.aggregate_key.aggregate_id,
             Request::TrimStart(req) => req.aggregate_key.aggregate_id,
             Request::Delete(req) => req.aggregate_key.aggregate_id,
+            Request::Watch(req) => req.aggregate_key.aggregate_id,
         }
     }
 
@@ -129,6 +150,9 @@ impl Request {
                 }
                 RequestType::UpdateCacheLimits => {
                     Request::UpdateCacheLimits(wire_header.read_fixed_size(reader, &mut buffer).await?)
+                }
+                RequestType::Watch => {
+                    Request::Watch(wire_header.read_fixed_size(reader, &mut buffer).await?)
                 }
                 _ => unreachable!(),
             }
@@ -174,6 +198,7 @@ impl Request {
                 Request::TrimStart(req) => WireHeader::write_fixed_size(writer, req, request_type_id, version).await,
                 Request::Delete(req) => WireHeader::write_fixed_size(writer, req, request_type_id, version).await,
                 Request::UpdateCacheLimits(req) => WireHeader::write_fixed_size(writer, req, request_type_id, version).await,
+                Request::Watch(req) => WireHeader::write_fixed_size(writer, req, request_type_id, version).await,
                 _ => unreachable!(),
             }
         } else {
@@ -217,8 +242,8 @@ mod tests {
     use crate::request::{directory_filters::DirectoryFilters, read_filters::ReadFilters};
 
     // UPDATE THIS when adding new RequestTypes - tests will fail if mismatched
-    const REQUEST_TYPE_COUNT: usize = 9;
-    const REQUEST_TYPE_MAX_ID: u32 = 9;
+    const REQUEST_TYPE_COUNT: usize = 10;
+    const REQUEST_TYPE_MAX_ID: u32 = 10;
 
     impl RequestType {
         /// Returns all RequestType variants. Adding a new variant without updating
@@ -234,6 +259,7 @@ mod tests {
                 RequestType::TrimStart,
                 RequestType::Delete,
                 RequestType::UpdateCacheLimits,
+                RequestType::Watch,
             ]
         }
     }
@@ -298,6 +324,11 @@ mod tests {
             RequestType::UpdateCacheLimits => Request::UpdateCacheLimits(UpdateCacheLimitsRequest {
                 correlation_id: Some(108),
                 aggregate_write_max_data_cache_size_bytes: 1024,
+            }),
+            RequestType::Watch => Request::Watch(ReadRequest {
+                correlation_id: Some(103),
+                aggregate_key: key,
+                filters: ReadFilters::new(1),
             }),
         }
     }

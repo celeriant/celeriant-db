@@ -10,8 +10,9 @@ members = [
     "celeriant_wal",
     "celeriant_wire",
     "celeriant_crypto", 
-    "celeriant_runtimes"
-, "celeriant_sidecar"]
+    "celeriant_runtimes",
+    "celeriant_cli"
+, "celeriant_sidecar", "celeriant_client_demo"]
 
 resolver = "2"
 
@@ -56,3 +57,5 @@ flume = "0.11.1"
 bytes = "1.11.0"
 signal-hook = "0.3.18"
 async-trait = "0.1.89"
+walkdir = "2.5.0"
+directories = "6.0.0"

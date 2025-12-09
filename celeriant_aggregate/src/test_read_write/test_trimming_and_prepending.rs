@@ -4,17 +4,22 @@ mod test_trimming_and_prepending {
 
     use celeriant_disk::files::open_dma_files::existing_file_read_only_dma;
     use celeriant_msg::request::{read_filters::ReadFilters, requests::WriteRequest};
-    use celeriant_wal::{aggregate_key::AggregateKey, compression_type::CompressionType, wal::event_item::EventItem};
+    use celeriant_wal::{
+        aggregate_key::AggregateKey, compression_type::CompressionType, wal::event_item::EventItem,
+    };
     use glommio::{LocalExecutorBuilder, Placement};
 
     use crate::{
-        cache::aggregate_cache::AggregateCache, node_config::test_node_config::test_config, read_operations::{
+        cache::aggregate_cache::AggregateCache,
+        node_config::test_node_config::test_config,
+        read_operations::{
             read_error::ReadError, read_operations::ReadOperations,
             read_structures::AggregateReadConfig,
-        }, write_operations::{
-            write_error::WriteError, write_operations::WriteOperations,
-            aggregate_write_config::{AggregateWriteConfig},
-        }
+        },
+        write_operations::{
+            aggregate_write_config::AggregateWriteConfig, write_error::WriteError,
+            write_operations::WriteOperations,
+        },
     };
 
     /// Creates a test aggregate key with predictable values
@@ -23,7 +28,7 @@ mod test_trimming_and_prepending {
     }
 
     /// Creates test events with sequential indexes
-    /// 
+    ///
     /// # Parameters
     /// * `starting_client_event_index` - Base index for client event indexes
     /// * `count` - Number of events to create
@@ -34,10 +39,10 @@ mod test_trimming_and_prepending {
         base_timestamp: u64,
     ) -> Vec<EventItem> {
         let mut events = Vec::with_capacity(count);
-        
+
         for i in 0..count {
             let client_event_index = starting_client_event_index + i as u64;
-            
+
             events.push(EventItem {
                 client_event_index,
                 event_index: 0, // Will be set by writer
@@ -49,7 +54,7 @@ mod test_trimming_and_prepending {
                 iv: None,
             });
         }
-        
+
         events
     }
 
@@ -82,12 +87,10 @@ mod test_trimming_and_prepending {
         let mut writer = aggregate_resources.get_writer_mut(true).await.unwrap();
 
         writer
-            .as_mut()
-            .unwrap()
-            .queue_events_in_memory(0, 0,  base_timestamp, &mut write_request)
+            .queue_events_in_memory(0, 0, base_timestamp, &mut write_request)
             .unwrap();
 
-        writer.as_mut().unwrap().sync_with_rollback().await.unwrap();
+        writer.sync_with_rollback().await.unwrap();
     }
 
     #[test]
@@ -97,7 +100,6 @@ mod test_trimming_and_prepending {
             .spawn(|| async move {
                 let aggregate_read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
-                    
                 };
 
                 let aggregate_write_config = AggregateWriteConfig {
@@ -130,58 +132,57 @@ mod test_trimming_and_prepending {
                     )
                     .await;
                 }
-                
+
                 let aggregate_resources = aggregates_cache.get_aggregate_resources(&aggregate_key);
 
                 let first_batch = {
                     let writer = aggregate_resources.get_writer(true).await.unwrap();
-                    let writer_ref = writer.as_ref().unwrap();
+
                     // Let's get the first two batches from the writer cache to add back later
                     let filters = ReadFilters::new(1).to_event_batch_index(1);
-                    writer_ref.maybe_read_cached_events(&filters, None).unwrap()
+                    writer.maybe_read_cached_events(None, &filters, None).unwrap()
                 };
 
                 let first_three_batches = {
                     let writer = aggregate_resources.get_writer(true).await.unwrap();
-                    let writer_ref = writer.as_ref().unwrap();
+
                     // Let's get the first two batches from the writer cache to add back later
                     let filters = ReadFilters::new(1).to_event_batch_index(3);
-                    writer_ref.maybe_read_cached_events(&filters, None).unwrap()
+                    writer.maybe_read_cached_events(None, &filters, None).unwrap()
                 };
 
                 let first_two_batches = {
                     let writer = aggregate_resources.get_writer(true).await.unwrap();
-                    let writer_ref = writer.as_ref().unwrap();
+
                     // Let's get the first two batches from the writer cache to add back later
                     let filters = ReadFilters::new(1).to_event_batch_index(2);
-                    writer_ref.maybe_read_cached_events(&filters, None).unwrap()
+                    writer.maybe_read_cached_events(None, &filters, None).unwrap()
                 };
 
                 {
                     //Everything is cached
                     let writer = aggregate_resources.get_writer(true).await.unwrap();
-                    let writer_ref = writer.as_ref().unwrap();
+
                     // Let's get the first two batches from the writer cache to add back later
                     let filters = ReadFilters::new(1);
-                    writer_ref.maybe_read_cached_events(&filters, None).unwrap()
+                    writer.maybe_read_cached_events(None, &filters, None).unwrap()
                 };
 
                 // Check we can do a read of all batches
                 {
-                    let mut writer = aggregate_resources.get_writer_mut(true).await.unwrap();
+                    let writer = aggregate_resources.get_writer_mut(true).await.unwrap();
                     let reader = aggregate_resources.get_reader(true).await.unwrap();
-                    let reader_ref = reader.as_ref().unwrap();
-                    let writer_ref = writer.as_mut().unwrap();
 
-                    assert_eq!(writer_ref.minimum_available_event_batch_index, 1);
+                    assert_eq!(writer.minimum_available_event_batch_index, 1);
 
                     // Should be able to read from batch 3
                     let read_filters = ReadFilters::new(1);
-                    let read_result = reader_ref
+                    let read_result = reader
                         .read(
-                            writer_ref.minimum_available_event_batch_index,
-                            writer_ref.file_len_metadata,
-                            writer_ref.file_len_event_batch,
+                            None,
+                            writer.minimum_available_event_batch_index,
+                            writer.file_len_metadata,
+                            writer.file_len_event_batch,
                             &read_filters,
                             None,
                         )
@@ -195,15 +196,13 @@ mod test_trimming_and_prepending {
                     // Get file positions to trim first 2 batches
                     let reader = aggregate_resources.get_reader(true).await.unwrap();
                     let writer = aggregate_resources.get_writer(true).await.unwrap();
-                    let reader_ref = reader.as_ref().unwrap();
-                    let writer_ref = writer.as_ref().unwrap();
 
-                    reader_ref
+                    reader
                         .get_file_positions(
-                            writer_ref.minimum_available_event_batch_index,
+                            writer.minimum_available_event_batch_index,
                             3, // Keep from batch 3 onwards
-                            writer_ref.file_len_metadata,
-                            writer_ref.file_len_event_batch,
+                            writer.file_len_metadata,
+                            writer.file_len_event_batch,
                         )
                         .await
                         .unwrap()
@@ -212,14 +211,14 @@ mod test_trimming_and_prepending {
                 {
                     // Perform trim_start
                     let mut writer = aggregate_resources.get_writer_mut(true).await.unwrap();
-                    let writer_ref = writer.as_mut().unwrap();
-                    let mut reader = aggregate_resources.get_reader_mut(true).await.unwrap();
-                    let reader_ref = reader.as_mut().unwrap();
 
-                    writer_ref.trim_start(
-                            3, 
-                            reader_ref.metadata_dma_file.as_ref().unwrap(), 
-                            reader_ref.event_batches_dma_file.as_ref().unwrap(),
+                    let mut reader = aggregate_resources.get_reader_mut(true).await.unwrap();
+
+                    writer
+                        .trim_start(
+                            3,
+                            reader.metadata_dma_file.as_ref().unwrap(),
+                            reader.event_batches_dma_file.as_ref().unwrap(),
                             file_positions.metadata_position,
                             file_positions.event_batch_position,
                         )
@@ -227,33 +226,48 @@ mod test_trimming_and_prepending {
                         .unwrap();
 
                     // Verify writer cache now only has batches 3,4,5
-                    assert_eq!(writer_ref.data_cache.len(), 3);
-                    assert_eq!(writer_ref.data_cache.iter().last().unwrap().event_batch_item.event_batch_index, 5);
-                    
-                    let data_requirements = reader_ref.replace_dma_files(
-                        existing_file_read_only_dma(&aggregate_resources.path_metadata).await.unwrap(),
-                        existing_file_read_only_dma(&aggregate_resources.path_event_batches).await.unwrap(),
-                    ).await.unwrap();
+                    assert_eq!(writer.data_cache.len(), 3);
+                    assert_eq!(
+                        writer
+                            .data_cache
+                            .iter()
+                            .last()
+                            .unwrap()
+                            .event_batch_item
+                            .event_batch_index,
+                        5
+                    );
 
-                    writer_ref.update_write_operations_data_requirements(data_requirements);
+                    let data_requirements = reader
+                        .replace_dma_files(
+                            existing_file_read_only_dma(&aggregate_resources.path_metadata)
+                                .await
+                                .unwrap(),
+                            existing_file_read_only_dma(&aggregate_resources.path_event_batches)
+                                .await
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+
+                    writer.update_write_operations_data_requirements(data_requirements);
                 }
 
                 // Verify batches 1 and 2 are gone, 3-5 remain
                 {
-                    let mut writer = aggregate_resources.get_writer_mut(true).await.unwrap();
+                    let writer = aggregate_resources.get_writer_mut(true).await.unwrap();
                     let reader = aggregate_resources.get_reader(true).await.unwrap();
-                    let reader_ref = reader.as_ref().unwrap();
-                    let writer_ref = writer.as_mut().unwrap();
 
-                    assert_eq!(writer_ref.minimum_available_event_batch_index, 3);
+                    assert_eq!(writer.minimum_available_event_batch_index, 3);
 
                     // Should be able to read from batch 3
                     let read_filters = ReadFilters::new(3);
-                    let read_result = reader_ref
+                    let read_result = reader
                         .read(
-                            writer_ref.minimum_available_event_batch_index,
-                            writer_ref.file_len_metadata,
-                            writer_ref.file_len_event_batch,
+                            None,
+                            writer.minimum_available_event_batch_index,
+                            writer.file_len_metadata,
+                            writer.file_len_event_batch,
                             &read_filters,
                             None,
                         )
@@ -261,25 +275,17 @@ mod test_trimming_and_prepending {
                         .unwrap();
 
                     assert_eq!(read_result.event_batches.len(), 3);
-                    assert_eq!(
-                        read_result.event_batches[0].event_batch_index,
-                        3
-                    );
-                    assert_eq!(
-                        read_result.event_batches[1].event_batch_index,
-                        4
-                    );
-                    assert_eq!(
-                        read_result.event_batches[2].event_batch_index,
-                        5
-                    );
+                    assert_eq!(read_result.event_batches[0].event_batch_index, 3);
+                    assert_eq!(read_result.event_batches[1].event_batch_index, 4);
+                    assert_eq!(read_result.event_batches[2].event_batch_index, 5);
 
                     let read_filters = ReadFilters::new(2);
-                    let result = reader_ref
+                    let result = reader
                         .read(
-                            writer_ref.minimum_available_event_batch_index,
-                            writer_ref.file_len_metadata,
-                            writer_ref.file_len_event_batch,
+                            None,
+                            writer.minimum_available_event_batch_index,
+                            writer.file_len_metadata,
+                            writer.file_len_event_batch,
                             &read_filters,
                             None,
                         )
@@ -299,7 +305,6 @@ mod test_trimming_and_prepending {
 
                 {
                     let mut writer = aggregate_resources.get_writer_mut(true).await.unwrap();
-                    let writer_ref = writer.as_mut().unwrap();
 
                     //Write some more events at the end
                     let events = create_test_events(99, 3, 8778);
@@ -316,84 +321,113 @@ mod test_trimming_and_prepending {
                         allow_create: false,
                         durable_write_with_delay_us: None,
                     };
-                    writer_ref.queue_events_in_memory(0, 0,  8779, &mut write_options).unwrap();
+                    writer
+                        .queue_events_in_memory(0, 0, 8779, &mut write_options)
+                        .unwrap();
 
-                    writer_ref.sync_with_rollback().await.unwrap();
+                    writer.sync_with_rollback().await.unwrap();
                 }
 
                 {
                     let mut writer = aggregate_resources.get_writer_mut(true).await.unwrap();
                     let mut reader = aggregate_resources.get_reader_mut(true).await.unwrap();
-                    let reader_ref = reader.as_mut().unwrap();
-                    let writer_ref = writer.as_mut().unwrap();
-
 
                     //Now lets try and prepend back the trimmed batches
                     //First error condition - creating a gap
-                    let err = writer_ref.prepend_batches(CompressionType::None, &first_batch.event_batches, reader_ref.metadata_dma_file.as_ref().unwrap(), reader_ref.event_batches_dma_file.as_ref().unwrap()).await.unwrap_err();
+                    let err = writer
+                        .prepend_batches(
+                            CompressionType::None,
+                            &first_batch.event_batches,
+                            reader.metadata_dma_file.as_ref().unwrap(),
+                            reader.event_batches_dma_file.as_ref().unwrap(),
+                        )
+                        .await
+                        .unwrap_err();
                     match err {
-                        WriteError::PrependCreatesEventBatchIndexGap { 
+                        WriteError::PrependCreatesEventBatchIndexGap {
                             provided_last_batch_index,
-                            current_first_event_batch_index 
+                            current_first_event_batch_index,
                         } => {
                             assert_eq!(provided_last_batch_index, 1);
                             assert_eq!(current_first_event_batch_index, 3);
                         }
-                        _ => panic!("Expected PrependCreatesEventBatchIndexGap error, got {:?}", err),
+                        _ => panic!(
+                            "Expected PrependCreatesEventBatchIndexGap error, got {:?}",
+                            err
+                        ),
                     }
 
                     //Second error condition - overlap
-                    let err = writer_ref.prepend_batches(CompressionType::None, &first_three_batches.event_batches, reader_ref.metadata_dma_file.as_ref().unwrap(), reader_ref.event_batches_dma_file.as_ref().unwrap()).await.unwrap_err();
+                    let err = writer
+                        .prepend_batches(
+                            CompressionType::None,
+                            &first_three_batches.event_batches,
+                            reader.metadata_dma_file.as_ref().unwrap(),
+                            reader.event_batches_dma_file.as_ref().unwrap(),
+                        )
+                        .await
+                        .unwrap_err();
                     match err {
-                        WriteError::PrependCreatesEventBatchIndexGap { 
+                        WriteError::PrependCreatesEventBatchIndexGap {
                             provided_last_batch_index,
-                            current_first_event_batch_index 
+                            current_first_event_batch_index,
                         } => {
                             assert_eq!(provided_last_batch_index, 3);
                             assert_eq!(current_first_event_batch_index, 3);
                         }
-                        _ => panic!("Expected PrependCreatesEventBatchIndexGap error, got {:?}", err),
+                        _ => panic!(
+                            "Expected PrependCreatesEventBatchIndexGap error, got {:?}",
+                            err
+                        ),
                     }
 
-                    writer_ref.prepend_batches(CompressionType::Snappy, &first_two_batches.event_batches, reader_ref.metadata_dma_file.as_ref().unwrap(), reader_ref.event_batches_dma_file.as_ref().unwrap()).await.unwrap();
-                    let data_requirements = reader_ref.replace_dma_files(
-                        existing_file_read_only_dma(&aggregate_resources.path_metadata).await.unwrap(),
-                        existing_file_read_only_dma(&aggregate_resources.path_event_batches).await.unwrap(),
-                    ).await.unwrap();
+                    writer
+                        .prepend_batches(
+                            CompressionType::Snappy,
+                            &first_two_batches.event_batches,
+                            reader.metadata_dma_file.as_ref().unwrap(),
+                            reader.event_batches_dma_file.as_ref().unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    let data_requirements = reader
+                        .replace_dma_files(
+                            existing_file_read_only_dma(&aggregate_resources.path_metadata)
+                                .await
+                                .unwrap(),
+                            existing_file_read_only_dma(&aggregate_resources.path_event_batches)
+                                .await
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
 
-                    writer_ref.update_write_operations_data_requirements(data_requirements);
+                    writer.update_write_operations_data_requirements(data_requirements);
                 }
 
                 {
                     let writer = aggregate_resources.get_writer(true).await.unwrap();
                     let reader = aggregate_resources.get_reader(true).await.unwrap();
-                    let reader_ref = reader.as_ref().unwrap();
-                    let writer_ref = writer.as_ref().unwrap();
 
                     let read_filters = ReadFilters::new(1);
-                    let read_result = reader_ref
+                    let read_result = reader
                         .read(
-                            writer_ref.minimum_available_event_batch_index,
-                            writer_ref.file_len_metadata,
-                            writer_ref.file_len_event_batch,
+                            None,
+                            writer.minimum_available_event_batch_index,
+                            writer.file_len_metadata,
+                            writer.file_len_event_batch,
                             &read_filters,
                             None,
                         )
-                        .await.unwrap();
+                        .await
+                        .unwrap();
 
                     assert_eq!(read_result.event_batches.len(), 6);
-                    assert_eq!(
-                        read_result.event_batches[0].event_batch_index,
-                        1
-                    );
-                    assert_eq!(
-                        read_result.event_batches[5].event_batch_index,
-                        6
-                    );
+                    assert_eq!(read_result.event_batches[0].event_batch_index, 1);
+                    assert_eq!(read_result.event_batches[5].event_batch_index, 6);
                 }
             })
             .unwrap();
         handle.join().unwrap();
     }
-
 }

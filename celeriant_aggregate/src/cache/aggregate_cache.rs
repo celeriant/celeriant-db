@@ -59,8 +59,8 @@ impl AggregateCache {
             let mut reader = aggregate_resources.get_reader_mut(false).await?;
             let mut writer = aggregate_resources.get_writer_mut(false).await?;
 
-            reader.as_mut().unwrap().close().await?;
-            writer.as_mut().unwrap().close().await?;
+            reader.close().await?;
+            writer.close().await?;
         }
 
         Ok(())

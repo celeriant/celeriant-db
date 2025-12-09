@@ -420,6 +420,7 @@ pub trait WriteOperations {
 
     fn maybe_read_cached_events(
         &self,
+        correlation_id: Option<u128>,
         filters: &ReadFilters,
         max_bytes: Option<usize>,
     ) -> Result<ReadResponse, WriteError>;
@@ -554,6 +555,7 @@ impl WriteOperations for WriteOperationsWithDmaFile {
         }
 
         let mut write_response = WriteResponse {
+            correlation_id: write_request.correlation_id,
             event_batch_index: self.next_event_batch_index,
             start_event_index: self.next_event_index,
             server_timestamp,
@@ -799,6 +801,7 @@ impl WriteOperations for WriteOperationsWithDmaFile {
 
     fn maybe_read_cached_events(
         &self,
+        correlation_id: Option<u128>,
         filters: &ReadFilters,
         max_bytes: Option<usize>,
     ) -> Result<ReadResponse, WriteError> {
@@ -871,7 +874,7 @@ impl WriteOperations for WriteOperationsWithDmaFile {
         }
 
         Ok(ReadResponse {
-            correlation_id: None,
+            correlation_id,
             event_batches: filtered_event_batches,
             next_event_batch_index,
         })

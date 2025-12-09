@@ -44,6 +44,7 @@ pub enum WriteError {
         current_max_bytes: u64,
         required_max_bytes: u64,
     },
+    InvalidLeaseIndex,
 }
 
 impl From<WireFormatError> for WriteError {

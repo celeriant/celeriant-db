@@ -3,17 +3,18 @@ pub mod test_corruption {
     use std::num::NonZeroUsize;
 
     use celeriant_msg::request::requests::WriteRequest;
-    use celeriant_wal::{aggregate_key::AggregateKey, compression_type, wal::event_item::EventItem};
-    use glommio::{io::OpenOptions, LocalExecutorBuilder, Placement};
+    use celeriant_wal::{
+        aggregate_key::AggregateKey, compression_type, wal::event_item::EventItem,
+    };
+    use glommio::{LocalExecutorBuilder, Placement, io::OpenOptions};
 
     use crate::{
-        cache::aggregate_cache::AggregateCache, node_config::test_node_config::test_config, read_operations::{
-            read_operations::ReadOperations,
-            read_structures::AggregateReadConfig,
-        }, write_operations::{
-            write_operations::WriteOperations,
-            aggregate_write_config::{AggregateWriteConfig},
-        }
+        cache::aggregate_cache::AggregateCache,
+        node_config::test_node_config::test_config,
+        read_operations::{read_operations::ReadOperations, read_structures::AggregateReadConfig},
+        write_operations::{
+            aggregate_write_config::AggregateWriteConfig, write_operations::WriteOperations,
+        },
     };
 
     pub async fn write_batch(
@@ -51,22 +52,20 @@ pub mod test_corruption {
         let mut writer = aggregate_resources.get_writer_mut(true).await.unwrap();
 
         writer
-            .as_mut()
-            .unwrap()
-            .queue_events_in_memory(0, 0,  998, &mut write_request)
+            .queue_events_in_memory(0, 0, 998, &mut write_request)
             .unwrap();
 
-        writer.as_mut().unwrap().sync_with_rollback().await.unwrap();
+        writer.sync_with_rollback().await.unwrap();
 
         if !skip_close {
-            writer.as_mut().unwrap().close().await.unwrap();
+            writer.close().await.unwrap();
         }
     }
 
     fn corrupt_event_batches_file(data_folder: &str, append_bytes: u64) {
         use std::fs::OpenOptions;
         use std::io::Write;
-        
+
         let path = format!("{}/1/1/1/event_batches.bin", data_folder);
         let mut file = OpenOptions::new()
             .write(true)
@@ -98,7 +97,6 @@ pub mod test_corruption {
             .spawn(|| async move {
                 let aggregate_read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
-                    
                 };
 
                 let aggregate_write_config = AggregateWriteConfig {
@@ -125,8 +123,6 @@ pub mod test_corruption {
                 let aggregate_resources = aggregates_cache.get_aggregate_resources(&aggregate_key);
                 let reader = aggregate_resources.get_reader(true).await.unwrap();
                 let result = reader
-                    .as_ref()
-                    .unwrap()
                     .get_write_operations_data_requirements()
                     .await
                     .unwrap();
@@ -139,14 +135,12 @@ pub mod test_corruption {
         handle.join().unwrap();
     }
 
-
     #[test]
     fn test_1_single_batch_no_close_auto_trim() {
         let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
             .spawn(|| async move {
                 let aggregate_read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
-                    
                 };
 
                 let aggregate_write_config = AggregateWriteConfig {
@@ -173,8 +167,6 @@ pub mod test_corruption {
                 let aggregate_resources = aggregates_cache.get_aggregate_resources(&aggregate_key);
                 let reader = aggregate_resources.get_reader(true).await.unwrap();
                 let result = reader
-                    .as_ref()
-                    .unwrap()
                     .get_write_operations_data_requirements()
                     .await
                     .unwrap();
@@ -195,7 +187,6 @@ pub mod test_corruption {
             .spawn(|| async move {
                 let aggregate_read_config = AggregateReadConfig {
                     max_chunk_size: 1 << 20,
-                    
                 };
 
                 let aggregate_write_config = AggregateWriteConfig {
@@ -226,11 +217,7 @@ pub mod test_corruption {
                 // Should fail with CorruptEventBatch error (no auto-repair possible)
                 let aggregate_resources = aggregates_cache.get_aggregate_resources(&aggregate_key);
                 let reader = aggregate_resources.get_reader(true).await.unwrap();
-                let result = reader
-                    .as_ref()
-                    .unwrap()
-                    .get_write_operations_data_requirements()
-                    .await;
+                let result = reader.get_write_operations_data_requirements().await;
 
                 assert!(result.is_ok());
             })
@@ -276,8 +263,6 @@ pub mod test_corruption {
                 let aggregate_resources = aggregates_cache.get_aggregate_resources(&aggregate_key);
                 let reader = aggregate_resources.get_reader(true).await.unwrap();
                 let result = reader
-                    .as_ref()
-                    .unwrap()
                     .get_write_operations_data_requirements()
                     .await
                     .unwrap();
@@ -290,7 +275,6 @@ pub mod test_corruption {
             .unwrap();
         handle.join().unwrap();
     }
-
 
     #[test]
     fn test_4_single_batch_partial_metadata_corrupt_auto_repair() {
@@ -330,8 +314,6 @@ pub mod test_corruption {
                 let aggregate_resources = aggregates_cache.get_aggregate_resources(&aggregate_key);
                 let reader = aggregate_resources.get_reader(true).await.unwrap();
                 let result = reader
-                    .as_ref()
-                    .unwrap()
                     .get_write_operations_data_requirements()
                     .await
                     .unwrap();
@@ -344,5 +326,4 @@ pub mod test_corruption {
             .unwrap();
         handle.join().unwrap();
     }
-
 }
