@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod test_trimming_and_prepending {
-    use std::{num::NonZeroUsize, sync::Arc};
+    use std::{num::NonZeroUsize, rc::Rc, sync::Arc};
 
     use celeriant_disk::files::open_dma_files::existing_file_read_only_dma;
     use celeriant_msg::request::{read_filters::ReadFilters, requests::WriteRequest};
@@ -10,16 +10,13 @@ mod test_trimming_and_prepending {
     use glommio::{LocalExecutorBuilder, Placement};
 
     use crate::{
-        cache::aggregate_cache::AggregateCache,
-        node_config::test_node_config::test_config,
-        read_operations::{
+        cache::aggregate_cache::AggregateCache, node_config::test_node_config::test_config, read_operations::{
             read_error::ReadError, read_operations::ReadOperations,
             read_structures::AggregateReadConfig,
-        },
-        write_operations::{
+        }, watch::watched_aggregates::WatchedAggregates, write_operations::{
             aggregate_write_config::AggregateWriteConfig, write_error::WriteError,
             write_operations::WriteOperations,
-        },
+        }
     };
 
     /// Creates a test aggregate key with predictable values
@@ -90,7 +87,7 @@ mod test_trimming_and_prepending {
             .queue_events_in_memory(0, 0, base_timestamp, &mut write_request)
             .unwrap();
 
-        writer.sync_with_rollback().await.unwrap();
+        writer.sync_with_rollback(Rc::new(WatchedAggregates::new())).await.unwrap();
     }
 
     #[test]
@@ -325,7 +322,7 @@ mod test_trimming_and_prepending {
                         .queue_events_in_memory(0, 0, 8779, &mut write_options)
                         .unwrap();
 
-                    writer.sync_with_rollback().await.unwrap();
+                    writer.sync_with_rollback(Rc::new(WatchedAggregates::new())).await.unwrap();
                 }
 
                 {

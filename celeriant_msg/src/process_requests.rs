@@ -2,7 +2,7 @@ use celeriant_wal::compression_type::CompressionType;
 use celeriant_wire::{constants::WIRE_FIXED_BODY_SIZE, wire_error::WireError, wire_header::WireHeader};
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
 
-use crate::request::requests::{DeleteRequest, ExistsRequest, ListAggregatesRequest, ListOrganisationsRequest, PrependBatchesRequest, ReadRequest, TrimStartRequest, UpdateCacheLimitsRequest, WriteRequest};
+use crate::request::requests::{DeleteRequest, ExistsRequest, ListAggregatesRequest, ListOrganisationsRequest, PrependBatchesRequest, ReadRequest, TrimStartRequest, UpdateCacheLimitsRequest, WatchRequest, WriteRequest};
 
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,7 +63,7 @@ pub enum Request {
     TrimStart(TrimStartRequest),
     Delete(DeleteRequest),
     UpdateCacheLimits(UpdateCacheLimitsRequest),
-    Watch(ReadRequest),
+    Watch(WatchRequest),
 }
 
 impl Request {
@@ -325,10 +325,13 @@ mod tests {
                 correlation_id: Some(108),
                 aggregate_write_max_data_cache_size_bytes: 1024,
             }),
-            RequestType::Watch => Request::Watch(ReadRequest {
-                correlation_id: Some(103),
-                aggregate_key: key,
-                filters: ReadFilters::new(1),
+            RequestType::Watch => Request::Watch(WatchRequest { 
+                subscribe_to_event_types: vec![1],
+                correlation_id: Some(109), 
+                aggregate_key: key, 
+                requested_latency_ms: Some(10), 
+                requested_throughput_bs: Some(1 << 20), 
+                filters: Some(ReadFilters::new(1)) 
             }),
         }
     }

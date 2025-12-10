@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod test_pagination {
-    use std::num::NonZeroUsize;
+    use std::{num::NonZeroUsize, rc::Rc};
 
     use celeriant_msg::request::{read_filters::ReadFilters, requests::WriteRequest};
     use celeriant_wal::{
@@ -9,15 +9,12 @@ mod test_pagination {
     use glommio::{LocalExecutorBuilder, Placement};
 
     use crate::{
-        cache::aggregate_cache::AggregateCache,
-        node_config::test_node_config::test_config,
-        read_operations::{
+        cache::aggregate_cache::AggregateCache, node_config::test_node_config::test_config, read_operations::{
             read_error::ReadError, read_operations::ReadOperations,
             read_structures::AggregateReadConfig,
-        },
-        write_operations::{
+        }, watch::watched_aggregates::WatchedAggregates, write_operations::{
             aggregate_write_config::AggregateWriteConfig, write_operations::WriteOperations,
-        },
+        }
     };
 
     /// Helper to write a batch with specific parameters
@@ -62,7 +59,7 @@ mod test_pagination {
             .queue_events_in_memory(0, 0, base_timestamp, &mut write_request)
             .unwrap();
 
-        writer.sync_with_rollback().await.unwrap();
+        writer.sync_with_rollback(Rc::new(WatchedAggregates::new())).await.unwrap();
 
         payload_size as u64 + 19
     }

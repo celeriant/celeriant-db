@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod test_writer_cache {
-    use std::num::NonZeroUsize;
+    use std::{num::NonZeroUsize, rc::Rc};
 
     use celeriant_msg::request::{read_filters::ReadFilters, requests::WriteRequest};
     use celeriant_wal::{
@@ -9,13 +9,10 @@ mod test_writer_cache {
     use glommio::{LocalExecutorBuilder, Placement};
 
     use crate::{
-        cache::aggregate_cache::AggregateCache,
-        node_config::test_node_config::test_config,
-        read_operations::read_structures::AggregateReadConfig,
-        write_operations::{
+        cache::aggregate_cache::AggregateCache, node_config::test_node_config::test_config, read_operations::read_structures::AggregateReadConfig, watch::watched_aggregates::WatchedAggregates, write_operations::{
             aggregate_write_config::AggregateWriteConfig, write_error::WriteError,
             write_operations::WriteOperations,
-        },
+        }
     };
 
     /// Helper to write a batch with specific parameters
@@ -62,7 +59,7 @@ mod test_writer_cache {
             .queue_events_in_memory(0, 0, base_timestamp, &mut write_request)
             .unwrap();
 
-        writer.sync_with_rollback().await.unwrap();
+        writer.sync_with_rollback(Rc::new(WatchedAggregates::new())).await.unwrap();
     }
 
     #[test]
@@ -381,7 +378,7 @@ mod test_writer_cache {
                         .queue_events_in_memory(0, 0, 1000 * i, &mut write_request)
                         .unwrap();
 
-                    writer.sync_with_rollback().await.unwrap();
+                    writer.sync_with_rollback(Rc::new(WatchedAggregates::new())).await.unwrap();
                 }
 
                 // Verify that cache was trimmed
@@ -499,7 +496,7 @@ mod test_writer_cache {
                     metadata_file.take().unwrap().close().await.unwrap();
 
                     // Attempt sync - should fail and rollback
-                    let sync_result = writer.sync_with_rollback().await;
+                    let sync_result = writer.sync_with_rollback(Rc::new(WatchedAggregates::new())).await;
                     assert!(sync_result.is_err());
 
                     // Verify state was rolled back

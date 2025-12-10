@@ -448,6 +448,7 @@ dependencies = [
  "celeriant_aggregate",
  "celeriant_msg",
  "celeriant_sidecar",
+ "celeriant_wal",
  "celeriant_wire",
  "flume",
  "glommio",

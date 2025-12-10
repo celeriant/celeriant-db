@@ -149,7 +149,6 @@ async fn check_exists(client: &mut CeleriantClient, args: AggregateKeyArgs) -> R
         Response::Exists(res) => {
             println!("Aggregate exists:");
             println!("  Min batch index: {}", res.min_event_batch_index);
-            println!("  Max batch index: {}", res.max_event_batch_index);
         }
         Response::GenericError(err) => {
             anyhow::bail!("Error {}: {}", err.error_code, err.error_message);

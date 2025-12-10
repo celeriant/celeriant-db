@@ -74,3 +74,13 @@ pub struct DeleteRequest {
     pub correlation_id: Option<u128>,
     pub aggregate_key: AggregateKey,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub struct WatchRequest {
+    pub subscribe_to_event_types: Vec<u8>,
+    pub correlation_id: Option<u128>,
+    pub aggregate_key: AggregateKey,
+    pub requested_latency_ms: Option<u64>,
+    pub requested_throughput_bs: Option<usize>,
+    pub filters: Option<ReadFilters>,
+}

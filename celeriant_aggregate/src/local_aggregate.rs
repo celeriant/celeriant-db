@@ -1,13 +1,11 @@
-use std::{num::NonZeroUsize, time::Duration};
+use std::{num::NonZeroUsize, rc::Rc, time::Duration};
 
 use celeriant_disk::files::open_dma_files::existing_file_read_only_dma;
 use celeriant_msg::{
     process_requests::Request, request::{
-        directory_filters::DirectoryFilters,
-        requests::{
-            DeleteRequest, ListAggregatesRequest, ListOrganisationsRequest, PrependBatchesRequest,
-            ReadRequest, TrimStartRequest, UpdateCacheLimitsRequest, WriteRequest,
-        },
+        directory_filters::DirectoryFilters, requests::{
+            DeleteRequest, ListAggregatesRequest, ListOrganisationsRequest, PrependBatchesRequest, ReadRequest, TrimStartRequest, UpdateCacheLimitsRequest, WriteRequest
+        }
     }, response::{
         aggregate_info::AggregateInfo,
         organisation_info::OrganisationInfo,
@@ -19,21 +17,18 @@ use celeriant_msg::{
 use celeriant_wal::aggregate_key::AggregateKey;
 
 use crate::{
-    cache::aggregate_cache::AggregateCache,
-    node_config::NodeConfig,
-    read_operations::{
+    cache::aggregate_cache::AggregateCache, node_config::NodeConfig, read_operations::{
         read_error::ReadError, read_operations::ReadOperations,
         read_structures::AggregateReadConfig,
-    },
-    read_write_error::ReadWriteError,
-    write_operations::{
+    }, read_write_error::ReadWriteError, watch::{aggregate_watch_event::AggregateWatchEvent, watched_aggregates::WatchedAggregates}, write_operations::{
         aggregate_write_config::AggregateWriteConfig, write_error::WriteError,
         write_operations::WriteOperations,
-    },
+    }
 };
 
 pub struct LocalAggregate {
-    aggregate_cache: AggregateCache,
+    pub aggregate_cache: AggregateCache,
+    pub watched_aggregates: Rc<WatchedAggregates>,
     node_config: NodeConfig,
 }
 
@@ -93,6 +88,7 @@ impl LocalAggregate {
                 aggregate_write_config,
             ),
             node_config,
+            watched_aggregates: Rc::new(WatchedAggregates::new()),
         }
     }
 }
@@ -119,8 +115,7 @@ impl LocalAggregateTrait for LocalAggregate {
                 let writer = aggregate_resources.get_writer(false).await?;
                 return Ok(celeriant_msg::process_responses::Response::Exists(celeriant_msg::response::responses::ExistsResponse { 
                     correlation_id: req.correlation_id, 
-                    min_event_batch_index: writer.minimum_available_event_batch_index, 
-                    max_event_batch_index: writer.next_event_batch_index - 1,
+                    min_event_batch_index: writer.minimum_available_event_batch_index,
                 }));
             }
             Request::Read(req) => {
@@ -154,8 +149,8 @@ impl LocalAggregateTrait for LocalAggregate {
                     correlation_id: req.correlation_id
                 }));
             }
-            Request::Watch(req) => {
-                return Ok(celeriant_msg::process_responses::Response::Read(self.read(&req).await?));
+            Request::Watch(_) => {
+                unreachable!()
             }
         }
     }
@@ -168,6 +163,7 @@ impl LocalAggregateTrait for LocalAggregate {
         let mut writer = aggregate_resources.get_writer_mut(false).await?;
         let mut reader = aggregate_resources.get_reader_mut(false).await?;
 
+        //TODO: Minor invariant problem where next_event_batch_index represents the in-memory queue, not fsynced yet
         if request.keep_from_event_batch_index >= writer.next_event_batch_index {
             return Err(ReadError::UnavailableBatchIndex { 
                 minimum_available_event_batch_index: writer.minimum_available_event_batch_index, 
@@ -516,6 +512,14 @@ impl LocalAggregateTrait for LocalAggregate {
                 &request.filters,
                 self.node_config.max_event_batches_response_size,
             ) {
+
+                self.watched_aggregates.notify(&request.aggregate_key, AggregateWatchEvent::Read { 
+                    correlation_id: request.correlation_id, 
+                    from_event_batch_index: request.filters.from_event_batch_index, 
+                    to_event_batch_index: result.event_batches.last().map(|eb| eb.event_batch_index),
+                    is_cached_read: true
+                });
+
                 return Ok(result);
             }
 
@@ -539,6 +543,13 @@ impl LocalAggregateTrait for LocalAggregate {
                 )
                 .await?
         };
+
+        self.watched_aggregates.notify(&request.aggregate_key, AggregateWatchEvent::Read { 
+            correlation_id: request.correlation_id, 
+            from_event_batch_index: request.filters.from_event_batch_index, 
+            to_event_batch_index: read_result.event_batches.last().map(|eb| eb.event_batch_index),
+            is_cached_read: false
+        });
 
         Ok(read_result)
     }
@@ -574,19 +585,20 @@ impl LocalAggregateTrait for LocalAggregate {
         // Write lock #2 is for flushing data and updating cache in writer
         if force_durable {
             // Force immediate durable write due to previous sync error
-            aggregate_resources.sync_with_delay(None).await?;
+            aggregate_resources.sync_with_delay(None, self.watched_aggregates.clone()).await?;
             aggregate_resources.clear_pending_sync_error();
         } else if let Some(delay_us) = request.durable_write_with_delay_us {
             aggregate_resources
-                .sync_with_delay(Some(Duration::from_micros(delay_us)))
+                .sync_with_delay(Some(Duration::from_micros(delay_us)), self.watched_aggregates.clone())
                 .await?;
         } else {
             let aggregate_resources = aggregate_resources.clone();
             let async_flush_ms = self.node_config.async_flush_ms;
 
+            let watched_aggregates = self.watched_aggregates.clone();
             glommio::spawn_local(async move {
                 let sync_result = aggregate_resources
-                    .sync_with_delay(Some(Duration::from_millis(async_flush_ms)))
+                    .sync_with_delay(Some(Duration::from_millis(async_flush_ms)), watched_aggregates)
                     .await;
                 if let Err(_e) = sync_result {
                     aggregate_resources.set_pending_sync_error();

@@ -1,17 +1,16 @@
-use std::{collections::{HashMap, HashSet, VecDeque}};
+use std::{collections::{HashMap, HashSet, VecDeque}, rc::Rc};
 
 use celeriant_disk::files::open_dma_files::existing_file_write_only_dma;
 use celeriant_msg::{request::{read_filters::ReadFilters, requests::WriteRequest}, response::responses::{ReadResponse, WriteResponse}};
-use celeriant_wal::{compression_type::CompressionType, constants::{BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED, METADATA_BATCH_SIZE_BYTES}, wal::{event_batch_item::EventBatchItem, event_batch_metadata::{EventBatchMetadata, EventTypesData}, event_item::EventItem}};
+use celeriant_wal::{aggregate_key::AggregateKey, compression_type::CompressionType, constants::{BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED, METADATA_BATCH_SIZE_BYTES}, wal::{event_batch_item::EventBatchItem, event_batch_metadata::{EventBatchMetadata, EventTypesData}, event_item::EventItem}};
 use celeriant_wire::{version_aware_wire_format::to_wire_format_fixed_with_version, wire_format::to_wire_format_variable};
 use fastbloom::BloomFilter;
 use futures_lite::AsyncWriteExt;
 use glommio::{GlommioError, io::{DmaFile, DmaStreamWriterBuilder}};
 
 use crate::{
-    read_operations::{in_memory_filtering::{apply_event_filters, is_include_batch}, read_structures::WriteOperationsDataRequirements}, write_operations::{
-        write_error::WriteError,
-        aggregate_write_config::{AggregateWriteConfig},
+    read_operations::{in_memory_filtering::{apply_event_filters, is_include_batch}, read_structures::WriteOperationsDataRequirements}, watch::{aggregate_watch_event::AggregateWatchEvent, watched_aggregates::WatchedAggregates}, write_operations::{
+        aggregate_write_config::AggregateWriteConfig, write_error::WriteError
     }
 };
 
@@ -39,6 +38,7 @@ pub struct WriteOperationsWithDmaFile {
     append_event_batch_queue: Vec<EventBatchQueueItem>,
     pub file_len_metadata: u64,
     pub file_len_event_batch: u64,
+    aggregate_key: AggregateKey,
 }
 
 impl WriteOperationsWithDmaFile {
@@ -47,6 +47,7 @@ impl WriteOperationsWithDmaFile {
         event_batches_dma_file: DmaFile,
         data_requirements: WriteOperationsDataRequirements,
         aggregate_write_config: AggregateWriteConfig,
+        aggregate_key: AggregateKey,
     ) -> WriteOperationsWithDmaFile {
         let bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8)
             .seed(&BLOOM_HASH_SEED)
@@ -71,6 +72,7 @@ impl WriteOperationsWithDmaFile {
             append_event_batch_queue: vec![],
             file_len_metadata: data_requirements.file_len_metadata,
             file_len_event_batch: data_requirements.file_len_event_batch,
+            aggregate_key
         }
     }
 
@@ -93,7 +95,7 @@ impl WriteOperationsWithDmaFile {
             .expect("Conversion failed")
     }
 
-    async fn sync(&mut self) -> Result<(), WriteError> {
+    async fn sync(&mut self, watched_aggregates: Rc<WatchedAggregates>) -> Result<(), WriteError> {
 
         // Check for unexpected close of files
         if self.event_batches_dma_file.is_none() || self.metadata_dma_file.is_none() {
@@ -101,6 +103,13 @@ impl WriteOperationsWithDmaFile {
         }
         let event_batches_dma_file = self.event_batches_dma_file.as_mut().unwrap();
         let metadata_dma_file = self.metadata_dma_file.as_mut().unwrap();
+
+        if self.append_event_batch_queue.is_empty() {
+            return Ok(());
+        }
+
+        let from_event_batch_index = self.append_event_batch_queue.first().unwrap().event_batch_item.event_batch_index;
+        let to_event_batch_index = self.append_event_batch_queue.last().unwrap().event_batch_item.event_batch_index;
 
         // Calculate total sizes of the batches to write
         let event_data_size_bytes: usize = self
@@ -236,6 +245,12 @@ impl WriteOperationsWithDmaFile {
                 self.total_cache_size_bytes -= size_to_remove;
             }
         }
+
+        // Finally notify any listeners that there have been new writes
+        watched_aggregates.notify(&self.aggregate_key, AggregateWatchEvent::Write { 
+            from_event_batch_index, 
+            to_event_batch_index,
+        });
 
         Ok(())
     }
@@ -383,7 +398,7 @@ pub trait WriteOperations {
     fn update_max_data_cache_size_bytes(&mut self, value: usize);
 
     // In case of failure during sync, we need to roll back the in-memory state
-    async fn sync_with_rollback(&mut self) -> Result<(), WriteError>;
+    async fn sync_with_rollback(&mut self, watched_aggregates: Rc<WatchedAggregates>) -> Result<(), WriteError>;
 
     /// We require the ownership of the events to be transferred, as they will be stored in the in-memory cache
     /// The events are also mutable as we need to filter out events for client idempotency requirements
@@ -473,8 +488,8 @@ impl WriteOperations for WriteOperationsWithDmaFile {
     }
 
     // In case of failure during sync, we need to roll back the in-memory state
-    async fn sync_with_rollback(&mut self) -> Result<(), WriteError> {
-        match self.sync().await {
+    async fn sync_with_rollback(&mut self, watched_aggregates: Rc<WatchedAggregates>) -> Result<(), WriteError> {
+        match self.sync(watched_aggregates).await {
             Ok(_) => Ok(()),
             Err(e) => {
                 //Pop off items from append_event_batch_queue, inspect metadata to rollback

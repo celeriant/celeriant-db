@@ -448,7 +448,7 @@ let resources = cache.get_aggregate_resources(&aggregate_key);
 // Get writer with exclusive access
 let mut writer = resources.get_writer_mut(true).await?;
 writer.queue_events_in_memory(node_id, lease_index, timestamp, &mut request)?;
-writer.sync_with_rollback().await?;
+writer.sync_with_rollback(Rc::new(WatchedAggregates::new())).await?;
 
 // Get reader
 let reader = resources.get_reader(false).await?;

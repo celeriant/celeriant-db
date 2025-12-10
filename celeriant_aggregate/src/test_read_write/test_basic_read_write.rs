@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod test_basic_read_write {
-    use std::num::NonZeroUsize;
+    use std::{num::NonZeroUsize, rc::Rc};
 
     use celeriant_disk::files::open_dma_files::{
         create_and_write_only_dma, existing_file_read_only_dma,
@@ -18,17 +18,14 @@ mod test_basic_read_write {
     use glommio::{LocalExecutorBuilder, Placement};
 
     use crate::{
-        cache::aggregate_cache::AggregateCache,
-        node_config::test_node_config::test_config,
-        read_operations::{
+        cache::aggregate_cache::AggregateCache, node_config::test_node_config::test_config, read_operations::{
             read_operations::{ReadOperations, ReadOperationsWithDmaFiles},
             read_structures::AggregateReadConfig,
-        },
-        write_operations::{
+        }, watch::watched_aggregates::WatchedAggregates, write_operations::{
             aggregate_write_config::AggregateWriteConfig,
             write_error::WriteError,
             write_operations::{WriteOperations, WriteOperationsWithDmaFile},
-        },
+        }
     };
 
     fn check_read_1(read_result: &ReadResponse, event_id: u128) {
@@ -174,7 +171,7 @@ mod test_basic_read_write {
                     assert_eq!(append_result.event_batch_index, 1);
 
                     //Write to disk
-                    writer.sync_with_rollback().await.unwrap();
+                    writer.sync_with_rollback(Rc::new(WatchedAggregates::new())).await.unwrap();
                 }
 
                 // Generate a guid and map it to u128
@@ -211,7 +208,7 @@ mod test_basic_read_write {
                     assert_eq!(append_result.event_batch_index, 2);
 
                     //Write to disk
-                    writer.sync_with_rollback().await.unwrap();
+                    writer.sync_with_rollback(Rc::new(WatchedAggregates::new())).await.unwrap();
                 }
 
                 let mut read_filters = ReadFilters::new(1);
@@ -342,6 +339,7 @@ mod test_basic_read_write {
                     writer_event_batch_dma_file,
                     data_requirements,
                     aggregate_write_config.clone(),
+                    aggregate_key.clone()
                 );
 
                 // Write some event batches
@@ -363,7 +361,7 @@ mod test_basic_read_write {
                     .queue_events_in_memory(0, 0, 998, &mut write_request)
                     .unwrap();
                 assert_eq!(append_result.event_batch_index, 1);
-                write_operations.sync_with_rollback().await.unwrap();
+                write_operations.sync_with_rollback(Rc::new(WatchedAggregates::new())).await.unwrap();
 
                 let _read_result = read_operations
                     .read(
@@ -485,7 +483,7 @@ mod test_basic_read_write {
                 {
                     //Write to disk
                     let mut writer = aggregate_resources.get_writer_mut(true).await.unwrap();
-                    writer.sync_with_rollback().await.unwrap();
+                    writer.sync_with_rollback(Rc::new(WatchedAggregates::new())).await.unwrap();
                 }
 
                 {

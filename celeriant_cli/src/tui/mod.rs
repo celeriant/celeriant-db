@@ -43,6 +43,8 @@ pub async fn run(server: &str) -> Result<()> {
 
 async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
     loop {
+        app.poll_watch_events();
+        
         terminal.draw(|f| ui::draw(f, app))?;
 
         if event::handle_events(app).await? {

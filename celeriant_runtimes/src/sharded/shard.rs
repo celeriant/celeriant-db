@@ -1,7 +1,7 @@
 use std::{cell::Cell, rc::Rc, time::Duration};
 
-use celeriant_aggregate::{local_aggregate::{LocalAggregate, LocalAggregateTrait}, read_operations::read_error::ReadError, read_write_error::ReadWriteError, write_operations::write_error::WriteError};
-use celeriant_msg::response::responses::ErrorResponse;
+use celeriant_aggregate::{local_aggregate::{LocalAggregate, LocalAggregateTrait}, read_operations::read_error::ReadError, read_write_error::ReadWriteError, watch::{aggregate_watch_event::AggregateWatchEvent, watch_session::{WatchOutput, WatchSession}}, write_operations::write_error::WriteError};
+use celeriant_msg::{request::{read_filters::ReadFilters, requests::WatchRequest}, response::responses::{ErrorResponse, WatchResponse}};
 use celeriant_wire::wire_error::WireError;
 use glommio::{
     GlommioError,
@@ -136,6 +136,73 @@ async fn check_for_shard_redirect(
     Some((request, tcp_stream))
 }
 
+fn read_write_error_to_response(correlation_id: Option<u128>, error: ReadWriteError) -> celeriant_msg::process_responses::Response {
+    let (error_code, error_message) = match error {
+        ReadWriteError::Read(read_error) => match read_error {
+            ReadError::NotExists => (404, "Aggregate does not exist".to_string()),
+            ReadError::IoError(msg) => (500, format!("IO error: {}", msg)),
+            ReadError::CannotCreateFolders(msg) => (500, format!("Cannot create folders: {}", msg)),
+            ReadError::MaxBytesTooSmall { current_max_bytes, required_max_bytes } => {
+                (400, format!("Max bytes too small: current={}, required={}", current_max_bytes, required_max_bytes))
+            },
+            ReadError::SerializationError(wire_error) => (500, format!("Serialization error: {:?}", wire_error)),
+            ReadError::UnavailableBatchIndex { minimum_available_event_batch_index, requested_event_batch_index } => {
+                (410, format!("Batch index unavailable: requested={}, minimum available={}", requested_event_batch_index, minimum_available_event_batch_index))
+            },
+            ReadError::CorruptMetadata { file_pos_metadata } => {
+                (500, format!("Corrupt metadata at position {}", file_pos_metadata))
+            },
+            ReadError::CorruptEventBatch { expected_crc, actual_crc, event_batch_index, file_pos_metadata, file_pos_event_batch } => {
+                (500, format!("Corrupt event batch: index={}, expected_crc={}, actual_crc={}, metadata_pos={}, batch_pos={}", 
+                    event_batch_index, expected_crc, actual_crc, file_pos_metadata, file_pos_event_batch))
+            },
+        },
+        ReadWriteError::Write(write_error) => match write_error {
+            WriteError::DmaFileNotInitialized => (500, "DMA file not initialized".to_string()),
+            WriteError::IoError(msg) => (500, format!("IO error: {}", msg)),
+            WriteError::SerializationError(wire_error) => (500, format!("Serialization error: {:?}", wire_error)),
+            WriteError::OptimisticConcurrencyViolation { client_id, expected_event_batch_index, current_event_batch_index } => {
+                (409, format!("Optimistic concurrency violation: client_id={}, expected={}, current={}", 
+                    client_id, expected_event_batch_index, current_event_batch_index))
+            },
+            WriteError::ClientIdempotencyViolation { client_id, last_client_event_index, attempted_client_event_index } => {
+                (409, format!("Client idempotency violation: client_id={}, last={}, attempted={}", 
+                    client_id, last_client_event_index, attempted_client_event_index))
+            },
+            WriteError::EmptyEventsList => (400, "Empty events list".to_string()),
+            WriteError::NoEventsToAppend { client_id, existing_event_index } => {
+                (400, format!("No events to append: client_id={}, existing_index={}", client_id, existing_event_index))
+            },
+            WriteError::ZeroEventType { client_event_index } => {
+                (400, format!("Zero event type at index {}", client_event_index))
+            },
+            WriteError::CacheMiss { missing_from_event_batch_index, missing_to_event_batch_index } => {
+                (503, format!("Cache miss: from={}, to={:?}", missing_from_event_batch_index, missing_to_event_batch_index))
+            },
+            WriteError::PrependCreatesEventBatchIndexGap { provided_last_batch_index, current_first_event_batch_index } => {
+                (400, format!("Prepend creates gap: provided_last={}, current_first={}", 
+                    provided_last_batch_index, current_first_event_batch_index))
+            },
+            WriteError::PrependNonContiguousBatches { from_event_batch_index, to_event_batch_index } => {
+                (400, format!("Prepend non-contiguous batches: from={}, to={}", from_event_batch_index, to_event_batch_index))
+            },
+            WriteError::FileRenameFailure { from, to } => {
+                (500, format!("File rename failure: from='{}', to='{}'", from, to))
+            },
+            WriteError::MaxBytesTooSmall { current_max_bytes, required_max_bytes } => {
+                (400, format!("Max bytes too small: current={}, required={}", current_max_bytes, required_max_bytes))
+            },
+            WriteError::InvalidLeaseIndex => (400, "Invalid lease index".to_string()),
+        },
+    };
+
+    celeriant_msg::process_responses::Response::GenericError(ErrorResponse {
+        correlation_id,
+        error_code,
+        error_message,
+    })
+}
+
 async fn process_client_request(
     tcp_stream: &mut TcpStream,
     local_aggregates: Rc<LocalAggregate>,
@@ -147,72 +214,7 @@ async fn process_client_request(
     
     let response = match local_aggregates.as_ref().process_request(Some(0), request).await {
         Ok(result) => result,
-        Err(error) => {
-            let (error_code, error_message) = match error {
-                ReadWriteError::Read(read_error) => match read_error {
-                    ReadError::NotExists => (404, "Aggregate does not exist".to_string()),
-                    ReadError::IoError(msg) => (500, format!("IO error: {}", msg)),
-                    ReadError::CannotCreateFolders(msg) => (500, format!("Cannot create folders: {}", msg)),
-                    ReadError::MaxBytesTooSmall { current_max_bytes, required_max_bytes } => {
-                        (400, format!("Max bytes too small: current={}, required={}", current_max_bytes, required_max_bytes))
-                    },
-                    ReadError::SerializationError(wire_error) => (500, format!("Serialization error: {:?}", wire_error)),
-                    ReadError::UnavailableBatchIndex { minimum_available_event_batch_index, requested_event_batch_index } => {
-                        (410, format!("Batch index unavailable: requested={}, minimum available={}", requested_event_batch_index, minimum_available_event_batch_index))
-                    },
-                    ReadError::CorruptMetadata { file_pos_metadata } => {
-                        (500, format!("Corrupt metadata at position {}", file_pos_metadata))
-                    },
-                    ReadError::CorruptEventBatch { expected_crc, actual_crc, event_batch_index, file_pos_metadata, file_pos_event_batch } => {
-                        (500, format!("Corrupt event batch: index={}, expected_crc={}, actual_crc={}, metadata_pos={}, batch_pos={}", 
-                            event_batch_index, expected_crc, actual_crc, file_pos_metadata, file_pos_event_batch))
-                    },
-                },
-                ReadWriteError::Write(write_error) => match write_error {
-                    WriteError::DmaFileNotInitialized => (500, "DMA file not initialized".to_string()),
-                    WriteError::IoError(msg) => (500, format!("IO error: {}", msg)),
-                    WriteError::SerializationError(wire_error) => (500, format!("Serialization error: {:?}", wire_error)),
-                    WriteError::OptimisticConcurrencyViolation { client_id, expected_event_batch_index, current_event_batch_index } => {
-                        (409, format!("Optimistic concurrency violation: client_id={}, expected={}, current={}", 
-                            client_id, expected_event_batch_index, current_event_batch_index))
-                    },
-                    WriteError::ClientIdempotencyViolation { client_id, last_client_event_index, attempted_client_event_index } => {
-                        (409, format!("Client idempotency violation: client_id={}, last={}, attempted={}", 
-                            client_id, last_client_event_index, attempted_client_event_index))
-                    },
-                    WriteError::EmptyEventsList => (400, "Empty events list".to_string()),
-                    WriteError::NoEventsToAppend { client_id, existing_event_index } => {
-                        (400, format!("No events to append: client_id={}, existing_index={}", client_id, existing_event_index))
-                    },
-                    WriteError::ZeroEventType { client_event_index } => {
-                        (400, format!("Zero event type at index {}", client_event_index))
-                    },
-                    WriteError::CacheMiss { missing_from_event_batch_index, missing_to_event_batch_index } => {
-                        (503, format!("Cache miss: from={}, to={:?}", missing_from_event_batch_index, missing_to_event_batch_index))
-                    },
-                    WriteError::PrependCreatesEventBatchIndexGap { provided_last_batch_index, current_first_event_batch_index } => {
-                        (400, format!("Prepend creates gap: provided_last={}, current_first={}", 
-                            provided_last_batch_index, current_first_event_batch_index))
-                    },
-                    WriteError::PrependNonContiguousBatches { from_event_batch_index, to_event_batch_index } => {
-                        (400, format!("Prepend non-contiguous batches: from={}, to={}", from_event_batch_index, to_event_batch_index))
-                    },
-                    WriteError::FileRenameFailure { from, to } => {
-                        (500, format!("File rename failure: from='{}', to='{}'", from, to))
-                    },
-                    WriteError::MaxBytesTooSmall { current_max_bytes, required_max_bytes } => {
-                        (400, format!("Max bytes too small: current={}, required={}", current_max_bytes, required_max_bytes))
-                    },
-                    WriteError::InvalidLeaseIndex => (400, "Invalid lease index".to_string()),
-                },
-            };
-            
-            celeriant_msg::process_responses::Response::GenericError(ErrorResponse {
-                correlation_id,
-                error_code,
-                error_message,
-            })
-        },
+        Err(error) => read_write_error_to_response(correlation_id, error),
     };
 
     let compression_type =
@@ -349,6 +351,107 @@ fn spawn_intrashard_message_connection_redirect_task(
     .detach();
 }
 
+async fn create_watch_session(
+    local_aggregates: Rc<LocalAggregate>,
+    request: WatchRequest,
+    message_version: u32,
+    max_response_size: Option<usize>,
+) -> Result<WatchSession, ReadWriteError> {
+    let aggregate_key = request.aggregate_key.clone();
+    let watchers = local_aggregates.watched_aggregates.get_or_create(&aggregate_key);
+    let watching_writes = request.subscribe_to_event_types.contains(&AggregateWatchEvent::WRITE);
+    let correlation_id = request.correlation_id;
+    let mut read_filters = request.filters.clone();
+
+    if watching_writes && read_filters.is_none() {
+        let minimum_available_event_batch_index = local_aggregates
+            .aggregate_cache
+            .get_aggregate_resources(&aggregate_key)
+            .get_writer(false)
+            .await?
+            .minimum_available_event_batch_index;
+        read_filters = Some(ReadFilters {
+            from_event_batch_index: minimum_available_event_batch_index,
+            ..Default::default()
+        });
+    }
+
+    let (watcher_id, subscribed_client) = watchers.add_subscriber(
+        request,
+        message_version,
+        max_response_size,
+    );
+
+    Ok(WatchSession::new(
+        aggregate_key,
+        correlation_id,
+        watcher_id,
+        subscribed_client,
+        local_aggregates.clone(),
+        read_filters,
+        watching_writes,
+    ))
+}
+
+async fn handle_watch_request(
+    mut tcp_stream: TcpStream,
+    watch_request: WatchRequest,
+    message_version: u32,
+    local_aggregates: Rc<LocalAggregate>,
+    max_response_size: Option<usize>,
+) {
+    let correlation_id = watch_request.correlation_id;
+    
+    let mut watch_session = match create_watch_session(local_aggregates.clone(), watch_request, message_version, max_response_size).await {
+        Ok(session) => session,
+        Err(error) => {
+            let response = read_write_error_to_response(correlation_id, error);
+            let compression_type = celeriant_msg::process_responses::Response::determine_compression_type(&response);
+            let _ = celeriant_msg::process_responses::Response::write_response(
+                &mut tcp_stream, &response, compression_type, message_version
+            ).await;
+            return;
+        }
+    };
+
+    loop {
+        match watch_session.next().await {
+            Ok(WatchOutput::Continue) => continue,
+            Ok(WatchOutput::Response(watch_response)) => {
+                let response = celeriant_msg::process_responses::Response::Watch(watch_response);
+                let compression_type = celeriant_msg::process_responses::Response::determine_compression_type(&response);
+                if celeriant_msg::process_responses::Response::write_response(
+                    &mut tcp_stream, &response, compression_type, message_version
+                ).await.is_err() {
+                    break;
+                }
+            }
+            Ok(WatchOutput::Heartbeat) => {
+                let response = celeriant_msg::process_responses::Response::Watch(WatchResponse { 
+                    events: None, 
+                    is_heartbeat: true 
+                });
+                if celeriant_msg::process_responses::Response::write_response(
+                    &mut tcp_stream, &response, celeriant_wal::compression_type::CompressionType::None, message_version
+                ).await.is_err() {
+                    break;
+                }
+            }
+            Ok(WatchOutput::Done) => break,
+            Err(error) => {
+                let response = read_write_error_to_response(correlation_id, error);
+                let compression_type = celeriant_msg::process_responses::Response::determine_compression_type(&response);
+                let _ = celeriant_msg::process_responses::Response::write_response(
+                    &mut tcp_stream, &response, compression_type, message_version
+                ).await;
+                break;
+            }
+        }
+    }
+    
+    watch_session.cleanup();
+}
+
 async fn handle_request_and_further_pipelining(
     mut tcp_stream: TcpStream,
     mut request: celeriant_msg::process_requests::Request,
@@ -360,7 +463,19 @@ async fn handle_request_and_further_pipelining(
             break;
         }
 
-        process_client_request(&mut tcp_stream, shard_data.local_aggregates.clone(), request, message_version).await;
+        // if request is Watch type process seprately
+        if let celeriant_msg::process_requests::Request::Watch(watch_request) = request {
+            handle_watch_request(
+                tcp_stream, 
+                watch_request, 
+                message_version, 
+                shard_data.local_aggregates.clone(),
+                Some(shard_data.config.max_event_batches_response_size),
+            ).await;
+            return;
+        } else {
+            process_client_request(&mut tcp_stream, shard_data.local_aggregates.clone(), request, message_version).await;
+        }
 
         if shard_data.shutdown_requested.get() {
             break;

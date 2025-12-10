@@ -1,6 +1,6 @@
 #[cfg(test)]
 pub mod test_corruption {
-    use std::num::NonZeroUsize;
+    use std::{num::NonZeroUsize, rc::Rc};
 
     use celeriant_msg::request::requests::WriteRequest;
     use celeriant_wal::{
@@ -9,12 +9,9 @@ pub mod test_corruption {
     use glommio::{LocalExecutorBuilder, Placement, io::OpenOptions};
 
     use crate::{
-        cache::aggregate_cache::AggregateCache,
-        node_config::test_node_config::test_config,
-        read_operations::{read_operations::ReadOperations, read_structures::AggregateReadConfig},
-        write_operations::{
+        cache::aggregate_cache::AggregateCache, node_config::test_node_config::test_config, read_operations::{read_operations::ReadOperations, read_structures::AggregateReadConfig}, watch::watched_aggregates::WatchedAggregates, write_operations::{
             aggregate_write_config::AggregateWriteConfig, write_operations::WriteOperations,
-        },
+        }
     };
 
     pub async fn write_batch(
@@ -55,7 +52,7 @@ pub mod test_corruption {
             .queue_events_in_memory(0, 0, 998, &mut write_request)
             .unwrap();
 
-        writer.sync_with_rollback().await.unwrap();
+        writer.sync_with_rollback(Rc::new(WatchedAggregates::new())).await.unwrap();
 
         if !skip_close {
             writer.close().await.unwrap();

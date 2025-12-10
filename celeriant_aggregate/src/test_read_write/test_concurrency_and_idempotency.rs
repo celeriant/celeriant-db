@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod test_concurrency_and_idempotency {
-    use std::{num::NonZeroUsize, sync::Arc, time::Duration};
+    use std::{num::NonZeroUsize, rc::Rc, sync::Arc, time::Duration};
 
     use celeriant_msg::request::requests::WriteRequest;
     use celeriant_wal::{
@@ -9,13 +9,10 @@ mod test_concurrency_and_idempotency {
     use glommio::{LocalExecutorBuilder, Placement};
 
     use crate::{
-        cache::aggregate_cache::AggregateCache,
-        node_config::test_node_config::test_config,
-        read_operations::read_structures::AggregateReadConfig,
-        write_operations::{
+        cache::aggregate_cache::AggregateCache, node_config::test_node_config::test_config, read_operations::read_structures::AggregateReadConfig, watch::watched_aggregates::WatchedAggregates, write_operations::{
             aggregate_write_config::AggregateWriteConfig, write_error::WriteError,
             write_operations::WriteOperations,
-        },
+        }
     };
 
     /// Helper to create test events
@@ -87,7 +84,7 @@ mod test_concurrency_and_idempotency {
                         .queue_events_in_memory(0, 0, 1000, &mut write_options1)
                         .unwrap();
                     assert_eq!(result.event_batch_index, 1);
-                    writer.sync_with_rollback().await.unwrap();
+                    writer.sync_with_rollback(Rc::new(WatchedAggregates::new())).await.unwrap();
                 }
 
                 // Write second batch with NO concurrency check (expected_event_batch_index = None)
@@ -168,7 +165,7 @@ mod test_concurrency_and_idempotency {
                         .queue_events_in_memory(0, 0, 1000, &mut write_options)
                         .unwrap();
                     assert_eq!(result.event_batch_index, 1);
-                    writer.sync_with_rollback().await.unwrap();
+                    writer.sync_with_rollback(Rc::new(WatchedAggregates::new())).await.unwrap();
                 }
 
                 // Second write with same expected_event_batch_index should fail
@@ -254,7 +251,7 @@ mod test_concurrency_and_idempotency {
                     writer
                         .queue_events_in_memory(0, 0, 1000, &mut write_options)
                         .unwrap();
-                    writer.sync_with_rollback().await.unwrap();
+                    writer.sync_with_rollback(Rc::new(WatchedAggregates::new())).await.unwrap();
                 }
 
                 // Attempt to write overlapping client_event_index (2-4)
@@ -463,7 +460,7 @@ mod test_concurrency_and_idempotency {
                     let resources = aggregate_resources.clone();
 
                     let task = glommio::spawn_local(async move {
-                        let result = resources.sync_with_delay(Some(sync_delay)).await;
+                        let result = resources.sync_with_delay(Some(sync_delay), Rc::new(WatchedAggregates::new())).await;
                         // All tasks should complete successfully
                         assert!(result.is_ok());
                     });
@@ -533,7 +530,7 @@ mod test_concurrency_and_idempotency {
                     writer
                         .queue_events_in_memory(0, 0, 1000, &mut write_options1)
                         .unwrap();
-                    writer.sync_with_rollback().await.unwrap();
+                    writer.sync_with_rollback(Rc::new(WatchedAggregates::new())).await.unwrap();
                 }
 
                 // Client 200 can use the same client_event_index range (1-3) without conflict
@@ -611,7 +608,7 @@ mod test_concurrency_and_idempotency {
                     writer
                         .queue_events_in_memory(0, 0, 1000, &mut write_options1)
                         .unwrap();
-                    writer.sync_with_rollback().await.unwrap();
+                    writer.sync_with_rollback(Rc::new(WatchedAggregates::new())).await.unwrap();
                 }
 
                 // Write second batch with overlapping client_event_index (2-4)

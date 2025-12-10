@@ -37,10 +37,11 @@ pub fn draw(f: &mut Frame, app: &App) {
         Screen::Organisations => draw_organisations(f, app, chunks[1]),
         Screen::Aggregates => draw_aggregates(f, app, chunks[1]),
         Screen::AggregateContext => draw_aggregate_context(f, app, chunks[1]),
-        Screen::EnterAggregate => draw_enter_aggregate(f, app, chunks[1]),  // Add this
+        Screen::EnterAggregate => draw_enter_aggregate(f, app, chunks[1]),
         Screen::ReadEvents => draw_read_events(f, app, chunks[1]),
         Screen::WriteEvent => draw_write_event(f, app, chunks[1]),
         Screen::TrimStart => draw_trim_start(f, app, chunks[1]),
+        Screen::Watch => draw_watch(f, app, chunks[1]),  // Add this
         Screen::Help => draw_help(f, app, chunks[1]),
     }
     
@@ -129,10 +130,11 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
                 "Aggregate".to_string()
             }
         }
-        Screen::EnterAggregate => "Enter Aggregate".to_string(),  // Add this
+        Screen::EnterAggregate => "Enter Aggregate".to_string(),
         Screen::ReadEvents => "Read Events".to_string(),
         Screen::WriteEvent => "Write Event".to_string(),
         Screen::TrimStart => "Trim Start".to_string(),
+        Screen::Watch => "Watch Events".to_string(),
         Screen::Help => "Help".to_string(),
     };
 
@@ -174,6 +176,7 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(status_bar, area);
 }
 
+
 fn get_screen_hints(screen: &Screen, input_mode: &InputMode) -> &'static str {
     match input_mode {
         InputMode::Editing => "Tab: next │ Enter: confirm │ Esc: cancel",
@@ -182,11 +185,159 @@ fn get_screen_hints(screen: &Screen, input_mode: &InputMode) -> &'static str {
             Screen::Organisations | Screen::Aggregates => "↑↓/jk: navigate │ Enter: select │ r: refresh │ q: back",
             Screen::AggregateContext => "↑↓/jk: navigate │ Enter: select │ r: refresh │ q: back",
             Screen::ReadEvents | Screen::WriteEvent => "e/i: edit │ x: execute │ ↑↓: scroll │ q: back",
+            Screen::Watch => "e/i: edit │ x: start │ s: stop │ ↑↓: scroll │ q: back",  // Add this
             Screen::Help => "q/Esc: back",
             _ => "q: back │ ?: help",
         },
     }
 }
+
+fn draw_watch(f: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(11),   // Input section
+            Constraint::Min(10),     // Events display
+        ])
+        .split(area);
+
+    // Input section
+    let input_block = Block::default()
+        .borders(Borders::ALL)
+        .title(if app.watch_active {
+            " Watch Configuration (Active) "
+        } else {
+            " Watch Configuration "
+        });
+    let input_inner = input_block.inner(chunks[0]);
+    f.render_widget(input_block, chunks[0]);
+
+    let input_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),  // Event types
+            Constraint::Length(3),  // Latency
+            Constraint::Length(3),  // Throughput
+        ])
+        .split(input_inner);
+
+    // Event types input
+    let et_style = if app.input_mode == InputMode::Editing && app.input_field_index == 0 {
+        Style::default().fg(EDITING_COLOR)
+    } else if app.watch_active {
+        Style::default().fg(DIM_COLOR)
+    } else {
+        Style::default()
+    };
+    let et_input = Paragraph::new(app.watch_event_types.as_str())
+        .style(et_style)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .title(" Event Types (0=DEL,1=WRITE,2=READ,3=TRIM,4=EXISTS,5=PREPEND) "));
+    f.render_widget(et_input, input_chunks[0]);
+
+    // Latency input
+    let lat_style = if app.input_mode == InputMode::Editing && app.input_field_index == 1 {
+        Style::default().fg(EDITING_COLOR)
+    } else if app.watch_active {
+        Style::default().fg(DIM_COLOR)
+    } else {
+        Style::default()
+    };
+    let lat_input = Paragraph::new(app.watch_latency_ms.as_str())
+        .style(lat_style)
+        .block(Block::default().borders(Borders::ALL).title(" Latency (ms) "));
+    f.render_widget(lat_input, input_chunks[1]);
+
+    // Throughput input
+    let tp_style = if app.input_mode == InputMode::Editing && app.input_field_index == 2 {
+        Style::default().fg(EDITING_COLOR)
+    } else if app.watch_active {
+        Style::default().fg(DIM_COLOR)
+    } else {
+        Style::default()
+    };
+    let tp_input = Paragraph::new(app.watch_throughput_bs.as_str())
+        .style(tp_style)
+        .block(Block::default().borders(Borders::ALL).title(" Throughput (bytes/sec, optional) "));
+    f.render_widget(tp_input, input_chunks[2]);
+
+    // Set cursor position when editing
+    if app.input_mode == InputMode::Editing && !app.watch_active {
+        let (x, y) = match app.input_field_index {
+            0 => (input_chunks[0].x + app.watch_event_types.len() as u16 + 1, input_chunks[0].y + 1),
+            1 => (input_chunks[1].x + app.watch_latency_ms.len() as u16 + 1, input_chunks[1].y + 1),
+            2 => (input_chunks[2].x + app.watch_throughput_bs.len() as u16 + 1, input_chunks[2].y + 1),
+            _ => (0, 0),
+        };
+        f.set_cursor_position((x, y));
+    }
+
+    // Events display section
+    let visible_height = chunks[1].height.saturating_sub(2) as usize;
+    let total_lines = app.watch_events.len();
+    let scroll_offset = app.watch_scroll.min(total_lines.saturating_sub(visible_height));
+
+    let event_lines: Vec<Line> = app
+        .watch_events
+        .iter()
+        .skip(scroll_offset)
+        .take(visible_height)
+        .map(|s| {
+            let style = if s.starts_with('━') {
+                Style::default().fg(HEADER_COLOR).bold()
+            } else if s.starts_with("⚠") {
+                Style::default().fg(ERROR_COLOR)
+            } else if s.starts_with('♥') {
+                Style::default().fg(DIM_COLOR)
+            } else if s.starts_with("Event:") {
+                Style::default().fg(SUCCESS_COLOR)
+            } else {
+                Style::default()
+            };
+            Line::from(Span::styled(s.as_str(), style))
+        })
+        .collect();
+
+    let status_indicator = if app.watch_active {
+        Span::styled(" ● LIVE ", Style::default().fg(SUCCESS_COLOR).bold())
+    } else {
+        Span::styled(" ○ STOPPED ", Style::default().fg(DIM_COLOR))
+    };
+
+    let events_title = Line::from(vec![
+        Span::raw(" Events "),
+        status_indicator,
+        Span::styled(
+            format!("({}/{}) ", scroll_offset + 1, total_lines.max(1)),
+            Style::default().fg(DIM_COLOR),
+        ),
+        if app.watch_active {
+            Span::styled("Press 's' to stop ", Style::default().fg(DIM_COLOR))
+        } else {
+            Span::styled("Press 'x' to start ", Style::default().fg(DIM_COLOR))
+        },
+    ]);
+
+    let events = Paragraph::new(event_lines)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .title(events_title))
+        .wrap(Wrap { trim: false });
+
+    f.render_widget(events, chunks[1]);
+
+    if total_lines > visible_height {
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
+        let mut scrollbar_state = ScrollbarState::new(total_lines).position(scroll_offset);
+        f.render_stateful_widget(scrollbar, chunks[1], &mut scrollbar_state);
+    }
+}
+
+
+
+
+
 
 fn draw_home(f: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
@@ -433,14 +584,6 @@ fn draw_aggregate_context(f: &mut Frame, app: &App, area: Rect) {
                 Span::styled("Min batch: ", Style::default().fg(DIM_COLOR)),
                 Span::raw(info.min_batch.to_string()),
             ]));
-            info_lines.push(Line::from(vec![
-                Span::styled("Max batch: ", Style::default().fg(DIM_COLOR)),
-                Span::raw(info.max_batch.to_string()),
-            ]));
-            info_lines.push(Line::from(vec![
-                Span::styled("Batch count: ", Style::default().fg(DIM_COLOR)),
-                Span::raw((info.max_batch - info.min_batch + 1).to_string()),
-            ]));
         } else {
             info_lines.push(Line::from(Span::styled(
                 "Press 'r' to load aggregate info",
@@ -562,7 +705,7 @@ fn draw_trim_start(f: &mut Frame, app: &App, area: Rect) {
             info_lines.push(Line::from(vec![
                 Span::styled("Current batch range: ", Style::default().fg(DIM_COLOR)),
                 Span::styled(
-                    format!("{} to {}", info.min_batch, info.max_batch),
+                    format!("from batch {}", info.min_batch),
                     Style::default().bold()
                 ),
             ]));
@@ -714,6 +857,17 @@ fn draw_help(f: &mut Frame, _app: &App, area: Rect) {
         Line::from("  Shift+Tab     Previous input field"),
         Line::from("  Enter         Confirm input"),
         Line::from("  Esc           Cancel editing"),
+        Line::from(""),
+        Line::from(Span::styled("Watch Mode", Style::default().bold())),
+        Line::from("  e/i           Edit watch parameters"),
+        Line::from("  x             Start watching"),
+        Line::from("  s             Stop watching"),
+        Line::from("  ↑↓/jk         Scroll through events"),
+        Line::from("  g/G           Jump to start/end"),
+        Line::from(""),
+        Line::from(Span::styled("Event Types:", Style::default().fg(DIM_COLOR))),
+        Line::from("  0=DELETE  1=WRITE  2=READ"),
+        Line::from("  3=TRIM_START  4=EXISTS  5=PREPEND_BATCHES"),
         Line::from(""),
         Line::from(Span::styled("Actions", Style::default().bold())),
         Line::from("  r             Refresh current list"),

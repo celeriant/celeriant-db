@@ -10,17 +10,13 @@ use glommio::{
 use std::{cell::Cell, rc::Rc, time::Duration};
 
 use crate::{
-    local_event::LocalEvent,
-    read_operations::{
+    local_event::LocalEvent, read_operations::{
         read_error::ReadError,
         read_operations::{ReadOperations, ReadOperationsWithDmaFiles},
         read_structures::AggregateReadConfig,
-    },
-    read_write_error::ReadWriteError,
-    write_operations::{
-        write_operations::{WriteOperations, WriteOperationsWithDmaFile},
-        aggregate_write_config::AggregateWriteConfig,
-    },
+    }, read_write_error::ReadWriteError, watch::watched_aggregates::WatchedAggregates, write_operations::{
+        aggregate_write_config::AggregateWriteConfig, write_operations::{WriteOperations, WriteOperationsWithDmaFile}
+    }
 };
 
 pub type SyncResult = Result<(), ReadWriteError>;
@@ -34,8 +30,8 @@ pub struct AggregateResources {
     reader: RwLock<Option<ReadOperationsWithDmaFiles>>,
     writer: RwLock<Option<WriteOperationsWithDmaFile>>,
     wal_sync_event: RwLock<Option<Rc<LocalEvent<SyncResult>>>>,
-    /// Tracks if a previous async sync failed - forces next write to be durable
     has_pending_sync_error: Cell<bool>,
+    aggregate_key: AggregateKey,
 }
 
 impl AggregateResources {
@@ -65,6 +61,7 @@ impl AggregateResources {
             writer: RwLock::new(None),
             wal_sync_event: RwLock::new(None),
             has_pending_sync_error: Cell::new(false),
+            aggregate_key
         }
     }
 
@@ -140,6 +137,7 @@ impl AggregateResources {
             writer_event_batch_dma_file,
             data_requirements,
             self.aggregate_write_config.clone(),
+            self.aggregate_key.clone()
         );
 
         *guard_reader = Some(read_operations);
@@ -208,11 +206,11 @@ impl AggregateResources {
         })
     }
 
-    pub async fn sync_with_delay(&self, wal_sync_delay: Option<Duration>) -> SyncResult {
+    pub async fn sync_with_delay(&self, wal_sync_delay: Option<Duration>, watched_aggregates: Rc<WatchedAggregates>) -> SyncResult {
         if wal_sync_delay.is_none() || wal_sync_delay.unwrap().as_micros() == 0 {
             // No delay - do immediate sync
             let mut writer = self.get_writer_mut(false).await?;
-            return Ok(writer.sync_with_rollback().await?);
+            return Ok(writer.sync_with_rollback(watched_aggregates).await?);
         }
 
         let wal_sync_delay = wal_sync_delay.unwrap();
@@ -242,11 +240,13 @@ impl AggregateResources {
                     // Do the actual sync
                     let sync_result = {
                         let mut writer = self.get_writer_mut(false).await?;
-                        writer.sync_with_rollback().await?
+                        writer.sync_with_rollback(watched_aggregates).await?
                     };
 
                     // Notify all waiters
                     event.notify(Ok(sync_result.clone()));
+
+                    //TODO: Notify channel push for watchers
 
                     return Ok(sync_result);
                 }

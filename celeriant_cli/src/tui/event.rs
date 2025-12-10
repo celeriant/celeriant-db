@@ -50,6 +50,7 @@ async fn handle_normal_mode(app: &mut App, key: KeyEvent) -> anyhow::Result<()> 
                 Screen::ReadEvents => handle_read_events_keys(app, key).await?,
                 Screen::WriteEvent => handle_write_event_keys(app, key).await?,
                 Screen::TrimStart => handle_trim_start_keys(app, key).await?,
+                Screen::Watch => handle_watch_keys(app, key).await?,  // Add this
                 Screen::Help => handle_help_keys(app, key),
             }
         }
@@ -165,6 +166,14 @@ async fn handle_editing_mode(app: &mut App, key: KeyEvent) -> anyhow::Result<()>
                 Screen::TrimStart => {
                     app.trim_keep_from.push(c);
                 }
+                Screen::Watch => {
+                    match app.input_field_index {
+                        0 => app.watch_event_types.push(c),
+                        1 => app.watch_latency_ms.push(c),
+                        2 => app.watch_throughput_bs.push(c),
+                        _ => {}
+                    }
+                }
                 _ => {}
             }
         }
@@ -194,6 +203,14 @@ async fn handle_editing_mode(app: &mut App, key: KeyEvent) -> anyhow::Result<()>
                 }
                 Screen::TrimStart => {
                     app.trim_keep_from.pop();
+                }
+                Screen::Watch => {
+                    match app.input_field_index {
+                        0 => { app.watch_event_types.pop(); }
+                        1 => { app.watch_latency_ms.pop(); }
+                        2 => { app.watch_throughput_bs.pop(); }
+                        _ => {}
+                    }
                 }
                 _ => {}
             }
@@ -403,7 +420,7 @@ async fn handle_aggregate_context_keys(app: &mut App, key: KeyEvent) -> anyhow::
                     app.go_to_screen(Screen::ReadEvents);
                 }
                 2 => {
-                    // Write Event - removed client_id field
+                    // Write Event
                     app.input_fields = vec![
                         InputField::with_value("Event Type", &app.write_event_type),
                         InputField::new("Event Data (JSON/text)", ""),
@@ -413,6 +430,11 @@ async fn handle_aggregate_context_keys(app: &mut App, key: KeyEvent) -> anyhow::
                     app.go_to_screen(Screen::WriteEvent);
                 }
                 3 => {
+                    // Watch
+                    app.setup_watch_fields();
+                    app.go_to_screen(Screen::Watch);
+                }
+                4 => {
                     // Trim Start
                     if let Some(ctx) = &app.aggregate_context {
                         if let Some(info) = &ctx.info {
@@ -423,7 +445,7 @@ async fn handle_aggregate_context_keys(app: &mut App, key: KeyEvent) -> anyhow::
                         app.go_to_screen(Screen::TrimStart);
                     }
                 }
-                4 => {
+                5 => {
                     // Delete
                     if let Err(e) = app.delete_aggregate().await {
                         app.set_error(&e);
@@ -431,7 +453,7 @@ async fn handle_aggregate_context_keys(app: &mut App, key: KeyEvent) -> anyhow::
                         app.go_back();
                     }
                 }
-                5 => {
+                6 => {
                     // Back
                     app.go_back();
                 }
@@ -448,6 +470,59 @@ async fn handle_aggregate_context_keys(app: &mut App, key: KeyEvent) -> anyhow::
     Ok(())
 }
 
+async fn handle_watch_keys(app: &mut App, key: KeyEvent) -> anyhow::Result<()> {
+    // Poll for new watch events
+    app.poll_watch_events();
+    
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.watch_scroll > 0 {
+                app.watch_scroll -= 1;
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.watch_scroll < app.watch_events.len().saturating_sub(10) {
+                app.watch_scroll += 1;
+            }
+        }
+        KeyCode::PageUp => {
+            app.watch_scroll = app.watch_scroll.saturating_sub(10);
+        }
+        KeyCode::PageDown => {
+            app.watch_scroll = (app.watch_scroll + 10).min(app.watch_events.len().saturating_sub(10));
+        }
+        KeyCode::Home | KeyCode::Char('g') => {
+            app.watch_scroll = 0;
+        }
+        KeyCode::End | KeyCode::Char('G') => {
+            app.watch_scroll = app.watch_events.len().saturating_sub(10);
+        }
+        KeyCode::Enter | KeyCode::Char('e') | KeyCode::Char('i') => {
+            if !app.watch_active {
+                app.input_mode = InputMode::Editing;
+            }
+        }
+        KeyCode::Char('x') => {
+            if !app.watch_active {
+                if let Err(e) = app.start_watch().await {
+                    app.set_error(&e);
+                }
+            }
+        }
+        KeyCode::Char('s') => {
+            if app.watch_active {
+                app.stop_watch();
+            }
+        }
+        KeyCode::Esc | KeyCode::Char('q') => {
+            // Stop watch when leaving
+            app.stop_watch();
+            app.go_back();
+        }
+        _ => {}
+    }
+    Ok(())
+}
 
 async fn handle_read_events_keys(app: &mut App, key: KeyEvent) -> anyhow::Result<()> {
     match key.code {

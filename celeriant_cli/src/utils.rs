@@ -19,8 +19,8 @@ pub fn format_response(response: &Response) -> String {
     match response {
         Response::ListOrganisations(r) => format!("ListOrganisations: {} orgs", r.organisations.len()),
         Response::ListAggregates(r) => format!("ListAggregates: {} aggregates", r.aggregates.len()),
-        Response::Exists(r) => format!("Exists: batches {}-{}", 
-            r.min_event_batch_index, r.max_event_batch_index),
+        Response::Exists(r) => format!("Exists: batches from {}", 
+            r.min_event_batch_index),
         Response::Read(r) => format!("Read: {} batches", r.event_batches.len()),
         Response::Write(r) => format!("Write: batch {}", r.event_batch_index),
         Response::PrependBatches(_) => "PrependBatches: success".to_string(),
@@ -29,5 +29,7 @@ pub fn format_response(response: &Response) -> String {
         Response::ProtocolError(_) => "ProtocolError".to_string(),
         Response::UpdateCacheLimits(_) => "UpdateCacheLimits: success".to_string(),
         Response::GenericError(r) => format!("Error {}: {}", r.error_code, r.error_message),
+        Response::Watch(watch_response) => format!("Watch: {}-{:?}", 
+            watch_response.is_heartbeat, watch_response.events.as_ref().map(|f| f.len())),
     }
 }

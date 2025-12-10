@@ -2,7 +2,7 @@ use celeriant_wal::compression_type::CompressionType;
 use celeriant_wire::{constants::WIRE_FIXED_BODY_SIZE, wire_error::WireError, wire_header::WireHeader};
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
 
-use crate::response::responses::{ErrorResponse, ExistsResponse, ListAggregatesResponse, ListOrganisationsResponse, ProtocolErrorResponse, ReadResponse, SuccessResponse, WriteResponse};
+use crate::response::responses::{ErrorResponse, ExistsResponse, ListAggregatesResponse, ListOrganisationsResponse, ProtocolErrorResponse, ReadResponse, SuccessResponse, WatchResponse, WriteResponse};
 
 // Response type discriminants
 #[repr(u32)]
@@ -19,6 +19,7 @@ pub enum ResponseType {
     ProtocolError = 9,
     UpdateCacheLimits = 10,
     GenericError = 11,
+    Watch = 12,
 }
 
 impl ResponseType {
@@ -35,6 +36,7 @@ impl ResponseType {
             9 => Ok(ResponseType::ProtocolError),
             10 => Ok(ResponseType::UpdateCacheLimits),
             11 => Ok(ResponseType::GenericError),
+            12 => Ok(ResponseType::Watch),
             _ => Err(WireError::UnknownResponseType(value)),
         }
     }
@@ -68,6 +70,7 @@ pub enum Response {
     ProtocolError(ProtocolErrorResponse),
     UpdateCacheLimits(SuccessResponse),
     GenericError(ErrorResponse),
+    Watch(WatchResponse)
 }
 
 impl Response {
@@ -84,6 +87,7 @@ impl Response {
             Response::ProtocolError(_) => ResponseType::ProtocolError,
             Response::UpdateCacheLimits(_) => ResponseType::UpdateCacheLimits,
             Response::GenericError(_) => ResponseType::GenericError,
+            Response::Watch(_) => ResponseType::Watch,
         }
     }
 
@@ -137,6 +141,9 @@ impl Response {
                 ResponseType::Read => {
                     Response::Read(wire_header.read_variable_size(reader, None).await?)
                 }
+                ResponseType::Watch => {
+                    Response::Watch(wire_header.read_variable_size(reader, None).await?)
+                }
                 _ => unreachable!(),
             }
         };
@@ -157,6 +164,7 @@ impl Response {
             Response::ProtocolError(_) => CompressionType::None,
             Response::UpdateCacheLimits(_) => CompressionType::None,
             Response::GenericError(_) => CompressionType::None,
+            Response::Watch(_) => CompressionType::Snappy,
         }
     }
 
@@ -197,6 +205,9 @@ impl Response {
                 Response::Read(res) => {
                     WireHeader::write_variable_size(writer, res, response_type_id, compression_type, None, version).await
                 }
+                Response::Watch(res) => {
+                    WireHeader::write_variable_size(writer, res, response_type_id, compression_type, None, version).await
+                }
                 _ => unreachable!(),
             }
         }
@@ -210,8 +221,8 @@ mod tests {
     use futures_lite::{future::block_on, io::Cursor};
 
     // UPDATE THIS when adding new ResponseTypes - tests will fail if mismatched
-    const RESPONSE_TYPE_COUNT: usize = 11;
-    const RESPONSE_TYPE_MAX_ID: u32 = 11;
+    const RESPONSE_TYPE_COUNT: usize = 12;
+    const RESPONSE_TYPE_MAX_ID: u32 = 12;
 
     impl ResponseType {
         /// Returns all ResponseType variants. Adding a new variant without updating
@@ -229,6 +240,7 @@ mod tests {
                 ResponseType::ProtocolError,
                 ResponseType::UpdateCacheLimits,
                 ResponseType::GenericError,
+                ResponseType::Watch,
             ]
         }
     }
@@ -248,12 +260,15 @@ mod tests {
             ResponseType::Exists => Response::Exists(ExistsResponse {
                 correlation_id: Some(102),
                 min_event_batch_index: 0,
-                max_event_batch_index: 10,
             }),
             ResponseType::Read => Response::Read(ReadResponse {
                 correlation_id: Some(103),
                 event_batches: vec![],
                 next_event_batch_index: Some(5),
+            }),
+            ResponseType::Watch => Response::Watch(WatchResponse {
+                events: None,
+                is_heartbeat: true,
             }),
             ResponseType::Write => Response::Write(WriteResponse {
                 correlation_id: Some(104),

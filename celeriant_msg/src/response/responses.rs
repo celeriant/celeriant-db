@@ -2,7 +2,7 @@ use bincode::{Decode, Encode};
 use celeriant_wal::wal::event_batch_item::EventBatchItem;
 use serde::{Deserialize, Serialize};
 
-use crate::response::{aggregate_info::AggregateInfo, organisation_info::OrganisationInfo};
+use crate::response::{aggregate_info::AggregateInfo, organisation_info::OrganisationInfo, watch_event::WatchEvent};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct ListOrganisationsResponse {
@@ -20,7 +20,6 @@ pub struct ListAggregatesResponse {
 pub struct ExistsResponse {
     pub correlation_id: Option<u128>,
     pub min_event_batch_index: u64,
-    pub max_event_batch_index: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
@@ -28,6 +27,12 @@ pub struct ReadResponse {
     pub correlation_id: Option<u128>,
     pub event_batches: Vec<EventBatchItem>,
     pub next_event_batch_index: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode, Default)]
+pub struct WatchResponse {
+    pub events: Option<Vec<WatchEvent>>,
+    pub is_heartbeat: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]

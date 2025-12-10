@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod test_write_updates_metadata_cache {
-    use std::{num::NonZeroUsize, sync::Arc};
+    use std::{num::NonZeroUsize, rc::Rc, sync::Arc};
 
     use celeriant_msg::request::{read_filters::ReadFilters, requests::WriteRequest};
     use celeriant_wal::{
@@ -9,12 +9,9 @@ mod test_write_updates_metadata_cache {
     use glommio::{LocalExecutorBuilder, Placement};
 
     use crate::{
-        cache::{aggregate_cache::AggregateCache, aggregate_resources::AggregateResources},
-        node_config::test_node_config::test_config,
-        read_operations::{read_operations::ReadOperations, read_structures::AggregateReadConfig},
-        write_operations::{
+        cache::{aggregate_cache::AggregateCache, aggregate_resources::AggregateResources}, node_config::test_node_config::test_config, read_operations::{read_operations::ReadOperations, read_structures::AggregateReadConfig}, watch::watched_aggregates::WatchedAggregates, write_operations::{
             aggregate_write_config::AggregateWriteConfig, write_operations::WriteOperations,
-        },
+        }
     };
 
     /// Creates a test aggregate key with predictable values
@@ -85,7 +82,7 @@ mod test_write_updates_metadata_cache {
             .queue_events_in_memory(0, 0, base_timestamp, &mut write_request)
             .unwrap();
 
-        writer.sync_with_rollback().await.unwrap();
+        writer.sync_with_rollback(Rc::new(WatchedAggregates::new())).await.unwrap();
     }
 
     async fn read_with_expected_len(aggregate_resources: &AggregateResources, expected_len: usize) {
