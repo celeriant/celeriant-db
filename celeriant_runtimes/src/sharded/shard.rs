@@ -354,7 +354,6 @@ fn spawn_intrashard_message_connection_redirect_task(
 async fn create_watch_session(
     local_aggregates: Rc<LocalAggregate>,
     request: WatchRequest,
-    message_version: u32,
     max_response_size: Option<usize>,
 ) -> Result<WatchSession, ReadWriteError> {
     let aggregate_key = request.aggregate_key.clone();
@@ -362,7 +361,7 @@ async fn create_watch_session(
     let watching_writes = request.subscribe_to_event_types.contains(&AggregateWatchEvent::WRITE);
     let correlation_id = request.correlation_id;
     let mut read_filters = request.filters.clone();
-
+    
     if watching_writes && read_filters.is_none() {
         let minimum_available_event_batch_index = local_aggregates
             .aggregate_cache
@@ -378,7 +377,6 @@ async fn create_watch_session(
 
     let (watcher_id, subscribed_client) = watchers.add_subscriber(
         request,
-        message_version,
         max_response_size,
     );
 
@@ -402,7 +400,7 @@ async fn handle_watch_request(
 ) {
     let correlation_id = watch_request.correlation_id;
     
-    let mut watch_session = match create_watch_session(local_aggregates.clone(), watch_request, message_version, max_response_size).await {
+    let mut watch_session = match create_watch_session(local_aggregates.clone(), watch_request, max_response_size).await {
         Ok(session) => session,
         Err(error) => {
             let response = read_write_error_to_response(correlation_id, error);

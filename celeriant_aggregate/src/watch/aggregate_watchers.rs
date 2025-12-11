@@ -1,4 +1,4 @@
-use std::{cell::{Cell, RefCell}, rc::Rc, time::{Duration, Instant}};
+use std::{cell::{Cell, RefCell}, rc::Rc};
 
 use celeriant_msg::request::requests::WatchRequest;
 use glommio::channels::local_channel::{self, LocalSender};
@@ -27,28 +27,16 @@ impl AggregateWatchers {
 
     /// Add a new subscriber, returns (id, receiver) for the subscriber's task
     pub fn add_subscriber(&self, 
-        mut request: WatchRequest,
-        message_version: u32,
+        request: WatchRequest,
         max_response_size: Option<usize>,
     ) -> (u64, Rc<RefCell<SubscribedClient>>) {
         let id = self.next_id.get();
         self.next_id.set(id.wrapping_add(1));
-
-        // Ensure if we have read filters, there is no upper limit as we are watching
-        if let Some(read_filters) = request.filters.as_mut() {
-            read_filters.to_event_batch_index = None;
-            read_filters.max_client_event_index = None;
-            read_filters.max_event_index = None;
-            read_filters.max_event_timestamp = None;
-            read_filters.max_server_timestamp = None;
-        }
         
         let (client, sender) = SubscribedClient::new(
             request.requested_latency_ms,
             request.requested_throughput_bs,
-            request.filters,
             max_response_size,
-            message_version,
         );
         let subscribed_client = Rc::new(RefCell::new(client));
         

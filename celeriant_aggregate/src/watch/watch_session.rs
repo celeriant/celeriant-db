@@ -34,9 +34,19 @@ impl WatchSession {
         watcher_id: u64,
         subscribed_client: Rc<RefCell<SubscribedClient>>,
         local_aggregate: Rc<LocalAggregate>,
-        read_filters: Option<ReadFilters>,
+        mut read_filters: Option<ReadFilters>,
         watching_writes: bool,
     ) -> Self {
+
+        // Ensure if we have read filters, there is no upper limit as we are watching
+        if let Some(ref mut filters) = read_filters {
+            filters.to_event_batch_index = None;
+            filters.max_client_event_index = None;
+            filters.max_event_index = None;
+            filters.max_event_timestamp = None;
+            filters.max_server_timestamp = None;
+        }
+
         Self {
             aggregate_key,
             correlation_id,

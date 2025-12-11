@@ -1,5 +1,5 @@
 use std::time::{Duration, Instant};
-use celeriant_msg::{request::read_filters::ReadFilters, response::{responses::WatchResponse, watch_event::WatchEvent}};
+use celeriant_msg::response::{responses::WatchResponse, watch_event::WatchEvent};
 use celeriant_wal::wal::event_batch_item::EventBatchItem;
 use glommio::channels::local_channel::LocalSender;
 
@@ -9,8 +9,6 @@ pub struct SubscribedClient {
     pub requested_latency: Option<Duration>,
     pub requested_throughput: Option<usize>,
     pub last_send_time: std::time::Instant,
-    pub message_version: u32,
-    pub read_filters: Option<ReadFilters>,
     pub receiver: glommio::channels::local_channel::LocalReceiver<AggregateWatchEvent>,
     pub events: Option<Vec<WatchEvent>>,
     pub accumulated_bytes: usize,
@@ -22,21 +20,17 @@ impl SubscribedClient {
     pub fn new(
         requested_latency_ms: Option<u64>,
         requested_throughput_bs: Option<usize>,
-        read_filters: Option<ReadFilters>,
         max_response_size: Option<usize>,
-        message_version: u32,
     ) -> (Self, LocalSender<AggregateWatchEvent>) {
         let (sender, receiver) = glommio::channels::local_channel::new_unbounded();
         let client = Self {
             requested_latency: requested_latency_ms.map(Duration::from_millis),
             requested_throughput: requested_throughput_bs,
-            read_filters,
             receiver,
             last_send_time: Instant::now(),
             events: None,
             accumulated_bytes: 0,
             max_response_size,
-            message_version,
         };
         (client, sender)
     }
@@ -206,23 +200,43 @@ impl SubscribedClient {
 
 #[cfg(test)]
 mod test_subscribed_client {
+    use std::time::{Duration, Instant};
+
     use glommio::{LocalExecutorBuilder, Placement};
 
     use crate::watch::subscribed_client::SubscribedClient;
 
 
     #[test]
-    fn test_additional_latency_wait_time() {
+    fn test_requirements() {
         let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
             .spawn(|| async move {
 
-            let (client, sender) = SubscribedClient::new(
+            let (mut client, _) = SubscribedClient::new(
                 None,
                 None,
                 None,
-                None,
-                1,
             );
+
+            // No requirements
+            assert_eq!(client.additional_latency_wait_time(), Duration::ZERO);
+            assert_eq!(client.additional_throughput_wait_time(999), Duration::ZERO);
+
+            // Latency in isolation
+            client.requested_latency = Some(Duration::from_millis(10));
+
+            assert_ne!(client.additional_latency_wait_time(), Duration::ZERO);
+            assert!(client.additional_latency_wait_time().as_millis() > 5);
+
+            glommio::timer::sleep(client.additional_latency_wait_time()).await;
+
+            assert_eq!(client.additional_latency_wait_time(), Duration::ZERO);
+
+            client.last_send_time = Instant::now();
+            assert!(client.additional_latency_wait_time().as_millis() > 5);
+
+            // Throughput in isolation
+
 
         })
         .unwrap();

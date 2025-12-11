@@ -5,6 +5,18 @@ authors.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "batch_main"
+path = "src/batch_main.rs"
+
+[[bin]]
+name = "single_main"
+path = "src/single_main.rs"
+
+[[bin]]
+name = "performance_main"
+path = "src/performance_main.rs"
+
 [dependencies]
 celeriant_client_tokio = { path = "../celeriant_client_tokio" }
 celeriant_msg = { path = "../celeriant_msg" }
