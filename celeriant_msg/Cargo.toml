@@ -1,0 +1,13 @@
+[package]
+name = "celeriant_msg"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+celeriant_wal = { path = "../celeriant_wal" }
+celeriant_wire = { path = "../celeriant_wire" }
+bincode.workspace = true
+futures-lite.workspace = true
+serde.workspace = true

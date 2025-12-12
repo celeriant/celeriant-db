@@ -1,0 +1,35 @@
+[package]
+name = "celeriant_cli"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Workspace crates
+celeriant_client_tokio = { path = "../celeriant_client_tokio" }
+celeriant_msg = { path = "../celeriant_msg" }
+celeriant_wal = { path = "../celeriant_wal" }
+celeriant_crypto = { path = "../celeriant_crypto" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# TUI
+ratatui = "0.28"
+crossterm = { version = "0.28", features = ["event-stream"] }
+
+# Utilities
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+humansize = "2"
+tui-textarea = "0.6"
+unicode-width = "0.1"
+
+directories.workspace = true

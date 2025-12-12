@@ -1,0 +1,20 @@
+[package]
+name = "celeriant_runtimes"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+celeriant_sidecar = { path = "../celeriant_sidecar" }
+celeriant_wal = { path = "../celeriant_wal" }
+celeriant_msg = { path = "../celeriant_msg" }
+celeriant_wire = { path = "../celeriant_wire" }
+celeriant_aggregate = { path = "../celeriant_aggregate" }
+glommio.workspace = true
+tracing.workspace = true
+flume.workspace = true
+bytes.workspace = true
+tokio.workspace = true
+signal-hook.workspace = true
+async-trait.workspace = true

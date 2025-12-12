@@ -1,0 +1,61 @@
+[workspace]
+members = [
+    "celeriant",
+    "celeriant_embedded",
+    "celeriant_aggregate",
+    "celeriant_client_glommio",
+    "celeriant_client_tokio",
+    "celeriant_disk",
+    "celeriant_msg",
+    "celeriant_wal",
+    "celeriant_wire",
+    "celeriant_crypto", 
+    "celeriant_runtimes",
+    "celeriant_cli"
+, "celeriant_sidecar", "celeriant_client_demo"]
+
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+authors = ["Celeriant"]
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+serde = { version = "1.0.228", features = ["derive", "rc"] }
+base64 = "0.22.1"
+bincode = "2.0.1"
+snap = "1.1.1"
+rmp-serde = "1.3.0"
+zstd = "0.13.3"
+brotli = "8.0.2"
+flate2 = "1.1.7"
+futures-lite = "2.6.1"
+criterion = "0.8.0"
+tokio = { version = "1.48.0", features = ["full"] }
+tokio-util = { version = "0.7.17", features = ["compat"]}
+futures-util = "0.3.31"
+glommio = { git = "https://github.com/utilitydelta/glommio", branch = "tcp-into-raw-fd-accepted-stream" }
+tempfile = "3.23.0"
+fastbloom = "0.14.0"
+uuid = { version = "1.18.1", features = ["v4"] }
+lru = "0.16.2"
+num_cpus = "1.17.0"
+crc32c = "0.6.8"
+clap = { version = "4.5.53", features = ["derive", "env"] }
+mimalloc = "0.1.48"
+libc = "0.2.178"
+dotenvy = "0.15.7"
+tracing = "0.1.43"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+thiserror = "2.0.12"
+rsa = { version = "0.9.9", features = ["sha2", "pem"] }
+sha2 = "0.10.9"
+rand = "0.8.5"
+flume = "0.11.1"
+bytes = "1.11.0"
+signal-hook = "0.3.18"
+async-trait = "0.1.89"
+walkdir = "2.5.0"
+directories = "6.0.0"

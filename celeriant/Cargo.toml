@@ -1,0 +1,27 @@
+[package]
+name = "celeriant"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "celeriant_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "celeriant"
+path = "src/main.rs"
+
+[dependencies]
+celeriant_crypto = { path = "../celeriant_crypto" }
+celeriant_runtimes = { path = "../celeriant_runtimes" }
+celeriant_sidecar = { path = "../celeriant_sidecar" }
+clap.workspace = true
+mimalloc.workspace = true
+libc.workspace = true
+dotenvy.workspace = true
+tracing .workspace = true
+tracing-subscriber.workspace = true
+glommio.workspace = true
+num_cpus.workspace = true
