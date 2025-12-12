@@ -18,6 +18,7 @@ pub struct ShardConfig {
     pub cache_trim_factor: usize,
     pub max_request_size: Option<u32>,
     pub max_event_batches_response_size: usize,
+    pub max_requested_latency_ms: u64,
 }
 
 impl ShardConfig {

@@ -48,6 +48,10 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 1024 * 1024 * 64, env = "CELERIANT_MAX_EVENT_BATCHES_RESPONSE_SIZE", help = "Maximum size of event batches set to return (64 MiB)")]
     pub max_event_batches_response_size: usize,
 
+    // Maximum latency setting for watch connections
+    #[arg(long, default_value_t = 2000, env = "CELERIANT_MAX_REQUESTED_LATENCY_MS", help = "Maximum latency a client can use for watch connections (2s)")]
+    pub max_requested_latency_ms: u64,
+
     // Misc / logging
     #[arg(long, default_value = "info", env = "CELERIANT_DEFAULT_LOG_LEVEL", help = "Default log level (trace, debug, info, warn, error)")]
     pub default_log_level: String,
@@ -126,6 +130,7 @@ impl ServerConfig {
             cache_trim_factor: self.cache_trim_factor,
             max_request_size: Some(self.max_request_size),
             max_event_batches_response_size: self.max_event_batches_response_size,
+            max_requested_latency_ms: self.max_requested_latency_ms,
         }
     }
 
@@ -198,6 +203,7 @@ impl Default for ServerConfig {
             max_open_aggregates: 10000,
             max_request_size: 16 * 1024 * 1024,
             max_event_batches_response_size: 64 * 1024 * 1024,
+            max_requested_latency_ms: 2000,
             default_log_level: "info".to_string(),
             s3_enabled: false,
             s3_region: None,

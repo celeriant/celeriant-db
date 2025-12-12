@@ -488,7 +488,6 @@ impl ReadOperations for ReadOperationsWithDmaFiles {
                     actual_crc,
                     event_batch_index: metadata.event_batch_index,
                     file_pos_event_batch: object_positions[index].start_pos,
-                    file_pos_metadata: metadata_for_reading[index].event_batch_absolute_position,
                 });
             }
 

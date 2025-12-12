@@ -11,10 +11,10 @@ use celeriant_wal::{
 };
 use tokio::time::Instant;
 
-const NUM_CONNECTIONS: usize = 8000;
+const NUM_CONNECTIONS: usize = 4000; // 28k max source port limit ~25000;
 const TEST_DURATION_SECS: u64 = 30;
-const NUM_AGGREGATES: usize = 16;
-const SYNC_DELAY_US: u64 = 30;
+const NUM_AGGREGATES: usize = 3000;
+const SYNC_DELAY_US: u64 = 10000;
 
 struct TaskStats {
     request_count: u64,

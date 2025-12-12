@@ -115,14 +115,17 @@ impl AggregateResources {
         } else {
             existing_file_write_only_dma(&self.path_metadata).await?
         };
-        let reader_metadata_dma_file = existing_file_read_only_dma(&self.path_metadata).await?;
+        // let reader_metadata_dma_file = existing_file_read_only_dma(&self.path_metadata).await?;
+        let reader_metadata_dma_file = writer_metadata_dma_file.dup()?;
+
         let writer_event_batch_dma_file = if !is_event_batch_exists {
             create_and_write_only_dma(&self.path_event_batches).await?
         } else {
             existing_file_write_only_dma(&self.path_event_batches).await?
         };
-        let reader_event_batch_dma_file =
-            existing_file_read_only_dma(&self.path_event_batches).await?;
+        // let reader_event_batch_dma_file =
+        //     existing_file_read_only_dma(&self.path_event_batches).await?;
+        let reader_event_batch_dma_file = writer_event_batch_dma_file.dup()?;
 
         let read_operations = ReadOperationsWithDmaFiles::new(
             reader_metadata_dma_file,
@@ -245,8 +248,6 @@ impl AggregateResources {
 
                     // Notify all waiters
                     event.notify(Ok(sync_result.clone()));
-
-                    //TODO: Notify channel push for watchers
 
                     return Ok(sync_result);
                 }

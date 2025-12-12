@@ -53,8 +53,12 @@ impl AggregateCache {
     }
 
     pub async fn pop(&self, aggregate_key: &AggregateKey) -> Result<(), ReadError> {
-        let mut cache = self.aggregates_cache.borrow_mut();
-        let aggregate_resources = cache.pop(aggregate_key);
+    
+        let aggregate_resources = {
+            let mut cache = self.aggregates_cache.borrow_mut();
+            cache.pop(aggregate_key)
+        };
+
         if let Some(aggregate_resources) = aggregate_resources {
             let mut reader = aggregate_resources.get_reader_mut(false).await?;
             let mut writer = aggregate_resources.get_writer_mut(false).await?;
@@ -64,6 +68,38 @@ impl AggregateCache {
         }
 
         Ok(())
+    }
+
+    pub async fn close(&self) {
+        // Drain all entries from cache
+        let all_resources: Vec<Rc<AggregateResources>> = {
+            let mut cache = self.aggregates_cache.borrow_mut();
+            let mut resources = Vec::new();
+            while let Some((_, v)) = cache.pop_lru() {
+                resources.push(v);
+            }
+            resources
+        };
+
+        // Spawn all close operations as concurrent tasks
+        let tasks: Vec<_> = all_resources
+            .into_iter()
+            .map(|resources| {
+                glommio::spawn_local(async move {
+                    if let Ok(mut reader) = resources.get_reader_mut(false).await {
+                        let _ = reader.close().await;
+                    }
+                    if let Ok(mut writer) = resources.get_writer_mut(false).await {
+                        let _ = writer.close().await;
+                    }
+                })
+            })
+            .collect();
+
+        // Wait for all tasks to complete
+        for task in tasks {
+            task.await;
+        }
     }
 
     pub fn get_all_keys(&self) -> Vec<AggregateKey> {

@@ -497,7 +497,7 @@ impl App {
             allow_create: true,
             expected_event_batch_index: None,
             enforce_client_idempotency: false,
-            durable_write_with_delay_us: None,
+            durable_write_with_delay_us: Some(0),
             compression_type: CompressionType::None,
         });
         

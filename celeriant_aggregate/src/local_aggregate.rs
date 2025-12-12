@@ -34,6 +34,8 @@ pub struct LocalAggregate {
 
 #[allow(async_fn_in_trait)]
 pub trait LocalAggregateTrait {
+    async fn close(&self);
+
     async fn process_request(
         &self,
         lease_index: Option<u64>,
@@ -94,6 +96,10 @@ impl LocalAggregate {
 }
 
 impl LocalAggregateTrait for LocalAggregate {
+
+    async fn close(&self) {
+        self.aggregate_cache.close().await;
+    }
 
     async fn process_request(
         &self,
@@ -201,12 +207,8 @@ impl LocalAggregateTrait for LocalAggregate {
 
         let data_requirements = reader
             .replace_dma_files(
-                existing_file_read_only_dma(&aggregate_resources.path_metadata)
-                    .await
-                    .map_err(ReadError::from)?,
-                existing_file_read_only_dma(&aggregate_resources.path_event_batches)
-                    .await
-                    .map_err(ReadError::from)?,
+                writer.metadata_dma_file.as_ref().unwrap().dup().map_err(ReadError::from)?,
+                writer.event_batches_dma_file.as_ref().unwrap().dup().map_err(ReadError::from)?,
             )
             .await?;
 

@@ -1,7 +1,7 @@
 use std::{cell::{Cell, RefCell}, rc::Rc};
 
 use celeriant_msg::request::requests::WatchRequest;
-use glommio::channels::local_channel::{self, LocalSender};
+use glommio::channels::local_channel::{LocalSender};
 
 use crate::watch::{aggregate_watch_event::AggregateWatchEvent, subscribed_client::{SubscribedClient}};
 

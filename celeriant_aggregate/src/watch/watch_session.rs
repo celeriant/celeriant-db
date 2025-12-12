@@ -72,12 +72,19 @@ impl WatchSession {
     }
 
     async fn process_initial_catchup(&mut self) -> Result<Option<WatchOutput>, ReadWriteError> {
+
+        if self.read_filters.as_ref().is_none() {
+            return Ok(None);
+        }
+
         let read_request = ReadRequest {
             correlation_id: self.correlation_id,
             aggregate_key: self.aggregate_key.clone(),
             filters: self.read_filters.as_ref().unwrap().clone(),
         };
 
+        //TODO: Some more detail here - should stream results back to client
+        //Currently just waits due to throughput limitation and then dumps it all over the wire at once
         let read_result = self.local_aggregate.read(&read_request).await?;
         if read_result.event_batches.is_empty() {
             return Ok(None); // Catchup complete
@@ -94,11 +101,7 @@ impl WatchSession {
             AggregateWatchEvent::Write { from_event_batch_index, to_event_batch_index },
         );
 
-        if let Some(wait_time) = client.time_until_flush() {
-            drop(client);
-            glommio::timer::sleep(wait_time).await;
-            client = self.subscribed_client.borrow_mut();
-        }
+        client.should_wait_and_flush(0).await;
 
         // Update read_filters for next catchup page
         if let Some(filters) = self.read_filters.as_mut() {
@@ -137,7 +140,7 @@ impl WatchSession {
     async fn process_watch_event(&mut self) -> Result<WatchOutput, ReadWriteError> {
         let timeout_duration = {
             let client = self.subscribed_client.borrow();
-            client.time_until_flush().unwrap_or(Duration::from_secs(5))
+            client.watch_wait_time().unwrap_or(Duration::from_secs(5))
         };
 
         match glommio::timer::timeout(timeout_duration, async {
@@ -150,7 +153,9 @@ impl WatchSession {
                 let mut client = self.subscribed_client.borrow_mut();
                 
                 if client.should_wait_and_flush(data_size_bytes).await {
-                    return Ok(WatchOutput::Response(client.take_response()));
+                    let early_response = client.take_response();
+                    client.accumulate_watch_event(data_size_bytes, event_batches, aggregate_watch_event);
+                    return Ok(WatchOutput::Response(early_response));
                 }
 
                 client.accumulate_watch_event(data_size_bytes, event_batches, aggregate_watch_event);

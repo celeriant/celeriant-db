@@ -156,6 +156,11 @@ impl WriteOperationsWithDmaFile {
             event_offset += len;
         }
 
+        // Zero padding after actual data to ensure clean recovery after unclean shutdown
+        if event_offset < event_buf.len() {
+            event_buf.as_bytes_mut()[event_offset..].fill(0);
+        }
+
         // Save any data that goes over the last alignment boundary for the next write
         let event_carry_over = if event_carry_over_len > 0 {
             let carry_over_start = event_offset - event_carry_over_len as usize;
@@ -174,6 +179,11 @@ impl WriteOperationsWithDmaFile {
             meta_buf.as_bytes_mut()[meta_offset..meta_offset + len]
                 .copy_from_slice(&item.metadata_bytes);
             meta_offset += len;
+        }
+
+        // Zero padding after actual data to ensure clean recovery after unclean shutdown
+        if meta_offset < meta_buf.len() {
+            meta_buf.as_bytes_mut()[meta_offset..].fill(0);
         }
 
         // Save any data that goes over the last alignment boundary for the next write

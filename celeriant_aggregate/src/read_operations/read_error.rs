@@ -24,9 +24,12 @@ pub enum ReadError {
         expected_crc: u32,
         actual_crc: u32,
         event_batch_index: u64,
-        file_pos_metadata: u64,
         file_pos_event_batch: u64,
     },
+    WatchLatencyTooHigh {
+        latency_ms: u64,
+        max_latency_mx: u64,
+    }
 }
 
 impl From<walkdir::Error> for ReadError {

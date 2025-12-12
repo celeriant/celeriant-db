@@ -5,3 +5,5 @@ mod test_pagination;
 mod test_writer_cache;
 mod test_concurrency_and_idempotency;
 mod test_write_updates_metadata_cache;
+mod test_continuous_writes;
+mod test_unclean_shutdown;

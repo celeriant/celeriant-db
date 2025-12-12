@@ -26,6 +26,9 @@ impl CeleriantClient {
         let stream = TcpStream::connect(address)
             .await
             .map_err(ClientError::ConnectionFailed)?;
+
+        // Set TCP_NODELAY to disable Nagle's algorithm
+        stream.set_nodelay(true).map_err(ClientError::ConnectionFailed)?;
         
         Ok(Self {
             stream: stream.compat(),
