@@ -15,6 +15,7 @@ zstd.workspace = true
 brotli.workspace = true
 flate2.workspace = true
 futures-lite.workspace = true
+crc32c.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

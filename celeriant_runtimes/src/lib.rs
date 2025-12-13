@@ -1,8 +1,9 @@
+use celeriant_filesystem::shard_write_ahead_log::ShardWriteAheadLog;
 use celeriant_sidecar::store::SidecarStoreTrait;
 use glommio::{
     CpuSet, LocalExecutorPoolBuilder, PoolPlacement,
     channels::channel_mesh::{Full, MeshBuilder},
-    enclose,
+    enclose, net::TcpListener,
 };
 use tracing::{error, info};
 
@@ -23,14 +24,26 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
         Ok(sidecar_handle) => sidecar_handle,
         Err(e) => {
             error!("Failed to initialise sidecar: {}", e);
-            return;
+            panic!("Cannot start server without sidecar");
         },
     };
 
     LocalExecutorPoolBuilder::new(PoolPlacement::MaxSpread(shard_config.num_shards, CpuSet::online().ok()))
         .on_all_shards(enclose!((mesh, shard_config, sidecar_senders) move || async move {
-            let (sender, receivers) = mesh.join().await.unwrap();            
-            Shard::new(shard_config, sender.peer_id(), sender, receivers, sidecar_senders).unwrap().run().await;
+            
+            let (sender, receivers) = mesh.join().await
+                .expect("Failed to join mesh - cannot initialize shard");
+            
+            let tcp_listener = TcpListener::bind(&shard_config.listen_address)
+                .expect(&format!("Failed to bind TCP listener to {} - cannot initialize shard", shard_config.listen_address));
+            
+            let current_shard_id = sender.peer_id();
+
+            let filesystem = ShardWriteAheadLog::new(current_shard_id, &shard_config.data_root).await
+                .expect(&format!("Failed to initialize filesystem at {:?} - cannot initialize shard", shard_config.data_root));
+
+            Shard::new(shard_config, current_shard_id, sender, receivers, sidecar_senders, tcp_listener, filesystem).run().await;
+
         }))
         .unwrap()
         .join_all();

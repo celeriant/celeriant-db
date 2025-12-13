@@ -10,8 +10,9 @@ use celeriant_aggregate::{
     },
     write_operations::write_error::WriteError,
 };
+use celeriant_filesystem::shard_write_ahead_log::ShardWriteAheadLog;
 use celeriant_msg::{
-    request::{read_filters::ReadFilters, requests::WatchRequest},
+    request::{requests::WatchRequest},
     response::responses::{ErrorResponse, WatchResponse},
 };
 use celeriant_wire::wire_error::WireError;
@@ -46,14 +47,14 @@ impl Shard {
         sender: Senders<IntrashardMessages>,
         receivers: Receivers<IntrashardMessages>,
         sidecar_senders: SidecarSenders,
-    ) -> Result<Self, GlommioError<()>> {
+        tcp_listener: TcpListener,
+        filesystem: ShardWriteAheadLog,
+    ) -> Self {
         info!("Initializing shard {current_shard_id}");
-        let tcp_listener = TcpListener::bind(&config.listen_address)?;
-
         let node_config = config.node_config();
 
         let local_aggregate =
-            LocalAggregate::new(node_config);
+            LocalAggregate::new(node_config, filesystem);
 
         let shard_data = ShardData {
             config: Rc::new(config),
@@ -64,11 +65,11 @@ impl Shard {
             local_aggregates: Rc::new(local_aggregate),
         };
 
-        Ok(Self {
+        Self {
             intrashard_receivers: receivers,
             tcp_listener: Rc::new(tcp_listener),
             shard_data,
-        })
+        }
     }
 
     pub async fn run(&mut self) {

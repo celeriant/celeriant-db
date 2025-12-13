@@ -1,5 +1,6 @@
 use std::{num::NonZeroUsize, rc::Rc};
 
+use celeriant_filesystem::shard_write_ahead_log::ShardWriteAheadLog;
 use celeriant_msg::{
     process_requests::Request, request::requests::{
             DeleteRequest, ExistsRequest, ListAggregatesRequest, ListOrganisationsRequest, ReadRequest, TrimStartRequest, WriteRequest
@@ -13,6 +14,7 @@ use crate::{
 
 pub struct LocalAggregate {
     pub watched_aggregates: Rc<WatchedAggregates>,
+    filesystem: Rc<ShardWriteAheadLog>,
     node_config: NodeConfig,
 }
 
@@ -57,11 +59,12 @@ pub trait LocalAggregateTrait {
 impl LocalAggregate {
     pub fn new(
         node_config: NodeConfig,
+        filesystem: ShardWriteAheadLog
     ) -> Self {
-        let capacity = NonZeroUsize::new(node_config.max_open_aggregates).unwrap();
         Self {
             node_config,
             watched_aggregates: Rc::new(WatchedAggregates::new()),
+            filesystem: Rc::new(filesystem)
         }
     }
 }
@@ -170,10 +173,10 @@ impl LocalAggregateTrait for LocalAggregate {
     async fn write(
         &self,
         lease_index: u64,
-        mut request: WriteRequest,
+        request: WriteRequest,
     ) -> Result<WriteResponse, ReadWriteError> {
 
-        Ok(WriteResponse { correlation_id: None, event_batch_index: 0, start_event_index: 0, server_timestamp: 0, compressed_size: 0, node_id: 0, lease_index, events_crc: 0 })
+        Ok(self.filesystem.write(lease_index, request).await.unwrap())
     }
 }
 
@@ -186,6 +189,9 @@ fn get_server_timestamp_millis() -> u64 {
 
 #[cfg(test)]
 mod test_local_aggregate_integration {
+    use std::{path::PathBuf, str::FromStr};
+
+    use celeriant_filesystem::shard_write_ahead_log::ShardWriteAheadLog;
     use celeriant_msg::request::{
         directory_filters::DirectoryFilters,
         read_filters::ReadFilters,
@@ -220,8 +226,9 @@ mod test_local_aggregate_integration {
             .collect()
     }
 
-    fn create_local_aggregate(data_root: &str) -> LocalAggregate {
-        LocalAggregate::new(test_config(data_root))
+    async fn create_local_aggregate(data_root: &str) -> LocalAggregate {
+        let filesystem = ShardWriteAheadLog::new(1, &PathBuf::from_str(data_root).unwrap()).await.unwrap();
+        LocalAggregate::new(test_config(data_root), filesystem)
     }
 
     #[test]
@@ -231,7 +238,7 @@ mod test_local_aggregate_integration {
                 let tempdir = tempfile::tempdir().unwrap();
                 let data_root = tempdir.path().to_str().unwrap();
 
-                let local_aggregate = create_local_aggregate(data_root);
+                let local_aggregate = create_local_aggregate(data_root).await;
 
                 let aggregate_key = AggregateKey::new(1, 1, 1);
 
@@ -311,7 +318,7 @@ mod test_local_aggregate_integration {
                 let tempdir = tempfile::tempdir().unwrap();
                 let data_root = tempdir.path().to_str().unwrap();
 
-                let local_aggregate = create_local_aggregate(data_root);
+                let local_aggregate = create_local_aggregate(data_root).await;
 
                 let aggregate_key_1 = AggregateKey::new(1, 1, 1);
                 let aggregate_key_2 = AggregateKey::new(1, 1, 2);
@@ -382,7 +389,7 @@ mod test_local_aggregate_integration {
                 let tempdir = tempfile::tempdir().unwrap();
                 let data_root = tempdir.path().to_str().unwrap();
 
-                let local_aggregate = create_local_aggregate(data_root);
+                let local_aggregate = create_local_aggregate(data_root).await;
                 let aggregate_key = AggregateKey::new(1, 1, 1);
 
                 // Write first batch
@@ -444,7 +451,7 @@ mod test_local_aggregate_integration {
                 let tempdir = tempfile::tempdir().unwrap();
                 let data_root = tempdir.path().to_str().unwrap();
 
-                let local_aggregate = create_local_aggregate(data_root);
+                let local_aggregate = create_local_aggregate(data_root).await;
                 let aggregate_key = AggregateKey::new(1, 1, 1);
 
                 // Write 5 batches
@@ -513,7 +520,7 @@ mod test_local_aggregate_integration {
                 let tempdir = tempfile::tempdir().unwrap();
                 let data_root = tempdir.path().to_str().unwrap();
 
-                let local_aggregate = create_local_aggregate(data_root);
+                let local_aggregate = create_local_aggregate(data_root).await;
                 let aggregate_key = AggregateKey::new(1, 1, 1);
 
                 // Create aggregate
@@ -571,7 +578,8 @@ mod test_local_aggregate_integration {
                 let mut node_config = test_config(data_root);
                 node_config.max_event_batches_response_size = Some(300);
 
-                let local_aggregate = LocalAggregate::new(node_config);
+                let filesystem = ShardWriteAheadLog::new(1, &PathBuf::from_str(data_root).unwrap()).await.unwrap();
+                let local_aggregate = LocalAggregate::new(node_config, filesystem);
 
                 let aggregate_key = AggregateKey::new(1, 1, 1);
 
@@ -628,7 +636,7 @@ mod test_local_aggregate_integration {
                 let tempdir = tempfile::tempdir().unwrap();
                 let data_root = tempdir.path().to_str().unwrap();
 
-                let local_aggregate = create_local_aggregate(data_root);
+                let local_aggregate = create_local_aggregate(data_root).await;
                 let aggregate_key = AggregateKey::new(1, 1, 1);
 
                 // Client 100 writes
@@ -702,7 +710,7 @@ mod test_local_aggregate_integration {
                 let tempdir = tempfile::tempdir().unwrap();
                 let data_root = tempdir.path().to_str().unwrap();
 
-                let local_aggregate = create_local_aggregate(data_root);
+                let local_aggregate = create_local_aggregate(data_root).await;
 
                 // Create aggregates in different organisations
                 for org_id in 1u128..=3 {
@@ -777,7 +785,7 @@ mod test_local_aggregate_integration {
                 let tempdir = tempfile::tempdir().unwrap();
                 let data_root = tempdir.path().to_str().unwrap();
 
-                let local_aggregate = create_local_aggregate(data_root);
+                let local_aggregate = create_local_aggregate(data_root).await;
                 let aggregate_key = AggregateKey::new(1, 1, 1);
 
                 // Write with immediate sync
@@ -835,7 +843,7 @@ mod test_local_aggregate_integration {
                 let tempdir = tempfile::tempdir().unwrap();
                 let data_root = tempdir.path().to_str().unwrap();
 
-                let local_aggregate = create_local_aggregate(data_root);
+                let local_aggregate = create_local_aggregate(data_root).await;
                 let aggregate_key = AggregateKey::new(1, 1, 999);
 
                 // Try to read from non-existent aggregate
@@ -884,7 +892,7 @@ mod test_local_aggregate_integration {
                 let tempdir = tempfile::tempdir().unwrap();
                 let data_root = tempdir.path().to_str().unwrap();
 
-                let local_aggregate = create_local_aggregate(data_root);
+                let local_aggregate = create_local_aggregate(data_root).await;
 
                 // Scenario: 3 users (aggregates) in a collaborative app
                 // Each user has their own event stream

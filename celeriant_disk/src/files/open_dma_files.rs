@@ -2,7 +2,7 @@ use std::path::Path;
 
 use glommio::{GlommioError, io::{DmaFile, OpenOptions}};
 
-pub async fn create_dma<P: AsRef<Path>>(
+pub async fn create_file_dma<P: AsRef<Path>>(
     path: P,
     pre_allocate: Option<u64>,
 ) -> Result<DmaFile, GlommioError<()>> {
@@ -56,7 +56,7 @@ mod tests {
                 let tempdir = tempdir().unwrap();
                 let file_path = tempdir.path().join("test_file.bin");
 
-                let file = create_dma(&file_path, Some(1024)).await.unwrap();
+                let file = create_file_dma(&file_path, Some(1024)).await.unwrap();
 
                 // Write 512 bytes of 0xAB
                 let mut write_buf = file.alloc_dma_buffer(512);

@@ -144,7 +144,7 @@ impl WireHeader {
             .await?;
 
         let obj: T = match self.version {
-            PROTOCOL_VERSION_V2 => from_wire_format_fixed(&buffer[..uncompressed_length])?,
+            PROTOCOL_VERSION_V2 => from_wire_format_fixed(&buffer[..uncompressed_length])?.0,
             PROTOCOL_VERSION_V3 => from_wire_format_fixed_msgpack(&buffer[..uncompressed_length])?,
             _ => return Err(WireError::UnsupportedProtocol(self.version)),
         };

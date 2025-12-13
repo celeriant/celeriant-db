@@ -31,13 +31,13 @@ where
     )?)
 }
 
-pub fn from_wire_format_fixed<T>(buffer: &[u8]) -> Result<T, WireFormatError>
+pub fn from_wire_format_fixed<T>(buffer: &[u8]) -> Result<(T, usize), WireFormatError>
 where
     T: Decode<()>,
 {
     let result = bincode::decode_from_slice(buffer, BINCODE_CONFIG_FIXED)?;
 
-    Ok(result.0)
+    Ok(result)
 }
 
 pub fn to_wire_format_variable<T>(
@@ -252,7 +252,7 @@ mod tests {
         let mut buffer = [0u8; 1024];
 
         let written = to_wire_format_fixed(&original, &mut buffer).unwrap();
-        let decoded: TestMessage = from_wire_format_fixed(&buffer[..written]).unwrap();
+        let decoded: TestMessage = from_wire_format_fixed(&buffer[..written]).unwrap().0;
 
         assert_eq!(original, decoded);
     }
@@ -327,7 +327,7 @@ mod tests {
         // Fixed bincode
         let mut buffer = [0u8; 64];
         let written = to_wire_format_fixed(&original, &mut buffer).unwrap();
-        let decoded: Empty = from_wire_format_fixed(&buffer[..written]).unwrap();
+        let decoded: Empty = from_wire_format_fixed(&buffer[..written]).unwrap().0;
         assert_eq!(original, decoded);
 
         // Variable bincode

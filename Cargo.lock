@@ -329,6 +329,7 @@ name = "celeriant_aggregate"
 version = "0.1.0"
 dependencies = [
  "celeriant_disk",
+ "celeriant_filesystem",
  "celeriant_msg",
  "celeriant_wal",
  "celeriant_wire",
@@ -429,10 +430,11 @@ name = "celeriant_embedded"
 version = "0.1.0"
 
 [[package]]
-name = "celeriant_files"
+name = "celeriant_filesystem"
 version = "0.1.0"
 dependencies = [
  "celeriant_disk",
+ "celeriant_msg",
  "celeriant_wal",
  "celeriant_wire",
  "crc32c",
@@ -462,6 +464,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "celeriant_aggregate",
+ "celeriant_filesystem",
  "celeriant_msg",
  "celeriant_sidecar",
  "celeriant_wal",
@@ -498,6 +501,7 @@ dependencies = [
  "bincode",
  "brotli",
  "celeriant_wal",
+ "crc32c",
  "criterion",
  "flate2",
  "futures-lite",

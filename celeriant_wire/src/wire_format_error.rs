@@ -4,6 +4,7 @@ pub enum WireFormatError {
     Deserialization(String),
     Compression(String),
     UnsupportedVersion(u32),
+    ChecksumMismatch { expected: u32, actual: u32 },
 }
 
 impl From<bincode::error::DecodeError> for WireFormatError {

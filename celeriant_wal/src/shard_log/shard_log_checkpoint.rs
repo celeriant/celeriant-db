@@ -31,12 +31,12 @@ pub struct ShardLogCheckpoint {
 }
 
 impl ShardLogCheckpoint {
-    pub fn new(file_size: u64, checkpoint_start_pos: u64) -> Self {
+    pub fn new(file_size: u64, metadata_start_pos: u64, checkpoint_start_pos: u64) -> Self {
         Self {
             file_size,
             checkpoint_start_pos,
             aggregates: HashMap::new(),
-            metadata_pos: 0,
+            metadata_pos: metadata_start_pos,
             event_batches_pos: checkpoint_start_pos,
         }
     }

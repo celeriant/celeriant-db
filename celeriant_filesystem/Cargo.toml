@@ -1,11 +1,12 @@
 [package]
-name = "celeriant_files"
+name = "celeriant_filesystem"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+celeriant_msg = { path = "../celeriant_msg" }
 celeriant_wire = { path = "../celeriant_wire" }
 celeriant_wal = { path = "../celeriant_wal" }
 celeriant_disk = { path = "../celeriant_disk" }

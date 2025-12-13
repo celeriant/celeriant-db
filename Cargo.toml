@@ -11,8 +11,11 @@ members = [
     "celeriant_wire",
     "celeriant_crypto", 
     "celeriant_runtimes",
-    "celeriant_cli"
-, "celeriant_sidecar", "celeriant_client_demo", "celeriant_files"]
+    "celeriant_cli",
+    "celeriant_filesystem",
+    "celeriant_sidecar", 
+    "celeriant_client_demo",
+]
 
 resolver = "2"
 
