@@ -12,7 +12,7 @@ members = [
     "celeriant_crypto", 
     "celeriant_runtimes",
     "celeriant_cli"
-, "celeriant_sidecar", "celeriant_client_demo"]
+, "celeriant_sidecar", "celeriant_client_demo", "celeriant_files"]
 
 resolver = "2"
 

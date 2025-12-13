@@ -2,17 +2,9 @@ use std::path::Path;
 
 use glommio::{GlommioError, io::{DmaFile, OpenOptions}};
 
-pub async fn existing_file_read_only_dma<P: AsRef<Path>>(
+pub async fn create_dma<P: AsRef<Path>>(
     path: P,
-) -> Result<DmaFile, GlommioError<()>> {
-    OpenOptions::new()
-        .read(true)
-        .dma_open(path.as_ref())
-        .await
-}
-
-pub async fn create_and_write_only_dma<P: AsRef<Path>>(
-    path: P,
+    pre_allocate: Option<u64>,
 ) -> Result<DmaFile, GlommioError<()>> {
     let file = OpenOptions::new()
         .read(false) // See test below, will fail if set to true
@@ -21,6 +13,10 @@ pub async fn create_and_write_only_dma<P: AsRef<Path>>(
         .truncate(true)
         .dma_open(path.as_ref())
         .await?;
+
+    if let Some(pre_allocate) = pre_allocate {
+        file.pre_allocate(pre_allocate, false).await?;
+    }
 
     file.close().await?;
 
@@ -33,7 +29,7 @@ pub async fn create_and_write_only_dma<P: AsRef<Path>>(
         .await
 }
 
-pub async fn existing_file_write_only_dma<P: AsRef<Path>>(
+pub async fn existing_file_dma<P: AsRef<Path>>(
     path: P,
 ) -> Result<DmaFile, GlommioError<()>> {
     OpenOptions::new()
@@ -60,16 +56,17 @@ mod tests {
                 let tempdir = tempdir().unwrap();
                 let file_path = tempdir.path().join("test_file.bin");
 
-                let file = create_and_write_only_dma(&file_path).await.unwrap();
+                let file = create_dma(&file_path, Some(1024)).await.unwrap();
 
                 // Write 512 bytes of 0xAB
                 let mut write_buf = file.alloc_dma_buffer(512);
                 write_buf.as_bytes_mut().fill(0xAB);
                 file.write_at(write_buf, 0).await.unwrap();
                 file.fdatasync().await.unwrap();
+                file.close().await.unwrap();
 
                 // Try to read it back
-                let file2 = existing_file_read_only_dma(&file_path).await.unwrap();
+                let file2 = existing_file_dma(&file_path).await.unwrap();
                 let read_buf = file2.read_at_aligned(0, 512).await.unwrap();
                 assert!(
                     read_buf.iter().all(|&b| b == 0xAB),

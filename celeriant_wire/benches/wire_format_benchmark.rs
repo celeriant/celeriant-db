@@ -61,7 +61,7 @@ fn create_metadata() -> EventBatchMetadata {
         event_types_data: EventTypesData::Direct([1, 2, 3, 4]),
         event_batch_index: 42,
         client_id: 0x123456789ABCDEF0,
-        user_id: 0xFEDCBA9876543210,
+        user_id: Some(0xFEDCBA9876543210),
         node_id: 0x1111222233334444,
         lease_index: 100,
         server_timestamp: 1700000000000,

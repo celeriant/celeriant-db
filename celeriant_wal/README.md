@@ -69,6 +69,83 @@ pub struct EventBatchMetadata {
 }
 ```
 
+### Shard Log Structures
+
+The shard log structures define how WAL data is stored on disk. Each shard has its own WAL, split into multiple ~1GB files that rotate when full.
+
+#### File Layout
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Header (fixed size)                                         │
+├─────────────────────────────────────────────────────────────┤
+│ Metadata entries (256 bytes each, growing downward →)       │
+│ ...                                                         │
+├─────────────────────────────────────────────────────────────┤
+│                      Free space                             │
+├─────────────────────────────────────────────────────────────┤
+│                                    ... Event batches        │
+│              (compressed, variable size, growing ← upward)  │
+├─────────────────────────────────────────────────────────────┤
+│ Checkpoint (at end, pre-allocated space, can extend file)   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+Files are preallocated to 1GB. Metadata grows from the top, event batches grow from the bottom. When they meet, the file rotates. The checkpoint is stored at the file's end with reserved space, but can extend beyond 1GB if tracking many aggregates or clients.
+
+#### ShardLogHeader
+
+File header with version and checkpoint location.
+
+```rust
+pub struct ShardLogHeader {
+    pub shard_log_version: u32,              // File format version
+    pub shard_log_checkpoint_version: u64,   // Checkpoint format version
+    pub shard_log_checkpoint_start_pos: u64, // Byte offset to checkpoint
+}
+```
+
+#### ShardLogCheckpoint
+
+Authoritative source of truth for file state. Tracks write positions and aggregate metadata.
+
+```rust
+pub struct ShardLogCheckpoint {
+    pub file_size: u64,                                  // Logical file size (not OS-reported)
+    pub aggregates: HashMap<AggregateKey, ShardLogAggregate>, // Per-aggregate metadata
+    pub metadata_pos: u64,                               // End of metadata region
+    pub event_batches_pos: u64,                          // Start of event batches region
+}
+```
+
+Key behaviors:
+- `file_size` is tracked explicitly because direct I/O may pad bytes
+- `metadata_pos` advances forward as metadata entries are written
+- `event_batches_pos` decreases as batches are written from the end
+- `available_space()` returns bytes between the two regions
+
+#### ShardLogAggregate
+
+Per-aggregate state within a shard log file.
+
+```rust
+pub struct ShardLogAggregate {
+    pub client_event_indexes: Option<HashMap<u128, u64>>, // Client idempotency tracking
+    pub last_event_index: u64,
+    pub last_event_batch_index: u64,
+    pub minimum_available_event_batch_index: u64,         // After trimming
+    pub compressed_size_bytes: u64,
+    pub uncompressed_size_bytes: u64,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub read_at: Option<u64>,                             // LRU eviction hint
+}
+```
+
+- `client_event_indexes` may be `None` if evicted from memory under pressure—requires scanning metadata to reconstruct
+- `minimum_available_event_batch_index` reflects trimmed batches
+- `read_at` helps identify cold aggregates whose metadata can be evicted
+
 ## Design Decisions
 
 ### Arc-Wrapped Event Payloads

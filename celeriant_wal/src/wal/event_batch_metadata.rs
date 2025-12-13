@@ -1,7 +1,7 @@
 use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 use crate::aggregate_key::AggregateKey;
-use crate::serde::serde_u128_base64;
+use crate::serde::{serde_u128_base64, serde_option_u128_base64};
 
 use crate::wal::event_batch_item::EventBatchItem;
 use crate::{
@@ -26,8 +26,12 @@ pub struct EventBatchMetadata {
     #[serde(with = "serde_u128_base64", rename = "ci")]
     pub client_id: u128,
     /// Optional user ID
-    #[serde(with = "serde_u128_base64", rename = "ui")]
-    pub user_id: u128,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        with = "serde_option_u128_base64",
+        rename = "ui"
+    )]
+    pub user_id: Option<u128>,
     /// ID of the node that wrote this batch
     #[serde(rename = "ni")]
     pub node_id: u128,
@@ -69,7 +73,7 @@ impl Default for EventBatchMetadata {
             event_types_data: EventTypesData::Direct([0; 4]),
             event_batch_index: 0,
             client_id: 0,
-            user_id: 0,
+            user_id: None,
             node_id: 0,
             lease_index: 0,
             server_timestamp: 0,
@@ -152,7 +156,7 @@ impl EventBatchMetadata {
             event_types_data,
             event_batch_index: event_batch_item.event_batch_index,
             client_id: event_batch_item.client_id,
-            user_id: event_batch_item.user_id.unwrap_or_default(),
+            user_id: event_batch_item.user_id,
             node_id: event_batch_item.node_id,
             lease_index: event_batch_item.lease_index,
             server_timestamp: event_batch_item.server_timestamp,
@@ -205,7 +209,7 @@ mod tests {
             client_id: 0xA,
             node_id: 99,
             lease_index: 43,
-            user_id: Some(0xB),
+            user_id: None,
             events,
         };
 
@@ -227,7 +231,7 @@ mod tests {
         assert_eq!(meta.event_batch_index, 42);
         assert_eq!(meta.server_timestamp, 9_999);
         assert_eq!(meta.client_id, 0xA);
-        assert_eq!(meta.user_id, 0xB);
+        assert_eq!(meta.user_id, None);
         assert_eq!(meta.node_id, 99);
         assert_eq!(meta.lease_index, 43);
         assert_eq!(meta.uncompressed_size, 1234);

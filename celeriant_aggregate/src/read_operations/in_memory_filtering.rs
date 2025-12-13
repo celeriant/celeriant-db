@@ -101,14 +101,18 @@ pub fn is_include_batch(metadata: &EventBatchMetadata, filters: &ReadFilters) ->
 
     if filters
         .exclude_user_id
-        .map_or(false, |exclude_user_id| metadata.user_id == exclude_user_id)
+        .map_or(false, |exclude_user_id| {
+            metadata.user_id == Some(exclude_user_id)
+        })
     {
         return false;
     }
 
     if filters
         .include_user_id
-        .map_or(false, |include_user_id| metadata.user_id != include_user_id)
+        .map_or(false, |include_user_id| {
+            metadata.user_id != Some(include_user_id)
+        })
     {
         return false;
     }
@@ -276,7 +280,7 @@ mod tests {
         event_batch_index: u64,
         server_timestamp: u64,
         client_id: u128,
-        user_id: u128,
+        user_id: Option<u128>,
         min_cidx: u64,
         max_cidx: u64,
         min_ts: u64,
@@ -313,7 +317,7 @@ mod tests {
         event_batch_index: u64,
         server_timestamp: u64,
         client_id: u128,
-        user_id: u128,
+        user_id: Option<u128>,
         min_cidx: u64,
         max_cidx: u64,
         min_ts: u64,
@@ -379,7 +383,7 @@ mod tests {
             10, // bx
             1000,
             1,
-            2,
+            Some(2),
             1,
             5,
             100,
@@ -409,7 +413,7 @@ mod tests {
 
     #[test]
     fn is_include_batch_inclusive_server_timestamp_bounds() {
-        let base = mk_metadata(5, 1000, 1, 2, 1, 5, 100, 200, 10, 20, 1, &[1, 0, 0, 0]);
+        let base = mk_metadata(5, 1000, 1, Some(2), 1, 5, 100, 200, 10, 20, 1, &[1, 0, 0, 0]);
 
         // min_server_timestamp: keep when server_timestamp >= min
         let filters = ReadFilters::new(1).min_server_timestamp(1000);
@@ -426,7 +430,7 @@ mod tests {
 
     #[test]
     fn is_include_batch_include_exclude_client_and_user() {
-        let meta = mk_metadata(1, 1, 123, 456, 0, 0, 0, 0, 0, 0, 1, &[0, 0, 0, 0]);
+        let meta = mk_metadata(1, 1, 123, Some(456), 0, 0, 0, 0, 0, 0, 1, &[0, 0, 0, 0]);
 
         // Exclude matching client
         let filters = ReadFilters::new(1).exclude_client_id(123);
@@ -459,7 +463,7 @@ mod tests {
         // client_event_index: [10, 20]
         // event_timestamp: [1_000, 2_000]
         // event_index: [100, 200]
-        let meta = mk_metadata(1, 0, 0, 0, 10, 20, 1000, 2000, 100, 200, 1, &[0, 0, 0, 0]);
+        let meta = mk_metadata(1, 0, 0, Some(0), 10, 20, 1000, 2000, 100, 200, 1, &[0, 0, 0, 0]);
 
         // min_client_event_index: keep when max >= min (inclusive)
         let filters = ReadFilters::new(1).min_client_event_index(20);
@@ -501,7 +505,7 @@ mod tests {
     #[test]
     fn is_include_batch_include_event_types_direct() {
         // Batch types are {2, 4}
-        let meta = mk_metadata(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, &[2, 4, 0, 0]);
+        let meta = mk_metadata(1, 0, 0, Some(0), 0, 0, 0, 0, 0, 0, 1, &[2, 4, 0, 0]);
 
         // Any overlap -> included
         let filters = ReadFilters::new(1).include_event_types(vec![4, 7, 9]);
@@ -515,7 +519,7 @@ mod tests {
     #[test]
     fn is_include_batch_include_event_types_bloom() {
         // Batch types are {2, 4}
-        let meta = mk_metadata_bloom(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, &[2, 4, 0, 0, 7, 8, 11]);
+        let meta = mk_metadata_bloom(1, 0, 0, Some(0), 0, 0, 0, 0, 0, 0, 1, &[2, 4, 0, 0, 7, 8, 11]);
 
         // Any overlap -> included
         let filters = ReadFilters::new(1).include_event_types(vec![4, 7, 9]);
@@ -605,9 +609,9 @@ mod tests {
     fn trim_end_if_exceeds_max_bytes_truncates_and_returns_next_index() {
         // Three batches: sizes 100, 200, 300; total 600
         // max_bytes=250 -> only first fits; next index should be second's bx
-        let m1 = mk_mwap(mk_metadata(10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 100, &[0, 0, 0, 0]));
-        let m2 = mk_mwap(mk_metadata(11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 200, &[0, 0, 0, 0]));
-        let m3 = mk_mwap(mk_metadata(12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 300, &[0, 0, 0, 0]));
+        let m1 = mk_mwap(mk_metadata(10, 0, 0, Some(0), 0, 0, 0, 0, 0, 0, 100, &[0, 0, 0, 0]));
+        let m2 = mk_mwap(mk_metadata(11, 0, 0, Some(0), 0, 0, 0, 0, 0, 0, 200, &[0, 0, 0, 0]));
+        let m3 = mk_mwap(mk_metadata(12, 0, 0, Some(0), 0, 0, 0, 0, 0, 0, 300, &[0, 0, 0, 0]));
 
         let mut v = vec![m1, m2, m3];
 
@@ -622,8 +626,8 @@ mod tests {
 
     #[test]
     fn trim_end_if_exceeds_max_bytes_all_fit_returns_none() {
-        let m1 = mk_mwap(mk_metadata(5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 100, &[0, 0, 0, 0]));
-        let m2 = mk_mwap(mk_metadata(6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 150, &[0, 0, 0, 0]));
+        let m1 = mk_mwap(mk_metadata(5, 0, 0, Some(0), 0, 0, 0, 0, 0, 0, 100, &[0, 0, 0, 0]));
+        let m2 = mk_mwap(mk_metadata(6, 0, 0, Some(0), 0, 0, 0, 0, 0, 0, 150, &[0, 0, 0, 0]));
 
         let mut v = vec![m1, m2];
         let filters = ReadFilters::new(1);
@@ -636,7 +640,7 @@ mod tests {
     #[test]
     fn trim_end_if_exceeds_max_bytes_too_small_errors() {
         // Single batch size=200; max_bytes=100 -> error
-        let m1 = mk_mwap(mk_metadata(99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 200, &[0, 0, 0, 0]));
+        let m1 = mk_mwap(mk_metadata(99, 0, 0, Some(0), 0, 0, 0, 0, 0, 0, 200, &[0, 0, 0, 0]));
         let mut v = vec![m1];
         let filters = ReadFilters::new(1);
 
@@ -652,7 +656,7 @@ mod tests {
 
     #[test]
     fn include_event_types_empty_treated_as_no_filter() {
-        let meta = mk_metadata(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, &[2, 4, 0, 0]);
+        let meta = mk_metadata(1, 0, 0, Some(0), 0, 0, 0, 0, 0, 0, 1, &[2, 4, 0, 0]);
         let filters = ReadFilters::new(1).include_event_types(vec![]);
         assert!(is_include_batch(&meta, &filters));
 
@@ -672,7 +676,7 @@ mod tests {
 
     #[test]
     fn trim_end_if_exceeds_max_bytes_filters_out_all_returns_none() {
-        let m1 = mk_mwap(mk_metadata(10, 1000, 1, 2, 0, 0, 0, 0, 0, 0, 100, &[2, 0, 0, 0]));
+        let m1 = mk_mwap(mk_metadata(10, 1000, 1, Some(2), 0, 0, 0, 0, 0, 0, 100, &[2, 0, 0, 0]));
         let mut v = vec![m1];
 
         // Filter to a different client_id so batch gets filtered out
@@ -685,7 +689,7 @@ mod tests {
 
     #[test]
     fn include_and_exclude_client_conflict_exclude_wins() {
-        let meta = mk_metadata(1, 0, 123, 0, 0, 0, 0, 0, 0, 0, 1, &[0, 0, 0, 0]);
+        let meta = mk_metadata(1, 0, 123, Some(0), 0, 0, 0, 0, 0, 0, 1, &[0, 0, 0, 0]);
         let filters = ReadFilters::new(1)
             .include_client_id(123)
             .exclude_client_id(123);

@@ -429,6 +429,22 @@ name = "celeriant_embedded"
 version = "0.1.0"
 
 [[package]]
+name = "celeriant_files"
+version = "0.1.0"
+dependencies = [
+ "celeriant_disk",
+ "celeriant_wal",
+ "celeriant_wire",
+ "crc32c",
+ "criterion",
+ "futures-lite",
+ "glommio",
+ "num_cpus",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "celeriant_msg"
 version = "0.1.0"
 dependencies = [

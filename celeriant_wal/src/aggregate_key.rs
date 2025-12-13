@@ -1,12 +1,15 @@
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
-use bincode::{Decode, Encode};
+use bincode::de::{BorrowDecoder, Decoder};
+use bincode::enc::Encoder;
+use bincode::error::{DecodeError, EncodeError};
+use bincode::{BorrowDecode, Decode, Encode};
 use serde::{Deserialize, Serialize};
 
 /// High-performance composite key for client event index tracking
 /// Optimized for hashing and comparison operations
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggregateKey {
     #[serde(rename = "oi")]
     pub org_id: u128,
@@ -37,6 +40,36 @@ impl AggregateKey {
         aggregate_type_id.hash(&mut hasher);
         aggregate_id.hash(&mut hasher);
         hasher.finish()
+    }
+}
+
+
+impl Encode for AggregateKey {
+    fn encode<E: Encoder>(&self, encoder: &mut E) -> Result<(), EncodeError> {
+        self.org_id.encode(encoder)?;
+        self.aggregate_type_id.encode(encoder)?;
+        self.aggregate_id.encode(encoder)?;
+        Ok(())
+    }
+}
+
+impl<Context> Decode<Context> for AggregateKey {
+    fn decode<D: Decoder<Context = Context>>(decoder: &mut D) -> Result<Self, DecodeError> {
+        let org_id = <u128 as Decode<Context>>::decode(decoder)?;
+        let aggregate_type_id = <u128 as Decode<Context>>::decode(decoder)?;
+        let aggregate_id = <u128 as Decode<Context>>::decode(decoder)?;
+        Ok(Self::new(org_id, aggregate_type_id, aggregate_id))
+    }
+}
+
+impl<'de, Context> BorrowDecode<'de, Context> for AggregateKey {
+    fn borrow_decode<D: BorrowDecoder<'de, Context = Context>>(
+        decoder: &mut D,
+    ) -> Result<Self, DecodeError> {
+        let org_id = <u128 as BorrowDecode<'de, Context>>::borrow_decode(decoder)?;
+        let aggregate_type_id = <u128 as BorrowDecode<'de, Context>>::borrow_decode(decoder)?;
+        let aggregate_id = <u128 as BorrowDecode<'de, Context>>::borrow_decode(decoder)?;
+        Ok(Self::new(org_id, aggregate_type_id, aggregate_id))
     }
 }
 
