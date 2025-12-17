@@ -1,3 +1,5 @@
+use celeriant_filesystem::shard_log_write_error::ShardLogWriteError;
+
 use crate::read_operations::read_error::ReadError;
 use crate::write_operations::write_error::WriteError;
 

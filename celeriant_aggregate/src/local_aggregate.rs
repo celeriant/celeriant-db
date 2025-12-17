@@ -176,16 +176,10 @@ impl LocalAggregateTrait for LocalAggregate {
         request: WriteRequest,
     ) -> Result<WriteResponse, ReadWriteError> {
 
-        Ok(self.filesystem.write(lease_index, request).await.unwrap())
+        Ok(self.filesystem.write(lease_index, request).await.map_err(WriteError::from)?)
     }
 }
 
-fn get_server_timestamp_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
-}
 
 #[cfg(test)]
 mod test_local_aggregate_integration {
@@ -201,7 +195,7 @@ mod test_local_aggregate_integration {
         },
     };
     use celeriant_wal::{
-        aggregate_key::AggregateKey, compression_type::CompressionType, wal::event_item::EventItem,
+        aggregate_key::AggregateKey, compression_type::CompressionType, datablocks::event_item::EventItem,
     };
     use glommio::{LocalExecutorBuilder, Placement};
 
@@ -252,7 +246,6 @@ mod test_local_aggregate_integration {
                     allow_create: true,
                     expected_event_batch_index: Some(1),
                     enforce_client_idempotency: true,
-                    durable_write_with_delay_us: Some(0),
                     compression_type: CompressionType::None,
                 };
 
@@ -271,7 +264,6 @@ mod test_local_aggregate_integration {
                     allow_create: false,
                     expected_event_batch_index: Some(2),
                     enforce_client_idempotency: true,
-                    durable_write_with_delay_us: Some(0),
                     compression_type: CompressionType::None,
                 };
 
@@ -333,7 +325,6 @@ mod test_local_aggregate_integration {
                     allow_create: true,
                     expected_event_batch_index: Some(1),
                     enforce_client_idempotency: true,
-                    durable_write_with_delay_us: Some(0),
                     compression_type: CompressionType::None,
                 };
                 local_aggregate.write(1, write_req1).await.unwrap();
@@ -348,7 +339,6 @@ mod test_local_aggregate_integration {
                     allow_create: true,
                     expected_event_batch_index: Some(1),
                     enforce_client_idempotency: true,
-                    durable_write_with_delay_us: Some(0),
                     compression_type: CompressionType::None,
                 };
                 local_aggregate.write(1, write_req2).await.unwrap();
@@ -402,7 +392,6 @@ mod test_local_aggregate_integration {
                     allow_create: true,
                     expected_event_batch_index: Some(1),
                     enforce_client_idempotency: true,
-                    durable_write_with_delay_us: Some(0),
                     compression_type: CompressionType::None,
                 };
                 local_aggregate.write(1, write_req).await.unwrap();
@@ -417,7 +406,6 @@ mod test_local_aggregate_integration {
                     allow_create: false,
                     expected_event_batch_index: Some(1), // Wrong! Should be 2
                     enforce_client_idempotency: true,
-                    durable_write_with_delay_us: Some(0),
                     compression_type: CompressionType::None,
                 };
                 let result = local_aggregate.write(1, write_req).await;
@@ -433,7 +421,6 @@ mod test_local_aggregate_integration {
                     allow_create: false,
                     expected_event_batch_index: Some(2),
                     enforce_client_idempotency: true,
-                    durable_write_with_delay_us: Some(0),
                     compression_type: CompressionType::None,
                 };
                 let result = local_aggregate.write(1, write_req).await;
@@ -465,7 +452,6 @@ mod test_local_aggregate_integration {
                         allow_create: i == 1,
                         expected_event_batch_index: Some(i),
                         enforce_client_idempotency: true,
-                        durable_write_with_delay_us: Some(0),
                         compression_type: CompressionType::None,
                     };
                     local_aggregate.write(1, write_req).await.unwrap();
@@ -533,7 +519,6 @@ mod test_local_aggregate_integration {
                     allow_create: true,
                     expected_event_batch_index: Some(1),
                     enforce_client_idempotency: true,
-                    durable_write_with_delay_us: Some(0),
                     compression_type: CompressionType::None,
                 };
                 local_aggregate.write(1, write_req).await.unwrap();
@@ -594,7 +579,6 @@ mod test_local_aggregate_integration {
                         allow_create: i == 1,
                         expected_event_batch_index: Some(i),
                         enforce_client_idempotency: true,
-                        durable_write_with_delay_us: Some(0),
                         compression_type: CompressionType::None,
                     };
                     local_aggregate.write(1, write_req).await.unwrap();
@@ -649,7 +633,6 @@ mod test_local_aggregate_integration {
                     allow_create: true,
                     expected_event_batch_index: Some(1),
                     enforce_client_idempotency: true,
-                    durable_write_with_delay_us: Some(0),
                     compression_type: CompressionType::None,
                 };
                 local_aggregate.write(1, write_req).await.unwrap();
@@ -664,7 +647,6 @@ mod test_local_aggregate_integration {
                     allow_create: false,
                     expected_event_batch_index: Some(2),
                     enforce_client_idempotency: true,
-                    durable_write_with_delay_us: Some(0),
                     compression_type: CompressionType::None,
                 };
                 let result = local_aggregate.write(1, write_req).await.unwrap();
@@ -680,7 +662,6 @@ mod test_local_aggregate_integration {
                     allow_create: false,
                     expected_event_batch_index: Some(3),
                     enforce_client_idempotency: true,
-                    durable_write_with_delay_us: Some(0),
                     compression_type: CompressionType::None,
                 };
                 local_aggregate.write(1, write_req).await.unwrap();
@@ -725,7 +706,6 @@ mod test_local_aggregate_integration {
                             allow_create: true,
                             expected_event_batch_index: Some(1),
                             enforce_client_idempotency: true,
-                            durable_write_with_delay_us: Some(0),
                             compression_type: CompressionType::None,
                         };
                         local_aggregate.write(1, write_req).await.unwrap();
@@ -798,7 +778,6 @@ mod test_local_aggregate_integration {
                     allow_create: true,
                     expected_event_batch_index: Some(1),
                     enforce_client_idempotency: true,
-                    durable_write_with_delay_us: Some(0), // Sync immediately
                     compression_type: CompressionType::None,
                 };
                 local_aggregate.write(1, write_req).await.unwrap();
@@ -813,7 +792,6 @@ mod test_local_aggregate_integration {
                     allow_create: false,
                     expected_event_batch_index: Some(2),
                     enforce_client_idempotency: true,
-                    durable_write_with_delay_us: None, // Background sync
                     compression_type: CompressionType::None,
                 };
                 local_aggregate.write(1, write_req).await.unwrap();
@@ -865,7 +843,6 @@ mod test_local_aggregate_integration {
                     allow_create: false,
                     expected_event_batch_index: Some(1),
                     enforce_client_idempotency: true,
-                    durable_write_with_delay_us: Some(0),
                     compression_type: CompressionType::None,
                 };
                 let result = local_aggregate.write(1, write_req).await;
@@ -908,7 +885,6 @@ mod test_local_aggregate_integration {
                         allow_create: true,
                         expected_event_batch_index: Some(1),
                         enforce_client_idempotency: true,
-                        durable_write_with_delay_us: Some(0),
                         compression_type: CompressionType::None,
                     };
                     local_aggregate.write(1, write_req).await.unwrap();
@@ -927,7 +903,6 @@ mod test_local_aggregate_integration {
                             allow_create: false,
                             expected_event_batch_index: Some(batch),
                             enforce_client_idempotency: true,
-                            durable_write_with_delay_us: None, // Background
                             compression_type: CompressionType::None,
                         };
                         local_aggregate.write(1, write_req).await.unwrap();

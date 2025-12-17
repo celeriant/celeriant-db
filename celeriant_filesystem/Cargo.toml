@@ -13,6 +13,7 @@ celeriant_disk = { path = "../celeriant_disk" }
 glommio.workspace = true
 futures-lite.workspace = true
 crc32c.workspace = true
+fastbloom.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

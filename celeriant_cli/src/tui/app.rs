@@ -14,8 +14,7 @@ use celeriant_msg::{
 };
 use celeriant_wal::{
     aggregate_key::AggregateKey,
-    compression_type::CompressionType,
-    wal::event_item::EventItem,
+    compression_type::CompressionType, datablocks::event_item::EventItem,
 };
 use directories::ProjectDirs;
 
@@ -497,7 +496,6 @@ impl App {
             allow_create: true,
             expected_event_batch_index: None,
             enforce_client_idempotency: false,
-            durable_write_with_delay_us: Some(0),
             compression_type: CompressionType::None,
         });
         

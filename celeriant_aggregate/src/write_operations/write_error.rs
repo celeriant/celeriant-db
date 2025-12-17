@@ -1,3 +1,4 @@
+use celeriant_filesystem::shard_log_write_error::ShardLogWriteError;
 use celeriant_wire::wire_format_error::WireFormatError;
 use glommio::GlommioError;
 
@@ -62,5 +63,39 @@ impl From<GlommioError<()>> for WriteError {
 impl From<std::io::Error> for WriteError {
     fn from(error: std::io::Error) -> Self {
         WriteError::IoError(error.to_string())
+    }
+}
+
+impl From<ShardLogWriteError> for WriteError {
+    fn from(error: ShardLogWriteError) -> Self {
+        match error {
+            ShardLogWriteError::DmaFileNotInitialized => WriteError::DmaFileNotInitialized,
+            ShardLogWriteError::DatablocksCarryOverBufferNotPresent => {
+                WriteError::IoError("DatablocksCarryOverBufferNotPresent".to_string())
+            }
+            ShardLogWriteError::IoError(s) => WriteError::IoError(s),
+            ShardLogWriteError::SerializationError(e) => WriteError::SerializationError(e),
+            ShardLogWriteError::EmptyEventsList => WriteError::EmptyEventsList,
+            ShardLogWriteError::ZeroEventType { client_event_index } => {
+                WriteError::ZeroEventType { client_event_index }
+            }
+            ShardLogWriteError::ClientIdempotencyViolation {
+                client_id,
+                last_client_event_index,
+                attempted_client_event_index,
+            } => WriteError::ClientIdempotencyViolation {
+                client_id,
+                last_client_event_index,
+                attempted_client_event_index,
+            },
+            ShardLogWriteError::OptimisticConcurrencyViolation {
+                expected_event_batch_index,
+                current_event_batch_index,
+            } => WriteError::OptimisticConcurrencyViolation {
+                client_id: 0, // Note: ShardLogWriteError doesn't include client_id
+                expected_event_batch_index,
+                current_event_batch_index,
+            },
+        }
     }
 }

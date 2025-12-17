@@ -7,6 +7,8 @@ use crate::serde::serde_option_u128_base64;
 use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
+/// A single event which has an arbitary length byte message payload from the client
+/// Typically validated against a schema based on the event type major+minor versions
 #[derive(Default, Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct EventItem {
     /// Client derived incremented index position used to prevent client from writing the same event twice

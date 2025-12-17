@@ -48,6 +48,8 @@ fn perform_dio_check(test_file: &Path) -> Result<(), String> {
         )
     };
 
+    //TODO: Check alignment min size is 512 bytes
+
     if ret < 0 {
         let err = Error::last_os_error();
         if err.kind() == ErrorKind::InvalidInput {

@@ -87,27 +87,27 @@ where
 pub fn from_wire_format_variable<T>(
     data: &[u8],
     compression_type: CompressionType,
-    compressed_size: usize,
+    uncompressed_size: usize,
 ) -> Result<T, WireFormatError>
 where
     T: Decode<()>,
 {
     let decompressed = match compression_type {
         CompressionType::None => data.to_vec(),
-        CompressionType::Zstd { .. } => zstd::bulk::decompress(data, compressed_size)
+        CompressionType::Zstd { .. } => zstd::bulk::decompress(data, uncompressed_size)
             .map_err(|e| std::io::Error::other(e.to_string()))?,
         CompressionType::Snappy => snap::raw::Decoder::new()
             .decompress_vec(data)
             .map_err(|e| std::io::Error::other(e.to_string()))?,
         CompressionType::Brotli { .. } => {
-            let mut decompressed = Vec::with_capacity(compressed_size);
+            let mut decompressed = Vec::with_capacity(uncompressed_size);
             brotli::BrotliDecompress(&mut std::io::Cursor::new(data), &mut decompressed)?;
             decompressed
         }
         CompressionType::Gzip { .. } => {
             use flate2::read::GzDecoder;
             let mut decoder = GzDecoder::new(data);
-            let mut decompressed = Vec::with_capacity(compressed_size);
+            let mut decompressed = Vec::with_capacity(uncompressed_size);
             std::io::Read::read_to_end(&mut decoder, &mut decompressed)?;
             decompressed
         }
@@ -164,27 +164,27 @@ where
 pub fn from_wire_format_variable_msgpack<T>(
     data: &[u8],
     compression_type: CompressionType,
-    compressed_size: usize,
+    uncompressed_size: usize,
 ) -> Result<T, WireFormatError>
 where
     T: DeserializeOwned,
 {
     let decompressed = match compression_type {
         CompressionType::None => data.to_vec(),
-        CompressionType::Zstd { .. } => zstd::bulk::decompress(data, compressed_size)
+        CompressionType::Zstd { .. } => zstd::bulk::decompress(data, uncompressed_size)
             .map_err(|e| std::io::Error::other(e.to_string()))?,
         CompressionType::Snappy => snap::raw::Decoder::new()
             .decompress_vec(data)
             .map_err(|e| std::io::Error::other(e.to_string()))?,
         CompressionType::Brotli { .. } => {
-            let mut decompressed = Vec::with_capacity(compressed_size);
+            let mut decompressed = Vec::with_capacity(uncompressed_size);
             brotli::BrotliDecompress(&mut std::io::Cursor::new(data), &mut decompressed)?;
             decompressed
         }
         CompressionType::Gzip { .. } => {
             use flate2::read::GzDecoder;
             let mut decoder = GzDecoder::new(data);
-            let mut decompressed = Vec::with_capacity(compressed_size);
+            let mut decompressed = Vec::with_capacity(uncompressed_size);
             std::io::Read::read_to_end(&mut decoder, &mut decompressed)?;
             decompressed
         }

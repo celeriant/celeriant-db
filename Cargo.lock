@@ -439,6 +439,7 @@ dependencies = [
  "celeriant_wire",
  "crc32c",
  "criterion",
+ "fastbloom",
  "futures-lite",
  "glommio",
  "num_cpus",

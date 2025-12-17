@@ -12,7 +12,7 @@ use celeriant_msg::{
 use celeriant_wal::{
     aggregate_key::AggregateKey,
     compression_type::CompressionType,
-    wal::event_item::EventItem,
+    datablocks::event_item::EventItem,
 };
 use std::fs;
 
@@ -261,7 +261,6 @@ async fn write_event(client: &mut CeleriantClient, args: WriteArgs) -> Result<()
         allow_create: args.allow_create,
         expected_event_batch_index: args.expected_index,
         enforce_client_idempotency: args.enforce_idempotency,
-        durable_write_with_delay_us: Some(0),
         compression_type: compression,
     });
 

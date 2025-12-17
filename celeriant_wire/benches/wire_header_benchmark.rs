@@ -15,7 +15,7 @@ criterion_group!(benches, bench_fixed_vs_variable);
 criterion_main!(benches);
 
 /// Small message that fits in WIRE_FIXED_BODY_SIZE - used for both fixed and variable benchmarks
-#[derive(Debug, Clone, PartialEq, Encode, Decode, Serialize, Deserialize)]
+#[derive(Debug, Clone, Encode, Decode, Serialize, Deserialize)]
 struct SmallMessage {
     request_id: u64,
     timestamp: u64,

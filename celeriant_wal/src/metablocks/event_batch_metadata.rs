@@ -1,75 +1,54 @@
 use bincode::{Decode, Encode};
-use serde::{Deserialize, Serialize};
 use crate::aggregate_key::AggregateKey;
-use crate::serde::{serde_u128_base64, serde_option_u128_base64};
-
-use crate::wal::event_batch_item::EventBatchItem;
+use crate::constants::MINIBATCH_SIZE_BYTES;
+use crate::datablocks::event_batch_item::{CURRENT_VERSION, EventBatchItem};
+use crate::metablocks::datablock_style::DatablockStyle;
 use crate::{
     compression_type::CompressionType, constants::BLOOM_BYTES, 
 };
 
 /// Metadata written to the tail of each event batch for efficient reading and validation
-#[derive(Debug, Clone, PartialEq, Encode, Decode, Serialize, Deserialize)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub struct EventBatchMetadata {
-    #[serde(rename = "ak")]
     pub aggregate_key: AggregateKey,
-    /// Size of the uncompressed event batch data in bytes
-    #[serde(rename = "us")]
-    pub uncompressed_size: u64,
+    pub datablock: DatablockStyle,
     /// Event types data - either bloom filter bytes or up to 4 event type u64s
-    #[serde(rename = "etd")]
     pub event_types_data: EventTypesData,
     /// Server-assigned ID for this batch
-    #[serde(rename = "bx")]
     pub event_batch_index: u64,
-    /// Client ID that created this batch (u128 to match EventBatchItem)
-    #[serde(with = "serde_u128_base64", rename = "ci")]
+    /// Client ID that created this batch
     pub client_id: u128,
     /// Optional user ID
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        with = "serde_option_u128_base64",
-        rename = "ui"
-    )]
     pub user_id: Option<u128>,
     /// ID of the node that wrote this batch
-    #[serde(rename = "ni")]
     pub node_id: u128,
     /// Lease index at time of write
-    #[serde(rename = "lx")]
     pub lease_index: u64,
     /// Server timestamp when batch was processed
-    #[serde(rename = "st")]
     pub server_timestamp: u64,
+
+    pub min_client_event_index: u64,
+    pub max_client_event_index: u64,
+    pub min_event_timestamp: u64,
+    pub max_event_timestamp: u64,
+    pub min_event_index: u64,
+    pub max_event_index: u64,
+
+    /// Size of the uncompressed event batch data in bytes
+    pub uncompressed_size: u64,
     /// Length of the compressed event batch data
-    #[serde(rename = "cs")]
     pub compressed_size: u64,
     /// Compression algorithm used
-    #[serde(rename = "ct")]
     pub compression_type: u8,
-    /// CRC32 checksum of the compressed event data
-    #[serde(rename = "crc")]
-    pub events_crc: u32,
-
-    #[serde(rename = "mcx")]
-    pub min_client_event_index: u64,
-    #[serde(rename = "xcx")]
-    pub max_client_event_index: u64,
-    #[serde(rename = "met")]
-    pub min_event_timestamp: u64,
-    #[serde(rename = "xet")]
-    pub max_event_timestamp: u64,
-    #[serde(rename = "mex")]
-    pub min_event_index: u64,
-    #[serde(rename = "xex")]
-    pub max_event_index: u64,
+    /// Datablock version, 0 if no datablock
+    pub version: u32,
 }
 
 impl Default for EventBatchMetadata {
     fn default() -> Self {
         Self {
             aggregate_key: AggregateKey::default(),
-            uncompressed_size: 0,
+            datablock: DatablockStyle::Block { crc32c: 0, datablock_position: 0 },
             event_types_data: EventTypesData::Direct([0; 4]),
             event_batch_index: 0,
             client_id: 0,
@@ -77,26 +56,25 @@ impl Default for EventBatchMetadata {
             node_id: 0,
             lease_index: 0,
             server_timestamp: 0,
-            compressed_size: 0,
-            compression_type: 0,
-            events_crc: 0,
             min_client_event_index: 0,
             max_client_event_index: 0,
             min_event_timestamp: 0,
             max_event_timestamp: 0,
             min_event_index: 0,
             max_event_index: 0,
+            uncompressed_size: 0,
+            compressed_size: 0,
+            compression_type: 0,
+            version: 0,
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Encode, Decode, Serialize, Deserialize)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub enum EventTypesData {
     /// Bloom filter bytes (when more than 4 unique event types)
-    #[serde(rename = "b")]
     Bloom([u64; BLOOM_BYTES / 8]),
     /// Direct event type array (when 4 or fewer unique event types)
-    #[serde(rename = "d")]
     Direct([u64; BLOOM_BYTES / 8]),
 }
 
@@ -105,11 +83,13 @@ impl EventBatchMetadata {
     pub fn from_batch_item(
         aggregate_key: AggregateKey,
         event_batch_item: &EventBatchItem,
+        datablock_position: u64,
         uncompressed_size: u64,
         compressed_size: u64,
+        crc32c: u32,
         compression_type: CompressionType,
         event_types_data: EventTypesData,
-        events_crc: u32,
+        minibatch: Option<[u8; MINIBATCH_SIZE_BYTES]>,
     ) -> Self {
         // Calculate min/max values in a single pass over the events
         let (
@@ -150,9 +130,14 @@ impl EventBatchMetadata {
             min_event_index
         };
 
+        let datablock = match minibatch.is_some() {
+            true => DatablockStyle::Inline { minibatch: minibatch.unwrap() },
+            false => DatablockStyle::Block { crc32c, datablock_position },
+        };
+
         Self {
             aggregate_key,
-            uncompressed_size,
+            datablock,
             event_types_data,
             event_batch_index: event_batch_item.event_batch_index,
             client_id: event_batch_item.client_id,
@@ -160,15 +145,16 @@ impl EventBatchMetadata {
             node_id: event_batch_item.node_id,
             lease_index: event_batch_item.lease_index,
             server_timestamp: event_batch_item.server_timestamp,
-            compressed_size,
-            compression_type: compression_type.to_tuple().0,
-            events_crc,
             min_client_event_index,
             max_client_event_index,
             min_event_timestamp,
             max_event_timestamp,
             min_event_index,
             max_event_index,
+            version: CURRENT_VERSION, 
+            uncompressed_size, 
+            compressed_size, 
+            compression_type: compression_type.to_tuple().0,
         }
     }
 }
@@ -177,7 +163,7 @@ impl EventBatchMetadata {
 mod tests {
     use super::*;
     use crate::{
-        aggregate_key, compression_type::CompressionType, wal::{event_batch_item::EventBatchItem, event_item::EventItem}
+        compression_type::CompressionType, datablocks::event_item::EventItem
     };
 
     fn mk_event(
@@ -218,11 +204,13 @@ mod tests {
         let meta = EventBatchMetadata::from_batch_item(
             aggregate_key,
             &batch,
+            777,
             1234,                // uncompressed
             567,                 // compressed
+            999,
             CompressionType::Snappy,
             EventTypesData::Direct([2, 4, 0, 0]),
-            0xDEADBEEF,
+            None,
         );
 
         assert_eq!(meta.aggregate_key.org_id, 3);
@@ -234,10 +222,18 @@ mod tests {
         assert_eq!(meta.user_id, None);
         assert_eq!(meta.node_id, 99);
         assert_eq!(meta.lease_index, 43);
-        assert_eq!(meta.uncompressed_size, 1234);
+        assert_eq!(meta.version, CURRENT_VERSION);
+        assert_eq!(meta.uncompressed_size, 1234);        
         assert_eq!(meta.compressed_size, 567);        
         assert_eq!(meta.compression_type, 2);
-        assert_eq!(meta.events_crc, 0xDEADBEEF);
+        
+        let DatablockStyle::Block { 
+            crc32c, datablock_position 
+        } = meta.datablock else {
+            panic!("Expected DatablockStyle::Block");
+        };
+        assert_eq!(crc32c, 999);
+        assert_eq!(datablock_position, 777);
 
         // Min/max from the 3 events
         assert_eq!(meta.min_client_event_index, 10);
@@ -265,11 +261,13 @@ mod tests {
         let meta = EventBatchMetadata::from_batch_item(
             aggregate_key,
             &batch,
+            666,
             10,
             5,
+            999,
             CompressionType::None,
             EventTypesData::Direct([0, 0, 0, 0]),
-            0,
+            None,
         );
 
         assert_eq!(meta.min_client_event_index, 0);

@@ -1,5 +1,5 @@
 use bincode::{Decode, Encode};
-use celeriant_wal::{aggregate_key::AggregateKey, compression_type::CompressionType, wal::{event_item::EventItem}};
+use celeriant_wal::{aggregate_key::AggregateKey, compression_type::CompressionType, datablocks::{event_item::EventItem}};
 use serde::{Deserialize, Serialize};
 
 use crate::request::{directory_filters::DirectoryFilters, read_filters::ReadFilters};
@@ -42,7 +42,6 @@ pub struct WriteRequest {
     pub allow_create: bool,
     pub expected_event_batch_index: Option<u64>,
     pub enforce_client_idempotency: bool,
-    pub durable_write_with_delay_us: Option<u64>,
     pub compression_type: CompressionType,
 }
 

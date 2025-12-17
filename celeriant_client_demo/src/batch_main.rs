@@ -7,14 +7,13 @@ use celeriant_msg::request::requests::WriteRequest;
 use celeriant_wal::{
     aggregate_key::AggregateKey,
     compression_type::CompressionType,
-    wal::event_item::EventItem,
+    datablocks::event_item::EventItem,
 };
 use tokio::time::Instant;
 
-const NUM_CONNECTIONS: usize = 4000; // 28k max source port limit ~25000;
+const NUM_CONNECTIONS: usize = 1024*12; // 28k max source port limit ~25000;
 const TEST_DURATION_SECS: u64 = 30;
-const NUM_AGGREGATES: usize = 3000;
-const SYNC_DELAY_US: u64 = 10000;
+const NUM_AGGREGATES: usize = 1024;
 
 struct TaskStats {
     request_count: u64,
@@ -112,7 +111,6 @@ async fn run_connection_benchmark(connection_id: usize) -> Result<TaskStats, Str
         allow_create: true,
         expected_event_batch_index: None,
         enforce_client_idempotency: false,
-        durable_write_with_delay_us: if SYNC_DELAY_US == 0 { None } else { Some(SYNC_DELAY_US) },
         compression_type: CompressionType::None,
     });
 

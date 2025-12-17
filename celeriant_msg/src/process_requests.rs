@@ -266,7 +266,6 @@ mod tests {
                 allow_create: true,
                 expected_event_batch_index: None,
                 enforce_client_idempotency: false,
-                durable_write_with_delay_us: None,
                 compression_type: CompressionType::None,
             }),
             RequestType::TrimStart => Request::TrimStart(TrimStartRequest {

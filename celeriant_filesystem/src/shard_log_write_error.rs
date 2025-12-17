@@ -3,8 +3,23 @@ use glommio::GlommioError;
 
 #[derive(Debug, Clone)]
 pub enum ShardLogWriteError {
+    DmaFileNotInitialized,
+    DatablocksCarryOverBufferNotPresent,
     IoError(String),
     SerializationError(WireFormatError),
+    EmptyEventsList,
+    ZeroEventType {
+        client_event_index: u64,
+    },
+    ClientIdempotencyViolation {
+        client_id: u128,
+        last_client_event_index: u64,
+        attempted_client_event_index: u64,
+    },
+    OptimisticConcurrencyViolation {
+        expected_event_batch_index: u64,
+        current_event_batch_index: u64,
+    },
 }
 
 impl From<WireFormatError> for ShardLogWriteError {

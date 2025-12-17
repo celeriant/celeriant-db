@@ -85,7 +85,7 @@ impl WireHeader {
         T: Decode<()> + serde::de::DeserializeOwned,
     {
         if let Some(max_request_size) = max_size_bytes
-            && self.compressed_length > max_request_size
+            && self.uncompressed_length > max_request_size
         {
             return Err(WireError::MessageTooLarge {
                 message_length: self.compressed_length,
@@ -94,18 +94,19 @@ impl WireHeader {
         }
 
         let compressed_length = self.compressed_length as usize;
+        let uncompressed_length = self.uncompressed_length as usize;
 
         let mut payload = vec![0u8; compressed_length];
         reader.read_exact(&mut payload).await?;
 
         let obj = match self.version {
             PROTOCOL_VERSION_V2 => {
-                from_wire_format_variable(&payload, self.compression_type, compressed_length)?
+                from_wire_format_variable(&payload, self.compression_type, uncompressed_length)?
             }
             PROTOCOL_VERSION_V3 => from_wire_format_variable_msgpack(
                 &payload,
                 self.compression_type,
-                compressed_length,
+                uncompressed_length,
             )?,
             _ => return Err(WireError::UnsupportedProtocol(self.version)),
         };

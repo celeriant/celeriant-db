@@ -1,23 +1,67 @@
 # celeriant_wal
 
-Core data structures for the Celeriant write-ahead log. This crate defines the event, batch, and metadata types used throughout the server and client libraries.
+Core data structures for the Celeriant write-ahead log (WAL). This crate defines the event, batch, snapshot, and metadata types used throughout the server and client libraries.
 
 ## Overview
 
 This crate provides the serializable data structures that form the foundation of Celeriant's storage and wire protocol. It contains no I/O logic—just types and their serialization implementations.
 
-```
-EventBatchItem
-├── batch-level metadata (indexes, timestamps, identity)
-└── Vec<EventItem>
-    ├── event payload (Arc<Vec<u8>>)
-    └── event metadata (type, timestamps, indexes)
+High-level layout:
 
-EventBatchMetadata (separate file)
-├── min/max ranges for filtering
-├── event type bloom filter or direct array
-└── compression/integrity info
 ```
+WalMetablock (512 bytes, fixed-size)
+├── EventBatchMetadata
+│   ├── aggregate key + datablock pointer
+│   ├── min/max ranges for filtering
+│   ├── event type bloom filter or direct array
+│   ├── compression info + minibatch fast-path
+├── SnapshotOrg
+├── SnapshotAggregateType
+└── SnapshotAggregate
+
+WalDatablock (variable-size)
+├── EventBatch(EventBatchItem)
+│   ├── batch-level headers (indexes, timestamps, identity)
+│   └── Vec<EventItem)
+├── SnapshotOrg
+├── SnapshotAggregateType
+└── SnapshotAggregate
+```
+
+Notes:
+- **Metablocks** are always fixed-size and optimized for fast scanning/filtering without pulling large payloads from disk.
+- **Datablocks** contain variable-length payloads (event batches and “full” snapshot payloads).
+
+## Block Architecture
+
+All blocks (both meta and data) are protected by a version byte and CRC32 checksum at the front. This enables:
+
+- **Format upgrades**: Version byte allows forward-compatible schema evolution
+- **Corruption detection**: CRC protects against bitrot and torn writes
+- **Safe deserialization**: Validation happens before bincode decodes the payload
+
+### Metablocks vs Datablocks
+
+| Property | Metablock | Datablock |
+|----------|-----------|-----------|
+| Size | Fixed 512 bytes | Variable length |
+| Growth direction | Forward from file start | Backward from file end |
+| Purpose | Fast filtering, discovery, offsets | Event payloads, full snapshots |
+| Compression | Never | Per-block optional |
+
+### Block Types
+
+**WalMetablock** variants:
+- `EventBatchMetadata` — Filtering metadata for an event batch + pointer to datablock payload (or inline minibatch)
+- `SnapshotOrg` — Organization/tenant discovery marker
+- `SnapshotAggregateType` — Aggregate-type discovery marker (and whether schemas exist)
+- `SnapshotAggregate` — Aggregate discovery + index/size tracking metadata
+
+**WalDatablock** variants:
+- `EventBatch` — The actual event batch payload (`EventBatchItem`)
+- `SnapshotOrg` — Reserved for org-level snapshot payloads (currently empty in this crate)
+- `SnapshotAggregateType` — Schema registry payloads (per aggregate type)
+- `SnapshotAggregate` — Idempotency tracking payloads (per aggregate)
 
 ## Key Types
 
@@ -25,283 +69,155 @@ EventBatchMetadata (separate file)
 
 An individual event within a batch.
 
-```rust
-pub struct EventItem {
-    pub client_event_index: u64,    // Client-assigned, for idempotency
-    pub event_index: u64,           // Server-assigned, globally unique within aggregate
-    pub event_id: Option<u128>,     // Optional client-assigned unique ID
-    pub event_timestamp: u64,       // Client-side Unix ms timestamp
-    pub event_type_major: u64,      // Event schema identifier
-    pub event_type_minor: u64,      // Forward-compatible schema version
-    pub event_value: Arc<Vec<u8>>,  // Opaque payload
-    pub iv: Option<[u8; 12]>,       // AES-GCM initialization vector
-}
-```
+- `client_event_index` supports idempotent producers
+- `event_index` is server-assigned ordering within an aggregate
+- `event_value` is `Arc<Vec<u8>>` for cheap cross-thread moves
+- `iv: Option<[u8; 12]>` supports per-event AES-GCM encrypted payloads (opaque to server)
 
 ### EventBatchItem
 
 A batch of events from a single client, persisted atomically.
 
-```rust
-pub struct EventBatchItem {
-    pub event_batch_index: u64,     // Server-assigned batch sequence number
-    pub server_timestamp: u64,      // Server-side Unix ms timestamp
-    pub client_id: u128,            // Machine identity
-    pub user_id: Option<u128>,      // Human identity (optional)
-    pub node_id: u128,              // Which cluster node wrote this batch
-    pub lease_index: u64,           // Leadership lease at write time
-    pub events: Vec<EventItem>,
-}
-```
+Headers include:
+- `event_batch_index` (server-assigned, monotonically increasing per aggregate)
+- `server_timestamp` (when persisted)
+- `client_id` (machine identity)
+- `user_id` (optional human identity)
+- `node_id` + `lease_index` for fencing in replicated deployments
 
-### EventBatchMetadata
+### EventBatchMetadata (metablock)
 
-Metadata written alongside each batch for efficient filtering.
+Metadata written alongside each batch for efficient filtering and validation. Stored in a **512-byte metablock**.
 
-```rust
-pub struct EventBatchMetadata {
-    pub event_types_data: EventTypesData,  // Bloom or direct array
-    pub min_event_index: u64,
-    pub max_event_index: u64,
-    pub min_event_timestamp: u64,
-    pub max_event_timestamp: u64,
-    // ... compression, CRC, sizing fields
-}
-```
+Includes:
+- `AggregateKey` and `datablock_position` (where the batch payload lives)
+- `uncompressed_size` / `compressed_size` and `compression_type`
+- min/max ranges for binary-search and filtering:
+  - `min/max_event_index`
+  - `min/max_event_timestamp`
+  - `min/max_client_event_index`
+- `event_types_data` (bloom filter or direct list)
+
+#### Minibatch fast-path
+
+If the (encoded+compressed) batch payload is small enough, it can be inlined into the metablock’s `minibatch` area (256 bytes). This avoids an extra disk read for tiny batches.
+
+### SnapshotAggregate (metablock)
+
+Quick metadata about an aggregate, used for:
+- Aggregate discovery (listing aggregates in an org)
+- Write path index tracking (`last_event_index`, `last_event_batch_index`)
+- Read path availability (`min_available_event_index`, `min_available_event_batch_index`)
+- Size/timestamp “filesystem style” metadata
+
+### SnapshotAggregate (datablock)
+
+Full aggregate state snapshot payload used for recovery. Currently this contains idempotency tracking:
+
+- `client_event_indexes: HashMap<u128, u64>` — last accepted `event_batch_index` per `client_id`
+
+### SnapshotAggregateType (metablock + datablock)
+
+Two layers:
+- Metablock `SnapshotAggregateType` is the compact discovery record (`org_id`, `aggregate_type_id`, `has_schemas`).
+- Datablock `SnapshotAggregateType` contains the actual schema registry payload:
+  - `schemas: HashMap<u64, Option<EventTypeSchema>>`
+  - `EventTypeSchema` tracks schema type and per-minor-version schemas.
 
 ### Shard Log Structures
 
-The shard log structures define how WAL data is stored on disk. Each shard has its own WAL, split into multiple ~1GB files that rotate when full.
+The shard log structures define how WAL data is stored on disk. Each shard has its own WAL, split into multiple fixed-size files that rotate when full.
 
 #### File Layout
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│ Header (fixed size)                                         │
+│ Header (512 bytes) - version + crc protected                │
 ├─────────────────────────────────────────────────────────────┤
-│ Metadata entries (256 bytes each, growing downward →)       │
-│ ...                                                         │
+│ Metablocks (512 bytes each, growing downward →)             │
+│   [version][crc][WalMetablock bincode payload]              │
+│   ...                                                       │
 ├─────────────────────────────────────────────────────────────┤
 │                      Free space                             │
 ├─────────────────────────────────────────────────────────────┤
-│                                    ... Event batches        │
-│              (compressed, variable size, growing ← upward)  │
+│                                    ... Datablocks           │
+│   [version][crc][WalDatablock bincode payload]              │
+│              (variable size, growing ← upward)              │
 ├─────────────────────────────────────────────────────────────┤
-│ Checkpoint (at end, pre-allocated space, can extend file)   │
+│ Header (512 bytes) - duplicate for torn write recovery      │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-Files are preallocated to 1GB. Metadata grows from the top, event batches grow from the bottom. When they meet, the file rotates. The checkpoint is stored at the file's end with reserved space, but can extend beyond 1GB if tracking many aggregates or clients.
+Files are preallocated. Metablocks grow from the top, Datablocks grow from the bottom. When they meet, the file rotates.
 
 #### ShardLogHeader
 
-File header with version and checkpoint location.
+Tracks file boundaries and current write positions:
 
 ```rust
 pub struct ShardLogHeader {
-    pub shard_log_version: u32,              // File format version
-    pub shard_log_checkpoint_version: u64,   // Checkpoint format version
-    pub shard_log_checkpoint_start_pos: u64, // Byte offset to checkpoint
+    pub file_len: u64,           // Total file size (may differ after trimming)
+    pub metablocks_position: u64, // End of last written metablock
+    pub datablocks_position: u64, // Start of last written datablock
 }
 ```
 
-#### ShardLogCheckpoint
-
-Authoritative source of truth for file state. Tracks write positions and aggregate metadata.
-
-```rust
-pub struct ShardLogCheckpoint {
-    pub file_size: u64,                                  // Logical file size (not OS-reported)
-    pub aggregates: HashMap<AggregateKey, ShardLogAggregate>, // Per-aggregate metadata
-    pub metadata_pos: u64,                               // End of metadata region
-    pub event_batches_pos: u64,                          // Start of event batches region
-}
-```
-
-Key behaviors:
-- `file_size` is tracked explicitly because direct I/O may pad bytes
-- `metadata_pos` advances forward as metadata entries are written
-- `event_batches_pos` decreases as batches are written from the end
-- `available_space()` returns bytes between the two regions
-
-#### ShardLogAggregate
-
-Per-aggregate state within a shard log file.
-
-```rust
-pub struct ShardLogAggregate {
-    pub client_event_indexes: Option<HashMap<u128, u64>>, // Client idempotency tracking
-    pub last_event_index: u64,
-    pub last_event_batch_index: u64,
-    pub minimum_available_event_batch_index: u64,         // After trimming
-    pub compressed_size_bytes: u64,
-    pub uncompressed_size_bytes: u64,
-    pub created_at: u64,
-    pub updated_at: u64,
-    pub read_at: Option<u64>,                             // LRU eviction hint
-}
-```
-
-- `client_event_indexes` may be `None` if evicted from memory under pressure—requires scanning metadata to reconstruct
-- `minimum_available_event_batch_index` reflects trimmed batches
-- `read_at` helps identify cold aggregates whose metadata can be evicted
+Written at both start and end of file, protected by CRC, enabling recovery from torn writes.
 
 ## Design Decisions
 
-### Arc-Wrapped Event Payloads
+### Arc-wrapped event payloads
 
-`event_value` is `Arc<Vec<u8>>` rather than `Vec<u8>`:
+`event_value` is `Arc<Vec<u8>>` rather than `Vec<u8>` to avoid copying payload bytes across thread boundaries.
 
-```rust
-pub event_value: Arc<Vec<u8>>,
-```
-
-Arc enables zero-copy transfer across thread boundaries. Celeriant uses a thread-per-core architecture so it doesn't technically need Arcs. We still wrap event_value in arc however to make it easier to move data around in clients on the tokio side, and when Celeriant is embedded inside another tokio based server as a library. Our testing indicates that performance cost is minimal.
-
-### Client Identity vs User Identity
+### Client identity vs user identity
 
 Two identity fields serve different purposes:
 
 | Field | Source | Purpose |
 |-------|--------|---------|
-| `client_id` | Truncated SHA-256 of client's public key or a UUID | Machine identity, connection authentication |
-| `user_id` | Truncated SHA-256 of user's `sub` claim | Human identity, multi-tenant authorization |
+| `client_id` | Machine identity | Connection/app identity and idempotency tracking |
+| `user_id` | Human identity (optional) | Authorization/auditing |
 
-A single user may connect from multiple clients (devices). A single client may handle requests for multiple users. Both are truncated to 128 bits for storage efficiency while maintaining collision resistance.
+Both are stored as truncated 128-bit identifiers for storage efficiency.
 
-`user_id` is optional—service-to-service writes may have no associated user.
+### Client event index for idempotency
 
-### Client Event Index for Idempotency
+`client_event_index` enables exactly-once semantics for clients that retry. The server can track the highest seen index per client and reject duplicates (policy-dependent).
 
-```rust
-pub client_event_index: u64,
-```
+### Dual timestamps
 
-Each client maintains a monotonically increasing counter. When `enforce_client_idempotency` is enabled on writes, the server rejects events with a `client_event_index` it has already seen from that `client_id`.
+- `event_timestamp` (client): when the event occurred
+- `server_timestamp` (server): when it was persisted
 
-This provides exactly-once semantics for clients that retry on network failures. The server tracks the highest seen index per client and rejects duplicates.
+Use for filtering, not strict ordering.
 
-It's designed to be used by clients that have a transactional database of their own, and follow the inbox pattern.
+### Optional event ID
 
-### Dual Timestamps
+`event_id: Option<u128>` is a client-supplied identifier for correlation/external references.
 
-| Field | Set By | Purpose |
-|-------|--------|---------|
-| `event_timestamp` | Client | When the event occurred in the real world |
-| `server_timestamp` | Server | When the batch was persisted |
+### Per-event encryption support
 
-Both are Unix milliseconds. They allow for queries against the aggregate that filter by time. Don't use these for ordering though as multiple clients may write batches at the same time.
+`iv: Option<[u8; 12]>` indicates the payload is encrypted (AES-GCM). The server stores encrypted payloads opaquely.
 
-### Optional Event ID
+Avoid compression for encrypted payloads.
 
-```rust
-pub event_id: Option<u128>,
-```
+### Metadata separation
 
-Clients can assign their own unique identifiers to events. Useful for:
+Batch metadata is stored separately from batch payload so the server can filter without decompressing/reading datablocks.
 
-- Correlation across systems
-- External references to specific events
+Event type filtering uses either:
+- `Direct([u64; 4])` when a batch contains ≤ 4 unique event types (exact match)
+- `Bloom([u64; 4])` when more types are present (false positives possible, no false negatives)
 
-Most use cases don't need this—`client_event_index` handles idempotency, and `event_index` provides a server-assigned identifier. Clients use the `event_batch_index` on reads get events from the right position in the aggregate.
+### Serialization choices
 
-### Per-Event Encryption Support
-
-```rust
-pub iv: Option<[u8; 12]>,
-```
-
-When present, indicates `event_value` is encrypted with AES-256-GCM. The 12-byte IV (initialization vector) is the standard size for AES-GCM and must be unique per encryption operation.
-
-The server stores encrypted payloads opaquely. Encryption/decryption happens client-side. This enables end-to-end encryption where the server never sees plaintext event data.
-
-Don't use compression if storing encrypted events.
-
-### Distributed Fencing Fields
-
-```rust
-pub node_id: u128,
-pub lease_index: u64,
-```
-
-These fields prevent split-brain writes in replicated deployments.
-
-Celeriant uses lease-based leadership for writes using a shared control plane. `node_id` identifies which cluster node wrote a batch. `lease_index` is the leadership lease term at write time.
-
-Leaders must write to a quorum of followers to accept writes from clients. Followers don't allow replication from a leader if the leader's `lease_index` is less than the follower's current `lease_index`.
-
-### Metadata Separation
-
-`EventBatchMetadata` exists as a separate structure from the event data itself. `EventBatchMetadata` is always stored as 256 bytes on disk, allowing quick calculation of offsets on disk using the `event_batch_index` (There are never any gaps in the batch index sequence)
-
-**Filtering without decompression**: Event data is compressed. Metadata is not. When filtering by event type or time range, the server reads metadata first to skip irrelevant batches entirely.
-
-**Index acceleration**: Min/max fields enable binary search over batch ranges:
-
-```rust
-pub min_event_index: u64,
-pub max_event_index: u64,
-pub min_event_timestamp: u64,
-pub max_event_timestamp: u64,
-pub min_client_event_index: u64,
-pub max_client_event_index: u64,
-```
-
-**Event type filtering**: The `EventTypesData` enum supports two strategies:
-
-```rust
-pub enum EventTypesData {
-    Bloom([u64; 4]),   // 256-bit bloom filter for many event types
-    Direct([u64; 4]),  // Up to 4 event type IDs stored directly
-}
-```
-
-When a batch contains ≤4 unique event types, they're stored directly for exact matching. With more types, a bloom filter provides probabilistic filtering (false positives possible, false negatives impossible) and further filtering happens at the event level in memory later.
-
-### Serialization Choices
-
-**Short field names**: All serde renames use 2-3 character keys:
-
-```rust
-#[serde(rename = "bx")]
-pub event_batch_index: u64,
-```
-
-This reduces JSON payload size by ~40% compared to full field names. The wire protocol is binary (bincode), but JSON is used for debugging, logging, and the HTTP API.
-
-**Base64-encoded u128**: JSON has no native 128-bit integer type. JavaScript's `Number` loses precision beyond 53 bits. We encode u128 fields as base64 strings:
-
-```rust
-#[serde(with = "serde_u128_base64", rename = "ci")]
-pub client_id: u128,
-```
-
-This produces 22-character strings (128 bits → 22 base64 chars) that round-trip correctly through any JSON parser.
-
-## Compression
-
-The `CompressionType` enum supports multiple algorithms:
-
-```rust
-pub enum CompressionType {
-    None,
-    Zstd { level: i32 },   // Default, best ratio/speed
-    Snappy,                 // Fastest decompression
-    Brotli { level: i32 }, // Best ratio
-    Gzip { level: i32 },   // Compatibility
-}
-```
-
-Compression is per-batch. The server compresses event data before writing; metadata remains uncompressed.
-
-It's up to you to decide which batches to compress, what algorithm and what compression level. A trade off between speed and size. Consider that large payloads benefit more from compression.
+- Short serde keys reduce JSON/debug payload size
+- `u128` fields are base64-encoded in JSON to preserve full precision across languages
 
 ## Dependencies
 
 Minimal by design:
-
 - `serde` - Serialization framework for attributes on structs
-- `bincode` - Required due to bincode v2 not using standard serde attributes
+- `bincode` - Binary encoding/decoding (v2)
 - `base64` - u128 JSON encoding support
-
-No async runtime, no I/O, no platform-specific code. See `celeriant_wire` for ser/deser routines.

@@ -2,13 +2,14 @@ use std::{sync::Arc, time::Duration};
 use std::hint::black_box;
 
 use celeriant_wal::aggregate_key::AggregateKey;
+use celeriant_wal::constants::MINIBATCH_SIZE_BYTES;
+use celeriant_wal::datablocks::event_batch_item::EventBatchItem;
+use celeriant_wal::datablocks::event_item::EventItem;
+use celeriant_wal::metablocks::datablock_style::DatablockStyle;
+use celeriant_wal::metablocks::event_batch_metadata::{EventBatchMetadata, EventTypesData};
+use celeriant_wal::metablocks::wal_metablock::CURRENT_VERSION;
 use celeriant_wal::{
     compression_type::CompressionType,
-    wal::{
-        event_batch_item::EventBatchItem,
-        event_batch_metadata::{EventBatchMetadata, EventTypesData},
-        event_item::EventItem,
-    },
 };
 use celeriant_wire::wire_format::{
     from_wire_format_variable, from_wire_format_variable_msgpack, to_wire_format_variable,
@@ -57,7 +58,14 @@ fn create_event_batch(event_count: usize, payload_size: usize) -> EventBatchItem
 fn create_metadata() -> EventBatchMetadata {
     EventBatchMetadata {
         aggregate_key: AggregateKey::new(1, 2, 3),
-        uncompressed_size: 4096,
+        datablock: DatablockStyle::Block { 
+            crc32c: 0,
+            datablock_position: 0, 
+        },
+        version: CURRENT_VERSION, 
+        uncompressed_size: 4096, 
+        compressed_size: 2048, 
+        compression_type: 1,
         event_types_data: EventTypesData::Direct([1, 2, 3, 4]),
         event_batch_index: 42,
         client_id: 0x123456789ABCDEF0,
@@ -65,9 +73,6 @@ fn create_metadata() -> EventBatchMetadata {
         node_id: 0x1111222233334444,
         lease_index: 100,
         server_timestamp: 1700000000000,
-        compressed_size: 2048,
-        compression_type: 1,
-        events_crc: 0xDEADBEEF,
         min_client_event_index: 0,
         max_client_event_index: 99,
         min_event_timestamp: 1700000000000,
@@ -169,21 +174,6 @@ fn bench_metadata_serialization(c: &mut Criterion) {
                         to_wire_format_variable(black_box(*meta), *comp).unwrap();
                     let _decoded: EventBatchMetadata =
                         from_wire_format_variable(&encoded, *comp, uncompressed_size).unwrap();
-                });
-            },
-        );
-
-        // MessagePack serialization
-        group.bench_with_input(
-            BenchmarkId::new("msgpack", comp_name),
-            &(&metadata, compression),
-            |b, (meta, comp)| {
-                b.iter(|| {
-                    let (uncompressed_size, encoded) =
-                        to_wire_format_variable_msgpack(black_box(*meta), *comp).unwrap();
-                    let _decoded: EventBatchMetadata =
-                        from_wire_format_variable_msgpack(&encoded, *comp, uncompressed_size)
-                            .unwrap();
                 });
             },
         );

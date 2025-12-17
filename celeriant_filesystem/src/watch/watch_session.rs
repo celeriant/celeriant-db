@@ -7,7 +7,7 @@ use celeriant_msg::{
 use celeriant_wal::{aggregate_key::AggregateKey, datablocks::event_batch_item::EventBatchItem};
 
 use crate::{
-    local_aggregate::{LocalAggregate, LocalAggregateTrait}, read_operations::read_error::ReadError, read_write_error::ReadWriteError, watch::{aggregate_watch_event::AggregateWatchEvent, subscribed_client::SubscribedClient}
+    shard_log_write_error::ShardLogWriteError, shard_write_ahead_log::ShardWriteAheadLog, watch::{aggregate_watch_event::AggregateWatchEvent, subscribed_client::SubscribedClient}
 };
 
 pub enum WatchOutput {
@@ -22,7 +22,7 @@ pub struct WatchSession {
     correlation_id: Option<u128>,
     watcher_id: u64,
     subscribed_client: Rc<RefCell<SubscribedClient>>,
-    local_aggregate: Rc<LocalAggregate>,
+    shard_write_ahead_log: Rc<ShardWriteAheadLog>,
     read_filters: Option<ReadFilters>,
     initial_catchup_complete: bool,
 }
@@ -33,7 +33,7 @@ impl WatchSession {
         correlation_id: Option<u128>,
         watcher_id: u64,
         subscribed_client: Rc<RefCell<SubscribedClient>>,
-        local_aggregate: Rc<LocalAggregate>,
+        shard_write_ahead_log: Rc<ShardWriteAheadLog>,
         mut read_filters: Option<ReadFilters>,
         watching_writes: bool,
     ) -> Self {
@@ -52,13 +52,13 @@ impl WatchSession {
             correlation_id,
             watcher_id,
             subscribed_client,
-            local_aggregate,
+            shard_write_ahead_log,
             read_filters,
             initial_catchup_complete: !watching_writes,
         }
     }
 
-    pub async fn next(&mut self) -> Result<WatchOutput, ReadWriteError> {
+    pub async fn next(&mut self) -> Result<WatchOutput, ShardLogWriteError> {
         // Handle initial catchup for write watchers
         if !self.initial_catchup_complete {
             if let Some(output) = self.process_initial_catchup().await? {
@@ -71,7 +71,7 @@ impl WatchSession {
         self.process_watch_event().await
     }
 
-    async fn process_initial_catchup(&mut self) -> Result<Option<WatchOutput>, ReadWriteError> {
+    async fn process_initial_catchup(&mut self) -> Result<Option<WatchOutput>, ShardLogWriteError> {
 
         if self.read_filters.as_ref().is_none() {
             return Ok(None);
@@ -85,7 +85,7 @@ impl WatchSession {
 
         //TODO: Some more detail here - should stream results back to client
         //Currently just waits due to throughput limitation and then dumps it all over the wire at once
-        let read_result = self.local_aggregate.read(&read_request).await?;
+        let read_result = self.shard_write_ahead_log.read(&read_request).await?;
         if read_result.event_batches.is_empty() {
             return Ok(None); // Catchup complete
         }
@@ -112,7 +112,7 @@ impl WatchSession {
         Ok(Some(WatchOutput::Response(response)))
     }
 
-    async fn get_batches_for_write_event(&mut self, aggregate_watch_event: &AggregateWatchEvent) -> Result<(usize, Option<Vec<EventBatchItem>>), ReadError> {
+    async fn get_batches_for_write_event(&mut self, aggregate_watch_event: &AggregateWatchEvent) -> Result<(usize, Option<Vec<EventBatchItem>>), ShardLogWriteError> {
         let (data_size_bytes, event_batches) = if let AggregateWatchEvent::Write { 
                     from_event_batch_index, to_event_batch_index 
                 } = aggregate_watch_event.clone() {
@@ -123,7 +123,7 @@ impl WatchSession {
                     };
                     read_request.filters.from_event_batch_index = from_event_batch_index;
                     read_request.filters.to_event_batch_index = Some(to_event_batch_index);
-                    let read_result = self.local_aggregate.read(&read_request).await?;
+                    let read_result = self.shard_write_ahead_log.read(&read_request).await?;
 
                     //Ensure the next write event pulls batches from the right offset for the client
                     if let Some(read_filters) = self.read_filters.as_mut() {
@@ -137,7 +137,7 @@ impl WatchSession {
         Ok((data_size_bytes, event_batches))
     }
 
-    async fn process_watch_event(&mut self) -> Result<WatchOutput, ReadWriteError> {
+    async fn process_watch_event(&mut self) -> Result<WatchOutput, ShardLogWriteError> {
         let timeout_duration = {
             let client = self.subscribed_client.borrow();
             client.watch_wait_time().unwrap_or(Duration::from_secs(5))
@@ -181,7 +181,7 @@ impl WatchSession {
     }
 
     pub fn cleanup(&self) {
-        let watchers = self.local_aggregate.watched_aggregates.get_or_create(&self.aggregate_key);
+        let watchers = self.shard_write_ahead_log.watched_aggregates.get_or_create(&self.aggregate_key);
         watchers.remove_subscriber(self.watcher_id);
     }
 }

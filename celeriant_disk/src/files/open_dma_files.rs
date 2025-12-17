@@ -31,14 +31,16 @@ pub async fn create_file_dma<P: AsRef<Path>>(
 
 pub async fn existing_file_dma<P: AsRef<Path>>(
     path: P,
-) -> Result<DmaFile, GlommioError<()>> {
-    OpenOptions::new()
+) -> Result<(DmaFile, u64), GlommioError<()>> {
+    let dma_file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(false)
         .truncate(false)
         .dma_open(path.as_ref())
-        .await
+        .await?;
+    let file_len = dma_file.file_size().await?;
+    Ok((dma_file, file_len))
 }
 
 #[cfg(test)]
@@ -66,7 +68,7 @@ mod tests {
                 file.close().await.unwrap();
 
                 // Try to read it back
-                let file2 = existing_file_dma(&file_path).await.unwrap();
+                let (file2, len2) = existing_file_dma(&file_path).await.unwrap();
                 let read_buf = file2.read_at_aligned(0, 512).await.unwrap();
                 assert!(
                     read_buf.iter().all(|&b| b == 0xAB),

@@ -1,4 +1,5 @@
-use std::hint::black_box;
+use std::str::FromStr;
+use std::{hint::black_box, path::PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -6,6 +7,8 @@ use celeriant_aggregate::{
     local_aggregate::{LocalAggregate, LocalAggregateTrait},
     node_config::NodeConfig,
 };
+use celeriant_filesystem::shard_config::ShardConfig;
+use celeriant_filesystem::shard_write_ahead_log::{ShardWriteAheadLog};
 use celeriant_msg::request::{
     read_filters::ReadFilters,
     requests::{ReadRequest, WriteRequest},
@@ -13,7 +16,7 @@ use celeriant_msg::request::{
 use celeriant_wal::{
     aggregate_key::AggregateKey,
     compression_type::CompressionType,
-    wal::event_item::EventItem,
+    datablocks::event_item::EventItem,
 };
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use glommio::{LocalExecutorBuilder, Placement};
@@ -63,7 +66,6 @@ fn create_write_request(
     aggregate_key: AggregateKey,
     client_id: u128,
     events: Vec<EventItem>,
-    durable_write_delay_us: Option<u64>,
 ) -> WriteRequest {
     WriteRequest {
         correlation_id: None,
@@ -74,7 +76,6 @@ fn create_write_request(
         allow_create: true,
         expected_event_batch_index: None,
         enforce_client_idempotency: false,
-        durable_write_with_delay_us: durable_write_delay_us,
         compression_type: CompressionType::Snappy,
     }
 }
@@ -87,8 +88,9 @@ fn create_read_request(aggregate_key: AggregateKey, filters: ReadFilters) -> Rea
     }
 }
 
-fn create_local_aggregate(
+async fn create_local_aggregate(
     data_folder: &str,
+    delay_us: Option<u64>,
     max_data_cache_size_bytes: usize,
     async_flush_ms: u64,
 ) -> LocalAggregate {
@@ -101,8 +103,14 @@ fn create_local_aggregate(
         listen_address: "127.0.0.1:0".to_string(),
         max_event_batches_response_size: Some(64 * 1024 * 1024),
     };
-
-    LocalAggregate::new(node_config)
+    let shard_config = ShardConfig {
+        node_id: 1,
+        async_flush_ms,
+        durable_write_with_delay_us: delay_us,
+        ..Default::default()
+    };
+    let shard_write_ahead_log = ShardWriteAheadLog::new_with_config(1, &PathBuf::from_str(data_folder).unwrap(), shard_config).await.unwrap();
+    LocalAggregate::new(node_config, shard_write_ahead_log)
 }
 
 // ============================================================================
@@ -142,7 +150,7 @@ fn benchmark_write_fsync_modes(c: &mut Criterion) {
 
                     let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
                         .spawn(move || async move {
-                            let local_aggregate = std::rc::Rc::new(create_local_aggregate(&data_folder, 64 * 1024 * 1024, 50));
+                            let local_aggregate = std::rc::Rc::new(create_local_aggregate(&data_folder, delay_us, 64 * 1024 * 1024, 50).await);
                             let aggregate_key = create_aggregate_key(1);
                             let client_id = 100u128;
 
@@ -153,7 +161,7 @@ fn benchmark_write_fsync_modes(c: &mut Criterion) {
                                 
                                 glommio::spawn_local(async move {
                                     let events = create_events_batch(i as u64 * events_per_batch as u64, events_per_batch, payload_size);
-                                    let request = create_write_request(aggregate_key, client_id + i as u128, events, delay_us);
+                                    let request = create_write_request(aggregate_key, client_id + i as u128, events);
                                     let result = local_aggregate.write(1, request).await;
                                     black_box(result.unwrap());
                                 })
@@ -247,7 +255,7 @@ fn benchmark_write_then_read_with_filters(c: &mut Criterion) {
                             .spawn(move || async move {
                                 //Don't use the cache - force disk reads
                                 let local_aggregate =
-                                    create_local_aggregate(&data_folder, 0, 50);
+                                    create_local_aggregate(&data_folder, Some(0), 0, 50).await;
                                 let aggregate_key = create_aggregate_key(1);
                                 let client_id = 100u128;
 
@@ -260,7 +268,6 @@ fn benchmark_write_then_read_with_filters(c: &mut Criterion) {
                                         aggregate_key.clone(),
                                         client_id,
                                         events,
-                                        Some(0),
                                     );
 
                                     local_aggregate.write(1, request).await.unwrap();
@@ -325,7 +332,7 @@ fn benchmark_read_cache_hit_vs_miss(c: &mut Criterion) {
                         let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
                             .spawn(move || async move {
                                 let local_aggregate =
-                                    create_local_aggregate(&data_folder, cache_size, 50);
+                                    create_local_aggregate(&data_folder, Some(0), cache_size, 50).await;
                                 let aggregate_key = create_aggregate_key(1);
                                 let client_id = 100u128;
 
@@ -338,7 +345,6 @@ fn benchmark_read_cache_hit_vs_miss(c: &mut Criterion) {
                                         aggregate_key.clone(),
                                         client_id,
                                         events,
-                                        Some(0),
                                     );
 
                                     local_aggregate.write(1, request).await.unwrap();

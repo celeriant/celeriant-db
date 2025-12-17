@@ -1,5 +1,5 @@
 use bincode::{Decode, Encode};
-use celeriant_wal::wal::event_batch_item::EventBatchItem;
+use celeriant_wal::datablocks::event_batch_item::EventBatchItem;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode, Default)]

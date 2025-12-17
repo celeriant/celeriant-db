@@ -1,5 +1,5 @@
 use celeriant_msg::request::read_filters::ReadFilters;
-use celeriant_wal::{constants::{BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED}, wal::{event_batch_item::EventBatchItem, event_batch_metadata::{EventBatchMetadata, EventTypesData}}};
+use celeriant_wal::{constants::{BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED}, datablocks::event_batch_item::EventBatchItem, metablocks::event_batch_metadata::{EventBatchMetadata, EventTypesData}};
 use fastbloom::BloomFilter;
 
 use crate::read_operations::{read_error::ReadError};
@@ -200,7 +200,6 @@ fn bloom_filter_from_bytes(bloom_bytes: &[u64; BLOOM_BYTES / 8]) -> BloomFilter 
 pub struct MetadataWithAbsolutePosition {
     pub event_batch_metadata: EventBatchMetadata,
     pub event_batch_absolute_position: u64,
-    pub format_version_on_disk: u32,
 }
 
 pub fn trim_end_if_exceeds_max_bytes(
@@ -271,8 +270,7 @@ pub fn trim_end_if_exceeds_max_bytes(
 
 #[cfg(test)]
 mod tests {
-    use celeriant_wal::{aggregate_key::AggregateKey, wal::event_item::EventItem};
-    use celeriant_wire::constants::WIRE_FORMAT_CURRENT_VERSION;
+    use celeriant_wal::{aggregate_key::AggregateKey, constants::MINIBATCH_SIZE_BYTES, datablocks::event_item::EventItem};
 
     use super::*;
 
@@ -292,7 +290,7 @@ mod tests {
     ) -> EventBatchMetadata {
         EventBatchMetadata {
             aggregate_key: AggregateKey::default(),
-            uncompressed_size: 0,
+            datablock: celeriant_wal::metablocks::datablock_style::DatablockStyle::Block { crc32c: 0, datablock_position: 0 },
             event_types_data: EventTypesData::Direct(*event_types),
             event_batch_index,
             client_id,
@@ -300,15 +298,16 @@ mod tests {
             node_id: 0,
             lease_index: 0,
             server_timestamp,
-            compressed_size,
-            compression_type: 0,
-            events_crc: 0,
             min_client_event_index: min_cidx,
             max_client_event_index: max_cidx,
             min_event_timestamp: min_ts,
             max_event_timestamp: max_ts,
             min_event_index: min_eidx,
             max_event_index: max_eidx,
+            uncompressed_size: 0,
+            compressed_size,
+            compression_type: 0,
+            version: 0,
         }
     }
 
@@ -342,7 +341,7 @@ mod tests {
 
         EventBatchMetadata {
             aggregate_key: AggregateKey::default(),
-            uncompressed_size: 0,
+            datablock: celeriant_wal::metablocks::datablock_style::DatablockStyle::Block { crc32c: 0, datablock_position: 0 },
             event_types_data: EventTypesData::Bloom(bloom_bytes),
             event_batch_index,
             client_id,
@@ -350,15 +349,16 @@ mod tests {
             node_id: 0,
             lease_index: 0,
             server_timestamp,
-            compressed_size,
-            compression_type: 0,
-            events_crc: 0,
             min_client_event_index: min_cidx,
             max_client_event_index: max_cidx,
             min_event_timestamp: min_ts,
             max_event_timestamp: max_ts,
             min_event_index: min_eidx,
             max_event_index: max_eidx,
+            uncompressed_size: 0,
+            compressed_size,
+            compression_type: 0,
+            version: 0,
         }
     }
 
@@ -601,7 +601,6 @@ mod tests {
         MetadataWithAbsolutePosition {
             event_batch_metadata: meta,
             event_batch_absolute_position: 0,
-            format_version_on_disk: WIRE_FORMAT_CURRENT_VERSION,
         }
     }
 
