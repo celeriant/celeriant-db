@@ -2,8 +2,8 @@ use crate::{in_memory_cache::{
     aggregate_positions::AggregatePositions, recent_write::RecentWrite,
     shard_log_queue_item::ShardLogQueueItem, sync_positions_snapshot::SyncPositionsSnapshot,
 }, shard_config::ShardConfig};
-use celeriant_wal::{aggregate_key::AggregateKey, constants::FIXED_BLOCK_SIZE_BYTES};
-use std::{collections::HashMap, path::PathBuf};
+use celeriant_wal::{aggregate_key::AggregateKey, constants::FIXED_BLOCK_SIZE_BYTES, datablocks::wal_datablock::WalDatablock, metablocks::wal_metablock::WalMetablock};
+use std::{collections::{BTreeMap, HashMap, VecDeque}, path::PathBuf};
 
 pub struct ShardMemCache {
     config: ShardConfig,
@@ -21,9 +21,15 @@ pub struct ShardMemCache {
     /// Direct I/O aligned writes. Saves reading the bytes for the next datablock write
     datablocks_carry_over: Option<Vec<u8>>,
 
-    /// Cache of recent writes of meta and datablocks for aggregates
-    /// Cache is contiguous and always has most recent write if aggregate is present
-    aggregate_recent_writes: HashMap<AggregateKey, RecentWrite>,
+    /// Cache of recent writes indexed by aggregate key and batch index.
+    /// Only populated after successful durable write.
+    aggregate_recent_writes: HashMap<AggregateKey, BTreeMap<u64, RecentWrite>>,
+    
+    /// Current size of the recent write cache in bytes
+    cache_current_bytes: u64,
+    
+    /// Eviction queue: (aggregate_key, batch_index, size_bytes) in insertion order
+    cache_eviction_queue: VecDeque<(AggregateKey, u64, u64)>,
 
     /// Current positions of indexes committed to file (batch, event, client event indexes)
     aggregate_file_positions: HashMap<AggregateKey, AggregatePositions>,
@@ -45,7 +51,70 @@ pub struct ShardMemCache {
 }
 
 impl ShardMemCache {
+    /// Insert a write into the recent write cache. Call only after durable write.
+    pub fn cache_recent_write(
+        &mut self,
+        aggregate_key: AggregateKey,
+        batch_index: u64,
+        metablock: WalMetablock,
+        datablock: Option<WalDatablock>,
+        size_bytes: u64,
+    ) {
+        let max_bytes = self.config.recent_write_cache_bytes;
+        if max_bytes == 0 {
+            return;
+        }
 
+        // Evict until we have room
+        while self.cache_current_bytes + size_bytes > max_bytes {
+            if !self.evict_oldest_cache_entry() {
+                break; // Cache is empty, nothing to evict
+            }
+        }
+
+        // Insert new entry
+        let batches = self.aggregate_recent_writes
+            .entry(aggregate_key.clone())
+            .or_insert_with(BTreeMap::new);
+        
+        batches.insert(batch_index, RecentWrite {
+            metablock,
+            datablock,
+            size_bytes,
+        });
+        
+        self.cache_current_bytes += size_bytes;
+        self.cache_eviction_queue.push_back((aggregate_key, batch_index, size_bytes));
+    }
+
+    fn evict_oldest_cache_entry(&mut self) -> bool {
+        let Some((aggregate_key, batch_index, size_bytes)) = self.cache_eviction_queue.pop_front() else {
+            return false;
+        };
+
+        if let Some(batches) = self.aggregate_recent_writes.get_mut(&aggregate_key) {
+            if batches.remove(&batch_index).is_some() {
+                self.cache_current_bytes = self.cache_current_bytes.saturating_sub(size_bytes);
+            }
+            if batches.is_empty() {
+                self.aggregate_recent_writes.remove(&aggregate_key);
+            }
+        }
+        true
+    }
+
+    /// Get cached writes for an aggregate from a starting batch index.
+    /// Returns writes in batch order. Returns None if aggregate not in cache.
+    pub fn get_cached_writes_from(
+        &self,
+        aggregate_key: &AggregateKey,
+        from_batch_index: u64,
+    ) -> Option<impl Iterator<Item = (&u64, &RecentWrite)>> {
+        self.aggregate_recent_writes
+            .get(aggregate_key)
+            .map(|batches| batches.range(from_batch_index..))
+    }
+    
     pub fn shard_dir(&self) -> PathBuf {
         self.config.shard_dir.clone()
     }
@@ -263,6 +332,8 @@ impl ShardMemCache {
             file_len,
             datablocks_carry_over: None,
             aggregate_recent_writes: HashMap::new(),
+            cache_current_bytes: 0,
+            cache_eviction_queue: VecDeque::new(),
             aggregate_file_positions: HashMap::new(),
             aggregate_queue_positions: HashMap::new(),
             pending_append_queue: vec![],

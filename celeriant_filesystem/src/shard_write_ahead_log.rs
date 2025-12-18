@@ -25,7 +25,7 @@ use fastbloom::BloomFilter;
 use glommio::sync::RwLock;
 
 use crate::{
-    in_memory_cache::{shard_log_queue_item::ShardLogQueueItem, shard_mem_cache::ShardMemCache, sync_positions_snapshot::SyncPositionsSnapshot}, local_event::LocalEvent, read_write_error::ReadWriteError, shard_config::ShardConfig, shard_log_write_error::ShardLogWriteError, watch::{aggregate_watch_event::AggregateWatchEvent, watched_aggregates::WatchedAggregates}
+    in_memory_cache::{shard_log_queue_item::ShardLogQueueItem, shard_mem_cache::ShardMemCache, sync_positions_snapshot::SyncPositionsSnapshot}, in_memory_filtering::{apply_event_filters, is_include_batch}, local_event::LocalEvent, read_write_error::ReadWriteError, shard_config::ShardConfig, shard_log_write_error::ShardLogWriteError, watch::{aggregate_watch_event::AggregateWatchEvent, watched_aggregates::WatchedAggregates}
 };
 use celeriant_rotating_log::{rotating_log_cache::RotatingLogCache, shard_log_dma_file::ShardLogDmaFile};
 pub type SyncResult = Result<(), ShardLogWriteError>;
@@ -50,8 +50,98 @@ pub struct ShardWriteAheadLog {
 }
 
 impl ShardWriteAheadLog {
-    pub async fn read(&self, _read_request: &ReadRequest) -> Result<ReadResponse, ShardLogWriteError> {
-        todo!()
+    pub async fn read(&self, read_request: &ReadRequest) -> Result<ReadResponse, ShardLogWriteError> {
+        let shard_mem_cache = self.shard_mem_cache.borrow();
+        
+        let mut event_batches = Vec::new();
+        
+        // Get cached writes for this aggregate starting from the requested batch index
+        let Some(cached_writes) = shard_mem_cache.get_cached_writes_from(
+            &read_request.aggregate_key,
+            read_request.filters.from_event_batch_index,
+        ) else {
+            // No cached data for this aggregate
+            return Ok(ReadResponse {
+                correlation_id: read_request.correlation_id,
+                event_batches: vec![],
+                next_event_batch_index: None,
+            });
+        };
+        
+        for (_batch_index, recent_write) in cached_writes {
+            // Extract metadata from metablock
+            let metadata = match &recent_write.metablock {
+                WalMetablock::EventBatchMetadata(meta) => meta,
+                _ => continue, // Skip non-event-batch metablocks
+            };
+            
+            // Check if this batch passes metadata-level filters
+            if !is_include_batch(metadata, &read_request.filters) {
+                continue;
+            }
+            
+            // Get the EventBatchItem from either inline minibatch or datablock
+            let event_batch_opt = match &metadata.datablock {
+                DatablockStyle::Inline { minibatch } => {
+                    // Deserialize from minibatch - contains wire-format encoded bytes
+                    self.deserialize_minibatch(
+                        minibatch,
+                        metadata.compressed_size as usize,
+                        metadata.compression_type,
+                        metadata.uncompressed_size,
+                    )?
+                }
+                DatablockStyle::Block { .. } => {
+                    // Get from recent_write.datablock (cached in memory)
+                    match &recent_write.datablock {
+                        Some(WalDatablock::EventBatch(item)) => Some(item.clone()),
+                        _ => None, // Not in cache - would need disk read
+                    }
+                }
+            };
+            
+            let Some(mut event_batch) = event_batch_opt else {
+                continue;
+            };
+            
+            // Apply event-level filters (event types, timestamps, indexes)
+            apply_event_filters(&mut event_batch, &read_request.filters);
+            
+            // Only include if there are events left after filtering
+            if !event_batch.events.is_empty() {
+                event_batches.push(event_batch);
+            }
+        }
+        
+        Ok(ReadResponse {
+            correlation_id: read_request.correlation_id,
+            event_batches,
+            next_event_batch_index: None, //TODO: Batching
+        })
+    }
+
+    fn deserialize_minibatch(
+        &self,
+        minibatch: &[u8; MINIBATCH_SIZE_BYTES],
+        compressed_size: usize,
+        compression_type: u8,
+        uncompressed_size: u64,
+    ) -> Result<Option<EventBatchItem>, ShardLogWriteError> {
+        use celeriant_wal::compression_type::CompressionType;
+        use celeriant_wire::wire_format::from_wire_format_variable;
+        
+        let compression = CompressionType::from_tuple(compression_type, None);
+        
+        let datablock: WalDatablock = from_wire_format_variable(
+            &minibatch[..compressed_size],
+            compression,
+            uncompressed_size as usize,
+        )?;
+        
+        match datablock {
+            WalDatablock::EventBatch(item) => Ok(Some(item)),
+            _ => Ok(None),
+        }
     }
 
     pub async fn close(&self) -> Result<(), ShardLogWriteError> {
@@ -462,11 +552,9 @@ async fn sync_with_rollback(
                 match queue_item.metablock {
                     WalMetablock::EventBatchMetadata(event_batch_metadata) => {
 
-                        //TODO: update in-memory cache
-
                         // Build watched_aggregates events
                         write_events
-                            .entry(event_batch_metadata.aggregate_key)
+                            .entry(event_batch_metadata.aggregate_key.clone())
                             .and_modify(|event| {
                                 if let AggregateWatchEvent::Write { from_event_batch_index, to_event_batch_index } = event {
                                     if event_batch_metadata.event_batch_index < *from_event_batch_index {
@@ -481,6 +569,20 @@ async fn sync_with_rollback(
                                 from_event_batch_index: event_batch_metadata.event_batch_index,
                                 to_event_batch_index: event_batch_metadata.event_batch_index,
                             });
+
+                        //update in-memory cache
+                        let aggregate_key = event_batch_metadata.aggregate_key.clone();
+                        let batch_index = event_batch_metadata.event_batch_index;
+                        let size_bytes = event_batch_metadata.compressed_size;
+
+                        // Cache the write (only happens after durable write confirmed)
+                        shard_mem_cache.cache_recent_write(
+                            aggregate_key.clone(),
+                            batch_index,
+                            WalMetablock::EventBatchMetadata(event_batch_metadata),
+                            queue_item.datablock,
+                            size_bytes,
+                        );
                     },
                     WalMetablock::SnapshotOrg(_snapshot_org) => {},
                     WalMetablock::SnapshotAggregatSnapshotAggregateType(_snapshot_aggregate_type) => {},
@@ -663,6 +765,7 @@ mod test_shard_write_ahead_log {
             durable_write_with_delay_us: Some(10000),
             shard_dir,
             max_cached_files: 1,
+            recent_write_cache_bytes: 500,
         }
     }
 

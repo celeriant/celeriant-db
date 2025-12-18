@@ -18,5 +18,6 @@ pub struct ShardConfig {
     pub max_event_batches_response_size: usize,
     pub max_requested_latency_ms: u64,
     pub shard_log_preallocate_bytes: u64,
-    pub durable_write_with_delay_us: Option<u64>
+    pub durable_write_with_delay_us: Option<u64>,
+    pub recent_write_cache_bytes: u64,
 }

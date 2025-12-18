@@ -46,7 +46,8 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                 async_flush_ms: shard_config.async_flush_ms, 
                 durable_write_with_delay_us: shard_config.durable_write_with_delay_us, 
                 shard_dir,
-                max_cached_files: shard_config.max_open_files 
+                max_cached_files: shard_config.max_open_files,
+                recent_write_cache_bytes: shard_config.recent_write_cache_bytes,
             };
             let filesystem = ShardWriteAheadLog::new(internal_shard_config).await
                 .expect(&format!("Failed to initialize filesystem at {:?} - cannot initialize shard", shard_config.data_root));
