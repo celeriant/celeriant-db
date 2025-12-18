@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use glommio::{GlommioError, io::{DmaFile, OpenOptions}};
 
@@ -27,6 +27,22 @@ pub async fn create_file_dma<P: AsRef<Path>>(
         .truncate(false)
         .dma_open(path.as_ref())
         .await
+}
+
+pub async fn open_or_create_file_dma(
+    path: &PathBuf,
+    pre_allocate: Option<u64>,
+) -> Result<(DmaFile, u64, bool), GlommioError<()>> {
+    let exists = path.exists();
+    let (dma_file, file_len) = if exists {
+        existing_file_dma(&path).await?
+    } else {
+        (
+            create_file_dma(&path, pre_allocate).await?,
+            pre_allocate.unwrap_or(0),
+        )
+    };
+    Ok((dma_file, file_len, exists))
 }
 
 pub async fn existing_file_dma<P: AsRef<Path>>(

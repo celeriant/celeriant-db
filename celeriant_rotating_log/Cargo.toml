@@ -1,32 +1,20 @@
 [package]
-name = "celeriant_aggregate"
+name = "celeriant_rotating_log"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-celeriant_filesystem = { path = "../celeriant_filesystem" }
-celeriant_msg = { path = "../celeriant_msg" }
 celeriant_wire = { path = "../celeriant_wire" }
 celeriant_wal = { path = "../celeriant_wal" }
 celeriant_disk = { path = "../celeriant_disk" }
-fastbloom.workspace = true
 glommio.workspace = true
-lru.workspace = true
 futures-lite.workspace = true
-crc32c.workspace = true
-walkdir.workspace = true
+lru.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 uuid.workspace = true
 criterion.workspace = true
 num_cpus.workspace = true
-
-[lib]
-bench = false
-
-[[bench]]
-name = "write_then_read_benchmark"
-harness = false

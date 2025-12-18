@@ -1,5 +1,5 @@
 use bincode::{Encode};
-use celeriant_wal::{ constants::FIXED_BLOCK_SIZE_BYTES, metablocks::wal_metablock::WalMetablock, shard_log_header::ShardLogHeader};
+use celeriant_wal::{ metablocks::wal_metablock::WalMetablock, shard_log_header::ShardLogHeader};
 
 use crate::{constants::{METABLOCK_CURRENT_VERSION, SHARD_LOG_HEADER_CURRENT_VERSION}, wire_format::{from_wire_format_fixed, to_wire_format_fixed}, wire_format_error::WireFormatError};
 
@@ -87,7 +87,7 @@ where
     let len = to_wire_format_fixed(message, &mut buffer[HEADER_SIZE..])?;
     
     //Ensure we always entirely fill the provided fixed length buffer
-    buffer[len+1..].fill(0);
+    buffer[HEADER_SIZE + len..].fill(0);
 
     // Calculate CRC over data only
     let crc = crc32c::crc32c(&buffer[CRC_SIZE..]);
@@ -101,7 +101,30 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use celeriant_wal::{shard_log_header::ShardLogHeader};
+    use celeriant_wal::{constants::FIXED_BLOCK_SIZE_BYTES, shard_log_header::ShardLogHeader};
+
+    #[test]
+    fn serialize_does_not_corrupt_trailing_fields() {
+        // Use larger values that will occupy more bytes in the serialized output
+        // to make the off-by-one zeroing bug more apparent
+        let header = ShardLogHeader {
+            metablocks_position: 0x1234_5678_9ABC_DEF0,
+            datablocks_position: 0xFEDC_BA98_7654_3210,
+        };
+
+        let mut buffer = [0u8; FIXED_BLOCK_SIZE_BYTES];
+        serialize_fixed_len_with_version(&header, SHARD_LOG_HEADER_CURRENT_VERSION, &mut buffer).unwrap();
+
+        let (deserialized, _) = deserialize_shard_log_header_versioned(&buffer).unwrap();
+
+        // The bug `buffer[len+1..].fill(0)` zeros bytes starting at the wrong offset,
+        // corrupting the latter portion of the serialized data (datablocks_position)
+        assert_eq!(
+            deserialized.datablocks_position, 
+            header.datablocks_position,
+            "datablocks_position was corrupted - likely due to incorrect zero-fill offset"
+        );
+    }
 
     #[test]
     fn shard_log_header_roundtrip() {
@@ -130,11 +153,71 @@ mod tests {
         let mut buffer = [0u8; FIXED_BLOCK_SIZE_BYTES];
         serialize_fixed_len_with_version(&header, 1, &mut buffer).unwrap();
 
-        // Corrupt a byte in the middle of the data
+        // Corrupt a byte in the version field (not payload - see crc_covers_payload_data test)
         buffer[VERSION_SIZE + 2] ^= 0xFF;
 
         let result = deserialize_shard_log_header_versioned(&buffer);
         assert!(matches!(result, Err(WireFormatError::ChecksumMismatch { .. })));
+    }
+
+    #[test]
+    fn crc_covers_payload_data() {
+        let header = ShardLogHeader {
+            metablocks_position: 0x1111_1111_1111_1111,
+            datablocks_position: 0x2222_2222_2222_2222,
+        };
+
+        let mut buffer = [0u8; FIXED_BLOCK_SIZE_BYTES];
+        serialize_fixed_len_with_version(&header, SHARD_LOG_HEADER_CURRENT_VERSION, &mut buffer).unwrap();
+
+        // Corrupt a byte in the actual payload area (after HEADER_SIZE)
+        buffer[HEADER_SIZE + 4] ^= 0xFF;
+
+        let result = deserialize_shard_log_header_versioned(&buffer);
+        assert!(
+            matches!(result, Err(WireFormatError::ChecksumMismatch { .. })),
+            "CRC should detect corruption in payload data"
+        );
+    }
+
+    #[test]
+    fn crc_covers_version_field() {
+        let header = ShardLogHeader {
+            metablocks_position: 11,
+            datablocks_position: 12,
+        };
+
+        let mut buffer = [0u8; FIXED_BLOCK_SIZE_BYTES];
+        serialize_fixed_len_with_version(&header, SHARD_LOG_HEADER_CURRENT_VERSION, &mut buffer).unwrap();
+
+        // Corrupt a byte in the version field (bytes CRC_SIZE..HEADER_SIZE)
+        buffer[CRC_SIZE + 1] ^= 0xFF;
+
+        let result = deserialize_shard_log_header_versioned(&buffer);
+        assert!(
+            matches!(result, Err(WireFormatError::ChecksumMismatch { .. })),
+            "CRC should detect corruption in version field"
+        );
+    }
+
+    #[test]
+    fn crc_does_not_cover_itself() {
+        let header = ShardLogHeader {
+            metablocks_position: 11,
+            datablocks_position: 12,
+        };
+
+        let mut buffer = [0u8; FIXED_BLOCK_SIZE_BYTES];
+        serialize_fixed_len_with_version(&header, SHARD_LOG_HEADER_CURRENT_VERSION, &mut buffer).unwrap();
+
+        // Corrupting the CRC field itself should cause mismatch (not pass silently)
+        buffer[1] ^= 0xFF;
+
+        let result = deserialize_shard_log_header_versioned(&buffer);
+        assert!(
+            matches!(result, Err(WireFormatError::ChecksumMismatch { .. })),
+            "Corrupted CRC should not accidentally match"
+        );
     }
 
     #[test]

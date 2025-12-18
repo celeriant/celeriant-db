@@ -1,20 +1,13 @@
-use crate::in_memory_cache::{
+use crate::{in_memory_cache::{
     aggregate_positions::AggregatePositions, recent_write::RecentWrite,
-    shard_log_queue_item::ShardLogQueueItem,
-};
-use celeriant_wal::aggregate_key::AggregateKey;
-use std::collections::HashMap;
-
-pub struct SyncPositionsSnapshot {
-    pub pending_append_queue: Vec<ShardLogQueueItem>,
-    pub aggregate_queue_positions: HashMap<AggregateKey, AggregatePositions>,
-    pub metablocks_position: u64,
-    pub datablocks_position: u64,
-    pub file_len: u64,
-    pub datablocks_carry_over: Option<Vec<u8>>,
-}
+    shard_log_queue_item::ShardLogQueueItem, sync_positions_snapshot::SyncPositionsSnapshot,
+}, shard_config::ShardConfig};
+use celeriant_wal::{aggregate_key::AggregateKey, constants::FIXED_BLOCK_SIZE_BYTES};
+use std::{collections::HashMap, path::PathBuf};
 
 pub struct ShardMemCache {
+    config: ShardConfig,
+    
     /// The next write position for metablocks in the shard log
     metablocks_position: u64,
 
@@ -46,9 +39,35 @@ pub struct ShardMemCache {
     /// if fsync has failed until the next write. This flag is to force fsync on the next write
     /// so clients get notified and can take action
     had_fsync_failure: bool,
+
+    /// The active log file id for this shard. We will increment when it gets full.
+    current_log_id: u64,
 }
 
 impl ShardMemCache {
+
+    pub fn shard_dir(&self) -> PathBuf {
+        self.config.shard_dir.clone()
+    }
+
+    pub fn preallocate_bytes(&self) -> u64 {
+        self.config.preallocate_bytes
+    }
+
+    pub fn current_log_id(&self) -> u64 {
+        self.current_log_id
+    }
+
+    pub fn rotate_to_next_log(&mut self, current_log_id: u64, metablocks_position: u64, datablocks_position: u64, file_len: u64) {
+        
+        self.metablocks_position = metablocks_position;
+        self.datablocks_position = datablocks_position;
+        self.file_len = file_len;
+        self.datablocks_carry_over = None;
+        self.current_log_id = current_log_id;
+
+    }
+
     pub fn requires_write(&self) -> bool {
         !self.pending_append_queue.is_empty()
     }
@@ -115,6 +134,23 @@ impl ShardMemCache {
             datablocks_carry_over: self.datablocks_carry_over.clone(), //On rollback we want to keep this, not clear it
             file_len: self.file_len,
         }
+    }
+    
+    pub fn buffer_size_datablocks(&self) -> u64 {
+        self.pending_append_queue
+            .iter()
+            .map(|item| item.datablock_bytes.as_ref().map_or(0, |bytes| bytes.len() as u64))
+            .sum()
+    }
+
+    pub fn buffer_size_metablocks(&self) -> u64 {
+        (self.pending_append_queue.len() * FIXED_BLOCK_SIZE_BYTES) as u64
+    }
+
+    pub fn has_enough_free_space(&self) -> bool {
+        let free_space = self.datablocks_position.saturating_sub(self.metablocks_position);
+        let required_space = self.buffer_size_datablocks().saturating_sub(self.buffer_size_metablocks());
+        free_space.saturating_sub(required_space) > 0
     }
 
     /// If we have any failure to write to disk, set had_fsync_failure and clear
@@ -218,6 +254,8 @@ impl ShardMemCache {
         file_len: u64,
         metablocks_position: u64,
         datablocks_position: u64,
+        config: ShardConfig,
+        current_log_id: u64,
     ) -> Self {
         Self {
             metablocks_position,
@@ -229,6 +267,8 @@ impl ShardMemCache {
             aggregate_queue_positions: HashMap::new(),
             pending_append_queue: vec![],
             had_fsync_failure: false,
+            config,
+            current_log_id,
         }
     }
 }

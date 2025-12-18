@@ -4,3 +4,5 @@ pub mod shard_config;
 pub mod in_memory_cache;
 pub mod local_event;
 pub mod watch;
+pub mod shard_log_read_error;
+pub mod read_write_error;

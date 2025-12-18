@@ -1,12 +1,10 @@
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
     rc::Rc, time::Duration,
 };
 
-use celeriant_disk::files::open_dma_files::{create_file_dma, existing_file_dma};
-use celeriant_msg::{request::requests::{ReadRequest, WriteRequest}, response::responses::{ReadResponse, WriteResponse}};
+use celeriant_msg::{process_requests::Request, process_responses::Response, request::requests::{ReadRequest, WriteRequest}, response::responses::{ReadResponse, SuccessResponse, WriteResponse}};
 use celeriant_wal::{
     aggregate_key::AggregateKey, constants::{
         BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED, FIXED_BLOCK_SIZE_BYTES,
@@ -15,24 +13,21 @@ use celeriant_wal::{
         event_batch_item::EventBatchItem, event_item::EventItem, wal_datablock::WalDatablock,
     }, metablocks::{
         datablock_style::DatablockStyle, event_batch_metadata::{EventBatchMetadata, EventTypesData}, wal_metablock::WalMetablock
-    }, shard_log_header::ShardLogHeader
+    }
 };
 use celeriant_wire::{
-    version_aware_wire_format::{
-        deserialize_shard_log_header_versioned, serialize_fixed_len_with_version,
-    },
+    version_aware_wire_format::
+        serialize_fixed_len_with_version
+    ,
     wire_format::to_wire_format_variable,
 };
 use fastbloom::BloomFilter;
-use glommio::{io::DmaFile, sync::RwLock};
+use glommio::sync::RwLock;
 
 use crate::{
-    in_memory_cache::{shard_log_queue_item::ShardLogQueueItem, shard_mem_cache::{self, ShardMemCache, SyncPositionsSnapshot}},
-    local_event::LocalEvent,
-    shard_config::ShardConfig,
-    shard_log_write_error::ShardLogWriteError, watch::{aggregate_watch_event::AggregateWatchEvent, watched_aggregates::WatchedAggregates},
+    in_memory_cache::{shard_log_queue_item::ShardLogQueueItem, shard_mem_cache::ShardMemCache, sync_positions_snapshot::SyncPositionsSnapshot}, local_event::LocalEvent, read_write_error::ReadWriteError, shard_config::ShardConfig, shard_log_write_error::ShardLogWriteError, watch::{aggregate_watch_event::AggregateWatchEvent, watched_aggregates::WatchedAggregates}
 };
-
+use celeriant_rotating_log::{rotating_log_cache::RotatingLogCache, shard_log_dma_file::ShardLogDmaFile};
 pub type SyncResult = Result<(), ShardLogWriteError>;
 
 /// Represents the WAL for each shard. Operations we perform:
@@ -50,77 +45,88 @@ pub struct ShardWriteAheadLog {
     event_type_dedup: RefCell<HashSet<u64>>,
     pub watched_aggregates: Rc<WatchedAggregates>,
     wal_sync_event: Rc<RwLock<Option<Rc<LocalEvent<SyncResult>>>>>,
-    dma_file: Rc<RwLock<Option<DmaFile>>>,
-    active_log_id: u64,
-    active_log_len: u64,
+    rotating_log_cache: Rc<RotatingLogCache>,
     config: ShardConfig,
 }
 
 impl ShardWriteAheadLog {
-    pub async fn new(shard_id: usize, data_root: &PathBuf) -> Result<Self, ShardLogWriteError> {
-        Self::new_with_config(shard_id, data_root, ShardConfig::default()).await
-    }
-
-    pub async fn read(&self, read_request: &ReadRequest) -> Result<ReadResponse, ShardLogWriteError> {
+    pub async fn read(&self, _read_request: &ReadRequest) -> Result<ReadResponse, ShardLogWriteError> {
         todo!()
     }
 
     pub async fn close(&self) -> Result<(), ShardLogWriteError> {
-        let mut disk_writer = self.dma_file.write().await?;
-
-        if let Some(dma_file) = disk_writer.take() {
-            dma_file.close().await?;
-        }
+        self.rotating_log_cache.close().await?;
 
         Ok(())
     }
 
-    pub async fn new_with_config(
-        shard_id: usize,
-        data_root: &PathBuf,
+    pub async fn process_request(
+        &self,
+        lease_index: Option<u64>,
+        request: Request,
+    ) -> Result<Response, ReadWriteError> {
+        match request {
+            Request::ListOrganisations(_req) => {
+                return Err(ReadWriteError::Read(crate::shard_log_read_error::ShardLogReadError::CannotCreateFolders("Not implemented".to_string())))
+            }
+            Request::ListAggregates(_req) => {
+                return Err(ReadWriteError::Read(crate::shard_log_read_error::ShardLogReadError::CannotCreateFolders("Not implemented".to_string())))
+            }
+            Request::Exists(req) => {
+                return Ok(celeriant_msg::process_responses::Response::Exists(celeriant_msg::response::responses::ExistsResponse { 
+                    correlation_id: req.correlation_id, 
+                    min_event_batch_index: 1,
+                }));
+            }
+            Request::Read(req) => {
+                return Ok(celeriant_msg::process_responses::Response::Read(self.read(&req).await?));
+            }
+            Request::Write(req) => {
+                let lease_index = lease_index.ok_or(ShardLogWriteError::InvalidLeaseIndex)?;
+                return Ok(celeriant_msg::process_responses::Response::Write(self.write(lease_index, req).await?));
+            }
+            Request::TrimStart(req) => {
+                // self.trim_start(&req).await?;
+                return Ok(celeriant_msg::process_responses::Response::TrimStart(SuccessResponse {
+                    correlation_id: req.correlation_id
+                }));
+            }
+            Request::Delete(req) => {
+                // self.delete(&req).await?;
+                return Ok(celeriant_msg::process_responses::Response::TrimStart(SuccessResponse {
+                    correlation_id: req.correlation_id
+                }));
+            }
+            Request::Watch(_) => {
+                unreachable!()
+            }
+        }
+    }
+
+    pub async fn new(
         config: ShardConfig,
     ) -> Result<Self, ShardLogWriteError> {
-        let shard_dir = data_root.join(format!("shard_{shard_id}"));
-        std::fs::create_dir_all(&shard_dir)?;
 
-        // Find latest log file id (or create first).
-        let (active_log_id, log_path) = find_latest_log_file(&shard_dir)
-            .map_err(|e| ShardLogWriteError::IoError(e.to_string()))?
-            .unwrap_or((1, shard_dir.join(log_file_name(1))));
-
-        let exists = log_path.exists();
-        let (mut dma_file, active_log_len) = if exists {
-            existing_file_dma(&log_path).await?
-        } else {
-            (
-                create_file_dma(&log_path, Some(config.preallocate_bytes)).await?,
-                config.preallocate_bytes,
-            )
+        let rotating_log_cache = RotatingLogCache::new(config.shard_dir.clone(), config.preallocate_bytes, config.max_cached_files as usize).await?;
+        
+        let shard_mem_cache = {
+            let active_lock = rotating_log_cache.active();
+            let active_log_file = active_lock.read().await?;
+            ShardMemCache::new(active_log_file.file_len, active_log_file.shard_log_header.metablocks_position, active_log_file.shard_log_header.datablocks_position, config.clone(), active_log_file.log_id)
         };
-
-        let header = if exists {
-            load_header(&mut dma_file, active_log_len).await?
-            //TODO: This could fail due to crc or torn writes, we can repair by going through the metadata and other logs.
-        } else {
-            setup_new_file(&mut dma_file, active_log_len).await?
-        };
-
-        let shard_mem_cache = ShardMemCache::new(active_log_len, header.metablocks_position, header.datablocks_position);
 
         let bloom_filter = BloomFilter::with_num_bits(BLOOM_BYTES * 8)
             .seed(&BLOOM_HASH_SEED)
             .hashes(BLOOM_HASH_COUNT);
 
         Ok(Self {
-            active_log_len,
-            active_log_id,
             shard_mem_cache: Rc::new(RefCell::new(shard_mem_cache)),
-            dma_file: Rc::new(RwLock::new(Some(dma_file))),
+            rotating_log_cache: Rc::new(rotating_log_cache),
             wal_sync_event: Rc::new(RwLock::new(None)),
-            config,
             bloom_filter: RefCell::new(bloom_filter),
             event_type_dedup: RefCell::new(HashSet::new()),
-            watched_aggregates: Rc::new(WatchedAggregates::new())
+            watched_aggregates: Rc::new(WatchedAggregates::new()),
+            config,
         })
     }
 
@@ -293,19 +299,19 @@ impl ShardWriteAheadLog {
 
         // Now we wait on disk write before ack to client
         if force_durable {
-            sync_with_delay(self.wal_sync_event.clone(), self.dma_file.clone(), self.shard_mem_cache.clone(), None, self.watched_aggregates.clone()).await?;
+            sync_with_delay(self.wal_sync_event.clone(), self.rotating_log_cache.clone(), self.shard_mem_cache.clone(), None, self.watched_aggregates.clone()).await?;
         } else if let Some(delay_us) = self.config.durable_write_with_delay_us {
-            sync_with_delay(self.wal_sync_event.clone(), self.dma_file.clone(), self.shard_mem_cache.clone(), Some(Duration::from_micros(delay_us)), self.watched_aggregates.clone()).await?;
+            sync_with_delay(self.wal_sync_event.clone(), self.rotating_log_cache.clone(), self.shard_mem_cache.clone(), Some(Duration::from_micros(delay_us)), self.watched_aggregates.clone()).await?;
         } else {
             let async_flush_ms = self.config.async_flush_ms;
             let watched_aggregates = self.watched_aggregates.clone();
             let shard_mem_cache = self.shard_mem_cache.clone();
             let wal_sync_event = self.wal_sync_event.clone();
-            let dma_file = self.dma_file.clone();
+            let rotating_log_cache = self.rotating_log_cache.clone();
 
             //TODO: do we really need another spawn_local? Just don't await?
             glommio::spawn_local(async move {
-                let _ = sync_with_delay(wal_sync_event, dma_file, shard_mem_cache.clone(), Some(Duration::from_millis(async_flush_ms)), watched_aggregates).await;
+                let _ = sync_with_delay(wal_sync_event, rotating_log_cache, shard_mem_cache.clone(), Some(Duration::from_millis(async_flush_ms)), watched_aggregates).await;
             })
             .detach();
         }
@@ -339,14 +345,14 @@ impl ShardWriteAheadLog {
 
 async fn sync_with_delay(
     wal_sync_event: Rc<RwLock<Option<Rc<LocalEvent<SyncResult>>>>>,
-    dma_file: Rc<RwLock<Option<DmaFile>>>,
+    rotating_log_cache: Rc<RotatingLogCache>,
     shard_mem_cache: Rc<RefCell<ShardMemCache>>,
     wal_sync_delay: Option<Duration>, 
     watched_aggregates: Rc<WatchedAggregates>) -> SyncResult {
 
     if wal_sync_delay.is_none() || wal_sync_delay.unwrap().as_micros() == 0 {
         // No delay - do immediate sync
-        return Ok(sync_with_rollback(dma_file, shard_mem_cache, watched_aggregates).await?);
+        return Ok(sync_with_rollback(rotating_log_cache, shard_mem_cache, watched_aggregates).await?);
     }
 
     let wal_sync_delay = wal_sync_delay.unwrap();
@@ -375,7 +381,7 @@ async fn sync_with_delay(
 
                 // Do the actual sync
                 let sync_result = {
-                    sync_with_rollback(dma_file, shard_mem_cache, watched_aggregates).await?
+                    sync_with_rollback(rotating_log_cache, shard_mem_cache, watched_aggregates).await?
                 };
 
                 // Notify all waiters
@@ -400,21 +406,15 @@ async fn sync_with_delay(
 }
 
 async fn sync_with_rollback(
-    dma_file: Rc<RwLock<Option<DmaFile>>>,
+    rotating_log_cache: Rc<RotatingLogCache>,
     shard_mem_cache: Rc<RefCell<ShardMemCache>>,
     watched_aggregates: Rc<WatchedAggregates>) -> SyncResult {
     
     // Lock the writer before we take the snapshot of the queue
-    let mut guard_writer = dma_file.write().await?;
-    let dma_file_writer = guard_writer.as_mut();
+    let lockable_active_log_file = rotating_log_cache.active();
+    let mut shard_log_dma_file = lockable_active_log_file.write().await?;
 
-    let mut dma_file_writer = if let Some(dma_file_writer) = dma_file_writer {
-        dma_file_writer
-    } else {
-        return Err(ShardLogWriteError::DmaFileNotInitialized);
-    };
-
-    let mut sync_positions_snapshot = {
+    let (has_enough_free_space, _current_log_id, preallocate_bytes, shard_dir, sync_positions_snapshot) = {
         let mut shard_mem_cache = shard_mem_cache.borrow_mut();
         if !shard_mem_cache.requires_write() {
             // Queue is empty - either another coordinator synced our items,
@@ -425,11 +425,29 @@ async fn sync_with_rollback(
             // Another coordinator successfully synced our items
             return Ok(());
         }
-        
-        shard_mem_cache.take_sync_positions_snapshot()
+
+        if !shard_mem_cache.has_enough_free_space() {
+            (false, shard_mem_cache.current_log_id(), shard_mem_cache.preallocate_bytes(), Some(shard_mem_cache.shard_dir()), None)
+        } else {
+            (true, shard_mem_cache.current_log_id(),shard_mem_cache.preallocate_bytes(), None, Some(shard_mem_cache.take_sync_positions_snapshot()))
+        }
     };
 
-    match sync(&mut dma_file_writer, &mut sync_positions_snapshot).await {
+    let mut sync_positions_snapshot = if !has_enough_free_space {
+        let previous_shard_log_dma_file: ShardLogDmaFile = shard_log_dma_file.rotate_to_next_log(shard_dir.as_ref().unwrap(), preallocate_bytes).await?;
+        rotating_log_cache.rotate_to_next_log(shard_log_dma_file.log_id, previous_shard_log_dma_file);
+
+        // Can only acquire shard_mem_cache after async operations        
+        let mut shard_mem_cache = shard_mem_cache.borrow_mut();
+        shard_mem_cache.rotate_to_next_log(shard_log_dma_file.log_id, shard_log_dma_file.shard_log_header.metablocks_position, shard_log_dma_file.shard_log_header.datablocks_position, shard_log_dma_file.file_len);
+        let snapshot = shard_mem_cache.take_sync_positions_snapshot();
+
+        snapshot
+    } else {
+        sync_positions_snapshot.unwrap()
+    };
+
+    match sync(&mut shard_log_dma_file, &mut sync_positions_snapshot).await {
         Ok(_) => {
             let mut shard_mem_cache = shard_mem_cache.borrow_mut();
 
@@ -485,12 +503,18 @@ async fn sync_with_rollback(
 
 }
 
-async fn sync(dma_file_writer: &mut DmaFile, sync_positions_snapshot: &mut SyncPositionsSnapshot) -> Result<(), ShardLogWriteError> {
+async fn sync(shard_log_dma_file: &mut ShardLogDmaFile, sync_positions_snapshot: &mut SyncPositionsSnapshot) -> Result<(), ShardLogWriteError> {
+    let dma_file_writer = shard_log_dma_file.dma_file.as_mut();
+
+    let dma_file_writer = if let Some(dma_file_writer) = dma_file_writer {
+        dma_file_writer
+    } else {
+        return Err(ShardLogWriteError::DmaFileNotInitialized);
+    };
+
     // Write datablocks first so we can get the positions to include into metablocks
-    let buffer_size_datablocks: u64 = sync_positions_snapshot.pending_append_queue
-        .iter()
-        .map(|item| item.datablock_bytes.as_ref().map_or(0, |bytes| bytes.len() as u64))
-        .sum();
+    let buffer_size_datablocks: u64 = sync_positions_snapshot.buffer_size_datablocks();
+
     let mut datablocks_absolute_write_positions: Vec<u64> = Vec::with_capacity(sync_positions_snapshot.pending_append_queue.len());
     let mut new_datablocks_position = sync_positions_snapshot.datablocks_position;
     let mut datablocks_carry_over: Option<Vec<u8>> = sync_positions_snapshot.datablocks_carry_over.take();
@@ -537,7 +561,7 @@ async fn sync(dma_file_writer: &mut DmaFile, sync_positions_snapshot: &mut SyncP
         dma_file_writer.write_at(buffer_datablocks, new_datablocks_position.saturating_sub(front_carry_over as u64)).await?;
     }
 
-    let buffer_size_metablocks: u64 = (sync_positions_snapshot.pending_append_queue.len() * FIXED_BLOCK_SIZE_BYTES) as u64;
+    let buffer_size_metablocks: u64 = sync_positions_snapshot.buffer_size_metablocks();
     let mut buffer_metablocks = dma_file_writer.alloc_dma_buffer(buffer_size_metablocks as usize);
     let buffer_metablocks_slice = buffer_metablocks.as_bytes_mut();
     let mut position = 0usize;
@@ -570,20 +594,11 @@ async fn sync(dma_file_writer: &mut DmaFile, sync_positions_snapshot: &mut SyncP
     
     //Write header front & back
     let new_metablocks_position = sync_positions_snapshot.metablocks_position + buffer_metablocks.len() as u64;
-    let shard_log_header = ShardLogHeader {
-        datablocks_position: new_datablocks_position,
-        metablocks_position: new_metablocks_position
-    };
     
     dma_file_writer.write_at(buffer_metablocks, sync_positions_snapshot.metablocks_position).await?;
 
-    write_dual_shard_log_header(
-        dma_file_writer, 
-        sync_positions_snapshot.file_len.saturating_sub(FIXED_BLOCK_SIZE_BYTES as u64), 
-        &shard_log_header).await?;
-
-    dma_file_writer.fdatasync().await?;
-
+    shard_log_dma_file.write_new_headers_and_fsync(new_datablocks_position, new_metablocks_position).await?;
+    
     sync_positions_snapshot.datablocks_position = new_datablocks_position;
     sync_positions_snapshot.datablocks_carry_over = datablocks_carry_over;
     sync_positions_snapshot.metablocks_position = new_metablocks_position;
@@ -633,119 +648,32 @@ fn get_server_timestamp_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn log_file_name(log_id: u64) -> String {
-    format!("log_{log_id}.wal")
-}
-
-fn find_latest_log_file(dir: &Path) -> Result<Option<(u64, PathBuf)>, std::io::Error> {
-    let mut best: Option<(u64, PathBuf)> = None;
-
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-
-        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-            continue;
-        };
-
-        // Expect: log_{id}.wal
-        if !name.starts_with("log_") || !name.ends_with(".wal") {
-            continue;
-        }
-
-        let id_str = &name["log_".len()..name.len() - ".wal".len()];
-        if let Ok(id) = id_str.parse::<u64>() {
-            match &best {
-                None => best = Some((id, path)),
-                Some((best_id, _)) if id > *best_id => best = Some((id, path)),
-                _ => {}
-            }
-        }
-    }
-
-    Ok(best)
-}
-
-async fn load_header(
-    dma_file: &mut DmaFile,
-    file_len: u64,
-) -> Result<ShardLogHeader, ShardLogWriteError> {
-    let header_bytes = dma_file.read_at(0, FIXED_BLOCK_SIZE_BYTES).await?;
-    match deserialize_shard_log_header_versioned(&header_bytes) {
-        Ok((shard_log_header, _version)) => return Ok(shard_log_header),
-        Err(_) => {
-            let header_bytes = dma_file
-                .read_at(
-                    file_len.saturating_sub(FIXED_BLOCK_SIZE_BYTES as u64),
-                    FIXED_BLOCK_SIZE_BYTES,
-                )
-                .await?;
-            return Ok(deserialize_shard_log_header_versioned(&header_bytes)?.0);
-        }
-    }
-}
-
-async fn write_dual_shard_log_header(
-    dma_file: &mut DmaFile,
-    header_end_start_pos: u64,
-    header: &ShardLogHeader,
-) -> Result<(), ShardLogWriteError> {
-    let mut header_bytes = dma_file.alloc_dma_buffer(FIXED_BLOCK_SIZE_BYTES);
-    serialize_fixed_len_with_version(
-        &header,
-        celeriant_wal::shard_log_header::CURRENT_VERSION,
-        header_bytes.as_bytes_mut(),
-    )?;
-    dma_file.write_at(header_bytes, 0).await?;
-
-    let mut header_bytes = dma_file.alloc_dma_buffer(FIXED_BLOCK_SIZE_BYTES);
-    serialize_fixed_len_with_version(
-        &header,
-        celeriant_wal::shard_log_header::CURRENT_VERSION,
-        header_bytes.as_bytes_mut(),
-    )?;
-    dma_file
-        .write_at(header_bytes, header_end_start_pos)
-        .await?;
-
-    Ok(())
-}
-
-async fn setup_new_file(
-    dma_file: &mut DmaFile,
-    file_len: u64,
-) -> Result<ShardLogHeader, ShardLogWriteError> {
-    let header = ShardLogHeader {
-        metablocks_position: FIXED_BLOCK_SIZE_BYTES as u64,
-        datablocks_position: file_len.saturating_sub(FIXED_BLOCK_SIZE_BYTES as u64),
-    };
-
-    write_dual_shard_log_header(dma_file, header.datablocks_position, &header).await?;
-
-    dma_file.fdatasync().await?;
-
-    //TODO: Folder fsync
-
-    Ok(header)
-}
-
 #[cfg(test)]
 mod test_shard_write_ahead_log {
     use glommio::{LocalExecutorBuilder, Placement};
 
     use crate::{shard_config::ShardConfig, shard_write_ahead_log::ShardWriteAheadLog};
 
+    fn setup_config(data_root: &std::path::PathBuf, shard_id: u64) -> ShardConfig {
+        let shard_dir = data_root.join(format!("shard_{shard_id}"));
+        ShardConfig {
+            preallocate_bytes: 1024 * 1024 * 1024, // 1 GiB
+            node_id: 0,
+            async_flush_ms: 100,
+            durable_write_with_delay_us: Some(10000),
+            shard_dir,
+            max_cached_files: 1,
+        }
+    }
+
     #[test]
     fn test_create_new_shard_wal() {
         let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
             .spawn(|| async move {
                 let tempdir = tempfile::tempdir().unwrap();
-                let data_root = tempdir.path().to_path_buf();
+                let data_root: std::path::PathBuf = tempdir.path().to_path_buf();
 
-                let wal = ShardWriteAheadLog::new(0, &data_root).await.unwrap();
+                let wal = ShardWriteAheadLog::new(setup_config(&data_root, 0)).await.unwrap();
 
                 // Verify the shard directory was created
                 let shard_dir = data_root.join("shard_0");
@@ -770,13 +698,13 @@ mod test_shard_write_ahead_log {
 
                 // Create and close the WAL
                 {
-                    let wal = ShardWriteAheadLog::new(0, &data_root).await.unwrap();
+                    let wal = ShardWriteAheadLog::new(setup_config(&data_root, 0)).await.unwrap();
                     wal.close().await.unwrap();
                 }
 
                 // Reopen the WAL - should load existing file
                 {
-                    let wal = ShardWriteAheadLog::new(0, &data_root).await.unwrap();
+                    let wal = ShardWriteAheadLog::new(setup_config(&data_root, 0)).await.unwrap();
                     wal.close().await.unwrap();
                 }
 
@@ -805,19 +733,15 @@ mod test_shard_write_ahead_log {
                 let tempdir = tempfile::tempdir().unwrap();
                 let data_root = tempdir.path().to_path_buf();
 
-                let config = ShardConfig {
-                    preallocate_bytes: 64 * 1024 * 1024, // 64 MiB
-                    ..Default::default()
-                };
+                let mut config = setup_config(&data_root, 0);
+                config.preallocate_bytes = 64 * 1024 * 1024;
 
-                let wal = ShardWriteAheadLog::new_with_config(0, &data_root, config.clone())
-                    .await
-                    .unwrap();
+                let wal = ShardWriteAheadLog::new(config).await.unwrap();
 
                 // Verify file was preallocated to the configured size
                 let log_file = data_root.join("shard_0").join("log_1.wal");
                 let metadata = std::fs::metadata(&log_file).unwrap();
-                assert_eq!(metadata.len(), config.preallocate_bytes);
+                assert_eq!(metadata.len(), 64 * 1024 * 1024);
 
                 wal.close().await.unwrap();
             })
@@ -832,9 +756,9 @@ mod test_shard_write_ahead_log {
                 let tempdir = tempfile::tempdir().unwrap();
                 let data_root = tempdir.path().to_path_buf();
 
-                let wal_0 = ShardWriteAheadLog::new(0, &data_root).await.unwrap();
-                let wal_1 = ShardWriteAheadLog::new(1, &data_root).await.unwrap();
-                let wal_2 = ShardWriteAheadLog::new(2, &data_root).await.unwrap();
+                let wal_0 = ShardWriteAheadLog::new(setup_config(&data_root, 0)).await.unwrap();
+                let wal_1 = ShardWriteAheadLog::new(setup_config(&data_root, 1)).await.unwrap();
+                let wal_2 = ShardWriteAheadLog::new(setup_config(&data_root, 2)).await.unwrap();
 
                 // Verify separate directories created
                 assert!(data_root.join("shard_0").exists());
@@ -856,7 +780,7 @@ mod test_shard_write_ahead_log {
                 let tempdir = tempfile::tempdir().unwrap();
                 let data_root = tempdir.path().to_path_buf();
 
-                let wal = ShardWriteAheadLog::new(0, &data_root).await.unwrap();
+                let wal = ShardWriteAheadLog::new(setup_config(&data_root, 0)).await.unwrap();
 
                 // Close multiple times should not error
                 wal.close().await.unwrap();
@@ -873,25 +797,15 @@ mod test_shard_write_ahead_log {
                 let tempdir = tempfile::tempdir().unwrap();
                 let data_root = tempdir.path().to_path_buf();
 
-                let config = ShardConfig {
-                    preallocate_bytes: 32 * 1024 * 1024,
-                    ..Default::default()
-                };
-
                 // Create WAL with specific config
                 {
-                    let wal = ShardWriteAheadLog::new_with_config(0, &data_root, config.clone())
-                        .await
-                        .unwrap();
+                    let wal = ShardWriteAheadLog::new(setup_config(&data_root, 0)).await.unwrap();
                     wal.close().await.unwrap();
                 }
 
                 // Reopen and verify config was persisted
                 {
-                    let wal = ShardWriteAheadLog::new_with_config(0, &data_root, config.clone())
-                        .await
-                        .unwrap();
-
+                    let wal = ShardWriteAheadLog::new(setup_config(&data_root, 0)).await.unwrap();
                     wal.close().await.unwrap();
                 }
             })

@@ -10,9 +10,11 @@ celeriant_msg = { path = "../celeriant_msg" }
 celeriant_wire = { path = "../celeriant_wire" }
 celeriant_wal = { path = "../celeriant_wal" }
 celeriant_disk = { path = "../celeriant_disk" }
+celeriant_rotating_log = { path = "../celeriant_rotating_log" }
 glommio.workspace = true
 futures-lite.workspace = true
 crc32c.workspace = true
+lru.workspace = true
 fastbloom.workspace = true
 
 [dev-dependencies]

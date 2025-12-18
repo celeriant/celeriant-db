@@ -2,9 +2,8 @@ use celeriant_disk::files::read_fixed_records_visit_const::ReadVisitError;
 use celeriant_wire::wire_format_error::WireFormatError;
 use glommio::GlommioError;
 
-
 #[derive(Debug, Clone)]
-pub enum ReadError {
+pub enum ShardLogReadError {
     NotExists,
     IoError(String),
     CannotCreateFolders(String),
@@ -32,35 +31,29 @@ pub enum ReadError {
     }
 }
 
-impl From<walkdir::Error> for ReadError {
-    fn from(error: walkdir::Error) -> Self {
-        ReadError::IoError(error.to_string())
-    }
-}
-
-impl From<std::io::Error> for ReadError {
+impl From<std::io::Error> for ShardLogReadError {
     fn from(error: std::io::Error) -> Self {
-        ReadError::IoError(error.to_string())
+        ShardLogReadError::IoError(error.to_string())
     }
 }
 
-impl From<WireFormatError> for ReadError {
+impl From<WireFormatError> for ShardLogReadError {
     fn from(error: WireFormatError) -> Self {
-        ReadError::SerializationError(error)
+        ShardLogReadError::SerializationError(error)
     }
 }
 
-impl From<GlommioError<()>> for ReadError {
+impl From<GlommioError<()>> for ShardLogReadError {
     fn from(error: GlommioError<()>) -> Self {
-        ReadError::IoError(error.to_string())
+        ShardLogReadError::IoError(error.to_string())
     }
 }
 
 /// Push the ReadVisitError (io or deserialisation errors) into ReadError
-impl From<ReadVisitError<ReadError>> for ReadError {
-    fn from(error: ReadVisitError<ReadError>) -> Self {
+impl From<ReadVisitError<ShardLogReadError>> for ShardLogReadError {
+    fn from(error: ReadVisitError<ShardLogReadError>) -> Self {
         match error {
-            ReadVisitError::Io(glommio_error) => ReadError::IoError(glommio_error.to_string()),
+            ReadVisitError::Io(glommio_error) => ShardLogReadError::IoError(glommio_error.to_string()),
             ReadVisitError::Visitor(e) => e,
         }
     }

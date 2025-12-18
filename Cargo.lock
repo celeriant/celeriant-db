@@ -325,27 +325,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "celeriant_aggregate"
-version = "0.1.0"
-dependencies = [
- "celeriant_disk",
- "celeriant_filesystem",
- "celeriant_msg",
- "celeriant_wal",
- "celeriant_wire",
- "crc32c",
- "criterion",
- "fastbloom",
- "futures-lite",
- "glommio",
- "lru 0.16.2",
- "num_cpus",
- "tempfile",
- "uuid",
- "walkdir",
-]
-
-[[package]]
 name = "celeriant_cli"
 version = "0.1.0"
 dependencies = [
@@ -435,6 +414,7 @@ version = "0.1.0"
 dependencies = [
  "celeriant_disk",
  "celeriant_msg",
+ "celeriant_rotating_log",
  "celeriant_wal",
  "celeriant_wire",
  "crc32c",
@@ -442,6 +422,7 @@ dependencies = [
  "fastbloom",
  "futures-lite",
  "glommio",
+ "lru 0.16.2",
  "num_cpus",
  "tempfile",
  "uuid",
@@ -459,12 +440,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "celeriant_rotating_log"
+version = "0.1.0"
+dependencies = [
+ "celeriant_disk",
+ "celeriant_wal",
+ "celeriant_wire",
+ "criterion",
+ "futures-lite",
+ "glommio",
+ "lru 0.16.2",
+ "num_cpus",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "celeriant_runtimes"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
- "celeriant_aggregate",
  "celeriant_filesystem",
  "celeriant_msg",
  "celeriant_sidecar",

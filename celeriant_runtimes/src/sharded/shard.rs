@@ -1,23 +1,12 @@
 use std::{cell::Cell, rc::Rc, time::Duration};
 
-use celeriant_aggregate::{
-    local_aggregate::{LocalAggregate, LocalAggregateTrait},
-    read_operations::read_error::ReadError,
-    read_write_error::ReadWriteError,
-    watch::{
-        aggregate_watch_event::AggregateWatchEvent,
-        watch_session::{WatchOutput, WatchSession},
-    },
-    write_operations::write_error::WriteError,
-};
-use celeriant_filesystem::shard_write_ahead_log::ShardWriteAheadLog;
+use celeriant_filesystem::{read_write_error::ReadWriteError, shard_log_read_error::ShardLogReadError, shard_log_write_error::ShardLogWriteError, shard_write_ahead_log::ShardWriteAheadLog, watch::{aggregate_watch_event::AggregateWatchEvent, watch_session::{WatchOutput, WatchSession}}};
 use celeriant_msg::{
     request::{requests::WatchRequest},
     response::responses::{ErrorResponse, WatchResponse},
 };
 use celeriant_wire::wire_error::WireError;
 use glommio::{
-    GlommioError,
     channels::{
         channel_mesh::{Receivers, Senders},
         shared_channel::ConnectedReceiver,
@@ -51,10 +40,6 @@ impl Shard {
         filesystem: ShardWriteAheadLog,
     ) -> Self {
         info!("Initializing shard {current_shard_id}");
-        let node_config = config.node_config();
-
-        let local_aggregate =
-            LocalAggregate::new(node_config, filesystem);
 
         let shard_data = ShardData {
             config: Rc::new(config),
@@ -62,7 +47,7 @@ impl Shard {
             intrashard_sender: Rc::new(sender),
             _sidecar_senders: Rc::new(sidecar_senders),
             shutdown_requested: Rc::new(Cell::new(false)),
-            local_aggregates: Rc::new(local_aggregate),
+            filesystem: Rc::new(filesystem),
         };
 
         Self {
@@ -91,7 +76,7 @@ impl Shard {
     async fn enter_main_loop_until_shutdown(&self) {
         loop {
             if self.shard_data.shutdown_requested.get() {
-                self.shard_data.local_aggregates.close().await;
+                let _ = self.shard_data.filesystem.close().await;
                 break;
             }
 
@@ -118,7 +103,7 @@ struct ShardData {
     intrashard_sender: Rc<Senders<IntrashardMessages>>,
     _sidecar_senders: Rc<SidecarSenders>,
     shutdown_requested: Rc<Cell<bool>>,
-    local_aggregates: Rc<LocalAggregate>,
+    filesystem: Rc<ShardWriteAheadLog>,
 }
 
 async fn check_for_shard_redirect(
@@ -151,17 +136,17 @@ fn read_write_error_to_response(
 ) -> celeriant_msg::process_responses::Response {
     let (error_code, error_message) = match error {
         ReadWriteError::Read(read_error) => match read_error {
-            ReadError::WatchLatencyTooHigh { latency_ms, max_latency_mx } => (
+            ShardLogReadError::WatchLatencyTooHigh { latency_ms, max_latency_mx } => (
                 400,
                 format!(
                     "Requested watch latency {}ms exceeds server max of {}ms",
                     latency_ms, max_latency_mx
                 ),
             ),
-            ReadError::NotExists => (404, "Aggregate does not exist".to_string()),
-            ReadError::IoError(msg) => (500, format!("IO error: {}", msg)),
-            ReadError::CannotCreateFolders(msg) => (500, format!("Cannot create folders: {}", msg)),
-            ReadError::MaxBytesTooSmall {
+            ShardLogReadError::NotExists => (404, "Aggregate does not exist".to_string()),
+            ShardLogReadError::IoError(msg) => (500, format!("IO error: {}", msg)),
+            ShardLogReadError::CannotCreateFolders(msg) => (500, format!("Cannot create folders: {}", msg)),
+            ShardLogReadError::MaxBytesTooSmall {
                 current_max_bytes,
                 required_max_bytes,
             } => (
@@ -171,10 +156,10 @@ fn read_write_error_to_response(
                     current_max_bytes, required_max_bytes
                 ),
             ),
-            ReadError::SerializationError(wire_error) => {
+            ShardLogReadError::SerializationError(wire_error) => {
                 (500, format!("Serialization error: {:?}", wire_error))
             }
-            ReadError::UnavailableBatchIndex {
+            ShardLogReadError::UnavailableBatchIndex {
                 minimum_available_event_batch_index,
                 requested_event_batch_index,
             } => (
@@ -184,11 +169,11 @@ fn read_write_error_to_response(
                     requested_event_batch_index, minimum_available_event_batch_index
                 ),
             ),
-            ReadError::CorruptMetadata { file_pos_metadata } => (
+            ShardLogReadError::CorruptMetadata { file_pos_metadata } => (
                 500,
                 format!("Corrupt metadata at position {}", file_pos_metadata),
             ),
-            ReadError::CorruptEventBatch {
+            ShardLogReadError::CorruptEventBatch {
                 expected_crc,
                 actual_crc,
                 event_batch_index,
@@ -205,23 +190,22 @@ fn read_write_error_to_response(
             ),
         },
         ReadWriteError::Write(write_error) => match write_error {
-            WriteError::DmaFileNotInitialized => (500, "DMA file not initialized".to_string()),
-            WriteError::IoError(msg) => (500, format!("IO error: {}", msg)),
-            WriteError::SerializationError(wire_error) => {
+            ShardLogWriteError::DmaFileNotInitialized => (500, "DMA file not initialized".to_string()),
+            ShardLogWriteError::IoError(msg) => (500, format!("IO error: {}", msg)),
+            ShardLogWriteError::SerializationError(wire_error) => {
                 (500, format!("Serialization error: {:?}", wire_error))
             }
-            WriteError::OptimisticConcurrencyViolation {
-                client_id,
+            ShardLogWriteError::OptimisticConcurrencyViolation {
                 expected_event_batch_index,
                 current_event_batch_index,
             } => (
                 409,
                 format!(
-                    "Optimistic concurrency violation: client_id={}, expected={}, current={}",
-                    client_id, expected_event_batch_index, current_event_batch_index
+                    "Optimistic concurrency violation: expected={}, current={}",
+                    expected_event_batch_index, current_event_batch_index
                 ),
             ),
-            WriteError::ClientIdempotencyViolation {
+            ShardLogWriteError::ClientIdempotencyViolation {
                 client_id,
                 last_client_event_index,
                 attempted_client_event_index,
@@ -232,8 +216,8 @@ fn read_write_error_to_response(
                     client_id, last_client_event_index, attempted_client_event_index
                 ),
             ),
-            WriteError::EmptyEventsList => (400, "Empty events list".to_string()),
-            WriteError::NoEventsToAppend {
+            ShardLogWriteError::EmptyEventsList => (400, "Empty events list".to_string()),
+            ShardLogWriteError::NoEventsToAppend {
                 client_id,
                 existing_event_index,
             } => (
@@ -243,11 +227,11 @@ fn read_write_error_to_response(
                     client_id, existing_event_index
                 ),
             ),
-            WriteError::ZeroEventType { client_event_index } => (
+            ShardLogWriteError::ZeroEventType { client_event_index } => (
                 400,
                 format!("Zero event type at index {}", client_event_index),
             ),
-            WriteError::CacheMiss {
+            ShardLogWriteError::CacheMiss {
                 missing_from_event_batch_index,
                 missing_to_event_batch_index,
             } => (
@@ -257,7 +241,7 @@ fn read_write_error_to_response(
                     missing_from_event_batch_index, missing_to_event_batch_index
                 ),
             ),
-            WriteError::PrependCreatesEventBatchIndexGap {
+            ShardLogWriteError::PrependCreatesEventBatchIndexGap {
                 provided_last_batch_index,
                 current_first_event_batch_index,
             } => (
@@ -267,7 +251,7 @@ fn read_write_error_to_response(
                     provided_last_batch_index, current_first_event_batch_index
                 ),
             ),
-            WriteError::PrependNonContiguousBatches {
+            ShardLogWriteError::PrependNonContiguousBatches {
                 from_event_batch_index,
                 to_event_batch_index,
             } => (
@@ -277,11 +261,11 @@ fn read_write_error_to_response(
                     from_event_batch_index, to_event_batch_index
                 ),
             ),
-            WriteError::FileRenameFailure { from, to } => (
+            ShardLogWriteError::FileRenameFailure { from, to } => (
                 500,
                 format!("File rename failure: from='{}', to='{}'", from, to),
             ),
-            WriteError::MaxBytesTooSmall {
+            ShardLogWriteError::MaxBytesTooSmall {
                 current_max_bytes,
                 required_max_bytes,
             } => (
@@ -291,7 +275,8 @@ fn read_write_error_to_response(
                     current_max_bytes, required_max_bytes
                 ),
             ),
-            WriteError::InvalidLeaseIndex => (400, "Invalid lease index".to_string()),
+            ShardLogWriteError::InvalidLeaseIndex => (400, "Invalid lease index".to_string()),
+            ShardLogWriteError::DatablocksCarryOverBufferNotPresent => (500, "Datablocks carry over buffer not present".to_string()),
         },
     };
 
@@ -304,13 +289,13 @@ fn read_write_error_to_response(
 
 async fn process_client_request(
     tcp_stream: &mut TcpStream,
-    local_aggregates: Rc<LocalAggregate>,
+    shard_write_ahead_log: Rc<ShardWriteAheadLog>,
     request: celeriant_msg::process_requests::Request,
     message_version: u32,
 ) {
     let correlation_id = request.correlation_id();
 
-    let response = match local_aggregates
+    let response = match shard_write_ahead_log
         .as_ref()
         .process_request(Some(0), request)
         .await
@@ -457,13 +442,13 @@ fn spawn_intrashard_message_connection_redirect_task(
 }
 
 async fn create_watch_session(
-    local_aggregates: Rc<LocalAggregate>,
+    shard_write_ahead_log: Rc<ShardWriteAheadLog>,
     request: WatchRequest,
     max_requested_latency_ms: u64,
     max_response_size: Option<usize>,
 ) -> Result<WatchSession, ReadWriteError> {
     let aggregate_key = request.aggregate_key.clone();
-    let watchers = local_aggregates
+    let watchers = shard_write_ahead_log
         .watched_aggregates
         .get_or_create(&aggregate_key);
     let watching_writes = request
@@ -474,7 +459,7 @@ async fn create_watch_session(
 
     // Default in a read filter if client didn't provide one
     if watching_writes && read_filters.is_none() {
-        return Err(celeriant_aggregate::read_write_error::ReadWriteError::Read(ReadError::IoError("Must provide read filters".to_string())));
+        return Err(ReadWriteError::Read(ShardLogReadError::IoError("Must provide read filters".to_string())));
     }
 
     // Don't allow setup of a watch with a latency too high
@@ -483,7 +468,7 @@ async fn create_watch_session(
     if let Some(latency_ms) = request.requested_latency_ms
         && latency_ms > max_requested_latency_ms
     {
-        return Err(ReadError::WatchLatencyTooHigh {
+        return Err(ShardLogReadError::WatchLatencyTooHigh {
             latency_ms,
             max_latency_mx: max_requested_latency_ms,
         })?;
@@ -497,7 +482,7 @@ async fn create_watch_session(
         correlation_id,
         watcher_id,
         subscribed_client,
-        local_aggregates.clone(),
+        shard_write_ahead_log.clone(),
         read_filters,
         watching_writes,
     ))
@@ -507,14 +492,14 @@ async fn handle_watch_request(
     mut tcp_stream: TcpStream,
     watch_request: WatchRequest,
     message_version: u32,
-    local_aggregates: Rc<LocalAggregate>,
+    shard_write_ahead_log: Rc<ShardWriteAheadLog>,
     max_requested_latency_ms: u64,
     max_response_size: Option<usize>,
 ) {
     let correlation_id = watch_request.correlation_id;
 
     let mut watch_session = match create_watch_session(
-        local_aggregates.clone(),
+        shard_write_ahead_log.clone(),
         watch_request,
         max_requested_latency_ms,
         max_response_size,
@@ -577,7 +562,7 @@ async fn handle_watch_request(
             }
             Ok(WatchOutput::Done) => break,
             Err(error) => {
-                let response = read_write_error_to_response(correlation_id, error);
+                let response = read_write_error_to_response(correlation_id, error.into());
                 let compression_type =
                     celeriant_msg::process_responses::Response::determine_compression_type(
                         &response,
@@ -614,7 +599,7 @@ async fn handle_request_and_further_pipelining(
                 tcp_stream,
                 watch_request,
                 message_version,
-                shard_data.local_aggregates.clone(),
+                shard_data.filesystem.clone(),
                 shard_data.config.max_requested_latency_ms,
                 Some(shard_data.config.max_event_batches_response_size),
             )
@@ -623,7 +608,7 @@ async fn handle_request_and_further_pipelining(
         } else {
             process_client_request(
                 &mut tcp_stream,
-                shard_data.local_aggregates.clone(),
+                shard_data.filesystem.clone(),
                 request,
                 message_version,
             )

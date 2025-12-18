@@ -2,7 +2,6 @@
 members = [
     "celeriant",
     "celeriant_embedded",
-    "celeriant_aggregate",
     "celeriant_client_glommio",
     "celeriant_client_tokio",
     "celeriant_disk",
@@ -14,7 +13,7 @@ members = [
     "celeriant_cli",
     "celeriant_filesystem",
     "celeriant_sidecar", 
-    "celeriant_client_demo",
+    "celeriant_client_demo", "celeriant_rotating_log",
 ]
 
 resolver = "2"

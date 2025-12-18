@@ -39,7 +39,16 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
             
             let current_shard_id = sender.peer_id();
 
-            let filesystem = ShardWriteAheadLog::new(current_shard_id, &shard_config.data_root).await
+            let shard_dir = shard_config.data_root.join(format!("shard_{current_shard_id}"));
+            let internal_shard_config = celeriant_filesystem::shard_config::ShardConfig { 
+                preallocate_bytes: shard_config.shard_log_preallocate_bytes, 
+                node_id, 
+                async_flush_ms: shard_config.async_flush_ms, 
+                durable_write_with_delay_us: shard_config.durable_write_with_delay_us, 
+                shard_dir,
+                max_cached_files: shard_config.max_open_files 
+            };
+            let filesystem = ShardWriteAheadLog::new(internal_shard_config).await
                 .expect(&format!("Failed to initialize filesystem at {:?} - cannot initialize shard", shard_config.data_root));
 
             Shard::new(shard_config, current_shard_id, sender, receivers, sidecar_senders, tcp_listener, filesystem).run().await;
