@@ -1,6 +1,7 @@
 use bincode::{Decode, Encode};
+use deepsize::DeepSizeOf;
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, Encode, Decode, DeepSizeOf)]
 pub struct SnapshotOrg {
     pub org_id: u128,
 }

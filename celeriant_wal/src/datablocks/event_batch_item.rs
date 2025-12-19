@@ -1,4 +1,5 @@
 use bincode::{Decode, Encode};
+use deepsize::DeepSizeOf;
 use serde::{Deserialize, Serialize};
 
 use crate::datablocks::event_item::EventItem;
@@ -10,7 +11,7 @@ pub const CURRENT_VERSION: u32 = 1;
 /// Events from clients are grouped into batches, compressed and stored in the WAL,
 /// typically in datablocks which are variable length, but if < 256 bytes can
 /// be stored directly in a metablock minibatch
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode, DeepSizeOf)]
 pub struct EventBatchItem {
     /// Unique, incremented integer assigned to each event batch when persisted on the server
     #[serde(rename = "bx")]

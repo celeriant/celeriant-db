@@ -9,3 +9,4 @@ license.workspace = true
 base64.workspace = true
 bincode.workspace = true
 serde.workspace = true
+deepsize.workspace = true

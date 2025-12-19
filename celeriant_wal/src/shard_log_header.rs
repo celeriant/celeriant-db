@@ -1,5 +1,6 @@
 
 use bincode::{Decode, Encode};
+use deepsize::DeepSizeOf;
 
 use crate::constants::{FIXED_BLOCK_SIZE_BYTES};
 
@@ -7,7 +8,7 @@ pub const CURRENT_VERSION: u32 = 1;
 
 /// The header is written at the start and end of the 1GB fixed size file
 /// Writing both, protected by crc checks, allows recovery on torn writes
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, Encode, Decode, DeepSizeOf)]
 pub struct ShardLogHeader {
     /// A metablock is 512 byte fixed size, written from the start of the file
     /// This position indicates the end of the last written metablock entry

@@ -111,7 +111,6 @@ The protocol is binary over TCP. Request types:
 | `Exists` | Check if aggregate exists |
 | `TrimStart` | Remove old events (retention) |
 | `Delete` | Remove the entire aggregate |
-| `PrependBatches` | Prepend historical batches to restore stream availability |
 | `Watch` | Get notified immediately with new events for an aggregate |
 
 Events are opaque byte array payloads. You handle serialization.

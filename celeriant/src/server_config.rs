@@ -104,7 +104,7 @@ pub struct ServerConfig {
     pub shard_log_preallocate_bytes: u64,
 
     // Amount of recent write data to keep in memory for each shard
-    #[arg(long, default_value_t = 128 * 1024 * 1024, env = "CELERIANT_RECENT_WRITE_CACHE_BYTES", help = "Amount of recent write data to keep in memory for each shard (128MB)")]
+    #[arg(long, default_value_t = 512 * 1024 * 1024, env = "CELERIANT_RECENT_WRITE_CACHE_BYTES", help = "Amount of recent write data to keep in memory for each shard (512MB)")]
     pub recent_write_cache_bytes: u64,
 
     // Maximum latency setting for watch connections
@@ -327,7 +327,7 @@ impl Default for ServerConfig {
             shard_log_preallocate_bytes: 1024 * 1024 * 1024,
             durable_write_with_delay_us: 10000,
             allow_non_durable_writes: false,
-            recent_write_cache_bytes: 128 * 1024 * 1024,
+            recent_write_cache_bytes: 512 * 1024 * 1024,
             slow_client_timeout_ms: 30000,
         }
     }

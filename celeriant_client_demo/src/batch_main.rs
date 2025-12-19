@@ -12,8 +12,8 @@ use celeriant_wal::{
 use tokio::time::Instant;
 
 const NUM_CONNECTIONS: usize = 1024*12; // 28k max source port limit ~25000;
-const TEST_DURATION_SECS: u64 = 60;
-const NUM_AGGREGATES: usize = 1024;
+const TEST_DURATION_SECS: u64 = 160;
+const NUM_AGGREGATES: usize = 32;
 
 struct TaskStats {
     request_count: u64,
@@ -89,7 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn run_connection_benchmark(connection_id: usize) -> Result<TaskStats, String> {
     // Connect to the server
     let mut client = CeleriantClient::connect("127.0.0.1:10000")
-        .await
+        .await  
         .map_err(|e| format!("Connection error: {}", e))?
         .with_timeout(Duration::from_secs(5));
 
@@ -106,9 +106,20 @@ async fn run_connection_benchmark(connection_id: usize) -> Result<TaskStats, Str
             0,                           // client timestamp
             1,                           // event_type_major
             0,                           // event_type_minor
-            b"Hello World".to_vec(),
-            //b"For example, those who worked from home spent about 3 hours and 24 minutes doing unpaid work, while those working in the office spent fewer than two and a half hours. So it may be things like putting an extra load of washing on or actually having some extra time to spend caring for, whether it's children or pets or aging parents.".to_vec(),
-        )],
+            //b"Hello World".to_vec(),
+            b"For example, those who worked from home spent about 3 hours and 24 minutes doing unpaid work, while those working in the office spent fewer than two and a half hours. So it may be things like putting an extra load of washing on or actually having some extra time to spend caring for, whether it's children or pets or aging parents.".to_vec(),
+        ),
+        EventItem::new(
+            0,                           // client_event_index
+            0,                           // event_index (server will assign)
+            None,                        // event_id
+            0,                           // client timestamp
+            1,                           // event_type_major
+            0,                           // event_type_minor
+            //b"Hello World".to_vec(),
+            b"It has excellent ergonomics and a clear vision, but until it proves itself with public performance data and a clear escape hatch for users (like an open-source core or data migration tools), it remains a high-risk choice for core infrastructure.".to_vec(),
+        )
+        ],
         allow_create: true,
         expected_event_batch_index: None,
         enforce_client_idempotency: false,

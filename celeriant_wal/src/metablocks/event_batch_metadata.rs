@@ -1,4 +1,5 @@
 use bincode::{Decode, Encode};
+use deepsize::DeepSizeOf;
 use crate::aggregate_key::AggregateKey;
 use crate::constants::MINIBATCH_SIZE_BYTES;
 use crate::datablocks::event_batch_item::{CURRENT_VERSION, EventBatchItem};
@@ -8,7 +9,7 @@ use crate::{
 };
 
 /// Metadata written to the tail of each event batch for efficient reading and validation
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, Encode, Decode, DeepSizeOf)]
 pub struct EventBatchMetadata {
     pub aggregate_key: AggregateKey,
     pub datablock: DatablockStyle,
@@ -70,7 +71,7 @@ impl Default for EventBatchMetadata {
     }
 }
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, Encode, Decode, DeepSizeOf)]
 pub enum EventTypesData {
     /// Bloom filter bytes (when more than 4 unique event types)
     Bloom([u64; BLOOM_BYTES / 8]),

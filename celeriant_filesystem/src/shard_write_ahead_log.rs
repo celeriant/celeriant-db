@@ -3,7 +3,7 @@ use std::{
     collections::{HashMap, HashSet},
     rc::Rc, time::Duration,
 };
-
+use deepsize::DeepSizeOf;
 use celeriant_msg::{process_requests::Request, process_responses::Response, request::requests::{ReadRequest, WriteRequest}, response::responses::{ReadResponse, SuccessResponse, WriteResponse}};
 use celeriant_wal::{
     aggregate_key::AggregateKey, constants::{
@@ -575,13 +575,16 @@ async fn sync_with_rollback(
                         //update in-memory cache
                         let aggregate_key = event_batch_metadata.aggregate_key.clone();
                         let batch_index = event_batch_metadata.event_batch_index;
-                        let size_bytes = event_batch_metadata.compressed_size;
+                        let metablock = WalMetablock::EventBatchMetadata(event_batch_metadata);
+
+                        let size_bytes = (metablock.deep_size_of() as u64
+                            + queue_item.datablock.deep_size_of() as u64) * 3;
 
                         // Cache the write (only happens after durable write confirmed)
                         shard_mem_cache.cache_recent_write(
                             aggregate_key.clone(),
                             batch_index,
-                            WalMetablock::EventBatchMetadata(event_batch_metadata),
+                            metablock,
                             queue_item.datablock,
                             size_bytes,
                         );

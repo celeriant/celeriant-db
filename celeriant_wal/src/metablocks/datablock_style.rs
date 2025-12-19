@@ -1,4 +1,5 @@
 use bincode::{Decode, Encode};
+use deepsize::DeepSizeOf;
 use crate::constants::MINIBATCH_SIZE_BYTES;
 
 #[derive(Debug, Clone, Encode, Decode)]
@@ -14,5 +15,12 @@ pub enum DatablockStyle {
         crc32c: u32,
         /// Where the datablock variable payload is located in the shard log, 0 if no datablock
         datablock_position: u64,
+    }
+}
+
+impl DeepSizeOf for DatablockStyle {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        // No heap allocations, just stack data
+        0
     }
 }

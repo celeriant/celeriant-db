@@ -1,9 +1,8 @@
 use crate::{in_memory_cache::{
-    aggregate_positions::AggregatePositions, recent_write::RecentWrite,
-    shard_log_queue_item::ShardLogQueueItem, sync_positions_snapshot::SyncPositionsSnapshot,
+    aggregate_positions::AggregatePositions, recent_write::RecentWrite, shard_log_queue_item::ShardLogQueueItem, sync_positions_snapshot::SyncPositionsSnapshot
 }, shard_config::ShardConfig};
 use celeriant_wal::{aggregate_key::AggregateKey, constants::FIXED_BLOCK_SIZE_BYTES, datablocks::wal_datablock::WalDatablock, metablocks::wal_metablock::WalMetablock};
-use std::{collections::{BTreeMap, HashMap, VecDeque}, path::PathBuf};
+use std::{collections::{BTreeMap, HashMap, VecDeque}, path::PathBuf, usize};
 
 pub struct ShardMemCache {
     config: ShardConfig,
@@ -48,6 +47,7 @@ pub struct ShardMemCache {
 
     /// The active log file id for this shard. We will increment when it gets full.
     current_log_id: u64,
+    
 }
 
 impl ShardMemCache {
@@ -59,7 +59,8 @@ impl ShardMemCache {
         metablock: WalMetablock,
         datablock: Option<WalDatablock>,
         size_bytes: u64,
-    ) {
+    )
+     {
         let max_bytes = self.config.recent_write_cache_bytes;
         if max_bytes == 0 {
             return;

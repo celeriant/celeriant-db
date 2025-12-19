@@ -1,7 +1,8 @@
 use bincode::{Decode, Encode};
+use deepsize::DeepSizeOf;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, DeepSizeOf)]
 pub enum CompressionType {
     None,
     Zstd { level: i32 },

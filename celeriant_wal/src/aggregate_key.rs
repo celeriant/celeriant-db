@@ -5,11 +5,12 @@ use bincode::de::{BorrowDecoder, Decoder};
 use bincode::enc::Encoder;
 use bincode::error::{DecodeError, EncodeError};
 use bincode::{BorrowDecode, Decode, Encode};
+use deepsize::DeepSizeOf;
 use serde::{Deserialize, Serialize};
 
 /// High-performance composite key for client event index tracking
 /// Optimized for hashing and comparison operations
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
 pub struct AggregateKey {
     #[serde(rename = "oi")]
     pub org_id: u128,

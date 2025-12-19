@@ -17,6 +17,7 @@ futures-lite.workspace = true
 crc32c.workspace = true
 lru.workspace = true
 fastbloom.workspace = true
+deepsize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

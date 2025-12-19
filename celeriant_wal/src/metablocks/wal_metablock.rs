@@ -1,4 +1,5 @@
 use bincode::{Decode, Encode};
+use deepsize::DeepSizeOf;
 
 use crate::{datablocks::{snapshot_aggregate_type::SnapshotAggregateType, snapshot_org::SnapshotOrg}, metablocks::{event_batch_metadata::EventBatchMetadata, snapshot_aggregate::SnapshotAggregate}};
 
@@ -8,7 +9,7 @@ pub const CURRENT_VERSION: u32 = 1;
 /// us to avoid pulling in large message payloads (stored in datablocks)
 /// We use bincode with fixed-length integers so can pull out data
 /// like aggregate key without deserialising the entire block
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, Encode, Decode, DeepSizeOf)]
 pub enum WalMetablock {
     EventBatchMetadata(EventBatchMetadata),
     SnapshotOrg(SnapshotOrg),

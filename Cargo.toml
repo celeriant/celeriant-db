@@ -26,6 +26,7 @@ edition = "2024"
 license = "Apache-2.0"
 
 [workspace.dependencies]
+deepsize = "0.2.0"
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 base64 = "0.22.1"
 bincode = "2.0.1"
