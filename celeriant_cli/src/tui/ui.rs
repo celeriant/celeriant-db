@@ -34,8 +34,6 @@ pub fn draw(f: &mut Frame, app: &App) {
     match app.screen {
         Screen::Home => draw_home(f, app, chunks[1]),
         Screen::Connect => draw_connect(f, app, chunks[1]),
-        Screen::Organisations => draw_organisations(f, app, chunks[1]),
-        Screen::Aggregates => draw_aggregates(f, app, chunks[1]),
         Screen::AggregateContext => draw_aggregate_context(f, app, chunks[1]),
         Screen::EnterAggregate => draw_enter_aggregate(f, app, chunks[1]),
         Screen::ReadEvents => draw_read_events(f, app, chunks[1]),
@@ -121,8 +119,6 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let breadcrumb = match &app.screen {
         Screen::Home => "Home".to_string(),
         Screen::Connect => "Connect".to_string(),
-        Screen::Organisations => "Organisations".to_string(),
-        Screen::Aggregates => format!("Org {} › Aggregates", app.selected_org.unwrap_or(0)),
         Screen::AggregateContext => {
             if let Some(ctx) = &app.aggregate_context {
                 format!("Org {} › Type {} › Agg {}", ctx.org_id, ctx.aggregate_type_id, ctx.aggregate_id)
@@ -182,7 +178,6 @@ fn get_screen_hints(screen: &Screen, input_mode: &InputMode) -> &'static str {
         InputMode::Editing => "Tab: next │ Enter: confirm │ Esc: cancel",
         InputMode::Normal => match screen {
             Screen::Home => "↑↓/jk: navigate │ Enter: select │ q: quit │ ?: help",
-            Screen::Organisations | Screen::Aggregates => "↑↓/jk: navigate │ Enter: select │ r: refresh │ q: back",
             Screen::AggregateContext => "↑↓/jk: navigate │ Enter: select │ r: refresh │ q: back",
             Screen::ReadEvents | Screen::WriteEvent => "e/i: edit │ x: execute │ ↑↓: scroll │ q: back",
             Screen::Watch => "e/i: edit │ x: start │ s: stop │ ↑↓: scroll │ q: back",  // Add this
@@ -385,10 +380,6 @@ fn draw_home(f: &mut Frame, app: &App, area: Rect) {
             format!("Server: {}", app.server_address),
             Style::default().fg(SUCCESS_COLOR),
         )));
-        info_lines.push(Line::from(Span::styled(
-            format!("Organisations cached: {}", app.organisations.len()),
-            Style::default().fg(DIM_COLOR),
-        )));
     }
 
     let info = Paragraph::new(info_lines)
@@ -436,95 +427,6 @@ fn draw_connect(f: &mut Frame, app: &App, area: Rect) {
     .style(Style::default().fg(DIM_COLOR));
 
     f.render_widget(help, chunks[1]);
-}
-
-fn draw_organisations(f: &mut Frame, app: &App, area: Rect) {
-    let items: Vec<ListItem> = app
-        .organisations
-        .iter()
-        .enumerate()
-        .map(|(i, org)| {
-            let style = if i == app.org_list_index {
-                Style::default().fg(SELECTED_COLOR).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
-            let prefix = if i == app.org_list_index { "▶ " } else { "  " };
-            ListItem::new(Line::from(vec![
-                Span::styled(prefix, style),
-                Span::styled(format!("Org {}", org.org_id), style),
-                Span::styled(
-                    format!(
-                        "  │  {} │ {}",
-                        format_timestamp(org.modified_at),
-                        humansize::format_size(org.disk_usage, humansize::BINARY)
-                    ),
-                    Style::default().fg(DIM_COLOR),
-                ),
-            ]))
-        })
-        .collect();
-
-    let title = format!(" Organisations ({}) ", app.organisations.len());
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title));
-
-    f.render_widget(list, area);
-
-    if app.organisations.len() > area.height as usize - 2 {
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
-        let mut scrollbar_state = ScrollbarState::new(app.organisations.len())
-            .position(app.org_list_index);
-        f.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
-    }
-}
-
-fn draw_aggregates(f: &mut Frame, app: &App, area: Rect) {
-    let items: Vec<ListItem> = app
-        .aggregates
-        .iter()
-        .enumerate()
-        .map(|(i, agg)| {
-            let style = if i == app.agg_list_index {
-                Style::default().fg(SELECTED_COLOR).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
-            let prefix = if i == app.agg_list_index { "▶ " } else { "  " };
-            ListItem::new(Line::from(vec![
-                Span::styled(prefix, style),
-                Span::styled(
-                    format!("Type {} / ID {}", agg.key.aggregate_type_id, agg.key.aggregate_id),
-                    style,
-                ),
-                Span::styled(
-                    format!(
-                        "  │  {} │ {}",
-                        format_timestamp(agg.modified_at),
-                        humansize::format_size(agg.disk_usage, humansize::BINARY)
-                    ),
-                    Style::default().fg(DIM_COLOR),
-                ),
-            ]))
-        })
-        .collect();
-
-    let title = format!(
-        " Aggregates in Org {} ({}) ",
-        app.selected_org.unwrap_or(0),
-        app.aggregates.len()
-    );
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title));
-
-    f.render_widget(list, area);
-
-    if app.aggregates.len() > area.height as usize - 2 {
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
-        let mut scrollbar_state = ScrollbarState::new(app.aggregates.len())
-            .position(app.agg_list_index);
-        f.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
-    }
 }
 
 fn draw_aggregate_context(f: &mut Frame, app: &App, area: Rect) {

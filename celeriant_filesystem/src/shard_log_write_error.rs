@@ -3,6 +3,8 @@ use glommio::GlommioError;
 
 use celeriant_rotating_log::rotating_log_error::RotatingLogError;
 
+use celeriant_watch::aggregate_reader::WatchReadError;
+
 #[derive(Debug, Clone)]
 pub enum ShardLogWriteError {
     DmaFileNotInitialized,
@@ -47,6 +49,26 @@ pub enum ShardLogWriteError {
         required_max_bytes: u64,
     },
     InvalidLeaseIndex,
+}
+
+impl From<ShardLogWriteError> for WatchReadError {
+    fn from(err: ShardLogWriteError) -> Self {
+        match err {
+            ShardLogWriteError::IoError(s) => WatchReadError::Io(s),
+            ShardLogWriteError::SerializationError(s) => WatchReadError::Serialization(s),
+            _other => WatchReadError::Other("Unknown error".to_string()),
+        }
+    }
+}
+
+impl From<WatchReadError> for ShardLogWriteError {
+    fn from(value: WatchReadError) -> Self {
+        match value {
+            WatchReadError::Io(e) => ShardLogWriteError::IoError(e),
+            WatchReadError::Serialization(e) => ShardLogWriteError::SerializationError(e),
+            WatchReadError::Other(_) => ShardLogWriteError::IoError("Unknown watch error".to_string()),
+        }
+    }
 }
 
 impl From<RotatingLogError> for ShardLogWriteError {

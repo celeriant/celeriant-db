@@ -1,7 +1,7 @@
 use celeriant_runtimes::{ShardConfig, SidecarConfig};
 use celeriant_sidecar::s3_config::S3Config;
 use clap::Parser;
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 #[derive(Clone, Debug, Parser)]
 #[command(name = "celeriant")]
@@ -91,12 +91,20 @@ pub struct ServerConfig {
     )]
     pub max_requested_latency_ms: u64,
 
+    #[arg(
+        long,
+        default_value_t = 30000,
+        env = "CELERIANT_SLOW_CLIENT_TIMEOUT_MS",
+        help = "Maximum time a client has to pull down server messages over tcp (30s)"
+    )]
+    pub slow_client_timeout_ms: u64,
+
     // Size of each individual log file on disk
     #[arg(long, default_value_t = 1024 * 1024 * 1024, env = "CELERIANT_SHARD_LOG_PREALLOCATE_BYTES", help = "Size of each individual log file on disk (1GB)")]
     pub shard_log_preallocate_bytes: u64,
 
     // Amount of recent write data to keep in memory for each shard
-    #[arg(long, default_value_t = 1024 * 1024 * 1024, env = "CELERIANT_RECENT_WRITE_CACHE_BYTES", help = "Amount of recent write data to keep in memory for each shard (1GB)")]
+    #[arg(long, default_value_t = 128 * 1024 * 1024, env = "CELERIANT_RECENT_WRITE_CACHE_BYTES", help = "Amount of recent write data to keep in memory for each shard (128MB)")]
     pub recent_write_cache_bytes: u64,
 
     // Maximum latency setting for watch connections
@@ -230,6 +238,7 @@ impl ServerConfig {
                 Some(self.durable_write_with_delay_us)
             },
             recent_write_cache_bytes: self.recent_write_cache_bytes,
+            slow_client_timeout: Duration::from_millis(self.slow_client_timeout_ms),
         }
     }
 
@@ -318,7 +327,8 @@ impl Default for ServerConfig {
             shard_log_preallocate_bytes: 1024 * 1024 * 1024,
             durable_write_with_delay_us: 10000,
             allow_non_durable_writes: false,
-            recent_write_cache_bytes: 1024 * 1024 * 1024,
+            recent_write_cache_bytes: 128 * 1024 * 1024,
+            slow_client_timeout_ms: 30000,
         }
     }
 }

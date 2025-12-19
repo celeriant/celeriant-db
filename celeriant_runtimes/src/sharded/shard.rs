@@ -1,6 +1,7 @@
 use std::{cell::Cell, rc::Rc, time::Duration};
 
-use celeriant_filesystem::{read_write_error::ReadWriteError, shard_log_read_error::ShardLogReadError, shard_log_write_error::ShardLogWriteError, shard_write_ahead_log::ShardWriteAheadLog, watch::{aggregate_watch_event::AggregateWatchEvent, watch_session::{WatchOutput, WatchSession}}};
+use celeriant_watch::{aggregate_watch_event::AggregateWatchEvent, watch_output_type::WatchOutputType, watch_session::WatchSession};
+use celeriant_filesystem::{read_write_error::ReadWriteError, shard_log_read_error::ShardLogReadError, shard_log_write_error::ShardLogWriteError, shard_write_ahead_log::ShardWriteAheadLog};
 use celeriant_msg::{
     request::{requests::WatchRequest},
     response::responses::{ErrorResponse, WatchResponse},
@@ -292,6 +293,7 @@ async fn process_client_request(
     shard_write_ahead_log: Rc<ShardWriteAheadLog>,
     request: celeriant_msg::process_requests::Request,
     message_version: u32,
+    slow_client_timeout: Duration,
 ) {
     let correlation_id = request.correlation_id();
 
@@ -307,35 +309,44 @@ async fn process_client_request(
     let compression_type =
         celeriant_msg::process_responses::Response::determine_compression_type(&response);
 
-    let _ = celeriant_msg::process_responses::Response::write_response(
+    let _ = write_response_with_timeout(
         tcp_stream,
         &response,
         compression_type,
         message_version,
+        slow_client_timeout,
     )
     .await;
 }
 
 /// Try to read a request from the client.
-/// Read can fail due to disconnect, wrong protocol version, or other errors
-/// read_request may write a message back, otherweise we just close the connection
+/// Read can fail due to disconnect, wrong protocol version, timeout, or other errors
+/// read_request may write a message back, otherwise we just close the connection
 async fn read_client_request(
     tcp_stream: &mut TcpStream,
     shard_data: &ShardData,
+    timeout_duration: Duration,
 ) -> Option<(celeriant_msg::process_requests::Request, u32)> {
-    match celeriant_msg::process_requests::Request::read_request(
-        tcp_stream,
-        shard_data.config.max_request_size,
-    )
+    match glommio::timer::timeout(timeout_duration, async {
+        let result = celeriant_msg::process_requests::Request::read_request(
+            tcp_stream,
+            shard_data.config.max_request_size,
+        )
+        .await;
+        Ok::<_, glommio::GlommioError<()>>(result)
+    })
     .await
     {
-        Ok(read_result) => return Some(read_result),
-        Err(WireError::NetworkError(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-            return None;
+        Ok(Ok(read_result)) => Some(read_result),
+        Ok(Err(WireError::NetworkError(ref e)))
+            if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+        {
+            None
         }
-        Err(WireError::UnsupportedProtocol(_version)) => return None,
-        Err(_e) => return None,
-    };
+        Ok(Err(WireError::UnsupportedProtocol(_version))) => None,
+        Ok(Err(_e)) => None,
+        Err(_) => None, // Timeout
+    }
 }
 
 async fn broadcast_message_to_other_shards(
@@ -445,22 +456,7 @@ async fn create_watch_session(
     shard_write_ahead_log: Rc<ShardWriteAheadLog>,
     request: WatchRequest,
     max_requested_latency_ms: u64,
-    max_response_size: Option<usize>,
-) -> Result<WatchSession, ReadWriteError> {
-    let aggregate_key = request.aggregate_key.clone();
-    let watchers = shard_write_ahead_log
-        .watched_aggregates
-        .get_or_create(&aggregate_key);
-    let watching_writes = request
-        .subscribe_to_event_types
-        .contains(&AggregateWatchEvent::WRITE);
-    let correlation_id = request.correlation_id;
-    let read_filters = request.filters.clone();
-
-    // Default in a read filter if client didn't provide one
-    if watching_writes && read_filters.is_none() {
-        return Err(ReadWriteError::Read(ShardLogReadError::IoError("Must provide read filters".to_string())));
-    }
+) -> Result<WatchSession<ShardWriteAheadLog>, ReadWriteError> {
 
     // Don't allow setup of a watch with a latency too high
     // as this creates too much load on the server
@@ -474,17 +470,15 @@ async fn create_watch_session(
         })?;
     }
 
-    let (watcher_id, subscribed_client) = watchers.add_subscriber(request, max_response_size);
+    let (watcher_id, subscribed_client) = shard_write_ahead_log
+        .watched_aggregates
+        .add_subscriber(request);
 
     // Watcher needs a ref to local_aggregates so it can retrieve batches
     Ok(WatchSession::new(
-        aggregate_key,
-        correlation_id,
         watcher_id,
         subscribed_client,
         shard_write_ahead_log.clone(),
-        read_filters,
-        watching_writes,
     ))
 }
 
@@ -494,7 +488,7 @@ async fn handle_watch_request(
     message_version: u32,
     shard_write_ahead_log: Rc<ShardWriteAheadLog>,
     max_requested_latency_ms: u64,
-    max_response_size: Option<usize>,
+    slow_client_timeout: Duration,
 ) {
     let correlation_id = watch_request.correlation_id;
 
@@ -502,7 +496,6 @@ async fn handle_watch_request(
         shard_write_ahead_log.clone(),
         watch_request,
         max_requested_latency_ms,
-        max_response_size,
     )
     .await
     {
@@ -511,11 +504,12 @@ async fn handle_watch_request(
             let response = read_write_error_to_response(correlation_id, error);
             let compression_type =
                 celeriant_msg::process_responses::Response::determine_compression_type(&response);
-            let _ = celeriant_msg::process_responses::Response::write_response(
+            let _ = write_response_with_timeout(
                 &mut tcp_stream,
                 &response,
                 compression_type,
                 message_version,
+                slow_client_timeout,
             )
             .await;
             return;
@@ -524,18 +518,19 @@ async fn handle_watch_request(
 
     loop {
         match watch_session.next().await {
-            Ok(WatchOutput::Continue) => continue,
-            Ok(WatchOutput::Response(watch_response)) => {
+            Ok(WatchOutputType::Continue) => continue,
+            Ok(WatchOutputType::Response(watch_response)) => {
                 let response = celeriant_msg::process_responses::Response::Watch(watch_response);
                 let compression_type =
                     celeriant_msg::process_responses::Response::determine_compression_type(
                         &response,
                     );
-                if celeriant_msg::process_responses::Response::write_response(
+                if write_response_with_timeout(
                     &mut tcp_stream,
                     &response,
                     compression_type,
                     message_version,
+                    slow_client_timeout,
                 )
                 .await
                 .is_err()
@@ -543,16 +538,16 @@ async fn handle_watch_request(
                     break;
                 }
             }
-            Ok(WatchOutput::Heartbeat) => {
+            Ok(WatchOutputType::Heartbeat) => {
                 let response = celeriant_msg::process_responses::Response::Watch(WatchResponse {
                     events: None,
-                    is_heartbeat: true,
                 });
-                if celeriant_msg::process_responses::Response::write_response(
+                if write_response_with_timeout(
                     &mut tcp_stream,
                     &response,
                     celeriant_wal::compression_type::CompressionType::None,
                     message_version,
+                    slow_client_timeout,
                 )
                 .await
                 .is_err()
@@ -560,26 +555,26 @@ async fn handle_watch_request(
                     break;
                 }
             }
-            Ok(WatchOutput::Done) => break,
+            Ok(WatchOutputType::Done) => break,
             Err(error) => {
-                let response = read_write_error_to_response(correlation_id, error.into());
+                let write_error: ShardLogWriteError = error.into();
+                let response = read_write_error_to_response(correlation_id, write_error.into());
                 let compression_type =
                     celeriant_msg::process_responses::Response::determine_compression_type(
                         &response,
                     );
-                let _ = celeriant_msg::process_responses::Response::write_response(
+                let _ = write_response_with_timeout(
                     &mut tcp_stream,
                     &response,
                     compression_type,
                     message_version,
+                    slow_client_timeout,
                 )
                 .await;
                 break;
             }
         }
     }
-
-    watch_session.cleanup();
 }
 
 async fn handle_request_and_further_pipelining(
@@ -601,7 +596,7 @@ async fn handle_request_and_further_pipelining(
                 message_version,
                 shard_data.filesystem.clone(),
                 shard_data.config.max_requested_latency_ms,
-                Some(shard_data.config.max_event_batches_response_size),
+                shard_data.config.slow_client_timeout,
             )
             .await;
             return;
@@ -611,6 +606,7 @@ async fn handle_request_and_further_pipelining(
                 shard_data.filesystem.clone(),
                 request,
                 message_version,
+                shard_data.config.slow_client_timeout,
             )
             .await;
         }
@@ -620,7 +616,7 @@ async fn handle_request_and_further_pipelining(
         }
 
         // Support pipelining of another request on the same connection
-        match read_client_request(&mut tcp_stream, &shard_data).await {
+        match read_client_request(&mut tcp_stream, &shard_data, shard_data.config.slow_client_timeout).await {
             Some((next_request, next_message_version)) => {
                 request = next_request;
                 message_version = next_message_version;
@@ -654,7 +650,7 @@ fn handle_new_client_connection(mut tcp_stream: TcpStream, shard_data: ShardData
         }
 
         let (mut request, message_version) =
-            match read_client_request(&mut tcp_stream, &shard_data).await {
+            match read_client_request(&mut tcp_stream, &shard_data, shard_data.config.slow_client_timeout).await {
                 Some(r) => r,
                 None => return,
             };
@@ -672,4 +668,29 @@ fn handle_new_client_connection(mut tcp_stream: TcpStream, shard_data: ShardData
             .await;
     })
     .detach();
+}
+
+async fn write_response_with_timeout(
+    tcp_stream: &mut TcpStream,
+    response: &celeriant_msg::process_responses::Response,
+    compression_type: celeriant_wal::compression_type::CompressionType,
+    message_version: u32,
+    timeout_duration: Duration,
+) -> Result<(), WireError> {
+    match glommio::timer::timeout(timeout_duration, async {
+        let result = celeriant_msg::process_responses::Response::write_response(
+            tcp_stream,
+            response,
+            compression_type,
+            message_version,
+        ).await;
+        Ok::<_, glommio::GlommioError<()>>(result)
+    }).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(wire_error)) => Err(wire_error),
+        Err(_) => Err(WireError::NetworkError(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "Write timed out - slow client",
+        ))),
+    }
 }

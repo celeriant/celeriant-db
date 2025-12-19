@@ -1,23 +1,10 @@
+use std::collections::HashSet;
+
 use bincode::{Decode, Encode};
-use celeriant_wal::{aggregate_key::AggregateKey, compression_type::CompressionType, datablocks::{event_item::EventItem}};
+use celeriant_wal::{aggregate_key::AggregateKey, aggregate_type_key::AggregateTypeKey, compression_type::CompressionType, datablocks::event_item::EventItem};
 use serde::{Deserialize, Serialize};
 
-use crate::request::{directory_filters::DirectoryFilters, read_filters::ReadFilters};
-
-// Individual request structs
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
-pub struct ListOrganisationsRequest {
-    pub correlation_id: Option<u128>,
-    pub filters: DirectoryFilters,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
-pub struct ListAggregatesRequest {
-    pub correlation_id: Option<u128>,
-    pub org_id: u128,
-    pub aggregate_type_id: Option<u128>,
-    pub filters: DirectoryFilters,
-}
+use crate::request::{read_filters::ReadFilters};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct ExistsRequest {
@@ -60,10 +47,10 @@ pub struct DeleteRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct WatchRequest {
-    pub subscribe_to_event_types: Vec<u8>,
     pub correlation_id: Option<u128>,
-    pub aggregate_key: AggregateKey,
     pub requested_latency_ms: Option<u64>,
-    pub requested_throughput_bs: Option<usize>,
-    pub filters: Option<ReadFilters>,
+    pub orgs: Option<HashSet<u128>>,
+    pub aggregate_types: Option<HashSet<AggregateTypeKey>>,
+    pub aggregates: Option<HashSet<AggregateKey>>,
+    pub operation_types: Option<HashSet<u8>>,
 }

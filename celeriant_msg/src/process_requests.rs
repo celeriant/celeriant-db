@@ -2,32 +2,28 @@ use celeriant_wal::compression_type::CompressionType;
 use celeriant_wire::{constants::WIRE_FIXED_BODY_SIZE, wire_error::WireError, wire_header::WireHeader};
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
 
-use crate::request::requests::{DeleteRequest, ExistsRequest, ListAggregatesRequest, ListOrganisationsRequest, ReadRequest, TrimStartRequest, WatchRequest, WriteRequest};
+use crate::request::requests::{DeleteRequest, ExistsRequest, ReadRequest, TrimStartRequest, WatchRequest, WriteRequest};
 
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestType {
-    ListOrganisations = 1,
-    ListAggregates = 2,
-    Exists = 3,
-    Read = 4,
-    Write = 5,
-    TrimStart = 6,
-    Delete = 7,
-    Watch = 8,
+    Exists = 1,
+    Read = 2,
+    Write = 3,
+    TrimStart = 4,
+    Delete = 5,
+    Watch = 6,
 }
 
 impl RequestType {
     pub fn from_u32(value: u32) -> Result<Self, WireError> {
         match value {
-            1 => Ok(RequestType::ListOrganisations),
-            2 => Ok(RequestType::ListAggregates),
-            3 => Ok(RequestType::Exists),
-            4 => Ok(RequestType::Read),
-            5 => Ok(RequestType::Write),
-            6 => Ok(RequestType::TrimStart),
-            7 => Ok(RequestType::Delete),
-            8 => Ok(RequestType::Watch),
+            1 => Ok(RequestType::Exists),
+            2 => Ok(RequestType::Read),
+            3 => Ok(RequestType::Write),
+            4 => Ok(RequestType::TrimStart),
+            5 => Ok(RequestType::Delete),
+            6 => Ok(RequestType::Watch),
             _ => Err(WireError::UnknownRequestType(value)),
         }
     }
@@ -35,9 +31,7 @@ impl RequestType {
     pub fn is_fixed_size(&self) -> bool {
         matches!(
             self,
-            RequestType::ListOrganisations
-                | RequestType::ListAggregates
-                | RequestType::Exists
+                RequestType::Exists
                 | RequestType::Read
                 | RequestType::TrimStart
                 | RequestType::Delete
@@ -49,8 +43,6 @@ impl RequestType {
 
 #[derive(Debug, Clone)]
 pub enum Request {
-    ListOrganisations(ListOrganisationsRequest),
-    ListAggregates(ListAggregatesRequest),
     Exists(ExistsRequest),
     Read(ReadRequest),
     Write(WriteRequest),
@@ -62,8 +54,6 @@ pub enum Request {
 impl Request {
     pub fn request_type(&self) -> RequestType {
         match self {
-            Request::ListOrganisations(_) => RequestType::ListOrganisations,
-            Request::ListAggregates(_) => RequestType::ListAggregates,
             Request::Exists(_) => RequestType::Exists,
             Request::Read(_) => RequestType::Read,
             Request::Write(_) => RequestType::Write,
@@ -75,8 +65,6 @@ impl Request {
 
     pub fn correlation_id(&self) -> Option<u128> {
         match self {
-            Request::ListOrganisations(req) => req.correlation_id,
-            Request::ListAggregates(req) => req.correlation_id,
             Request::Exists(req) => req.correlation_id,
             Request::Read(req) => req.correlation_id,
             Request::Write(req) => req.correlation_id,
@@ -90,14 +78,12 @@ impl Request {
     /// Returns 0 for requests without a specific aggregate (they go to shard 0).
     pub fn routing_id(&self) -> u128 {
         match self {
-            Request::ListOrganisations(_) => 0,
-            Request::ListAggregates(_) => 0,
             Request::Exists(req) => req.aggregate_key.aggregate_id,
             Request::Read(req) => req.aggregate_key.aggregate_id,
             Request::Write(req) => req.aggregate_key.aggregate_id,
             Request::TrimStart(req) => req.aggregate_key.aggregate_id,
             Request::Delete(req) => req.aggregate_key.aggregate_id,
-            Request::Watch(req) => req.aggregate_key.aggregate_id,
+            Request::Watch(_req) => 0,
         }
     }
 
@@ -117,12 +103,6 @@ impl Request {
             let mut buffer = [0u8; WIRE_FIXED_BODY_SIZE];
 
             match request_type {
-                RequestType::ListOrganisations => {
-                    Request::ListOrganisations(wire_header.read_fixed_size(reader, &mut buffer).await?)
-                }
-                RequestType::ListAggregates => {
-                    Request::ListAggregates(wire_header.read_fixed_size(reader, &mut buffer).await?)
-                }
                 RequestType::Exists => {
                     Request::Exists(wire_header.read_fixed_size(reader, &mut buffer).await?)
                 }
@@ -170,8 +150,6 @@ impl Request {
         if request_type.is_fixed_size() {
             // Fixed-size requests - no compression needed
             match request {
-                Request::ListOrganisations(req) => WireHeader::write_fixed_size(writer, req, request_type_id, version).await,
-                Request::ListAggregates(req) => WireHeader::write_fixed_size(writer, req, request_type_id, version).await,
                 Request::Exists(req) => WireHeader::write_fixed_size(writer, req, request_type_id, version).await,
                 Request::Read(req) => WireHeader::write_fixed_size(writer, req, request_type_id, version).await,
                 Request::TrimStart(req) => WireHeader::write_fixed_size(writer, req, request_type_id, version).await,
@@ -206,19 +184,17 @@ mod tests {
     use celeriant_wal::aggregate_key::AggregateKey;
     use celeriant_wire::constants::{PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3};
     use futures_lite::{future::block_on, io::Cursor};
-    use crate::request::{directory_filters::DirectoryFilters, read_filters::ReadFilters};
+    use crate::request::{read_filters::ReadFilters};
 
     // UPDATE THIS when adding new RequestTypes - tests will fail if mismatched
-    const REQUEST_TYPE_COUNT: usize = 8;
-    const REQUEST_TYPE_MAX_ID: u32 = 8;
+    const REQUEST_TYPE_COUNT: usize = 6;
+    const REQUEST_TYPE_MAX_ID: u32 = 6;
 
     impl RequestType {
         /// Returns all RequestType variants. Adding a new variant without updating
         /// this function will cause a compile error due to non-exhaustive match.
         fn all() -> [RequestType; REQUEST_TYPE_COUNT] {
             [
-                RequestType::ListOrganisations,
-                RequestType::ListAggregates,
                 RequestType::Exists,
                 RequestType::Read,
                 RequestType::Write,
@@ -238,16 +214,6 @@ mod tests {
     fn make_test_request(request_type: RequestType) -> Request {
         let key = make_test_aggregate_key();
         match request_type {
-            RequestType::ListOrganisations => Request::ListOrganisations(ListOrganisationsRequest {
-                correlation_id: Some(100),
-                filters: DirectoryFilters::default(),
-            }),
-            RequestType::ListAggregates => Request::ListAggregates(ListAggregatesRequest {
-                correlation_id: Some(101),
-                org_id: 1,
-                aggregate_type_id: Some(2),
-                filters: DirectoryFilters::default(),
-            }),
             RequestType::Exists => Request::Exists(ExistsRequest {
                 correlation_id: Some(102),
                 aggregate_key: key,
@@ -278,12 +244,12 @@ mod tests {
                 aggregate_key: key,
             }),
             RequestType::Watch => Request::Watch(WatchRequest { 
-                subscribe_to_event_types: vec![1],
                 correlation_id: Some(109), 
-                aggregate_key: key, 
-                requested_latency_ms: Some(10), 
-                requested_throughput_bs: Some(1 << 20), 
-                filters: Some(ReadFilters::new(1)) 
+                requested_latency_ms: Some(10),
+                orgs: None,
+                aggregate_types: None,
+                aggregates: None,
+                operation_types: None, 
             }),
         }
     }

@@ -2,37 +2,33 @@ use celeriant_wal::compression_type::CompressionType;
 use celeriant_wire::{constants::WIRE_FIXED_BODY_SIZE, wire_error::WireError, wire_header::WireHeader};
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
 
-use crate::response::responses::{ErrorResponse, ExistsResponse, ListAggregatesResponse, ListOrganisationsResponse, ProtocolErrorResponse, ReadResponse, SuccessResponse, WatchResponse, WriteResponse};
+use crate::response::responses::{ErrorResponse, ExistsResponse, ProtocolErrorResponse, ReadResponse, SuccessResponse, WatchResponse, WriteResponse};
 
 // Response type discriminants
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponseType {
-    ListOrganisations = 1,
-    ListAggregates = 2,
-    Exists = 3,
-    Read = 4,
-    Write = 5,
-    TrimStart = 6,
-    Delete = 7,
-    ProtocolError = 8,
-    GenericError = 9,
-    Watch = 10,
+    Exists = 1,
+    Read = 2,
+    Write = 3,
+    TrimStart = 4,
+    Delete = 5,
+    ProtocolError = 6,
+    GenericError = 7,
+    Watch = 8,
 }
 
 impl ResponseType {
     pub fn from_u32(value: u32) -> Result<Self, WireError> {
         match value {
-            1 => Ok(ResponseType::ListOrganisations),
-            2 => Ok(ResponseType::ListAggregates),
-            3 => Ok(ResponseType::Exists),
-            4 => Ok(ResponseType::Read),
-            5 => Ok(ResponseType::Write),
-            6 => Ok(ResponseType::TrimStart),
-            7 => Ok(ResponseType::Delete),
-            8 => Ok(ResponseType::ProtocolError),
-            9 => Ok(ResponseType::GenericError),
-            10 => Ok(ResponseType::Watch),
+            1 => Ok(ResponseType::Exists),
+            2 => Ok(ResponseType::Read),
+            3 => Ok(ResponseType::Write),
+            4 => Ok(ResponseType::TrimStart),
+            5 => Ok(ResponseType::Delete),
+            6 => Ok(ResponseType::ProtocolError),
+            7 => Ok(ResponseType::GenericError),
+            8 => Ok(ResponseType::Watch),
             _ => Err(WireError::UnknownResponseType(value)),
         }
     }
@@ -53,8 +49,6 @@ impl ResponseType {
 
 #[derive(Debug, Clone)]
 pub enum Response {
-    ListOrganisations(ListOrganisationsResponse),
-    ListAggregates(ListAggregatesResponse),
     Exists(ExistsResponse),
     Read(ReadResponse),
     Write(WriteResponse),
@@ -68,8 +62,6 @@ pub enum Response {
 impl Response {
     pub fn response_type(&self) -> ResponseType {
         match self {
-            Response::ListOrganisations(_) => ResponseType::ListOrganisations,
-            Response::ListAggregates(_) => ResponseType::ListAggregates,
             Response::Exists(_) => ResponseType::Exists,
             Response::Read(_) => ResponseType::Read,
             Response::Write(_) => ResponseType::Write,
@@ -116,12 +108,6 @@ impl Response {
             }
         } else {
             match response_type {
-                ResponseType::ListOrganisations => {
-                    Response::ListOrganisations(wire_header.read_variable_size(reader, None).await?)
-                }
-                ResponseType::ListAggregates => {
-                    Response::ListAggregates(wire_header.read_variable_size(reader, None).await?)
-                }
                 ResponseType::Read => {
                     Response::Read(wire_header.read_variable_size(reader, None).await?)
                 }
@@ -137,8 +123,6 @@ impl Response {
 
     pub fn determine_compression_type(response: &Response) -> CompressionType {
         match response {
-            Response::ListOrganisations(_) => CompressionType::Snappy,
-            Response::ListAggregates(_) => CompressionType::Snappy,
             Response::Exists(_) => CompressionType::None,
             Response::Read(_) => CompressionType::Snappy,
             Response::Write(_) => CompressionType::None,
@@ -176,12 +160,6 @@ impl Response {
         } else {
             // Variable-size responses - with compression
             match response {
-                Response::ListOrganisations(res) => {
-                    WireHeader::write_variable_size(writer, res, response_type_id, compression_type, None, version).await
-                }
-                Response::ListAggregates(res) => {
-                    WireHeader::write_variable_size(writer, res, response_type_id, compression_type, None, version).await
-                }
                 Response::Read(res) => {
                     WireHeader::write_variable_size(writer, res, response_type_id, compression_type, None, version).await
                 }
@@ -201,16 +179,14 @@ mod tests {
     use futures_lite::{future::block_on, io::Cursor};
 
     // UPDATE THIS when adding new ResponseTypes - tests will fail if mismatched
-    const RESPONSE_TYPE_COUNT: usize = 10;
-    const RESPONSE_TYPE_MAX_ID: u32 = 10;
+    const RESPONSE_TYPE_COUNT: usize = 8;
+    const RESPONSE_TYPE_MAX_ID: u32 = 8;
 
     impl ResponseType {
         /// Returns all ResponseType variants. Adding a new variant without updating
         /// this function will cause a compile error due to non-exhaustive match.
         fn all() -> [ResponseType; RESPONSE_TYPE_COUNT] {
             [
-                ResponseType::ListOrganisations,
-                ResponseType::ListAggregates,
                 ResponseType::Exists,
                 ResponseType::Read,
                 ResponseType::Write,
@@ -227,14 +203,6 @@ mod tests {
     /// cause compile error if new variants are added without updating this.
     fn make_test_response(response_type: ResponseType) -> Response {
         match response_type {
-            ResponseType::ListOrganisations => Response::ListOrganisations(ListOrganisationsResponse {
-                correlation_id: Some(100),
-                organisations: vec![],
-            }),
-            ResponseType::ListAggregates => Response::ListAggregates(ListAggregatesResponse {
-                correlation_id: Some(101),
-                aggregates: vec![],
-            }),
             ResponseType::Exists => Response::Exists(ExistsResponse {
                 correlation_id: Some(102),
                 min_event_batch_index: 0,
@@ -246,7 +214,6 @@ mod tests {
             }),
             ResponseType::Watch => Response::Watch(WatchResponse {
                 events: None,
-                is_heartbeat: true,
             }),
             ResponseType::Write => Response::Write(WriteResponse {
                 correlation_id: Some(104),

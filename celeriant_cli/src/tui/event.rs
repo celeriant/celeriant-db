@@ -43,8 +43,6 @@ async fn handle_normal_mode(app: &mut App, key: KeyEvent) -> anyhow::Result<()> 
             match app.screen {
                 Screen::Home => handle_home_keys(app, key).await?,
                 Screen::Connect => handle_connect_keys(app, key).await?,
-                Screen::Organisations => handle_organisations_keys(app, key).await?,
-                Screen::Aggregates => handle_aggregates_keys(app, key).await?,
                 Screen::AggregateContext => handle_aggregate_context_keys(app, key).await?,
                 Screen::EnterAggregate => handle_enter_aggregate_keys(app, key).await?,
                 Screen::ReadEvents => handle_read_events_keys(app, key).await?,
@@ -238,24 +236,17 @@ async fn handle_home_keys(app: &mut App, key: KeyEvent) -> anyhow::Result<()> {
             if app.is_connected() {
                 match app.menu_index {
                     0 => {
-                        if let Err(e) = app.load_organisations().await {
-                            app.set_error(&e);
-                        } else {
-                            app.go_to_screen(Screen::Organisations);
-                        }
-                    }
-                    1 => {
                         // Fixed: Navigate to EnterAggregate screen
                         app.setup_enter_aggregate_fields();
                         app.go_to_screen(Screen::EnterAggregate);
                     }
-                    2 => {
+                    1 => {
                         app.disconnect().await;
                     }
-                    3 => {
+                    2 => {
                         app.go_to_screen(Screen::Help);
                     }
-                    4 => {
+                    3 => {
                         app.should_quit = true;
                     }
                     _ => {}
@@ -286,11 +277,6 @@ async fn handle_home_keys(app: &mut App, key: KeyEvent) -> anyhow::Result<()> {
                 app.set_error(&e);
             }
         }
-        KeyCode::Char('r') if app.is_connected() => {
-            if let Err(e) = app.load_organisations().await {
-                app.set_error(&e);
-            }
-        }
         _ => {}
     }
     Ok(())
@@ -301,86 +287,6 @@ async fn handle_connect_keys(app: &mut App, key: KeyEvent) -> anyhow::Result<()>
     match key.code {
         KeyCode::Enter | KeyCode::Char('e') | KeyCode::Char('i') => {
             app.input_mode = InputMode::Editing;
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-async fn handle_organisations_keys(app: &mut App, key: KeyEvent) -> anyhow::Result<()> {
-    match key.code {
-        KeyCode::Up | KeyCode::Char('k') => {
-            if app.org_list_index > 0 {
-                app.org_list_index -= 1;
-            }
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            if app.org_list_index < app.organisations.len().saturating_sub(1) {
-                app.org_list_index += 1;
-            }
-        }
-        KeyCode::Enter => {
-            if let Some(org) = app.organisations.get(app.org_list_index) {
-                app.selected_org = Some(org.org_id);
-                if let Err(e) = app.load_aggregates().await {
-                    app.set_error(&e);
-                } else {
-                    app.go_to_screen(Screen::Aggregates);
-                }
-            }
-        }
-        KeyCode::Char('r') => {
-            if let Err(e) = app.load_organisations().await {
-                app.set_error(&e);
-            }
-        }
-        KeyCode::Home | KeyCode::Char('g') => {
-            app.org_list_index = 0;
-        }
-        KeyCode::End | KeyCode::Char('G') => {
-            app.org_list_index = app.organisations.len().saturating_sub(1);
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-async fn handle_aggregates_keys(app: &mut App, key: KeyEvent) -> anyhow::Result<()> {
-    match key.code {
-        KeyCode::Up | KeyCode::Char('k') => {
-            if app.agg_list_index > 0 {
-                app.agg_list_index -= 1;
-            }
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            if app.agg_list_index < app.aggregates.len().saturating_sub(1) {
-                app.agg_list_index += 1;
-            }
-        }
-        KeyCode::Enter => {
-            if let Some(agg) = app.aggregates.get(app.agg_list_index) {
-                app.aggregate_context = Some(AggregateContext {
-                    org_id: agg.key.org_id,
-                    aggregate_type_id: agg.key.aggregate_type_id,
-                    aggregate_id: agg.key.aggregate_id,
-                    info: None,
-                });
-                if let Err(e) = app.check_aggregate_exists().await {
-                    app.set_error(&e);
-                }
-                app.go_to_screen(Screen::AggregateContext);
-            }
-        }
-        KeyCode::Char('r') => {
-            if let Err(e) = app.load_aggregates().await {
-                app.set_error(&e);
-            }
-        }
-        KeyCode::Home | KeyCode::Char('g') => {
-            app.agg_list_index = 0;
-        }
-        KeyCode::End | KeyCode::Char('G') => {
-            app.agg_list_index = app.aggregates.len().saturating_sub(1);
         }
         _ => {}
     }

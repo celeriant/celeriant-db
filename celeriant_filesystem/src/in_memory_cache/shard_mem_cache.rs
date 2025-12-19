@@ -100,6 +100,15 @@ impl ShardMemCache {
                 self.aggregate_recent_writes.remove(&aggregate_key);
             }
         }
+        
+        // Periodically reclaim memory from data structures
+        if self.cache_eviction_queue.capacity() > self.cache_eviction_queue.len() * 2 {
+            self.cache_eviction_queue.shrink_to_fit();
+        }
+        if self.aggregate_recent_writes.capacity() > self.aggregate_recent_writes.len() * 2 {
+            self.aggregate_recent_writes.shrink_to_fit();
+        }
+
         true
     }
 

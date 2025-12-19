@@ -25,8 +25,9 @@ use fastbloom::BloomFilter;
 use glommio::sync::RwLock;
 
 use crate::{
-    in_memory_cache::{shard_log_queue_item::ShardLogQueueItem, shard_mem_cache::ShardMemCache, sync_positions_snapshot::SyncPositionsSnapshot}, in_memory_filtering::{apply_event_filters, is_include_batch}, local_event::LocalEvent, read_write_error::ReadWriteError, shard_config::ShardConfig, shard_log_write_error::ShardLogWriteError, watch::{aggregate_watch_event::AggregateWatchEvent, watched_aggregates::WatchedAggregates}
+    in_memory_cache::{shard_log_queue_item::ShardLogQueueItem, shard_mem_cache::ShardMemCache, sync_positions_snapshot::SyncPositionsSnapshot}, in_memory_filtering::{apply_event_filters, is_include_batch}, local_event::LocalEvent, read_write_error::ReadWriteError, shard_config::ShardConfig, shard_log_write_error::ShardLogWriteError
 };
+use celeriant_watch::{aggregate_reader::AggregateReader, aggregate_watch_event::{AggregateWatchEvent, AggregateWatchEventOperation}, aggregate_watchers::AggregateWatchers};
 use celeriant_rotating_log::{rotating_log_cache::RotatingLogCache, shard_log_dma_file::ShardLogDmaFile};
 pub type SyncResult = Result<(), ShardLogWriteError>;
 
@@ -43,10 +44,17 @@ pub struct ShardWriteAheadLog {
     shard_mem_cache: Rc<RefCell<ShardMemCache>>,
     bloom_filter: RefCell<BloomFilter>,
     event_type_dedup: RefCell<HashSet<u64>>,
-    pub watched_aggregates: Rc<WatchedAggregates>,
+    pub watched_aggregates: Rc<AggregateWatchers>,
     wal_sync_event: Rc<RwLock<Option<Rc<LocalEvent<SyncResult>>>>>,
     rotating_log_cache: Rc<RotatingLogCache>,
     config: ShardConfig,
+}
+
+
+impl AggregateReader for ShardWriteAheadLog {
+    fn watched_aggregates(&self) -> Rc<AggregateWatchers> {
+        self.watched_aggregates.clone()
+    }
 }
 
 impl ShardWriteAheadLog {
@@ -156,12 +164,6 @@ impl ShardWriteAheadLog {
         request: Request,
     ) -> Result<Response, ReadWriteError> {
         match request {
-            Request::ListOrganisations(_req) => {
-                return Err(ReadWriteError::Read(crate::shard_log_read_error::ShardLogReadError::CannotCreateFolders("Not implemented".to_string())))
-            }
-            Request::ListAggregates(_req) => {
-                return Err(ReadWriteError::Read(crate::shard_log_read_error::ShardLogReadError::CannotCreateFolders("Not implemented".to_string())))
-            }
             Request::Exists(req) => {
                 return Ok(celeriant_msg::process_responses::Response::Exists(celeriant_msg::response::responses::ExistsResponse { 
                     correlation_id: req.correlation_id, 
@@ -215,7 +217,7 @@ impl ShardWriteAheadLog {
             wal_sync_event: Rc::new(RwLock::new(None)),
             bloom_filter: RefCell::new(bloom_filter),
             event_type_dedup: RefCell::new(HashSet::new()),
-            watched_aggregates: Rc::new(WatchedAggregates::new()),
+            watched_aggregates: Rc::new(AggregateWatchers::new()),
             config,
         })
     }
@@ -438,7 +440,7 @@ async fn sync_with_delay(
     rotating_log_cache: Rc<RotatingLogCache>,
     shard_mem_cache: Rc<RefCell<ShardMemCache>>,
     wal_sync_delay: Option<Duration>, 
-    watched_aggregates: Rc<WatchedAggregates>) -> SyncResult {
+    watched_aggregates: Rc<AggregateWatchers>) -> SyncResult {
 
     if wal_sync_delay.is_none() || wal_sync_delay.unwrap().as_micros() == 0 {
         // No delay - do immediate sync
@@ -498,7 +500,7 @@ async fn sync_with_delay(
 async fn sync_with_rollback(
     rotating_log_cache: Rc<RotatingLogCache>,
     shard_mem_cache: Rc<RefCell<ShardMemCache>>,
-    watched_aggregates: Rc<WatchedAggregates>) -> SyncResult {
+    watched_aggregates: Rc<AggregateWatchers>) -> SyncResult {
     
     // Lock the writer before we take the snapshot of the queue
     let lockable_active_log_file = rotating_log_cache.active();
@@ -546,7 +548,7 @@ async fn sync_with_rollback(
 
             shard_mem_cache.commit_sync_positions_snapshot(sync_positions_snapshot);
 
-            let mut write_events: HashMap<AggregateKey, AggregateWatchEvent> = HashMap::new();
+            let mut write_events: HashMap<AggregateKey, AggregateWatchEventOperation> = HashMap::new();
             for queue_item in pending_append_queue {
 
                 match queue_item.metablock {
@@ -556,7 +558,7 @@ async fn sync_with_rollback(
                         write_events
                             .entry(event_batch_metadata.aggregate_key.clone())
                             .and_modify(|event| {
-                                if let AggregateWatchEvent::Write { from_event_batch_index, to_event_batch_index } = event {
+                                if let AggregateWatchEventOperation::Write { from_event_batch_index, to_event_batch_index } = event {
                                     if event_batch_metadata.event_batch_index < *from_event_batch_index {
                                         *from_event_batch_index = event_batch_metadata.event_batch_index;
                                     }
@@ -565,7 +567,7 @@ async fn sync_with_rollback(
                                     }
                                 }
                             })
-                            .or_insert(AggregateWatchEvent::Write {
+                            .or_insert(AggregateWatchEventOperation::Write {
                                 from_event_batch_index: event_batch_metadata.event_batch_index,
                                 to_event_batch_index: event_batch_metadata.event_batch_index,
                             });
@@ -590,8 +592,11 @@ async fn sync_with_rollback(
                 }
             }
 
-            for (aggregate_key, watch_event) in write_events {
-                watched_aggregates.notify(&aggregate_key, watch_event);
+            for (aggregate_key, operation) in write_events {
+                watched_aggregates.broadcast(AggregateWatchEvent {
+                    aggregate_key: aggregate_key.clone(),
+                    operation,
+                });
             }
 
             return Ok(());

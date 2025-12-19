@@ -416,6 +416,7 @@ dependencies = [
  "celeriant_msg",
  "celeriant_rotating_log",
  "celeriant_wal",
+ "celeriant_watch",
  "celeriant_wire",
  "crc32c",
  "criterion",
@@ -465,6 +466,7 @@ dependencies = [
  "celeriant_msg",
  "celeriant_sidecar",
  "celeriant_wal",
+ "celeriant_watch",
  "celeriant_wire",
  "flume",
  "glommio",
@@ -489,6 +491,20 @@ dependencies = [
  "base64",
  "bincode",
  "serde",
+]
+
+[[package]]
+name = "celeriant_watch"
+version = "0.1.0"
+dependencies = [
+ "celeriant_msg",
+ "celeriant_wal",
+ "celeriant_wire",
+ "criterion",
+ "glommio",
+ "num_cpus",
+ "tempfile",
+ "uuid",
 ]
 
 [[package]]

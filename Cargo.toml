@@ -13,7 +13,8 @@ members = [
     "celeriant_cli",
     "celeriant_filesystem",
     "celeriant_sidecar", 
-    "celeriant_client_demo", "celeriant_rotating_log",
+    "celeriant_client_demo", "celeriant_rotating_log", 
+    "celeriant_watch",
 ]
 
 resolver = "2"

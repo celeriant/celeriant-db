@@ -17,8 +17,6 @@ pub fn format_timestamp(timestamp_ms: u64) -> String {
 
 pub fn format_response(response: &Response) -> String {
     match response {
-        Response::ListOrganisations(r) => format!("ListOrganisations: {} orgs", r.organisations.len()),
-        Response::ListAggregates(r) => format!("ListAggregates: {} aggregates", r.aggregates.len()),
         Response::Exists(r) => format!("Exists: batches from {}", 
             r.min_event_batch_index),
         Response::Read(r) => format!("Read: {} batches", r.event_batches.len()),
@@ -28,6 +26,6 @@ pub fn format_response(response: &Response) -> String {
         Response::ProtocolError(_) => "ProtocolError".to_string(),
         Response::GenericError(r) => format!("Error {}: {}", r.error_code, r.error_message),
         Response::Watch(watch_response) => format!("Watch: {}-{:?}", 
-            watch_response.is_heartbeat, watch_response.events.as_ref().map(|f| f.len())),
+            watch_response.events.is_none(), watch_response.events.as_ref().map(|f| f.len())),
     }
 }

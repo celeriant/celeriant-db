@@ -12,7 +12,7 @@ use celeriant_wal::{
 use tokio::time::Instant;
 
 const NUM_CONNECTIONS: usize = 1024*12; // 28k max source port limit ~25000;
-const TEST_DURATION_SECS: u64 = 30;
+const TEST_DURATION_SECS: u64 = 60;
 const NUM_AGGREGATES: usize = 1024;
 
 struct TaskStats {
@@ -107,7 +107,7 @@ async fn run_connection_benchmark(connection_id: usize) -> Result<TaskStats, Str
             1,                           // event_type_major
             0,                           // event_type_minor
             b"Hello World".to_vec(),
-            // b"For example, those who worked from home spent about 3 hours and 24 minutes doing unpaid work, while those working in the office spent fewer than two and a half hours. So it may be things like putting an extra load of washing on or actually having some extra time to spend caring for, whether it's children or pets or aging parents.".to_vec(),
+            //b"For example, those who worked from home spent about 3 hours and 24 minutes doing unpaid work, while those working in the office spent fewer than two and a half hours. So it may be things like putting an extra load of washing on or actually having some extra time to spend caring for, whether it's children or pets or aging parents.".to_vec(),
         )],
         allow_create: true,
         expected_event_batch_index: None,

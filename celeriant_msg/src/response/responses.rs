@@ -1,20 +1,10 @@
+use std::collections::HashMap;
+
 use bincode::{Decode, Encode};
-use celeriant_wal::datablocks::event_batch_item::EventBatchItem;
+use celeriant_wal::{aggregate_key::AggregateKey, datablocks::event_batch_item::EventBatchItem};
 use serde::{Deserialize, Serialize};
 
-use crate::response::{aggregate_info::AggregateInfo, organisation_info::OrganisationInfo, watch_event::WatchEvent};
-
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
-pub struct ListOrganisationsResponse {
-    pub correlation_id: Option<u128>,
-    pub organisations: Vec<OrganisationInfo>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
-pub struct ListAggregatesResponse {
-    pub correlation_id: Option<u128>,
-    pub aggregates: Vec<AggregateInfo>,
-}
+use crate::response::{watch_event::WatchEvent};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct ExistsResponse {
@@ -31,8 +21,7 @@ pub struct ReadResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode, Default)]
 pub struct WatchResponse {
-    pub events: Option<Vec<WatchEvent>>,
-    pub is_heartbeat: bool,
+    pub events: Option<HashMap<AggregateKey, HashMap<u8, Option<WatchEvent>>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]

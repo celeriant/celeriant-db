@@ -4,7 +4,6 @@ use celeriant_msg::{
     process_requests::Request,
     process_responses::Response,
     request::{
-        directory_filters::DirectoryFilters,
         read_filters::ReadFilters,
         requests::*,
     },
@@ -25,113 +24,12 @@ pub async fn execute_command(server: &str, command: Commands) -> Result<()> {
         .with_context(|| format!("Failed to connect to {}", server))?;
 
     match command {
-        Commands::ListOrgs(args) => list_organisations(&mut client, args).await,
-        Commands::ListAggregates(args) => list_aggregates(&mut client, args).await,
         Commands::Exists(args) => check_exists(&mut client, args).await,
         Commands::Read(args) => read_events(&mut client, args).await,
         Commands::Write(args) => write_event(&mut client, args).await,
         Commands::Trim(args) => trim_start(&mut client, args).await,
         Commands::Delete(args) => delete_aggregate(&mut client, args).await,
     }
-}
-
-async fn list_organisations(client: &mut CeleriantClient, args: ListOrgsArgs) -> Result<()> {
-    let filters = DirectoryFilters {
-        created_after_or_on: args.created_after,
-        created_before_or_on: args.created_before,
-        modified_after_or_on: args.modified_after,
-        modified_before_or_on: args.modified_before,
-        ..Default::default()
-    };
-
-    let request = Request::ListOrganisations(ListOrganisationsRequest {
-        correlation_id: None,
-        filters,
-    });
-
-    let response = client.send_request(&request, CompressionType::None).await?;
-
-    match &response {
-        Response::ListOrganisations(res) => {
-            match args.format {
-                OutputFormat::Json => {
-                    println!("{}", serde_json::to_string_pretty(&res.organisations)?);
-                }
-                OutputFormat::Table | OutputFormat::Compact => {
-                    println!("{:<40} {:<24} {:<24} {:>12}", "ORG ID", "CREATED", "MODIFIED", "DISK USAGE");
-                    println!("{}", "-".repeat(104));
-                    for org in &res.organisations {
-                        println!(
-                            "{:<40} {:<24} {:<24} {:>12}",
-                            org.org_id,
-                            format_timestamp(org.created_at),
-                            format_timestamp(org.modified_at),
-                            humansize::format_size(org.disk_usage, humansize::BINARY)
-                        );
-                    }
-                    println!("\nTotal: {} organisations", res.organisations.len());
-                }
-            }
-        }
-        Response::GenericError(err) => {
-            anyhow::bail!("Error {}: {}", err.error_code, err.error_message);
-        }
-        other => {
-            println!("{}", format_response(other));
-        }
-    }
-
-    Ok(())
-}
-
-async fn list_aggregates(client: &mut CeleriantClient, args: ListAggregatesArgs) -> Result<()> {
-    let filters = DirectoryFilters {
-        created_after_or_on: args.created_after,
-        created_before_or_on: args.created_before,
-        ..Default::default()
-    };
-
-    let request = Request::ListAggregates(ListAggregatesRequest {
-        correlation_id: None,
-        org_id: args.org,
-        aggregate_type_id: args.aggregate_type,
-        filters,
-    });
-
-    let response = client.send_request(&request, CompressionType::None).await?;
-
-    match &response {
-        Response::ListAggregates(res) => {
-            match args.format {
-                OutputFormat::Json => {
-                    println!("{}", serde_json::to_string_pretty(&res.aggregates)?);
-                }
-                OutputFormat::Table | OutputFormat::Compact => {
-                    println!("{:<40} {:<20} {:<20} {:<24} {:>12}", "AGGREGATE ID", "ORG", "TYPE", "MODIFIED", "DISK USAGE");
-                    println!("{}", "-".repeat(120));
-                    for agg in &res.aggregates {
-                        println!(
-                            "{:<40} {:<20} {:<20} {:<24} {:>12}",
-                            agg.key.aggregate_id,
-                            agg.key.org_id,
-                            agg.key.aggregate_type_id,
-                            format_timestamp(agg.modified_at),
-                            humansize::format_size(agg.disk_usage, humansize::BINARY)
-                        );
-                    }
-                    println!("\nTotal: {} aggregates", res.aggregates.len());
-                }
-            }
-        }
-        Response::GenericError(err) => {
-            anyhow::bail!("Error {}: {}", err.error_code, err.error_message);
-        }
-        other => {
-            println!("{}", format_response(other));
-        }
-    }
-
-    Ok(())
 }
 
 async fn check_exists(client: &mut CeleriantClient, args: AggregateKeyArgs) -> Result<()> {

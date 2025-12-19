@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 /// Per-node configuration that gets cloned to each shard.
 /// Does not include shard_id since that's determined at runtime.
@@ -16,6 +16,7 @@ pub struct ShardConfig {
     pub cache_trim_factor: usize,
     pub max_request_size: Option<u32>,
     pub max_event_batches_response_size: usize,
+    pub slow_client_timeout: Duration,
     pub max_requested_latency_ms: u64,
     pub shard_log_preallocate_bytes: u64,
     pub durable_write_with_delay_us: Option<u64>,

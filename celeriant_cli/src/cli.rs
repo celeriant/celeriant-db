@@ -16,12 +16,7 @@ pub struct Cli {
 
 #[derive(Subcommand, Clone)]
 pub enum Commands {
-    /// List all organisations
-    ListOrgs(ListOrgsArgs),
-
-    /// List aggregates in an organisation
-    ListAggregates(ListAggregatesArgs),
-
+    
     /// Check if an aggregate exists
     Exists(AggregateKeyArgs),
 

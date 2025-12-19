@@ -1,4 +1,4 @@
-use std::{path::Path, sync::Arc};
+use std::{collections::{HashSet}, path::Path, sync::Arc};
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_crypto::Crypto;
@@ -6,11 +6,9 @@ use celeriant_msg::{
     process_requests::Request,
     process_responses::Response,
     request::{
-        directory_filters::DirectoryFilters,
         read_filters::ReadFilters,
         requests::*,
     },
-    response::{aggregate_info::AggregateInfo, organisation_info::OrganisationInfo},
 };
 use celeriant_wal::{
     aggregate_key::AggregateKey,
@@ -22,8 +20,6 @@ use directories::ProjectDirs;
 pub enum Screen {
     Home,
     Connect,
-    Organisations,
-    Aggregates,
     AggregateContext,
     EnterAggregate,
     ReadEvents,
@@ -63,13 +59,7 @@ pub struct App {
     // Status and messages
     pub status_message: String,
     pub last_error: Option<String>,
-    
-    // List states
-    pub organisations: Vec<OrganisationInfo>,
-    pub org_list_index: usize,
-    pub aggregates: Vec<AggregateInfo>,
-    pub agg_list_index: usize,
-    
+        
     // Current context
     pub selected_org: Option<u128>,
     pub aggregate_context: Option<AggregateContext>,
@@ -172,10 +162,6 @@ impl App {
             should_quit: false,
             status_message: format!("Welcome to Celeriant CLI. Server: {}", server_address),
             last_error: None,
-            organisations: Vec::new(),
-            org_list_index: 0,
-            aggregates: Vec::new(),
-            agg_list_index: 0,
             selected_org: None,
             aggregate_context: None,
             menu_index: 0,
@@ -299,60 +285,9 @@ impl App {
     
     pub async fn disconnect(&mut self) {
         self.client = None;
-        self.organisations.clear();
-        self.aggregates.clear();
         self.selected_org = None;
         self.aggregate_context = None;
         self.set_status("Disconnected");
-    }
-    
-    pub async fn load_organisations(&mut self) -> Result<(), String> {
-        let client = self.client.as_mut().ok_or("Not connected")?;
-        
-        let request = Request::ListOrganisations(ListOrganisationsRequest {
-            correlation_id: None,
-            filters: DirectoryFilters::default(),
-        });
-        
-        match client.send_request(&request, CompressionType::None).await {
-            Ok(Response::ListOrganisations(res)) => {
-                self.organisations = res.organisations;
-                self.org_list_index = 0;
-                self.set_status(&format!("Loaded {} organisations", self.organisations.len()));
-                Ok(())
-            }
-            Ok(Response::GenericError(e)) => {
-                Err(format!("Error {}: {}", e.error_code, e.error_message))
-            }
-            Ok(_) => Err("Unexpected response".to_string()),
-            Err(e) => Err(format!("Request failed: {}", e)),
-        }
-    }
-    
-    pub async fn load_aggregates(&mut self) -> Result<(), String> {
-        let client = self.client.as_mut().ok_or("Not connected")?;
-        let org_id = self.selected_org.ok_or("No organisation selected")?;
-        
-        let request = Request::ListAggregates(ListAggregatesRequest {
-            correlation_id: None,
-            org_id,
-            aggregate_type_id: None,
-            filters: DirectoryFilters::default(),
-        });
-        
-        match client.send_request(&request, CompressionType::None).await {
-            Ok(Response::ListAggregates(res)) => {
-                self.aggregates = res.aggregates;
-                self.agg_list_index = 0;
-                self.set_status(&format!("Loaded {} aggregates", self.aggregates.len()));
-                Ok(())
-            }
-            Ok(Response::GenericError(e)) => {
-                Err(format!("Error {}: {}", e.error_code, e.error_message))
-            }
-            Ok(_) => Err("Unexpected response".to_string()),
-            Err(e) => Err(format!("Request failed: {}", e)),
-        }
     }
     
     pub async fn check_aggregate_exists(&mut self) -> Result<(), String> {
@@ -576,7 +511,6 @@ impl App {
     pub fn get_home_menu_items(&self) -> Vec<(&str, &str)> {
         if self.is_connected() {
             vec![
-                ("Browse Organisations", "View and navigate organisations"),
                 ("Enter Aggregate", "Go directly to an aggregate by ID"),
                 ("Disconnect", "Disconnect from server"),
                 ("Help", "Show keyboard shortcuts"),
@@ -649,6 +583,20 @@ impl App {
         self.watch_events.push(format!("Event types: {:?}", event_types));
         self.watch_events.push(format!("Excluding client: {}", client_id));
         self.watch_events.push(String::new());
+            
+        let event_types: Option<std::collections::HashSet<u8>> = {
+            let types: std::collections::HashSet<u8> = self.watch_event_types
+                .split(',')
+                .filter_map(|s| s.trim().parse::<u8>().ok())
+                .filter(|&t| t <= 5)
+                .collect();
+            
+            if types.is_empty() {
+                None  // None means all event types
+            } else {
+                Some(types)
+            }
+        };
         
         // Spawn the watch task
         tokio::spawn(async move {
@@ -658,7 +606,6 @@ impl App {
                 event_types,
                 client_id,
                 latency_ms,
-                throughput_bs,
                 tx,
                 cancel_rx,
             ).await;
@@ -725,17 +672,15 @@ impl App {
 async fn watch_task(
     server_address: String,
     aggregate_key: AggregateKey,
-    event_types: Vec<u8>,
+    event_types: Option<std::collections::HashSet<u8>>,  // Changed type
     exclude_client_id: u128,
     latency_ms: Option<u64>,
-    throughput_bs: Option<usize>,
     tx: tokio::sync::mpsc::UnboundedSender<WatchUpdate>,
     mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
     use celeriant_client_tokio::celeriant_client::CeleriantClient;
     use celeriant_msg::process_requests::Request;
     use celeriant_msg::process_responses::Response;
-    use celeriant_msg::request::read_filters::ReadFilters;
     use celeriant_msg::request::requests::WatchRequest;
     use celeriant_wal::compression_type::CompressionType;
     
@@ -748,17 +693,17 @@ async fn watch_task(
         }
     };
     
-    // Build filters to exclude our own client
-    let filters = ReadFilters::new(1);
-    // Note we include self here for testing, add .exclude_client_id(exclude_client_id) to exclude
+    // Build the aggregates HashMap with the aggregate_key
+    let mut aggregates = HashSet::new();
+    aggregates.insert(aggregate_key);  // None for default filter, or provide specific filter
     
     let request = Request::Watch(WatchRequest {
-        subscribe_to_event_types: event_types,
+        operation_types: event_types,
         correlation_id: None,
-        aggregate_key,
         requested_latency_ms: latency_ms,
-        requested_throughput_bs: throughput_bs,
-        filters: Some(filters),
+        orgs: None,
+        aggregate_types: None,
+        aggregates: Some(aggregates),  // Include the specific aggregate
     });
     
     let _ = tx.send(WatchUpdate::Event(vec!["Sending watch request...".to_string()]));
@@ -774,48 +719,37 @@ async fn watch_task(
             result = client.send_request(&request, CompressionType::None) => {
                 match result {
                     Ok(Response::Watch(watch_response)) => {
-                        if watch_response.is_heartbeat {
+                        if watch_response.events.is_none() {
                             let _ = tx.send(WatchUpdate::Heartbeat);
-                        } else if let Some(events) = watch_response.events {
+                        } else if let Some(events_by_aggregate) = watch_response.events {
                             let mut lines = Vec::new();
-                            lines.push(format!("━━━ {} event(s) received ━━━", events.len()));
                             
-                            for event in events {
-                                let event_type_name = match event.event_type {
-                                    0 => "DELETE",
-                                    1 => "WRITE",
-                                    2 => "READ",
-                                    3 => "TRIM_START",
-                                    4 => "EXISTS",
-                                    5 => "PREPEND_BATCHES",
-                                    _ => "UNKNOWN",
-                                };
+                            for (aggregate_key, events_by_type) in events_by_aggregate {
+                                lines.push(format!("━━━ Aggregate: {}:{} ━━━", 
+                                    aggregate_key.aggregate_type_id, aggregate_key.aggregate_id));
                                 
-                                lines.push(format!("Event: {} ({})", event_type_name, event.event_type));
-                                
-                                if let Some(from) = event.from_event_batch_index {
-                                    lines.push(format!("  From batch: {}", from));
-                                }
-                                if let Some(to) = event.to_event_batch_index {
-                                    lines.push(format!("  To batch: {}", to));
-                                }
-                                if event.from_cache {
-                                    lines.push("  From in-memory cache".to_string());
-                                }
-                                if let Some(trim) = event.trim_start_keep_from_event_batch_index {
-                                    lines.push(format!("  Trim keep from: {}", trim));
-                                }
-                                
-                                if let Some(batches) = &event.event_batches {
-                                    for batch in batches {
-                                        lines.push(format!("  Batch {} ({} events):", 
-                                            batch.event_batch_index, batch.events.len()));
-                                        for evt in &batch.events {
-                                            let preview: String = String::from_utf8_lossy(&evt.event_value)
-                                                .chars()
-                                                .take(60)
-                                                .collect();
-                                            lines.push(format!("    Type {}: {}", evt.event_type_major, preview));
+                                for (event_type, maybe_event) in events_by_type {
+                                    let event_type_name = match event_type {
+                                        0 => "DELETE",
+                                        1 => "WRITE",
+                                        2 => "READ",
+                                        3 => "TRIM_START",
+                                        4 => "EXISTS",
+                                        5 => "PREPEND_BATCHES",
+                                        _ => "UNKNOWN",
+                                    };
+                                    
+                                    lines.push(format!("  Event: {} ({})", event_type_name, event_type));
+                                    
+                                    if let Some(event) = maybe_event {
+                                        if let Some(from) = event.from_event_batch_index {
+                                            lines.push(format!("    From batch: {}", from));
+                                        }
+                                        if let Some(to) = event.to_event_batch_index {
+                                            lines.push(format!("    To batch: {}", to));
+                                        }
+                                        if let Some(keep_from) = event.keep_from_event_batch_index {
+                                            lines.push(format!("    Keep from batch: {}", keep_from));
                                         }
                                     }
                                 }
