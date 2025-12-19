@@ -16,7 +16,7 @@ use crate::client_error::ClientError;
 /// TCP connections are a limited resource, only hold one open as long as you need it.
 pub struct CeleriantClient {
     stream: Compat<TcpStream>,
-    max_request_size: u32,
+    max_request_size: u64,
     timeout: Option<Duration>,
 }
 
@@ -38,7 +38,7 @@ impl CeleriantClient {
     }
 
     /// Set maximum request size in bytes (default: 10MB)
-    pub fn with_max_request_size(mut self, max_request_size: u32) -> Self {
+    pub fn with_max_request_size(mut self, max_request_size: u64) -> Self {
         self.max_request_size = max_request_size;
         self
     }

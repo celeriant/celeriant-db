@@ -1,7 +1,7 @@
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use std::time::Duration;
 
-use super::app::{App, InputMode, Screen, AggregateContext};
+use super::app::{App, InputMode, Screen};
 
 pub async fn handle_events(app: &mut App) -> anyhow::Result<bool> {
     if event::poll(Duration::from_millis(100))? {
@@ -168,7 +168,6 @@ async fn handle_editing_mode(app: &mut App, key: KeyEvent) -> anyhow::Result<()>
                     match app.input_field_index {
                         0 => app.watch_event_types.push(c),
                         1 => app.watch_latency_ms.push(c),
-                        2 => app.watch_throughput_bs.push(c),
                         _ => {}
                     }
                 }
@@ -206,7 +205,6 @@ async fn handle_editing_mode(app: &mut App, key: KeyEvent) -> anyhow::Result<()>
                     match app.input_field_index {
                         0 => { app.watch_event_types.pop(); }
                         1 => { app.watch_latency_ms.pop(); }
-                        2 => { app.watch_throughput_bs.pop(); }
                         _ => {}
                     }
                 }

@@ -1,4 +1,4 @@
-use std::hint::black_box;
+use std::{hint::black_box, u64};
 use std::time::Duration;
 
 use bincode::{Decode, Encode};
@@ -87,7 +87,7 @@ fn bench_fixed_vs_variable(c: &mut Criterion) {
                             black_box(*msg),
                             request_type,
                             compression,
-                            None,
+                            u64::MAX,
                             *ver,
                         )
                         .await
@@ -115,7 +115,7 @@ fn bench_fixed_vs_variable(c: &mut Criterion) {
                 &message,
                 request_type,
                 compression,
-                None,
+                u64::MAX,
                 version,
             )
             .await
@@ -152,7 +152,7 @@ fn bench_fixed_vs_variable(c: &mut Criterion) {
                         let mut reader = Cursor::new(black_box(data.as_slice()));
                         let header = WireHeader::from_reader(&mut reader).await.unwrap();
                         let decoded: SmallMessage =
-                            header.read_variable_size(&mut reader, None).await.unwrap();
+                            header.read_variable_size(&mut reader, u64::MAX).await.unwrap();
                         decoded
                     })
                 });
@@ -204,7 +204,7 @@ fn bench_fixed_vs_variable(c: &mut Criterion) {
                             black_box(*msg),
                             request_type,
                             compression,
-                            None,
+                            u64::MAX,
                             *ver,
                         )
                         .await
@@ -213,7 +213,7 @@ fn bench_fixed_vs_variable(c: &mut Criterion) {
                         let mut reader = Cursor::new(buffer.as_slice());
                         let header = WireHeader::from_reader(&mut reader).await.unwrap();
                         let decoded: SmallMessage =
-                            header.read_variable_size(&mut reader, None).await.unwrap();
+                            header.read_variable_size(&mut reader, u64::MAX).await.unwrap();
                         decoded
                     })
                 });

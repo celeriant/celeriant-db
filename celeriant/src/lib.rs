@@ -20,7 +20,7 @@ pub fn startup(args: Vec<String>) -> Result<(), std::io::Error> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(&server_config.default_log_level)),
+                .unwrap_or_else(|_| EnvFilter::new(&server_config.log_level)),
         )
         .init();
 
@@ -44,7 +44,7 @@ pub fn startup(args: Vec<String>) -> Result<(), std::io::Error> {
 
     info!("node_id={}, data_root={:?}, listen_address={}", node_id, server_config.data_root, server_config.listen_address);
     
-    let nbr_shards = server_config.num_shards.unwrap_or_else(num_cpus::get);
+    let nbr_shards = server_config.num_shards.unwrap_or_else(num_cpus::get) as u32;
     let shard_config = server_config.to_shard_config(node_id, nbr_shards);
     let sidecar_config = server_config.to_sidecar_config(nbr_shards);
     let sidecar_store_config = server_config.to_sidecar_store_config();

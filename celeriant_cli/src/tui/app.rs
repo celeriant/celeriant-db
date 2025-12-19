@@ -90,7 +90,6 @@ pub struct App {
     // Watch state
     pub watch_event_types: String,
     pub watch_latency_ms: String,
-    pub watch_throughput_bs: String,
     pub watch_active: bool,
     pub watch_events: Vec<String>,
     pub watch_scroll: usize,
@@ -179,7 +178,6 @@ impl App {
             // Watch state
             watch_event_types: "1".to_string(),  // Default to WRITE events
             watch_latency_ms: "100".to_string(),
-            watch_throughput_bs: String::new(),
             watch_active: false,
             watch_events: Vec::new(),
             watch_scroll: 0,
@@ -530,7 +528,6 @@ impl App {
         self.input_fields = vec![
             InputField::with_value("Event Types (0-5, comma-separated)", &self.watch_event_types),
             InputField::with_value("Latency (ms)", &self.watch_latency_ms),
-            InputField::new("Throughput (bytes/sec, optional)", &self.watch_throughput_bs),
         ];
         self.input_field_index = 0;
         self.watch_events.clear();
@@ -559,12 +556,6 @@ impl App {
             None
         } else {
             Some(self.watch_latency_ms.parse().map_err(|_| "Invalid latency")?)
-        };
-        
-        let throughput_bs: Option<usize> = if self.watch_throughput_bs.is_empty() {
-            None
-        } else {
-            Some(self.watch_throughput_bs.parse().map_err(|_| "Invalid throughput")?)
         };
         
         let key = AggregateKey::new(ctx.org_id, ctx.aggregate_type_id, ctx.aggregate_id);

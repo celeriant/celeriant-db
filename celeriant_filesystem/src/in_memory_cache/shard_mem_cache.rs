@@ -1,11 +1,11 @@
 use crate::{in_memory_cache::{
     aggregate_positions::AggregatePositions, recent_write::RecentWrite, shard_log_queue_item::ShardLogQueueItem, sync_positions_snapshot::SyncPositionsSnapshot
-}, shard_config::ShardConfig};
+}, internal_shard_config::InternalShardConfig};
 use celeriant_wal::{aggregate_key::AggregateKey, constants::FIXED_BLOCK_SIZE_BYTES, datablocks::wal_datablock::WalDatablock, metablocks::wal_metablock::WalMetablock};
-use std::{collections::{BTreeMap, HashMap, VecDeque}, path::PathBuf, usize};
+use std::{collections::{BTreeMap, HashMap, VecDeque}, path::PathBuf};
 
 pub struct ShardMemCache {
-    config: ShardConfig,
+    config: InternalShardConfig,
     
     /// The next write position for metablocks in the shard log
     metablocks_position: u64,
@@ -129,8 +129,8 @@ impl ShardMemCache {
         self.config.shard_dir.clone()
     }
 
-    pub fn preallocate_bytes(&self) -> u64 {
-        self.config.preallocate_bytes
+    pub fn shard_log_preallocate_bytes(&self) -> u64 {
+        self.config.shard_log_preallocate_bytes
     }
 
     pub fn current_log_id(&self) -> u64 {
@@ -333,7 +333,7 @@ impl ShardMemCache {
         file_len: u64,
         metablocks_position: u64,
         datablocks_position: u64,
-        config: ShardConfig,
+        config: InternalShardConfig,
         current_log_id: u64,
     ) -> Self {
         Self {

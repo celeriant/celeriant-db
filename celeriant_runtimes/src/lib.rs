@@ -12,13 +12,13 @@ use crate::{sharded::{intrashard_messages::IntrashardMessages, shard::Shard}, si
 mod sharded;
 mod sidecar;
 
-pub use {sharded::shard_config::ShardConfig, sidecar::sidecar_config::SidecarConfig};
+pub use {sharded::shard_config::ShardConfig, sidecar::sidecar_config::SidecarConfig, sharded::routing_rule::RoutingRule};
 
 pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig, sidecar_config: SidecarConfig, mesh_channel_size: usize, node_id: u128, sidecar_store: S) {
     info!("Starting {} shard executors on node {}", shard_config.num_shards, node_id);
 
     let mesh =
-        MeshBuilder::<IntrashardMessages, Full>::full(shard_config.num_shards, mesh_channel_size);
+        MeshBuilder::<IntrashardMessages, Full>::full(shard_config.num_shards as usize, mesh_channel_size);
 
     let (sidecar_senders, _sidecar_runtime) = match new_sidecar(sidecar_config, sidecar_store) {
         Ok(sidecar_handle) => sidecar_handle,
@@ -28,7 +28,7 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
         },
     };
 
-    LocalExecutorPoolBuilder::new(PoolPlacement::MaxSpread(shard_config.num_shards, CpuSet::online().ok()))
+    LocalExecutorPoolBuilder::new(PoolPlacement::MaxSpread(shard_config.num_shards as usize, CpuSet::online().ok()))
         .on_all_shards(enclose!((mesh, shard_config, sidecar_senders) move || async move {
             
             let (sender, receivers) = mesh.join().await
@@ -40,13 +40,13 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
             let current_shard_id = sender.peer_id();
 
             let shard_dir = shard_config.data_root.join(format!("shard_{current_shard_id}"));
-            let internal_shard_config = celeriant_filesystem::shard_config::ShardConfig { 
-                preallocate_bytes: shard_config.shard_log_preallocate_bytes, 
+            let internal_shard_config = celeriant_filesystem::internal_shard_config::InternalShardConfig { 
+                shard_log_preallocate_bytes: shard_config.shard_log_preallocate_bytes, 
                 node_id, 
-                async_flush_ms: shard_config.async_flush_ms, 
-                durable_write_with_delay_us: shard_config.durable_write_with_delay_us, 
+                fsync_delay: shard_config.fsync_delay, 
+                non_durable_writes: shard_config.non_durable_writes, 
                 shard_dir,
-                max_cached_files: shard_config.max_open_files,
+                max_open_files: shard_config.max_open_files,
                 recent_write_cache_bytes: shard_config.recent_write_cache_bytes,
             };
             let filesystem = ShardWriteAheadLog::new(internal_shard_config).await

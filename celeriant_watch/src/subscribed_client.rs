@@ -1,6 +1,6 @@
-use celeriant_msg::response::{responses::WatchResponse};
+use celeriant_msg::response::responses::WatchResponse;
 use glommio::channels::local_channel::LocalSender;
-use std::{time::{Duration, Instant}};
+use std::time::{Duration, Instant};
 
 use crate::aggregate_watch_event::AggregateWatchEvent;
 
@@ -22,10 +22,7 @@ pub struct SubscribedClient {
 pub const MAX_PENDING_EVENTS: usize = 10000;
 
 impl SubscribedClient {
-
-    pub fn new(
-        requested_latency_ms: Option<u64>,
-    ) -> (Self, LocalSender<AggregateWatchEvent>) {
+    pub fn new(requested_latency_ms: Option<u64>) -> (Self, LocalSender<AggregateWatchEvent>) {
         let (sender, receiver) = glommio::channels::local_channel::new_bounded(MAX_PENDING_EVENTS);
 
         let client = Self {
@@ -37,10 +34,7 @@ impl SubscribedClient {
         (client, sender)
     }
 
-    pub fn accumulate_watch_event(
-        &mut self,
-        watch_event: AggregateWatchEvent,
-    ) {
+    pub fn accumulate_watch_event(&mut self, watch_event: AggregateWatchEvent) {
         watch_event.add_to_response(&mut self.watch_response);
     }
 
@@ -66,16 +60,6 @@ impl SubscribedClient {
             return None;
         }
         Some(self.watch_response.take().unwrap())
-    }
-
-    /// If the client has a latency requirement we don't
-    /// want to send them a push message until the next
-    /// available time window
-    async fn wait_for_latency_requirement(&self) {
-        let wait_time = self.additional_latency_wait_time();
-        if !wait_time.is_zero() {
-            glommio::timer::sleep(wait_time).await;
-        }
     }
 
     /// How much time is left before we are 'green' to send the client
@@ -133,7 +117,6 @@ mod test_subscribed_client {
 
                 client.last_send_time = Instant::now();
                 assert!(client.additional_latency_wait_time().as_millis() > 5);
-
             })
             .unwrap();
 
@@ -142,49 +125,107 @@ mod test_subscribed_client {
 
     #[test]
     fn test_flow() {
-        let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
-            .spawn(|| async move {
-                let (mut client, _) = SubscribedClient::new(None);
+        let handle =
+            LocalExecutorBuilder::new(Placement::Fixed(0))
+                .spawn(|| async move {
+                    let (mut client, _) = SubscribedClient::new(None);
 
-                client.requested_latency = Some(Duration::from_millis(10));
+                    client.requested_latency = Some(Duration::from_millis(10));
 
-                client.accumulate_watch_event(AggregateWatchEvent { 
-                    aggregate_key: AggregateKey::new(1,2,3), 
-                    operation: crate::aggregate_watch_event::AggregateWatchEventOperation::Delete {  }
-                });
+                    client.accumulate_watch_event(AggregateWatchEvent {
+                        aggregate_key: AggregateKey::new(1, 2, 3),
+                        operation:
+                            crate::aggregate_watch_event::AggregateWatchEventOperation::Delete {},
+                    });
 
-                assert_eq!(client.watch_response.as_ref().unwrap().events.as_ref().unwrap().len(), 1);
-                assert!(client.last_send_time.elapsed().as_millis() <= 1);
-                assert!(!client.should_wait_and_flush().await);
+                    assert_eq!(
+                        client
+                            .watch_response
+                            .as_ref()
+                            .unwrap()
+                            .events
+                            .as_ref()
+                            .unwrap()
+                            .len(),
+                        1
+                    );
+                    assert!(client.last_send_time.elapsed().as_millis() <= 1);
+                    assert!(!client.should_wait_and_flush().await);
 
-                client.accumulate_watch_event(AggregateWatchEvent { 
-                    aggregate_key: AggregateKey::new(1,2,4), 
-                    operation: crate::aggregate_watch_event::AggregateWatchEventOperation::Read {
-                        from_event_batch_index: 44, 
-                        to_event_batch_index: Some(46), 
-                      }
-                });
+                    client.accumulate_watch_event(AggregateWatchEvent {
+                        aggregate_key: AggregateKey::new(1, 2, 4),
+                        operation:
+                            crate::aggregate_watch_event::AggregateWatchEventOperation::Read {
+                                from_event_batch_index: 44,
+                                to_event_batch_index: Some(46),
+                            },
+                    });
 
-                assert_eq!(client.watch_response.as_ref().unwrap().events.as_ref().unwrap().len(), 2);
-                assert!(client.last_send_time.elapsed().as_millis() <= 1);
-                assert!(!client.should_wait_and_flush().await);
+                    assert_eq!(
+                        client
+                            .watch_response
+                            .as_ref()
+                            .unwrap()
+                            .events
+                            .as_ref()
+                            .unwrap()
+                            .len(),
+                        2
+                    );
+                    assert!(client.last_send_time.elapsed().as_millis() <= 1);
+                    assert!(!client.should_wait_and_flush().await);
 
-                glommio::timer::sleep(client.additional_latency_wait_time()).await;
+                    glommio::timer::sleep(client.additional_latency_wait_time()).await;
 
-                assert!(client.should_wait_and_flush().await);
-                assert!(client.last_send_time.elapsed().as_millis() >= 10 && client.last_send_time.elapsed().as_millis() <= 12);
+                    assert!(client.should_wait_and_flush().await);
+                    assert!(
+                        client.last_send_time.elapsed().as_millis() >= 10
+                            && client.last_send_time.elapsed().as_millis() <= 12
+                    );
 
-                let watch_response = client.take_response();
-                assert!(client.watch_response.as_ref().is_none());
-                assert!(client.last_send_time.elapsed().as_millis() <= 1);
+                    let watch_response = client.take_response();
+                    assert!(client.watch_response.as_ref().is_none());
+                    assert!(client.last_send_time.elapsed().as_millis() <= 1);
 
-                assert_eq!(watch_response.as_ref().unwrap().events.as_ref().unwrap().len(), 2);
+                    assert_eq!(
+                        watch_response
+                            .as_ref()
+                            .unwrap()
+                            .events
+                            .as_ref()
+                            .unwrap()
+                            .len(),
+                        2
+                    );
 
-                assert!(watch_response.as_ref().unwrap().events.as_ref().unwrap().get(&AggregateKey::new(1,2,3)).unwrap().get(&AggregateWatchEvent::DELETE).unwrap().is_some());
-                assert!(watch_response.as_ref().unwrap().events.as_ref().unwrap().get(&AggregateKey::new(1,2,4)).unwrap().get(&AggregateWatchEvent::READ).unwrap().is_some());
-
-            })
-            .unwrap();
+                    assert!(
+                        watch_response
+                            .as_ref()
+                            .unwrap()
+                            .events
+                            .as_ref()
+                            .unwrap()
+                            .get(&AggregateKey::new(1, 2, 3))
+                            .unwrap()
+                            .get(&AggregateWatchEvent::DELETE)
+                            .unwrap()
+                            .is_none()
+                    );
+                    assert!(
+                        watch_response
+                            .as_ref()
+                            .unwrap()
+                            .events
+                            .as_ref()
+                            .unwrap()
+                            .get(&AggregateKey::new(1, 2, 4))
+                            .unwrap()
+                            .get(&AggregateWatchEvent::READ)
+                            .unwrap()
+                            .is_some()
+                    );
+                })
+                .unwrap();
 
         handle.join().unwrap();
     }

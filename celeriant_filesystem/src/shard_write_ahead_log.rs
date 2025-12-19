@@ -25,7 +25,7 @@ use fastbloom::BloomFilter;
 use glommio::sync::RwLock;
 
 use crate::{
-    in_memory_cache::{shard_log_queue_item::ShardLogQueueItem, shard_mem_cache::ShardMemCache, sync_positions_snapshot::SyncPositionsSnapshot}, in_memory_filtering::{apply_event_filters, is_include_batch}, local_event::LocalEvent, read_write_error::ReadWriteError, shard_config::ShardConfig, shard_log_write_error::ShardLogWriteError
+    in_memory_cache::{shard_log_queue_item::ShardLogQueueItem, shard_mem_cache::ShardMemCache, sync_positions_snapshot::SyncPositionsSnapshot}, in_memory_filtering::{apply_event_filters, is_include_batch}, local_event::LocalEvent, read_write_error::ReadWriteError, internal_shard_config::InternalShardConfig, shard_log_write_error::ShardLogWriteError
 };
 use celeriant_watch::{aggregate_reader::AggregateReader, aggregate_watch_event::{AggregateWatchEvent, AggregateWatchEventOperation}, aggregate_watchers::AggregateWatchers};
 use celeriant_rotating_log::{rotating_log_cache::RotatingLogCache, shard_log_dma_file::ShardLogDmaFile};
@@ -47,7 +47,7 @@ pub struct ShardWriteAheadLog {
     pub watched_aggregates: Rc<AggregateWatchers>,
     wal_sync_event: Rc<RwLock<Option<Rc<LocalEvent<SyncResult>>>>>,
     rotating_log_cache: Rc<RotatingLogCache>,
-    config: ShardConfig,
+    config: InternalShardConfig,
 }
 
 
@@ -196,10 +196,10 @@ impl ShardWriteAheadLog {
     }
 
     pub async fn new(
-        config: ShardConfig,
+        config: InternalShardConfig,
     ) -> Result<Self, ShardLogWriteError> {
 
-        let rotating_log_cache = RotatingLogCache::new(config.shard_dir.clone(), config.preallocate_bytes, config.max_cached_files as usize).await?;
+        let rotating_log_cache = RotatingLogCache::new(config.shard_dir.clone(), config.shard_log_preallocate_bytes, config.max_open_files as usize).await?;
         
         let shard_mem_cache = {
             let active_lock = rotating_log_cache.active();
@@ -392,18 +392,17 @@ impl ShardWriteAheadLog {
         // Now we wait on disk write before ack to client
         if force_durable {
             sync_with_delay(self.wal_sync_event.clone(), self.rotating_log_cache.clone(), self.shard_mem_cache.clone(), None, self.watched_aggregates.clone()).await?;
-        } else if let Some(delay_us) = self.config.durable_write_with_delay_us {
-            sync_with_delay(self.wal_sync_event.clone(), self.rotating_log_cache.clone(), self.shard_mem_cache.clone(), Some(Duration::from_micros(delay_us)), self.watched_aggregates.clone()).await?;
+        } else if !self.config.non_durable_writes {
+            sync_with_delay(self.wal_sync_event.clone(), self.rotating_log_cache.clone(), self.shard_mem_cache.clone(), Some(self.config.fsync_delay), self.watched_aggregates.clone()).await?;
         } else {
-            let async_flush_ms = self.config.async_flush_ms;
+            let fsync_delay = self.config.fsync_delay;
             let watched_aggregates = self.watched_aggregates.clone();
             let shard_mem_cache = self.shard_mem_cache.clone();
             let wal_sync_event = self.wal_sync_event.clone();
             let rotating_log_cache = self.rotating_log_cache.clone();
 
-            //TODO: do we really need another spawn_local? Just don't await?
             glommio::spawn_local(async move {
-                let _ = sync_with_delay(wal_sync_event, rotating_log_cache, shard_mem_cache.clone(), Some(Duration::from_millis(async_flush_ms)), watched_aggregates).await;
+                let _ = sync_with_delay(wal_sync_event, rotating_log_cache, shard_mem_cache.clone(), Some(fsync_delay), watched_aggregates).await;
             })
             .detach();
         }
@@ -519,9 +518,9 @@ async fn sync_with_rollback(
         }
 
         if !shard_mem_cache.has_enough_free_space() {
-            (false, shard_mem_cache.current_log_id(), shard_mem_cache.preallocate_bytes(), Some(shard_mem_cache.shard_dir()), None)
+            (false, shard_mem_cache.current_log_id(), shard_mem_cache.shard_log_preallocate_bytes(), Some(shard_mem_cache.shard_dir()), None)
         } else {
-            (true, shard_mem_cache.current_log_id(),shard_mem_cache.preallocate_bytes(), None, Some(shard_mem_cache.take_sync_positions_snapshot()))
+            (true, shard_mem_cache.current_log_id(),shard_mem_cache.shard_log_preallocate_bytes(), None, Some(shard_mem_cache.take_sync_positions_snapshot()))
         }
     };
 
@@ -762,17 +761,17 @@ fn get_server_timestamp_ms() -> u64 {
 mod test_shard_write_ahead_log {
     use glommio::{LocalExecutorBuilder, Placement};
 
-    use crate::{shard_config::ShardConfig, shard_write_ahead_log::ShardWriteAheadLog};
+    use crate::{internal_shard_config::InternalShardConfig, shard_write_ahead_log::ShardWriteAheadLog};
 
-    fn setup_config(data_root: &std::path::PathBuf, shard_id: u64) -> ShardConfig {
+    fn setup_config(data_root: &std::path::PathBuf, shard_id: u64) -> InternalShardConfig {
         let shard_dir = data_root.join(format!("shard_{shard_id}"));
-        ShardConfig {
-            preallocate_bytes: 1024 * 1024 * 1024, // 1 GiB
+        InternalShardConfig {
+            shard_log_preallocate_bytes: 1024 * 1024 * 1024, // 1 GiB
             node_id: 0,
-            async_flush_ms: 100,
-            durable_write_with_delay_us: Some(10000),
+            fsync_delay: std::time::Duration::from_micros(10000),
+            non_durable_writes: false,
             shard_dir,
-            max_cached_files: 1,
+            max_open_files: 1,
             recent_write_cache_bytes: 500,
         }
     }
@@ -845,7 +844,7 @@ mod test_shard_write_ahead_log {
                 let data_root = tempdir.path().to_path_buf();
 
                 let mut config = setup_config(&data_root, 0);
-                config.preallocate_bytes = 64 * 1024 * 1024;
+                config.shard_log_preallocate_bytes = 64 * 1024 * 1024;
 
                 let wal = ShardWriteAheadLog::new(config).await.unwrap();
 

@@ -27,8 +27,8 @@ pub enum ShardLogReadError {
     },
     WatchLatencyTooHigh {
         latency_ms: u64,
-        max_latency_mx: u64,
-    }
+        max_latency_ms: u64,
+    },
 }
 
 impl From<std::io::Error> for ShardLogReadError {

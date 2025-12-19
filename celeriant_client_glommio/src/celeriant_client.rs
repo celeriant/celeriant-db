@@ -20,7 +20,7 @@ use crate::client_error::ClientError;
 /// Note: This client must be used within a Glommio LocalExecutor context.
 pub struct CeleriantClient {
     stream: TcpStream,
-    max_request_size: u32,
+    max_request_size: u64,
     timeout_duration: Option<Duration>,
 }
 
@@ -58,7 +58,7 @@ impl CeleriantClient {
     }
 
     /// Set maximum request size in bytes (default: 10MB)
-    pub fn with_max_request_size(mut self, max_request_size: u32) -> Self {
+    pub fn with_max_request_size(mut self, max_request_size: u64) -> Self {
         self.max_request_size = max_request_size;
         self
     }

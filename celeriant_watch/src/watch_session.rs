@@ -1,7 +1,4 @@
 use std::{cell::RefCell, rc::Rc, time::Duration};
-
-use celeriant_wal::aggregate_key::AggregateKey;
-
 use crate::{
     aggregate_reader::{AggregateReader, WatchReadError}, subscribed_client::SubscribedClient, watch_output_type::WatchOutputType
 };

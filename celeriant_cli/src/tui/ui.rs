@@ -10,7 +10,6 @@ use ratatui::{
 };
 
 use super::app::{App, InputMode, Screen};
-use crate::utils::format_timestamp;
 
 const HEADER_COLOR: Color = Color::Cyan;
 const SELECTED_COLOR: Color = Color::Yellow;
@@ -244,25 +243,11 @@ fn draw_watch(f: &mut Frame, app: &App, area: Rect) {
         .block(Block::default().borders(Borders::ALL).title(" Latency (ms) "));
     f.render_widget(lat_input, input_chunks[1]);
 
-    // Throughput input
-    let tp_style = if app.input_mode == InputMode::Editing && app.input_field_index == 2 {
-        Style::default().fg(EDITING_COLOR)
-    } else if app.watch_active {
-        Style::default().fg(DIM_COLOR)
-    } else {
-        Style::default()
-    };
-    let tp_input = Paragraph::new(app.watch_throughput_bs.as_str())
-        .style(tp_style)
-        .block(Block::default().borders(Borders::ALL).title(" Throughput (bytes/sec, optional) "));
-    f.render_widget(tp_input, input_chunks[2]);
-
     // Set cursor position when editing
     if app.input_mode == InputMode::Editing && !app.watch_active {
         let (x, y) = match app.input_field_index {
             0 => (input_chunks[0].x + app.watch_event_types.len() as u16 + 1, input_chunks[0].y + 1),
             1 => (input_chunks[1].x + app.watch_latency_ms.len() as u16 + 1, input_chunks[1].y + 1),
-            2 => (input_chunks[2].x + app.watch_throughput_bs.len() as u16 + 1, input_chunks[2].y + 1),
             _ => (0, 0),
         };
         f.set_cursor_position((x, y));

@@ -78,18 +78,17 @@ impl WireHeader {
     pub async fn read_variable_size<R, T>(
         &self,
         reader: &mut R,
-        max_size_bytes: Option<u32>,
+        max_size_bytes: u64,
     ) -> Result<T, WireError>
     where
         R: AsyncReadExt + Unpin,
         T: Decode<()> + serde::de::DeserializeOwned,
     {
-        if let Some(max_request_size) = max_size_bytes
-            && self.uncompressed_length > max_request_size
+        if self.uncompressed_length as u64 > max_size_bytes
         {
             return Err(WireError::MessageTooLarge {
-                message_length: self.compressed_length,
-                max_request_size,
+                message_length: self.compressed_length as u64,
+                max_size_bytes,
             });
         }
 
@@ -213,7 +212,7 @@ impl WireHeader {
         message: &T,
         request_response_type: u32,
         compression_type: CompressionType,
-        max_size_bytes: Option<u32>,
+        max_size_bytes: u64,
         version: u32,
     ) -> Result<(), WireError>
     where
@@ -231,12 +230,11 @@ impl WireHeader {
         let compressed_size = encoded.len() as u32;
         let (compression_type_id, _) = compression_type.to_tuple();
 
-        if let Some(max_request_size) = max_size_bytes
-            && compressed_size > max_request_size
+        if compressed_size as u64 > max_size_bytes
         {
             return Err(WireError::MessageTooLarge {
-                message_length: compressed_size,
-                max_request_size,
+                message_length: compressed_size as u64,
+                max_size_bytes,
             });
         }
 
@@ -297,7 +295,7 @@ mod tests {
                 &message,
                 request_type,
                 CompressionType::None, // adjust based on your enum
-                None,
+                999,
                 PROTOCOL_VERSION_V3,
             )
             .await
@@ -309,7 +307,7 @@ mod tests {
             assert_eq!(header.version, PROTOCOL_VERSION_V3);
             assert_eq!(header.message_type, request_type);
 
-            let decoded: Vec<u8> = header.read_variable_size(&mut reader, None).await.unwrap();
+            let decoded: Vec<u8> = header.read_variable_size(&mut reader, 999).await.unwrap();
             assert_eq!(decoded, message);
         });
     }
@@ -325,7 +323,7 @@ mod tests {
                 &message,
                 1,
                 CompressionType::None,
-                Some(100), // max size smaller than message
+                100, // max size smaller than message
                 PROTOCOL_VERSION_V2,
             )
             .await;

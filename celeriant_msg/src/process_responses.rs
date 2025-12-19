@@ -1,3 +1,5 @@
+use std::u64;
+
 use celeriant_wal::compression_type::CompressionType;
 use celeriant_wire::{constants::WIRE_FIXED_BODY_SIZE, wire_error::WireError, wire_header::WireHeader};
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
@@ -109,10 +111,10 @@ impl Response {
         } else {
             match response_type {
                 ResponseType::Read => {
-                    Response::Read(wire_header.read_variable_size(reader, None).await?)
+                    Response::Read(wire_header.read_variable_size(reader, u64::MAX).await?)
                 }
                 ResponseType::Watch => {
-                    Response::Watch(wire_header.read_variable_size(reader, None).await?)
+                    Response::Watch(wire_header.read_variable_size(reader, u64::MAX).await?)
                 }
                 _ => unreachable!(),
             }
@@ -161,10 +163,10 @@ impl Response {
             // Variable-size responses - with compression
             match response {
                 Response::Read(res) => {
-                    WireHeader::write_variable_size(writer, res, response_type_id, compression_type, None, version).await
+                    WireHeader::write_variable_size(writer, res, response_type_id, compression_type, u64::MAX, version).await
                 }
                 Response::Watch(res) => {
-                    WireHeader::write_variable_size(writer, res, response_type_id, compression_type, None, version).await
+                    WireHeader::write_variable_size(writer, res, response_type_id, compression_type, u64::MAX, version).await
                 }
                 _ => unreachable!(),
             }

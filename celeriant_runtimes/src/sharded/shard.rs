@@ -1,6 +1,6 @@
 use std::{cell::Cell, rc::Rc, time::Duration};
 
-use celeriant_watch::{aggregate_watch_event::AggregateWatchEvent, watch_output_type::WatchOutputType, watch_session::WatchSession};
+use celeriant_watch::{watch_output_type::WatchOutputType, watch_session::WatchSession};
 use celeriant_filesystem::{read_write_error::ReadWriteError, shard_log_read_error::ShardLogReadError, shard_log_write_error::ShardLogWriteError, shard_write_ahead_log::ShardWriteAheadLog};
 use celeriant_msg::{
     request::{requests::WatchRequest},
@@ -107,14 +107,34 @@ struct ShardData {
     filesystem: Rc<ShardWriteAheadLog>,
 }
 
+
 async fn check_for_shard_redirect(
-    tcp_stream: TcpStream,
+    mut tcp_stream: TcpStream,
     request: celeriant_msg::process_requests::Request,
     message_version: u32,
     shard_data: &ShardData,
 ) -> Option<(celeriant_msg::process_requests::Request, TcpStream)> {
-    let aggregate_id = request.routing_id();
-    let idx = (aggregate_id % shard_data.config.num_shards as u128) as usize;
+
+    let idx = match determine_shard_route(&request, Rc::clone(&shard_data.config)) {
+        Ok(shard_idx) => shard_idx,
+        Err(e) => {
+            let response = celeriant_msg::process_responses::Response::GenericError(
+                celeriant_msg::response::responses::ErrorResponse {
+                    correlation_id: request.correlation_id(),
+                    error_code: 400,
+                    error_message: format!("Shard routing error: {:?}", e),
+                }
+            );
+            let _ = write_response_with_timeout(
+                &mut tcp_stream,
+                &response,
+                celeriant_wal::compression_type::CompressionType::None,
+                message_version,
+                shard_data.config.slow_client_timeout,
+            ).await;
+            return None;
+        }
+    };
 
     if idx != shard_data.current_shard_id {
         let msg = IntrashardMessages::ConnectionRedirect {
@@ -131,13 +151,125 @@ async fn check_for_shard_redirect(
     Some((request, tcp_stream))
 }
 
+#[derive(Debug)]
+pub enum ShardRoutingError {
+    NoRoutingKeyProvided,
+    MultipleShardRoutes,
+    IncompatibleFilters(String),
+}
+
+fn determine_shard_route(
+    request: &celeriant_msg::process_requests::Request,
+    config: Rc<ShardConfig>,
+) -> Result<usize, ShardRoutingError> {
+    let num_shards = config.num_shards as u128;
+    
+    match request {
+        celeriant_msg::process_requests::Request::Watch(watch_request) => {
+            determine_shard_route_watch_request(watch_request, config)
+        },
+        the_rest => {
+            let shard_id = match config.routing_rule {
+                crate::RoutingRule::OrgId => the_rest.org_id() % num_shards,
+                crate::RoutingRule::AggregateTypeId => the_rest.aggregate_type_id() % num_shards,
+                crate::RoutingRule::AggregateId => the_rest.aggregate_id() % num_shards,
+            };
+            Ok(shard_id as usize)
+        },
+    }
+}
+
+fn determine_shard_route_watch_request(
+    watch_request: &WatchRequest,
+    config: Rc<ShardConfig>,
+) -> Result<usize, ShardRoutingError> {
+    let num_shards = config.num_shards as u128;
+    
+    match config.routing_rule {
+        crate::RoutingRule::OrgId => {
+            collect_unique_shard_id(num_shards, [
+                watch_request.orgs.as_ref().map(|orgs| 
+                    orgs.iter().map(|id| *id).collect::<Vec<_>>()
+                ),
+                watch_request.aggregate_types.as_ref().map(|types| 
+                    types.iter().map(|k| k.org_id).collect()
+                ),
+                watch_request.aggregates.as_ref().map(|aggs| 
+                    aggs.iter().map(|k| k.org_id).collect()
+                ),
+            ])
+        },
+        crate::RoutingRule::AggregateTypeId => {
+            // Cannot route by aggregate_type_id if only orgs are specified
+            if watch_request.orgs.is_some() 
+                && watch_request.aggregate_types.is_none() 
+                && watch_request.aggregates.is_none() 
+            {
+                return Err(ShardRoutingError::IncompatibleFilters(
+                    "Cannot route by aggregate_type_id when only orgs are specified".into()
+                ));
+            }
+            
+            collect_unique_shard_id(num_shards, [
+                None, // orgs don't have aggregate_type_id for routing
+                watch_request.aggregate_types.as_ref().map(|types| 
+                    types.iter().map(|k| k.aggregate_type_id).collect()
+                ),
+                watch_request.aggregates.as_ref().map(|aggs| 
+                    aggs.iter().map(|k| k.aggregate_type_id).collect()
+                ),
+            ])
+        },
+        crate::RoutingRule::AggregateId => {
+            // Cannot route by aggregate_id if aggregates are not specified
+            if (watch_request.orgs.is_some() || watch_request.aggregate_types.is_some())
+                && watch_request.aggregates.is_none()
+            {
+                return Err(ShardRoutingError::IncompatibleFilters(
+                    "Cannot route by aggregate_id when aggregates are not specified".into()
+                ));
+            }
+            
+            collect_unique_shard_id(num_shards, [
+                None,
+                None,
+                watch_request.aggregates.as_ref().map(|aggs| 
+                    aggs.iter().map(|k| k.aggregate_id).collect()
+                ),
+            ])
+        },
+    }
+}
+
+fn collect_unique_shard_id(
+    num_shards: u128,
+    sources: [Option<Vec<u128>>; 3],
+) -> Result<usize, ShardRoutingError> {
+    let mut shard_id: Option<usize> = None;
+    
+    for source in sources.into_iter().flatten() {
+        for routing_key in source {
+            let computed_shard = (routing_key % num_shards) as usize;
+            match shard_id {
+                None => shard_id = Some(computed_shard),
+                Some(existing) if existing != computed_shard => {
+                    return Err(ShardRoutingError::MultipleShardRoutes);
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    
+    shard_id.ok_or(ShardRoutingError::NoRoutingKeyProvided)
+}
+
 fn read_write_error_to_response(
     correlation_id: Option<u128>,
     error: ReadWriteError,
 ) -> celeriant_msg::process_responses::Response {
     let (error_code, error_message) = match error {
         ReadWriteError::Read(read_error) => match read_error {
-            ShardLogReadError::WatchLatencyTooHigh { latency_ms, max_latency_mx } => (
+            ShardLogReadError::WatchLatencyTooHigh { latency_ms, max_latency_ms: max_latency_mx } => (
                 400,
                 format!(
                     "Requested watch latency {}ms exceeds server max of {}ms",
@@ -455,18 +587,18 @@ fn spawn_intrashard_message_connection_redirect_task(
 async fn create_watch_session(
     shard_write_ahead_log: Rc<ShardWriteAheadLog>,
     request: WatchRequest,
-    max_requested_latency_ms: u64,
+    max_requested_latency: Duration,
 ) -> Result<WatchSession<ShardWriteAheadLog>, ReadWriteError> {
 
     // Don't allow setup of a watch with a latency too high
     // as this creates too much load on the server
     // Clients should long-poll instead
     if let Some(latency_ms) = request.requested_latency_ms
-        && latency_ms > max_requested_latency_ms
+        && Duration::from_millis(latency_ms) > max_requested_latency
     {
         return Err(ShardLogReadError::WatchLatencyTooHigh {
             latency_ms,
-            max_latency_mx: max_requested_latency_ms,
+            max_latency_ms: max_requested_latency.as_millis() as u64,
         })?;
     }
 
@@ -487,7 +619,7 @@ async fn handle_watch_request(
     watch_request: WatchRequest,
     message_version: u32,
     shard_write_ahead_log: Rc<ShardWriteAheadLog>,
-    max_requested_latency_ms: u64,
+    max_requested_latency: Duration,
     slow_client_timeout: Duration,
 ) {
     let correlation_id = watch_request.correlation_id;
@@ -495,7 +627,7 @@ async fn handle_watch_request(
     let mut watch_session = match create_watch_session(
         shard_write_ahead_log.clone(),
         watch_request,
-        max_requested_latency_ms,
+        max_requested_latency,
     )
     .await
     {
@@ -595,7 +727,7 @@ async fn handle_request_and_further_pipelining(
                 watch_request,
                 message_version,
                 shard_data.filesystem.clone(),
-                shard_data.config.max_requested_latency_ms,
+                shard_data.config.max_requested_latency,
                 shard_data.config.slow_client_timeout,
             )
             .await;

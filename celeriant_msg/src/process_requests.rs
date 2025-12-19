@@ -75,8 +75,8 @@ impl Request {
     }
 
     /// Returns the aggregate_id for routing purposes.
-    /// Returns 0 for requests without a specific aggregate (they go to shard 0).
-    pub fn routing_id(&self) -> u128 {
+    /// Returns 0 for requests without a specific aggregate
+    pub fn aggregate_id(&self) -> u128 {
         match self {
             Request::Exists(req) => req.aggregate_key.aggregate_id,
             Request::Read(req) => req.aggregate_key.aggregate_id,
@@ -87,10 +87,36 @@ impl Request {
         }
     }
 
+    /// Returns the aggregate_id for routing purposes.
+    /// Returns 0 for requests without a specific aggregate
+    pub fn org_id(&self) -> u128 {
+        match self {
+            Request::Exists(req) => req.aggregate_key.org_id,
+            Request::Read(req) => req.aggregate_key.org_id,
+            Request::Write(req) => req.aggregate_key.org_id,
+            Request::TrimStart(req) => req.aggregate_key.org_id,
+            Request::Delete(req) => req.aggregate_key.org_id,
+            Request::Watch(_req) => 0,
+        }
+    }
+
+    /// Returns the aggregate_id for routing purposes.
+    /// Returns 0 for requests without a specific aggregate
+    pub fn aggregate_type_id(&self) -> u128 {
+        match self {
+            Request::Exists(req) => req.aggregate_key.aggregate_type_id,
+            Request::Read(req) => req.aggregate_key.aggregate_type_id,
+            Request::Write(req) => req.aggregate_key.aggregate_type_id,
+            Request::TrimStart(req) => req.aggregate_key.aggregate_type_id,
+            Request::Delete(req) => req.aggregate_key.aggregate_type_id,
+            Request::Watch(_req) => 0,
+        }
+    }
+
     /// Read a request from the wire protocol
     pub async fn read_request<R>(
         reader: &mut R,
-        max_request_size: Option<u32>,
+        max_request_size: u64,
     ) -> Result<(Request, u32), WireError>
     where
         R: AsyncReadExt + Unpin,
@@ -138,7 +164,7 @@ impl Request {
         writer: &mut W,
         request: &Request,
         compression_type: CompressionType,
-        max_message_size: u32,
+        max_message_size: u64,
         version: u32,
     ) -> Result<(), WireError>
     where
@@ -166,7 +192,7 @@ impl Request {
                         req,
                         request_type_id,
                         compression_type,
-                        Some(max_message_size),
+                        max_message_size,
                         version,
                     )
                     .await
@@ -323,7 +349,7 @@ mod tests {
 
                 // Read
                 let mut cursor = Cursor::new(buffer);
-                let (parsed, parsed_version) = Request::read_request(&mut cursor, None)
+                let (parsed, parsed_version) = Request::read_request(&mut cursor, u64::MAX)
                     .await
                     .unwrap_or_else(|e| panic!("read failed for {:?}: {:?}", request_type, e));
 
@@ -354,7 +380,7 @@ mod tests {
 
                 // Read
                 let mut cursor = Cursor::new(buffer);
-                let (parsed, parsed_version) = Request::read_request(&mut cursor, None)
+                let (parsed, parsed_version) = Request::read_request(&mut cursor, u64::MAX)
                     .await
                     .unwrap_or_else(|e| panic!("read failed for {:?}: {:?}", request_type, e));
 
