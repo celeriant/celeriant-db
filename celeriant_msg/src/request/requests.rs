@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use bincode::{Decode, Encode};
-use celeriant_wal::{aggregate_key::AggregateKey, aggregate_type_key::AggregateTypeKey, compression_type::CompressionType, datablocks::event_item::EventItem};
+use celeriant_wal::{aggregate_key::AggregateKey, aggregate_type_key::AggregateTypeKey, compression_type::CompressionType, datablocks::datablock_aggregate_event::DatablockAggregateEvent};
 use serde::{Deserialize, Serialize};
 
 use crate::request::{read_filters::ReadFilters};
@@ -25,7 +25,7 @@ pub struct WriteRequest {
     pub aggregate_key: AggregateKey,
     pub client_id: u128,
     pub user_id: Option<u128>,
-    pub events: Vec<EventItem>,
+    pub events: Vec<DatablockAggregateEvent>,
     pub allow_create: bool,
     pub expected_event_batch_index: Option<u64>,
     pub enforce_client_idempotency: bool,

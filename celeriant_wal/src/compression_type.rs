@@ -35,13 +35,7 @@ impl CompressionType {
             4 => CompressionType::Gzip {
                 level: level.unwrap_or(6),
             },
-            _ => CompressionType::default(),
+            _ => CompressionType::None,
         }
-    }
-}
-
-impl Default for CompressionType {
-    fn default() -> Self {
-        CompressionType::Zstd { level: 6 }
     }
 }

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use bincode::{Decode, Encode};
-use celeriant_wal::{aggregate_key::AggregateKey, datablocks::event_batch_item::EventBatchItem};
+use celeriant_wal::{aggregate_key::AggregateKey, datablocks::datablock_aggregate_event_batch::DatablockAggregateEventBatch};
 use serde::{Deserialize, Serialize};
 
 use crate::response::{watch_event::WatchEvent};
@@ -15,7 +15,7 @@ pub struct ExistsResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct ReadResponse {
     pub correlation_id: Option<u128>,
-    pub event_batches: Vec<EventBatchItem>,
+    pub event_batches: Vec<DatablockAggregateEventBatch>,
     pub next_event_batch_index: Option<u64>,
 }
 

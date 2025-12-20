@@ -7,7 +7,7 @@ use celeriant_msg::request::requests::WriteRequest;
 use celeriant_wal::{
     aggregate_key::AggregateKey,
     compression_type::CompressionType,
-    datablocks::event_item::EventItem,
+    datablocks::datablock_aggregate_event::DatablockAggregateEvent,
 };
 use tokio::time::Instant;
 
@@ -99,7 +99,7 @@ async fn run_connection_benchmark(connection_id: usize) -> Result<TaskStats, Str
         aggregate_key: AggregateKey::new(1, 3, (connection_id % NUM_AGGREGATES) as u128),
         client_id: connection_id as u128,
         user_id: None,
-        events: vec![EventItem::new(
+        events: vec![DatablockAggregateEvent::new(
             0,                           // client_event_index
             0,                           // event_index (server will assign)
             None,                        // event_id
@@ -109,7 +109,7 @@ async fn run_connection_benchmark(connection_id: usize) -> Result<TaskStats, Str
             //b"Hello World".to_vec(),
             b"For example, those who worked from home spent about 3 hours and 24 minutes doing unpaid work, while those working in the office spent fewer than two and a half hours. So it may be things like putting an extra load of washing on or actually having some extra time to spend caring for, whether it's children or pets or aging parents.".to_vec(),
         ),
-        EventItem::new(
+        DatablockAggregateEvent::new(
             0,                           // client_event_index
             0,                           // event_index (server will assign)
             None,                        // event_id

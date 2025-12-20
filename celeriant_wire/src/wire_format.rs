@@ -6,48 +6,54 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use crate::wire_format_error::WireFormatError;
 
-pub static BINCODE_CONFIG_FIXED: bincode::config::Configuration<
+static BINCODE_CONFIG_FIXED: bincode::config::Configuration<
     bincode::config::LittleEndian,
     bincode::config::Fixint,
 > = bincode::config::standard()
     .with_fixed_int_encoding() // Force fixed-length integers
     .with_little_endian();
 
-pub static BINCODE_CONFIG_VARIABLE: bincode::config::Configuration<
+static BINCODE_CONFIG_VARIABLE: bincode::config::Configuration<
     bincode::config::LittleEndian,
     bincode::config::Varint,
 > = bincode::config::standard()
     .with_variable_int_encoding()
     .with_little_endian();
 
-pub fn to_wire_format_fixed<T>(message: &T, buffer: &mut [u8]) -> Result<usize, WireFormatError>
+pub fn bincode_fixed_serialise<T>(message: &T, buffer: &mut [u8]) -> Result<usize, WireFormatError>
 where
     T: Encode,
 {
-    Ok(bincode::encode_into_slice(
-        message,
-        buffer,
-        BINCODE_CONFIG_FIXED,
-    )?)
+    bincode::encode_into_slice(message, buffer, BINCODE_CONFIG_FIXED).map_err(|e| e.into())
 }
 
-pub fn from_wire_format_fixed<T>(buffer: &[u8]) -> Result<(T, usize), WireFormatError>
+pub fn bincode_fixed_deserialise<T>(buffer: &[u8]) -> Result<(T, usize), WireFormatError>
 where
     T: Decode<()>,
 {
-    let result = bincode::decode_from_slice(buffer, BINCODE_CONFIG_FIXED)?;
-
-    Ok(result)
+    bincode::decode_from_slice(buffer, BINCODE_CONFIG_FIXED).map_err(|e| e.into())
 }
 
-pub fn to_wire_format_variable<T>(
-    item: &T,
-    compression_type: CompressionType,
-) -> Result<(usize, Vec<u8>), WireFormatError>
+pub fn bincode_variable_serialise<T>(message: &T, compression_type: CompressionType) -> Result<(usize, Vec<u8>), WireFormatError>
 where
     T: Encode,
 {
-    let serialized = bincode::encode_to_vec(item, BINCODE_CONFIG_VARIABLE)?;
+    let serialized = bincode::encode_to_vec(message, BINCODE_CONFIG_VARIABLE)?;
+    compress_variable(serialized, compression_type).map_err(|e|e.into())
+}
+
+pub fn bincode_variable_serialise_no_compression<T>(message: &T) -> Result<Vec<u8>, WireFormatError>
+where
+    T: Encode,
+{
+    bincode::encode_to_vec(message, BINCODE_CONFIG_VARIABLE).map_err(|e| e.into())
+}
+
+pub fn compress_variable(
+    serialized: Vec<u8>,
+    compression_type: CompressionType,
+) -> Result<(usize, Vec<u8>), WireFormatError>
+{
     let uncompressed_size = serialized.len();
 
     match compression_type {
@@ -83,15 +89,12 @@ where
     }
 }
 
-/// Deserialize and decompress from wire format
-pub fn from_wire_format_variable<T>(
+pub fn decompress_variable(
     data: &[u8],
     compression_type: CompressionType,
     uncompressed_size: usize,
-) -> Result<T, WireFormatError>
-where
-    T: Decode<()>,
-{
+) -> Result<Vec<u8>, WireFormatError> {
+
     let decompressed = match compression_type {
         CompressionType::None => data.to_vec(),
         CompressionType::Zstd { .. } => zstd::bulk::decompress(data, uncompressed_size)
@@ -113,12 +116,31 @@ where
         }
     };
 
+    Ok(decompressed)
+}
+
+/// Deserialize and decompress from wire format
+pub fn bincode_variable_deserialise<T>(
+    data: &[u8],
+    compression_type: CompressionType,
+    uncompressed_size: usize,
+) -> Result<T, WireFormatError>
+where
+    T: Decode<()>,
+{
+    if compression_type == CompressionType::None {
+        let result = bincode::decode_from_slice(data, BINCODE_CONFIG_VARIABLE)?;
+        return Ok(result.0);
+    }
+
+    let decompressed = decompress_variable(data, compression_type, uncompressed_size)?;
+
     let result = bincode::decode_from_slice(&decompressed, BINCODE_CONFIG_VARIABLE)?;
 
     Ok(result.0)
 }
 
-pub fn to_wire_format_variable_msgpack<T>(
+pub fn msgpack_variable_serialise<T>(
     item: &T,
     compression_type: CompressionType,
 ) -> Result<(usize, Vec<u8>), WireFormatError>
@@ -161,7 +183,7 @@ where
     }
 }
 
-pub fn from_wire_format_variable_msgpack<T>(
+pub fn msgpack_variable_deserialise<T>(
     data: &[u8],
     compression_type: CompressionType,
     uncompressed_size: usize,
@@ -194,7 +216,7 @@ where
     Ok(result)
 }
 
-pub fn to_wire_format_fixed_msgpack<T>(
+pub fn msgpack_fixed_serialise<T>(
     message: &T,
     buffer: &mut [u8],
 ) -> Result<usize, WireFormatError>
@@ -206,7 +228,7 @@ where
     Ok(cursor.position() as usize)
 }
 
-pub fn from_wire_format_fixed_msgpack<T>(buffer: &[u8]) -> Result<T, WireFormatError>
+pub fn msgpack_fixed_deserialise<T>(buffer: &[u8]) -> Result<T, WireFormatError>
 where
     T: DeserializeOwned,
 {
@@ -217,6 +239,7 @@ where
 mod tests {
     use super::*;
     use bincode::{Decode, Encode};
+    use celeriant_wal::datablocks::{datablock_aggregate_event::DatablockAggregateEvent, datablock_aggregate_event_batch::DatablockAggregateEventBatch};
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, Clone, PartialEq, Encode, Decode, Serialize, Deserialize)]
@@ -225,6 +248,8 @@ mod tests {
         name: String,
         values: Vec<i32>,
         flag: bool,
+        #[serde(rename = "ui", default)]
+        user_id: Option<u128>,
     }
 
     fn sample_message() -> TestMessage {
@@ -233,6 +258,7 @@ mod tests {
             name: "test message".to_string(),
             values: vec![1, 2, 3, 4, 5],
             flag: true,
+            user_id: None,
         }
     }
 
@@ -251,8 +277,8 @@ mod tests {
         let original = sample_message();
         let mut buffer = [0u8; 1024];
 
-        let written = to_wire_format_fixed(&original, &mut buffer).unwrap();
-        let decoded: TestMessage = from_wire_format_fixed(&buffer[..written]).unwrap().0;
+        let written = bincode_fixed_serialise(&original, &mut buffer).unwrap();
+        let decoded: TestMessage = bincode_fixed_deserialise(&buffer[..written]).unwrap().0;
 
         assert_eq!(original, decoded);
     }
@@ -262,11 +288,11 @@ mod tests {
         let original = sample_message();
 
         for compression in all_compression_types() {
-            let (uncompressed_size, encoded) =
-                to_wire_format_variable(&original, compression).unwrap();
+
+            let (uncompressed_size, encoded) = bincode_variable_serialise(&original, compression).unwrap();
 
             let decoded: TestMessage =
-                from_wire_format_variable(&encoded, compression, uncompressed_size).unwrap();
+                bincode_variable_deserialise(&encoded, compression, uncompressed_size).unwrap();
 
             assert_eq!(original, decoded, "Failed for {:?}", compression);
         }
@@ -277,10 +303,39 @@ mod tests {
         let original = sample_message();
         let mut buffer = [0u8; 1024];
 
-        let written = to_wire_format_fixed_msgpack(&original, &mut buffer).unwrap();
-        let decoded: TestMessage = from_wire_format_fixed_msgpack(&buffer[..written]).unwrap();
+        let written = msgpack_fixed_serialise(&original, &mut buffer).unwrap();
+        let decoded: TestMessage = msgpack_fixed_deserialise(&buffer[..written]).unwrap();
 
         assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn test_variable_msgpack_roundtrip_all_compression_event_batches() {
+        let original = DatablockAggregateEventBatch {
+            event_batch_index: 1,
+            events: vec![
+                DatablockAggregateEvent {
+                    event_index:10,
+                    event_id:Some(1001),
+                    event_timestamp:1_000,
+                    event_value:std::sync::Arc::new(vec![1,2,3]),
+                    iv:None, 
+                    client_event_index: 0, 
+                    event_type_major: 1, 
+                    event_type_minor: 0 },
+            ],
+        };
+
+        for compression in all_compression_types() {
+            let (uncompressed_size, encoded) =
+                msgpack_variable_serialise(&original, compression).unwrap();
+
+            let decoded: DatablockAggregateEventBatch =
+                msgpack_variable_deserialise(&encoded, compression, uncompressed_size)
+                    .unwrap();
+
+            assert_eq!(original.event_batch_index, decoded.event_batch_index, "Failed for {:?}", compression);
+        }
     }
 
     #[test]
@@ -289,10 +344,10 @@ mod tests {
 
         for compression in all_compression_types() {
             let (uncompressed_size, encoded) =
-                to_wire_format_variable_msgpack(&original, compression).unwrap();
+                msgpack_variable_serialise(&original, compression).unwrap();
 
             let decoded: TestMessage =
-                from_wire_format_variable_msgpack(&encoded, compression, uncompressed_size)
+                msgpack_variable_deserialise(&encoded, compression, uncompressed_size)
                     .unwrap();
 
             assert_eq!(original, decoded, "Failed for {:?}", compression);
@@ -304,7 +359,7 @@ mod tests {
         let original = sample_message();
         let mut buffer = [0u8; 4]; // Too small
 
-        let result = to_wire_format_fixed(&original, &mut buffer);
+        let result = bincode_fixed_serialise(&original, &mut buffer);
         assert!(result.is_err());
     }
 
@@ -313,7 +368,7 @@ mod tests {
         let original = sample_message();
         let mut buffer = [0u8; 4]; // Too small
 
-        let result = to_wire_format_fixed_msgpack(&original, &mut buffer);
+        let result = msgpack_fixed_serialise(&original, &mut buffer);
         assert!(result.is_err());
     }
 
@@ -326,13 +381,15 @@ mod tests {
 
         // Fixed bincode
         let mut buffer = [0u8; 64];
-        let written = to_wire_format_fixed(&original, &mut buffer).unwrap();
-        let decoded: Empty = from_wire_format_fixed(&buffer[..written]).unwrap().0;
+        let written = bincode_fixed_serialise(&original, &mut buffer).unwrap();
+        let decoded: Empty = bincode_fixed_deserialise(&buffer[..written]).unwrap().0;
         assert_eq!(original, decoded);
 
-        // Variable bincode
-        let (size, encoded) = to_wire_format_variable(&original, CompressionType::None).unwrap();
-        let decoded: Empty = from_wire_format_variable(&encoded, CompressionType::None, size).unwrap();
+        // Variable bincode        
+            let encoded = bincode_variable_serialise_no_compression(&original).unwrap();
+
+        let decoded: Empty =
+            bincode_variable_deserialise(&encoded, CompressionType::None, 0).unwrap();
         assert_eq!(original, decoded);
     }
 
@@ -343,14 +400,14 @@ mod tests {
             name: "x".repeat(10_000), // Large repetitive data compresses well
             values: (0..1000).collect(),
             flag: false,
+            user_id: Some(32423423423),
         };
 
         for compression in all_compression_types() {
-            let (uncompressed_size, encoded) =
-                to_wire_format_variable(&original, compression).unwrap();
+            let (uncompressed_size, encoded) = bincode_variable_serialise(&original, compression).unwrap();
 
             let decoded: TestMessage =
-                from_wire_format_variable(&encoded, compression, uncompressed_size).unwrap();
+                bincode_variable_deserialise(&encoded, compression, uncompressed_size).unwrap();
 
             assert_eq!(original, decoded, "Failed for {:?}", compression);
 

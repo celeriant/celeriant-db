@@ -12,7 +12,7 @@ use celeriant_msg::{
 };
 use celeriant_wal::{
     aggregate_key::AggregateKey,
-    compression_type::CompressionType, datablocks::event_item::EventItem,
+    compression_type::CompressionType, datablocks::datablock_aggregate_event::DatablockAggregateEvent,
 };
 use directories::ProjectDirs;
 
@@ -409,7 +409,7 @@ impl App {
         
         let key = AggregateKey::new(ctx.org_id, ctx.aggregate_type_id, ctx.aggregate_id);
         
-        let event = EventItem {
+        let event = DatablockAggregateEvent {
             event_type_major: event_type,
             event_type_minor: 0,
             client_event_index: 0,

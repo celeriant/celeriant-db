@@ -1,7 +1,7 @@
 use crate::{in_memory_cache::{
     aggregate_positions::AggregatePositions, recent_write::RecentWrite, shard_log_queue_item::ShardLogQueueItem, sync_positions_snapshot::SyncPositionsSnapshot
 }, internal_shard_config::InternalShardConfig};
-use celeriant_wal::{aggregate_key::AggregateKey, constants::FIXED_BLOCK_SIZE_BYTES, datablocks::wal_datablock::WalDatablock, metablocks::wal_metablock::WalMetablock};
+use celeriant_wal::{aggregate_key::AggregateKey, constants::FIXED_BLOCK_SIZE_BYTES, datablocks::datablock::Datablock, metablocks::metablock::Metablock};
 use std::{collections::{BTreeMap, HashMap, VecDeque}, path::PathBuf};
 
 pub struct ShardMemCache {
@@ -56,8 +56,8 @@ impl ShardMemCache {
         &mut self,
         aggregate_key: AggregateKey,
         batch_index: u64,
-        metablock: WalMetablock,
-        datablock: Option<WalDatablock>,
+        metablock: Metablock,
+        datablock: Option<Datablock>,
         size_bytes: u64,
     )
      {

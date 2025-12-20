@@ -67,7 +67,7 @@ impl<R: AggregateReader> WatchSession<R> {
     }
 }
 
-pub fn estimate_data_size_bytes(event_batches: &Vec<celeriant_wal::datablocks::event_batch_item::EventBatchItem>) -> usize {
+pub fn estimate_data_size_bytes(event_batches: &Vec<celeriant_wal::datablocks::datablock_aggregate_event_batch::DatablockAggregateEventBatch>) -> usize {
     event_batches.iter().map(|b| {
         b.events.iter().map(|e| e.event_value.len()).sum::<usize>() + 100 // overhead estimate per batch
     }).sum()

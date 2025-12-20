@@ -12,12 +12,9 @@ use serde::{Deserialize, Serialize};
 /// Optimized for hashing and comparison operations
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
 pub struct AggregateTypeKey {
-    #[serde(rename = "oi")]
     pub org_id: u128,
-    #[serde(rename = "ti")]
     pub aggregate_type_id: u128,
     // Pre-computed hash for better performance
-    #[serde(rename = "ha")]
     hash: u64,
 }
 

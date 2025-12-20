@@ -2,18 +2,14 @@ use std::{sync::Arc, time::Duration};
 use std::hint::black_box;
 
 use celeriant_wal::aggregate_key::AggregateKey;
-use celeriant_wal::constants::MINIBATCH_SIZE_BYTES;
-use celeriant_wal::datablocks::event_batch_item::EventBatchItem;
-use celeriant_wal::datablocks::event_item::EventItem;
-use celeriant_wal::metablocks::datablock_style::DatablockStyle;
-use celeriant_wal::metablocks::event_batch_metadata::{EventBatchMetadata, EventTypesData};
-use celeriant_wal::metablocks::wal_metablock::CURRENT_VERSION;
+use celeriant_wal::datablocks::datablock_aggregate_event_batch::DatablockAggregateEventBatch;
+use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
+use celeriant_wal::metablocks::metablock_event_batch::{MetablockEventBatch, EventTypesKind};
 use celeriant_wal::{
     compression_type::CompressionType,
 };
 use celeriant_wire::wire_format::{
-    from_wire_format_variable, from_wire_format_variable_msgpack, to_wire_format_variable,
-    to_wire_format_variable_msgpack,
+    bincode_variable_deserialise, bincode_variable_serialise, msgpack_variable_deserialise, msgpack_variable_serialise
 };
 use criterion::{
     criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
@@ -26,8 +22,8 @@ criterion_group!(
 );
 criterion_main!(benches);
 
-fn create_event(index: u64, payload_size: usize) -> EventItem {
-    EventItem {
+fn create_event(index: u64, payload_size: usize) -> DatablockAggregateEvent {
+    DatablockAggregateEvent {
         client_event_index: index,
         event_index: index * 2,
         event_id: Some(index as u128),
@@ -39,40 +35,24 @@ fn create_event(index: u64, payload_size: usize) -> EventItem {
     }
 }
 
-fn create_event_batch(event_count: usize, payload_size: usize) -> EventBatchItem {
-    let events: Vec<EventItem> = (0..event_count)
+fn create_event_batch(event_count: usize, payload_size: usize) -> DatablockAggregateEventBatch {
+    let events: Vec<DatablockAggregateEvent> = (0..event_count)
         .map(|i| create_event(i as u64, payload_size))
         .collect();
 
-    EventBatchItem {
+    DatablockAggregateEventBatch {
         event_batch_index: 42,
-        server_timestamp: 1700000000000,
-        client_id: 0x123456789ABCDEF0,
-        user_id: Some(0xFEDCBA9876543210),
-        node_id: 0x1111222233334444,
-        lease_index: 100,
         events,
     }
 }
 
-fn create_metadata() -> EventBatchMetadata {
-    EventBatchMetadata {
+fn create_metadata() -> MetablockEventBatch {
+    MetablockEventBatch {
         aggregate_key: AggregateKey::new(1, 2, 3),
-        datablock: DatablockStyle::Block { 
-            crc32c: 0,
-            datablock_position: 0, 
-        },
-        version: CURRENT_VERSION, 
-        uncompressed_size: 4096, 
-        compressed_size: 2048, 
-        compression_type: 1,
-        event_types_data: EventTypesData::Direct([1, 2, 3, 4]),
+        event_types_data: EventTypesKind::Direct([1, 2, 3, 4]),
         event_batch_index: 42,
         client_id: 0x123456789ABCDEF0,
         user_id: Some(0xFEDCBA9876543210),
-        node_id: 0x1111222233334444,
-        lease_index: 100,
-        server_timestamp: 1700000000000,
         min_client_event_index: 0,
         max_client_event_index: 99,
         min_event_timestamp: 1700000000000,
@@ -124,9 +104,9 @@ fn bench_event_batch_serialization(c: &mut Criterion) {
                 |b, (batch, comp)| {
                     b.iter(|| {
                         let (uncompressed_size, encoded) =
-                            to_wire_format_variable(black_box(*batch), *comp).unwrap();
-                        let _decoded: EventBatchItem =
-                            from_wire_format_variable(&encoded, *comp, uncompressed_size).unwrap();
+                            bincode_variable_serialise(black_box(*batch), *comp).unwrap();
+                        let _decoded: DatablockAggregateEventBatch =
+                            bincode_variable_deserialise(&encoded, *comp, uncompressed_size).unwrap();
                     });
                 },
             );
@@ -142,9 +122,9 @@ fn bench_event_batch_serialization(c: &mut Criterion) {
                 |b, (batch, comp)| {
                     b.iter(|| {
                         let (uncompressed_size, encoded) =
-                            to_wire_format_variable_msgpack(black_box(*batch), *comp).unwrap();
-                        let _decoded: EventBatchItem =
-                            from_wire_format_variable_msgpack(&encoded, *comp, uncompressed_size)
+                            msgpack_variable_serialise(black_box(*batch), *comp).unwrap();
+                        let _decoded: DatablockAggregateEventBatch =
+                            msgpack_variable_deserialise(&encoded, *comp, uncompressed_size)
                                 .unwrap();
                     });
                 },
@@ -171,9 +151,9 @@ fn bench_metadata_serialization(c: &mut Criterion) {
             |b, (meta, comp)| {
                 b.iter(|| {
                     let (uncompressed_size, encoded) =
-                        to_wire_format_variable(black_box(*meta), *comp).unwrap();
-                    let _decoded: EventBatchMetadata =
-                        from_wire_format_variable(&encoded, *comp, uncompressed_size).unwrap();
+                        bincode_variable_serialise(black_box(*meta), *comp).unwrap();
+                    let _decoded: MetablockEventBatch =
+                        bincode_variable_deserialise(&encoded, *comp, uncompressed_size).unwrap();
                 });
             },
         );

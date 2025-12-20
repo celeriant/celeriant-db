@@ -1,17 +1,17 @@
 use celeriant_msg::request::read_filters::ReadFilters;
-use celeriant_wal::{constants::{BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED}, datablocks::event_batch_item::EventBatchItem, metablocks::event_batch_metadata::{EventBatchMetadata, EventTypesData}};
+use celeriant_wal::{constants::{BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED}, datablocks::datablock_aggregate_event_batch::DatablockAggregateEventBatch, metablocks::metablock_event_batch::{MetablockEventBatch, EventTypesKind}};
 use fastbloom::BloomFilter;
 
 use crate::shard_log_read_error::ShardLogReadError;
 
 #[derive(Debug, Clone)]
 pub struct MetadataWithAbsolutePosition {
-    pub event_batch_metadata: EventBatchMetadata,
+    pub event_batch_metadata: MetablockEventBatch,
     pub event_batch_absolute_position: u64,
     pub format_version_on_disk: u32,
 }
 
-pub fn apply_event_filters(event_batch: &mut EventBatchItem, read_filters: &ReadFilters) {
+pub fn apply_event_filters(event_batch: &mut DatablockAggregateEventBatch, read_filters: &ReadFilters) {
     // Final event type filtering (bloom filter might have false positives)
     if let Some(event_types) = read_filters.include_event_types.as_deref() && !event_types.is_empty() {
         event_batch
@@ -59,7 +59,7 @@ pub fn apply_event_filters(event_batch: &mut EventBatchItem, read_filters: &Read
     }
 }
 
-pub fn is_include_batch(metadata: &EventBatchMetadata, filters: &ReadFilters) -> bool {
+pub fn is_include_batch(metadata: &MetablockEventBatch, filters: &ReadFilters) -> bool {
     if metadata.event_batch_index < filters.from_event_batch_index {
         return false;
     }
@@ -169,9 +169,9 @@ pub fn is_include_batch(metadata: &EventBatchMetadata, filters: &ReadFilters) ->
     true
 }
 
-fn check_event_types_match(event_types_data: &EventTypesData, include_event_types: &[u64]) -> bool {
+fn check_event_types_match(event_types_data: &EventTypesKind, include_event_types: &[u64]) -> bool {
     match event_types_data {
-        EventTypesData::Direct(event_types) => {
+        EventTypesKind::Direct(event_types) => {
             // Check if any of the required types are in the direct array
             if event_types.len() < include_event_types.len() {
                 event_types
@@ -183,7 +183,7 @@ fn check_event_types_match(event_types_data: &EventTypesData, include_event_type
                     .any(|&include_event_type| event_types.contains(&include_event_type))
             }
         }
-        EventTypesData::Bloom(bloom_bytes) => {
+        EventTypesKind::Bloom(bloom_bytes) => {
             // Create bloom filter and test each required type
             let bloom = bloom_filter_from_bytes(bloom_bytes);
             include_event_types
@@ -267,7 +267,7 @@ pub fn trim_end_if_exceeds_max_bytes(
 
 #[cfg(test)]
 mod tests {
-    use celeriant_wal::{aggregate_key::AggregateKey, datablocks::event_item::EventItem, metablocks::wal_metablock::{CURRENT_VERSION, WalMetablock}};
+    use celeriant_wal::{aggregate_key::AggregateKey, datablocks::datablock_aggregate_event::DatablockAggregateEvent, metablocks::metablock::{WIRE_VERSION_WAL_METABLOCK, Metablock}};
 
     use super::*;
 
@@ -284,10 +284,10 @@ mod tests {
         max_eidx: u64,
         compressed_size: u64,
         event_types: &[u64; 4],
-    ) -> EventBatchMetadata {
-        EventBatchMetadata {
+    ) -> MetablockEventBatch {
+        MetablockEventBatch {
             uncompressed_size: 0,
-            event_types_data: EventTypesData::Direct(*event_types),
+            event_types_data: EventTypesKind::Direct(*event_types),
             event_batch_index,
             client_id,
             user_id: Some(user_id),
@@ -303,7 +303,7 @@ mod tests {
             min_event_index: min_eidx,
             max_event_index: max_eidx,
             aggregate_key: AggregateKey::new(1, 1, 1),
-            datablock: celeriant_wal::metablocks::datablock_style::DatablockStyle::Block { crc32c: 0, datablock_position: 0 },
+            datablock: celeriant_wal::metablocks::datablock_storage_kind::DatablockStyle::Block { crc32c: 0, datablock_position: 0 },
             version: 1,
         }
     }
@@ -322,7 +322,7 @@ mod tests {
         max_eidx: u64,
         compressed_size: u64,
         types_to_insert: &[u64],
-    ) -> EventBatchMetadata {
+    ) -> MetablockEventBatch {
         // Start with an empty bloom bitmap
         let mut bloom = BloomFilter::from_vec(vec![0u64; BLOOM_BYTES / 8])
             .seed(&BLOOM_HASH_SEED)
@@ -336,9 +336,9 @@ mod tests {
         // Extract the underlying storage back into a fixed-size array
         let bloom_bytes: [u64; BLOOM_BYTES / 8] = bloom.as_slice().try_into().unwrap();
 
-        EventBatchMetadata {
+        MetablockEventBatch {
             uncompressed_size: 0,
-            event_types_data: EventTypesData::Bloom(bloom_bytes),
+            event_types_data: EventTypesKind::Bloom(bloom_bytes),
             event_batch_index,
             client_id,
             user_id: Some(user_id),
@@ -354,7 +354,7 @@ mod tests {
             min_event_index: min_eidx,
             max_event_index: max_eidx,
             aggregate_key: AggregateKey::new(1, 1, 1),
-            datablock: celeriant_wal::metablocks::datablock_style::DatablockStyle::Block { crc32c: 0, datablock_position: 0 },
+            datablock: celeriant_wal::metablocks::datablock_storage_kind::DatablockStyle::Block { crc32c: 0, datablock_position: 0 },
             version: 1,
         }
     }
@@ -364,8 +364,8 @@ mod tests {
         event_index: u64,
         client_event_index: u64,
         event_timestamp: u64,
-    ) -> EventItem {
-        EventItem {
+    ) -> DatablockAggregateEvent {
+        DatablockAggregateEvent {
             event_type_major,
             event_index,
             client_event_index,
@@ -534,7 +534,7 @@ mod tests {
         // event_index: 9, 10, 11, 12
         // client_event_index: 99, 100, 101, 102
         // event_timestamp: 999, 1000, 1001, 1002
-        let mut batch = EventBatchItem {
+        let mut batch = DatablockAggregateEventBatch {
             event_batch_index: 1,
             server_timestamp: 1,
             client_id: 1,
@@ -576,7 +576,7 @@ mod tests {
 
     #[test]
     fn apply_event_filters_type_whitelist_only() {
-        let mut batch = EventBatchItem {
+        let mut batch = DatablockAggregateEventBatch {
             event_batch_index: 1,
             server_timestamp: 1,
             client_id: 1,
@@ -594,11 +594,11 @@ mod tests {
     }
 
     // Helpers for pagination tests: assume MetadataWithAbsolutePosition implements Default
-    fn mk_mwap(meta: EventBatchMetadata) -> MetadataWithAbsolutePosition {
+    fn mk_mwap(meta: MetablockEventBatch) -> MetadataWithAbsolutePosition {
         MetadataWithAbsolutePosition {
             event_batch_metadata: meta,
             event_batch_absolute_position: 0,
-            format_version_on_disk: CURRENT_VERSION,
+            format_version_on_disk: WIRE_VERSION_WAL_METABLOCK,
         }
     }
 
@@ -657,7 +657,7 @@ mod tests {
         let filters = ReadFilters::new(1).include_event_types(vec![]);
         assert!(is_include_batch(&meta, &filters));
 
-        let mut batch = EventBatchItem {
+        let mut batch = DatablockAggregateEventBatch {
             event_batch_index: 1,
             server_timestamp: 1,
             client_id: 1,

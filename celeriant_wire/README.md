@@ -1,107 +1,113 @@
 # celeriant_wire
 
-Serialization, compression, and wire protocol framing for Celeriant. This crate handles encoding/decoding of messages between clients and servers.
+Serialization, compression, and wire protocol framing for Celeriant. Handles encoding/decoding for both network messages and WAL persistence.
 
-## Overview
+**LLM GENERATED -> HUMAN REVIEWED 2025-12-20**
+
+## Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│                  Wire Frame                     │
-├──────────────────┬──────────────────────────────┤
+Wire Frame (network messages)
+┌──────────────────┬──────────────────────────────┐
 │   Header (17B)   │         Payload              │
-│  version, type,  │  serialized + compressed     │
-│  lengths, comp   │  message body                │
+│ ver|type|lengths │  serialized + compressed     │
+│     |comp_type   │  message body                │
 └──────────────────┴──────────────────────────────┘
+
+Versioned Block (WAL persistence)
+┌──────────┬─────────┬───────────────────────────┐
+│ CRC (4B) │ Ver(4B) │  bincode payload + zero   │
+└──────────┴─────────┴───────────────────────────┘
 ```
 
-## Serialization Formats
+**Wire frames**: Network protocol with async read/write, version negotiation, compression.  
+**Versioned blocks**: CRC-protected fixed-size blocks for WAL headers/metablocks.
 
-Two protocol versions for different client ecosystems:
+## Key Types
+
+| Type | Purpose |
+|------|---------|
+| `WireHeader` | Network frame header with version, lengths, compression metadata |
+| `SerializedDatablock` | Result of datablock serialization (inline or block storage) |
+| `WireError` | Network-level errors (buffer size, protocol, I/O) |
+| `WireFormatError` | Serialization errors (encode, decode, compression, CRC) |
+
+## Key Functions
+
+| Function | Purpose |
+|----------|---------|
+| `bincode_variable_serialise` | Serialize + compress with bincode (Rust clients) |
+| `msgpack_variable_serialise` | Serialize + compress with msgpack (interop) |
+| `bincode_fixed_serialise` | Fixed-int bincode to stack buffer |
+| `serialize_versioned_message` | CRC + version header for header and metadata WAL blocks |
+| `serialize_datablock` | Auto-choose inline (≤256B) or block storage |
+| `WireHeader::write_fixed_size` | Write small, fixed-size framed message to async stream |
+| `WireHeader::write_variable_size` | Write variable length, framed message to async stream |
+
+## Design Decisions
+
+### Protocol versions
 
 | Version | Format | Use Case |
 |---------|--------|----------|
-| V2 | bincode | Rust clients (fastest) |
-| V3 | msgpack | Non-Rust clients (interoperable) |
+| V2 | bincode | Rust clients (~7x faster) |
+| V3 | msgpack | Non-Rust clients (standard format) |
 
-**bincode** is ~2-5x faster for Rust-to-Rust communication but produces a format that's awkward to parse from other languages. **msgpack** is a standard binary format with libraries in every language.
+Both use identical wire framing and compression; only payload encoding differs.
 
-Both support the same compression options and wire framing.
-
-## Compression
-
-Per-message compression with multiple algorithms:
+### Compression types
 
 ```rust
-pub enum CompressionType {
-    None,                    // No compression
-    Zstd { level: i32 },     // Best balance (default)
-    Snappy,                  // Fastest decompression
-    Brotli { level: i32 },   // Best ratio
-    Gzip { level: i32 },     // Compatibility
-}
+CompressionType::None           // No compression
+CompressionType::Zstd { level } // Best balance (recommended)
+CompressionType::Snappy         // Fastest decompression
+CompressionType::Brotli { level } // Best ratio
+CompressionType::Gzip { level } // Compatibility
 ```
 
-## Usage
+Compression is per-message. Type stored in header byte for self-describing frames.
 
-### Variable-size messages (typical)
+### Fixed vs variable serialization
 
-```rust
-use celeriant_wire::wire_format::*;
-use celeriant_wal::compression_type::CompressionType;
+- **Fixed** (`bincode_fixed_*`): Fixed-width integers, stack buffer, no compression. For small known-size messages.
+- **Variable** (`bincode_variable_*`, `msgpack_variable_*`): Varint encoding, heap allocation, optional compression. For payloads.
 
-// Serialize with compression
-let (uncompressed_size, bytes) = to_wire_format_variable(&message, CompressionType::Zstd { level: 3 })?;
+### Inline datablock optimization
 
-// Deserialize
-let decoded: MyMessage = from_wire_format_variable(&bytes, CompressionType::Zstd { level: 3 }, uncompressed_size)?;
+`serialize_datablock` checks serialized size:
+- ≤256 bytes → stored inline in metablock's `DatablockInlineData`
+- >256 bytes → compressed, stored as `DatablockBlockRef` with CRC
 
-// For non-Rust clients, use msgpack variants
-let (size, bytes) = to_wire_format_variable_msgpack(&message, compression)?;
-let decoded: MyMessage = from_wire_format_variable_msgpack(&bytes, compression, size)?;
+Avoids extra disk read for small event batches.
+
+### CRC placement for versioned blocks
+
+```
+[CRC32C][Version][Payload...]
 ```
 
-### Fixed-size messages (low-level)
+CRC covers version + payload. Verified before deserialization to detect corruption early. Version checked after CRC passes to provide meaningful errors.
 
-For small, fixed-layout messages where you want stack allocation:
+### Why return uncompressed_size?
 
-```rust
-let mut buffer = [0u8; 64];
-let len = to_wire_format_fixed(&message, &mut buffer)?;
-let decoded: MyMessage = from_wire_format_fixed(&buffer[..len])?;
-```
+Variable serialization returns `(uncompressed_size, compressed_bytes)`. The uncompressed size is required for decompression (zstd/brotli need allocation hint) and stored in wire headers for validation.
 
-### Wire header framing
+## Performance Summary
 
-For TCP streams, `WireHeader` handles framing:
+From benchmarks (bincode, 100 events × 1KB):
 
-```rust
-use celeriant_wire::wire_header::WireHeader;
+| Compression | Roundtrip | Throughput |
+|-------------|-----------|------------|
+| none | 12µs | 8 GB/s |
+| zstd_3 | 27µs | 3.5 GB/s |
+| snappy | 21µs | 4.6 GB/s |
 
-// Write framed message
-WireHeader::write_variable_size(&mut writer, &message, REQUEST_TYPE, compression, None, PROTOCOL_VERSION_V2).await?;
-
-// Read framed message
-let header = WireHeader::from_reader(&mut reader).await?;
-let message: MyMessage = header.read_variable_size(&mut reader, None).await?;
-```
-
-## Performance
-
-From benchmarks (see `benches/celeriant_wire.txt`):
-
-| Format | Compression | 100 events × 1KB | Throughput |
-|--------|-------------|------------------|------------|
-| bincode | none | 12.6µs | 7.6 GB/s |
-| bincode | zstd_3 | 26.4µs | 3.6 GB/s |
-| bincode | snappy | 21.2µs | 4.5 GB/s |
-| msgpack | none | 87.2µs | 1.1 GB/s |
-| msgpack | zstd_3 | 110.5µs | 884 MB/s |
-
-bincode without compression is ~7x faster than msgpack. With compression, the gap narrows as compression dominates.
+msgpack is ~7x slower than bincode uncompressed; gap narrows with compression.
 
 ## Dependencies
 
 - `bincode` - Rust-native binary serialization
-- `rmp-serde` - MessagePack serialization
+- `rmp-serde` - MessagePack for cross-language clients
 - `zstd`, `snap`, `brotli`, `flate2` - Compression algorithms
+- `crc32c` - Hardware-accelerated checksums
 - `futures-lite` - Async I/O traits

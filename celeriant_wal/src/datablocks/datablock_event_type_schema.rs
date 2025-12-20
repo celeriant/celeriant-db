@@ -1,9 +1,9 @@
 use bincode::{Decode, Encode};
 use deepsize::DeepSizeOf;
 
-/// Track the schemas for each event type.
+///TODO: Track the schemas for each event type.
 #[derive(Debug, Clone, Encode, Decode, DeepSizeOf)]
-pub struct EventTypeSchema {
+pub struct DatablockEventTypeSchema {
     /// Could be json, avro, protobuf, msgpack, etc.
     pub schema_type: u8,
 

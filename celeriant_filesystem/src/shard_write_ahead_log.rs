@@ -10,14 +10,14 @@ use celeriant_wal::{
         BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED, FIXED_BLOCK_SIZE_BYTES,
         MINIBATCH_SIZE_BYTES,
     }, datablocks::{
-        event_batch_item::EventBatchItem, event_item::EventItem, wal_datablock::WalDatablock,
+        datablock_aggregate_event_batch::DatablockAggregateEventBatch, datablock_aggregate_event::DatablockAggregateEvent, datablock::Datablock,
     }, metablocks::{
-        datablock_style::DatablockStyle, event_batch_metadata::{EventBatchMetadata, EventTypesData}, wal_metablock::WalMetablock
+        datablock_storage_kind::DatablockStyle, metablock_event_batch::{MetablockEventBatch, EventTypesKind}, metablock::Metablock
     }
 };
 use celeriant_wire::{
     version_aware_wire_format::
-        serialize_fixed_len_with_version
+        serialize_versioned_message
     ,
     wire_format::to_wire_format_variable,
 };
@@ -79,7 +79,7 @@ impl ShardWriteAheadLog {
         for (_batch_index, recent_write) in cached_writes {
             // Extract metadata from metablock
             let metadata = match &recent_write.metablock {
-                WalMetablock::EventBatchMetadata(meta) => meta,
+                Metablock::EventBatchMetadata(meta) => meta,
                 _ => continue, // Skip non-event-batch metablocks
             };
             
@@ -102,7 +102,7 @@ impl ShardWriteAheadLog {
                 DatablockStyle::Block { .. } => {
                     // Get from recent_write.datablock (cached in memory)
                     match &recent_write.datablock {
-                        Some(WalDatablock::EventBatch(item)) => Some(item.clone()),
+                        Some(Datablock::EventBatch(item)) => Some(item.clone()),
                         _ => None, // Not in cache - would need disk read
                     }
                 }
@@ -134,20 +134,20 @@ impl ShardWriteAheadLog {
         compressed_size: usize,
         compression_type: u8,
         uncompressed_size: u64,
-    ) -> Result<Option<EventBatchItem>, ShardLogWriteError> {
+    ) -> Result<Option<DatablockAggregateEventBatch>, ShardLogWriteError> {
         use celeriant_wal::compression_type::CompressionType;
-        use celeriant_wire::wire_format::from_wire_format_variable;
+        use celeriant_wire::wire_format::bincode_variable_deserialise;
         
         let compression = CompressionType::from_tuple(compression_type, None);
         
-        let datablock: WalDatablock = from_wire_format_variable(
+        let datablock: Datablock = bincode_variable_deserialise(
             &minibatch[..compressed_size],
             compression,
             uncompressed_size as usize,
         )?;
         
         match datablock {
-            WalDatablock::EventBatch(item) => Ok(Some(item)),
+            Datablock::EventBatch(item) => Ok(Some(item)),
             _ => Ok(None),
         }
     }
@@ -308,7 +308,7 @@ impl ShardWriteAheadLog {
             let events_in_batch = std::mem::take(&mut write_request.events);
 
             // Create EventBatchItem from events with next index, don't increment struct state yet though
-            let event_batch_item = EventBatchItem::new(
+            let event_batch_item = DatablockAggregateEventBatch::new(
                 write_response.event_batch_index,
                 server_timestamp,
                 write_request.client_id,
@@ -322,12 +322,12 @@ impl ShardWriteAheadLog {
             let (event_types, use_bloom) = extract_unique_event_types(&event_batch_item.events);
             let event_types_data = if use_bloom {
                 let bloom_bytes = self.create_bloom_filter_bytes(&event_batch_item.events);
-                EventTypesData::Bloom(bloom_bytes)
+                EventTypesKind::Bloom(bloom_bytes)
             } else {
-                EventTypesData::Direct(event_types)
+                EventTypesKind::Direct(event_types)
             };
 
-            let datablock = WalDatablock::EventBatch(event_batch_item);
+            let datablock = Datablock::EventBatch(event_batch_item);
 
             // Serialize and compress the wal_datablock
             let (uncompressed_size, datablock_bytes) =
@@ -347,12 +347,12 @@ impl ShardWriteAheadLog {
 
             // Extract reference from datablock instead of cloning
             let event_batch_item_ref = match &datablock {
-                WalDatablock::EventBatch(item) => item,
+                Datablock::EventBatch(item) => item,
                 _ => unreachable!("We just created an EventBatch variant"),
             };
 
             // Create and serialize metadata
-            let event_batch_metadata = EventBatchMetadata::from_batch_item(
+            let event_batch_metadata = MetablockEventBatch::from_batch_item(
                 write_request.aggregate_key.clone(),
                 event_batch_item_ref,
                 0, //Don't need to set datablock position yet
@@ -364,7 +364,7 @@ impl ShardWriteAheadLog {
                 minibatch,
             );
             let latest_client_event_index = event_batch_metadata.max_client_event_index;
-            let metablock = WalMetablock::EventBatchMetadata(event_batch_metadata);
+            let metablock = Metablock::EventBatchMetadata(event_batch_metadata);
 
             let shard_log_queue_item = ShardLogQueueItem {
                 datablock_bytes: if minibatch.is_none() {
@@ -411,7 +411,7 @@ impl ShardWriteAheadLog {
         Ok(write_response)
     }
 
-    fn create_bloom_filter_bytes(&self, events: &[EventItem]) -> [u64; BLOOM_BYTES / 8] {
+    fn create_bloom_filter_bytes(&self, events: &[DatablockAggregateEvent]) -> [u64; BLOOM_BYTES / 8] {
         let mut bloom_filter = self.bloom_filter.borrow_mut();
         let mut event_type_dedup = self.event_type_dedup.borrow_mut();
 
@@ -551,7 +551,7 @@ async fn sync_with_rollback(
             for queue_item in pending_append_queue {
 
                 match queue_item.metablock {
-                    WalMetablock::EventBatchMetadata(event_batch_metadata) => {
+                    Metablock::EventBatchMetadata(event_batch_metadata) => {
 
                         // Build watched_aggregates events
                         write_events
@@ -574,7 +574,7 @@ async fn sync_with_rollback(
                         //update in-memory cache
                         let aggregate_key = event_batch_metadata.aggregate_key.clone();
                         let batch_index = event_batch_metadata.event_batch_index;
-                        let metablock = WalMetablock::EventBatchMetadata(event_batch_metadata);
+                        let metablock = Metablock::EventBatchMetadata(event_batch_metadata);
 
                         let size_bytes = (metablock.deep_size_of() as u64
                             + queue_item.datablock.deep_size_of() as u64) * 3;
@@ -588,9 +588,9 @@ async fn sync_with_rollback(
                             size_bytes,
                         );
                     },
-                    WalMetablock::SnapshotOrg(_snapshot_org) => {},
-                    WalMetablock::SnapshotAggregatSnapshotAggregateType(_snapshot_aggregate_type) => {},
-                    WalMetablock::SnapshotAggregate(_snapshot_aggregate) => {},
+                    Metablock::SnapshotOrg(_snapshot_org) => {},
+                    Metablock::SnapshotAggregatSnapshotAggregateType(_snapshot_aggregate_type) => {},
+                    Metablock::SnapshotAggregate(_snapshot_aggregate) => {},
                 }
             }
 
@@ -679,7 +679,7 @@ async fn sync(shard_log_dma_file: &mut ShardLogDmaFile, sync_positions_snapshot:
         
         if item.datablock.is_some() {
             match &mut item.metablock {
-                WalMetablock::EventBatchMetadata(event_batch_metadata) => {
+                Metablock::EventBatchMetadata(event_batch_metadata) => {
                     if let DatablockStyle::Block { datablock_position, .. } = &mut event_batch_metadata.datablock {
                         *datablock_position = datablocks_absolute_write_positions[index];
                     }
@@ -690,9 +690,9 @@ async fn sync(shard_log_dma_file: &mut ShardLogDmaFile, sync_positions_snapshot:
         }
 
         let mut metablock_bytes = [0u8; FIXED_BLOCK_SIZE_BYTES];
-        serialize_fixed_len_with_version(
+        serialize_versioned_message(
             &item.metablock,
-            celeriant_wal::metablocks::wal_metablock::CURRENT_VERSION,
+            celeriant_wal::metablocks::metablock::WIRE_VERSION_WAL_METABLOCK,
             &mut metablock_bytes,
         )?;
 
@@ -715,7 +715,7 @@ async fn sync(shard_log_dma_file: &mut ShardLogDmaFile, sync_positions_snapshot:
     Ok(())
 }
 
-fn extract_unique_event_types(events: &[EventItem]) -> ([u64; 4], bool) {
+fn extract_unique_event_types(events: &[DatablockAggregateEvent]) -> ([u64; 4], bool) {
     let mut bloom_or_event_types = [u64::MAX, u64::MAX, u64::MAX, u64::MAX];
     let mut use_bloom = false;
     let mut unique_count = 0;

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use celeriant_disk::files::open_dma_files::{existing_file_dma, open_or_create_file_dma};
 use celeriant_wal::{constants::FIXED_BLOCK_SIZE_BYTES, shard_log_header::ShardLogHeader};
-use celeriant_wire::version_aware_wire_format::{deserialize_shard_log_header_versioned, serialize_fixed_len_with_version};
+use celeriant_wire::version_aware_wire_format::{deserialize_versioned_shard_log_header, serialize_versioned_message};
 use glommio::io::DmaFile;
 
 use crate::rotating_log_error::RotatingLogError;
@@ -147,7 +147,7 @@ async fn load_header_detecting_corruption(
     log_id: u64,
 ) -> Result<ShardLogHeader, RotatingLogError> {
     let header_bytes = dma_file.read_at(0, FIXED_BLOCK_SIZE_BYTES).await?;
-    match deserialize_shard_log_header_versioned(&header_bytes) {
+    match deserialize_versioned_shard_log_header(&header_bytes) {
         Ok((shard_log_header, _version)) => Ok(shard_log_header),
         Err(_primary_err) => {
             // Primary header failed, try backup at end of file
@@ -157,7 +157,7 @@ async fn load_header_detecting_corruption(
                     FIXED_BLOCK_SIZE_BYTES,
                 )
                 .await?;
-            match deserialize_shard_log_header_versioned(&header_bytes) {
+            match deserialize_versioned_shard_log_header(&header_bytes) {
                 Ok((shard_log_header, _version)) => Ok(shard_log_header),
                 Err(_backup_err) => Err(RotatingLogError::HeaderCorrupted { log_id: Some(log_id) }),
             }
@@ -202,7 +202,7 @@ async fn write_dual_shard_log_header(
     header: &ShardLogHeader,
 ) -> Result<(), RotatingLogError> {
     let mut header_bytes = dma_file.alloc_dma_buffer(FIXED_BLOCK_SIZE_BYTES);
-    serialize_fixed_len_with_version(
+    serialize_versioned_message(
         &header,
         celeriant_wal::shard_log_header::CURRENT_VERSION,
         header_bytes.as_bytes_mut(),
@@ -210,7 +210,7 @@ async fn write_dual_shard_log_header(
     dma_file.write_at(header_bytes, 0).await?;
 
     let mut header_bytes = dma_file.alloc_dma_buffer(FIXED_BLOCK_SIZE_BYTES);
-    serialize_fixed_len_with_version(
+    serialize_versioned_message(
         &header,
         celeriant_wal::shard_log_header::CURRENT_VERSION,
         header_bytes.as_bytes_mut(),

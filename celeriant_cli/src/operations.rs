@@ -11,7 +11,7 @@ use celeriant_msg::{
 use celeriant_wal::{
     aggregate_key::AggregateKey,
     compression_type::CompressionType,
-    datablocks::event_item::EventItem,
+    datablocks::datablock_aggregate_event::DatablockAggregateEvent,
 };
 use std::fs;
 
@@ -137,7 +137,7 @@ async fn write_event(client: &mut CeleriantClient, args: WriteArgs) -> Result<()
         anyhow::bail!("Either --data or --file must be provided");
     };
 
-    let event = EventItem {
+    let event = DatablockAggregateEvent {
         event_type_major: args.event_type,
         client_event_index: 0,
         event_timestamp: chrono::Utc::now().timestamp_millis() as u64,

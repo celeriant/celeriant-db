@@ -7,9 +7,9 @@ use crate::{
     constants::{PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3, WIRE_FIXED_BODY_SIZE, WIRE_HEADER_SIZE},
     wire_error::WireError,
     wire_format::{
-        from_wire_format_fixed, from_wire_format_fixed_msgpack, from_wire_format_variable,
-        from_wire_format_variable_msgpack, to_wire_format_fixed, to_wire_format_fixed_msgpack,
-        to_wire_format_variable, to_wire_format_variable_msgpack,
+        bincode_fixed_deserialise, msgpack_fixed_deserialise, bincode_variable_deserialise,
+        msgpack_variable_deserialise, bincode_fixed_serialise, msgpack_fixed_serialise,
+        bincode_variable_serialise, msgpack_variable_serialise,
     },
 };
 
@@ -100,9 +100,9 @@ impl WireHeader {
 
         let obj = match self.version {
             PROTOCOL_VERSION_V2 => {
-                from_wire_format_variable(&payload, self.compression_type, uncompressed_length)?
+                bincode_variable_deserialise(&payload, self.compression_type, uncompressed_length)?
             }
-            PROTOCOL_VERSION_V3 => from_wire_format_variable_msgpack(
+            PROTOCOL_VERSION_V3 => msgpack_variable_deserialise(
                 &payload,
                 self.compression_type,
                 uncompressed_length,
@@ -144,8 +144,8 @@ impl WireHeader {
             .await?;
 
         let obj: T = match self.version {
-            PROTOCOL_VERSION_V2 => from_wire_format_fixed(&buffer[..uncompressed_length])?.0,
-            PROTOCOL_VERSION_V3 => from_wire_format_fixed_msgpack(&buffer[..uncompressed_length])?,
+            PROTOCOL_VERSION_V2 => bincode_fixed_deserialise(&buffer[..uncompressed_length])?.0,
+            PROTOCOL_VERSION_V3 => msgpack_fixed_deserialise(&buffer[..uncompressed_length])?,
             _ => return Err(WireError::UnsupportedProtocol(self.version)),
         };
 
@@ -174,9 +174,9 @@ impl WireHeader {
 
         // Encode message based on version
         let encoded_len = match protocol_version {
-            PROTOCOL_VERSION_V2 => to_wire_format_fixed(message, &mut buffer[WIRE_HEADER_SIZE..])?,
+            PROTOCOL_VERSION_V2 => bincode_fixed_serialise(message, &mut buffer[WIRE_HEADER_SIZE..])?,
             PROTOCOL_VERSION_V3 => {
-                to_wire_format_fixed_msgpack(message, &mut buffer[WIRE_HEADER_SIZE..])?
+                msgpack_fixed_serialise(message, &mut buffer[WIRE_HEADER_SIZE..])?
             }
             _ => return Err(WireError::UnsupportedProtocol(protocol_version)),
         };
@@ -221,8 +221,8 @@ impl WireHeader {
     {
         // Encode and compress based on version
         let (uncompressed_size, encoded) = match version {
-            PROTOCOL_VERSION_V2 => to_wire_format_variable(message, compression_type)?,
-            PROTOCOL_VERSION_V3 => to_wire_format_variable_msgpack(message, compression_type)?,
+            PROTOCOL_VERSION_V2 => bincode_variable_serialise(message, compression_type)?,
+            PROTOCOL_VERSION_V3 => msgpack_variable_serialise(message, compression_type)?,
             _ => return Err(WireError::UnsupportedProtocol(version)),
         };
 
