@@ -32,13 +32,14 @@ Each server runs one executor per CPU core. Each core owns a subset of aggregate
 
 ### S3 as Control Plane
 
-We don't implement Raft or Paxos. Instead, we use S3's conditional writes (If-Match/If-None-Match) for lease-based coordination. This sounds crazy until you realise:
+We don't implement Raft or Paxos. Instead, we use S3's conditional writes (If-Match/If-None-Match) for lease-based coordination.
 
 1. S3 provides strong read-after-write consistency
 2. Conditional writes give you compare-and-swap semantics
-3. S3 is more available than your cluster will ever be
+3. Leader doesn't renew lease with S3 constantly, only in leader transition. If S3 goes down, your cluster stays up.
+4. The cluster only runs with two nodes, a leader and a follower. If the follower goes down, data is replicated to S3 before ack to client. If the leader goes down, the follower becomes leader and the cluster continues to operate.
 
-Leases are stored in S3. Data replication is synchronous TCP to a quorum. This design requires syncronised clocks but simplifies everything else.
+Leases are stored in S3. This design requires syncronised clocks but simplifies everything else. 
 
 ### Data Path
 
@@ -54,9 +55,9 @@ Lease Check (cached, validated against S3)
 Local Append + amortised fsync
     │
     ▼
-Concurrent Replication to Followers
+Concurrent Replication to Follower
     │
-    └─ Timeout or split-brain? Rollback local write(s).
+    └─ Timeout? Replicate to S3 instead
     │
     ▼
 Client ACK
@@ -83,12 +84,15 @@ Kafka on the same hardware with default settings (no fsync): ~40,000 writes/sec.
 
 - **Per-aggregate total ordering** - Events within an aggregate are strictly ordered, no gaps
 - **Optimistic concurrency control** - Writes can specify expected batch index
+- **Dynamic Consistency Boundaries** - Conditionally, atomically write events to multiple aggregates
 - **Client idempotency** - Deduplication via client-assigned event indexes
 - **Event type filtering** - Read only events of specific types, bloom filter acceleration
+- **Schema Validation** - Enforce schemas at the event type level per aggregate type
 - **Compression** - Zstd, Snappy, Brotli, Gzip per-batch
 - **In-memory read cache** - Recent events served from memory
 - **Explicit offsets** - You control your read position for each aggregate
-- **Distributed, Redundant Replication** - Synchronous replication to multiple nodes
+- **Distributed, Redundant Replication** - Synchronous replication to follower node
+- **Watch API** - Get notified immediately when other clients perform operations on aggregates
 
 ### What You Don't Get
 
@@ -98,7 +102,7 @@ Kafka on the same hardware with default settings (no fsync): ~40,000 writes/sec.
 - Consumer groups
 - Automatic offset management
 
-This is intentional. Celeriant is a primitive you build on, not a complete platform.
+It's not a state machine, a message streaming platform or a queue.
 
 ## API
 
@@ -124,9 +128,7 @@ This server is LINUX ONLY due to io_uring use. It can run inside mac/windows usi
 ### Single Node
 
 ```bash
-./celeriant_server \
-    --data-root /var/lib/celeriant \
-    --listen-address 0.0.0.0:10000
+./celeriant --data-root /var/lib/celeriant
 ```
 
 By default Celeriant will utilise all CPU cores on your server.
@@ -150,7 +152,7 @@ docker run -d \
     --name celeriant \
     -p 10000:10000 \
     -v celeriant-data:/app/data \
-    celeriant/celeriant-server:latest
+    celeriant/celeriant-db:latest
 ```
 
 ## Use Cases
@@ -169,7 +171,6 @@ If you need a fast, correct log per "thing" and you'll build the read side yours
 ## When Not to Use It
 
 - You need ad-hoc queries over aggregate state (use a read database)
-- You need cross-aggregate transactions (not implemented yet, consider sagas or other architectural patterns)
 - You want server-managed consumer groups for message fan-out (use Kafka)
 
 ## Status
@@ -177,9 +178,8 @@ If you need a fast, correct log per "thing" and you'll build the read side yours
 **Alpha**. The core is stable and we're running it in production, but the API may change.
 
 ### Roadmap
-- Atomic, cross aggregate writes (think debit+credit pattern on two aggregates)
 - Data tiering - reduce costs by offloading data to object storage / glacier
-- Hosted service - get up and running today!
+- Hosted services - managed Celeriant as a service
 - Admin UI / control plane
 - Fine-grained permissions - OAuth2, etc.
 
@@ -193,7 +193,7 @@ cargo build --release -p celeriant_server
 
 ## Contributing
 
-Discussions and PRs welcome. The codebase prioritises correctness and simplicity over micro-optimisation. If you're proposing a change, include tests and benchmarks.
+Discussions and PRs welcome. The codebase prioritises correctness and simplicity. If you're proposing a change, include tests and updated benchmarks.
 
 - Questions or bugs? [Open a GitHub Discussion](https://github.com/celeriant/celeriant-server/discussions)
 - Commercial inquiries? [LinkedIn](https://www.linkedin.com/in/tyson-brown-208b88b6)
