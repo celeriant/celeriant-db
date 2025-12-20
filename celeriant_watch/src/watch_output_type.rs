@@ -2,6 +2,7 @@ use celeriant_msg::response::responses::WatchResponse;
 
 /// The types of actions the shard needs to take when
 /// interacting with a client over a live tcp connection
+#[derive(Debug, Clone)]
 pub enum WatchOutputType {
 
     /// We have batched up a bunch of events and require

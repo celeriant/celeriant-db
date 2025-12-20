@@ -16,3 +16,5 @@ tempfile.workspace = true
 uuid.workspace = true
 criterion.workspace = true
 num_cpus.workspace = true
+rand.workspace = true
+futures-lite.workspace = true

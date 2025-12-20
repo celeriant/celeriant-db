@@ -503,8 +503,10 @@ dependencies = [
  "celeriant_wal",
  "celeriant_wire",
  "criterion",
+ "futures-lite",
  "glommio",
  "num_cpus",
+ "rand 0.8.5",
  "tempfile",
  "uuid",
 ]

@@ -2,6 +2,8 @@
 
 Rotating log file management for the Celeriant write-ahead log (WAL). This crate handles log file lifecycle, rotation, caching, and crash recovery using direct I/O.
 
+**LLM GENERATED -> HUMAN REVIEWED 2025-12-20**
+
 ## Overview
 
 ```
@@ -29,17 +31,17 @@ Rotating log file management for the Celeriant write-ahead log (WAL). This crate
 Each log file is preallocated to a fixed size with dual headers for crash recovery:
 
 ```
-┌─────────────────────────────────────────────────────────────┐
+┌──────────────────────────────────────────────────────────────┐
 │ Header (512 bytes) - metablocks_position, datablocks_position│
-├─────────────────────────────────────────────────────────────┤
-│ Metablocks (512 bytes each, growing forward →)              │
-│                                                             │
-├ ─ ─ ─ ─ ─ ─ ─ ─ ─ Free Space ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┤
-│                                                             │
-│              Datablocks (variable, growing ← backward)      │
-├─────────────────────────────────────────────────────────────┤
-│ Header (512 bytes) - duplicate for torn write recovery      │
-└─────────────────────────────────────────────────────────────┘
+├──────────────────────────────────────────────────────────────┤
+│ Metablocks (512 bytes each, growing forward →)               │
+│                                                              │
+├ ─ ─ ─ ─ ─ ─ ─ ─ ─ Free Space ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┤
+│                                                              │
+│              Datablocks (variable, growing ← backward)       │
+├──────────────────────────────────────────────────────────────┤
+│ Header (512 bytes) - duplicate for torn write recovery       │
+└──────────────────────────────────────────────────────────────┘
 
 File: log_1.wal, log_2.wal, log_3.wal, ...
 ```
@@ -166,50 +168,6 @@ Dual headers enable recovery from torn writes:
 1. **Normal state**: Front and back headers match
 2. **Torn write during header update**: Back header has last-known-good state
 3. **Recovery**: If front header CRC fails, use back header
-
-```rust
-// Header write order (in write_new_headers_and_fsync):
-// 1. Write front header
-// 2. Write back header  
-// 3. fdatasync()
-
-// Recovery order (in open_existing):
-// 1. Try front header
-// 2. If CRC fails, try back header
-// 3. If both fail, return HeaderCorrupted
-```
-
-## Configuration
-
-### Preallocate Bytes
-
-Must be:
-- Block-aligned (multiple of 512 bytes)
-- At least 3 blocks (1536 bytes) for dual headers + minimal data
-- Typically 1 GB depending on workload
-
-```rust
-// Valid
-let size = 64 * 1024; // 64 KiB
-
-// Invalid - not aligned
-let size = 64 * 1024 + 100; // Error: InvalidPreallocatedBytes
-
-// Invalid - too small
-let size = 512; // Error: InvalidPreallocatedBytes (need > 2 blocks)
-```
-
-### Max Cached Files
-
-Controls OS file descriptor usage for reader access to old log files:
-
-```rust
-// Minimum 1 (clamped internally)
-let cache = RotatingLogCache::new(dir, size, 0).await?; // Uses 1
-
-// Typical: 2-10 depending on read patterns
-let cache = RotatingLogCache::new(dir, size, 5).await?;
-```
 
 ## Error Handling
 

@@ -5,3 +5,6 @@ pub mod watch_session;
 pub mod aggregate_reader;
 pub mod watcher_handle;
 pub mod watch_output_type;
+
+#[cfg(test)]
+mod tests;

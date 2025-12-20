@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use celeriant_disk::files::open_dma_files::{existing_file_dma, open_or_create_file_dma};
-use celeriant_wal::{constants::FIXED_BLOCK_SIZE_BYTES, shard_log_header::ShardLogHeader};
+use celeriant_wal::{constants::{FIXED_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_SHARD_LOG_HEADER}, shard_log_header::ShardLogHeader};
 use celeriant_wire::version_aware_wire_format::{deserialize_versioned_shard_log_header, serialize_versioned_message};
 use glommio::io::DmaFile;
 
@@ -204,7 +204,7 @@ async fn write_dual_shard_log_header(
     let mut header_bytes = dma_file.alloc_dma_buffer(FIXED_BLOCK_SIZE_BYTES);
     serialize_versioned_message(
         &header,
-        celeriant_wal::shard_log_header::CURRENT_VERSION,
+        WIRE_VERSION_WAL_SHARD_LOG_HEADER,
         header_bytes.as_bytes_mut(),
     )?;
     dma_file.write_at(header_bytes, 0).await?;
@@ -212,7 +212,7 @@ async fn write_dual_shard_log_header(
     let mut header_bytes = dma_file.alloc_dma_buffer(FIXED_BLOCK_SIZE_BYTES);
     serialize_versioned_message(
         &header,
-        celeriant_wal::shard_log_header::CURRENT_VERSION,
+        WIRE_VERSION_WAL_SHARD_LOG_HEADER,
         header_bytes.as_bytes_mut(),
     )?;
     dma_file

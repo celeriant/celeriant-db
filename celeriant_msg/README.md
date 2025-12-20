@@ -1,203 +1,138 @@
 # celeriant_msg
 
-Request and response message types for the Celeriant wire protocol. This crate defines the message structures that clients and servers exchange over TCP.
+Request and response message definitions for the Celeriant wire protocol. Defines all client-server message types with serialization support.
 
-## Overview
+**LLM GENERATED -> HUMAN REVIEWED [2025-12-20]**
+
+## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      Wire Frame                             │
-├─────────────────┬───────────────────────────────────────────┤
-│  Header (17B)   │  Request or Response payload              │
-│  version, type  │  (serialized via celeriant_wire)          │
-└─────────────────┴───────────────────────────────────────────┘
+Client                                    Server
+   │                                         │
+   │  Request (ExistsRequest, ReadRequest,   │
+   │           WriteRequest, etc.)           │
+   │────────────────────────────────────────>│
+   │                                         │
+   │  Response (ExistsResponse, ReadResponse,│
+   │            WriteResponse, ErrorResponse)│
+   │<────────────────────────────────────────│
+   │                                         │
+
+Message Categories:
+┌─────────────────────────────────────────────────────┐
+│ Fixed-Size (stack buffer, no compression)           │
+│   Exists, Read, TrimStart, Delete, Watch requests   │
+│   Exists, Write, TrimStart, Delete, Error responses │
+├─────────────────────────────────────────────────────┤
+│ Variable-Size (heap allocation, compressed)         │
+│   Write requests (contain event payloads)           │
+│   Read, Watch responses (contain event batches)     │
+└─────────────────────────────────────────────────────┘
 ```
 
-This crate provides the message definitions. Serialization and framing are handled by `celeriant_wire`.
+## Key Types
 
-## Request Types
+### Requests
 
-| Type | Description | Fixed Size |
-|------|-------------|------------|
-| `Write` | Append events to an aggregate | No |
-| `Read` | Read events with filters | Yes |
-| `Exists` | Check aggregate existence and get bounds | Yes |
-| `ListOrganisations` | List organisations with filters | Yes |
-| `ListAggregates` | List aggregates within an org | Yes |
-| `TrimStart` | Remove events before a batch index | Yes |
-| `Delete` | Remove an entire aggregate | Yes |
+| Type | Fixed | Purpose |
+|------|-------|---------|
+| `ExistsRequest` | ✓ | Check if aggregate exists, get min batch index |
+| `ReadRequest` | ✓ | Read event batches with filters/pagination |
+| `WriteRequest` | ✗ | Append events to aggregate |
+| `TrimStartRequest` | ✓ | Remove old event batches from start |
+| `DeleteRequest` | ✓ | Delete entire aggregate |
+| `WatchRequest` | ✓ | Subscribe to aggregate changes |
 
-Fixed-size requests use stack-allocated buffers and skip compression. Variable-size requests support compression.
+### Responses
 
-## Response Types
+| Type | Fixed | Purpose |
+|------|-------|---------|
+| `ExistsResponse` | ✓ | Returns min_event_batch_index |
+| `ReadResponse` | ✗ | Returns event batches + next index |
+| `WriteResponse` | ✓ | Returns assigned indexes, timestamp, CRC |
+| `SuccessResponse` | ✓ | Generic success (TrimStart, Delete) |
+| `WatchResponse` | ✗ | Streaming aggregate change notifications |
+| `ProtocolErrorResponse` | ✓ | Unreadable request (no correlation_id) |
+| `ErrorResponse` | ✓ | Application error with code and message |
 
-| Type | Description | Fixed Size |
-|------|-------------|------------|
-| `Write` | Batch index, timestamp, CRC | Yes |
-| `Read` | Event batches, next batch index | No |
-| `Exists` | Min/max batch index, size | Yes |
-| `ListOrganisations` | Organisation info list | No |
-| `ListAggregates` | Aggregate info list | No |
-| `TrimStart` | Success acknowledgement | Yes |
-| `Delete` | Success acknowledgement | Yes |
-| `ProtocolError` | Malformed request (no correlation ID) | Yes |
+### Supporting Types
 
-## Error Handling
+| Type | Purpose |
+|------|---------|
+| `ReadFilters` | Pagination and filtering options for reads |
+| `WatchEvent` | Single aggregate change notification |
+| `Request` | Enum wrapper for all request types |
+| `Response` | Enum wrapper for all response types |
 
-Errors are indicated by the response type, not by a status field within responses.
+## Key Functions
 
-**Application errors** return an `ErrorResponse`:
+| Function | Purpose |
+|----------|---------|
+| `Request::read_request` | Deserialize request from async reader |
+| `Request::write_request` | Serialize request to async writer |
+| `Response::read_response` | Deserialize response from async reader |
+| `Response::write_response` | Serialize response to async writer |
+| `ReadFilters::new(from)` | Create filters starting at batch index |
+
+## Design Decisions
+
+### Fixed vs variable size messages
+
+Fixed-size messages use stack-allocated buffers and skip compression — optimal for small metadata operations. Variable-size messages (Write requests, Read/Watch responses) contain event payloads that benefit from compression.
+
+### Correlation IDs
+
+All requests have `correlation_id: Option<u128>`. Clients assign these to match responses to requests. `ProtocolErrorResponse` has no correlation_id since the request couldn't be parsed.
+
+### Type IDs are contiguous from 1
+
+Request types: 1-6, Response types: 1-8. Zero is invalid. This enables fast validation and compact representation.
+
+### ReadFilters builder pattern
 
 ```rust
-pub struct ErrorResponse {
-    pub correlation_id: Option<u128>,
-    pub error_code: u32,
-    pub error_message: String,
-}
+let filters = ReadFilters::new(1)
+    .to_event_batch_index(100)
+    .include_event_types(vec![1, 2, 3])
+    .exclude_client_id(my_client_id)
+    .time_range(start_ts, end_ts);
 ```
 
-The `correlation_id` matches the request that caused the error, allowing clients to associate errors with pending requests in async pipelines.
+Provides ergonomic filter construction without constructor explosion.
 
-**Protocol errors** return a `ProtocolErrorResponse`:
+### Error response types
 
-```rust
-pub struct ProtocolErrorResponse {
-    // No correlation_id - request was unparseable
-}
-```
+| Type | When Used |
+|------|-----------|
+| `ProtocolErrorResponse` | Wire-level failure, request unreadable |
+| `ErrorResponse` | Application error (validation, not found, etc.) |
 
-This is returned when the server cannot parse the request at all. No correlation ID is available because the request body was malformed. V3 of the wire format is used (messagepack).
+### Watch subscription model
 
-**Wire-level errors** occur before any response is returned:
+`WatchRequest` specifies filters (orgs, aggregate types, specific aggregates, operation types). Server pushes `WatchResponse` with batched changes. `WatchEvent` contains batch index ranges and trim notifications.
 
-| Error | Cause |
-|-------|-------|
-| `WireError::UnknownRequestType` | Unrecognised request type ID |
-| `WireError::UnknownResponseType` | Unrecognised response type ID |
-| `WireError::MessageTooLarge` | Payload exceeds size limit |
-| `WireError::UnsupportedProtocol` | Unknown protocol version |
-| `WireError::NetworkError` | TCP connection failure |
+### WriteRequest fields
 
-Handle wire errors by closing and reconnecting. Handle `ErrorResponse` based on `error_code`. Handle `ProtocolErrorResponse` by logging and investigating the client's serialisation logic.
+| Field | Purpose |
+|-------|---------|
+| `allow_create` | Create aggregate if doesn't exist |
+| `expected_event_batch_index` | Optimistic concurrency check |
+| `enforce_client_idempotency` | Reject duplicate client_event_index |
+| `compression_type` | How events are compressed in storage |
 
-## Correlation IDs
+### WriteResponse completeness
 
-All requests include an optional `correlation_id: Option<u128>`. Responses echo this value back, enabling clients to match responses to requests in pipelined or multiplexed connections.
-
-```
-Client                          Server
-  │                               │
-  ├─ Request (corr_id: 42) ──────►│
-  ├─ Request (corr_id: 43) ──────►│
-  │                               │
-  │◄──── Response (corr_id: 43) ──┤
-  │◄──── Response (corr_id: 42) ──┤
-```
-
-Responses may arrive out of order. Use correlation IDs to dispatch correctly.
-
-## Filters
-
-### ReadFilters
-
-Controls which event batches are returned from a `Read` request:
-
-```rust
-ReadFilters::new(1)                          // Start from batch 1
-    .to_event_batch_index(100)               // Stop at batch 100
-    .include_event_types(vec![1, 2, 3])      // Only these event types
-    .exclude_client_id(client_id)            // Skip own writes
-    .time_range(start_ms, end_ms)            // Server timestamp bounds
-    .event_time_range(min_ts, max_ts)        // Client event timestamp bounds
-```
-
-Filters are evaluated server-side using batch metadata before decompression. Bloom filters accelerate event type filtering.
-
-### DirectoryFilters
-
-Controls which organisations or aggregates are returned from list operations:
-
-```rust
-pub struct DirectoryFilters {
-    pub created_after_or_on: Option<u64>,
-    pub created_before_or_on: Option<u64>,
-    pub modified_after_or_on: Option<u64>,
-    pub modified_before_or_on: Option<u64>,
-    pub disk_usage_less_than_or_equal: Option<u64>,
-    pub disk_usage_greater_than_or_equal: Option<u64>,
-}
-```
-
-## Protocol Versions
-
-Two serialisation formats are supported:
-
-| Version | Format | Use Case |
-|---------|--------|----------|
-| V2 | bincode | Rust clients |
-| V3 | msgpack | Non-Rust clients |
-
-Both produce the same logical messages. Choose based on client language:
-
-- **Rust**: Use V2 (bincode) for best performance
-- **Other languages**: Use V3 (msgpack) for standard tooling
-
-The protocol version is set per-message.
-
-## Message Size
-
-Fixed-size messages fit in a 1024-byte buffer. Variable-size messages have no inherent limit but servers may enforce `max_request_size`.
-
-When writing a `Write` request with many events, monitor compressed size. Large batches may be rejected with `WireError::MessageTooLarge`.
-
-## Key Structures
-
-### WriteRequest
-
-```rust
-pub struct WriteRequest {
-    pub correlation_id: Option<u128>,
-    pub aggregate_key: AggregateKey,          // org/type/id
-    pub client_id: u128,                      // Machine identity
-    pub user_id: Option<u128>,                // Human identity
-    pub events: Vec<EventItem>,               // Events to append
-    pub allow_create: bool,                   // Create aggregate if missing
-    pub expected_event_batch_index: Option<u64>, // OCC check
-    pub enforce_client_idempotency: bool,     // Dedupe by client_event_index
-    pub durable_write_with_delay_us: Option<u64>, // Fsync delay
-    pub compression_type: CompressionType,    // For storage
-}
-```
-
-### WriteResponse
-
-```rust
-pub struct WriteResponse {
-    pub event_batch_index: u64,    // Assigned batch number
-    pub start_event_index: u64,    // First event's server index
-    pub server_timestamp: u64,     // When persisted (Unix ms)
-    pub compressed_size: u64,      // Bytes on disk
-    pub node_id: u128,             // Which node accepted
-    pub lease_index: u64,          // Leadership term
-    pub events_crc: u32,           // Integrity check
-}
-```
-
-### ReadResponse
-
-```rust
-pub struct ReadResponse {
-    pub correlation_id: Option<u128>,
-    pub event_batches: Vec<EventBatchItem>,   // Matching batches
-    pub next_event_batch_index: Option<u64>,  // Continue from here
-}
-```
-
-`next_event_batch_index` is `Some(n)` if more batches exist beyond those returned. Use it to paginate through large aggregates.
+Returns everything needed for client-side verification and caching:
+- `event_batch_index`, `start_event_index`: Assigned positions
+- `server_timestamp`: Authoritative time
+- `compressed_size`: Storage cost
+- `node_id`, `lease_index`: Cluster routing info
+- `events_crc`: Integrity verification
 
 ## Dependencies
 
-- `celeriant_wal` - Event and batch structures
-- `celeriant_wire` - Serialisation and framing
-- `bincode`, `serde` - Encoding
+- `celeriant_wal` - Aggregate keys, event batch types, compression
+- `celeriant_wire` - Wire framing, serialization, protocol versions
+- `bincode` - Binary serialization
+- `serde` - Serialization framework
 - `futures-lite` - Async I/O traits
