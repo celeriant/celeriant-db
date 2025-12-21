@@ -14,7 +14,7 @@ members = [
     "celeriant_filesystem",
     "celeriant_sidecar", 
     "celeriant_client_demo", "celeriant_rotating_log", 
-    "celeriant_watch", "celeriant_memcache",
+    "celeriant_watch", "celeriant_memcache", "celeriant_shard",
 ]
 
 resolver = "2"

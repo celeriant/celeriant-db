@@ -1,0 +1,874 @@
+use std::{rc::Rc, time::Duration};
+use glommio::sync::RwLock;
+use crate::amortisation::local_event::LocalEvent;
+
+/// Result of a sync operation.
+pub type SyncResult<E> = Result<(), E>;
+
+/// Coordinates delayed sync with writer coalescing.
+/// 
+/// Designed for the fsync batching pattern:
+/// 1. Writer calls `request_sync()`
+/// 2. First writer becomes leader, others become followers
+/// 3. Leader sleeps for `delay` while more writers accumulate
+/// 4. Leader calls the provided sync function
+/// 5. All waiters receive the result
+/// 
+/// # Example
+/// ```ignore
+/// let coordinator = SyncCoordinator::new();
+/// 
+/// // Called from multiple concurrent writers
+/// coordinator.request_sync(
+///     Some(Duration::from_millis(5)),
+///     || async { do_fsync().await }
+/// ).await?;
+/// ```
+pub struct Coordinator<E: Clone> {
+    lock_orchestrator: RwLock<Option<Rc<LocalEvent<SyncResult<E>>>>>,
+}
+
+impl<E: Clone> Coordinator<E> {
+    pub fn new() -> Self {
+        Self {
+            lock_orchestrator: RwLock::new(None),
+        }
+    }
+
+    /// Request a sync operation, potentially coalescing with other waiters.
+    /// 
+    /// # Arguments
+    /// * `delay` - How long the leader waits before syncing. `None` for immediate.
+    /// * `sync_fn` - The actual sync operation (called only by leader).
+    /// 
+    /// # Returns
+    /// The result of the sync operation (same result for all coalesced waiters).
+    pub async fn request_sync_old<F, Fut>(&self, delay: Option<Duration>, sync_fn: F) -> SyncResult<E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = SyncResult<E>>,
+    {
+
+        if delay.is_none() || delay.unwrap().as_micros() == 0 {
+            // No delay - do immediate sync
+            return Ok(sync_fn().await?);
+        }
+
+        let delay = delay.unwrap();
+
+        loop {
+            match self.lock_orchestrator.try_write() {
+                Ok(mut maybe_event) => {
+                    // We won! Check if sync is already in progress
+                    if let Some(event) = maybe_event.as_ref() {
+                        // Another task beat us between our check and lock acquisition
+                        let event = event.clone();
+                        drop(maybe_event); // Release lock before awaiting
+                        return event.listen().await;
+                    }
+
+                    // We're the coordinator - create the event
+                    let event = Rc::new(LocalEvent::new());
+                    *maybe_event = Some(event.clone());
+                    drop(maybe_event); // Release lock while sleeping
+
+                    // Sleep for the delay period
+                    glommio::timer::sleep(delay).await;
+
+                    // Clear the event before sync (need write lock again)
+                    self.lock_orchestrator.write().await.unwrap().take();
+
+                    // Do the actual sync
+                    let sync_result = sync_fn().await;
+
+                    // Notify all waiters (both success and error)
+                    event.notify(sync_result.clone());
+
+                    return sync_result;
+                }
+                Err(_) => {
+                    let maybe_event = self.lock_orchestrator.read().await.unwrap();
+                    if let Some(event) = maybe_event.as_ref() {
+                        let event = event.clone();
+                        drop(maybe_event);
+                        return event.listen().await;
+                    }
+                    // Retry - coordinator cleared event while we were waiting
+                    continue;
+                }
+            }
+        }
+    }
+
+    pub async fn request_sync<F, Fut>(&self, delay: Option<Duration>, sync_fn: F) -> SyncResult<E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = SyncResult<E>>,
+    {
+        let delay = match delay {
+            Some(d) if d.as_micros() > 0 => d,
+            _ => return sync_fn().await,
+        };
+
+        enum Acquired<E: Clone> {
+            Leader(Rc<LocalEvent<SyncResult<E>>>),
+            Follower(Rc<LocalEvent<SyncResult<E>>>),
+            Retry,
+        }
+
+        loop {
+            let acquired = {
+                match self.lock_orchestrator.try_write() {
+                    Ok(mut guard) => match guard.as_ref() {
+                        Some(event) => Acquired::Follower(event.clone()),
+                        None => {
+                            let event = Rc::new(LocalEvent::new());
+                            *guard = Some(event.clone());
+                            Acquired::Leader(event)
+                        }
+                    },
+                    Err(_) => {
+                        let guard = self.lock_orchestrator.read().await.unwrap();
+                        match guard.as_ref() {
+                            Some(event) => Acquired::Follower(event.clone()),
+                            None => Acquired::Retry,
+                        }
+                    }
+                }
+            }; // Guards dropped here automatically
+
+            match acquired {
+                Acquired::Leader(event) => {
+                    glommio::timer::sleep(delay).await;
+                    self.lock_orchestrator.write().await.unwrap().take();
+                    let result = sync_fn().await;
+                    event.notify(result.clone());
+                    return result;
+                }
+                Acquired::Follower(event) => return event.listen().await,
+                Acquired::Retry => continue,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::future::Future;
+    use futures_lite::future::yield_now;
+    use glommio::{spawn_local, LocalExecutorBuilder, Placement};
+
+    fn run_with_glommio<G, F, T>(fut_gen: G)
+    where
+        G: FnOnce() -> F + Send + 'static,
+        F: Future<Output = T> + 'static,
+        T: Send + 'static,
+    {
+        let builder = LocalExecutorBuilder::new(Placement::Unbound);
+        let handle = builder.name("test").spawn(fut_gen).unwrap();
+        handle.join().unwrap();
+    }
+
+    // ==================== Basic Functionality ====================
+
+    #[test]
+    fn single_request_succeeds() {
+        run_with_glommio(|| async {
+            let coordinator: Coordinator<String> = Coordinator::new();
+            let call_count = Rc::new(Cell::new(0));
+
+            let cc = call_count.clone();
+            let result = coordinator
+                .request_sync(Some(Duration::from_millis(1)), || async move {
+                    cc.set(cc.get() + 1);
+                    Ok(())
+                })
+                .await;
+
+            assert!(result.is_ok());
+            assert_eq!(call_count.get(), 1);
+        });
+    }
+
+    #[test]
+    fn immediate_sync_no_delay() {
+        run_with_glommio(|| async {
+            let coordinator: Coordinator<String> = Coordinator::new();
+            let call_count = Rc::new(Cell::new(0));
+
+            // None delay
+            let cc = call_count.clone();
+            let result = coordinator
+                .request_sync(None, || async move {
+                    cc.set(cc.get() + 1);
+                    Ok(())
+                })
+                .await;
+            assert!(result.is_ok());
+            assert_eq!(call_count.get(), 1);
+
+            // Zero duration delay
+            let cc = call_count.clone();
+            let result = coordinator
+                .request_sync(Some(Duration::ZERO), || async move {
+                    cc.set(cc.get() + 1);
+                    Ok(())
+                })
+                .await;
+            assert!(result.is_ok());
+            assert_eq!(call_count.get(), 2);
+        });
+    }
+
+    #[test]
+    fn immediate_sync_bypasses_coalescing() {
+        run_with_glommio(|| async {
+            let coordinator: Rc<Coordinator<String>> = Rc::new(Coordinator::new());
+            let call_count = Rc::new(Cell::new(0));
+
+            // Multiple immediate syncs should each call sync_fn
+            let mut handles = vec![];
+            for _ in 0..5 {
+                let coord = coordinator.clone();
+                let cc = call_count.clone();
+                handles.push(spawn_local(async move {
+                    coord
+                        .request_sync(None, || async move {
+                            cc.set(cc.get() + 1);
+                            Ok(())
+                        })
+                        .await
+                }));
+            }
+
+            for h in handles {
+                h.await.unwrap();
+            }
+
+            // Each immediate sync runs independently
+            assert_eq!(call_count.get(), 5);
+        });
+    }
+
+    // ==================== Leader/Follower Logic ====================
+
+    #[test]
+    fn first_caller_becomes_leader() {
+        run_with_glommio(|| async {
+            let coordinator: Rc<Coordinator<String>> = Rc::new(Coordinator::new());
+            let leader_id = Rc::new(Cell::new(0u32));
+            let sync_called_by = Rc::new(Cell::new(0u32));
+
+            let coord = coordinator.clone();
+            let lid = leader_id.clone();
+            let scb = sync_called_by.clone();
+
+            // First request - should become leader
+            let leader_handle = spawn_local(async move {
+                lid.set(1);
+                coord
+                    .request_sync(Some(Duration::from_millis(10)), || async move {
+                        scb.set(1);
+                        Ok(())
+                    })
+                    .await
+            });
+
+            yield_now().await; // Let leader start
+
+            let coord = coordinator.clone();
+            let scb = sync_called_by.clone();
+
+            // Second request - should become follower
+            let follower_handle = spawn_local(async move {
+                coord
+                    .request_sync(Some(Duration::from_millis(10)), || async move {
+                        scb.set(2); // Should NOT be called
+                        Ok(())
+                    })
+                    .await
+            });
+
+            leader_handle.await.unwrap();
+            follower_handle.await.unwrap();
+
+            // Only leader's sync_fn should have been called
+            assert_eq!(sync_called_by.get(), 1);
+        });
+    }
+
+    #[test]
+    fn only_one_leader_per_batch() {
+        run_with_glommio(|| async {
+            let coordinator: Rc<Coordinator<String>> = Rc::new(Coordinator::new());
+            let sync_count = Rc::new(Cell::new(0));
+            let concurrent_syncs = Rc::new(Cell::new(0));
+            let max_concurrent = Rc::new(Cell::new(0));
+
+            let mut handles = vec![];
+
+            for _ in 0..10 {
+                let coord = coordinator.clone();
+                let sc = sync_count.clone();
+                let cs = concurrent_syncs.clone();
+                let mc = max_concurrent.clone();
+
+                handles.push(spawn_local(async move {
+                    coord
+                        .request_sync(Some(Duration::from_millis(5)), || async move {
+                            let current = cs.get() + 1;
+                            cs.set(current);
+                            if current > mc.get() {
+                                mc.set(current);
+                            }
+
+                            // Simulate sync work
+                            yield_now().await;
+
+                            cs.set(cs.get() - 1);
+                            sc.set(sc.get() + 1);
+                            Ok(())
+                        })
+                        .await
+                }));
+
+                // Stagger the requests slightly
+                yield_now().await;
+            }
+
+            for h in handles {
+                h.await.unwrap();
+            }
+
+            // Should have exactly one sync call for the batch
+            assert_eq!(sync_count.get(), 1);
+            // Never more than one concurrent sync
+            assert_eq!(max_concurrent.get(), 1);
+        });
+    }
+
+    #[test]
+    fn all_followers_receive_same_result() {
+        run_with_glommio(|| async {
+            let coordinator: Rc<Coordinator<String>> = Rc::new(Coordinator::new());
+            let results: Rc<RefCell<Vec<SyncResult<String>>>> = Rc::new(RefCell::new(vec![]));
+
+            let mut handles = vec![];
+
+            for _ in 0..5 {
+                let coord = coordinator.clone();
+                let res = results.clone();
+
+                handles.push(spawn_local(async move {
+                    let result = coord
+                        .request_sync(Some(Duration::from_millis(5)), || async { Ok(()) })
+                        .await;
+                    res.borrow_mut().push(result);
+                }));
+
+                yield_now().await;
+            }
+
+            for h in handles {
+                h.await;
+            }
+
+            let results = results.borrow();
+            assert_eq!(results.len(), 5);
+            // All results should be Ok
+            for r in results.iter() {
+                assert!(r.is_ok());
+            }
+        });
+    }
+
+    // ==================== Coalescing Behavior ====================
+
+    #[test]
+    fn requests_during_delay_are_batched() {
+        run_with_glommio(|| async {
+            let coordinator: Rc<Coordinator<String>> = Rc::new(Coordinator::new());
+            let sync_count = Rc::new(Cell::new(0));
+            let completed_count = Rc::new(Cell::new(0));
+
+            let mut handles = vec![];
+
+            // Spawn many requests quickly
+            for _ in 0..20 {
+                let coord = coordinator.clone();
+                let sc = sync_count.clone();
+                let cc = completed_count.clone();
+
+                handles.push(spawn_local(async move {
+                    coord
+                        .request_sync(Some(Duration::from_millis(10)), || async move {
+                            sc.set(sc.get() + 1);
+                            Ok(())
+                        })
+                        .await
+                        .unwrap();
+                    cc.set(cc.get() + 1);
+                }));
+
+                yield_now().await;
+            }
+
+            for h in handles {
+                h.await;
+            }
+
+            // All 20 requests completed
+            assert_eq!(completed_count.get(), 20);
+            // But sync was only called once
+            assert_eq!(sync_count.get(), 1);
+        });
+    }
+
+    #[test]
+    fn multiple_batches_over_time() {
+        run_with_glommio(|| async {
+            let coordinator: Rc<Coordinator<String>> = Rc::new(Coordinator::new());
+            let sync_count = Rc::new(Cell::new(0));
+
+            // First batch
+            {
+                let mut handles = vec![];
+                for _ in 0..3 {
+                    let coord = coordinator.clone();
+                    let sc = sync_count.clone();
+                    handles.push(spawn_local(async move {
+                        coord
+                            .request_sync(Some(Duration::from_millis(5)), || async move {
+                                sc.set(sc.get() + 1);
+                                Ok(())
+                            })
+                            .await
+                    }));
+                    yield_now().await;
+                }
+                for h in handles {
+                    h.await.unwrap();
+                }
+            }
+
+            assert_eq!(sync_count.get(), 1);
+
+            // Wait for first batch to fully complete
+            glommio::timer::sleep(Duration::from_millis(10)).await;
+
+            // Second batch
+            {
+                let mut handles = vec![];
+                for _ in 0..3 {
+                    let coord = coordinator.clone();
+                    let sc = sync_count.clone();
+                    handles.push(spawn_local(async move {
+                        coord
+                            .request_sync(Some(Duration::from_millis(5)), || async move {
+                                sc.set(sc.get() + 1);
+                                Ok(())
+                            })
+                            .await
+                    }));
+                    yield_now().await;
+                }
+                for h in handles {
+                    h.await.unwrap();
+                }
+            }
+
+            // Two batches = two sync calls
+            assert_eq!(sync_count.get(), 2);
+        });
+    }
+
+    // ==================== Error Propagation ====================
+
+    #[test]
+    fn error_propagates_to_leader() {
+        run_with_glommio(|| async {
+            let coordinator: Coordinator<String> = Coordinator::new();
+
+            let result = coordinator
+                .request_sync(Some(Duration::from_millis(1)), || async {
+                    Err("sync failed".to_string())
+                })
+                .await;
+
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err(), "sync failed");
+        });
+    }
+
+    #[test]
+    fn error_propagates_to_all_followers() {
+        run_with_glommio(|| async {
+            let coordinator: Rc<Coordinator<String>> = Rc::new(Coordinator::new());
+            let results: Rc<RefCell<Vec<SyncResult<String>>>> = Rc::new(RefCell::new(vec![]));
+
+            let mut handles = vec![];
+
+            for i in 0..5 {
+                let coord = coordinator.clone();
+                let res = results.clone();
+
+                handles.push(spawn_local(async move {
+                    let result = coord
+                        .request_sync(Some(Duration::from_millis(5)), || async move {
+                            Err(format!("error from task {}", i))
+                        })
+                        .await;
+                    res.borrow_mut().push(result);
+                }));
+
+                yield_now().await;
+            }
+
+            for h in handles {
+                h.await;
+            }
+
+            let results = results.borrow();
+            assert_eq!(results.len(), 5);
+
+            // All should have the same error (from leader, task 0)
+            for r in results.iter() {
+                assert!(r.is_err());
+                assert_eq!(r.as_ref().unwrap_err(), "error from task 0");
+            }
+        });
+    }
+
+    #[test]
+    fn error_does_not_affect_subsequent_batches() {
+        run_with_glommio(|| async {
+            let coordinator: Rc<Coordinator<String>> = Rc::new(Coordinator::new());
+            let should_fail = Rc::new(Cell::new(true));
+
+            // First batch - fails
+            let coord = coordinator.clone();
+            let sf = should_fail.clone();
+            let result = coord
+                .request_sync(Some(Duration::from_millis(1)), || async move {
+                    if sf.get() {
+                        Err("first failure".to_string())
+                    } else {
+                        Ok(())
+                    }
+                })
+                .await;
+            assert!(result.is_err());
+
+            // Second batch - succeeds
+            should_fail.set(false);
+            glommio::timer::sleep(Duration::from_millis(5)).await;
+
+            let result = coordinator
+                .request_sync(Some(Duration::from_millis(1)), || async { Ok(()) })
+                .await;
+            assert!(result.is_ok());
+        });
+    }
+
+    // ==================== Edge Cases ====================
+
+    #[test]
+    fn request_arriving_as_leader_finishes() {
+        run_with_glommio(|| async {
+            let coordinator: Rc<Coordinator<String>> = Rc::new(Coordinator::new());
+            let sync_count = Rc::new(Cell::new(0));
+
+            // Very short delay to create race condition
+            let coord = coordinator.clone();
+            let sc = sync_count.clone();
+            let h1 = spawn_local(async move {
+                coord
+                    .request_sync(Some(Duration::from_micros(100)), || async move {
+                        sc.set(sc.get() + 1);
+                        Ok(())
+                    })
+                    .await
+            });
+
+            // Wait almost until delay expires
+            glommio::timer::sleep(Duration::from_micros(90)).await;
+
+            // Request right at the edge
+            let coord = coordinator.clone();
+            let sc = sync_count.clone();
+            let h2 = spawn_local(async move {
+                coord
+                    .request_sync(Some(Duration::from_micros(100)), || async move {
+                        sc.set(sc.get() + 1);
+                        Ok(())
+                    })
+                    .await
+            });
+
+            h1.await.unwrap();
+            h2.await.unwrap();
+
+            // Either 1 or 2 syncs depending on timing, but both complete successfully
+            assert!(sync_count.get() >= 1 && sync_count.get() <= 2);
+        });
+    }
+
+    #[test]
+    fn rapid_sequential_batches() {
+        run_with_glommio(|| async {
+            let coordinator: Rc<Coordinator<String>> = Rc::new(Coordinator::new());
+            let sync_count = Rc::new(Cell::new(0));
+            let total_completed = Rc::new(Cell::new(0));
+
+            // Run many sequential single-request batches
+            for _ in 0..10 {
+                let coord = coordinator.clone();
+                let sc = sync_count.clone();
+                let tc = total_completed.clone();
+
+                coord
+                    .request_sync(Some(Duration::from_micros(100)), || async move {
+                        sc.set(sc.get() + 1);
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+
+                tc.set(tc.get() + 1);
+
+                // Small gap between batches
+                glommio::timer::sleep(Duration::from_micros(200)).await;
+            }
+
+            assert_eq!(total_completed.get(), 10);
+            assert_eq!(sync_count.get(), 10); // Each was its own batch
+        });
+    }
+
+    #[test]
+    fn stress_test_concurrent_requests() {
+        run_with_glommio(|| async {
+            let coordinator: Rc<Coordinator<String>> = Rc::new(Coordinator::new());
+            let sync_count = Rc::new(Cell::new(0));
+            let completed = Rc::new(Cell::new(0));
+
+            let mut handles = vec![];
+
+            // Spawn 100 concurrent requests
+            for _ in 0..100 {
+                let coord = coordinator.clone();
+                let sc = sync_count.clone();
+                let cc = completed.clone();
+
+                handles.push(spawn_local(async move {
+                    coord
+                        .request_sync(Some(Duration::from_millis(2)), || async move {
+                            sc.set(sc.get() + 1);
+                            // Simulate some sync work
+                            yield_now().await;
+                            Ok(())
+                        })
+                        .await
+                        .unwrap();
+                    cc.set(cc.get() + 1);
+                }));
+            }
+
+            for h in handles {
+                h.await;
+            }
+
+            assert_eq!(completed.get(), 100);
+            // Should have far fewer syncs than requests due to batching
+            assert!(sync_count.get() < 100);
+            assert!(sync_count.get() >= 1);
+        });
+    }
+
+    #[test]
+    fn follower_sync_fn_never_called() {
+        run_with_glommio(|| async {
+            let coordinator: Rc<Coordinator<String>> = Rc::new(Coordinator::new());
+            let follower_sync_called = Rc::new(Cell::new(false));
+
+            let coord = coordinator.clone();
+            let leader = spawn_local(async move {
+                coord
+                    .request_sync(Some(Duration::from_millis(10)), || async { Ok(()) })
+                    .await
+            });
+
+            yield_now().await;
+
+            // Multiple followers
+            let mut followers = vec![];
+            for _ in 0..5 {
+                let coord = coordinator.clone();
+                let fsc = follower_sync_called.clone();
+                followers.push(spawn_local(async move {
+                    coord
+                        .request_sync(Some(Duration::from_millis(10)), || async move {
+                            fsc.set(true);
+                            Ok(())
+                        })
+                        .await
+                }));
+                yield_now().await;
+            }
+
+            leader.await.unwrap();
+            for f in followers {
+                f.await.unwrap();
+            }
+
+            // Follower's sync_fn should never have been invoked
+            assert!(!follower_sync_called.get());
+        });
+    }
+
+    #[test]
+    fn coordinator_reusable_after_completion() {
+        run_with_glommio(|| async {
+            let coordinator: Coordinator<String> = Coordinator::new();
+
+            for i in 0..5 {
+                let result = coordinator
+                    .request_sync(Some(Duration::from_millis(1)), || async { Ok(()) })
+                    .await;
+                assert!(result.is_ok(), "Iteration {} failed", i);
+
+                glommio::timer::sleep(Duration::from_millis(5)).await;
+            }
+        });
+    }
+
+    #[test]
+    fn sync_result_value_propagated() {
+        run_with_glommio(|| async {
+            // Test with a coordinator that returns actual values
+            let coordinator: Rc<Coordinator<String>> = Rc::new(Coordinator::new());
+            let results: Rc<RefCell<Vec<SyncResult<String>>>> = Rc::new(RefCell::new(vec![]));
+
+            let mut handles = vec![];
+
+            for i in 0..3 {
+                let coord = coordinator.clone();
+                let res = results.clone();
+
+                handles.push(spawn_local(async move {
+                    let result = coord
+                        .request_sync(Some(Duration::from_millis(5)), || async move {
+                            // Only leader (first one) sets this
+                            Ok(())
+                        })
+                        .await;
+                    res.borrow_mut().push(result);
+                }));
+
+                if i == 0 {
+                    yield_now().await; // Ensure first is leader
+                }
+            }
+
+            for h in handles {
+                h.await;
+            }
+
+            // All should have received Ok(())
+            let results = results.borrow();
+            assert_eq!(results.len(), 3);
+            for r in results.iter() {
+                assert!(r.is_ok());
+            }
+        });
+    }
+
+    // ==================== Invariant Verification ====================
+
+    #[test]
+    fn never_two_concurrent_leaders() {
+        run_with_glommio(|| async {
+            let coordinator: Rc<Coordinator<String>> = Rc::new(Coordinator::new());
+            let active_leaders = Rc::new(Cell::new(0u32));
+            let max_leaders = Rc::new(Cell::new(0u32));
+            let violations = Rc::new(Cell::new(0u32));
+
+            let mut handles = vec![];
+
+            for _ in 0..50 {
+                let coord = coordinator.clone();
+                let al = active_leaders.clone();
+                let ml = max_leaders.clone();
+                let v = violations.clone();
+
+                handles.push(spawn_local(async move {
+                    coord
+                        .request_sync(Some(Duration::from_millis(2)), || async move {
+                            let current = al.get() + 1;
+                            al.set(current);
+
+                            if current > ml.get() {
+                                ml.set(current);
+                            }
+                            if current > 1 {
+                                v.set(v.get() + 1);
+                            }
+
+                            // Hold the "leader" position for a bit
+                            yield_now().await;
+                            glommio::timer::sleep(Duration::from_micros(100)).await;
+
+                            al.set(al.get() - 1);
+                            Ok(())
+                        })
+                        .await
+                }));
+
+                yield_now().await;
+            }
+
+            for h in handles {
+                h.await.unwrap();
+            }
+
+            assert_eq!(violations.get(), 0, "Had {} concurrent leader violations", violations.get());
+            assert_eq!(max_leaders.get(), 1, "Max concurrent leaders was {}", max_leaders.get());
+        });
+    }
+
+    #[test]
+    fn all_waiters_complete_even_with_errors() {
+        run_with_glommio(|| async {
+            let coordinator: Rc<Coordinator<String>> = Rc::new(Coordinator::new());
+            let completed_count = Rc::new(Cell::new(0));
+
+            let mut handles = vec![];
+
+            for _ in 0..10 {
+                let coord = coordinator.clone();
+                let cc = completed_count.clone();
+
+                handles.push(spawn_local(async move {
+                    let _ = coord
+                        .request_sync(Some(Duration::from_millis(5)), || async {
+                            Err("intentional error".to_string())
+                        })
+                        .await;
+                    // This should still execute
+                    cc.set(cc.get() + 1);
+                }));
+
+                yield_now().await;
+            }
+
+            for h in handles {
+                h.await;
+            }
+
+            // All waiters should have completed, not hung
+            assert_eq!(completed_count.get(), 10);
+        });
+    }
+}

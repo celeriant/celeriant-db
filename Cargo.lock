@@ -484,6 +484,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "celeriant_shard"
+version = "0.1.0"
+dependencies = [
+ "celeriant_disk",
+ "celeriant_memcache",
+ "celeriant_msg",
+ "celeriant_rotating_log",
+ "celeriant_wal",
+ "celeriant_watch",
+ "celeriant_wire",
+ "criterion",
+ "fastbloom",
+ "futures-lite",
+ "glommio",
+ "num_cpus",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "celeriant_sidecar"
 version = "0.1.0"
 dependencies = [

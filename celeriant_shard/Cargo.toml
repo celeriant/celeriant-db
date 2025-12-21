@@ -1,0 +1,24 @@
+[package]
+name = "celeriant_shard"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+celeriant_msg = { path = "../celeriant_msg" }
+celeriant_wire = { path = "../celeriant_wire" }
+celeriant_wal = { path = "../celeriant_wal" }
+celeriant_disk = { path = "../celeriant_disk" }
+celeriant_watch = { path = "../celeriant_watch" }
+celeriant_memcache = { path = "../celeriant_memcache" }
+celeriant_rotating_log = { path = "../celeriant_rotating_log" }
+glommio.workspace = true
+futures-lite.workspace = true
+fastbloom.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+uuid.workspace = true
+criterion.workspace = true
+num_cpus.workspace = true
