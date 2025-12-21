@@ -431,6 +431,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "celeriant_memcache"
+version = "0.1.0"
+dependencies = [
+ "celeriant_wal",
+]
+
+[[package]]
 name = "celeriant_msg"
 version = "0.1.0"
 dependencies = [

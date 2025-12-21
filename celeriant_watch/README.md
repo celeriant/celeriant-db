@@ -2,7 +2,7 @@
 
 Watch/subscription system for real-time aggregate change notifications. Handles client subscriptions, event filtering, batching, and delivery.
 
-**LLM GENERATED -> HUMAN REVIEWED [2025-12-20]**
+**README WAS LLM GENERATED AND HUMAN REVIEWED [2025-12-20]**
 
 ## Architecture
 
@@ -11,10 +11,10 @@ ShardWriteAheadLog                    WatchSession (per client)
        │                                      │
        │ broadcast(AggregateWatchEvent)       │
        ▼                                      │
-┌──────────────────┐                          │
+┌───────────────────┐                         │
 │ AggregateWatchers │                         │
 │  (per shard)      │                         │
-└────────┬─────────┘                          │
+└────────┬──────────┘                         │
          │ filters by org/type/aggregate/op   │
          ▼                                    │
 ┌──────────────────┐    LocalChannel    ┌─────┴─────────────┐

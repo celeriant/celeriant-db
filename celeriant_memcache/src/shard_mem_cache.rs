@@ -1,6 +1,6 @@
-use crate::{in_memory_cache::{
+use crate::{
     aggregate_positions::AggregatePositions, recent_write::RecentWrite, shard_log_queue_item::ShardLogQueueItem, sync_positions_snapshot::SyncPositionsSnapshot
-}, internal_shard_config::InternalShardConfig};
+, internal_shard_config::InternalShardConfig};
 use celeriant_wal::{aggregate_key::AggregateKey, constants::FIXED_BLOCK_SIZE_BYTES, datablocks::datablock::Datablock, metablocks::metablock::Metablock};
 use std::{collections::{BTreeMap, HashMap, VecDeque}, path::PathBuf};
 
@@ -84,7 +84,7 @@ impl ShardMemCache {
             size_bytes,
         });
         
-        self.cache_current_bytes += size_bytes;
+        self.cache_current_bytes = self.cache_current_bytes.saturating_add(size_bytes);
         self.cache_eviction_queue.push_back((aggregate_key, batch_index, size_bytes));
     }
 
@@ -329,7 +329,7 @@ impl ShardMemCache {
         })
     }
 
-    pub(crate) fn new(
+    pub fn new(
         file_len: u64,
         metablocks_position: u64,
         datablocks_position: u64,

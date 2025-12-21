@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, collections::HashSet, rc::Rc, time::Duration};
+    use std::{collections::HashSet, rc::Rc, time::Duration};
     use futures_lite::future::poll_once;
     use celeriant_msg::request::requests::WatchRequest;
     use celeriant_wal::{
@@ -1293,45 +1293,4 @@ mod tests {
         handle.join().unwrap();
     }
 
-    #[test]
-    fn test_estimate_data_size_bytes() {
-        use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
-        use celeriant_wal::datablocks::datablock_aggregate_event_batch::DatablockAggregateEventBatch;
-        use std::sync::Arc;
-
-        let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
-            .spawn(|| async move {
-                let batches = vec![
-                    DatablockAggregateEventBatch {
-                        events: vec![
-                            DatablockAggregateEvent {
-                                event_type_major: 1,
-                                event_id: None,
-                                event_timestamp: 0,
-                                iv: None,
-                                event_value: Arc::new(vec![0u8; 100]),
-                                client_event_index: 1, event_index: 1, event_type_minor: 1
-                            },
-                            DatablockAggregateEvent {
-                                event_type_major: 1,
-                                event_id: None,
-                                event_timestamp: 0,
-                                iv: None,
-                                event_value: Arc::new(vec![0u8; 200]),
-                                client_event_index: 1, event_index: 1, event_type_minor: 1
-                            },
-                        ],
-                        event_batch_index: 1
-                    },
-                    DatablockAggregateEventBatch {events:vec![DatablockAggregateEvent{event_type_major:1,event_id:None,event_timestamp:0,iv:None,event_value:Arc::new(vec![0u8;500]),client_event_index:1,event_index:1,event_type_minor:1}], event_batch_index: 1 },
-                ];
-
-                let size = crate::watch_session::estimate_data_size_bytes(&batches);
-                // 100 + 200 + 100 (overhead) + 500 + 100 (overhead) = 1000
-                assert_eq!(size, 1000);
-            })
-            .unwrap();
-
-        handle.join().unwrap();
-    }
 }

@@ -2,7 +2,7 @@
 
 Data structures for the Celeriant write-ahead log. No I/O logic—just types and serialization.
 
-**LLM GENERATED -> HUMAN REVIEWED 2025-12-20**
+**README WAS LLM GENERATED AND HUMAN REVIEWED 2025-12-20**
 
 ## Architecture
 

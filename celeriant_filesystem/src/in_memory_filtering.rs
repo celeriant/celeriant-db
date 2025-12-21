@@ -1,15 +1,8 @@
 use celeriant_msg::request::read_filters::ReadFilters;
-use celeriant_wal::{constants::{BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED}, datablocks::datablock_aggregate_event_batch::DatablockAggregateEventBatch, metablocks::metablock_event_batch::{MetablockEventBatch, EventTypesKind}};
+use celeriant_wal::{constants::{BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED, MINIBATCH_SIZE_BYTES}, datablocks::datablock_aggregate_event_batch::DatablockAggregateEventBatch, metablocks::{datablock_storage_kind::DatablockStorageKind, metablock::Metablock, metablock_event_batch::{EventTypesKind, MetablockEventBatch}, metablock_kind::MetablockKind}};
 use fastbloom::BloomFilter;
 
 use crate::shard_log_read_error::ShardLogReadError;
-
-#[derive(Debug, Clone)]
-pub struct MetadataWithAbsolutePosition {
-    pub event_batch_metadata: MetablockEventBatch,
-    pub event_batch_absolute_position: u64,
-    pub format_version_on_disk: u32,
-}
 
 pub fn apply_event_filters(event_batch: &mut DatablockAggregateEventBatch, read_filters: &ReadFilters) {
     // Final event type filtering (bloom filter might have false positives)
@@ -59,7 +52,12 @@ pub fn apply_event_filters(event_batch: &mut DatablockAggregateEventBatch, read_
     }
 }
 
-pub fn is_include_batch(metadata: &MetablockEventBatch, filters: &ReadFilters) -> bool {
+pub fn is_include_batch(metablock: &Metablock, filters: &ReadFilters) -> bool {
+    let metadata = match &metablock.wal_metablock_type {
+        MetablockKind::EventBatchMetadata(meta) => meta,
+        _ => return false, // Not an EventBatch metablock
+    };
+
     if metadata.event_batch_index < filters.from_event_batch_index {
         return false;
     }
@@ -73,7 +71,7 @@ pub fn is_include_batch(metadata: &MetablockEventBatch, filters: &ReadFilters) -
     if filters
         .min_server_timestamp
         .map_or(false, |before_server_time| {
-            metadata.server_timestamp < before_server_time
+            metablock.server_timestamp < before_server_time
         })
     {
         return false;
@@ -82,7 +80,7 @@ pub fn is_include_batch(metadata: &MetablockEventBatch, filters: &ReadFilters) -
     if filters
         .max_server_timestamp
         .map_or(false, |after_server_time| {
-            metadata.server_timestamp > after_server_time
+            metablock.server_timestamp > after_server_time
         })
     {
         return false;
@@ -199,14 +197,22 @@ fn bloom_filter_from_bytes(bloom_bytes: &[u64; BLOOM_BYTES / 8]) -> BloomFilter 
         .hashes(BLOOM_HASH_COUNT)
 }
 
+fn get_uncompressed_size(datablock: &DatablockStorageKind) -> u64 {
+    match datablock {
+        DatablockStorageKind::None => 0,
+        DatablockStorageKind::Inline(_) => MINIBATCH_SIZE_BYTES as u64,
+        DatablockStorageKind::Block(block_ref) => block_ref.uncompressed_size,
+    }
+}
+
 pub fn trim_end_if_exceeds_max_bytes(
-    metadata_for_reading: &mut Vec<MetadataWithAbsolutePosition>,
+    metablocks: &mut Vec<Metablock>,
     read_filters: &ReadFilters,
     max_bytes: Option<usize>,
 ) -> Result<Option<u64>, ShardLogReadError> {
     // Only keep batches where include is true
-    metadata_for_reading
-        .retain(|batch| is_include_batch(&batch.event_batch_metadata, read_filters));
+    metablocks
+        .retain(|metablock| is_include_batch(metablock, read_filters));
 
     // If no max_bytes limit is specified, we don't need to trim
     let max_bytes = match max_bytes {
@@ -215,7 +221,7 @@ pub fn trim_end_if_exceeds_max_bytes(
     };
 
     // If after filtering we don't have any batches, return None
-    if metadata_for_reading.is_empty() {
+    if metablocks.is_empty() {
         return Ok(None);
     }
 
@@ -224,8 +230,8 @@ pub fn trim_end_if_exceeds_max_bytes(
     let mut cut_index: Option<usize> = None;
 
     // Batches are sorted by event_batch_index (ascending)
-    for (index, batch) in metadata_for_reading.iter().enumerate() {
-        cumulative_size += batch.event_batch_metadata.compressed_size;
+    for (index, batch) in metablocks.iter().enumerate() {
+        cumulative_size += get_uncompressed_size(&batch.datablock);
 
         // If we exceed the max_bytes limit, store this index as the cut point
         if cumulative_size > max_bytes {
@@ -237,20 +243,19 @@ pub fn trim_end_if_exceeds_max_bytes(
     // If we need to trim
     if let Some(index) = cut_index {
         // Get the event_batch_index of the first batch we're trimming
-        let next_event_batch_index = if index < metadata_for_reading.len() {
-            Some(
-                metadata_for_reading[index]
-                    .event_batch_metadata
-                    .event_batch_index,
-            )
+        let next_event_batch_index = if index < metablocks.len() {
+            match &metablocks[index].wal_metablock_type {
+                MetablockKind::EventBatchMetadata(m) => Some(m.event_batch_index),
+                _ => None,
+            }
         } else {
             None
         };
 
         // Keep only the batches that fit within the max_bytes limit
-        metadata_for_reading.truncate(index);
+        metablocks.truncate(index);
 
-        if metadata_for_reading.is_empty() {
+        if metablocks.is_empty() {
             // Throw an error as max bytes was too small to return any event batches
             return Err(ShardLogReadError::MaxBytesTooSmall {
                 current_max_bytes: max_bytes,
@@ -267,7 +272,7 @@ pub fn trim_end_if_exceeds_max_bytes(
 
 #[cfg(test)]
 mod tests {
-    use celeriant_wal::{aggregate_key::AggregateKey, datablocks::datablock_aggregate_event::DatablockAggregateEvent, metablocks::metablock::{WIRE_VERSION_WAL_METABLOCK, Metablock}};
+    use celeriant_wal::{aggregate_key::AggregateKey, datablocks::datablock_aggregate_event::DatablockAggregateEvent, metablocks::{datablock_block_ref::DatablockBlockRef, metablock::{Metablock}}};
 
     use super::*;
 
@@ -282,33 +287,38 @@ mod tests {
         max_ts: u64,
         min_eidx: u64,
         max_eidx: u64,
-        compressed_size: u64,
+        uncompressed_size: u64,
         event_types: &[u64; 4],
-    ) -> MetablockEventBatch {
-        MetablockEventBatch {
-            uncompressed_size: 0,
-            event_types_data: EventTypesKind::Direct(*event_types),
-            event_batch_index,
-            client_id,
-            user_id: Some(user_id),
-            node_id: 0,
-            lease_index: 0,
+    ) -> Metablock {
+        Metablock {
+            wal_index: 0,
             server_timestamp,
-            compressed_size,
-            compression_type: 0,
-            min_client_event_index: min_cidx,
-            max_client_event_index: max_cidx,
-            min_event_timestamp: min_ts,
-            max_event_timestamp: max_ts,
-            min_event_index: min_eidx,
-            max_event_index: max_eidx,
-            aggregate_key: AggregateKey::new(1, 1, 1),
-            datablock: celeriant_wal::metablocks::datablock_storage_kind::DatablockStyle::Block { crc32c: 0, datablock_position: 0 },
-            version: 1,
+            lease_index: 0,
+            node_id: 0,
+            datablock: DatablockStorageKind::Block(DatablockBlockRef {
+                crc32c: 0,
+                datablock_position: 0,
+                version: 1,
+                uncompressed_size,
+                compressed_size: 0,
+                compression_type: 0,
+            }),
+            wal_metablock_type: MetablockKind::EventBatchMetadata(MetablockEventBatch {
+                aggregate_key: AggregateKey::new(1, 1, 1),
+                event_types_data: EventTypesKind::Direct(*event_types),
+                event_batch_index,
+                client_id,
+                user_id: Some(user_id),
+                min_client_event_index: min_cidx,
+                max_client_event_index: max_cidx,
+                min_event_timestamp: min_ts,
+                max_event_timestamp: max_ts,
+                min_event_index: min_eidx,
+                max_event_index: max_eidx,
+            }),
         }
     }
 
-    // Build EventBatchMetadata with Bloom event types (insert the provided types into the bloom)
     fn mk_metadata_bloom(
         event_batch_index: u64,
         server_timestamp: u64,
@@ -320,42 +330,45 @@ mod tests {
         max_ts: u64,
         min_eidx: u64,
         max_eidx: u64,
-        compressed_size: u64,
+        uncompressed_size: u64,
         types_to_insert: &[u64],
-    ) -> MetablockEventBatch {
-        // Start with an empty bloom bitmap
+    ) -> Metablock {
         let mut bloom = BloomFilter::from_vec(vec![0u64; BLOOM_BYTES / 8])
             .seed(&BLOOM_HASH_SEED)
             .hashes(BLOOM_HASH_COUNT);
 
-        // Insert the event types
         for t in types_to_insert {
             bloom.insert(&t.to_le_bytes());
         }
 
-        // Extract the underlying storage back into a fixed-size array
         let bloom_bytes: [u64; BLOOM_BYTES / 8] = bloom.as_slice().try_into().unwrap();
 
-        MetablockEventBatch {
-            uncompressed_size: 0,
-            event_types_data: EventTypesKind::Bloom(bloom_bytes),
-            event_batch_index,
-            client_id,
-            user_id: Some(user_id),
-            node_id: 0,
-            lease_index: 0,
+        Metablock {
+            wal_index: 0,
             server_timestamp,
-            compressed_size,
-            compression_type: 0,
-            min_client_event_index: min_cidx,
-            max_client_event_index: max_cidx,
-            min_event_timestamp: min_ts,
-            max_event_timestamp: max_ts,
-            min_event_index: min_eidx,
-            max_event_index: max_eidx,
-            aggregate_key: AggregateKey::new(1, 1, 1),
-            datablock: celeriant_wal::metablocks::datablock_storage_kind::DatablockStyle::Block { crc32c: 0, datablock_position: 0 },
-            version: 1,
+            lease_index: 0,
+            node_id: 0,
+            datablock: DatablockStorageKind::Block(DatablockBlockRef {
+                crc32c: 0,
+                datablock_position: 0,
+                version: 1,
+                uncompressed_size,
+                compressed_size: 0,
+                compression_type: 0,
+            }),
+            wal_metablock_type: MetablockKind::EventBatchMetadata(MetablockEventBatch {
+                aggregate_key: AggregateKey::new(1, 1, 1),
+                event_types_data: EventTypesKind::Bloom(bloom_bytes),
+                event_batch_index,
+                client_id,
+                user_id: Some(user_id),
+                min_client_event_index: min_cidx,
+                max_client_event_index: max_cidx,
+                min_event_timestamp: min_ts,
+                max_event_timestamp: max_ts,
+                min_event_index: min_eidx,
+                max_event_index: max_eidx,
+            }),
         }
     }
 
@@ -536,11 +549,6 @@ mod tests {
         // event_timestamp: 999, 1000, 1001, 1002
         let mut batch = DatablockAggregateEventBatch {
             event_batch_index: 1,
-            server_timestamp: 1,
-            client_id: 1,
-            user_id: Some(2),
-            node_id: 0,
-            lease_index: 0,
             events: vec![
                 mk_event(1, 9, 99, 999),
                 mk_event(2, 10, 100, 1000),
@@ -578,11 +586,6 @@ mod tests {
     fn apply_event_filters_type_whitelist_only() {
         let mut batch = DatablockAggregateEventBatch {
             event_batch_index: 1,
-            server_timestamp: 1,
-            client_id: 1,
-            user_id: None,
-            node_id: 0,
-            lease_index: 0,
             events: vec![mk_event(1, 1, 1, 1), mk_event(2, 2, 2, 2), mk_event(3, 3, 3, 3)],
         };
 
@@ -593,12 +596,10 @@ mod tests {
         assert_eq!(kept_types, vec![2]);
     }
 
-    // Helpers for pagination tests: assume MetadataWithAbsolutePosition implements Default
-    fn mk_mwap(meta: MetablockEventBatch) -> MetadataWithAbsolutePosition {
-        MetadataWithAbsolutePosition {
-            event_batch_metadata: meta,
-            event_batch_absolute_position: 0,
-            format_version_on_disk: WIRE_VERSION_WAL_METABLOCK,
+    fn get_event_batch_index(meta: &Metablock) -> &MetablockEventBatch {
+        match &meta.wal_metablock_type {
+            MetablockKind::EventBatchMetadata(m) => m,
+            _ => panic!("Expected EventBatchMetadata"),
         }
     }
 
@@ -606,9 +607,9 @@ mod tests {
     fn trim_end_if_exceeds_max_bytes_truncates_and_returns_next_index() {
         // Three batches: sizes 100, 200, 300; total 600
         // max_bytes=250 -> only first fits; next index should be second's bx
-        let m1 = mk_mwap(mk_metadata(10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 100, &[0, 0, 0, 0]));
-        let m2 = mk_mwap(mk_metadata(11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 200, &[0, 0, 0, 0]));
-        let m3 = mk_mwap(mk_metadata(12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 300, &[0, 0, 0, 0]));
+        let m1 = mk_metadata(10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 100, &[0, 0, 0, 0]);
+        let m2 = mk_metadata(11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 200, &[0, 0, 0, 0]);
+        let m3 = mk_metadata(12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 300, &[0, 0, 0, 0]);
 
         let mut v = vec![m1, m2, m3];
 
@@ -618,13 +619,13 @@ mod tests {
         let next = trim_end_if_exceeds_max_bytes(&mut v, &filters, Some(250)).unwrap();
         assert_eq!(next, Some(11));
         assert_eq!(v.len(), 1);
-        assert_eq!(v[0].event_batch_metadata.event_batch_index, 10);
+        assert_eq!(get_event_batch_index(&v[0]).event_batch_index, 10);
     }
 
     #[test]
     fn trim_end_if_exceeds_max_bytes_all_fit_returns_none() {
-        let m1 = mk_mwap(mk_metadata(5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 100, &[0, 0, 0, 0]));
-        let m2 = mk_mwap(mk_metadata(6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 150, &[0, 0, 0, 0]));
+        let m1 = mk_metadata(5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 100, &[0, 0, 0, 0]);
+        let m2 = mk_metadata(6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 150, &[0, 0, 0, 0]);
 
         let mut v = vec![m1, m2];
         let filters = ReadFilters::new(1);
@@ -637,7 +638,7 @@ mod tests {
     #[test]
     fn trim_end_if_exceeds_max_bytes_too_small_errors() {
         // Single batch size=200; max_bytes=100 -> error
-        let m1 = mk_mwap(mk_metadata(99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 200, &[0, 0, 0, 0]));
+        let m1 = mk_metadata(99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 200, &[0, 0, 0, 0]);
         let mut v = vec![m1];
         let filters = ReadFilters::new(1);
 
@@ -659,11 +660,6 @@ mod tests {
 
         let mut batch = DatablockAggregateEventBatch {
             event_batch_index: 1,
-            server_timestamp: 1,
-            client_id: 1,
-            user_id: None,
-            node_id: 0,
-            lease_index: 0,
             events: vec![mk_event(1, 1, 1, 1), mk_event(2, 2, 2, 2)],
         };
         apply_event_filters(&mut batch, &filters);
@@ -673,7 +669,7 @@ mod tests {
 
     #[test]
     fn trim_end_if_exceeds_max_bytes_filters_out_all_returns_none() {
-        let m1 = mk_mwap(mk_metadata(10, 1000, 1, 2, 0, 0, 0, 0, 0, 0, 100, &[2, 0, 0, 0]));
+        let m1 = mk_metadata(10, 1000, 1, 2, 0, 0, 0, 0, 0, 0, 100, &[2, 0, 0, 0]);
         let mut v = vec![m1];
 
         // Filter to a different client_id so batch gets filtered out

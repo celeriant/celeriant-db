@@ -2,7 +2,7 @@
 
 Serialization, compression, and wire protocol framing for Celeriant. Handles encoding/decoding for both network messages and WAL persistence.
 
-**LLM GENERATED -> HUMAN REVIEWED 2025-12-20**
+**README WAS LLM GENERATED AND HUMAN REVIEWED 2025-12-20**
 
 ## Architecture
 

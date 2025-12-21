@@ -2,7 +2,7 @@
 
 Rotating log file management for the Celeriant write-ahead log (WAL). This crate handles log file lifecycle, rotation, caching, and crash recovery using direct I/O.
 
-**LLM GENERATED -> HUMAN REVIEWED 2025-12-20**
+**README WAS LLM GENERATED AND HUMAN REVIEWED 2025-12-20**
 
 ## Overview
 

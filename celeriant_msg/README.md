@@ -2,7 +2,7 @@
 
 Request and response message definitions for the Celeriant wire protocol. Defines all client-server message types with serialization support.
 
-**LLM GENERATED -> HUMAN REVIEWED [2025-12-20]**
+**README WAS LLM GENERATED AND HUMAN REVIEWED [2025-12-20]**
 
 ## Architecture
 
