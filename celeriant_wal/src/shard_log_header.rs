@@ -16,6 +16,9 @@ pub struct ShardLogHeader {
     /// Note that event batches are written to end of the file
     /// so this position indicates the start of the most recently written batches
     pub datablocks_position: u64,
+
+    /// Shard-global WAL index representing the last written metablock
+    pub wal_index: u64,
 }
 
 impl ShardLogHeader {
@@ -23,6 +26,7 @@ impl ShardLogHeader {
         Self {
             metablocks_position: FIXED_BLOCK_SIZE_BYTES as u64,
             datablocks_position: file_len.saturating_sub(FIXED_BLOCK_SIZE_BYTES as u64),
+            wal_index: 0,
         }
     }
 
@@ -87,6 +91,7 @@ mod tests {
         let header = ShardLogHeader {
             metablocks_position: 1000,
             datablocks_position: 500,
+            wal_index: 0,
         };
 
         assert_eq!(header.available_space(), 0); // saturating_sub prevents underflow

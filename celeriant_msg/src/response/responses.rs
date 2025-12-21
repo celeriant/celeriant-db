@@ -31,9 +31,6 @@ pub struct WriteResponse {
     pub start_event_index: u64,
     pub server_timestamp: u64,
     pub compressed_size: u64,
-    pub node_id: u128,
-    pub lease_index: u64,
-    pub events_crc: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]

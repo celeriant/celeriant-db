@@ -65,6 +65,7 @@ mod tests {
             file_len,
             metablocks_position,
             datablocks_position,
+            0,
             test_config(),
             0,
         )
@@ -74,7 +75,7 @@ mod tests {
         let file_len = 1024 * 1024 * 1024;
         let metablocks_position = FIXED_BLOCK_SIZE_BYTES as u64;
         let datablocks_position = file_len - FIXED_BLOCK_SIZE_BYTES as u64;
-        ShardMemCache::new(file_len, metablocks_position, datablocks_position, config, 0)
+        ShardMemCache::new(file_len, metablocks_position, datablocks_position, 0, config, 0)
     }
 
     fn make_aggregate_key(org: u128, agg_type: u128, agg_id: u128) -> AggregateKey {
@@ -143,6 +144,7 @@ mod tests {
             file_len,
             metablocks_position,
             datablocks_position,
+            0,
             test_config(),
             0,
         );
@@ -330,6 +332,7 @@ mod tests {
             file_len,
             metablocks_position,
             datablocks_position,
+            0,
             test_config(),
             5,
         );
@@ -351,6 +354,7 @@ mod tests {
             file_len,
             FIXED_BLOCK_SIZE_BYTES as u64,
             file_len - FIXED_BLOCK_SIZE_BYTES as u64,
+            0,
             test_config(),
             0,
         );
@@ -364,19 +368,21 @@ mod tests {
         assert!(snapshot1.datablocks_carry_over.is_none());
 
         // After commit with carry over, next snapshot should have it
-        let mut modified_snapshot = SyncPositionsSnapshot {
+        let modified_snapshot = SyncPositionsSnapshot {
             pending_append_queue: vec![],
             aggregate_queue_positions: HashMap::new(),
             metablocks_position: snapshot1.metablocks_position + 512,
             datablocks_position: snapshot1.datablocks_position - 1000,
             file_len: snapshot1.file_len,
             datablocks_carry_over: Some(vec![1, 2, 3, 4]),
+            wal_index: snapshot1.wal_index + 1,
         };
         cache.commit_sync_positions_snapshot(modified_snapshot);
 
         cache.add_to_pending_append_queue(&key, 2, 2, 100, 2, make_queue_item(None));
         let snapshot2 = cache.take_sync_positions_snapshot();
         assert_eq!(snapshot2.datablocks_carry_over, Some(vec![1, 2, 3, 4]));
+        assert_eq!(snapshot2.wal_index, 1);
     }
 
     #[test]
@@ -1534,6 +1540,7 @@ mod tests {
             metablocks_position: 512,
             datablocks_position: 1024 * 1024,
             file_len: 1024 * 1024 * 1024,
+            wal_index: 13,
             datablocks_carry_over: None,
         };
 
@@ -1553,6 +1560,7 @@ mod tests {
             datablocks_position: 10000,
             file_len: 1024 * 1024,
             datablocks_carry_over: None,
+            wal_index: 13,
         };
 
         assert!(snapshot.has_enough_free_space());
@@ -1567,6 +1575,7 @@ mod tests {
             datablocks_position: 1100, // Only 100 bytes free
             file_len: 2000,
             datablocks_carry_over: None,
+            wal_index: 13,
         };
 
         assert!(!snapshot.has_enough_free_space());

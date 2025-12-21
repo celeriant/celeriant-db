@@ -223,9 +223,6 @@ mod tests {
                 start_event_index: 0,
                 server_timestamp: 1234567890,
                 compressed_size: 512,
-                node_id: 999,
-                lease_index: 1,
-                events_crc: 0xDEADBEEF,
             }),
             ResponseType::TrimStart => Response::TrimStart(SuccessResponse {
                 correlation_id: Some(106),

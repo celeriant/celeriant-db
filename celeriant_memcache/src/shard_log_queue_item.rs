@@ -7,3 +7,17 @@ pub struct ShardLogQueueItem {
     pub datablock: Option<Datablock>,
     pub metablock: Metablock,
 }
+
+impl ShardLogQueueItem {
+    pub fn new(
+        datablock: Option<Datablock>,
+        datablock_bytes: Option<Vec<u8>>,
+        metablock: Metablock,
+    ) -> Self {
+        Self {
+            datablock_bytes,
+            datablock,
+            metablock,
+        }
+    }
+}

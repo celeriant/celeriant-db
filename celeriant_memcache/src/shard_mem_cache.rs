@@ -16,6 +16,9 @@ pub struct ShardMemCache {
     /// The length of the shard log file, cached to avoid system calls
     file_len: u64,
 
+    /// Shard WAL index representing the last written metablock
+    wal_index: u64,
+
     /// Partial bytes of the last written datablock to allow for efficient
     /// Direct I/O aligned writes. Saves reading the bytes for the next datablock write
     datablocks_carry_over: Option<Vec<u8>>,
@@ -51,6 +54,11 @@ pub struct ShardMemCache {
 }
 
 impl ShardMemCache {
+
+    pub fn current_wal_index(&self) -> u64 {
+        self.wal_index
+    }
+
     /// Insert a write into the recent write cache. Call only after durable write.
     pub fn cache_recent_write(
         &mut self,
@@ -212,6 +220,7 @@ impl ShardMemCache {
             datablocks_position: self.datablocks_position,
             datablocks_carry_over: self.datablocks_carry_over.clone(), //On rollback we want to keep this, not clear it
             file_len: self.file_len,
+            wal_index: self.wal_index,
         }
     }
     
@@ -247,6 +256,7 @@ impl ShardMemCache {
     ) {
         self.datablocks_position = sync_positions_snapshot.datablocks_position;
         self.metablocks_position = sync_positions_snapshot.metablocks_position;
+        self.wal_index = sync_positions_snapshot.wal_index;
         self.file_len = sync_positions_snapshot.file_len;
         self.datablocks_carry_over = sync_positions_snapshot.datablocks_carry_over;
         self.had_fsync_failure = false;
@@ -278,6 +288,11 @@ impl ShardMemCache {
                 }
             }
         }
+    }
+
+    pub fn aggregate_exists(&self, aggregate_key: &AggregateKey) -> bool {
+        self.aggregate_file_positions.contains_key(aggregate_key)
+            || self.aggregate_queue_positions.contains_key(aggregate_key)
     }
 
     /// Get the latest event index for a client within an aggregate
@@ -333,6 +348,7 @@ impl ShardMemCache {
         file_len: u64,
         metablocks_position: u64,
         datablocks_position: u64,
+        wal_index: u64,
         config: InternalShardConfig,
         current_log_id: u64,
     ) -> Self {
@@ -350,6 +366,7 @@ impl ShardMemCache {
             had_fsync_failure: false,
             config,
             current_log_id,
+            wal_index,
         }
     }
 }

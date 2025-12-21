@@ -71,6 +71,7 @@ impl ShardLogDmaFile {
         let old_file_len = self.file_len;
         let old_datablocks_position = self.shard_log_header.datablocks_position;
         let old_metablocks_position = self.shard_log_header.metablocks_position;
+        let old_wal_index = self.shard_log_header.wal_index;
 
         self.log_id = self.log_id.saturating_add(1);
 
@@ -88,6 +89,7 @@ impl ShardLogDmaFile {
             shard_log_header: ShardLogHeader {
                 datablocks_position: old_datablocks_position,
                 metablocks_position: old_metablocks_position,
+                wal_index: old_wal_index,
             },
         })
     }
@@ -99,10 +101,12 @@ impl ShardLogDmaFile {
         &mut self,
         datablocks_position: u64,
         metablocks_position: u64,
+        wal_index: u64,
     ) -> Result<(), RotatingLogError> {
         let header = ShardLogHeader {
             metablocks_position,
             datablocks_position,
+            wal_index,
         };
 
         let mut dma_file = self.dma_file.as_mut()
@@ -175,6 +179,7 @@ async fn setup_new_file(
     let header = ShardLogHeader {
         metablocks_position: FIXED_BLOCK_SIZE_BYTES as u64,
         datablocks_position: file_len.saturating_sub(FIXED_BLOCK_SIZE_BYTES as u64),
+        wal_index: 0,
     };
 
     write_dual_shard_log_header(dma_file, header.datablocks_position, &header).await?;

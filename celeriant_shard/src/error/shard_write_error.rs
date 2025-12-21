@@ -1,0 +1,77 @@
+use celeriant_wire::wire_format_error::WireFormatError;
+use glommio::GlommioError;
+
+use crate::error::shard_fsync_error::ShardFsyncError;
+
+/// Storage/infrastructure errors—may be transient.
+#[derive(Debug, Clone)]
+pub enum ShardWriteError {
+    /// Disk I/O failure.
+    IoError(String),
+    
+    /// Serialization or deserialization failure.
+    WireFormat(WireFormatError),
+
+    /// Write request contained no events.
+    EmptyEventsList,
+    
+    /// Event type 0 is reserved as a sentinel value.
+    ZeroEventType { client_event_index: u64 },
+    
+    /// Client already wrote an event with this or higher client_event_index.
+    ClientIdempotencyViolation {
+        last_client_event_index: u64,
+        attempted_client_event_index: u64,
+    },
+    
+    /// Expected event_batch_index doesn't match current aggregate state.
+    OptimisticConcurrencyViolation {
+        expected_event_batch_index: u64,
+        current_event_batch_index: u64,
+    },
+    
+    /// Write request requires a valid lease index.
+    InvalidLeaseIndex,
+
+    AggregateNotExists,
+}
+
+
+impl From<ShardFsyncError> for ShardWriteError {
+    fn from(e: ShardFsyncError) -> Self {
+        match e {
+            ShardFsyncError::Io(msg) => Self::IoError(msg),
+            ShardFsyncError::Serialization(wire_err) => Self::WireFormat(wire_err),
+            ShardFsyncError::DmaFileNotInitialized => {
+                Self::IoError("DMA file handle not initialized".to_string())
+            }
+            ShardFsyncError::HeaderCorrupted { log_id } => {
+                Self::IoError(format!("Log header corrupted: log_id={:?}", log_id))
+            }
+            ShardFsyncError::LogFileNotFound { log_id } => {
+                Self::IoError(format!("Log file not found: log_id={}", log_id))
+            }
+            ShardFsyncError::SyncFailurePending => {
+                Self::IoError("Previous sync failure pending".to_string())
+            }
+        }
+    }
+}
+
+impl From<GlommioError<()>> for ShardWriteError {
+    fn from(e: GlommioError<()>) -> Self {
+        Self::IoError(e.to_string())
+    }
+}
+
+impl From<WireFormatError> for ShardWriteError {
+    fn from(e: WireFormatError) -> Self {
+        Self::WireFormat(e)
+    }
+}
+
+impl From<std::io::Error> for ShardWriteError {
+    fn from(e: std::io::Error) -> Self {
+        Self::IoError(e.to_string())
+    }
+}

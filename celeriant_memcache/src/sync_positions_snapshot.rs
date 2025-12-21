@@ -9,6 +9,7 @@ pub struct SyncPositionsSnapshot {
     pub aggregate_queue_positions: HashMap<AggregateKey, AggregatePositions>,
     pub metablocks_position: u64,
     pub datablocks_position: u64,
+    pub wal_index: u64,
     pub file_len: u64,
     pub datablocks_carry_over: Option<Vec<u8>>,
 }

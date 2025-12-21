@@ -1,20 +1,13 @@
 [workspace]
 members = [
-    "celeriant",
-    "celeriant_embedded",
-    "celeriant_client_glommio",
-    "celeriant_client_tokio",
     "celeriant_disk",
     "celeriant_msg",
     "celeriant_wal",
     "celeriant_wire",
     "celeriant_crypto", 
-    "celeriant_runtimes",
-    "celeriant_cli",
-    "celeriant_filesystem",
-    "celeriant_sidecar", 
-    "celeriant_client_demo", "celeriant_rotating_log", 
-    "celeriant_watch", "celeriant_memcache", "celeriant_shard",
+    "celeriant_watch", 
+    "celeriant_memcache", 
+    "celeriant_shard",
 ]
 
 resolver = "2"

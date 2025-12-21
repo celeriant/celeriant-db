@@ -482,13 +482,14 @@ mod shard_log_dma_file_tests {
                 let new_data_pos = initial_data_pos - 1024;
 
                 dma_file
-                    .write_new_headers_and_fsync(new_data_pos, new_meta_pos)
+                    .write_new_headers_and_fsync(new_data_pos, new_meta_pos, 1)
                     .await
                     .unwrap();
 
                 // Verify in-memory header was updated
                 assert_eq!(dma_file.shard_log_header.metablocks_position, new_meta_pos);
                 assert_eq!(dma_file.shard_log_header.datablocks_position, new_data_pos);
+                assert_eq!(dma_file.shard_log_header.wal_index, 1);
 
                 // Close and reopen to verify persistence
                 if let Some(file) = dma_file.dma_file.take() {
@@ -499,6 +500,7 @@ mod shard_log_dma_file_tests {
 
                 assert_eq!(reopened.shard_log_header.metablocks_position, new_meta_pos);
                 assert_eq!(reopened.shard_log_header.datablocks_position, new_data_pos);
+                assert_eq!(reopened.shard_log_header.wal_index, 1);
 
                 if let Some(file) = reopened.dma_file {
                     file.close().await.unwrap();
@@ -723,8 +725,9 @@ mod integration_tests {
                     let new_meta_pos =
                         guard.shard_log_header.metablocks_position + FIXED_BLOCK_SIZE_BYTES as u64;
                     let new_data_pos = guard.shard_log_header.datablocks_position - 1024;
+                    let new_wal_index = guard.shard_log_header.wal_index + 1;
                     guard
-                        .write_new_headers_and_fsync(new_data_pos, new_meta_pos)
+                        .write_new_headers_and_fsync(new_data_pos, new_meta_pos, new_wal_index)
                         .await
                         .unwrap();
 
@@ -880,6 +883,7 @@ mod integration_tests {
 
                 let expected_meta_pos;
                 let expected_data_pos;
+                let expected_wal_index;
 
                 // Write and fsync, then "crash" (don't call close)
                 {
@@ -892,9 +896,10 @@ mod integration_tests {
                     expected_meta_pos = dma_file.shard_log_header.metablocks_position
                         + FIXED_BLOCK_SIZE_BYTES as u64 * 5;
                     expected_data_pos = dma_file.shard_log_header.datablocks_position - 2048;
+                    expected_wal_index = 5;
 
                     dma_file
-                        .write_new_headers_and_fsync(expected_data_pos, expected_meta_pos)
+                        .write_new_headers_and_fsync(expected_data_pos, expected_meta_pos, expected_wal_index)
                         .await
                         .unwrap();
 
@@ -915,6 +920,7 @@ mod integration_tests {
                         dma_file.shard_log_header.datablocks_position,
                         expected_data_pos
                     );
+                    assert_eq!(dma_file.shard_log_header.wal_index, expected_wal_index);
 
                     if let Some(file) = dma_file.dma_file {
                         file.close().await.unwrap();
@@ -1164,7 +1170,7 @@ mod edge_case_tests {
                 assert!(dma_file.dma_file.is_none());
 
                 // Try to write headers - should error
-                let result = dma_file.write_new_headers_and_fsync(1000, 2000).await;
+                let result = dma_file.write_new_headers_and_fsync(1000, 2000, 9999).await;
                 assert!(result.is_err());
 
                 // Clean up

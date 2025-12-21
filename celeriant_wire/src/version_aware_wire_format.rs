@@ -110,6 +110,7 @@ mod tests {
         let header = ShardLogHeader {
             metablocks_position: 0x1234_5678_9ABC_DEF0,
             datablocks_position: 0xFEDC_BA98_7654_3210,
+            wal_index: 0x0FED_CBA9_8765_4321,
         };
 
         let mut buffer = [0u8; FIXED_BLOCK_SIZE_BYTES];
@@ -124,6 +125,11 @@ mod tests {
             header.datablocks_position,
             "datablocks_position was corrupted - likely due to incorrect zero-fill offset"
         );
+        assert_eq!(
+            deserialized.wal_index, 
+            header.wal_index,
+            "wal_index was corrupted - likely due to incorrect zero-fill offset"
+        );
     }
 
     #[test]
@@ -131,6 +137,7 @@ mod tests {
         let header = ShardLogHeader {
             metablocks_position: 11,
             datablocks_position: 12,
+            wal_index: 13,
         };
 
         let mut buffer = [0u8; FIXED_BLOCK_SIZE_BYTES];
@@ -141,6 +148,7 @@ mod tests {
         assert_eq!(version, WIRE_VERSION_WAL_SHARD_LOG_HEADER);
         assert_eq!(deserialized.metablocks_position, header.metablocks_position);
         assert_eq!(deserialized.datablocks_position, header.datablocks_position);
+        assert_eq!(deserialized.wal_index, header.wal_index);
     }
 
     #[test]
@@ -148,6 +156,7 @@ mod tests {
         let header = ShardLogHeader {
             metablocks_position: 11,
             datablocks_position: 12,
+            wal_index: 13,
         };
 
         let mut buffer = [0u8; FIXED_BLOCK_SIZE_BYTES];
@@ -165,6 +174,7 @@ mod tests {
         let header = ShardLogHeader {
             metablocks_position: 0x1111_1111_1111_1111,
             datablocks_position: 0x2222_2222_2222_2222,
+            wal_index: 0x3333_3333_3333_3333,
         };
 
         let mut buffer = [0u8; FIXED_BLOCK_SIZE_BYTES];
@@ -185,6 +195,7 @@ mod tests {
         let header = ShardLogHeader {
             metablocks_position: 11,
             datablocks_position: 12,
+            wal_index: 13,
         };
 
         let mut buffer = [0u8; FIXED_BLOCK_SIZE_BYTES];
@@ -205,6 +216,7 @@ mod tests {
         let header = ShardLogHeader {
             metablocks_position: 11,
             datablocks_position: 12,
+            wal_index: 13,
         };
 
         let mut buffer = [0u8; FIXED_BLOCK_SIZE_BYTES];
@@ -225,6 +237,7 @@ mod tests {
         let header = ShardLogHeader {
             metablocks_position: 11,
             datablocks_position: 12,
+            wal_index: 13,
         };
 
         let mut buffer = [0u8; FIXED_BLOCK_SIZE_BYTES];
@@ -247,6 +260,7 @@ mod tests {
         let header = ShardLogHeader {
             metablocks_position: 11,
             datablocks_position: 12,
+            wal_index: 13,
         };
 
         let mut buffer = [0u8; FIXED_BLOCK_SIZE_BYTES];
