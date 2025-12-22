@@ -349,14 +349,11 @@ impl App {
                 
                 for batch in &res.event_batches {
                     self.result_output.push(format!(
-                        "━━━ Batch {} ━━━ {} ━━━",
+                        "━━━ Batch {} ━━━",
                         batch.event_batch_index,
-                        crate::utils::format_timestamp(batch.server_timestamp)
                     ));
                     self.result_output.push(format!(
-                        "Client: {} | User: {:?} | Events: {}",
-                        batch.client_id,
-                        batch.user_id,
+                        "Events: {}",
                         batch.events.len()
                     ));
                     
@@ -440,8 +437,6 @@ impl App {
                 self.result_output.push(format!("Start event index: {}", res.start_event_index));
                 self.result_output.push(format!("Server timestamp: {}", crate::utils::format_timestamp(res.server_timestamp)));
                 self.result_output.push(format!("Compressed size: {}", humansize::format_size(res.compressed_size, humansize::BINARY)));
-                self.result_output.push(format!("Node ID: {}", res.node_id));
-                self.result_output.push(format!("CRC: 0x{:08X}", res.events_crc));
                 
                 // Don't clear write_data - allow multiple writes
                 self.set_status("Event written successfully");

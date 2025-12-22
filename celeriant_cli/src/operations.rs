@@ -102,8 +102,6 @@ async fn read_events(client: &mut CeleriantClient, args: ReadArgs) -> Result<()>
                     }
                     println!();
                     for batch in &res.event_batches {
-                        println!("Batch {} ({})", batch.event_batch_index, format_timestamp(batch.server_timestamp));
-                        println!("  Client: {}, Events: {}", batch.client_id, batch.events.len());
                         for event in &batch.events {
                             let data_preview: String = String::from_utf8_lossy(&event.event_value)
                                 .chars()
@@ -171,8 +169,6 @@ async fn write_event(client: &mut CeleriantClient, args: WriteArgs) -> Result<()
             println!("  Start event index: {}", res.start_event_index);
             println!("  Server timestamp: {}", format_timestamp(res.server_timestamp));
             println!("  Compressed size: {}", humansize::format_size(res.compressed_size, humansize::BINARY));
-            println!("  Node ID: {}", res.node_id);
-            println!("  CRC: 0x{:08X}", res.events_crc);
         }
         Response::GenericError(err) => {
             anyhow::bail!("Error {}: {}", err.error_code, err.error_message);

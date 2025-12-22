@@ -12,6 +12,7 @@ members = [
     "celeriant",
     "celeriant_client_tokio",
     "celeriant_client_demo",
+    "celeriant_cli",
 ]
 
 resolver = "2"

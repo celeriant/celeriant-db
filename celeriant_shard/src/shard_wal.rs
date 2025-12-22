@@ -40,6 +40,7 @@ use crate::error::shard_error::ShardError;
 use crate::error::shard_fsync_error::ShardFsyncError;
 use crate::error::shard_read_error::ShardReadError;
 use crate::error::shard_write_error::ShardWriteError;
+use crate::in_memory_filtering::{apply_event_filters, trim_end_if_exceeds_max_bytes};
 
 /// Write-ahead log for a single shard.
 ///
@@ -85,7 +86,12 @@ impl ShardWal {
     ) -> Result<Response, ShardError> {
         match request {
             Request::Exists(_exists_request) => Err(ShardError::Read(ShardReadError::NotExists)),
-            Request::Read(_read_request) => Err(ShardError::Read(ShardReadError::NotExists)),
+            Request::Read(read_request) => {
+                self.read(&read_request)
+                    .await
+                    .map(Response::Read)
+                    .map_err(ShardError::Read)
+            },
             Request::Write(write_request) => {
                 let lease_index = lease_index.ok_or(ShardWriteError::InvalidLeaseIndex)?;
                 self.write(lease_index, write_request)
@@ -180,10 +186,109 @@ impl ShardWal {
         Ok(write_response)
     }
 
+
     /// Read event batches from an aggregate.
     /// Reads from cache when possible, falls back to disk for older batches.
-    pub async fn read(&self, _request: &ReadRequest) -> Result<ReadResponse, ShardReadError> {
-        todo!()
+    pub async fn read(&self, request: &ReadRequest) -> Result<ReadResponse, ShardReadError> {
+        let shard_mem_cache = self.shard_mem_cache.borrow();
+
+        // Check if aggregate exists
+        if !shard_mem_cache.aggregate_exists(&request.aggregate_key) {
+            return Err(ShardReadError::NotExists);
+        }
+
+        // Get cached writes starting from the requested batch index
+        let cached_writes = match shard_mem_cache
+            .get_cached_writes_from(&request.aggregate_key, request.filters.from_event_batch_index)
+        {
+            Some(writes) => writes,
+            None => {
+                return Err(ShardReadError::UnavailableBatchIndex {
+                    requested_event_batch_index: request.filters.from_event_batch_index,
+                    minimum_available_event_batch_index: u64::MAX,
+                });
+            }
+        };
+
+        // Collect writes into a vec for processing
+        let writes: Vec<_> = cached_writes.collect();
+
+        if writes.is_empty() {
+            return Err(ShardReadError::UnavailableBatchIndex {
+                requested_event_batch_index: request.filters.from_event_batch_index,
+                minimum_available_event_batch_index: u64::MAX,
+            });
+        }
+
+        // Check if the first available batch matches what was requested (detect gaps)
+        let first_batch_index = match &writes[0].1.metablock.wal_metablock_type {
+            MetablockKind::EventBatchMetadata(m) => m.event_batch_index,
+            _ => {
+                return Err(ShardReadError::UnavailableBatchIndex {
+                    requested_event_batch_index: request.filters.from_event_batch_index,
+                    minimum_available_event_batch_index: u64::MAX,
+                })
+            }
+        };
+
+        if first_batch_index > request.filters.from_event_batch_index {
+            return Err(ShardReadError::UnavailableBatchIndex {
+                requested_event_batch_index: request.filters.from_event_batch_index,
+                minimum_available_event_batch_index: first_batch_index,
+            });
+        }
+
+        // Extract metablocks for filtering
+        let mut metablocks: Vec<Metablock> = writes
+            .iter()
+            .map(|(_, write)| write.metablock.clone())
+            .collect();
+
+        // Apply batch-level filters and pagination based on max_response_size
+        let next_event_batch_index = trim_end_if_exceeds_max_bytes(
+            &mut metablocks,
+            &request.filters,
+            Some(self.config.max_response_size as usize),
+        )?;
+
+        // Build set of batch indexes that passed filtering
+        let kept_batch_indexes: std::collections::HashSet<u64> = metablocks
+            .iter()
+            .filter_map(|m| match &m.wal_metablock_type {
+                MetablockKind::EventBatchMetadata(meta) => Some(meta.event_batch_index),
+                _ => None,
+            })
+            .collect();
+
+        // Extract and filter event batches
+        let mut event_batches: Vec<DatablockAggregateEventBatch> = Vec::new();
+
+        for (_, write) in &writes {
+            let batch_index = match &write.metablock.wal_metablock_type {
+                MetablockKind::EventBatchMetadata(m) => m.event_batch_index,
+                _ => continue,
+            };
+
+            if !kept_batch_indexes.contains(&batch_index) {
+                continue;
+            }
+
+            if let Some(datablock) = &write.datablock {
+                if let DatablockKind::EventBatchItem(batch) = &datablock.datablock_kind {
+                    let mut batch_clone = batch.clone();
+                    apply_event_filters(&mut batch_clone, &request.filters);
+                    if !batch_clone.events.is_empty() {
+                        event_batches.push(batch_clone);
+                    }
+                }
+            }
+        }
+
+        Ok(ReadResponse {
+            correlation_id: request.correlation_id,
+            event_batches,
+            next_event_batch_index,
+        })
     }
 
     /// Close the shard WAL, flushing any pending writes.

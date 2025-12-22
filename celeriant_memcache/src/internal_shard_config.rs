@@ -9,4 +9,5 @@ pub struct InternalShardConfig {
     pub recent_write_cache_bytes: u64,
     pub non_durable_writes: bool,
     pub shard_dir: PathBuf,
+    pub max_response_size: u64,
 }

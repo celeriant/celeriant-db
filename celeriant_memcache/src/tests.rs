@@ -40,6 +40,7 @@ mod tests {
             recent_write_cache_bytes: 10000,
             non_durable_writes: false,
             shard_dir: PathBuf::from("/tmp/test_shard"),
+            max_response_size: 10 * 1024 * 1024, // 10MB
         }
     }
 
