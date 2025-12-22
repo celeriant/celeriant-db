@@ -1,8 +1,9 @@
-use std::{cell::{Cell, RefCell}, rc::Rc};
+use std::{cell::{Cell, RefCell}, collections::HashMap, rc::Rc};
 
 use celeriant_msg::request::requests::WatchRequest;
+use celeriant_wal::aggregate_key::AggregateKey;
 
-use crate::{aggregate_watch_event::AggregateWatchEvent, subscribed_client::SubscribedClient, watcher_handle::WatcherHandle};
+use crate::{aggregate_watch_event::{AggregateWatchEvent, AggregateWatchEventOperation}, subscribed_client::SubscribedClient, watcher_handle::WatcherHandle};
 
 
 pub struct AggregateWatchers {
@@ -51,6 +52,19 @@ impl AggregateWatchers {
     /// Check if there are any active subscribers
     pub fn is_empty(&self) -> bool {
         self.watcher_handles.borrow().is_empty()
+    }
+
+    /// Broadcast write events to watchers after durable sync.
+    pub fn notify_watchers(
+        &self,
+        events: HashMap<AggregateKey, AggregateWatchEventOperation>,
+    ) {
+        for (aggregate_key, operation) in events {
+            self.broadcast(AggregateWatchEvent {
+                aggregate_key: aggregate_key.clone(),
+                operation,
+            });
+        }
     }
 
     /// Broadcast an event to all subscribers

@@ -84,7 +84,7 @@ mod tests {
                 file.close().await.unwrap();
 
                 // Try to read it back
-                let (file2, len2) = existing_file_dma(&file_path).await.unwrap();
+                let (file2, _len2) = existing_file_dma(&file_path).await.unwrap();
                 let read_buf = file2.read_at_aligned(0, 512).await.unwrap();
                 assert!(
                     read_buf.iter().all(|&b| b == 0xAB),

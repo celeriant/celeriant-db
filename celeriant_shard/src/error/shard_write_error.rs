@@ -40,8 +40,8 @@ pub enum ShardWriteError {
 impl From<ShardFsyncError> for ShardWriteError {
     fn from(e: ShardFsyncError) -> Self {
         match e {
-            ShardFsyncError::Io(msg) => Self::IoError(msg),
-            ShardFsyncError::Serialization(wire_err) => Self::WireFormat(wire_err),
+            ShardFsyncError::IoError(msg) => Self::IoError(msg),
+            ShardFsyncError::WireFormat(wire_err) => Self::WireFormat(wire_err),
             ShardFsyncError::DmaFileNotInitialized => {
                 Self::IoError("DMA file handle not initialized".to_string())
             }
@@ -53,6 +53,9 @@ impl From<ShardFsyncError> for ShardWriteError {
             }
             ShardFsyncError::SyncFailurePending => {
                 Self::IoError("Previous sync failure pending".to_string())
+            }
+            ShardFsyncError::DatablocksCarryOverBufferNotPresent => {
+                Self::IoError("Datablocks carry-over buffer not present".to_string())
             }
         }
     }

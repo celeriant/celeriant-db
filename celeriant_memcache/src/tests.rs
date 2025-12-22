@@ -7,7 +7,7 @@ mod tests {
         internal_shard_config::InternalShardConfig,
         recent_write::RecentWrite,
         shard_log_queue_item::ShardLogQueueItem,
-        shard_mem_cache::{EventIndexes, ShardMemCache},
+        shard_mem_cache::{ShardMemCache},
         sync_positions_snapshot::SyncPositionsSnapshot,
     };
     use celeriant_wal::{

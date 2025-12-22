@@ -6,7 +6,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-celeriant_filesystem = { path = "../celeriant_filesystem" }
+celeriant_shard = { path = "../celeriant_shard" }
+celeriant_memcache = { path = "../celeriant_memcache" }
 celeriant_sidecar = { path = "../celeriant_sidecar" }
 celeriant_wal = { path = "../celeriant_wal" }
 celeriant_msg = { path = "../celeriant_msg" }

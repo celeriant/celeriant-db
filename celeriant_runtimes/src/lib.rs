@@ -1,4 +1,5 @@
-use celeriant_filesystem::shard_write_ahead_log::ShardWriteAheadLog;
+use celeriant_memcache::internal_shard_config::InternalShardConfig;
+use celeriant_shard::shard_wal::ShardWal;
 use celeriant_sidecar::store::SidecarStoreTrait;
 use glommio::{
     CpuSet, LocalExecutorPoolBuilder, PoolPlacement,
@@ -40,7 +41,7 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
             let current_shard_id = sender.peer_id();
 
             let shard_dir = shard_config.data_root.join(format!("shard_{current_shard_id}"));
-            let internal_shard_config = celeriant_filesystem::internal_shard_config::InternalShardConfig { 
+            let internal_shard_config = InternalShardConfig { 
                 shard_log_preallocate_bytes: shard_config.shard_log_preallocate_bytes, 
                 node_id, 
                 fsync_delay: shard_config.fsync_delay, 
@@ -49,7 +50,7 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                 max_open_files: shard_config.max_open_files,
                 recent_write_cache_bytes: shard_config.recent_write_cache_bytes,
             };
-            let filesystem = ShardWriteAheadLog::new(internal_shard_config).await
+            let filesystem = ShardWal::open(internal_shard_config).await
                 .expect(&format!("Failed to initialize filesystem at {:?} - cannot initialize shard", shard_config.data_root));
 
             Shard::new(shard_config, current_shard_id, sender, receivers, sidecar_senders, tcp_listener, filesystem).run().await;

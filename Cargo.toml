@@ -8,6 +8,10 @@ members = [
     "celeriant_watch", 
     "celeriant_memcache", 
     "celeriant_shard",
+    "celeriant_runtimes",
+    "celeriant",
+    "celeriant_client_tokio",
+    "celeriant_client_demo",
 ]
 
 resolver = "2"

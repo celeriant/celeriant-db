@@ -12,8 +12,9 @@ use celeriant_wal::{
 use tokio::time::Instant;
 
 const NUM_CONNECTIONS: usize = 1024*12; // 28k max source port limit ~25000;
-const TEST_DURATION_SECS: u64 = 160;
-const NUM_AGGREGATES: usize = 32;
+const TEST_DURATION_SECS: u64 = 30;
+const NUM_AGGREGATES: usize = 1024;
+const USE_MICRO_PAYLOAD: bool = true;
 
 struct TaskStats {
     request_count: u64,
@@ -93,33 +94,45 @@ async fn run_connection_benchmark(connection_id: usize) -> Result<TaskStats, Str
         .map_err(|e| format!("Connection error: {}", e))?
         .with_timeout(Duration::from_secs(5));
 
+    let event_1 = DatablockAggregateEvent {
+        client_event_index: 3,
+        event_index: 0,
+        event_id: Some(1234567890),
+        event_timestamp: 0,
+        event_type_major: 2,
+        event_type_minor: 3,
+        event_value: std::sync::Arc::new(b"Hello World!".to_vec()),
+        iv: None,
+    };
+
+    let event_2 = DatablockAggregateEvent {
+        client_event_index: 3,
+        event_index: 0,
+        event_id: Some(1234567890),
+        event_timestamp: 0,
+        event_type_major: 2,
+        event_type_minor: 3,
+        event_value: std::sync::Arc::new(b"She should have died hereafter;
+            There would have been a time for such a word.
+            Tomorrow, and tomorrow, and tomorrow,
+            Creeps in this petty pace from day to day
+            To the last syllable of recorded time,
+            And all our yesterdays have lighted fools
+            The way to dusty death. Out, out, brief candle!
+            Life's but a walking shadow, a poor player
+            That struts and frets his hour upon the stage
+            And then is heard no more. It is a tale
+            Told by an idiot, full of sound and fury, Signifying nothing. ".to_vec()),
+        iv: None,
+    };
+
     // Prepare the write request (reused for all requests)
     let request = Request::Write(WriteRequest {
         correlation_id: Some(connection_id as u128),
         aggregate_key: AggregateKey::new(1, 3, (connection_id % NUM_AGGREGATES) as u128),
         client_id: connection_id as u128,
         user_id: None,
-        events: vec![DatablockAggregateEvent::new(
-            0,                           // client_event_index
-            0,                           // event_index (server will assign)
-            None,                        // event_id
-            0,                           // client timestamp
-            1,                           // event_type_major
-            0,                           // event_type_minor
-            //b"Hello World".to_vec(),
-            b"For example, those who worked from home spent about 3 hours and 24 minutes doing unpaid work, while those working in the office spent fewer than two and a half hours. So it may be things like putting an extra load of washing on or actually having some extra time to spend caring for, whether it's children or pets or aging parents.".to_vec(),
-        ),
-        DatablockAggregateEvent::new(
-            0,                           // client_event_index
-            0,                           // event_index (server will assign)
-            None,                        // event_id
-            0,                           // client timestamp
-            1,                           // event_type_major
-            0,                           // event_type_minor
-            //b"Hello World".to_vec(),
-            b"It has excellent ergonomics and a clear vision, but until it proves itself with public performance data and a clear escape hatch for users (like an open-source core or data migration tools), it remains a high-risk choice for core infrastructure.".to_vec(),
-        )
-        ],
+        events: if USE_MICRO_PAYLOAD { vec![event_1] } else { vec![event_1, event_2] },
         allow_create: true,
         expected_event_batch_index: None,
         enforce_client_idempotency: false,

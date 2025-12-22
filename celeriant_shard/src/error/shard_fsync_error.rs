@@ -1,13 +1,15 @@
+use celeriant_rotating_log::rotating_log_error::RotatingLogError;
 use celeriant_wire::wire_format_error::WireFormatError;
+use glommio::GlommioError;
 
 /// Storage/infrastructure errors—may be transient.
 #[derive(Debug, Clone)]
 pub enum ShardFsyncError {
     /// Disk I/O failure.
-    Io(String),
+    IoError(String),
     
     /// Serialization or deserialization failure.
-    Serialization(WireFormatError),
+    WireFormat(WireFormatError),
     
     /// DMA file handle not initialized (startup issue).
     DmaFileNotInitialized,
@@ -20,4 +22,38 @@ pub enum ShardFsyncError {
     
     /// Previous sync failed, forcing durable mode.
     SyncFailurePending,
+
+    DatablocksCarryOverBufferNotPresent,
+}
+
+impl From<GlommioError<()>> for ShardFsyncError {
+    fn from(e: GlommioError<()>) -> Self {
+        Self::IoError(e.to_string())
+    }
+}
+
+impl From<WireFormatError> for ShardFsyncError {
+    fn from(e: WireFormatError) -> Self {
+        Self::WireFormat(e)
+    }
+}
+
+impl From<std::io::Error> for ShardFsyncError {
+    fn from(e: std::io::Error) -> Self {
+        Self::IoError(e.to_string())
+    }
+}
+
+impl From<RotatingLogError> for ShardFsyncError {
+    fn from(e: RotatingLogError) -> Self {
+        match e {
+            RotatingLogError::InvalidPreallocatedBytes(b) => {
+                Self::IoError(format!("Invalid preallocated bytes: {}", b))
+            }
+            RotatingLogError::IoError(msg) => Self::IoError(msg),
+            RotatingLogError::WireFormat(e) => Self::WireFormat(e),
+            RotatingLogError::HeaderCorrupted { log_id } => Self::HeaderCorrupted { log_id },
+            RotatingLogError::LogFileNotFound { log_id } => Self::LogFileNotFound { log_id },
+        }
+    }
 }

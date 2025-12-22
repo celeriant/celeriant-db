@@ -17,6 +17,7 @@ glommio.workspace = true
 futures-lite.workspace = true
 fastbloom.workspace = true
 crc32c.workspace = true
+deepsize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
