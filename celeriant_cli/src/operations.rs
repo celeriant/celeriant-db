@@ -102,6 +102,8 @@ async fn read_events(client: &mut CeleriantClient, args: ReadArgs) -> Result<()>
                     }
                     println!();
                     for batch in &res.event_batches {
+                        println!("Batch {} ({})", batch.event_batch_index, format_timestamp(batch.server_timestamp));
+                        println!("  Client: {}, Events: {}", batch.client_id, batch.events.len());
                         for event in &batch.events {
                             let data_preview: String = String::from_utf8_lossy(&event.event_value)
                                 .chars()

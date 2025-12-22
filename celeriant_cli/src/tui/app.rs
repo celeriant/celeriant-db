@@ -16,6 +16,8 @@ use celeriant_wal::{
 };
 use directories::ProjectDirs;
 
+use crate::utils::format_timestamp;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Screen {
     Home,
@@ -349,19 +351,22 @@ impl App {
                 
                 for batch in &res.event_batches {
                     self.result_output.push(format!(
-                        "━━━ Batch {} ━━━",
+                        "━━━ Batch {} ━━━ {} ━━━",
                         batch.event_batch_index,
+                        crate::utils::format_timestamp(batch.server_timestamp)
                     ));
                     self.result_output.push(format!(
-                        "Events: {}",
+                        "Client: {} | User: {:?} | Events: {}",
+                        batch.client_id,
+                        batch.user_id,
                         batch.events.len()
                     ));
                     
-                    for (i, event) in batch.events.iter().enumerate() {
+                    for (_i, event) in batch.events.iter().enumerate() {
                         let data_str = String::from_utf8_lossy(&event.event_value);
                         self.result_output.push(format!(
                             "  [{}] Type: {} | Index: {} | Time: {}",
-                            i, event.event_type_major, event.client_event_index, event.event_timestamp
+                            humansize::format_size(event.event_value.len(), humansize::BINARY), event.event_type_major, event.event_index, format_timestamp(event.event_timestamp)
                         ));
                         // Split data into lines for display
                         for line in data_str.lines().take(5) {

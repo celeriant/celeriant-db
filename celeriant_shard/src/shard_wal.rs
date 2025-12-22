@@ -13,6 +13,7 @@ use celeriant_memcache::sync_positions_snapshot::SyncPositionsSnapshot;
 use celeriant_msg::process_requests::Request;
 use celeriant_msg::process_responses::Response;
 use celeriant_msg::request::requests::{ReadRequest, WriteRequest};
+use celeriant_msg::response::aggregate_event_batch::AggregateEventBatch;
 use celeriant_msg::response::responses::{ReadResponse, WriteResponse};
 use celeriant_rotating_log::rotating_log_cache::RotatingLogCache;
 use celeriant_rotating_log::rotating_log_error::RotatingLogError;
@@ -261,15 +262,15 @@ impl ShardWal {
             .collect();
 
         // Extract and filter event batches
-        let mut event_batches: Vec<DatablockAggregateEventBatch> = Vec::new();
+        let mut event_batches: Vec<AggregateEventBatch> = Vec::new();
 
         for (_, write) in &writes {
-            let batch_index = match &write.metablock.wal_metablock_type {
-                MetablockKind::EventBatchMetadata(m) => m.event_batch_index,
+            let (event_batch_index, client_id, user_id) = match &write.metablock.wal_metablock_type {
+                MetablockKind::EventBatchMetadata(m) => (m.event_batch_index, m.client_id, m.user_id),
                 _ => continue,
             };
 
-            if !kept_batch_indexes.contains(&batch_index) {
+            if !kept_batch_indexes.contains(&event_batch_index) {
                 continue;
             }
 
@@ -278,7 +279,13 @@ impl ShardWal {
                     let mut batch_clone = batch.clone();
                     apply_event_filters(&mut batch_clone, &request.filters);
                     if !batch_clone.events.is_empty() {
-                        event_batches.push(batch_clone);
+                        event_batches.push(AggregateEventBatch {
+                            event_batch_index,
+                            client_id,
+                            user_id,
+                            server_timestamp: write.metablock.server_timestamp,
+                            events: batch_clone.events,
+                        });
                     }
                 }
             }
