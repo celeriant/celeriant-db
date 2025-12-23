@@ -6,3 +6,4 @@ pub mod datablocks;
 pub mod metablocks;
 pub mod shard_log_header;
 pub mod aggregate_type_key;
+pub mod aggregate_client_key;

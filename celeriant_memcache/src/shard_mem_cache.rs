@@ -1,8 +1,8 @@
 use crate::{
-    aggregate_positions::AggregatePositions, recent_write::RecentWrite, shard_log_queue_item::ShardLogQueueItem, sync_positions_snapshot::SyncPositionsSnapshot
-, internal_shard_config::InternalShardConfig};
-use celeriant_wal::{aggregate_key::AggregateKey, constants::FIXED_BLOCK_SIZE_BYTES, datablocks::datablock::Datablock, metablocks::metablock::Metablock};
-use std::{collections::{BTreeMap, HashMap, VecDeque}, path::PathBuf};
+    aggregate_recent_write::AggregateRecentWrites, internal_shard_config::InternalShardConfig, mem_snapshot_aggregate::MemSnapshotAggregate, queue_aggregate_positions::QueueAggregatePositions, recent_write::RecentWrite, shard_log_queue_item::ShardLogQueueItem, sync_positions_snapshot::SyncPositionsSnapshot};
+use celeriant_wal::{aggregate_client_key::AggregateClientKey, aggregate_key::AggregateKey, constants::FIXED_BLOCK_SIZE_BYTES, datablocks::datablock::Datablock, metablocks::metablock::Metablock};
+use lru::LruCache;
+use std::{collections::{BTreeMap, HashMap, VecDeque}, num::NonZeroUsize, path::PathBuf};
 
 pub struct ShardMemCache {
     config: InternalShardConfig,
@@ -23,9 +23,9 @@ pub struct ShardMemCache {
     /// Direct I/O aligned writes. Saves reading the bytes for the next datablock write
     datablocks_carry_over: Option<Vec<u8>>,
 
-    /// Cache of recent writes indexed by aggregate key and batch index.
+    /// Cache of recent writes indexed by aggregate key.
     /// Only populated after successful durable write.
-    aggregate_recent_writes: HashMap<AggregateKey, BTreeMap<u64, RecentWrite>>,
+    aggregate_recent_writes: HashMap<AggregateKey, AggregateRecentWrites>,
     
     /// Current size of the recent write cache in bytes
     cache_current_bytes: u64,
@@ -33,14 +33,20 @@ pub struct ShardMemCache {
     /// Eviction queue: (aggregate_key, batch_index, size_bytes) in insertion order
     cache_eviction_queue: VecDeque<(AggregateKey, u64, u64)>,
 
-    /// Current positions of indexes committed to file (batch, event, client event indexes)
-    aggregate_file_positions: HashMap<AggregateKey, AggregatePositions>,
+    /// LRU cache of aggregate positions committed to file (batch and event indexes)
+    aggregate_snapshots: LruCache<AggregateKey, MemSnapshotAggregate>,
+
+    /// LRU cache of client event indexes committed to file
+    /// Missing here does not mean client hasn't written to aggregate, just not in cache
+    aggregate_client_snapshots: LruCache<AggregateClientKey, u64>,
 
     /// Indexes representing the in-memory positions of the next write for each aggregate
     /// These are writes yet to be written to disk
-    aggregate_queue_positions: HashMap<AggregateKey, AggregatePositions>,
+    /// This is unbounded as we expect quick flush to disk
+    aggregate_queue_positions: HashMap<AggregateKey, QueueAggregatePositions>,
 
     /// Writes from clients that are pending write to disk
+    /// This is unbounded as we expect quick flush to disk
     pending_append_queue: Vec<ShardLogQueueItem>,
 
     /// When writing in early ack mode (eg. timeseries data) client's don't know
@@ -67,8 +73,7 @@ impl ShardMemCache {
         metablock: Metablock,
         datablock: Option<Datablock>,
         size_bytes: u64,
-    )
-     {
+    ) {
         let max_bytes = self.config.recent_write_cache_bytes;
         if max_bytes == 0 {
             return;
@@ -82,34 +87,35 @@ impl ShardMemCache {
         }
 
         // Insert new entry
-        let batches = self.aggregate_recent_writes
+        let aggregate_writes = self
+            .aggregate_recent_writes
             .entry(aggregate_key.clone())
-            .or_insert_with(BTreeMap::new);
-        
-        batches.insert(batch_index, RecentWrite {
+            .or_insert_with(|| AggregateRecentWrites::new(batch_index));
+
+        aggregate_writes.push(RecentWrite {
             metablock,
             datablock,
             size_bytes,
         });
-        
+
         self.cache_current_bytes = self.cache_current_bytes.saturating_add(size_bytes);
         self.cache_eviction_queue.push_back((aggregate_key, batch_index, size_bytes));
     }
 
     fn evict_oldest_cache_entry(&mut self) -> bool {
-        let Some((aggregate_key, batch_index, size_bytes)) = self.cache_eviction_queue.pop_front() else {
+        let Some((aggregate_key, _batch_index, size_bytes)) = self.cache_eviction_queue.pop_front() else {
             return false;
         };
 
-        if let Some(batches) = self.aggregate_recent_writes.get_mut(&aggregate_key) {
-            if batches.remove(&batch_index).is_some() {
+        if let Some(aggregate_writes) = self.aggregate_recent_writes.get_mut(&aggregate_key) {
+            if aggregate_writes.pop_front() {
                 self.cache_current_bytes = self.cache_current_bytes.saturating_sub(size_bytes);
             }
-            if batches.is_empty() {
+            if aggregate_writes.is_empty() {
                 self.aggregate_recent_writes.remove(&aggregate_key);
             }
         }
-        
+
         // Periodically reclaim memory from data structures
         if self.cache_eviction_queue.capacity() > self.cache_eviction_queue.len() * 2 {
             self.cache_eviction_queue.shrink_to_fit();
@@ -122,15 +128,16 @@ impl ShardMemCache {
     }
 
     /// Get cached writes for an aggregate from a starting batch index.
-    /// Returns writes in batch order. Returns None if aggregate not in cache.
+    /// Returns writes in batch order as (batch_index, &RecentWrite).
+    /// Returns None if aggregate not in cache.
     pub fn get_cached_writes_from(
         &self,
         aggregate_key: &AggregateKey,
         from_batch_index: u64,
-    ) -> Option<impl Iterator<Item = (&u64, &RecentWrite)>> {
+    ) -> Option<impl Iterator<Item = (u64, &RecentWrite)>> {
         self.aggregate_recent_writes
             .get(aggregate_key)
-            .map(|batches| batches.range(from_batch_index..))
+            .map(|aggregate_writes| aggregate_writes.iter_from(from_batch_index))
     }
     
     pub fn shard_dir(&self) -> PathBuf {
@@ -179,7 +186,7 @@ impl ShardMemCache {
         let aggregate = self
             .aggregate_queue_positions
             .entry(aggregate_key.clone())
-            .or_insert_with(|| AggregatePositions::default());
+            .or_insert_with(|| QueueAggregatePositions::default());
 
         if event_batch_index > aggregate.event_batch_index {
             aggregate.event_batch_index = event_batch_index;
@@ -261,87 +268,86 @@ impl ShardMemCache {
         self.datablocks_carry_over = sync_positions_snapshot.datablocks_carry_over;
         self.had_fsync_failure = false;
 
-        for (key, positions) in sync_positions_snapshot.aggregate_queue_positions {
-            match self.aggregate_file_positions.entry(key) {
-                std::collections::hash_map::Entry::Occupied(mut entry) => {
-                    let aggregate = entry.get_mut();
-                    if positions.event_batch_index > aggregate.event_batch_index {
-                        aggregate.event_batch_index = positions.event_batch_index;
-                    }
-                    if positions.event_index > aggregate.event_index {
-                        aggregate.event_index = positions.event_index;
-                    }
-                    for (client_id, client_event_index) in positions.client_event_indexes {
-                        aggregate
-                            .client_event_indexes
-                            .entry(client_id)
-                            .and_modify(|existing| {
-                                if client_event_index > *existing {
-                                    *existing = client_event_index;
-                                }
-                            })
-                            .or_insert(client_event_index);
-                    }
+        for (key, queue_positions) in sync_positions_snapshot.aggregate_queue_positions {
+            // Update aggregate positions LRU
+            if let Some(existing) = self.aggregate_snapshots.get_mut(&key) {
+                if queue_positions.event_batch_index > existing.event_batch_index {
+                    existing.event_batch_index = queue_positions.event_batch_index;
                 }
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(positions);
+                if queue_positions.event_index > existing.event_index {
+                    existing.event_index = queue_positions.event_index;
+                }
+            } else {
+                self.aggregate_snapshots.put(
+                    key.clone(),
+                    MemSnapshotAggregate {
+                        event_index: queue_positions.event_index,
+                        event_batch_index: queue_positions.event_batch_index,
+                    },
+                );
+            }
+
+            // Update client event indexes LRU
+            for (client_id, client_event_index) in queue_positions.client_event_indexes {
+                let client_key = AggregateClientKey::new(key.clone(), client_id);
+                if let Some(existing) = self.aggregate_client_snapshots.get_mut(&client_key) {
+                    if client_event_index > *existing {
+                        *existing = client_event_index;
+                    }
+                } else {
+                    self.aggregate_client_snapshots.put(client_key, client_event_index);
                 }
             }
         }
     }
 
-    pub fn aggregate_exists(&self, aggregate_key: &AggregateKey) -> bool {
-        self.aggregate_file_positions.contains_key(aggregate_key)
+    pub fn aggregate_snapshot_in_cache(&self, aggregate_key: &AggregateKey) -> bool {
+        self.aggregate_snapshots.contains(aggregate_key)
             || self.aggregate_queue_positions.contains_key(aggregate_key)
     }
 
     /// Get the latest event index for a client within an aggregate
     /// Preference the queue first, then fallback to file if no queued items for client
     pub fn get_client_event_index(
-        &self,
+        &mut self,
         aggregate_key: &AggregateKey,
         client_id: u128,
     ) -> Option<u64> {
-        let mut client_event_index = self
-            .aggregate_queue_positions
-            .get(aggregate_key)
-            .and_then(|aggregate| aggregate.client_event_indexes.get(&client_id).copied());
-
-        if client_event_index.is_none() {
-            client_event_index = self
-                .aggregate_file_positions
-                .get(aggregate_key)
-                .and_then(|aggregate| aggregate.client_event_indexes.get(&client_id).copied());
+        // Check queue first
+        if let Some(queue_pos) = self.aggregate_queue_positions.get(aggregate_key) {
+            if let Some(&idx) = queue_pos.client_event_indexes.get(&client_id) {
+                return Some(idx);
+            }
         }
 
-        client_event_index
+        // Fall back to file LRU (peek to avoid promoting on read)
+        let client_key = AggregateClientKey::new(aggregate_key.clone(), client_id);
+        self.aggregate_client_snapshots.get(&client_key).copied()
     }
 
     /// Get the latest batch and event index for an aggregate
     /// Preference the queue first, then fallback to file if no queued items for aggregate
-    pub fn get_event_indexes(&self, aggregate_key: &AggregateKey) -> EventIndexes {
-        let mut event_indexes =
-            self.aggregate_queue_positions
-                .get(aggregate_key)
-                .map(|aggregate| EventIndexes {
-                    event_batch_index: aggregate.event_batch_index,
-                    event_index: aggregate.event_index,
-                });
-
-        if event_indexes.is_none() {
-            event_indexes = self
-                .aggregate_file_positions
-                .get(aggregate_key)
-                .map(|aggregate| EventIndexes {
-                    event_batch_index: aggregate.event_batch_index,
-                    event_index: aggregate.event_index,
-                });
+    pub fn get_event_indexes(&mut self, aggregate_key: &AggregateKey) -> EventIndexes {
+        // Check queue first
+        if let Some(queue_pos) = self.aggregate_queue_positions.get(aggregate_key) {
+            return EventIndexes {
+                event_batch_index: queue_pos.event_batch_index,
+                event_index: queue_pos.event_index,
+            };
         }
 
-        event_indexes.unwrap_or(EventIndexes {
+        // Fall back to file LRU
+        if let Some(file_pos) = self.aggregate_snapshots.get(aggregate_key) {
+            return EventIndexes {
+                event_batch_index: file_pos.event_batch_index,
+                event_index: file_pos.event_index,
+            };
+        }
+
+        EventIndexes {
             event_batch_index: 0,
             event_index: 0,
-        })
+        }
     }
 
     pub fn new(
@@ -352,6 +358,11 @@ impl ShardMemCache {
         config: InternalShardConfig,
         current_log_id: u64,
     ) -> Self {
+        let aggregate_cap = NonZeroUsize::new((config.aggregate_snapshots_cache_bytes / 112) as usize)
+            .unwrap_or(NonZeroUsize::new(10_000).unwrap());
+        let client_cap = NonZeroUsize::new((config.aggregate_client_snapshots_cache_bytes / 128) as usize)
+            .unwrap_or(NonZeroUsize::new(100_000).unwrap());
+
         Self {
             metablocks_position,
             datablocks_position,
@@ -360,13 +371,14 @@ impl ShardMemCache {
             aggregate_recent_writes: HashMap::new(),
             cache_current_bytes: 0,
             cache_eviction_queue: VecDeque::new(),
-            aggregate_file_positions: HashMap::new(),
             aggregate_queue_positions: HashMap::new(),
             pending_append_queue: vec![],
             had_fsync_failure: false,
             config,
             current_log_id,
             wal_index,
+            aggregate_snapshots: LruCache::new(aggregate_cap),
+            aggregate_client_snapshots: LruCache::new(client_cap),
         }
     }
 }

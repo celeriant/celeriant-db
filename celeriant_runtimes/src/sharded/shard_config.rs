@@ -22,4 +22,6 @@ pub struct ShardConfig {
     pub recent_write_cache_bytes: u64,
     pub routing_rule: RoutingRule,
     pub non_durable_writes: bool,
+    pub aggregate_client_snapshots_cache_bytes: u64,
+    pub aggregate_snapshots_cache_bytes: u64,
 }

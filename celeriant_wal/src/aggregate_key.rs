@@ -8,7 +8,7 @@ use bincode::{BorrowDecode, Decode, Encode};
 use deepsize::DeepSizeOf;
 use serde::{Deserialize, Serialize};
 
-/// High-performance composite key for client event index tracking
+/// High-performance composite key for aggregate tracking
 /// Optimized for hashing and comparison operations
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
 pub struct AggregateKey {

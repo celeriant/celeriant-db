@@ -2,11 +2,11 @@ use std::collections::HashMap;
 
 use celeriant_wal::{aggregate_key::AggregateKey, constants::FIXED_BLOCK_SIZE_BYTES};
 
-use crate::{aggregate_positions::AggregatePositions, shard_log_queue_item::ShardLogQueueItem};
+use crate::{queue_aggregate_positions::QueueAggregatePositions, shard_log_queue_item::ShardLogQueueItem};
 
 pub struct SyncPositionsSnapshot {
     pub pending_append_queue: Vec<ShardLogQueueItem>,
-    pub aggregate_queue_positions: HashMap<AggregateKey, AggregatePositions>,
+    pub aggregate_queue_positions: HashMap<AggregateKey, QueueAggregatePositions>,
     pub metablocks_position: u64,
     pub datablocks_position: u64,
     pub wal_index: u64,

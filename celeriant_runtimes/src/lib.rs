@@ -50,6 +50,8 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                 max_open_files: shard_config.max_open_files,
                 recent_write_cache_bytes: shard_config.recent_write_cache_bytes,
                 max_response_size: shard_config.max_response_size,
+                aggregate_client_snapshots_cache_bytes: shard_config.aggregate_client_snapshots_cache_bytes,
+                aggregate_snapshots_cache_bytes: shard_config.aggregate_snapshots_cache_bytes,
             };
             let filesystem = ShardWal::open(internal_shard_config).await
                 .expect(&format!("Failed to initialize filesystem at {:?} - cannot initialize shard", shard_config.data_root));

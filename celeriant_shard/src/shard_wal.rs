@@ -194,7 +194,7 @@ impl ShardWal {
         let shard_mem_cache = self.shard_mem_cache.borrow();
 
         // Check if aggregate exists
-        if !shard_mem_cache.aggregate_exists(&request.aggregate_key) {
+        if !shard_mem_cache.aggregate_snapshot_in_cache(&request.aggregate_key) {
             return Err(ShardReadError::NotExists);
         }
 
@@ -341,7 +341,7 @@ impl ShardWal {
         }
 
         if !write_request.allow_create {
-            if !shard_mem_cache.aggregate_exists(&write_request.aggregate_key) {
+            if !shard_mem_cache.aggregate_snapshot_in_cache(&write_request.aggregate_key) {
                 return Err(ShardWriteError::AggregateNotExists);
             }
         }

@@ -89,6 +89,12 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 512 * 1024 * 1024, env = "CELERIANT_RECENT_WRITE_CACHE_BYTES", help = "Amount of recent write data to keep in memory for each shard (512MB)")]
     pub recent_write_cache_bytes: u64,
 
+    #[arg(long, default_value_t = 64 * 1024 * 1024, env = "CELERIANT_AGGREGATE_CLIENT_SNAPSHOTS_CACHE_BYTES", help = "Amount of recent client idempotency data to keep in memory for each shard (64MB)")]
+    pub aggregate_client_snapshots_cache_bytes: u64,
+
+    #[arg(long, default_value_t = 64 * 1024 * 1024, env = "CELERIANT_AGGREGATE_SNAPSHOTS_CACHE_BYTES", help = "Amount of recent aggregate metadata to keep in memory for each shard (64MB)")]
+    pub aggregate_snapshots_cache_bytes: u64,
+
     #[arg(
         long,
         default_value_t = 10000,
@@ -206,6 +212,8 @@ impl ServerConfig {
             fsync_delay: Duration::from_micros(self.fsync_delay_us),
             routing_rule: self.routing_rule,
             non_durable_writes: self.non_durable_writes,
+            aggregate_client_snapshots_cache_bytes: self.aggregate_client_snapshots_cache_bytes,
+            aggregate_snapshots_cache_bytes: self.aggregate_snapshots_cache_bytes,
         }
     }
 
@@ -235,6 +243,8 @@ impl ServerConfig {
         check_field!(read_max_chunk_size);
         check_field!(write_max_chunk_size);
         check_field!(recent_write_cache_bytes);
+        check_field!(aggregate_client_snapshots_cache_bytes);
+        check_field!(aggregate_snapshots_cache_bytes);
         check_field!(max_request_size);
         check_field!(max_response_size);
         check_field!(max_requested_latency_ms);
@@ -293,6 +303,8 @@ impl Default for ServerConfig {
             recent_write_cache_bytes: 512 * 1024 * 1024,
             client_connection_timeout_ms: 30000,
             routing_rule: RoutingRule::AggregateId,
+            aggregate_client_snapshots_cache_bytes: 64 * 1024 * 1024,
+            aggregate_snapshots_cache_bytes: 64 * 1024 * 1024,
         }
     }
 }

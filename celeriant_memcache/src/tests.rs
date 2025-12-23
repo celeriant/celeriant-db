@@ -3,7 +3,7 @@ mod tests {
     use std::{collections::HashMap, path::PathBuf, time::Duration};
 
     use crate::{
-        aggregate_positions::AggregatePositions,
+        queue_aggregate_positions::QueueAggregatePositions,
         internal_shard_config::InternalShardConfig,
         recent_write::RecentWrite,
         shard_log_queue_item::ShardLogQueueItem,
@@ -40,7 +40,9 @@ mod tests {
             recent_write_cache_bytes: 10000,
             non_durable_writes: false,
             shard_dir: PathBuf::from("/tmp/test_shard"),
-            max_response_size: 10 * 1024 * 1024, // 10MB
+            max_response_size: 10 * 1024 * 1024,
+            aggregate_snapshots_cache_bytes: 100000 * 112,
+            aggregate_client_snapshots_cache_bytes: 100000 * 128,
         }
     }
 
@@ -694,7 +696,7 @@ mod tests {
 
         let writes: Vec<_> = cache.get_cached_writes_from(&key, 0).unwrap().collect();
         assert_eq!(writes.len(), 1);
-        assert_eq!(*writes[0].0, 1);
+        assert_eq!(writes[0].0, 1);
         assert_eq!(writes[0].1.size_bytes, 100);
     }
 
@@ -724,7 +726,7 @@ mod tests {
 
         // Verify ordering
         for (i, (batch_idx, _)) in writes.iter().enumerate() {
-            assert_eq!(**batch_idx, (i + 1) as u64);
+            assert_eq!(*batch_idx, (i + 1) as u64);
         }
     }
 
@@ -759,8 +761,8 @@ mod tests {
         let writes: Vec<_> = cache.get_cached_writes_from(&key, 5).unwrap().collect();
         assert_eq!(writes.len(), 6); // batches 5, 6, 7, 8, 9, 10
 
-        assert_eq!(*writes[0].0, 5);
-        assert_eq!(*writes[5].0, 10);
+        assert_eq!(writes[0].0, 5);
+        assert_eq!(writes[5].0, 10);
     }
 
     #[test]
@@ -803,10 +805,10 @@ mod tests {
         let writes: Vec<_> = cache.get_cached_writes_from(&key, 0).unwrap().collect();
 
         // First entry should have been evicted (oldest)
-        assert!(!writes.iter().any(|(idx, _)| **idx == 1));
+        assert!(!writes.iter().any(|(idx, _)| *idx == 1));
         // Entries 2, 3, 4 should remain
         assert_eq!(writes.len(), 3);
-        assert_eq!(*writes[0].0, 2);
+        assert_eq!(writes[0].0, 2);
     }
 
     #[test]
@@ -837,7 +839,7 @@ mod tests {
         assert!(total_size <= 200);
 
         // Entry 5 should definitely be there
-        assert!(writes.iter().any(|(idx, _)| **idx == 5));
+        assert!(writes.iter().any(|(idx, _)| *idx == 5));
     }
 
     #[test]
@@ -862,7 +864,7 @@ mod tests {
         let writes2: Vec<_> = cache.get_cached_writes_from(&key2, 0).unwrap().collect();
 
         // key1 batch 1 should be evicted
-        assert!(!writes1.iter().any(|(idx, _)| **idx == 1));
+        assert!(!writes1.iter().any(|(idx, _)| *idx == 1));
         assert_eq!(writes1.len(), 1); // Only batch 2 remains for key1
         assert_eq!(writes2.len(), 2); // Both batches remain for key2
     }
@@ -906,7 +908,7 @@ mod tests {
         // The large entry should still be added (eviction loop breaks when cache is empty)
         let writes: Vec<_> = cache.get_cached_writes_from(&key, 0).unwrap().collect();
         assert_eq!(writes.len(), 1);
-        assert_eq!(*writes[0].0, 2);
+        assert_eq!(writes[0].0, 2);
     }
 
     #[test]
@@ -1092,7 +1094,7 @@ mod tests {
 
     #[test]
     fn get_event_indexes_returns_defaults_for_unknown_aggregate() {
-        let cache = new_cache();
+        let mut cache = new_cache();
         let key = make_aggregate_key(999, 999, 999);
 
         let indexes = cache.get_event_indexes(&key);
@@ -1354,7 +1356,7 @@ mod tests {
 
         let writes: Vec<_> = cache.get_cached_writes_from(&key, 0).unwrap().collect();
         // First entry should be evicted
-        assert!(!writes.iter().any(|(idx, _)| **idx == 1));
+        assert!(!writes.iter().any(|(idx, _)| *idx == 1));
         assert_eq!(writes.len(), 3); // entries 2, 3, 4
     }
 
@@ -1519,10 +1521,10 @@ mod tests {
         assert!(writes.len() <= 20);
 
         // Most recent should be present
-        assert!(writes.iter().any(|(idx, _)| **idx == 100));
+        assert!(writes.iter().any(|(idx, _)| *idx == 100));
 
         // Oldest should be evicted
-        assert!(!writes.iter().any(|(idx, _)| **idx == 1));
+        assert!(!writes.iter().any(|(idx, _)| *idx == 1));
     }
 
     // =============================================================================
@@ -1588,7 +1590,7 @@ mod tests {
 
     #[test]
     fn aggregate_positions_default_values() {
-        let positions = AggregatePositions::default();
+        let positions = QueueAggregatePositions::default();
 
         assert_eq!(positions.event_index, 0);
         assert_eq!(positions.event_batch_index, 0);
@@ -1760,8 +1762,8 @@ mod tests {
         // Read from batch 3 onwards
         let recent_writes: Vec<_> = cache.get_cached_writes_from(&key, 3).unwrap().collect();
         assert_eq!(recent_writes.len(), 3);
-        assert_eq!(*recent_writes[0].0, 3);
-        assert_eq!(*recent_writes[2].0, 5);
+        assert_eq!(recent_writes[0].0, 3);
+        assert_eq!(recent_writes[2].0, 5);
     }
 
     #[test]
@@ -1873,5 +1875,240 @@ mod tests {
 
         let snapshot = cache.take_sync_positions_snapshot();
         assert_eq!(snapshot.buffer_size_datablocks(), 100 + 10000 + 50);
+    }
+
+    // =============================================================================
+    // LRU Cache Capacity Tests
+    // =============================================================================
+
+    fn test_config_small_lru_caches(aggregate_cap: u64, client_cap: u64) -> InternalShardConfig {
+        InternalShardConfig {
+            aggregate_snapshots_cache_bytes: aggregate_cap * 112,
+            aggregate_client_snapshots_cache_bytes: client_cap * 128,
+            ..test_config()
+        }
+    }
+
+    #[test]
+    fn aggregate_snapshots_cache_respects_capacity() {
+        let mut cache = new_cache_with_config(test_config_small_lru_caches(3, 100));
+
+        // Add 5 different aggregates, but capacity is only 3
+        for i in 1..=5u128 {
+            let key = make_aggregate_key(1, 1, i);
+            cache.add_to_pending_append_queue(&key, i as u64, i as u64, 100, 1, make_queue_item(None));
+            let snapshot = cache.take_sync_positions_snapshot();
+            cache.commit_sync_positions_snapshot(snapshot);
+        }
+
+        // Only the 3 most recent should be in cache
+        // Aggregates 1 and 2 should have been evicted
+        let key1 = make_aggregate_key(1, 1, 1);
+        let key2 = make_aggregate_key(1, 1, 2);
+        let key3 = make_aggregate_key(1, 1, 3);
+        let key4 = make_aggregate_key(1, 1, 4);
+        let key5 = make_aggregate_key(1, 1, 5);
+
+        // Keys 3, 4, 5 should still be accessible
+        assert_eq!(cache.get_event_indexes(&key5).event_index, 5);
+        assert_eq!(cache.get_event_indexes(&key4).event_index, 4);
+        assert_eq!(cache.get_event_indexes(&key3).event_index, 3);
+
+        // Keys 1, 2 should return defaults (evicted from LRU)
+        assert_eq!(cache.get_event_indexes(&key1).event_index, 0);
+        assert_eq!(cache.get_event_indexes(&key2).event_index, 0);
+    }
+
+    #[test]
+    fn aggregate_client_snapshots_cache_respects_capacity() {
+        let mut cache = new_cache_with_config(test_config_small_lru_caches(100, 3));
+        let key = make_aggregate_key(1, 1, 1);
+
+        // Add 5 different clients, but capacity is only 3
+        for client_id in 1..=5u128 {
+            cache.add_to_pending_append_queue(
+                &key,
+                client_id as u64,
+                client_id as u64,
+                client_id,
+                client_id as u64 * 10,
+                make_queue_item(None),
+            );
+            let snapshot = cache.take_sync_positions_snapshot();
+            cache.commit_sync_positions_snapshot(snapshot);
+        }
+
+        // Only the 3 most recent clients should be in cache
+        // Clients 3, 4, 5 should still be accessible
+        assert_eq!(cache.get_client_event_index(&key, 5), Some(50));
+        assert_eq!(cache.get_client_event_index(&key, 4), Some(40));
+        assert_eq!(cache.get_client_event_index(&key, 3), Some(30));
+
+        // Clients 1, 2 should return None (evicted from LRU)
+        assert_eq!(cache.get_client_event_index(&key, 1), None);
+        assert_eq!(cache.get_client_event_index(&key, 2), None);
+    }
+
+    #[test]
+    fn aggregate_snapshots_lru_promotes_on_access() {
+        let mut cache = new_cache_with_config(test_config_small_lru_caches(3, 100));
+
+        // Add 3 aggregates to fill cache
+        for i in 1..=3u128 {
+            let key = make_aggregate_key(1, 1, i);
+            cache.add_to_pending_append_queue(&key, i as u64, i as u64, 100, 1, make_queue_item(None));
+            let snapshot = cache.take_sync_positions_snapshot();
+            cache.commit_sync_positions_snapshot(snapshot);
+        }
+
+        // Access key1 to promote it (make it recently used)
+        let key1 = make_aggregate_key(1, 1, 1);
+        let _ = cache.get_event_indexes(&key1);
+
+        // Add a new aggregate - should evict key2 (oldest unused), not key1
+        let key4 = make_aggregate_key(1, 1, 4);
+        cache.add_to_pending_append_queue(&key4, 4, 4, 100, 1, make_queue_item(None));
+        let snapshot = cache.take_sync_positions_snapshot();
+        cache.commit_sync_positions_snapshot(snapshot);
+
+        // key1 should still be there (was promoted)
+        assert_eq!(cache.get_event_indexes(&key1).event_index, 1);
+
+        // key2 should be evicted
+        let key2 = make_aggregate_key(1, 1, 2);
+        assert_eq!(cache.get_event_indexes(&key2).event_index, 0);
+
+        // key3 and key4 should be there
+        let key3 = make_aggregate_key(1, 1, 3);
+        assert_eq!(cache.get_event_indexes(&key3).event_index, 3);
+        assert_eq!(cache.get_event_indexes(&key4).event_index, 4);
+    }
+
+    #[test]
+    fn aggregate_client_snapshots_lru_promotes_on_access() {
+        let mut cache = new_cache_with_config(test_config_small_lru_caches(100, 3));
+        let key = make_aggregate_key(1, 1, 1);
+
+        // Add 3 clients to fill cache
+        for client_id in 1..=3u128 {
+            cache.add_to_pending_append_queue(&key, 1, 1, client_id, client_id as u64, make_queue_item(None));
+            let snapshot = cache.take_sync_positions_snapshot();
+            cache.commit_sync_positions_snapshot(snapshot);
+        }
+
+        // Access client 1 to promote it
+        let _ = cache.get_client_event_index(&key, 1);
+
+        // Add new client - should evict client 2, not client 1
+        cache.add_to_pending_append_queue(&key, 2, 2, 4, 4, make_queue_item(None));
+        let snapshot = cache.take_sync_positions_snapshot();
+        cache.commit_sync_positions_snapshot(snapshot);
+
+        // Client 1 should still be there (was promoted)
+        assert_eq!(cache.get_client_event_index(&key, 1), Some(1));
+
+        // Client 2 should be evicted
+        assert_eq!(cache.get_client_event_index(&key, 2), None);
+
+        // Clients 3 and 4 should be there
+        assert_eq!(cache.get_client_event_index(&key, 3), Some(3));
+        assert_eq!(cache.get_client_event_index(&key, 4), Some(4));
+    }
+
+    #[test]
+    fn aggregate_snapshots_cache_updates_existing_entries() {
+        let mut cache = new_cache_with_config(test_config_small_lru_caches(3, 100));
+        let key = make_aggregate_key(1, 1, 1);
+
+        // Add initial entry
+        cache.add_to_pending_append_queue(&key, 5, 3, 100, 1, make_queue_item(None));
+        let snapshot = cache.take_sync_positions_snapshot();
+        cache.commit_sync_positions_snapshot(snapshot);
+
+        // Update same aggregate with higher values
+        cache.add_to_pending_append_queue(&key, 10, 7, 100, 2, make_queue_item(None));
+        let snapshot = cache.take_sync_positions_snapshot();
+        cache.commit_sync_positions_snapshot(snapshot);
+
+        // Should have updated values, not create duplicate entry
+        let indexes = cache.get_event_indexes(&key);
+        assert_eq!(indexes.event_index, 10);
+        assert_eq!(indexes.event_batch_index, 7);
+    }
+
+    #[test]
+    fn aggregate_client_snapshots_cache_updates_existing_entries() {
+        let mut cache = new_cache_with_config(test_config_small_lru_caches(100, 3));
+        let key = make_aggregate_key(1, 1, 1);
+
+        // Add initial entry for client 100
+        cache.add_to_pending_append_queue(&key, 1, 1, 100, 5, make_queue_item(None));
+        let snapshot = cache.take_sync_positions_snapshot();
+        cache.commit_sync_positions_snapshot(snapshot);
+
+        // Update same client with higher value
+        cache.add_to_pending_append_queue(&key, 2, 2, 100, 15, make_queue_item(None));
+        let snapshot = cache.take_sync_positions_snapshot();
+        cache.commit_sync_positions_snapshot(snapshot);
+
+        // Should have updated value
+        assert_eq!(cache.get_client_event_index(&key, 100), Some(15));
+    }
+
+    #[test]
+    fn aggregate_snapshot_in_cache_checks_both_queue_and_lru() {
+        let mut cache = new_cache_with_config(test_config_small_lru_caches(100, 100));
+        let key1 = make_aggregate_key(1, 1, 1);
+        let key2 = make_aggregate_key(1, 1, 2);
+        let key3 = make_aggregate_key(1, 1, 3);
+
+        // key1 only in queue (not committed)
+        cache.add_to_pending_append_queue(&key1, 1, 1, 100, 1, make_queue_item(None));
+
+        // key2 committed to LRU
+        cache.add_to_pending_append_queue(&key2, 1, 1, 100, 1, make_queue_item(None));
+        let snapshot = cache.take_sync_positions_snapshot();
+        cache.commit_sync_positions_snapshot(snapshot);
+
+        // key1 should still be in queue
+        cache.add_to_pending_append_queue(&key1, 2, 2, 100, 2, make_queue_item(None));
+
+        // Both should return true
+        assert!(cache.aggregate_snapshot_in_cache(&key1)); // in queue
+        assert!(cache.aggregate_snapshot_in_cache(&key2)); // in LRU
+
+        // key3 not anywhere
+        assert!(!cache.aggregate_snapshot_in_cache(&key3));
+    }
+
+    #[test]
+    fn stress_lru_caches_with_many_aggregates_and_clients() {
+        let mut cache = new_cache_with_config(test_config_small_lru_caches(50, 100));
+
+        // Add 200 aggregates, each with 2 clients
+        for i in 1..=200u128 {
+            let key = make_aggregate_key(1, 1, i);
+            cache.add_to_pending_append_queue(&key, i as u64, i as u64, i * 1000, i as u64, make_queue_item(None));
+            cache.add_to_pending_append_queue(&key, i as u64, i as u64, i * 1000 + 1, i as u64, make_queue_item(None));
+            let snapshot = cache.take_sync_positions_snapshot();
+            cache.commit_sync_positions_snapshot(snapshot);
+        }
+
+        // Only last 50 aggregates should be in aggregate cache
+        for i in 1..=150u128 {
+            let key = make_aggregate_key(1, 1, i);
+            assert_eq!(cache.get_event_indexes(&key).event_index, 0, "Aggregate {} should be evicted", i);
+        }
+
+        for i in 151..=200u128 {
+            let key = make_aggregate_key(1, 1, i);
+            assert_eq!(cache.get_event_indexes(&key).event_index, i as u64, "Aggregate {} should be in cache", i);
+        }
+
+        // Only last 100 client entries should be in client cache (200 aggregates * 2 clients = 400 entries)
+        // Most recent 100 would be from aggregates 151-200 (100 entries)
+        let key_200 = make_aggregate_key(1, 1, 200);
+        assert_eq!(cache.get_client_event_index(&key_200, 200 * 1000), Some(200));
+        assert_eq!(cache.get_client_event_index(&key_200, 200 * 1000 + 1), Some(200));
     }
 }

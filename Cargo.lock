@@ -398,6 +398,7 @@ name = "celeriant_memcache"
 version = "0.1.0"
 dependencies = [
  "celeriant_wal",
+ "lru 0.16.2",
 ]
 
 [[package]]
