@@ -23,6 +23,26 @@ pub struct ShardLogDmaFile {
 
 impl ShardLogDmaFile {
 
+    pub async fn read_datablocks_carry_over_bytes(&self) -> Result<Option<Vec<u8>>, RotatingLogError> {
+        if let Some(dma_file) = self.dma_file.as_ref() {
+
+            let datablocks_carry_over_size = dma_file.align_up(self.shard_log_header.datablocks_position)
+                .saturating_sub(self.shard_log_header.datablocks_position);
+
+            if datablocks_carry_over_size > 0 {
+                return Ok(Some(dma_file.read_at(self.shard_log_header.datablocks_position, datablocks_carry_over_size as usize)
+                    .await?
+                    .to_vec()),
+                );
+            } else {
+                return Ok(None);
+            }
+            
+        } else {
+            Err(RotatingLogError::IoError("No file handle available to execute read_datablocks_carry_over_bytes".to_string()))
+        }
+    }
+
     /// Open a log file, if it doesn't exist, create it.
     /// Used for opening the active writing last log file.
     /// Errors if the file is corrupt and needs repair.

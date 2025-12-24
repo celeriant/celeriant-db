@@ -11,10 +11,11 @@ use celeriant_wal::{
 };
 use tokio::time::Instant;
 
-const NUM_CONNECTIONS: usize = 1024*12; // 28k max source port limit ~25000;
-const TEST_DURATION_SECS: u64 = 30;
+const NUM_CONNECTIONS: usize = 12*1024; // 28k max source port limit ~25000;
+const TEST_DURATION_SECS: u64 = 35;
 const NUM_AGGREGATES: usize = 1024;
 const USE_MICRO_PAYLOAD: bool = true;
+const SERVER_ADDR: &str = "0.0.0.0:10000";
 
 struct TaskStats {
     request_count: u64,
@@ -89,7 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run_connection_benchmark(connection_id: usize) -> Result<TaskStats, String> {
     // Connect to the server
-    let mut client = CeleriantClient::connect("127.0.0.1:10000")
+    let mut client = CeleriantClient::connect_with_timeout(SERVER_ADDR, Some(Duration::from_secs(5)))
         .await  
         .map_err(|e| format!("Connection error: {}", e))?
         .with_timeout(Duration::from_secs(5));

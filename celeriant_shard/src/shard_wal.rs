@@ -128,11 +128,14 @@ impl ShardWal {
         let shard_mem_cache = {
             let active_lock = rotating_log_cache.active();
             let active_log_file = active_lock.read().await?;
+            let datablocks_carry_over = active_log_file.read_datablocks_carry_over_bytes().await?;
+
             ShardMemCache::new(
                 active_log_file.file_len,
                 active_log_file.shard_log_header.metablocks_position,
-                active_log_file.shard_log_header.wal_index,
                 active_log_file.shard_log_header.datablocks_position,
+                active_log_file.shard_log_header.wal_index,
+                datablocks_carry_over,
                 config.clone(),
                 active_log_file.log_id,
             )
@@ -403,10 +406,11 @@ impl ShardWal {
     }
 
     async fn move_aggregate_client_to_memcache(&self, aggregate_key: &AggregateKey, client_id: u128) -> Result<(), ShardWriteError> {
-        let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
-        if shard_mem_cache.get_client_event_index(aggregate_key, client_id).is_none() {
+        let in_cache = self.shard_mem_cache.borrow_mut().get_client_event_index(aggregate_key, client_id).is_some();
+        
+        if !in_cache {
             if let Some(last_client_event_index) = self.load_aggregate_client_from_disk(aggregate_key, client_id).await? {
-                shard_mem_cache.put_aggregate_client_into_cache(aggregate_key.clone(), client_id, last_client_event_index);
+                self.shard_mem_cache.borrow_mut().put_aggregate_client_into_cache(aggregate_key.clone(), client_id, last_client_event_index);
             }
         }
         Ok(())
@@ -780,6 +784,7 @@ async fn sync(
         let mut buffer_datablocks =
             dma_file_writer.alloc_dma_buffer(aligned_buffer_size_datablocks as usize);
         let buffer_datablocks_slice = buffer_datablocks.as_bytes_mut();
+        buffer_datablocks_slice.fill(0);
 
         let end_carry_over = dma_file_writer
             .align_up(sync_positions_snapshot.datablocks_position)

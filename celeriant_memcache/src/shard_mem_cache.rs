@@ -380,6 +380,7 @@ impl ShardMemCache {
         metablocks_position: u64,
         datablocks_position: u64,
         wal_index: u64,
+        datablocks_carry_over: Option<Vec<u8>>,
         config: InternalShardConfig,
         current_log_id: u64,
     ) -> Self {
@@ -392,7 +393,7 @@ impl ShardMemCache {
             metablocks_position,
             datablocks_position,
             file_len,
-            datablocks_carry_over: None,
+            datablocks_carry_over,
             aggregate_recent_writes: HashMap::new(),
             cache_current_bytes: 0,
             cache_eviction_queue: VecDeque::new(),

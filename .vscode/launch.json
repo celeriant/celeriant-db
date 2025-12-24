@@ -19,6 +19,27 @@
             "args": ["--num-shards", "1", "--aggregate-snapshots-cache-bytes", "224"],
             "cwd": "${workspaceFolder}",
             "env": {}
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug batch_main",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin",
+                    "batch_main",
+                    "-p",
+                    "celeriant_client_demo",
+                ],
+                "filter": {
+                    "name": "batch_main",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "env": {}
         }
     ]
 }

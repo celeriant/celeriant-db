@@ -27,6 +27,8 @@ pub struct CeleriantClient {
 impl CeleriantClient {
     /// Connect to Celeriant server at the given address (e.g., "127.0.0.1:10000")
     pub async fn connect(address: &str) -> Result<Self, ClientError> {
+
+        //TODO: Apply timeout to connection attempt
         let stream = TcpStream::connect(address)
             .await
             .map_err(|e| ClientError::ConnectionFailed(e))?;

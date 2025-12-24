@@ -23,17 +23,34 @@ pub struct CeleriantClient {
 impl CeleriantClient {
     /// Connect to Celeriant server at the given address (e.g., "127.0.0.1:10000")
     pub async fn connect(address: &str) -> Result<Self, ClientError> {
-        let stream = TcpStream::connect(address)
-            .await
-            .map_err(ClientError::ConnectionFailed)?;
+        Self::connect_with_timeout(address, None).await
+    }
+
+    /// Connect to Celeriant server with an optional connection timeout
+    pub async fn connect_with_timeout(
+        address: &str,
+        connection_timeout: Option<Duration>,
+    ) -> Result<Self, ClientError> {
+        let connect_future = TcpStream::connect(address);
+
+        let stream = if let Some(duration) = connection_timeout {
+            timeout(duration, connect_future)
+                .await
+                .map_err(|_| ClientError::Timeout)?
+                .map_err(ClientError::ConnectionFailed)?
+        } else {
+            connect_future
+                .await
+                .map_err(ClientError::ConnectionFailed)?
+        };
 
         // Set TCP_NODELAY to disable Nagle's algorithm
         stream.set_nodelay(true).map_err(ClientError::ConnectionFailed)?;
-        
+
         Ok(Self {
             stream: stream.compat(),
             max_request_size: 10_000_000, // 10MB default
-            timeout: None,
+            timeout: connection_timeout,
         })
     }
 
