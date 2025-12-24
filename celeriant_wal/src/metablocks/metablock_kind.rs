@@ -6,9 +6,10 @@ use crate::{datablocks::{datablock_snapshot_aggregate_type::DatablockSnapshotAgg
 /// Different kinds of WAL metablocks, snapshots and event batch metadata
 /// All metablocks are fixed size 512 byte blocks
 #[derive(Debug, Clone, Encode, Decode, DeepSizeOf)]
+#[repr(u32)]
 pub enum MetablockKind {
-    EventBatchMetadata(MetablockEventBatch),
-    SnapshotOrg(DatablockSnapshotOrg),
-    SnapshotAggregateType(DatablockSnapshotAggregateType),
-    SnapshotAggregate(MetablockSnapshotAggregate),
+    EventBatchMetadata(MetablockEventBatch) = 0,
+    SnapshotOrg(DatablockSnapshotOrg) = 1,
+    SnapshotAggregateType(DatablockSnapshotAggregateType) = 2,
+    SnapshotAggregate(MetablockSnapshotAggregate) = 3,
 }

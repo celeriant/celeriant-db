@@ -6,8 +6,9 @@ use crate::metablocks::{datablock_block_ref::DatablockBlockRef, datablock_inline
 /// Datablocks which are small enough get stored inline within the metablock
 /// Otherwise they are stored as a reference to a separate datablock payload
 #[derive(Debug, Clone, Encode, Decode, DeepSizeOf)]
+#[repr(u32)]
 pub enum DatablockStorageKind {
-    None,
-    Inline(DatablockInlineData),
-    Block(DatablockBlockRef),
+    None = 0,
+    Inline(DatablockInlineData) = 1,
+    Block(DatablockBlockRef) = 2,
 }

@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use celeriant_memcache::internal_shard_config::InternalShardConfig;
+use celeriant_memcache::mem_snapshot_aggregate::MemSnapshotAggregate;
 use celeriant_memcache::shard_log_queue_item::ShardLogQueueItem;
 use celeriant_memcache::shard_mem_cache::ShardMemCache;
 use celeriant_memcache::sync_positions_snapshot::SyncPositionsSnapshot;
@@ -15,6 +16,7 @@ use celeriant_msg::process_responses::Response;
 use celeriant_msg::request::requests::{ReadRequest, WriteRequest};
 use celeriant_msg::response::aggregate_event_batch::AggregateEventBatch;
 use celeriant_msg::response::responses::{ReadResponse, WriteResponse};
+use celeriant_rotating_log::reverse_metablock_scanner::ReverseMetablockScanner;
 use celeriant_rotating_log::rotating_log_cache::RotatingLogCache;
 use celeriant_rotating_log::rotating_log_error::RotatingLogError;
 use celeriant_rotating_log::shard_log_dma_file::ShardLogDmaFile;
@@ -31,6 +33,7 @@ use celeriant_watch::aggregate_reader::AggregateReader;
 use celeriant_watch::aggregate_watch_event::{AggregateWatchEvent, AggregateWatchEventOperation};
 use celeriant_watch::aggregate_watchers::AggregateWatchers;
 use celeriant_wire::datablock_serialization::serialize_datablock;
+use celeriant_wire::metablock_bytes::{matches_aggregate_key, read_event_batch_client_id, read_event_batch_event_batch_index, read_event_batch_max_client_event_index, read_event_batch_max_event_index};
 use celeriant_wire::version_aware_wire_format::serialize_versioned_message;
 use deepsize::DeepSizeOf;
 
@@ -178,6 +181,16 @@ impl ShardWal {
             });
         }
 
+        // Ensure aggregate snapshot is in memcache, loading from disk if necessary
+        // Block must be in this order - load from cache, then if failed and cannot create, error
+        if !self.move_aggregate_to_memcache(&write_request.aggregate_key, Some(write_request.client_id)).await? && !write_request.allow_create {
+            return Err(ShardWriteError::AggregateNotExists);
+        }
+
+        if write_request.enforce_client_idempotency {
+            self.move_aggregate_client_to_memcache(&write_request.aggregate_key, write_request.client_id).await?;
+        }
+
         let (write_response, force_durable) =
             self.add_write_request_to_pending_queue(lease_index, write_request)?;
 
@@ -307,11 +320,115 @@ impl ShardWal {
     pub fn watched_aggregates(&self) -> Rc<AggregateWatchers> {
         self.watched_aggregates.clone()
     }
-}
 
-// Internal methods
+    async fn load_aggregate_snapshot_from_disk(&self, aggregate_key: &AggregateKey, client_id: Option<u128>) -> Result<(Option<MemSnapshotAggregate>, Option<u64>), ShardWriteError> {
+        let starting_log_id = self.rotating_log_cache.active_log_id();
+        
+        let mut scanner = ReverseMetablockScanner::new(
+            &self.rotating_log_cache, 
+            starting_log_id,
+            self.config.read_max_chunk_size,
+        );
 
-impl ShardWal {
+        let result: Option<(MemSnapshotAggregate, Option<u64>)> = scanner
+            .scan(|block| {
+                if matches_aggregate_key(block, aggregate_key) {
+
+                    let snapshot = MemSnapshotAggregate {
+                        event_index: read_event_batch_max_event_index(block),
+                        event_batch_index: read_event_batch_event_batch_index(block),
+                    };
+
+                    let same_client = match client_id {
+                        Some(cid) => read_event_batch_client_id(block) == cid,
+                        None => false,
+                    };
+                    let last_client_event_index =  if same_client {
+                        Some(read_event_batch_max_client_event_index(block))
+                    } else {
+                        None
+                    };
+
+                    return Ok::<Option<(MemSnapshotAggregate, Option<u64>)>, ShardWriteError>(Some((snapshot, last_client_event_index)));
+                }
+
+                return Ok(None);
+            })
+            .await
+            .map_err(|e| ShardWriteError::IoError(format!("{:?}", e)))?;
+
+        match result {
+            Some((snapshot, last_client_idx)) => Ok((Some(snapshot), last_client_idx)),
+            None => Ok((None, None)),
+        }
+    }
+
+    async fn load_aggregate_client_from_disk(&self, aggregate_key: &AggregateKey, client_id: u128) -> Result<Option<u64>, ShardWriteError> {
+        let starting_log_id = self.rotating_log_cache.active_log_id();
+
+        let mut scanner = ReverseMetablockScanner::new(
+            &self.rotating_log_cache, 
+            starting_log_id,
+            self.config.read_max_chunk_size,
+        );
+
+        let result: Option<Option<u64>> = scanner
+            .scan(|block| {
+                if matches_aggregate_key(block, aggregate_key) {
+
+                    let event_batch_index = read_event_batch_event_batch_index(block);
+                    if event_batch_index == 0 {
+                        return Ok(None); // Before any event batches for this aggregate
+                    }
+
+                    let same_client = read_event_batch_client_id(block) == client_id;
+                    let last_client_event_index =  if same_client {
+                        Some(read_event_batch_max_client_event_index(block))
+                    } else {
+                        None
+                    };
+
+                    return Ok::<Option<Option<u64>>, ShardWriteError>(Some(last_client_event_index));
+                }
+
+                return Ok(None);
+            })
+            .await
+            .map_err(|e| ShardWriteError::IoError(format!("{:?}", e)))?;
+
+        match result {
+            Some(last_client_idx) => Ok(last_client_idx),
+            None => Ok(None),
+        }
+    }
+
+    async fn move_aggregate_client_to_memcache(&self, aggregate_key: &AggregateKey, client_id: u128) -> Result<(), ShardWriteError> {
+        let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
+        if shard_mem_cache.get_client_event_index(aggregate_key, client_id).is_none() {
+            if let Some(last_client_event_index) = self.load_aggregate_client_from_disk(aggregate_key, client_id).await? {
+                shard_mem_cache.put_aggregate_client_into_cache(aggregate_key.clone(), client_id, last_client_event_index);
+            }
+        }
+        Ok(())
+    }
+
+    /// Load aggregate snapshot from disk into memcache if not already present.
+    /// Optionally search for the provided client, for idempotency tracking.
+    async fn move_aggregate_to_memcache(&self, aggregate_key: &AggregateKey, client_id: Option<u128>) -> Result<bool, ShardWriteError> {
+        // Check cache without holding borrow across await
+        let in_cache = self.shard_mem_cache.borrow().aggregate_snapshot_in_cache(aggregate_key);
+        
+        if !in_cache {
+            if let (Some(snapshot), last_client_event_index) = self.load_aggregate_snapshot_from_disk(aggregate_key, client_id).await? {
+                self.shard_mem_cache.borrow_mut().put_aggregate_into_cache(aggregate_key.clone(), snapshot, client_id, last_client_event_index);
+                return Ok(true);
+            } else {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Validate and add a write request to the pending queue.
     fn add_write_request_to_pending_queue(
         &self,
@@ -337,12 +454,6 @@ impl ShardWal {
                         attempted_client_event_index,
                     });
                 }
-            }
-        }
-
-        if !write_request.allow_create {
-            if !shard_mem_cache.aggregate_snapshot_in_cache(&write_request.aggregate_key) {
-                return Err(ShardWriteError::AggregateNotExists);
             }
         }
 

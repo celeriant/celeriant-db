@@ -5,7 +5,7 @@ use crate::{wire_format::{bincode_fixed_deserialise, bincode_fixed_serialise}, w
 
 const VERSION_SIZE: usize = 4;
 const CRC_SIZE: usize = 4;
-const HEADER_SIZE: usize = VERSION_SIZE + CRC_SIZE;
+pub const HEADER_SIZE: usize = VERSION_SIZE + CRC_SIZE;
 
 fn verify_crc32c(data: &[u8], expected_crc: u32) -> Result<(), WireFormatError> {
     let actual_crc = crc32c::crc32c(data);
@@ -101,7 +101,188 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use celeriant_wal::{constants::FIXED_BLOCK_SIZE_BYTES, shard_log_header::ShardLogHeader};
+    use celeriant_wal::{aggregate_key::AggregateKey, buffer_read::{read_option_u128_le, read_u64_le, read_u128_le}, constants::{FIXED_BLOCK_SIZE_BYTES, WIRE_SIZE_ENUM_DISCRIMINANT}, metablocks::{metablock_event_batch::MetablockEventBatch, metablock_snapshot_aggregate::MetablockSnapshotAggregate}, shard_log_header::ShardLogHeader};
+
+    fn indexing_metablock_event_batch() -> Metablock {
+        Metablock {
+            wal_index: 324234234,
+            server_timestamp: 1625079600,
+            lease_index: 1,
+            node_id: 12345678901234567890u128,
+            wal_metablock_type: celeriant_wal::metablocks::metablock_kind::MetablockKind::EventBatchMetadata(
+                celeriant_wal::metablocks::metablock_event_batch::MetablockEventBatch {
+                    aggregate_key: AggregateKey::new(23423423423, 33420324432, 230234323),
+                    event_types_data: celeriant_wal::metablocks::metablock_event_batch::EventTypesKind::Direct([33242342u64; 4]),
+                    event_batch_index: 43242343,
+                    client_id: 534534435,
+                    user_id: Some(342352352),
+                    min_client_event_index: 4,
+                    max_client_event_index: 4453,
+                    min_event_timestamp: 4,
+                    max_event_timestamp: 4,
+                    min_event_index: 4,
+                    max_event_index: 476765,
+                },
+            ),
+            datablock: celeriant_wal::metablocks::datablock_storage_kind::DatablockStorageKind::None,
+        }
+    }
+
+    fn indexing_metablock_snapshot_aggregate() -> Metablock {
+        Metablock {
+            wal_index: 324234234,
+            server_timestamp: 1625079600,
+            lease_index: 1,
+            node_id: 12345678901234567890u128,
+            wal_metablock_type: celeriant_wal::metablocks::metablock_kind::MetablockKind::SnapshotAggregate(
+                MetablockSnapshotAggregate {
+                    aggregate_key: AggregateKey::new(23423423423, 33420324432, 230234323),
+                    last_wal_index: 44,
+                    last_event_index: 32423,
+                    last_event_batch_index: 6546,
+                    min_available_event_index: 786787,
+                    min_available_event_batch_index: 87355,
+                    compressed_size_bytes: 777,
+                    uncompressed_size_bytes: 888,
+                    created_at: 4345433,
+                    created_by_client_id: 43534534,
+                    created_by_user_id: Some(342342),
+                },
+            ),
+            datablock: celeriant_wal::metablocks::datablock_storage_kind::DatablockStorageKind::None,
+        }
+    }
+
+    #[test]
+    fn metablock_indexing_() {
+        let mut metablock = indexing_metablock_event_batch();
+
+        let mut buffer = [0u8; FIXED_BLOCK_SIZE_BYTES];
+        serialize_versioned_message(&metablock, WIRE_VERSION_WAL_METABLOCK, &mut buffer).unwrap();
+
+        // Verify we can index into the buffer directly
+        let kind_discriminant = buffer[HEADER_SIZE + Metablock::OFFSET_WAL_METABLOCK_TYPE];
+        assert_eq!(kind_discriminant, 0); // EventBatchMetadata discriminant value
+
+        metablock.wal_metablock_type = celeriant_wal::metablocks::metablock_kind::MetablockKind::SnapshotOrg(
+            celeriant_wal::datablocks::datablock_snapshot_org::DatablockSnapshotOrg { },
+        );
+
+        let mut buffer = [0u8; FIXED_BLOCK_SIZE_BYTES];
+        serialize_versioned_message(&metablock, WIRE_VERSION_WAL_METABLOCK, &mut buffer).unwrap();
+
+        // Verify we can index into the buffer directly
+        let kind_discriminant = buffer[HEADER_SIZE + Metablock::OFFSET_WAL_METABLOCK_TYPE];
+        assert_eq!(kind_discriminant, 1); // SnapshotOrg discriminant value
+
+        let metablock = indexing_metablock_snapshot_aggregate();
+
+        let mut buffer = [0u8; FIXED_BLOCK_SIZE_BYTES];
+        serialize_versioned_message(&metablock, WIRE_VERSION_WAL_METABLOCK, &mut buffer).unwrap();
+
+        // Verify we can index into the buffer directly
+        let kind_discriminant = buffer[HEADER_SIZE + Metablock::OFFSET_WAL_METABLOCK_TYPE];
+        assert_eq!(kind_discriminant, 3); // SnapshotAggregate discriminant value
+    }
+
+    #[test]
+    fn metablock_indexing_event_batch() {
+        let metablock = indexing_metablock_event_batch();
+
+        let mut buffer = [0u8; FIXED_BLOCK_SIZE_BYTES];
+        serialize_versioned_message(&metablock, WIRE_VERSION_WAL_METABLOCK, &mut buffer).unwrap();
+
+        // Verify we can index into the buffer directly
+        let kind_discriminant = buffer[HEADER_SIZE + Metablock::OFFSET_WAL_METABLOCK_TYPE];
+        assert_eq!(kind_discriminant, 0); // EventBatchMetadata discriminant value
+
+        // Base offset for MetablockEventBatch payload
+        let batch_base = HEADER_SIZE + Metablock::OFFSET_WAL_METABLOCK_TYPE + WIRE_SIZE_ENUM_DISCRIMINANT;
+
+        //AggregateKey fields
+        let org_id_offset = batch_base + MetablockEventBatch::OFFSET_AGGREGATE_KEY + AggregateKey::OFFSET_ORG_ID;
+        assert_eq!(read_u128_le(&buffer, org_id_offset), 23423423423);
+
+        let type_id_offset = batch_base + MetablockEventBatch::OFFSET_AGGREGATE_KEY + AggregateKey::OFFSET_AGGREGATE_TYPE_ID;
+        assert_eq!(read_u128_le(&buffer, type_id_offset), 33420324432);
+
+        let aggregate_id_offset = batch_base + MetablockEventBatch::OFFSET_AGGREGATE_KEY + AggregateKey::OFFSET_AGGREGATE_ID;
+        assert_eq!(read_u128_le(&buffer, aggregate_id_offset), 230234323);
+
+        // Get event_batch_index and max_event_index directly
+        let event_batch_index_offset = batch_base + MetablockEventBatch::OFFSET_EVENT_BATCH_INDEX;
+        let max_event_index_offset = batch_base + MetablockEventBatch::OFFSET_MAX_EVENT_INDEX;
+        assert_eq!(u64::from_le_bytes(buffer[event_batch_index_offset..event_batch_index_offset + 8].try_into().unwrap()), 43242343);
+        assert_eq!(u64::from_le_bytes(buffer[max_event_index_offset..max_event_index_offset + 8].try_into().unwrap()), 476765);
+
+        // Get client_id and the client's max client_event_index
+        let client_id_offset = batch_base + MetablockEventBatch::OFFSET_CLIENT_ID;
+        let max_client_event_index_offset = batch_base + MetablockEventBatch::OFFSET_MAX_CLIENT_EVENT_INDEX;
+        assert_eq!(read_u128_le(&buffer, client_id_offset), 534534435);
+        assert_eq!(read_u64_le(&buffer, max_client_event_index_offset), 4453);
+
+        // Get the user_id
+        let user_id_offset = batch_base + MetablockEventBatch::OFFSET_USER_ID;
+        assert_eq!(read_option_u128_le(&buffer, user_id_offset), Some(342352352));
+
+    }
+
+    #[test]
+    fn metablock_indexing_snapshot_aggregate() {
+        let metablock = indexing_metablock_snapshot_aggregate();
+
+        let mut buffer = [0u8; FIXED_BLOCK_SIZE_BYTES];
+        serialize_versioned_message(&metablock, WIRE_VERSION_WAL_METABLOCK, &mut buffer).unwrap();
+
+        // Verify we can index into the buffer directly
+        let kind_discriminant = buffer[HEADER_SIZE + Metablock::OFFSET_WAL_METABLOCK_TYPE];
+        assert_eq!(kind_discriminant, 3); // SnapshotAggregate discriminant value
+
+        // Base offset for MetablockSnapshotAggregate payload
+        let snapshot_base = HEADER_SIZE + Metablock::OFFSET_WAL_METABLOCK_TYPE + WIRE_SIZE_ENUM_DISCRIMINANT;
+
+        // AggregateKey fields
+        let org_id_offset = snapshot_base + MetablockSnapshotAggregate::OFFSET_AGGREGATE_KEY + AggregateKey::OFFSET_ORG_ID;
+        assert_eq!(read_u128_le(&buffer, org_id_offset), 23423423423);
+
+        let type_id_offset = snapshot_base + MetablockSnapshotAggregate::OFFSET_AGGREGATE_KEY + AggregateKey::OFFSET_AGGREGATE_TYPE_ID;
+        assert_eq!(read_u128_le(&buffer, type_id_offset), 33420324432);
+
+        let aggregate_id_offset = snapshot_base + MetablockSnapshotAggregate::OFFSET_AGGREGATE_KEY + AggregateKey::OFFSET_AGGREGATE_ID;
+        assert_eq!(read_u128_le(&buffer, aggregate_id_offset), 230234323);
+
+        // Snapshot-specific fields
+        let last_wal_index_offset = snapshot_base + MetablockSnapshotAggregate::OFFSET_LAST_WAL_INDEX;
+        assert_eq!(read_u64_le(&buffer, last_wal_index_offset), 44);
+
+        let last_event_index_offset = snapshot_base + MetablockSnapshotAggregate::OFFSET_LAST_EVENT_INDEX;
+        assert_eq!(read_u64_le(&buffer, last_event_index_offset), 32423);
+
+        let last_event_batch_index_offset = snapshot_base + MetablockSnapshotAggregate::OFFSET_LAST_EVENT_BATCH_INDEX;
+        assert_eq!(read_u64_le(&buffer, last_event_batch_index_offset), 6546);
+
+        let min_available_event_index_offset = snapshot_base + MetablockSnapshotAggregate::OFFSET_MIN_AVAILABLE_EVENT_INDEX;
+        assert_eq!(read_u64_le(&buffer, min_available_event_index_offset), 786787);
+
+        let min_available_event_batch_index_offset = snapshot_base + MetablockSnapshotAggregate::OFFSET_MIN_AVAILABLE_EVENT_BATCH_INDEX;
+        assert_eq!(read_u64_le(&buffer, min_available_event_batch_index_offset), 87355);
+
+        let compressed_size_offset = snapshot_base + MetablockSnapshotAggregate::OFFSET_COMPRESSED_SIZE_BYTES;
+        assert_eq!(read_u64_le(&buffer, compressed_size_offset), 777);
+
+        let uncompressed_size_offset = snapshot_base + MetablockSnapshotAggregate::OFFSET_UNCOMPRESSED_SIZE_BYTES;
+        assert_eq!(read_u64_le(&buffer, uncompressed_size_offset), 888);
+
+        let created_at_offset = snapshot_base + MetablockSnapshotAggregate::OFFSET_CREATED_AT;
+        assert_eq!(read_u64_le(&buffer, created_at_offset), 4345433);
+
+        let created_by_client_id_offset = snapshot_base + MetablockSnapshotAggregate::OFFSET_CREATED_BY_CLIENT_ID;
+        assert_eq!(read_u128_le(&buffer, created_by_client_id_offset), 43534534);
+
+        // Get the user_id
+        let created_by_user_id_offset = snapshot_base + MetablockSnapshotAggregate::OFFSET_CREATED_BY_USER_ID;
+        assert_eq!(read_option_u128_le(&buffer, created_by_user_id_offset), Some(342342));
+    }
 
     #[test]
     fn serialize_does_not_corrupt_trailing_fields() {

@@ -12,4 +12,5 @@ pub struct InternalShardConfig {
     pub max_response_size: u64,
     pub aggregate_snapshots_cache_bytes: u64,
     pub aggregate_client_snapshots_cache_bytes: u64,
+    pub read_max_chunk_size: u64,
 }

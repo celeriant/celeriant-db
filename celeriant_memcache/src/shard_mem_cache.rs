@@ -2,7 +2,7 @@ use crate::{
     aggregate_recent_write::AggregateRecentWrites, internal_shard_config::InternalShardConfig, mem_snapshot_aggregate::MemSnapshotAggregate, queue_aggregate_positions::QueueAggregatePositions, recent_write::RecentWrite, shard_log_queue_item::ShardLogQueueItem, sync_positions_snapshot::SyncPositionsSnapshot};
 use celeriant_wal::{aggregate_client_key::AggregateClientKey, aggregate_key::AggregateKey, constants::FIXED_BLOCK_SIZE_BYTES, datablocks::datablock::Datablock, metablocks::metablock::Metablock};
 use lru::LruCache;
-use std::{collections::{BTreeMap, HashMap, VecDeque}, num::NonZeroUsize, path::PathBuf};
+use std::{collections::{HashMap, VecDeque}, num::NonZeroUsize, path::PathBuf};
 
 pub struct ShardMemCache {
     config: InternalShardConfig,
@@ -253,6 +253,31 @@ impl ShardMemCache {
     pub fn rollback_queue_positions(&mut self) {
         self.had_fsync_failure = true;
         self.aggregate_queue_positions.clear();
+    }
+
+    pub fn put_aggregate_client_into_cache(
+        &mut self,
+        aggregate_key: AggregateKey,
+        client_id: u128,
+        last_client_event_index: u64,
+    ) {
+        let client_key = AggregateClientKey::new(aggregate_key, client_id);
+        self.aggregate_client_snapshots.put(client_key, last_client_event_index);
+    }
+
+    pub fn put_aggregate_into_cache(
+        &mut self,
+        aggregate_key: AggregateKey,
+        snapshot: MemSnapshotAggregate,
+        client_id: Option<u128>,
+        last_client_event_index: Option<u64>,
+    ) {
+        self.aggregate_snapshots.put(aggregate_key.clone(), snapshot);
+
+        if let (Some(client_id), Some(last_client_event_index)) = (client_id, last_client_event_index) {
+            let client_key = AggregateClientKey::new(aggregate_key, client_id);
+            self.aggregate_client_snapshots.put(client_key, last_client_event_index);
+        }
     }
 
     /// Provide the aggregate_queue_positions snapshotted before disk write begun

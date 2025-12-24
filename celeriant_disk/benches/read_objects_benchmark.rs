@@ -25,7 +25,7 @@ criterion_group!(benches, benchmark_read_objects_chunk_sizes, benchmark_read_obj
 criterion_main!(benches);
 
 fn benchmark_read_fixed_records_chunk_sizes(c: &mut Criterion) {
-    const N: usize = 256;
+    const N: usize = 512;
 
     let mut group = c.benchmark_group("read_fixed_records_chunk_sizes");
     
@@ -100,7 +100,7 @@ fn benchmark_read_fixed_records_chunk_sizes(c: &mut Criterion) {
 }
 
 fn execute_read_fixed_records(file_size: u64, max_chunk_size: u64, folder: &str, glommio_tasks_per_executor: usize, nbr_shards: usize, online_cpus: &Option<CpuSet>) {
-    const N: usize = 256;
+    const N: usize = 512;
     
     let folder = folder.to_string();
 
@@ -126,13 +126,13 @@ fn execute_read_fixed_records(file_size: u64, max_chunk_size: u64, folder: &str,
                         let mut count = 0usize;
                         let result = read_fixed_records_visit_const::<N, ()>(
                             &file,
-                            file_size,
+                            false,
                             0,
-                            None,
+                            file_size,
                             max_chunk_size,
                             |_rec| {
                                 count += 1;
-                                Ok(())
+                                Ok(false)
                             }
                         )
                         .await

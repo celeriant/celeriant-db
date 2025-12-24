@@ -20,6 +20,26 @@ pub struct AggregateKey {
 }
 
 impl AggregateKey {
+    // Wire format layout (bincode fixed-int encoding)
+    // Note: hash field is NOT serialized (computed on decode)
+    // Update these if field order or types change!
+
+    const WIRE_SIZE_ORG_ID: usize = 16;
+    const WIRE_SIZE_AGGREGATE_TYPE_ID: usize = 16;
+    const WIRE_SIZE_AGGREGATE_ID: usize = 16;
+
+    pub const OFFSET_ORG_ID: usize = 0;
+
+    pub const OFFSET_AGGREGATE_TYPE_ID: usize = 
+        Self::OFFSET_ORG_ID + Self::WIRE_SIZE_ORG_ID;
+
+    pub const OFFSET_AGGREGATE_ID: usize = 
+        Self::OFFSET_AGGREGATE_TYPE_ID + Self::WIRE_SIZE_AGGREGATE_TYPE_ID;
+
+    /// Total wire size of AggregateKey (hash is not serialized)
+    pub const WIRE_SIZE_TOTAL: usize = 
+        Self::OFFSET_AGGREGATE_ID + Self::WIRE_SIZE_AGGREGATE_ID; // = 48 bytes
+        
     pub fn new(org_id: u128, aggregate_type_id: u128, aggregate_id: u128) -> Self {
         let hash = Self::compute_hash(org_id, aggregate_type_id, aggregate_id);
         Self {

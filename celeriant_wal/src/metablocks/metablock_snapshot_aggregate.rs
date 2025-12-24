@@ -31,6 +31,58 @@ pub struct MetablockSnapshotAggregate {
 }
 
 impl MetablockSnapshotAggregate {
+    // Wire format layout (bincode fixed-int encoding)
+    // Update these if field order or types change!
+
+    // AggregateKey contains 3 x u64 fields (org_id, aggregate_type_id, aggregate_id)
+    const WIRE_SIZE_LAST_WAL_INDEX: usize = 8;
+    const WIRE_SIZE_LAST_EVENT_INDEX: usize = 8;
+    const WIRE_SIZE_LAST_EVENT_BATCH_INDEX: usize = 8;
+    const WIRE_SIZE_MIN_AVAILABLE_EVENT_INDEX: usize = 8;
+    const WIRE_SIZE_MIN_AVAILABLE_EVENT_BATCH_INDEX: usize = 8;
+    const WIRE_SIZE_COMPRESSED_SIZE_BYTES: usize = 8;
+    const WIRE_SIZE_UNCOMPRESSED_SIZE_BYTES: usize = 8;
+    const WIRE_SIZE_CREATED_AT: usize = 8;
+    const WIRE_SIZE_CREATED_BY_CLIENT_ID: usize = 16;
+    // Option<u128>: 1 byte discriminant + 16 bytes value
+    const WIRE_SIZE_CREATED_BY_USER_ID: usize = 1 + 16;
+
+    pub const OFFSET_AGGREGATE_KEY: usize = 0;
+
+    pub const OFFSET_LAST_WAL_INDEX: usize = 
+        Self::OFFSET_AGGREGATE_KEY + AggregateKey::WIRE_SIZE_TOTAL;
+
+    pub const OFFSET_LAST_EVENT_INDEX: usize = 
+        Self::OFFSET_LAST_WAL_INDEX + Self::WIRE_SIZE_LAST_WAL_INDEX;
+
+    pub const OFFSET_LAST_EVENT_BATCH_INDEX: usize = 
+        Self::OFFSET_LAST_EVENT_INDEX + Self::WIRE_SIZE_LAST_EVENT_INDEX;
+
+    pub const OFFSET_MIN_AVAILABLE_EVENT_INDEX: usize = 
+        Self::OFFSET_LAST_EVENT_BATCH_INDEX + Self::WIRE_SIZE_LAST_EVENT_BATCH_INDEX;
+
+    pub const OFFSET_MIN_AVAILABLE_EVENT_BATCH_INDEX: usize = 
+        Self::OFFSET_MIN_AVAILABLE_EVENT_INDEX + Self::WIRE_SIZE_MIN_AVAILABLE_EVENT_INDEX;
+
+    pub const OFFSET_COMPRESSED_SIZE_BYTES: usize = 
+        Self::OFFSET_MIN_AVAILABLE_EVENT_BATCH_INDEX + Self::WIRE_SIZE_MIN_AVAILABLE_EVENT_BATCH_INDEX;
+
+    pub const OFFSET_UNCOMPRESSED_SIZE_BYTES: usize = 
+        Self::OFFSET_COMPRESSED_SIZE_BYTES + Self::WIRE_SIZE_COMPRESSED_SIZE_BYTES;
+
+    pub const OFFSET_CREATED_AT: usize = 
+        Self::OFFSET_UNCOMPRESSED_SIZE_BYTES + Self::WIRE_SIZE_UNCOMPRESSED_SIZE_BYTES;
+
+    pub const OFFSET_CREATED_BY_CLIENT_ID: usize = 
+        Self::OFFSET_CREATED_AT + Self::WIRE_SIZE_CREATED_AT;
+
+    pub const OFFSET_CREATED_BY_USER_ID: usize = 
+        Self::OFFSET_CREATED_BY_CLIENT_ID + Self::WIRE_SIZE_CREATED_BY_CLIENT_ID;
+
+    /// Total wire size of MetablockSnapshotAggregate
+    pub const WIRE_SIZE_TOTAL: usize = 
+        Self::OFFSET_CREATED_BY_USER_ID + Self::WIRE_SIZE_CREATED_BY_USER_ID;
+
     pub fn append_event_batches(
         &mut self,
         wal_index: u64,

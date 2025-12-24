@@ -1,4 +1,4 @@
-use crate::aggregate_key::AggregateKey;
+use crate::{aggregate_key::AggregateKey, constants::WIRE_SIZE_ENUM_DISCRIMINANT};
 use crate::constants::BLOOM_BYTES;
 use crate::datablocks::datablock_aggregate_event_batch::DatablockAggregateEventBatch;
 use bincode::{Decode, Encode};
@@ -8,14 +8,8 @@ use deepsize::DeepSizeOf;
 #[derive(Debug, Clone, Encode, Decode, DeepSizeOf)]
 pub struct MetablockEventBatch {
     pub aggregate_key: AggregateKey,
-    /// Event types data - either bloom filter bytes or up to 4 event type u64s
-    pub event_types_data: EventTypesKind,
     /// Server-assigned ID for this batch within the aggregate
     pub event_batch_index: u64,
-    /// Client ID that created this batch
-    pub client_id: u128,
-    /// Optional user ID
-    pub user_id: Option<u128>,
 
     pub min_client_event_index: u64,
     pub max_client_event_index: u64,
@@ -25,6 +19,12 @@ pub struct MetablockEventBatch {
 
     pub min_event_index: u64,
     pub max_event_index: u64,
+
+    pub client_id: u128,
+    pub user_id: Option<u128>,
+
+    /// Event types data - either bloom filter bytes or up to 4 event type u64s
+    pub event_types_data: EventTypesKind,
 }
 
 #[derive(Debug, Clone, Encode, Decode, DeepSizeOf)]
@@ -33,6 +33,62 @@ pub enum EventTypesKind {
     Bloom([u64; BLOOM_BYTES / 8]),
     /// Direct event type array (when 4 or fewer unique event types)
     Direct([u64; BLOOM_BYTES / 8]),
+}
+
+impl MetablockEventBatch {
+    // Wire format layout (bincode fixed-int encoding)
+    // Update these if field order or types change!
+
+    // AggregateKey contains 3 x u64 fields (org_id, aggregate_type_id, aggregate_id)
+    const WIRE_SIZE_AGGREGATE_KEY: usize = AggregateKey::WIRE_SIZE_TOTAL;
+    const WIRE_SIZE_EVENT_BATCH_INDEX: usize = 8;
+    const WIRE_SIZE_MIN_CLIENT_EVENT_INDEX: usize = 8;
+    const WIRE_SIZE_MAX_CLIENT_EVENT_INDEX: usize = 8;
+    const WIRE_SIZE_MIN_EVENT_TIMESTAMP: usize = 8;
+    const WIRE_SIZE_MAX_EVENT_TIMESTAMP: usize = 8;
+    const WIRE_SIZE_MIN_EVENT_INDEX: usize = 8;
+    const WIRE_SIZE_MAX_EVENT_INDEX: usize = 8;
+    const WIRE_SIZE_CLIENT_ID: usize = 16;
+    // Option<u128>: 1 byte discriminant + 16 bytes value
+    const WIRE_SIZE_USER_ID: usize = 1 + 16;
+    // EventTypesKind: 4 byte discriminant + [u64; BLOOM_BYTES / 8]
+    const WIRE_SIZE_EVENT_TYPES_DATA: usize = WIRE_SIZE_ENUM_DISCRIMINANT + BLOOM_BYTES;
+
+    pub const OFFSET_AGGREGATE_KEY: usize = 0;
+
+    pub const OFFSET_EVENT_BATCH_INDEX: usize = 
+        Self::OFFSET_AGGREGATE_KEY + Self::WIRE_SIZE_AGGREGATE_KEY;
+
+    pub const OFFSET_MIN_CLIENT_EVENT_INDEX: usize = 
+        Self::OFFSET_EVENT_BATCH_INDEX + Self::WIRE_SIZE_EVENT_BATCH_INDEX;
+
+    pub const OFFSET_MAX_CLIENT_EVENT_INDEX: usize = 
+        Self::OFFSET_MIN_CLIENT_EVENT_INDEX + Self::WIRE_SIZE_MIN_CLIENT_EVENT_INDEX;
+
+    pub const OFFSET_MIN_EVENT_TIMESTAMP: usize = 
+        Self::OFFSET_MAX_CLIENT_EVENT_INDEX + Self::WIRE_SIZE_MAX_CLIENT_EVENT_INDEX;
+
+    pub const OFFSET_MAX_EVENT_TIMESTAMP: usize = 
+        Self::OFFSET_MIN_EVENT_TIMESTAMP + Self::WIRE_SIZE_MIN_EVENT_TIMESTAMP;
+
+    pub const OFFSET_MIN_EVENT_INDEX: usize = 
+        Self::OFFSET_MAX_EVENT_TIMESTAMP + Self::WIRE_SIZE_MAX_EVENT_TIMESTAMP;
+
+    pub const OFFSET_MAX_EVENT_INDEX: usize = 
+        Self::OFFSET_MIN_EVENT_INDEX + Self::WIRE_SIZE_MIN_EVENT_INDEX;
+
+    pub const OFFSET_CLIENT_ID: usize = 
+        Self::OFFSET_MAX_EVENT_INDEX + Self::WIRE_SIZE_MAX_EVENT_INDEX;
+
+    pub const OFFSET_USER_ID: usize = 
+        Self::OFFSET_CLIENT_ID + Self::WIRE_SIZE_CLIENT_ID;
+
+    pub const OFFSET_EVENT_TYPES_DATA: usize = 
+        Self::OFFSET_USER_ID + Self::WIRE_SIZE_USER_ID;
+
+    /// Total wire size of MetablockEventBatch
+    pub const WIRE_SIZE_TOTAL: usize = 
+        Self::OFFSET_EVENT_TYPES_DATA + Self::WIRE_SIZE_EVENT_TYPES_DATA;
 }
 
 impl MetablockEventBatch {

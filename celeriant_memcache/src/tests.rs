@@ -43,6 +43,7 @@ mod tests {
             max_response_size: 10 * 1024 * 1024,
             aggregate_snapshots_cache_bytes: 100000 * 112,
             aggregate_client_snapshots_cache_bytes: 100000 * 128,
+            read_max_chunk_size: 64 * 1024, // 64KB
         }
     }
 

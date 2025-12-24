@@ -204,9 +204,10 @@ Apache-2.0
 
 ## Readme TODOs
 
-- Running on low power devices, green, cheap database attributes
-- What to do for read side? eg. DuckDB, etc.
-- Notes on AI usage, best practices
+- IoT, Running on low power devices, green, cheap database attributes
+- Notes on infinite cardinality design ethos
+- Guiding devs on what to do for read side? eg. DuckDB, etc.
+- Notes on AI usage in celeriant, best practices & techniques
 - Embedding instead of using as server
 - Client use + serverless friendly notes
 - Notes on head-of-line blocking mitigation

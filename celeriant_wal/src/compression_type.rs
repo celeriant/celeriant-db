@@ -3,12 +3,13 @@ use deepsize::DeepSizeOf;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, DeepSizeOf)]
+#[repr(u32)]
 pub enum CompressionType {
-    None,
-    Zstd { level: i32 },
-    Snappy,
-    Brotli { level: i32 },
-    Gzip { level: i32 },
+    None = 0,
+    Zstd { level: i32 } = 1,
+    Snappy = 2,
+    Brotli { level: i32 } = 3,
+    Gzip { level: i32 } = 4,
 }
 
 impl CompressionType {

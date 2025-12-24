@@ -16,7 +16,7 @@
                     "kind": "bin"
                 }
             },
-            "args": ["--num-shards", "1"],
+            "args": ["--num-shards", "1", "--aggregate-snapshots-cache-bytes", "224"],
             "cwd": "${workspaceFolder}",
             "env": {}
         }

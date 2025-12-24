@@ -36,6 +36,12 @@ pub struct RotatingLogCache {
 const FIRST_LOG_ID: u64 = 1;
 
 impl RotatingLogCache {
+
+    /// Get the current active log id without taking a lock
+    pub fn active_log_id(&self) -> u64 {
+        self.active_log_id.get()
+    }
+    
     /// Called when starting up a shard, ensures we always have an active log file to write to
     pub async fn new(
         shard_dir: PathBuf,

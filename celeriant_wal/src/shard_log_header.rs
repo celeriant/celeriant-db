@@ -22,6 +22,25 @@ pub struct ShardLogHeader {
 }
 
 impl ShardLogHeader {
+    // Wire format layout (bincode fixed-int encoding)
+    // Update these if field order or types change!
+
+    const WIRE_SIZE_METABLOCKS_POSITION: usize = 8;
+    const WIRE_SIZE_DATABLOCKS_POSITION: usize = 8;
+    const WIRE_SIZE_WAL_INDEX: usize = 8;
+
+    pub const OFFSET_METABLOCKS_POSITION: usize = 0;
+
+    pub const OFFSET_DATABLOCKS_POSITION: usize = 
+        Self::OFFSET_METABLOCKS_POSITION + Self::WIRE_SIZE_METABLOCKS_POSITION;
+
+    pub const OFFSET_WAL_INDEX: usize = 
+        Self::OFFSET_DATABLOCKS_POSITION + Self::WIRE_SIZE_DATABLOCKS_POSITION;
+
+    /// Total wire size of ShardLogHeader
+    pub const WIRE_SIZE_TOTAL: usize = 
+        Self::OFFSET_WAL_INDEX + Self::WIRE_SIZE_WAL_INDEX; // = 24 bytes
+        
     pub fn new(file_len: u64) -> Self {
         Self {
             metablocks_position: FIXED_BLOCK_SIZE_BYTES as u64,
