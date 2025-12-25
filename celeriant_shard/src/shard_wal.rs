@@ -522,7 +522,7 @@ impl ShardWal {
             .map(|f| f.len())
             .unwrap_or_default() as u64;
 
-        let server_timestamp = get_server_timestamp_ms();
+        let server_timestamp = self.config.timestamp_config.now();
 
         let metablock = Metablock {
             wal_index: shard_mem_cache.current_wal_index().saturating_add(1),
@@ -621,13 +621,6 @@ fn add_write_event(
             from_event_batch_index: metablock_event_batch.event_batch_index,
             to_event_batch_index: metablock_event_batch.event_batch_index,
         });
-}
-
-fn get_server_timestamp_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
 }
 
 async fn sync_with_rollback(

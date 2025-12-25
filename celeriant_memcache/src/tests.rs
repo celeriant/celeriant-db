@@ -3,12 +3,7 @@ mod tests {
     use std::{collections::HashMap, path::PathBuf, time::Duration};
 
     use crate::{
-        queue_aggregate_positions::QueueAggregatePositions,
-        internal_shard_config::InternalShardConfig,
-        recent_write::RecentWrite,
-        shard_log_queue_item::ShardLogQueueItem,
-        shard_mem_cache::{ShardMemCache},
-        sync_positions_snapshot::SyncPositionsSnapshot,
+        internal_shard_config::InternalShardConfig, queue_aggregate_positions::QueueAggregatePositions, recent_write::RecentWrite, shard_log_queue_item::ShardLogQueueItem, shard_mem_cache::ShardMemCache, sync_positions_snapshot::SyncPositionsSnapshot, timestamp_config::{TimestampConfig, TimestampPrecision}
     };
     use celeriant_wal::{
         aggregate_key::AggregateKey,
@@ -44,6 +39,10 @@ mod tests {
             aggregate_snapshots_cache_bytes: 100000 * 112,
             aggregate_client_snapshots_cache_bytes: 100000 * 128,
             read_max_chunk_size: 64 * 1024, // 64KB
+            timestamp_config: TimestampConfig {
+                precision: TimestampPrecision::Milliseconds,
+                epoch_offset_secs: 0,
+            },
         }
     }
 
@@ -70,6 +69,7 @@ mod tests {
             metablocks_position,
             datablocks_position,
             0,
+            None,
             test_config(),
             0,
         )
@@ -79,7 +79,7 @@ mod tests {
         let file_len = 1024 * 1024 * 1024;
         let metablocks_position = FIXED_BLOCK_SIZE_BYTES as u64;
         let datablocks_position = file_len - FIXED_BLOCK_SIZE_BYTES as u64;
-        ShardMemCache::new(file_len, metablocks_position, datablocks_position, 0, config, 0)
+        ShardMemCache::new(file_len, metablocks_position, datablocks_position, 0, None, config, 0)
     }
 
     fn make_aggregate_key(org: u128, agg_type: u128, agg_id: u128) -> AggregateKey {
@@ -149,6 +149,7 @@ mod tests {
             metablocks_position,
             datablocks_position,
             0,
+            None,
             test_config(),
             0,
         );
@@ -337,6 +338,7 @@ mod tests {
             metablocks_position,
             datablocks_position,
             0,
+            None,
             test_config(),
             5,
         );
@@ -359,6 +361,7 @@ mod tests {
             FIXED_BLOCK_SIZE_BYTES as u64,
             file_len - FIXED_BLOCK_SIZE_BYTES as u64,
             0,
+            None,
             test_config(),
             0,
         );

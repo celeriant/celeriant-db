@@ -1,5 +1,7 @@
 use std::{path::PathBuf, time::Duration};
 
+use crate::timestamp_config::TimestampConfig;
+
 #[derive(Clone, Debug)]
 pub struct InternalShardConfig {
     pub node_id: u128,
@@ -13,4 +15,5 @@ pub struct InternalShardConfig {
     pub aggregate_snapshots_cache_bytes: u64,
     pub aggregate_client_snapshots_cache_bytes: u64,
     pub read_max_chunk_size: u64,
+    pub timestamp_config: TimestampConfig,
 }

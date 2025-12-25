@@ -312,6 +312,7 @@ name = "celeriant"
 version = "0.1.0"
 dependencies = [
  "celeriant_crypto",
+ "celeriant_memcache",
  "celeriant_runtimes",
  "celeriant_sidecar",
  "clap",

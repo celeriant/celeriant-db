@@ -1,5 +1,7 @@
 use std::{path::PathBuf, time::Duration};
 
+use celeriant_memcache::timestamp_config::TimestampConfig;
+
 use crate::sharded::routing_rule::RoutingRule;
 
 /// Per-node configuration that gets cloned to each shard.
@@ -24,4 +26,5 @@ pub struct ShardConfig {
     pub non_durable_writes: bool,
     pub aggregate_client_snapshots_cache_bytes: u64,
     pub aggregate_snapshots_cache_bytes: u64,
+    pub timestamp_config: TimestampConfig,
 }

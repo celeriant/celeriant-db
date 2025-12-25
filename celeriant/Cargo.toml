@@ -17,6 +17,7 @@ path = "src/main.rs"
 celeriant_crypto = { path = "../celeriant_crypto" }
 celeriant_runtimes = { path = "../celeriant_runtimes" }
 celeriant_sidecar = { path = "../celeriant_sidecar" }
+celeriant_memcache = { path = "../celeriant_memcache" }
 clap.workspace = true
 mimalloc.workspace = true
 libc.workspace = true

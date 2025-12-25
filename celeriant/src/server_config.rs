@@ -1,13 +1,40 @@
+use celeriant_memcache::timestamp_config::{TimestampConfig, TimestampPrecision};
 use celeriant_runtimes::RoutingRule;
 use celeriant_runtimes::{ShardConfig, SidecarConfig};
 use celeriant_sidecar::s3_config::S3Config;
 use clap::Parser;
 use std::{path::PathBuf, time::Duration};
+use clap::ValueEnum;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, ValueEnum)]
+pub enum ConfigTimestampPrecision {
+    #[default]
+    Milliseconds,
+    Microseconds,
+    Nanoseconds,
+}
 
 #[derive(Clone, Debug, Parser)]
 #[command(name = "celeriant")]
 #[command(about = "Celeriant TCP Server", long_about = None)]
 pub struct ServerConfig {
+
+    #[arg(
+        long,
+        default_value = "milliseconds",
+        env = "CELERIANT_TIMESTAMP_PRECISION",
+        help = "Timestamp precision: milliseconds, microseconds, or nanoseconds"
+    )]
+    pub timestamp_precision: ConfigTimestampPrecision,
+
+    #[arg(
+        long,
+        default_value_t = 0,
+        env = "CELERIANT_TIMESTAMP_EPOCH_OFFSET_SECS",
+        help = "Custom epoch as seconds offset from Unix epoch"
+    )]
+    pub timestamp_epoch_offset_secs: i64,
+
     #[arg(
         long,
         default_value = "data",
@@ -214,6 +241,14 @@ impl ServerConfig {
             non_durable_writes: self.non_durable_writes,
             aggregate_client_snapshots_cache_bytes: self.aggregate_client_snapshots_cache_bytes,
             aggregate_snapshots_cache_bytes: self.aggregate_snapshots_cache_bytes,
+            timestamp_config: TimestampConfig {
+                precision: match self.timestamp_precision {
+                    ConfigTimestampPrecision::Milliseconds => TimestampPrecision::Milliseconds,
+                    ConfigTimestampPrecision::Microseconds => TimestampPrecision::Microseconds,
+                    ConfigTimestampPrecision::Nanoseconds => TimestampPrecision::Nanoseconds,
+                },
+                epoch_offset_secs: self.timestamp_epoch_offset_secs,
+            },
         }
     }
 
@@ -305,6 +340,8 @@ impl Default for ServerConfig {
             routing_rule: RoutingRule::AggregateId,
             aggregate_client_snapshots_cache_bytes: 64 * 1024 * 1024,
             aggregate_snapshots_cache_bytes: 64 * 1024 * 1024,
+            timestamp_precision: ConfigTimestampPrecision::Milliseconds,
+            timestamp_epoch_offset_secs: 0,
         }
     }
 }

@@ -6,6 +6,7 @@ pub mod sync_positions_snapshot;
 pub mod internal_shard_config;
 pub mod mem_snapshot_aggregate;
 pub mod aggregate_recent_write;
+pub mod timestamp_config;
 
 #[cfg(test)]
 mod tests;
