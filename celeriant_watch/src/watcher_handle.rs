@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 
-use celeriant_wal::{aggregate_key::AggregateKey, aggregate_type_key::AggregateTypeKey};
 use glommio::channels::local_channel::LocalSender;
 use crate::aggregate_watch_event::AggregateWatchEvent;
 
@@ -11,8 +10,8 @@ pub struct WatcherHandle {
     pub local_sender_channel: LocalSender<AggregateWatchEvent>,
 
     pub orgs: Option<HashSet<u128>>,
-    pub aggregate_types: Option<HashSet<AggregateTypeKey>>,
-    pub aggregates: Option<HashSet<AggregateKey>>,
+    pub aggregate_types: Option<HashSet<u128>>,
+    pub aggregates: Option<HashSet<u128>>,
     pub operation_types: Option<HashSet<u8>>,
 }
 
@@ -32,14 +31,12 @@ impl WatcherHandle {
         if self.orgs.as_ref().is_some_and(|s| !s.contains(&key.org_id)) {
             return true;
         }
-
-        if self.aggregates.as_ref().is_some_and(|s| !s.contains(key)) {
+        
+        if self.aggregate_types.as_ref().is_some_and(|s| !s.contains(&key.aggregate_type_id)) {
             return true;
         }
 
-        if self.aggregate_types.as_ref().is_some_and(|s| {
-            !s.contains(&AggregateTypeKey::new(key.org_id, key.aggregate_type_id))
-        }) {
+        if self.aggregates.as_ref().is_some_and(|s| !s.contains(&key.aggregate_id)) {
             return true;
         }
 

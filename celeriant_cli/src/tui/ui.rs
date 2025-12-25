@@ -182,7 +182,7 @@ fn get_screen_hints(screen: &Screen, input_mode: &InputMode) -> &'static str {
             Screen::AggregateContext => "↑↓/jk: navigate │ Enter: select │ r: refresh │ q: back",
             Screen::ReadEvents | Screen::WriteEvent => "e/i: edit │ x: execute │ ↑↓: scroll │ q: back",
             Screen::Watch => "e/i: edit │ x: start │ s: stop │ ↑↓: scroll │ q: back",
-            Screen::Watch | Screen::OrgWatch => "e/i: edit │ x: start │ s: stop │ ↑↓: scroll │ q: back",
+            Screen::OrgWatch => "e/i: edit │ x: start │ s: stop │ ↑↓: scroll │ q: back",
             Screen::Help => "q/Esc: back",
             _ => "q: back │ ?: help",
         },

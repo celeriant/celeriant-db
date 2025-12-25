@@ -1,4 +1,4 @@
-use std::{collections::{HashSet}, path::Path, sync::Arc};
+use std::{collections::HashSet, path::Path, sync::Arc};
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_crypto::Crypto;
@@ -11,7 +11,7 @@ use celeriant_msg::{
     },
 };
 use celeriant_wal::{
-    aggregate_key::AggregateKey, aggregate_type_key::AggregateTypeKey, compression_type::CompressionType, datablocks::datablock_aggregate_event::DatablockAggregateEvent
+    aggregate_key::AggregateKey, compression_type::CompressionType, datablocks::datablock_aggregate_event::DatablockAggregateEvent
 };
 use directories::ProjectDirs;
 
@@ -608,7 +608,6 @@ impl App {
                 server_address,
                 key,
                 event_types,
-                client_id,
                 latency_ms,
                 tx,
                 cancel_rx,
@@ -689,19 +688,26 @@ impl App {
         }
         
         // Parse org ID
-        let org_id: u128 = self.org_watch_org_id.parse()
-            .map_err(|_| "Invalid Organisation ID")?;
+        let org_id: Option<u128> = {
+            let s = self.org_watch_org_id.trim();
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.parse().map_err(|_| "Invalid Organisation ID")?)
+            }
+        };
         
         // Parse aggregate types (optional)
-        let aggregate_types: Option<HashSet<AggregateTypeKey>> = {
+        let aggregate_types: Option<HashSet<u128>> = {
             if self.org_watch_aggregate_types.trim().is_empty() {
                 None
             } else {
-                let types: HashSet<AggregateTypeKey> = self.org_watch_aggregate_types
+                let types: HashSet<u128> = self
+                    .org_watch_aggregate_types
                     .split(',')
                     .filter_map(|s| s.trim().parse::<u128>().ok())
-                    .map(|t| AggregateTypeKey::new(org_id, t))
                     .collect();
+
                 if types.is_empty() { None } else { Some(types) }
             }
         };
@@ -733,17 +739,23 @@ impl App {
         self.watch_active = true;
         self.watch_events.clear();
         self.watch_events.push(format!("Starting organisation watch..."));
-        self.watch_events.push(format!("Organisation: {}", org_id));
+        self.watch_events.push(format!("Organisation: {:?}", org_id));
         if let Some(ref types) = aggregate_types {
-            self.watch_events.push(format!("Aggregate types: {:?}", types.iter().map(|t| t.aggregate_type_id).collect::<Vec<_>>()));
+            self.watch_events.push(format!("Aggregate types: {:?}", types.iter().map(|t| t).collect::<Vec<_>>()));
         } else {
             self.watch_events.push("Aggregate types: all".to_string());
         }
         self.watch_events.push(format!("Event types: {:?}", event_types));
         self.watch_events.push(String::new());
         
-        let mut orgs = HashSet::new();
-        orgs.insert(org_id);
+        let orgs = match org_id {
+            Some(id) => {
+                let mut set = HashSet::new();
+                set.insert(id);
+                Some(set)
+            }
+            None => None,
+        };
         
         // Spawn the watch task
         tokio::spawn(async move {
@@ -767,8 +779,7 @@ impl App {
 async fn watch_task(
     server_address: String,
     aggregate_key: AggregateKey,
-    event_types: Option<std::collections::HashSet<u8>>,  // Changed type
-    exclude_client_id: u128,
+    event_types: Option<std::collections::HashSet<u8>>,
     latency_ms: Option<u64>,
     tx: tokio::sync::mpsc::UnboundedSender<WatchUpdate>,
     mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
@@ -788,17 +799,20 @@ async fn watch_task(
         }
     };
     
-    // Build the aggregates HashMap with the aggregate_key
+    let mut orgs = HashSet::new();
+    orgs.insert(aggregate_key.org_id);
+    let mut types = HashSet::new();
+    types.insert(aggregate_key.aggregate_type_id);
     let mut aggregates = HashSet::new();
-    aggregates.insert(aggregate_key);  // None for default filter, or provide specific filter
+    aggregates.insert(aggregate_key.aggregate_id);
     
     let request = Request::Watch(WatchRequest {
         operation_types: event_types,
         correlation_id: None,
         requested_latency_ms: latency_ms,
-        orgs: None,
-        aggregate_types: None,
-        aggregates: Some(aggregates),  // Include the specific aggregate
+        orgs: Some(orgs),
+        aggregate_types: Some(types),
+        aggregates: Some(aggregates),
     });
     
     let _ = tx.send(WatchUpdate::Event(vec!["Sending watch request...".to_string()]));
@@ -874,8 +888,8 @@ async fn watch_task(
 
 async fn org_watch_task(
     server_address: String,
-    orgs: HashSet<u128>,
-    aggregate_types: Option<HashSet<AggregateTypeKey>>,
+    orgs: Option<HashSet<u128>>,
+    aggregate_types: Option<HashSet<u128>>,
     event_types: Option<HashSet<u8>>,
     latency_ms: Option<u64>,
     tx: tokio::sync::mpsc::UnboundedSender<WatchUpdate>,
@@ -900,8 +914,8 @@ async fn org_watch_task(
         operation_types: event_types,
         correlation_id: None,
         requested_latency_ms: latency_ms,
-        orgs: Some(orgs),
-        aggregate_types,
+        orgs: orgs,
+        aggregate_types: aggregate_types,
         aggregates: None,
     });
     

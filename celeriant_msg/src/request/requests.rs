@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use bincode::{Decode, Encode};
-use celeriant_wal::{aggregate_key::AggregateKey, aggregate_type_key::AggregateTypeKey, compression_type::CompressionType, datablocks::datablock_aggregate_event::DatablockAggregateEvent};
+use celeriant_wal::{aggregate_key::AggregateKey, compression_type::CompressionType, datablocks::datablock_aggregate_event::DatablockAggregateEvent};
 use serde::{Deserialize, Serialize};
 
 use crate::request::{read_filters::ReadFilters};
@@ -50,7 +50,7 @@ pub struct WatchRequest {
     pub correlation_id: Option<u128>,
     pub requested_latency_ms: Option<u64>,
     pub orgs: Option<HashSet<u128>>,
-    pub aggregate_types: Option<HashSet<AggregateTypeKey>>,
-    pub aggregates: Option<HashSet<AggregateKey>>,
+    pub aggregate_types: Option<HashSet<u128>>,
+    pub aggregates: Option<HashSet<u128>>,
     pub operation_types: Option<HashSet<u8>>,
 }

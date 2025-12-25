@@ -1,4 +1,4 @@
-use std::{cell::Cell, fmt, rc::Rc, time::Duration};
+use std::{cell::Cell, collections::HashSet, fmt, rc::Rc, time::Duration};
 
 use celeriant_shard::{error::{shard_error::ShardError, shard_read_error::ShardReadError, shard_write_error::ShardWriteError}, shard_wal::ShardWal};
 use celeriant_watch::{watch_output_type::WatchOutputType, watch_session::WatchSession};
@@ -203,79 +203,59 @@ fn determine_shard_route_watch_request(
     
     match config.routing_rule {
         crate::RoutingRule::OrgId => {
-            collect_unique_shard_id(num_shards, [
-                watch_request.orgs.as_ref().map(|orgs| 
-                    orgs.iter().map(|id| *id).collect::<Vec<_>>()
-                ),
-                watch_request.aggregate_types.as_ref().map(|types| 
-                    types.iter().map(|k| k.org_id).collect()
-                ),
-                watch_request.aggregates.as_ref().map(|aggs| 
-                    aggs.iter().map(|k| k.org_id).collect()
-                ),
-            ])
+            if watch_request.orgs.is_none() || watch_request.orgs.as_ref().unwrap().is_empty()
+            {
+                return Err(ShardRoutingError::IncompatibleFilters(
+                    "Must specify at least one organisation. Server is setup to shard by organisation.".into()
+                ));
+            }
+
+            collect_unique_shard_id(num_shards, &watch_request.orgs)
         },
         crate::RoutingRule::AggregateTypeId => {
-            // Cannot route by aggregate_type_id if only orgs are specified
-            if watch_request.orgs.is_some() 
-                && watch_request.aggregate_types.is_none() 
-                && watch_request.aggregates.is_none() 
+            if watch_request.aggregate_types.is_none() || watch_request.aggregate_types.as_ref().unwrap().is_empty()
             {
                 return Err(ShardRoutingError::IncompatibleFilters(
-                    "Cannot route by aggregate_type_id when only orgs are specified".into()
+                    "Must specify at least one aggregate type. Server is setup to shard by aggregate type.".into()
                 ));
             }
-            
-            collect_unique_shard_id(num_shards, [
-                None, // orgs don't have aggregate_type_id for routing
-                watch_request.aggregate_types.as_ref().map(|types| 
-                    types.iter().map(|k| k.aggregate_type_id).collect()
-                ),
-                watch_request.aggregates.as_ref().map(|aggs| 
-                    aggs.iter().map(|k| k.aggregate_type_id).collect()
-                ),
-            ])
+
+            collect_unique_shard_id(num_shards, &watch_request.aggregate_types)
         },
         crate::RoutingRule::AggregateId => {
-            // Cannot route by aggregate_id if aggregates are not specified
-            if (watch_request.orgs.is_some() || watch_request.aggregate_types.is_some())
-                && watch_request.aggregates.is_none()
+            if watch_request.aggregates.is_none() || watch_request.aggregates.as_ref().unwrap().is_empty()
             {
                 return Err(ShardRoutingError::IncompatibleFilters(
-                    "Cannot route by aggregate_id when aggregates are not specified".into()
+                    "Must specify at least one aggregate. Server is setup to shard by aggregate.".into()
                 ));
             }
-            
-            collect_unique_shard_id(num_shards, [
-                None,
-                None,
-                watch_request.aggregates.as_ref().map(|aggs| 
-                    aggs.iter().map(|k| k.aggregate_id).collect()
-                ),
-            ])
+
+            collect_unique_shard_id(num_shards, &watch_request.aggregates)
         },
     }
 }
 
 fn collect_unique_shard_id(
     num_shards: u128,
-    sources: [Option<Vec<u128>>; 3],
+    sources: &Option<HashSet<u128>>,
 ) -> Result<usize, ShardRoutingError> {
+    let set = sources
+        .as_ref()
+        .ok_or(ShardRoutingError::NoRoutingKeyProvided)?;
+
     let mut shard_id: Option<usize> = None;
-    
-    for source in sources.into_iter().flatten() {
-        for routing_key in source {
-            let computed_shard = (routing_key % num_shards) as usize;
-            match shard_id {
-                None => shard_id = Some(computed_shard),
-                Some(existing) if existing != computed_shard => {
-                    return Err(ShardRoutingError::MultipleShardRoutes);
-                }
-                Some(_) => {}
+
+    for &routing_key in set.iter() {
+        let computed_shard = (routing_key % num_shards) as usize;
+        match shard_id {
+            None => shard_id = Some(computed_shard),
+            Some(existing) if existing != computed_shard => {
+                return Err(ShardRoutingError::MultipleShardRoutes);
             }
+            Some(_) => {}
         }
     }
-    
+
     shard_id.ok_or(ShardRoutingError::NoRoutingKeyProvided)
 }
 

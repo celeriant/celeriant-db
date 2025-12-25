@@ -5,7 +5,6 @@ mod tests {
     use celeriant_msg::request::requests::WatchRequest;
     use celeriant_wal::{
         aggregate_key::AggregateKey,
-        aggregate_type_key::AggregateTypeKey,
     };
     use glommio::{LocalExecutorBuilder, Placement};
 
@@ -260,7 +259,7 @@ mod tests {
                 let watchers = AggregateWatchers::new();
 
                 let mut aggregate_types = HashSet::new();
-                aggregate_types.insert(AggregateTypeKey::new(100, 50));
+                aggregate_types.insert(50);
 
                 let request = WatchRequest {
                     correlation_id: Some(1),
@@ -306,7 +305,7 @@ mod tests {
                 let watchers = AggregateWatchers::new();
 
                 let mut aggregates = HashSet::new();
-                aggregates.insert(AggregateKey::new(1, 2, 3));
+                aggregates.insert(3);
 
                 let request = WatchRequest {
                     correlation_id: Some(1),
@@ -409,7 +408,7 @@ mod tests {
                 orgs.insert(100u128);
 
                 let mut aggregates = HashSet::new();
-                aggregates.insert(AggregateKey::new(100, 1, 1));
+                aggregates.insert(1u128);
 
                 let request = WatchRequest {
                     correlation_id: Some(1),
@@ -421,16 +420,6 @@ mod tests {
                 };
 
                 let (_id, client) = watchers.add_subscriber(request);
-
-                // Matches org filter
-                // watchers.broadcast(AggregateWatchEvent {
-                //     aggregate_key: AggregateKey::new(100, 99, 99),
-                //     operation: AggregateWatchEventOperation::Write {
-                //         from_event_batch_index: 1,
-                //         to_event_batch_index: 1,
-                //     },
-                // });
-                // assert!(client.borrow().receiver.recv().await.is_some());
 
                 // Matches aggregate filter
                 watchers.broadcast(AggregateWatchEvent {
