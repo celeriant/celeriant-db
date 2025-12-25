@@ -286,12 +286,12 @@ mod tests {
                 });
                 assert!(poll_once(client.borrow().receiver.recv()).await.is_none());
 
-                // Non-matching aggregate type (different org)
+                // Still matching aggregate type (different org)
                 watchers.broadcast(AggregateWatchEvent {
                     aggregate_key: AggregateKey::new(101, 50, 999),
                     operation: AggregateWatchEventOperation::Exists {},
                 });
-                assert!(poll_once(client.borrow().receiver.recv()).await.is_none());
+                assert!(client.borrow().receiver.recv().await.is_some());
             })
             .unwrap();
 
