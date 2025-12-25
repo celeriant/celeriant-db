@@ -13,7 +13,7 @@ use celeriant_wal::{
     compression_type::CompressionType,
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
 };
-use std::fs;
+use std::{collections::HashMap, fs};
 
 use crate::cli::*;
 use crate::utils::{format_response, format_timestamp};
@@ -150,27 +150,27 @@ async fn write_event(client: &mut CeleriantClient, args: WriteArgs) -> Result<()
 
     let compression: CompressionType = args.compression.into();
 
-    let request = Request::Write(WriteRequest {
-        correlation_id: args.key.correlation_id,
-        aggregate_key: key,
-        client_id: args.client_id,
-        user_id: args.user_id,
+    let mut writes = HashMap::new();
+    writes.insert(key, SingleAggregateWrite {
         events: vec![event],
         allow_create: args.allow_create,
         expected_event_batch_index: args.expected_index,
         enforce_client_idempotency: args.enforce_idempotency,
         compression_type: compression,
     });
+    
+    let request = Request::Write(WriteRequest {
+        correlation_id: args.key.correlation_id,
+        client_id: args.client_id,
+        user_id: args.user_id,
+        writes,
+    });
 
     let response = client.send_request(&request, compression).await?;
 
     match &response {
-        Response::Write(res) => {
-            println!("Write successful:");
-            println!("  Batch index: {}", res.event_batch_index);
-            println!("  Start event index: {}", res.start_event_index);
-            println!("  Server timestamp: {}", format_timestamp(res.server_timestamp));
-            println!("  Compressed size: {}", humansize::format_size(res.compressed_size, humansize::BINARY));
+        Response::Write(_res) => {
+            println!("Write successful.");
         }
         Response::GenericError(err) => {
             anyhow::bail!("Error {}: {}", err.error_code, err.error_message);

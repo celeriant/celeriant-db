@@ -3,7 +3,7 @@ use std::{cell::Cell, collections::HashSet, fmt, rc::Rc, time::Duration};
 use celeriant_shard::{error::{shard_error::ShardError, shard_read_error::ShardReadError, shard_write_error::ShardWriteError}, shard_wal::ShardWal};
 use celeriant_watch::{watch_output_type::WatchOutputType, watch_session::WatchSession};
 use celeriant_msg::{
-    request::{requests::WatchRequest},
+    request::requests::{WatchRequest, WriteRequest},
     response::responses::{ErrorResponse, WatchResponse},
 };
 use celeriant_wire::wire_error::WireError;
@@ -184,6 +184,9 @@ fn determine_shard_route(
         celeriant_msg::process_requests::Request::Watch(watch_request) => {
             determine_shard_route_watch_request(watch_request, config)
         },
+        celeriant_msg::process_requests::Request::Write(write_request) => {
+            determine_shard_route_write_request(write_request, config)
+        },
         the_rest => {
             let shard_id = match config.routing_rule {
                 crate::RoutingRule::OrgId => the_rest.org_id() % num_shards,
@@ -193,6 +196,38 @@ fn determine_shard_route(
             Ok(shard_id as usize)
         },
     }
+}
+
+fn determine_shard_route_write_request(
+    write_request: &WriteRequest,
+    config: Rc<ShardConfig>,
+) -> Result<usize, ShardRoutingError> {
+    let num_shards = config.num_shards as u128;
+
+    if write_request.writes.is_empty() {
+        return Err(ShardRoutingError::IncompatibleFilters(
+            "Write request must contain at least one write operation.".into(),
+        ));
+    }
+
+    let mut shard_ids: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+    for aggregate_key in write_request.writes.keys() {
+        let routing_id = config.routing_rule.routing_id_for_rule(aggregate_key);
+        let shard_id = (routing_id % num_shards) as usize;
+        shard_ids.insert(shard_id);
+    }
+
+    if shard_ids.len() > 1 {
+        return Err(ShardRoutingError::IncompatibleFilters(
+            format!(
+                "Write request spans multiple shards. All writes must route to the same shard when using {} routing.",
+                config.routing_rule
+            ),
+        ));
+    }
+
+    Ok(shard_ids.into_iter().next().unwrap())
 }
 
 fn determine_shard_route_watch_request(

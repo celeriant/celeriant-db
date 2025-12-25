@@ -13,12 +13,13 @@ use celeriant_memcache::shard_mem_cache::ShardMemCache;
 use celeriant_memcache::sync_positions_snapshot::SyncPositionsSnapshot;
 use celeriant_msg::process_requests::Request;
 use celeriant_msg::process_responses::Response;
-use celeriant_msg::request::requests::{ReadRequest, WriteRequest};
+use celeriant_msg::request::requests::{ReadRequest, SingleAggregateWrite, WriteRequest};
 use celeriant_msg::response::aggregate_event_batch::AggregateEventBatch;
-use celeriant_msg::response::responses::{ReadResponse, WriteResponse};
+use celeriant_msg::response::responses::{ReadResponse, SuccessResponse};
 use celeriant_rotating_log::reverse_metablock_scanner::ReverseMetablockScanner;
 use celeriant_rotating_log::rotating_log_cache::RotatingLogCache;
 use celeriant_rotating_log::rotating_log_error::RotatingLogError;
+use celeriant_rotating_log::rwlock_timeout::{read_with_timeout, write_with_timeout};
 use celeriant_rotating_log::shard_log_dma_file::ShardLogDmaFile;
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::constants::{FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_METABLOCK};
@@ -127,7 +128,7 @@ impl ShardWal {
 
         let shard_mem_cache = {
             let active_lock = rotating_log_cache.active();
-            let active_log_file = active_lock.read().await?;
+            let active_log_file = read_with_timeout(&active_lock).await?;
             let datablocks_carry_over = active_log_file.read_datablocks_carry_over_bytes().await?;
 
             ShardMemCache::new(
@@ -167,42 +168,68 @@ impl ShardWal {
         &self,
         lease_index: u64,
         write_request: WriteRequest,
-    ) -> Result<WriteResponse, ShardWriteError> {
-        // Make sure we have at least one event to write
-        if write_request.events.is_empty() {
+    ) -> Result<SuccessResponse, ShardWriteError> {
+        // Make sure we have at least one aggregate to write
+        if write_request.writes.is_empty() {
             return Err(ShardWriteError::EmptyEventsList);
         }
 
-        // Validate that no event uses the sentinel 0 event type
-        if let Some(ev) = write_request
-            .events
-            .iter()
-            .find(|e| e.event_type_major == 0)
-        {
-            return Err(ShardWriteError::ZeroEventType {
-                client_event_index: ev.client_event_index,
-            });
+        // Phase 1: Validation and preparation - all checks that can fail happen here
+        // No mutations to shard_mem_cache until all validations pass
+        let mut prepared_writes = Vec::with_capacity(write_request.writes.len());
+        let mut wal_index = self.shard_mem_cache.borrow_mut().get_wal_index();
+
+        for (aggregate_key, single_write) in &write_request.writes {
+            // Validate events list is not empty
+            if single_write.events.is_empty() {
+                return Err(ShardWriteError::EmptyEventsList);
+            }
+
+            // Validate that no event uses the sentinel 0 event type
+            if let Some(ev) = single_write
+                .events
+                .iter()
+                .find(|e| e.event_type_major == 0)
+            {
+                return Err(ShardWriteError::ZeroEventType {
+                    client_event_index: ev.client_event_index,
+                });
+            }
+
+            // Ensure aggregate snapshot is in memcache, loading from disk if necessary
+            if !self.move_aggregate_to_memcache(aggregate_key, Some(write_request.client_id)).await?
+                && !single_write.allow_create
+            {
+                return Err(ShardWriteError::AggregateNotExists);
+            }
+
+            if single_write.enforce_client_idempotency {
+                self.move_aggregate_client_to_memcache(aggregate_key, write_request.client_id).await?;
+            }
+
+            wal_index = wal_index.saturating_sub(1);
+
+            // Validate and prepare - reads from memcache but does not mutate
+            let prepared = self.validate_and_prepare_write(
+                lease_index,
+                aggregate_key,
+                write_request.client_id,
+                write_request.user_id,
+                single_write.clone(),
+                wal_index,
+            )?;
+            
+            prepared_writes.push(prepared);
         }
 
-        // Ensure aggregate snapshot is in memcache, loading from disk if necessary
-        // Block must be in this order - load from cache, then if failed and cannot create, error
-        if !self.move_aggregate_to_memcache(&write_request.aggregate_key, Some(write_request.client_id)).await? && !write_request.allow_create {
-            return Err(ShardWriteError::AggregateNotExists);
-        }
-
-        if write_request.enforce_client_idempotency {
-            self.move_aggregate_client_to_memcache(&write_request.aggregate_key, write_request.client_id).await?;
-        }
-
-        let (write_response, force_durable) =
-            self.add_write_request_to_pending_queue(lease_index, write_request)?;
+        // Phase 2: Append all prepared writes to queue - cannot fail
+        let force_durable = self.append_prepared_writes_to_queue(prepared_writes, wal_index);
 
         // Now we wait on disk write before ack to client
         self.sync_durable(force_durable).await?;
 
-        Ok(write_response)
+        Ok(SuccessResponse { correlation_id: write_request.correlation_id })
     }
-
 
     /// Read event batches from an aggregate.
     /// Reads from cache when possible, falls back to disk for older batches.
@@ -433,18 +460,23 @@ impl ShardWal {
         Ok(true)
     }
 
-    /// Validate and add a write request to the pending queue.
-    fn add_write_request_to_pending_queue(
+    /// Validate a write request and prepare all data for appending.
+    /// This performs read-only access to shard_mem_cache and can fail.
+    fn validate_and_prepare_write(
         &self,
         lease_index: u64,
-        mut write_request: WriteRequest,
-    ) -> Result<(WriteResponse, bool), ShardWriteError> {
+        aggregate_key: &AggregateKey,
+        client_id: u128,
+        user_id: Option<u128>,
+        mut write_request: SingleAggregateWrite,
+        wal_index: u64,
+    ) -> Result<PreparedWrite, ShardWriteError> {
         let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
 
-        // If checking idempotency, check if client is providing the same events again using client event index, if so, error
+        // Validate client idempotency
         if write_request.enforce_client_idempotency {
             if let Some(last_client_event_index) = shard_mem_cache
-                .get_client_event_index(&write_request.aggregate_key, write_request.client_id)
+                .get_client_event_index(aggregate_key, client_id)
             {
                 let attempted_client_event_index = write_request
                     .events
@@ -461,10 +493,9 @@ impl ShardWal {
             }
         }
 
-        let aggregate_current_indexes =
-            shard_mem_cache.get_event_indexes(&write_request.aggregate_key);
+        let aggregate_current_indexes = shard_mem_cache.get_event_indexes(aggregate_key);
 
-        // If doing optimistic concurrency, check expected event batch index matches current
+        // Validate optimistic concurrency
         if let Some(expected) = write_request.expected_event_batch_index {
             if expected != aggregate_current_indexes.event_batch_index {
                 return Err(ShardWriteError::OptimisticConcurrencyViolation {
@@ -474,14 +505,13 @@ impl ShardWal {
             }
         }
 
-        // Update events - set event indexes, server timestamp millis. Keep track of last event index assigned to update state later
-        let mut events_in_batch = std::mem::take(&mut write_request.events);
+        // Drop the borrow before doing potentially expensive serialization
+        drop(shard_mem_cache);
 
+        // Prepare event data
+        let mut events_in_batch = std::mem::take(&mut write_request.events);
         let mut event_index = aggregate_current_indexes.event_index;
-        let start_event_index = event_index.saturating_add(1);
-        let event_batch_index = aggregate_current_indexes
-            .event_batch_index
-            .saturating_add(1);
+        let event_batch_index = aggregate_current_indexes.event_batch_index.saturating_add(1);
 
         for e in events_in_batch.iter_mut() {
             event_index = event_index.saturating_add(1);
@@ -502,9 +532,9 @@ impl ShardWal {
         };
 
         let metablock_event_batch = MetablockEventBatch::from_batch_item(
-            write_request.client_id,
-            write_request.user_id,
-            write_request.aggregate_key.clone(),
+            client_id,
+            user_id,
+            aggregate_key.clone(),
             &datablock_aggregate_event_batch,
             event_types_data,
         );
@@ -514,18 +544,14 @@ impl ShardWal {
             datablock_kind: DatablockKind::EventBatchItem(datablock_aggregate_event_batch),
         };
 
+        // Serialize datablock - this can fail
         let serialized_datablock =
             serialize_datablock(&datablock, write_request.compression_type, 0)?;
-        let external_data_len = serialized_datablock
-            .external_data
-            .as_ref()
-            .map(|f| f.len())
-            .unwrap_or_default() as u64;
 
         let server_timestamp = self.config.timestamp_config.now();
 
         let metablock = Metablock {
-            wal_index: shard_mem_cache.current_wal_index().saturating_add(1),
+            wal_index,
             server_timestamp,
             lease_index,
             node_id: self.config.node_id,
@@ -539,28 +565,40 @@ impl ShardWal {
             metablock,
         );
 
-        // Update next event index, next event batch index, client event indexes
-        shard_mem_cache.add_to_pending_append_queue(
-            &write_request.aggregate_key,
+        Ok(PreparedWrite {
+            aggregate_key: aggregate_key.clone(),
+            client_id,
             event_index,
             event_batch_index,
-            write_request.client_id,
             latest_client_event_index,
             shard_log_queue_item,
-        );
+        })
+    }
 
-        let write_response = WriteResponse {
-            correlation_id: write_request.correlation_id,
-            event_batch_index,
-            start_event_index,
-            server_timestamp,
-            compressed_size: FIXED_BLOCK_SIZE_BYTES as u64 + external_data_len,
-        };
+    /// Append all prepared writes to the pending queue.
+    /// This mutates shard_mem_cache but cannot fail.
+    fn append_prepared_writes_to_queue(
+        &self,
+        prepared_writes: Vec<PreparedWrite>,
+        final_wal_index: u64,
+    ) -> bool {
+        let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
 
-        Ok((
-            write_response,
-            shard_mem_cache.force_durable_on_next_write(),
-        ))
+        for prepared in prepared_writes {
+            shard_mem_cache.add_to_pending_append_queue(
+                &prepared.aggregate_key,
+                prepared.event_index,
+                prepared.event_batch_index,
+                prepared.client_id,
+                prepared.latest_client_event_index,
+                prepared.shard_log_queue_item,
+            );
+        }
+
+        // Update the wal_index to reflect all appended writes
+        shard_mem_cache.set_queue_wal_index(final_wal_index);
+
+        shard_mem_cache.force_durable_on_next_write()
     }
 
     /// Perform sync with potential delay for amortisation.
@@ -640,7 +678,7 @@ async fn sync_with_rollback(
 ) -> Result<(), ShardFsyncError> {
     // Lock the writer before we take the snapshot of the queue
     let lockable_active_log_file = rotating_log_cache.active();
-    let mut shard_log_dma_file = lockable_active_log_file.write().await?;
+    let mut shard_log_dma_file = write_with_timeout(&lockable_active_log_file).await?;
 
     let (
         has_enough_free_space,
@@ -918,4 +956,14 @@ async fn sync(
     sync_positions_snapshot.wal_index = new_wal_index;
 
     Ok(())
+}
+
+/// Intermediate struct for validated and prepared write data
+struct PreparedWrite {
+    aggregate_key: AggregateKey,
+    client_id: u128,
+    event_index: u64,
+    event_batch_index: u64,
+    latest_client_event_index: u64,
+    shard_log_queue_item: ShardLogQueueItem,
 }

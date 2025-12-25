@@ -1,6 +1,8 @@
 use celeriant_wire::wire_format_error::WireFormatError;
 use glommio::GlommioError;
 
+use crate::rwlock_timeout::LockTimeoutError;
+
 
 #[derive(Debug, Clone)]
 pub enum RotatingLogError {
@@ -27,6 +29,12 @@ impl std::fmt::Display for RotatingLogError {
 }
 
 impl std::error::Error for RotatingLogError {}
+
+impl From<LockTimeoutError> for RotatingLogError {
+    fn from(e: LockTimeoutError) -> Self {
+        Self::IoError(e.to_string())
+    }
+}
 
 impl From<GlommioError<()>> for RotatingLogError {
     fn from(e: GlommioError<()>) -> Self {

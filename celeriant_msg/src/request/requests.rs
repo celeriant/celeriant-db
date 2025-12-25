@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use bincode::{Decode, Encode};
 use celeriant_wal::{aggregate_key::AggregateKey, compression_type::CompressionType, datablocks::datablock_aggregate_event::DatablockAggregateEvent};
@@ -22,15 +22,20 @@ pub struct ReadRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct WriteRequest {
     pub correlation_id: Option<u128>,
-    pub aggregate_key: AggregateKey,
     pub client_id: u128,
     pub user_id: Option<u128>,
+    pub writes: HashMap<AggregateKey, SingleAggregateWrite>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub struct SingleAggregateWrite {
     pub events: Vec<DatablockAggregateEvent>,
     pub allow_create: bool,
     pub expected_event_batch_index: Option<u64>,
     pub enforce_client_idempotency: bool,
     pub compression_type: CompressionType,
 }
+
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct TrimStartRequest {

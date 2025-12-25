@@ -10,6 +10,7 @@ use crate::response::{aggregate_event_batch::AggregateEventBatch, watch_event::W
 pub struct ExistsResponse {
     pub correlation_id: Option<u128>,
     pub min_event_batch_index: u64,
+    //TODO: Include other metadata.
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
@@ -22,15 +23,6 @@ pub struct ReadResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode, Default)]
 pub struct WatchResponse {
     pub events: Option<HashMap<AggregateKey, HashMap<u8, Option<WatchEvent>>>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
-pub struct WriteResponse {
-    pub correlation_id: Option<u128>,
-    pub event_batch_index: u64,
-    pub start_event_index: u64,
-    pub server_timestamp: u64,
-    pub compressed_size: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]

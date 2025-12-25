@@ -4,7 +4,7 @@ use celeriant_wal::compression_type::CompressionType;
 use celeriant_wire::{constants::WIRE_FIXED_BODY_SIZE, wire_error::WireError, wire_header::WireHeader};
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
 
-use crate::response::responses::{ErrorResponse, ExistsResponse, ProtocolErrorResponse, ReadResponse, SuccessResponse, WatchResponse, WriteResponse};
+use crate::response::responses::{ErrorResponse, ExistsResponse, ProtocolErrorResponse, ReadResponse, SuccessResponse, WatchResponse};
 
 // Response type discriminants
 #[repr(u32)]
@@ -53,7 +53,7 @@ impl ResponseType {
 pub enum Response {
     Exists(ExistsResponse),
     Read(ReadResponse),
-    Write(WriteResponse),
+    Write(SuccessResponse),
     TrimStart(SuccessResponse),
     Delete(SuccessResponse),
     ProtocolError(ProtocolErrorResponse),
@@ -217,12 +217,8 @@ mod tests {
             ResponseType::Watch => Response::Watch(WatchResponse {
                 events: None,
             }),
-            ResponseType::Write => Response::Write(WriteResponse {
-                correlation_id: Some(104),
-                event_batch_index: 1,
-                start_event_index: 0,
-                server_timestamp: 1234567890,
-                compressed_size: 512,
+            ResponseType::Write => Response::Write(SuccessResponse {
+                correlation_id: Some(105),
             }),
             ResponseType::TrimStart => Response::TrimStart(SuccessResponse {
                 correlation_id: Some(106),

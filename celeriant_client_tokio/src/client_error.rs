@@ -7,7 +7,8 @@ pub enum ClientError {
     WireError(WireError),
     ProtocolError,
     CeleriantError(ErrorResponse),
-    Timeout,
+    ConnectionTimeout,
+    RequestTimeout,
 }
 
 impl std::fmt::Display for ClientError {
@@ -17,7 +18,8 @@ impl std::fmt::Display for ClientError {
             ClientError::WireError(e) => write!(f, "Wire error: {:?}", e),
             ClientError::ProtocolError => write!(f, "Protocol error"),
             ClientError::CeleriantError(e) => write!(f, "CeleriantError server error {}: {}", e.error_message, e.error_message),
-            ClientError::Timeout => write!(f, "Request timeout"),
+            ClientError::RequestTimeout => write!(f, "Request timeout"),
+            ClientError::ConnectionTimeout => write!(f, "Connection timeout"),
         }
     }
 }

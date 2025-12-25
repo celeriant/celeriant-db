@@ -1,8 +1,8 @@
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
-use celeriant_msg::process_requests::Request;
+use celeriant_msg::{process_requests::Request, request::requests::SingleAggregateWrite};
 use celeriant_msg::request::requests::WriteRequest;
 use celeriant_wal::{
     aggregate_key::AggregateKey,
@@ -12,7 +12,7 @@ use celeriant_wal::{
 use tokio::time::Instant;
 
 const NUM_CONNECTIONS: usize = 12*1024; // 28k max source port limit ~25000;
-const TEST_DURATION_SECS: u64 = 35;
+const TEST_DURATION_SECS: u64 = 15;
 const NUM_AGGREGATES: usize = 1024;
 const USE_MICRO_PAYLOAD: bool = true;
 const SERVER_ADDR: &str = "0.0.0.0:10000";
@@ -127,17 +127,20 @@ async fn run_connection_benchmark(connection_id: usize) -> Result<TaskStats, Str
         iv: None,
     };
 
-    // Prepare the write request (reused for all requests)
-    let request = Request::Write(WriteRequest {
-        correlation_id: Some(connection_id as u128),
-        aggregate_key: AggregateKey::new(1, 3, (connection_id % NUM_AGGREGATES) as u128),
-        client_id: connection_id as u128,
-        user_id: None,
+    let mut writes = HashMap::new();
+    writes.insert(AggregateKey::new((connection_id % NUM_AGGREGATES) as u128, 3, (connection_id % NUM_AGGREGATES) as u128), SingleAggregateWrite {
         events: if USE_MICRO_PAYLOAD { vec![event_1] } else { vec![event_1, event_2] },
         allow_create: true,
         expected_event_batch_index: None,
         enforce_client_idempotency: false,
         compression_type: CompressionType::None,
+    });
+    
+    let request = Request::Write(WriteRequest {
+        correlation_id: None,
+        client_id: connection_id as u128,
+        user_id: None,
+        writes,
     });
 
     let mut request_count = 0u64;

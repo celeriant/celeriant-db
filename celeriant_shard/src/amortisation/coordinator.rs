@@ -1,4 +1,5 @@
 use std::{rc::Rc, time::Duration};
+use celeriant_rotating_log::rwlock_timeout::{read_with_timeout, write_with_timeout};
 use glommio::sync::RwLock;
 use crate::amortisation::local_event::LocalEvent;
 
@@ -63,10 +64,12 @@ impl<E: Clone> Coordinator<E> {
                         }
                     },
                     Err(_) => {
-                        let guard = self.lock_orchestrator.read().await.unwrap();
-                        match guard.as_ref() {
-                            Some(event) => Acquired::Follower(event.clone()),
-                            None => Acquired::Retry,
+                        match read_with_timeout(&self.lock_orchestrator).await {
+                            Ok(guard) => match guard.as_ref() {
+                                Some(event) => Acquired::Follower(event.clone()),
+                                None => Acquired::Retry,
+                            },
+                            Err(_) => Acquired::Retry,
                         }
                     }
                 }
@@ -75,6 +78,7 @@ impl<E: Clone> Coordinator<E> {
             match acquired {
                 Acquired::Leader(event) => {
                     glommio::timer::sleep(delay).await;
+                    let _ = write_with_timeout(&self.lock_orchestrator).await.map(|mut g| g.take());
                     self.lock_orchestrator.write().await.unwrap().take();
                     let result = sync_fn().await;
                     event.notify(result.clone());

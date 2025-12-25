@@ -80,7 +80,7 @@ impl Request {
         match self {
             Request::Exists(req) => req.aggregate_key.aggregate_id,
             Request::Read(req) => req.aggregate_key.aggregate_id,
-            Request::Write(req) => req.aggregate_key.aggregate_id,
+            Request::Write(_req) => 0,
             Request::TrimStart(req) => req.aggregate_key.aggregate_id,
             Request::Delete(req) => req.aggregate_key.aggregate_id,
             Request::Watch(_req) => 0,
@@ -93,7 +93,7 @@ impl Request {
         match self {
             Request::Exists(req) => req.aggregate_key.org_id,
             Request::Read(req) => req.aggregate_key.org_id,
-            Request::Write(req) => req.aggregate_key.org_id,
+            Request::Write(_req) => 0,
             Request::TrimStart(req) => req.aggregate_key.org_id,
             Request::Delete(req) => req.aggregate_key.org_id,
             Request::Watch(_req) => 0,
@@ -106,7 +106,7 @@ impl Request {
         match self {
             Request::Exists(req) => req.aggregate_key.aggregate_type_id,
             Request::Read(req) => req.aggregate_key.aggregate_type_id,
-            Request::Write(req) => req.aggregate_key.aggregate_type_id,
+            Request::Write(_req) => 0,
             Request::TrimStart(req) => req.aggregate_key.aggregate_type_id,
             Request::Delete(req) => req.aggregate_key.aggregate_type_id,
             Request::Watch(_req) => 0,
@@ -210,7 +210,7 @@ mod tests {
     use celeriant_wal::aggregate_key::AggregateKey;
     use celeriant_wire::constants::{PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3};
     use futures_lite::{future::block_on, io::Cursor};
-    use crate::request::{read_filters::ReadFilters};
+    use crate::request::{read_filters::ReadFilters, requests::SingleAggregateWrite};
 
     // UPDATE THIS when adding new RequestTypes - tests will fail if mismatched
     const REQUEST_TYPE_COUNT: usize = 6;
@@ -249,17 +249,25 @@ mod tests {
                 aggregate_key: key,
                 filters: ReadFilters::new(1),
             }),
-            RequestType::Write => Request::Write(WriteRequest {
-                correlation_id: Some(104),
-                aggregate_key: key,
-                client_id: 999,
-                user_id: Some(888),
-                events: vec![],
-                allow_create: true,
-                expected_event_batch_index: None,
-                enforce_client_idempotency: false,
-                compression_type: CompressionType::None,
-            }),
+            RequestType::Write => {
+                let writes = std::collections::HashMap::from([(
+                    key.clone(),
+                    SingleAggregateWrite {
+                        events: vec![],
+                        allow_create: true,
+                        expected_event_batch_index: None,
+                        enforce_client_idempotency: false,
+                        compression_type: CompressionType::None,
+                    },
+                )]);
+
+                Request::Write(WriteRequest {
+                    correlation_id: Some(104),
+                    client_id: 999,
+                    user_id: Some(888),
+                    writes,
+                })
+            },
             RequestType::TrimStart => Request::TrimStart(TrimStartRequest {
                 correlation_id: Some(106),
                 aggregate_key: key,

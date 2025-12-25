@@ -8,7 +8,7 @@ use celeriant_wal::constants::FIXED_BLOCK_SIZE_BYTES;
 use glommio::{sync::RwLock};
 use lru::LruCache;
 
-use crate::{rotating_log_error::RotatingLogError, shard_log_dma_file::ShardLogDmaFile};
+use crate::{rotating_log_error::RotatingLogError, rwlock_timeout::write_with_timeout, shard_log_dma_file::ShardLogDmaFile};
 
 /// Manages DmaFile handles for a shard with LRU caching.
 ///
@@ -112,7 +112,7 @@ impl RotatingLogCache {
     /// before closing files.
     pub async fn close(&self) -> Result<(), RotatingLogError> {
         {
-            let mut guard = self.active_file.write().await?;
+            let mut guard = write_with_timeout(&self.active_file).await?;
             if let Some(file) = guard.dma_file.take() {
                 file.close().await?;
             }
@@ -121,7 +121,7 @@ impl RotatingLogCache {
         {
             let mut cache = self.lru_cache.borrow_mut();
             for (_id, file_rc) in cache.iter() {
-                let mut guard = file_rc.write().await?;
+                let mut guard = write_with_timeout(&file_rc).await?;
                 if let Some(file) = guard.dma_file.take() {
                     file.close().await?;
                 }

@@ -19,6 +19,9 @@ pub struct ShardMemCache {
     /// Shard WAL index representing the last written metablock
     wal_index: u64,
 
+    /// Represents the wal index of the uncommitted queue
+    queue_wal_index: Option<u64>,
+
     /// Partial bytes of the last written datablock to allow for efficient
     /// Direct I/O aligned writes. Saves reading the bytes for the next datablock write
     datablocks_carry_over: Option<Vec<u8>>,
@@ -61,8 +64,12 @@ pub struct ShardMemCache {
 
 impl ShardMemCache {
 
-    pub fn current_wal_index(&self) -> u64 {
-        self.wal_index
+    pub fn get_wal_index(&mut self) -> u64 {
+        if let Some(wal_index) = self.queue_wal_index {
+            return wal_index;
+        } else {    
+            self.wal_index
+        }   
     }
 
     /// Insert a write into the recent write cache. Call only after durable write.
@@ -208,6 +215,10 @@ impl ShardMemCache {
         self.pending_append_queue.push(shard_log_queue_item);
     }
 
+    pub fn set_queue_wal_index(&mut self, wal_index: u64) {
+        self.queue_wal_index = Some(wal_index);
+    }
+
     /// When we begin writing to disk, we need to take the queue positions
     /// While disk is writing the queue is still available for the next batch
     pub fn take_sync_positions_snapshot(&mut self) -> SyncPositionsSnapshot {
@@ -252,6 +263,7 @@ impl ShardMemCache {
     /// out all our aggregate_queue_positions, falling back to the aggregate_file_positions store
     pub fn rollback_queue_positions(&mut self) {
         self.had_fsync_failure = true;
+        self.queue_wal_index = None;
         self.aggregate_queue_positions.clear();
     }
 
@@ -292,6 +304,10 @@ impl ShardMemCache {
         self.file_len = sync_positions_snapshot.file_len;
         self.datablocks_carry_over = sync_positions_snapshot.datablocks_carry_over;
         self.had_fsync_failure = false;
+        if let Some(wal_index) = self.queue_wal_index {
+            self.wal_index = wal_index;
+            self.queue_wal_index = None;
+        }
 
         for (key, queue_positions) in sync_positions_snapshot.aggregate_queue_positions {
             // Update aggregate positions LRU
@@ -405,6 +421,7 @@ impl ShardMemCache {
             wal_index,
             aggregate_snapshots: LruCache::new(aggregate_cap),
             aggregate_client_snapshots: LruCache::new(client_cap),
+            queue_wal_index: None
         }
     }
 }

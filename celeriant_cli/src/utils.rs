@@ -20,7 +20,7 @@ pub fn format_response(response: &Response) -> String {
         Response::Exists(r) => format!("Exists: batches from {}", 
             r.min_event_batch_index),
         Response::Read(r) => format!("Read: {} batches", r.event_batches.len()),
-        Response::Write(r) => format!("Write: batch {}", r.event_batch_index),
+        Response::Write(_) => "Write: success".to_string(),
         Response::TrimStart(_) => "TrimStart: success".to_string(),
         Response::Delete(_) => "Delete: success".to_string(),
         Response::ProtocolError(_) => "ProtocolError".to_string(),

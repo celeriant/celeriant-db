@@ -1,4 +1,4 @@
-use celeriant_rotating_log::rotating_log_error::RotatingLogError;
+use celeriant_rotating_log::{rotating_log_error::RotatingLogError, rwlock_timeout::LockTimeoutError};
 use celeriant_wire::wire_format_error::WireFormatError;
 use glommio::GlommioError;
 
@@ -24,6 +24,12 @@ pub enum ShardFsyncError {
     SyncFailurePending,
 
     DatablocksCarryOverBufferNotPresent,
+}
+
+impl From<LockTimeoutError> for ShardFsyncError {
+    fn from(e: LockTimeoutError) -> Self {
+        Self::IoError(e.to_string())
+    }
 }
 
 impl From<GlommioError<()>> for ShardFsyncError {

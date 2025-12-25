@@ -1,4 +1,4 @@
-use std::{collections::HashSet, path::Path, sync::Arc};
+use std::{collections::{HashMap, HashSet}, path::Path, sync::Arc};
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_crypto::Crypto;
@@ -433,12 +433,9 @@ impl App {
             event_id: None,
             iv: None,
         };
-        
-        let request = Request::Write(WriteRequest {
-            correlation_id: None,
-            aggregate_key: key,
-            client_id: self.client_id,  // Use app's client_id
-            user_id: None,
+
+        let mut writes = HashMap::new();
+        writes.insert(key, SingleAggregateWrite {
             events: vec![event],
             allow_create: true,
             expected_event_batch_index: None,
@@ -446,14 +443,17 @@ impl App {
             compression_type: CompressionType::None,
         });
         
+        let request = Request::Write(WriteRequest {
+            correlation_id: None,
+            client_id: self.client_id,  // Use app's client_id
+            user_id: None,
+            writes,
+        });
+        
         match client.send_request(&request, CompressionType::None).await {
-            Ok(Response::Write(res)) => {
+            Ok(Response::Write(_res)) => {
                 self.result_output.clear();
                 self.result_output.push("Write successful!".to_string());
-                self.result_output.push(format!("Batch index: {}", res.event_batch_index));
-                self.result_output.push(format!("Start event index: {}", res.start_event_index));
-                self.result_output.push(format!("Server timestamp: {}", crate::utils::format_timestamp(res.server_timestamp)));
-                self.result_output.push(format!("Compressed size: {}", humansize::format_size(res.compressed_size, humansize::BINARY)));
                 
                 // Don't clear write_data - allow multiple writes
                 self.set_status("Event written successfully");

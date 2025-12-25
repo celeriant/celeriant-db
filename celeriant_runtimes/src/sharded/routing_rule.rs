@@ -42,7 +42,7 @@ impl std::fmt::Display for RoutingRule {
 
 impl RoutingRule {
     /// Returns the routing ID based on the specified routing rule.
-    pub fn routing_id_for_rule(&self, aggregate_key: AggregateKey) -> u128 {
+    pub fn routing_id_for_rule(&self, aggregate_key: &AggregateKey) -> u128 {
         match self {
             RoutingRule::OrgId => aggregate_key.org_id,
             RoutingRule::AggregateTypeId => aggregate_key.aggregate_type_id,

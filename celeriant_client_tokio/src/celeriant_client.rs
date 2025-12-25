@@ -36,7 +36,7 @@ impl CeleriantClient {
         let stream = if let Some(duration) = connection_timeout {
             timeout(duration, connect_future)
                 .await
-                .map_err(|_| ClientError::Timeout)?
+                .map_err(|_| ClientError::ConnectionTimeout)?
                 .map_err(ClientError::ConnectionFailed)?
         } else {
             connect_future
@@ -105,7 +105,7 @@ impl CeleriantClient {
         if let Some(duration) = self.timeout {
             timeout(duration, request_future)
                 .await
-                .map_err(|_| ClientError::Timeout)?
+                .map_err(|_| ClientError::RequestTimeout)?
         } else {
             request_future.await
         }

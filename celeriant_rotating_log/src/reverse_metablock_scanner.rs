@@ -4,7 +4,7 @@ use celeriant_disk::files::read_fixed_records_visit_const::read_fixed_records_vi
 use celeriant_wal::constants::FIXED_BLOCK_SIZE_BYTES;
 use glommio::sync::RwLock;
 
-use crate::{rotating_log_cache::RotatingLogCache, rotating_log_error::RotatingLogError, shard_log_dma_file::ShardLogDmaFile};
+use crate::{rotating_log_cache::RotatingLogCache, rotating_log_error::RotatingLogError, rwlock_timeout::read_with_timeout, shard_log_dma_file::ShardLogDmaFile};
 
 /// Scans metablocks in reverse order across all log files.
 /// Starts from the active log and works backwards through older logs.
@@ -59,7 +59,7 @@ impl<'a> ReverseMetablockScanner<'a> {
         E: std::fmt::Debug,
     {
         let file_rc: Rc<RwLock<ShardLogDmaFile>> = self.log_cache.get(self.current_log_id).await?;
-        let guard = file_rc.read().await?;
+        let guard = read_with_timeout(&file_rc).await?;
 
         let dma_file = guard.dma_file.as_ref()
             .ok_or_else(|| RotatingLogError::IoError("No file handle".to_string()))?;
