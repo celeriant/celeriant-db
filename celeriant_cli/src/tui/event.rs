@@ -48,7 +48,8 @@ async fn handle_normal_mode(app: &mut App, key: KeyEvent) -> anyhow::Result<()> 
                 Screen::ReadEvents => handle_read_events_keys(app, key).await?,
                 Screen::WriteEvent => handle_write_event_keys(app, key).await?,
                 Screen::TrimStart => handle_trim_start_keys(app, key).await?,
-                Screen::Watch => handle_watch_keys(app, key).await?,  // Add this
+                Screen::Watch => handle_watch_keys(app, key).await?,
+                Screen::OrgWatch => handle_org_watch_keys(app, key).await?,
                 Screen::Help => handle_help_keys(app, key),
             }
         }
@@ -147,6 +148,15 @@ async fn handle_editing_mode(app: &mut App, key: KeyEvent) -> anyhow::Result<()>
                         app.input_fields[app.input_field_index].value.push(c);
                     }
                 }
+                Screen::OrgWatch => {
+                    match app.input_field_index {
+                        0 => app.org_watch_org_id.push(c),
+                        1 => app.org_watch_aggregate_types.push(c),
+                        2 => app.org_watch_event_types.push(c),
+                        3 => app.org_watch_latency_ms.push(c),
+                        _ => {}
+                    }
+                }
                 Screen::ReadEvents => {
                     match app.input_field_index {
                         0 => app.read_from_index.push(c),
@@ -182,6 +192,15 @@ async fn handle_editing_mode(app: &mut App, key: KeyEvent) -> anyhow::Result<()>
                 Screen::EnterAggregate => {  
                     if app.input_field_index < app.input_fields.len() {
                         app.input_fields[app.input_field_index].value.pop();
+                    }
+                }
+                Screen::OrgWatch => {
+                    match app.input_field_index {
+                        0 => { app.org_watch_org_id.pop(); }
+                        1 => { app.org_watch_aggregate_types.pop(); }
+                        2 => { app.org_watch_event_types.pop(); }
+                        3 => { app.org_watch_latency_ms.pop(); }
+                        _ => {}
                     }
                 }
                 Screen::ReadEvents => {
@@ -234,17 +253,22 @@ async fn handle_home_keys(app: &mut App, key: KeyEvent) -> anyhow::Result<()> {
             if app.is_connected() {
                 match app.menu_index {
                     0 => {
-                        // Fixed: Navigate to EnterAggregate screen
+                        // Enter Aggregate
                         app.setup_enter_aggregate_fields();
                         app.go_to_screen(Screen::EnterAggregate);
                     }
                     1 => {
-                        app.disconnect().await;
+                        // Organisation Watch
+                        app.setup_org_watch_fields();
+                        app.go_to_screen(Screen::OrgWatch);
                     }
                     2 => {
-                        app.go_to_screen(Screen::Help);
+                        app.disconnect().await;
                     }
                     3 => {
+                        app.go_to_screen(Screen::Help);
+                    }
+                    4 => {
                         app.should_quit = true;
                     }
                     _ => {}
@@ -409,6 +433,60 @@ async fn handle_watch_keys(app: &mut App, key: KeyEvent) -> anyhow::Result<()> {
         KeyCode::Char('x') => {
             if !app.watch_active {
                 if let Err(e) = app.start_watch().await {
+                    app.set_error(&e);
+                }
+            }
+        }
+        KeyCode::Char('s') => {
+            if app.watch_active {
+                app.stop_watch();
+            }
+        }
+        KeyCode::Esc | KeyCode::Char('q') => {
+            // Stop watch when leaving
+            app.stop_watch();
+            app.go_back();
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn handle_org_watch_keys(app: &mut App, key: KeyEvent) -> anyhow::Result<()> {
+    // Poll for new watch events
+    app.poll_watch_events();
+    
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.watch_scroll > 0 {
+                app.watch_scroll -= 1;
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.watch_scroll < app.watch_events.len().saturating_sub(10) {
+                app.watch_scroll += 1;
+            }
+        }
+        KeyCode::PageUp => {
+            app.watch_scroll = app.watch_scroll.saturating_sub(10);
+        }
+        KeyCode::PageDown => {
+            app.watch_scroll = (app.watch_scroll + 10).min(app.watch_events.len().saturating_sub(10));
+        }
+        KeyCode::Home | KeyCode::Char('g') => {
+            app.watch_scroll = 0;
+        }
+        KeyCode::End | KeyCode::Char('G') => {
+            app.watch_scroll = app.watch_events.len().saturating_sub(10);
+        }
+        KeyCode::Enter | KeyCode::Char('e') | KeyCode::Char('i') => {
+            if !app.watch_active {
+                app.input_mode = InputMode::Editing;
+            }
+        }
+        KeyCode::Char('x') => {
+            if !app.watch_active {
+                if let Err(e) = app.start_org_watch().await {
                     app.set_error(&e);
                 }
             }

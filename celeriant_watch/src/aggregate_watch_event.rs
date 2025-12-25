@@ -24,6 +24,7 @@ pub enum AggregateWatchEventOperation {
         keep_from_event_batch_index: u64,
     },
     Exists {},
+    Create {},
 }
 
 impl AggregateWatchEvent {
@@ -32,6 +33,7 @@ impl AggregateWatchEvent {
     pub const READ: u8 = 2;
     pub const TRIM_START: u8 = 3;
     pub const EXISTS: u8 = 4;
+    pub const CREATE: u8 = 5;
 
     pub fn operation_as_u8(&self) -> u8 {
         match self.operation {
@@ -40,6 +42,7 @@ impl AggregateWatchEvent {
             AggregateWatchEventOperation::Read { .. } => Self::READ,
             AggregateWatchEventOperation::TrimStart { .. } => Self::TRIM_START,
             AggregateWatchEventOperation::Exists { .. } => Self::EXISTS,
+            AggregateWatchEventOperation::Create { .. } => Self::CREATE,
         }
     }
 
@@ -54,7 +57,9 @@ impl AggregateWatchEvent {
             .or_default();
 
         match self.operation {
-            AggregateWatchEventOperation::Delete {} | AggregateWatchEventOperation::Exists {} => {
+            AggregateWatchEventOperation::Delete {}
+            | AggregateWatchEventOperation::Exists {}
+            | AggregateWatchEventOperation::Create {} => {
                 events_map.insert(operation_key, None);
             }
             AggregateWatchEventOperation::Write {

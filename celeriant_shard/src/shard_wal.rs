@@ -21,7 +21,7 @@ use celeriant_rotating_log::rotating_log_cache::RotatingLogCache;
 use celeriant_rotating_log::rotating_log_error::RotatingLogError;
 use celeriant_rotating_log::shard_log_dma_file::ShardLogDmaFile;
 use celeriant_wal::aggregate_key::AggregateKey;
-use celeriant_wal::constants::{FIXED_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_METABLOCK};
+use celeriant_wal::constants::{FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_METABLOCK};
 use celeriant_wal::datablocks::datablock::Datablock;
 use celeriant_wal::datablocks::datablock_aggregate_event_batch::DatablockAggregateEventBatch;
 use celeriant_wal::datablocks::datablock_kind::DatablockKind;
@@ -623,6 +623,16 @@ fn add_write_event(
         });
 }
 
+/// Records a create event for an aggregate.
+fn add_create_event(
+    create_events: &mut HashMap<AggregateKey, AggregateWatchEventOperation>,
+    aggregate_key: AggregateKey,
+) {
+    create_events
+        .entry(aggregate_key)
+        .or_insert(AggregateWatchEventOperation::Create {});
+}
+
 async fn sync_with_rollback(
     rotating_log_cache: Rc<RotatingLogCache>,
     shard_mem_cache: Rc<RefCell<ShardMemCache>>,
@@ -705,11 +715,19 @@ async fn sync_with_rollback(
             // Transform the queue into recent writes and broadcast events
             let mut write_events: HashMap<AggregateKey, AggregateWatchEventOperation> =
                 HashMap::new();
+            let mut create_events: HashMap<AggregateKey, AggregateWatchEventOperation> =
+                HashMap::new();
             for queue_item in pending_append_queue {
                 match &queue_item.metablock.wal_metablock_type {
                     MetablockKind::EventBatchMetadata(event_batch_metadata) => {
+                        
                         // Build watched_aggregates events
                         add_write_event(&mut write_events, event_batch_metadata);
+
+                        // If first event batch for aggregate, add create event
+                        if event_batch_metadata.event_batch_index == FIRST_EVENT_BATCH_INDEX {
+                            add_create_event(&mut create_events, event_batch_metadata.aggregate_key.clone());
+                        }
 
                         let size_bytes = ((queue_item.metablock.deep_size_of()
                             + queue_item.datablock.deep_size_of())
@@ -728,6 +746,13 @@ async fn sync_with_rollback(
                 }
             }
 
+            for (aggregate_key, operation) in create_events {
+                watched_aggregates.broadcast(AggregateWatchEvent {
+                    aggregate_key,
+                    operation,
+                });
+            }
+            
             for (aggregate_key, operation) in write_events {
                 watched_aggregates.broadcast(AggregateWatchEvent {
                     aggregate_key: aggregate_key.clone(),

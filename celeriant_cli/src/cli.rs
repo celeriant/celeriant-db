@@ -179,24 +179,6 @@ pub struct WriteArgs {
 }
 
 #[derive(Args, Clone)]
-pub struct PrependArgs {
-    #[command(flatten)]
-    pub key: AggregateKeyArgs,
-
-    /// JSON file containing batches to prepend
-    #[arg(long)]
-    pub file: PathBuf,
-
-    /// Allow creating the aggregate if it doesn't exist
-    #[arg(long)]
-    pub allow_create: bool,
-
-    /// Compression type
-    #[arg(long, value_enum, default_value = "none")]
-    pub compression: CompressionArg,
-}
-
-#[derive(Args, Clone)]
 pub struct TrimArgs {
     #[command(flatten)]
     pub key: AggregateKeyArgs,

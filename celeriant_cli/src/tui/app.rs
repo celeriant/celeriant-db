@@ -11,8 +11,7 @@ use celeriant_msg::{
     },
 };
 use celeriant_wal::{
-    aggregate_key::AggregateKey,
-    compression_type::CompressionType, datablocks::datablock_aggregate_event::DatablockAggregateEvent,
+    aggregate_key::AggregateKey, aggregate_type_key::AggregateTypeKey, compression_type::CompressionType, datablocks::datablock_aggregate_event::DatablockAggregateEvent
 };
 use directories::ProjectDirs;
 
@@ -28,6 +27,7 @@ pub enum Screen {
     WriteEvent,
     TrimStart,
     Watch, 
+    OrgWatch,
     Help,
 }
 
@@ -97,6 +97,12 @@ pub struct App {
     pub watch_scroll: usize,
     pub watch_receiver: Option<tokio::sync::mpsc::UnboundedReceiver<WatchUpdate>>,
     pub watch_cancel: Option<tokio::sync::oneshot::Sender<()>>,
+    
+    // Org Watch state
+    pub org_watch_org_id: String,
+    pub org_watch_aggregate_types: String,
+    pub org_watch_event_types: String,
+    pub org_watch_latency_ms: String,
 }
 
 #[derive(Debug)]
@@ -185,6 +191,12 @@ impl App {
             watch_scroll: 0,
             watch_receiver: None,
             watch_cancel: None,
+            
+            // Org Watch state
+            org_watch_org_id: "1".to_string(),
+            org_watch_aggregate_types: String::new(),
+            org_watch_event_types: "1".to_string(),
+            org_watch_latency_ms: "100".to_string(),
         }
     }
     
@@ -510,6 +522,7 @@ impl App {
         if self.is_connected() {
             vec![
                 ("Enter Aggregate", "Go directly to an aggregate by ID"),
+                ("Organisation Watch", "Watch events across an organisation"),
                 ("Disconnect", "Disconnect from server"),
                 ("Help", "Show keyboard shortcuts"),
                 ("Quit", "Exit the application"),
@@ -658,6 +671,97 @@ impl App {
         ]
     }
 
+    pub fn setup_org_watch_fields(&mut self) {
+        self.input_fields = vec![
+            InputField::with_value("Organisation ID", &self.org_watch_org_id),
+            InputField::with_value("Aggregate Types (comma-separated, optional)", &self.org_watch_aggregate_types),
+            InputField::with_value("Event Types (0-5, comma-separated)", &self.org_watch_event_types),
+            InputField::with_value("Latency (ms)", &self.org_watch_latency_ms),
+        ];
+        self.input_field_index = 0;
+        self.watch_events.clear();
+        self.watch_scroll = 0;
+    }
+
+    pub async fn start_org_watch(&mut self) -> Result<(), String> {
+        if self.watch_active {
+            return Err("Watch already active".to_string());
+        }
+        
+        // Parse org ID
+        let org_id: u128 = self.org_watch_org_id.parse()
+            .map_err(|_| "Invalid Organisation ID")?;
+        
+        // Parse aggregate types (optional)
+        let aggregate_types: Option<HashSet<AggregateTypeKey>> = {
+            if self.org_watch_aggregate_types.trim().is_empty() {
+                None
+            } else {
+                let types: HashSet<AggregateTypeKey> = self.org_watch_aggregate_types
+                    .split(',')
+                    .filter_map(|s| s.trim().parse::<u128>().ok())
+                    .map(|t| AggregateTypeKey::new(org_id, t))
+                    .collect();
+                if types.is_empty() { None } else { Some(types) }
+            }
+        };
+        
+        // Parse event types
+        let event_types: Option<HashSet<u8>> = {
+            let types: HashSet<u8> = self.org_watch_event_types
+                .split(',')
+                .filter_map(|s| s.trim().parse::<u8>().ok())
+                .filter(|&t| t <= 5)
+                .collect();
+            if types.is_empty() { None } else { Some(types) }
+        };
+        
+        let latency_ms: Option<u64> = if self.org_watch_latency_ms.is_empty() {
+            None
+        } else {
+            Some(self.org_watch_latency_ms.parse().map_err(|_| "Invalid latency")?)
+        };
+        
+        let server_address = self.server_address.clone();
+        
+        // Create channels
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        
+        self.watch_receiver = Some(rx);
+        self.watch_cancel = Some(cancel_tx);
+        self.watch_active = true;
+        self.watch_events.clear();
+        self.watch_events.push(format!("Starting organisation watch..."));
+        self.watch_events.push(format!("Organisation: {}", org_id));
+        if let Some(ref types) = aggregate_types {
+            self.watch_events.push(format!("Aggregate types: {:?}", types.iter().map(|t| t.aggregate_type_id).collect::<Vec<_>>()));
+        } else {
+            self.watch_events.push("Aggregate types: all".to_string());
+        }
+        self.watch_events.push(format!("Event types: {:?}", event_types));
+        self.watch_events.push(String::new());
+        
+        let mut orgs = HashSet::new();
+        orgs.insert(org_id);
+        
+        // Spawn the watch task
+        tokio::spawn(async move {
+            org_watch_task(
+                server_address,
+                orgs,
+                aggregate_types,
+                event_types,
+                latency_ms,
+                tx,
+                cancel_rx,
+            ).await;
+        });
+        
+        self.set_status("Organisation watch started");
+        Ok(())
+    }
+
 }
 
 async fn watch_task(
@@ -726,7 +830,111 @@ async fn watch_task(
                                         2 => "READ",
                                         3 => "TRIM_START",
                                         4 => "EXISTS",
-                                        5 => "PREPEND_BATCHES",
+                                        5 => "CREATE",
+                                        _ => "UNKNOWN",
+                                    };
+                                    
+                                    lines.push(format!("  Event: {} ({})", event_type_name, event_type));
+                                    
+                                    if let Some(event) = maybe_event {
+                                        if let Some(from) = event.from_event_batch_index {
+                                            lines.push(format!("    From batch: {}", from));
+                                        }
+                                        if let Some(to) = event.to_event_batch_index {
+                                            lines.push(format!("    To batch: {}", to));
+                                        }
+                                        if let Some(keep_from) = event.keep_from_event_batch_index {
+                                            lines.push(format!("    Keep from batch: {}", keep_from));
+                                        }
+                                    }
+                                }
+                                lines.push(String::new());
+                            }
+                            let _ = tx.send(WatchUpdate::Event(lines));
+                        }
+                    }
+                    Ok(Response::GenericError(e)) => {
+                        let _ = tx.send(WatchUpdate::Error(format!("{}: {}", e.error_code, e.error_message)));
+                        break;
+                    }
+                    Ok(_) => {
+                        let _ = tx.send(WatchUpdate::Error("Unexpected response type".to_string()));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(WatchUpdate::Error(format!("Request error: {}", e)));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    
+    let _ = tx.send(WatchUpdate::Disconnected);
+}
+
+async fn org_watch_task(
+    server_address: String,
+    orgs: HashSet<u128>,
+    aggregate_types: Option<HashSet<AggregateTypeKey>>,
+    event_types: Option<HashSet<u8>>,
+    latency_ms: Option<u64>,
+    tx: tokio::sync::mpsc::UnboundedSender<WatchUpdate>,
+    mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
+) {
+    use celeriant_client_tokio::celeriant_client::CeleriantClient;
+    use celeriant_msg::process_requests::Request;
+    use celeriant_msg::process_responses::Response;
+    use celeriant_msg::request::requests::WatchRequest;
+    use celeriant_wal::compression_type::CompressionType;
+    
+    // Connect to server
+    let mut client = match CeleriantClient::connect(&server_address).await {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx.send(WatchUpdate::Error(format!("Connection failed: {}", e)));
+            return;
+        }
+    };
+    
+    let request = Request::Watch(WatchRequest {
+        operation_types: event_types,
+        correlation_id: None,
+        requested_latency_ms: latency_ms,
+        orgs: Some(orgs),
+        aggregate_types,
+        aggregates: None,
+    });
+    
+    let _ = tx.send(WatchUpdate::Event(vec!["Sending watch request...".to_string()]));
+    
+    loop {
+        tokio::select! {
+            _ = &mut cancel_rx => {
+                let _ = tx.send(WatchUpdate::Event(vec!["Watch cancelled by user".to_string()]));
+                break;
+            }
+            result = client.send_request(&request, CompressionType::None) => {
+                match result {
+                    Ok(Response::Watch(watch_response)) => {
+                        if watch_response.events.is_none() {
+                            let _ = tx.send(WatchUpdate::Heartbeat);
+                        } else if let Some(events_by_aggregate) = watch_response.events {
+                            let mut lines = Vec::new();
+                            
+                            for (aggregate_key, events_by_type) in events_by_aggregate {
+                                lines.push(format!("━━━ Org: {} | Type: {} | Agg: {} ━━━", 
+                                    aggregate_key.org_id,
+                                    aggregate_key.aggregate_type_id, 
+                                    aggregate_key.aggregate_id));
+                                
+                                for (event_type, maybe_event) in events_by_type {
+                                    let event_type_name = match event_type {
+                                        0 => "DELETE",
+                                        1 => "WRITE",
+                                        2 => "READ",
+                                        3 => "TRIM_START",
+                                        4 => "EXISTS",
+                                        5 => "CREATE",
                                         _ => "UNKNOWN",
                                     };
                                     

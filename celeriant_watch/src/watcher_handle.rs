@@ -25,23 +25,22 @@ impl WatcherHandle {
         }
 
         let key = &event.aggregate_key;
-        
-        // If all filters are None, match everything
-        // If any filter is Some and matches, notify
-        // If filters exist but none match, skip
-        let has_any_filter = self.orgs.is_some() || 
-                             self.aggregate_types.is_some() || 
-                             self.aggregates.is_some();
 
-        if has_any_filter {
-            let matches = self.orgs.as_ref().is_some_and(|s| s.contains(&key.org_id)) ||
-                          self.aggregates.as_ref().is_some_and(|s| s.contains(key)) ||
-                          self.aggregate_types.as_ref().is_some_and(|s| 
-                              s.contains(&AggregateTypeKey::new(key.org_id, key.aggregate_type_id)));
-            
-            if !matches {
-                return true;
-            }
+        // AND across filter categories:
+        // - if a filter is None => it does not restrict matching
+        // - if a filter is Some(set) => the event must match that set (OR within the set)
+        if self.orgs.as_ref().is_some_and(|s| !s.contains(&key.org_id)) {
+            return true;
+        }
+
+        if self.aggregates.as_ref().is_some_and(|s| !s.contains(key)) {
+            return true;
+        }
+
+        if self.aggregate_types.as_ref().is_some_and(|s| {
+            !s.contains(&AggregateTypeKey::new(key.org_id, key.aggregate_type_id))
+        }) {
+            return true;
         }
 
         self.local_sender_channel.try_send(event.clone()).is_ok()
