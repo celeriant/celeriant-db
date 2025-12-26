@@ -1207,3 +1207,566 @@ mod edge_case_tests {
         handle.join().unwrap();
     }
 }
+
+// ============================================================================
+// read_datablocks_carry_over_bytes Tests
+// ============================================================================
+
+#[cfg(test)]
+mod datablocks_carry_over_tests {
+    use super::*;
+
+    #[test]
+    fn test_carry_over_bytes_when_aligned() {
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
+            .spawn(|| async move {
+                let (_tempdir, shard_dir) = create_test_dir();
+                let preallocate_bytes = 64 * 1024;
+
+                let dma_file = ShardLogDmaFile::open_or_create(&shard_dir, preallocate_bytes, 1)
+                    .await
+                    .unwrap();
+
+                // Initial datablocks_position is aligned (file_len - FIXED_BLOCK_SIZE_BYTES)
+                // which is 64*1024 - 512 = 65024, divisible by 512
+                let result = dma_file.read_datablocks_carry_over_bytes().await.unwrap();
+                assert!(result.is_none(), "Expected None when datablocks_position is aligned");
+
+                if let Some(file) = dma_file.dma_file {
+                    file.close().await.unwrap();
+                }
+            })
+            .unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_carry_over_bytes_when_unaligned() {
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
+            .spawn(|| async move {
+                let (_tempdir, shard_dir) = create_test_dir();
+                let preallocate_bytes = 64 * 1024;
+
+                let mut dma_file = ShardLogDmaFile::open_or_create(&shard_dir, preallocate_bytes, 1)
+                    .await
+                    .unwrap();
+
+                // Simulate a write that leaves datablocks_position unaligned
+                // Move it back by 100 bytes (not aligned to 512)
+                let unaligned_pos = dma_file.shard_log_header.datablocks_position - 100;
+                dma_file
+                    .write_new_headers_and_fsync(
+                        unaligned_pos,
+                        dma_file.shard_log_header.metablocks_position,
+                        1,
+                    )
+                    .await
+                    .unwrap();
+
+                let result = dma_file.read_datablocks_carry_over_bytes().await.unwrap();
+                assert!(result.is_some(), "Expected Some when datablocks_position is unaligned");
+
+                let carry_over = result.unwrap();
+                // The carry-over size should be align_up(unaligned_pos) - unaligned_pos
+                // align_up rounds up to next 512 boundary
+                let expected_size = (FIXED_BLOCK_SIZE_BYTES - (unaligned_pos as usize % FIXED_BLOCK_SIZE_BYTES)) % FIXED_BLOCK_SIZE_BYTES;
+                // Actually: align_up(x) - x when x is not aligned
+                // If unaligned_pos = 65024 - 100 = 64924
+                // 64924 % 512 = 412, so align_up = 64924 + (512 - 412) = 64924 + 100 = 65024
+                // carry_over_size = 65024 - 64924 = 100
+                assert_eq!(carry_over.len(), 100);
+
+                if let Some(file) = dma_file.dma_file {
+                    file.close().await.unwrap();
+                }
+            })
+            .unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_carry_over_bytes_various_alignments() {
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
+            .spawn(|| async move {
+
+                for offset in [0, 1, 50, 255, 511] {
+                    let (_tempdir, shard_dir) = create_test_dir();
+                    let preallocate_bytes = 64 * 1024;
+
+                    let mut dma_file = ShardLogDmaFile::open_or_create(&shard_dir, preallocate_bytes, 1)
+                        .await
+                        .unwrap();
+
+                    let unaligned_pos = dma_file.shard_log_header.datablocks_position - offset;
+                    dma_file
+                        .write_new_headers_and_fsync(
+                            unaligned_pos,
+                            dma_file.shard_log_header.metablocks_position,
+                            1,
+                        )
+                        .await
+                        .unwrap();
+
+                    let result = dma_file.read_datablocks_carry_over_bytes().await.unwrap();
+                    if offset == 0 {
+                        assert!(result.is_none());
+                    } else {
+                        assert!(result.is_some());
+                        assert_eq!(result.unwrap().len(), offset as usize);
+                    }
+
+                    if let Some(file) = dma_file.dma_file {
+                        file.close().await.unwrap();
+                    }
+                }
+            })
+            .unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_carry_over_bytes_no_file_handle_errors() {
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
+            .spawn(|| async move {
+                let (_tempdir, shard_dir) = create_test_dir();
+                let preallocate_bytes = 64 * 1024;
+
+                let mut dma_file = ShardLogDmaFile::open_or_create(&shard_dir, preallocate_bytes, 1)
+                    .await
+                    .unwrap();
+
+                // Take the file handle
+                let taken = dma_file.dma_file.take();
+
+                let result = dma_file.read_datablocks_carry_over_bytes().await;
+                assert!(result.is_err());
+
+                if let Some(file) = taken {
+                    file.close().await.unwrap();
+                }
+            })
+            .unwrap();
+        handle.join().unwrap();
+    }
+}
+
+// ============================================================================
+// Active File Reader Tests
+// ============================================================================
+
+#[cfg(test)]
+mod active_file_reader_tests {
+    use super::*;
+
+    #[test]
+    fn test_concurrent_read_and_write_on_active_file() {
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
+            .spawn(|| async move {
+                let (_tempdir, shard_dir) = create_test_dir();
+                let preallocate_bytes = 64 * 1024;
+
+                let cache = RotatingLogCache::new(shard_dir.clone(), preallocate_bytes, 2)
+                    .await
+                    .unwrap();
+
+                let active_log_id = cache.active_log_id();
+
+                // Acquire write lock on active file
+                let active = cache.active();
+                let write_guard = active.write().await.unwrap();
+
+                // While holding write lock, get reader for same log_id
+                // This should succeed because get() returns active_file_reader (separate fd)
+                let reader = cache.get(active_log_id).await.unwrap();
+                let read_guard = reader.read().await.unwrap();
+
+                // Both should refer to the same log
+                assert_eq!(write_guard.log_id, read_guard.log_id);
+                assert_eq!(write_guard.log_id, active_log_id);
+
+                // Verify they have the same header state
+                assert_eq!(
+                    write_guard.shard_log_header.metablocks_position,
+                    read_guard.shard_log_header.metablocks_position
+                );
+
+                drop(read_guard);
+                drop(write_guard);
+
+                cache.close().await.unwrap();
+            })
+            .unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_multiple_readers_while_writer_holds_lock() {
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
+            .spawn(|| async move {
+                let (_tempdir, shard_dir) = create_test_dir();
+                let preallocate_bytes = 64 * 1024;
+
+                let cache = RotatingLogCache::new(shard_dir.clone(), preallocate_bytes, 2)
+                    .await
+                    .unwrap();
+
+                let active_log_id = cache.active_log_id();
+
+                // Writer acquires exclusive lock
+                let active = cache.active();
+                let write_guard = active.write().await.unwrap();
+
+                // Multiple readers can still access via get()
+                let reader1 = cache.get(active_log_id).await.unwrap();
+                let reader2 = cache.get(active_log_id).await.unwrap();
+
+                // Both readers should be the same Rc (active_file_reader)
+                assert!(std::rc::Rc::ptr_eq(&reader1, &reader2));
+
+                // Both can acquire read locks concurrently
+                let read_guard1 = reader1.read().await.unwrap();
+                let read_guard2 = reader2.read().await.unwrap();
+
+                assert_eq!(read_guard1.log_id, active_log_id);
+                assert_eq!(read_guard2.log_id, active_log_id);
+
+                drop(read_guard1);
+                drop(read_guard2);
+                drop(write_guard);
+
+                cache.close().await.unwrap();
+            })
+            .unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_active_returns_writer_not_reader() {
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
+            .spawn(|| async move {
+                let (_tempdir, shard_dir) = create_test_dir();
+                let preallocate_bytes = 64 * 1024;
+
+                let cache = RotatingLogCache::new(shard_dir.clone(), preallocate_bytes, 2)
+                    .await
+                    .unwrap();
+
+                let active_log_id = cache.active_log_id();
+
+                let active = cache.active();
+                let reader = cache.get(active_log_id).await.unwrap();
+
+                // active() and get() should return different Rc instances
+                assert!(!std::rc::Rc::ptr_eq(&active, &reader));
+
+                cache.close().await.unwrap();
+            })
+            .unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_reader_updated_after_rotation() {
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
+            .spawn(|| async move {
+                let (_tempdir, shard_dir) = create_test_dir();
+                let preallocate_bytes = 64 * 1024;
+
+                let cache = RotatingLogCache::new(shard_dir.clone(), preallocate_bytes, 2)
+                    .await
+                    .unwrap();
+
+                let initial_log_id = cache.active_log_id();
+                assert_eq!(initial_log_id, 1);
+
+                // Perform rotation
+                {
+                    let previous = {
+                        let active = cache.active();
+                        let mut guard = active.write().await.unwrap();
+                        guard
+                            .rotate_to_next_log(&shard_dir, preallocate_bytes)
+                            .await
+                            .unwrap()
+                    };
+                    cache.rotate_to_next_log(previous.log_id + 1, previous).await.unwrap();
+                }
+
+                let new_log_id = cache.active_log_id();
+                assert_eq!(new_log_id, 2);
+
+                // Getting the new active log_id should return updated reader
+                let reader = cache.get(new_log_id).await.unwrap();
+                let guard = reader.read().await.unwrap();
+                assert_eq!(guard.log_id, 2);
+                drop(guard);
+
+                // Old log should be accessible from cache (not the reader)
+                let old_log = cache.get(1).await.unwrap();
+                let guard = old_log.read().await.unwrap();
+                assert_eq!(guard.log_id, 1);
+                drop(guard);
+
+                cache.close().await.unwrap();
+            })
+            .unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_concurrent_rotation_and_read() {
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
+            .spawn(|| async move {
+                let (_tempdir, shard_dir) = create_test_dir();
+                let preallocate_bytes = 64 * 1024;
+
+                let cache = std::rc::Rc::new(
+                    RotatingLogCache::new(shard_dir.clone(), preallocate_bytes, 2)
+                        .await
+                        .unwrap(),
+                );
+
+                // Reader task that continuously reads active file
+                let cache_reader = cache.clone();
+                let reader_task = glommio::spawn_local(async move {
+                    for _ in 0..20 {
+                        let log_id = cache_reader.active_log_id();
+                        let reader = cache_reader.get(log_id).await.unwrap();
+                        let guard = reader.read().await.unwrap();
+                        // Just access some data
+                        let _pos = guard.shard_log_header.metablocks_position;
+                        drop(guard);
+                        glommio::timer::sleep(std::time::Duration::from_micros(50)).await;
+                    }
+                });
+
+                // Writer task that rotates files
+                let cache_writer = cache.clone();
+                let shard_dir_clone = shard_dir.clone();
+                let writer_task = glommio::spawn_local(async move {
+                    for _ in 0..5 {
+                        let previous = {
+                            let active = cache_writer.active();
+                            let mut guard = active.write().await.unwrap();
+                            guard
+                                .rotate_to_next_log(&shard_dir_clone, preallocate_bytes)
+                                .await
+                                .unwrap()
+                        };
+                        let next_log_id = cache_writer.active_log_id() + 1;
+                        cache_writer.rotate_to_next_log(next_log_id, previous).await.unwrap();
+                        glommio::timer::sleep(std::time::Duration::from_micros(200)).await;
+                    }
+                });
+
+                reader_task.await;
+                writer_task.await;
+
+                // Final state should be log_6
+                assert_eq!(cache.active_log_id(), 6);
+
+                cache.close().await.unwrap();
+            })
+            .unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_reader_header_state_independent_of_writer() {
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
+            .spawn(|| async move {
+                let (_tempdir, shard_dir) = create_test_dir();
+                let preallocate_bytes = 64 * 1024;
+
+                let cache = RotatingLogCache::new(shard_dir.clone(), preallocate_bytes, 2)
+                    .await
+                    .unwrap();
+
+                let active_log_id = cache.active_log_id();
+
+                // Get initial reader state
+                let reader = cache.get(active_log_id).await.unwrap();
+                let initial_meta_pos = {
+                    let guard = reader.read().await.unwrap();
+                    guard.shard_log_header.metablocks_position
+                };
+
+                // Writer updates header
+                {
+                    let active = cache.active();
+                    let mut guard = active.write().await.unwrap();
+                    let datablocks_position = guard.shard_log_header.datablocks_position;
+                    let new_meta_pos = guard.shard_log_header.metablocks_position + FIXED_BLOCK_SIZE_BYTES as u64;
+                    guard
+                        .write_new_headers_and_fsync(
+                            datablocks_position,
+                            new_meta_pos,
+                            1,
+                        )
+                        .await
+                        .unwrap();
+                }
+
+                // Reader's in-memory header is not automatically updated
+                // (it's a separate ShardLogDmaFile instance with its own header copy)
+                let reader_meta_pos = {
+                    let guard = reader.read().await.unwrap();
+                    guard.shard_log_header.metablocks_position
+                };
+
+                // The reader still has the old header value
+                // This is expected - it's a snapshot at dup time
+                assert_eq!(reader_meta_pos, initial_meta_pos);
+
+                cache.close().await.unwrap();
+            })
+            .unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_close_closes_both_writer_and_reader() {
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
+            .spawn(|| async move {
+                let (_tempdir, shard_dir) = create_test_dir();
+                let preallocate_bytes = 64 * 1024;
+
+                let cache = RotatingLogCache::new(shard_dir.clone(), preallocate_bytes, 2)
+                    .await
+                    .unwrap();
+
+                let active_log_id = cache.active_log_id();
+
+                // Get references before close
+                let reader = cache.get(active_log_id).await.unwrap();
+                let active = cache.active();
+
+                // Close should close both
+                cache.close().await.unwrap();
+
+                // After close, the dma_file should be None
+                {
+                    let guard = active.read().await.unwrap();
+                    assert!(guard.dma_file.is_none());
+                }
+                {
+                    let guard = reader.read().await.unwrap();
+                    assert!(guard.dma_file.is_none());
+                }
+            })
+            .unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_reader_for_non_active_log_uses_cache() {
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
+            .spawn(|| async move {
+                let (_tempdir, shard_dir) = create_test_dir();
+                let preallocate_bytes = 64 * 1024;
+
+                let cache = RotatingLogCache::new(shard_dir.clone(), preallocate_bytes, 2)
+                    .await
+                    .unwrap();
+
+                // Rotate to create log_2
+                {
+                    let previous = {
+                        let active = cache.active();
+                        let mut guard = active.write().await.unwrap();
+                        guard
+                            .rotate_to_next_log(&shard_dir, preallocate_bytes)
+                            .await
+                            .unwrap()
+                    };
+                    cache.rotate_to_next_log(previous.log_id + 1, previous).await.unwrap();
+                }
+
+                assert_eq!(cache.active_log_id(), 2);
+
+                // Get log_1 - should come from cache, not active_file_reader
+                let log1_first = cache.get(1).await.unwrap();
+                let log1_second = cache.get(1).await.unwrap();
+
+                // Should be same Rc from LRU cache
+                assert!(std::rc::Rc::ptr_eq(&log1_first, &log1_second));
+
+                // And different from active_file_reader
+                let reader = cache.get(2).await.unwrap();
+                assert!(!std::rc::Rc::ptr_eq(&log1_first, &reader));
+
+                cache.close().await.unwrap();
+            })
+            .unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_active_log_id_lockfree_access() {
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
+            .spawn(|| async move {
+                let (_tempdir, shard_dir) = create_test_dir();
+                let preallocate_bytes = 64 * 1024;
+
+                let cache = RotatingLogCache::new(shard_dir.clone(), preallocate_bytes, 2)
+                    .await
+                    .unwrap();
+
+                // Hold write lock on active file
+                let active = cache.active();
+                {
+                    let _write_guard = active.write().await.unwrap();
+
+                    // active_log_id() should still work without blocking
+                    let log_id = cache.active_log_id();
+                    assert_eq!(log_id, 1);
+                }
+
+                cache.close().await.unwrap();
+            })
+            .unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_multiple_rotations_reader_always_current() {
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
+            .spawn(|| async move {
+                let (_tempdir, shard_dir) = create_test_dir();
+                let preallocate_bytes = 64 * 1024;
+
+                let cache = RotatingLogCache::new(shard_dir.clone(), preallocate_bytes, 2)
+                    .await
+                    .unwrap();
+
+                for expected_id in 2..=5 {
+                    // Rotate
+                    {
+                        let previous = {
+                            let active = cache.active();
+                            let mut guard = active.write().await.unwrap();
+                            guard
+                                .rotate_to_next_log(&shard_dir, preallocate_bytes)
+                                .await
+                                .unwrap()
+                        };
+                        
+                        cache.rotate_to_next_log(cache.active_log_id() + 1, previous).await.unwrap();
+                    }
+
+                    // Verify reader is updated
+                    let current_log_id = cache.active_log_id();
+                    assert_eq!(current_log_id, expected_id);
+
+                    let reader = cache.get(current_log_id).await.unwrap();
+                    let guard = reader.read().await.unwrap();
+                    assert_eq!(guard.log_id, expected_id);
+                    drop(guard);
+                }
+
+                cache.close().await.unwrap();
+            })
+            .unwrap();
+        handle.join().unwrap();
+    }
+}
