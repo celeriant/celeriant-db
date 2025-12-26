@@ -21,6 +21,7 @@ use celeriant_rotating_log::rotating_log_cache::RotatingLogCache;
 use celeriant_rotating_log::rotating_log_error::RotatingLogError;
 use celeriant_rotating_log::rwlock_timeout::{read_with_timeout, write_with_timeout};
 use celeriant_rotating_log::shard_log_dma_file::ShardLogDmaFile;
+use celeriant_wal::aggregate_client_key::AggregateClientKey;
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::constants::{FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_METABLOCK};
 use celeriant_wal::datablocks::datablock::Datablock;
@@ -46,6 +47,7 @@ use crate::error::shard_fsync_error::ShardFsyncError;
 use crate::error::shard_read_error::ShardReadError;
 use crate::error::shard_write_error::ShardWriteError;
 use crate::in_memory_filtering::{apply_event_filters, trim_end_if_exceeds_max_bytes};
+use crate::loading_coordinator::LoadingCoordinator;
 
 /// Write-ahead log for a single shard.
 ///
@@ -75,6 +77,12 @@ pub struct ShardWal {
     bloom_filter_cache: Rc<BloomFilterCache>,
 
     config: InternalShardConfig,
+
+    /// Serializes concurrent aggregate snapshot loading from disk
+    aggregate_loading: LoadingCoordinator<AggregateKey>,
+
+    /// Serializes concurrent client event index loading from disk
+    client_loading: LoadingCoordinator<AggregateClientKey>,
 }
 
 impl AggregateReader for ShardWal {
@@ -149,6 +157,8 @@ impl ShardWal {
             watched_aggregates: Rc::new(AggregateWatchers::new()),
             bloom_filter_cache: Rc::new(BloomFilterCache::new()),
             config,
+            aggregate_loading: LoadingCoordinator::new(),
+            client_loading: LoadingCoordinator::new(),
         })
     }
 
@@ -207,7 +217,7 @@ impl ShardWal {
                 self.move_aggregate_client_to_memcache(aggregate_key, write_request.client_id).await?;
             }
 
-            wal_index = wal_index.saturating_sub(1);
+            wal_index = wal_index.saturating_add(1);
 
             // Validate and prepare - reads from memcache but does not mutate
             let prepared = self.validate_and_prepare_write(
@@ -433,33 +443,102 @@ impl ShardWal {
     }
 
     async fn move_aggregate_client_to_memcache(&self, aggregate_key: &AggregateKey, client_id: u128) -> Result<(), ShardWriteError> {
-        let in_cache = self.shard_mem_cache.borrow_mut().get_client_event_index(aggregate_key, client_id).is_some();
-        
-        //TODO: Need a RwLock at per-aggregate-client level to avoid a multiple writers for same aggregate storming herd
-        if !in_cache {
-            if let Some(last_client_event_index) = self.load_aggregate_client_from_disk(aggregate_key, client_id).await? {
-                self.shard_mem_cache.borrow_mut().put_aggregate_client_into_cache(aggregate_key.clone(), client_id, last_client_event_index);
+        // Fast path: check if we've already loaded this client
+        {
+            let (is_loaded, _) = self.shard_mem_cache.borrow_mut().client_load_status(aggregate_key, client_id);
+            if is_loaded {
+                return Ok(());
             }
         }
+
+        // Serialize concurrent loaders for this aggregate+client
+        let key = AggregateClientKey::new(aggregate_key.clone(), client_id);
+        let load_lock = self.client_loading.acquire(&key);
+        let _guard = load_lock.write().await
+            .map_err(|e| ShardWriteError::IoError(format!("{:?}", e)))?;
+
+        // Re-check after acquiring lock
+        {
+            let (is_loaded, _) = self.shard_mem_cache.borrow_mut().client_load_status(aggregate_key, client_id);
+            if is_loaded {
+                drop(_guard);
+                drop(load_lock);
+                self.client_loading.release(&key);
+                return Ok(());
+            }
+        }
+
+        // Load from disk
+        let result = self.load_aggregate_client_from_disk(aggregate_key, client_id).await;
+
+        // Release lock before processing result
+        drop(_guard);
+        drop(load_lock);
+        self.client_loading.release(&key);
+
+        // Cache result - use 0 as "not found" sentinel
+        let index_to_cache = result?.unwrap_or(0);
+        self.shard_mem_cache.borrow_mut().put_aggregate_client_into_cache(
+            aggregate_key.clone(), client_id, index_to_cache
+        );
+
         Ok(())
     }
 
-    /// Load aggregate snapshot from disk into memcache if not already present.
-    /// Optionally search for the provided client, for idempotency tracking.
     async fn move_aggregate_to_memcache(&self, aggregate_key: &AggregateKey, client_id: Option<u128>) -> Result<bool, ShardWriteError> {
-        // Check cache without holding borrow across await
-        let in_cache = self.shard_mem_cache.borrow().aggregate_snapshot_in_cache(aggregate_key);
-        
-        //TODO: Need a RwLock at per-aggregate level to avoid a multiple writers for same aggregate storming herd
-        if !in_cache {
-            if let (Some(snapshot), last_client_event_index) = self.load_aggregate_snapshot_from_disk(aggregate_key, client_id).await? {
-                self.shard_mem_cache.borrow_mut().put_aggregate_into_cache(aggregate_key.clone(), snapshot, client_id, last_client_event_index);
-                return Ok(true);
-            } else {
-                return Ok(false);
+        // Fast path: check if we've already loaded this aggregate
+        {
+            let (is_loaded, exists) = self.shard_mem_cache.borrow().aggregate_load_status(aggregate_key);
+            if is_loaded {
+                return Ok(exists);
             }
         }
-        Ok(true)
+
+        // Serialize concurrent loaders for this aggregate
+        let load_lock = self.aggregate_loading.acquire(aggregate_key);
+        let _guard = load_lock.write().await
+            .map_err(|e| ShardWriteError::IoError(format!("{:?}", e)))?;
+
+        // Re-check after acquiring lock
+        {
+            let (is_loaded, exists) = self.shard_mem_cache.borrow().aggregate_load_status(aggregate_key);
+            if is_loaded {
+                drop(_guard);
+                drop(load_lock);
+                self.aggregate_loading.release(aggregate_key);
+                return Ok(exists);
+            }
+        }
+
+        // Load from disk
+        let result = self.load_aggregate_snapshot_from_disk(aggregate_key, client_id).await;
+
+        // Release lock before processing result
+        drop(_guard);
+        drop(load_lock);
+        self.aggregate_loading.release(aggregate_key);
+
+        match result? {
+            (Some(snapshot), last_client_event_index) => {
+                self.shard_mem_cache.borrow_mut().put_aggregate_into_cache(
+                    aggregate_key.clone(), snapshot, client_id, last_client_event_index
+                );
+                Ok(true)
+            }
+            (None, _) => {
+                // Cache "not found" marker (zero indexes) to prevent repeated disk scans
+                self.shard_mem_cache.borrow_mut().put_aggregate_into_cache(
+                    aggregate_key.clone(),
+                    MemSnapshotAggregate {
+                        event_index: 0,
+                        event_batch_index: 0,
+                    },
+                    None,
+                    None,
+                );
+                Ok(false)
+            },
+        }
     }
 
     /// Validate a write request and prepare all data for appending.

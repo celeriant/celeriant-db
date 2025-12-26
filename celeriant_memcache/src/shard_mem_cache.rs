@@ -64,6 +64,47 @@ pub struct ShardMemCache {
 
 impl ShardMemCache {
 
+    /// Returns (is_loaded, last_client_event_index)
+    /// - is_loaded: true if we've already checked disk for this aggregate+client
+    /// - last_client_event_index: Some(idx) if client has written, None if not found
+    pub fn client_load_status(&mut self, aggregate_key: &AggregateKey, client_id: u128) -> (bool, Option<u64>) {
+        // Check queue first
+        if let Some(queue_pos) = self.aggregate_queue_positions.get(aggregate_key) {
+            if let Some(&idx) = queue_pos.client_event_indexes.get(&client_id) {
+                return (true, Some(idx));
+            }
+        }
+
+        // Check LRU cache
+        let client_key = AggregateClientKey::new(aggregate_key.clone(), client_id);
+        if let Some(&idx) = self.aggregate_client_snapshots.peek(&client_key) {
+            // 0 is sentinel for "checked but client never wrote"
+            let result = if idx == 0 { None } else { Some(idx) };
+            return (true, result);
+        }
+        
+        (false, None)
+    }
+
+    /// Returns (is_loaded, exists)
+    /// - is_loaded: true if we've already checked disk for this aggregate  
+    /// - exists: true if the aggregate has actual data (on disk or in queue)
+    pub fn aggregate_load_status(&self, aggregate_key: &AggregateKey) -> (bool, bool) {
+        // Check if in queue (being created/modified)
+        if self.aggregate_queue_positions.contains_key(aggregate_key) {
+            return (true, true);
+        }
+        
+        // Check if in snapshots cache
+        if let Some(snapshot) = self.aggregate_snapshots.peek(aggregate_key) {
+            // event_batch_index > 0 means real data exists on disk
+            let exists = snapshot.event_batch_index > 0;
+            return (true, exists);
+        }
+        
+        (false, false)
+    }
+
     pub fn get_wal_index(&mut self) -> u64 {
         if let Some(wal_index) = self.queue_wal_index {
             return wal_index;
@@ -363,7 +404,10 @@ impl ShardMemCache {
 
         // Fall back to file LRU (peek to avoid promoting on read)
         let client_key = AggregateClientKey::new(aggregate_key.clone(), client_id);
-        self.aggregate_client_snapshots.get(&client_key).copied()
+        self.aggregate_client_snapshots
+            .get(&client_key)
+            .copied()
+            .filter(|&idx| idx > 0)  // 0 is sentinel for "checked but not found"
     }
 
     /// Get the latest batch and event index for an aggregate
