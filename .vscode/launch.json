@@ -16,7 +16,7 @@
                     "kind": "bin"
                 }
             },
-            "args": ["--listen-address", "0.0.0.0:10004", "--num-shards", "1"],
+            "args": ["--listen-address", "0.0.0.0:10000", "--num-shards", "1", "--shard-log-preallocate-bytes", "16384"],
             "cwd": "${workspaceFolder}",
             "env": {}
         },

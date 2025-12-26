@@ -24,6 +24,11 @@ pub enum ShardFsyncError {
     SyncFailurePending,
 
     DatablocksCarryOverBufferNotPresent,
+
+    NotEnoughLogFreeSpace {
+        required: u64,
+        available: u64,
+    }
 }
 
 impl From<LockTimeoutError> for ShardFsyncError {

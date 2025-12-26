@@ -174,13 +174,9 @@ mod rotating_log_cache_tests {
                 {
                     let active = cache.active();
                     let mut guard = active.write().await.unwrap();
-                    let previous = guard
-                        .rotate_to_next_log(&shard_dir, preallocate_bytes)
-                        .await
-                        .unwrap();
 
                     // Update cache with new active log
-                    cache.rotate_to_next_log(guard.log_id, previous);
+                    cache.rotate_to_next_log(&mut guard, &shard_dir, preallocate_bytes).await.unwrap();
                 }
 
                 // Verify new active log_id
@@ -224,11 +220,9 @@ mod rotating_log_cache_tests {
                 for _ in 0..4 {
                     let active = cache.active();
                     let mut guard = active.write().await.unwrap();
-                    let previous = guard
-                        .rotate_to_next_log(&shard_dir, preallocate_bytes)
-                        .await
-                        .unwrap();
-                    cache.rotate_to_next_log(guard.log_id, previous);
+
+                    // Update cache with new active log
+                    cache.rotate_to_next_log(&mut guard, &shard_dir, preallocate_bytes).await.unwrap();
                 }
 
                 // Active should now be log_5
@@ -734,11 +728,7 @@ mod integration_tests {
                         .unwrap();
 
                     // Rotate
-                    let previous = guard
-                        .rotate_to_next_log(&shard_dir, preallocate_bytes)
-                        .await
-                        .unwrap();
-                    cache.rotate_to_next_log(guard.log_id, previous);
+                    cache.rotate_to_next_log(&mut guard, &shard_dir, preallocate_bytes).await.unwrap();
 
                     assert_eq!(guard.log_id, expected_log_id);
                 }
@@ -777,11 +767,9 @@ mod integration_tests {
                     for _ in 0..3 {
                         let active = cache.active();
                         let mut guard = active.write().await.unwrap();
-                        let previous = guard
-                            .rotate_to_next_log(&shard_dir, preallocate_bytes)
-                            .await
-                            .unwrap();
-                        cache.rotate_to_next_log(guard.log_id, previous);
+
+                        // Update cache with new active log
+                        cache.rotate_to_next_log(&mut guard, &shard_dir, preallocate_bytes).await.unwrap();
                     }
 
                     cache.close().await.unwrap();
@@ -855,11 +843,9 @@ mod integration_tests {
                     for _ in 0..3 {
                         let active = cache_clone3.active();
                         let mut guard = active.write().await.unwrap();
-                        let previous = guard
-                            .rotate_to_next_log(&shard_dir_clone, preallocate_bytes)
-                            .await
-                            .unwrap();
-                        cache_clone3.rotate_to_next_log(guard.log_id, previous);
+
+                        // Update cache with new active log
+                        cache_clone3.rotate_to_next_log(&mut guard, &shard_dir_clone, preallocate_bytes).await.unwrap();
                         drop(guard);
                         glommio::timer::sleep(std::time::Duration::from_micros(500)).await;
                     }
@@ -948,11 +934,8 @@ mod integration_tests {
                 for _ in 0..5 {
                     let active = cache.active();
                     let mut guard = active.write().await.unwrap();
-                    let previous = guard
-                        .rotate_to_next_log(&shard_dir, preallocate_bytes)
-                        .await
-                        .unwrap();
-                    cache.rotate_to_next_log(guard.log_id, previous);
+                    
+                    cache.rotate_to_next_log(&mut guard, &shard_dir, preallocate_bytes).await.unwrap();
                 }
 
                 // Verify naming: log_{id}.wal
@@ -1481,15 +1464,9 @@ mod active_file_reader_tests {
 
                 // Perform rotation
                 {
-                    let previous = {
-                        let active = cache.active();
-                        let mut guard = active.write().await.unwrap();
-                        guard
-                            .rotate_to_next_log(&shard_dir, preallocate_bytes)
-                            .await
-                            .unwrap()
-                    };
-                    cache.rotate_to_next_log(previous.log_id + 1, previous).await.unwrap();
+                    let active = cache.active();
+                    let mut guard = active.write().await.unwrap();
+                    cache.rotate_to_next_log(&mut guard, &shard_dir, preallocate_bytes).await.unwrap();
                 }
 
                 let new_log_id = cache.active_log_id();
@@ -1545,16 +1522,11 @@ mod active_file_reader_tests {
                 let shard_dir_clone = shard_dir.clone();
                 let writer_task = glommio::spawn_local(async move {
                     for _ in 0..5 {
-                        let previous = {
+                        {
                             let active = cache_writer.active();
                             let mut guard = active.write().await.unwrap();
-                            guard
-                                .rotate_to_next_log(&shard_dir_clone, preallocate_bytes)
-                                .await
-                                .unwrap()
-                        };
-                        let next_log_id = cache_writer.active_log_id() + 1;
-                        cache_writer.rotate_to_next_log(next_log_id, previous).await.unwrap();
+                            cache_writer.rotate_to_next_log(&mut guard, &shard_dir_clone, preallocate_bytes).await.unwrap();
+                        }
                         glommio::timer::sleep(std::time::Duration::from_micros(200)).await;
                     }
                 });
@@ -1671,15 +1643,9 @@ mod active_file_reader_tests {
 
                 // Rotate to create log_2
                 {
-                    let previous = {
-                        let active = cache.active();
-                        let mut guard = active.write().await.unwrap();
-                        guard
-                            .rotate_to_next_log(&shard_dir, preallocate_bytes)
-                            .await
-                            .unwrap()
-                    };
-                    cache.rotate_to_next_log(previous.log_id + 1, previous).await.unwrap();
+                    let active = cache.active();
+                    let mut guard = active.write().await.unwrap();
+                    cache.rotate_to_next_log(&mut guard, &shard_dir, preallocate_bytes).await.unwrap();
                 }
 
                 assert_eq!(cache.active_log_id(), 2);
@@ -1742,16 +1708,9 @@ mod active_file_reader_tests {
                 for expected_id in 2..=5 {
                     // Rotate
                     {
-                        let previous = {
-                            let active = cache.active();
-                            let mut guard = active.write().await.unwrap();
-                            guard
-                                .rotate_to_next_log(&shard_dir, preallocate_bytes)
-                                .await
-                                .unwrap()
-                        };
-                        
-                        cache.rotate_to_next_log(cache.active_log_id() + 1, previous).await.unwrap();
+                        let active = cache.active();
+                        let mut guard = active.write().await.unwrap();
+                        cache.rotate_to_next_log(&mut guard, &shard_dir, preallocate_bytes).await.unwrap();
                     }
 
                     // Verify reader is updated

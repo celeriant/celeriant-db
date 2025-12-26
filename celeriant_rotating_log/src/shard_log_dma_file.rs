@@ -143,6 +143,14 @@ impl ShardLogDmaFile {
 
         Ok(())
     }
+
+    pub fn update_from_writer(&mut self, writer: &Self) {
+        self.file_len = writer.file_len;
+        self.log_id = writer.log_id;
+        self.shard_log_header.datablocks_position = writer.shard_log_header.datablocks_position;
+        self.shard_log_header.metablocks_position = writer.shard_log_header.metablocks_position;
+        self.shard_log_header.wal_index = writer.shard_log_header.wal_index;
+    }
 }
 
 fn log_file_name(log_id: u64) -> String {

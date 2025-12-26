@@ -12,10 +12,10 @@ use celeriant_wal::{
 use tokio::sync::Barrier;
 use tokio::time::Instant;
 
-const NUM_CONNECTIONS: usize = 12*1024; // 28k max source port limit ~25000;
-const TEST_DURATION_SECS: u64 = 30;
-const NUM_AGGREGATES: usize = 1024;
-const USE_MICRO_PAYLOAD: bool = true;
+const NUM_CONNECTIONS: usize = 10; // 28k max source port limit ~25000;
+const TEST_DURATION_SECS: u64 = 230;
+const NUM_AGGREGATES: usize = 10;
+const USE_MICRO_PAYLOAD: bool = false;
 const SERVER_ADDR: &str = "0.0.0.0:10000";
 const CLIENTSIDE_TIMEOUT_S: u64 = 5;
 

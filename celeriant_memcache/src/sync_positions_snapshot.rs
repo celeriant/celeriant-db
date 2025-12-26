@@ -28,7 +28,7 @@ impl SyncPositionsSnapshot {
 
     pub fn has_enough_free_space(&self) -> bool {
         let free_space = self.datablocks_position.saturating_sub(self.metablocks_position);
-        let required_space = self.buffer_size_datablocks().saturating_sub(self.buffer_size_metablocks());
+        let required_space = self.buffer_size_datablocks().saturating_add(self.buffer_size_metablocks());
         free_space.saturating_sub(required_space) > 0
     }
 }

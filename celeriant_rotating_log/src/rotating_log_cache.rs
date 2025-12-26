@@ -8,7 +8,7 @@ use celeriant_wal::constants::FIXED_BLOCK_SIZE_BYTES;
 use glommio::sync::RwLock;
 use lru::LruCache;
 
-use crate::{rotating_log_error::RotatingLogError, rwlock_timeout::write_with_timeout, shard_log_dma_file::ShardLogDmaFile};
+use crate::{rotating_log_error::RotatingLogError, rwlock_timeout::{read_with_timeout, write_with_timeout}, shard_log_dma_file::ShardLogDmaFile};
 
 /// Manages DmaFile handles for a shard with LRU caching.
 ///
@@ -107,16 +107,27 @@ impl RotatingLogCache {
         self.active_file.clone()
     }
 
+    /// Allows writers to get access to the RwLock, to lock it for writing.
+    pub fn active_reader(&self) -> Rc<RwLock<ShardLogDmaFile>> {
+        self.active_file_reader.clone()
+    }
+
     /// Update active log id after rotation.
     /// Caller is responsible for placing the new file in the RwLock.
     /// This is done to allow the caller to control the locking semantics.
     pub async fn rotate_to_next_log(
         &self,
-        new_active_log_id: u64,
-        previous_shard_log_file: ShardLogDmaFile,
+        active_shard_dma_file: &mut ShardLogDmaFile,
+        shard_dir: &PathBuf,
+        preallocate_bytes: u64,
     ) -> Result<(), RotatingLogError> {
+
+        let previous_shard_log_file: ShardLogDmaFile = active_shard_dma_file
+            .rotate_to_next_log(shard_dir, preallocate_bytes)
+            .await?;
+
         // Update active log id (sync Cell operation)
-        self.active_log_id.set(new_active_log_id);
+        self.active_log_id.set(active_shard_dma_file.log_id);
 
         // Push previous file to cache - borrow dropped before any await
         self.lru_cache.borrow_mut().push(
@@ -125,10 +136,7 @@ impl RotatingLogCache {
         );
 
         // Create new reader duplicate from the new active file
-        let new_reader = {
-            let active_guard = self.active_file.read().await?;
-            dup_shard_log_dma_file(&active_guard)?
-        };
+        let new_reader = dup_shard_log_dma_file(&active_shard_dma_file)?;
 
         // Update the reader file, closing the old duplicate first
         let mut reader_guard = write_with_timeout(&self.active_file_reader, "rotate_reader").await?;

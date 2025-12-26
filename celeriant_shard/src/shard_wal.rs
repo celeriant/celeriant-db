@@ -38,6 +38,7 @@ use celeriant_wire::datablock_serialization::serialize_datablock;
 use celeriant_wire::metablock_bytes::{matches_aggregate_key, read_event_batch_client_id, read_event_batch_event_batch_index, read_event_batch_max_client_event_index, read_event_batch_max_event_index};
 use celeriant_wire::version_aware_wire_format::serialize_versioned_message;
 use deepsize::DeepSizeOf;
+use glommio::sync::RwLock;
 
 use crate::amortisation::coordinator::Coordinator;
 use crate::bloom::bloom_filter_cache::BloomFilterCache;
@@ -801,11 +802,9 @@ async fn sync_with_rollback(
     };
 
     let mut sync_positions_snapshot = if !has_enough_free_space {
-        let previous_shard_log_dma_file: ShardLogDmaFile = shard_log_dma_file
-            .rotate_to_next_log(shard_dir.as_ref().unwrap(), preallocate_bytes)
-            .await?;
-        rotating_log_cache
-            .rotate_to_next_log(shard_log_dma_file.log_id, previous_shard_log_dma_file).await?;
+        let shard_dir = shard_dir.as_ref().unwrap();
+
+        rotating_log_cache.rotate_to_next_log(&mut shard_log_dma_file, &shard_dir, preallocate_bytes).await?;
 
         // Can only acquire shard_mem_cache after async operations
         let mut shard_mem_cache = shard_mem_cache.borrow_mut();
@@ -822,7 +821,7 @@ async fn sync_with_rollback(
         sync_positions_snapshot.unwrap()
     };
 
-    match sync(&mut shard_log_dma_file, &mut sync_positions_snapshot).await {
+    match sync(&mut shard_log_dma_file, rotating_log_cache.active_reader(), &mut sync_positions_snapshot).await {
         Ok(_) => {
             let mut shard_mem_cache = shard_mem_cache.borrow_mut();
 
@@ -891,6 +890,7 @@ async fn sync_with_rollback(
 
 async fn sync(
     shard_log_dma_file: &mut ShardLogDmaFile,
+    reader_shard_log_dma_file: Rc<RwLock<ShardLogDmaFile>>,
     sync_positions_snapshot: &mut SyncPositionsSnapshot,
 ) -> Result<(), ShardFsyncError> {
     let dma_file_writer = shard_log_dma_file.dma_file.as_mut();
@@ -902,6 +902,15 @@ async fn sync(
     };
 
     // Write datablocks first so we can get the positions to include into metablocks
+    if !sync_positions_snapshot.has_enough_free_space() {
+        let free_space = sync_positions_snapshot.datablocks_position.saturating_sub(sync_positions_snapshot.metablocks_position);
+        let required_space = sync_positions_snapshot.buffer_size_datablocks().saturating_add(sync_positions_snapshot.buffer_size_metablocks());
+
+        return Err(ShardFsyncError::NotEnoughLogFreeSpace {
+            required: required_space,
+            available: free_space,
+        });
+    }
     let buffer_size_datablocks: u64 = sync_positions_snapshot.buffer_size_datablocks();
 
     let mut datablocks_absolute_write_positions: Vec<u64> =
@@ -952,10 +961,11 @@ async fn sync(
         for item in &sync_positions_snapshot.pending_append_queue {
             if let Some(datablock_bytes) = &item.datablock_bytes {
                 let len = datablock_bytes.len();
+                let start_idx = front_carry_over + position;
+                let end_idx = front_carry_over + position + len;
+                
                 datablocks_absolute_write_positions.push(new_datablocks_position + position as u64);
-                buffer_datablocks_slice
-                    [front_carry_over + position..front_carry_over + position + len]
-                    .copy_from_slice(datablock_bytes);
+                buffer_datablocks_slice[start_idx..end_idx].copy_from_slice(datablock_bytes);
                 position += len;
             }
         }
@@ -986,11 +996,10 @@ async fn sync(
     let mut index = 0;
     let mut new_wal_index = 0;
     for item in &mut sync_positions_snapshot.pending_append_queue {
-        if item.datablock.is_some() {
+        if item.datablock_bytes.is_some() && item.datablock.is_some() {
             match &mut item.metablock.datablock {
                 DatablockStorageKind::Block(datablock_block_ref) => {
-                    datablock_block_ref.datablock_position =
-                        datablocks_absolute_write_positions[index];
+                    datablock_block_ref.datablock_position = datablocks_absolute_write_positions[index];
                 }
                 _ => {}
             }
@@ -1030,6 +1039,13 @@ async fn sync(
             new_wal_index,
         )
         .await?;
+
+    {
+        // Now we are 'committed' we need to update the reader, minimising our write lock duration
+        // Other tasks use to read and we async lock the metadata and the DmaFile together, so async write lock here is unavoidable
+        let mut reader_shard_log_dma_file = write_with_timeout(&reader_shard_log_dma_file, "sync_update_reader").await?;
+        reader_shard_log_dma_file.update_from_writer(&shard_log_dma_file);
+    }
 
     sync_positions_snapshot.datablocks_position = new_datablocks_position;
     sync_positions_snapshot.datablocks_carry_over = datablocks_carry_over;

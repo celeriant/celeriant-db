@@ -296,7 +296,7 @@ impl ShardMemCache {
 
     pub fn has_enough_free_space(&self) -> bool {
         let free_space = self.datablocks_position.saturating_sub(self.metablocks_position);
-        let required_space = self.buffer_size_datablocks().saturating_sub(self.buffer_size_metablocks());
+        let required_space = self.buffer_size_datablocks().saturating_add(self.buffer_size_metablocks());
         free_space.saturating_sub(required_space) > 0
     }
 
@@ -473,4 +473,112 @@ impl ShardMemCache {
 pub struct EventIndexes {
     pub event_batch_index: u64,
     pub event_index: u64,
+}
+
+#[cfg(test)]
+pub mod test_shard_mem_cache {
+    use std::{path::PathBuf, time::Duration};
+
+    use celeriant_wal::{aggregate_key::AggregateKey, constants::FIXED_BLOCK_SIZE_BYTES, datablocks::{datablock::Datablock, datablock_aggregate_event_batch::DatablockAggregateEventBatch, datablock_kind::DatablockKind}, metablocks::{datablock_storage_kind::DatablockStorageKind, metablock::Metablock, metablock_event_batch::{EventTypesKind, MetablockEventBatch}, metablock_kind::MetablockKind}};
+
+    use crate::{internal_shard_config::InternalShardConfig, shard_log_queue_item::ShardLogQueueItem, timestamp_config::{TimestampConfig, TimestampPrecision}};
+
+    fn make_metablock(wal_index: u64, aggregate_key: AggregateKey) -> Metablock {
+        Metablock {
+            wal_index,
+            server_timestamp: 1000,
+            lease_index: 1,
+            node_id: 1,
+            datablock: DatablockStorageKind::None,
+            wal_metablock_type: MetablockKind::EventBatchMetadata(MetablockEventBatch {
+                aggregate_key,
+                event_types_data: EventTypesKind::Direct([0, 0, 0, 0]),
+                event_batch_index: 1,
+                client_id: 1,
+                user_id: None,
+                min_client_event_index: 0,
+                max_client_event_index: 0,
+                min_event_timestamp: 0,
+                max_event_timestamp: 0,
+                min_event_index: 0,
+                max_event_index: 0,
+            }),
+        }
+    }
+
+    fn make_queue_item(datablock_size: Option<usize>) -> ShardLogQueueItem {
+        let datablock_bytes = datablock_size.map(|size| vec![0u8; size]);
+        let datablock = datablock_size.map(|_| Datablock {
+            datablock_kind: DatablockKind::EventBatchItem(DatablockAggregateEventBatch {
+                event_batch_index: 1,
+                events: vec![],
+            }),
+        });
+
+        ShardLogQueueItem {
+            datablock_bytes,
+            datablock,
+            metablock: make_metablock(1, AggregateKey::new(1, 1, 1)),
+        }
+    }
+    
+    fn test_config() -> InternalShardConfig {
+        InternalShardConfig {
+            node_id: 1,
+            max_open_files: 100,
+            shard_log_preallocate_bytes: 1024 * 1024 * 1024, // 1GB
+            fsync_delay: Duration::from_millis(5),
+            recent_write_cache_bytes: 10000,
+            non_durable_writes: false,
+            shard_dir: PathBuf::from("/tmp/test_shard"),
+            max_response_size: 10 * 1024 * 1024,
+            aggregate_snapshots_cache_bytes: 100000 * 112,
+            aggregate_client_snapshots_cache_bytes: 100000 * 128,
+            read_max_chunk_size: 64 * 1024, // 64KB
+            timestamp_config: TimestampConfig {
+                precision: TimestampPrecision::Milliseconds,
+                epoch_offset_secs: 0,
+            },
+        }
+    }
+
+    fn new_cache() -> super::ShardMemCache {
+        let file_len = 1024 * 1024 * 1024; // 1GB
+        let metablocks_position = FIXED_BLOCK_SIZE_BYTES as u64;
+        let datablocks_position = file_len - FIXED_BLOCK_SIZE_BYTES as u64;
+        super::ShardMemCache::new(
+            file_len,
+            metablocks_position,
+            datablocks_position,
+            0,
+            None,
+            test_config(),
+            0,
+        )
+    }
+
+
+    #[test]
+    fn has_enough_free_space_correctly_adds_datablock_and_metablock_sizes() {
+        let mut cache = new_cache();
+        let key = AggregateKey::new(1, 1, 1);
+
+        // Set up positions so free space is limited
+        // For example: free_space = 500 bytes
+        cache.datablocks_position = 1000;
+        cache.metablocks_position = 500;
+        // free_space = 1000 - 500 = 500
+
+        // Add items where metablock size > datablock size
+        // Small datablock (100 bytes) but metablock is FIXED_BLOCK_SIZE_BYTES
+        // If FIXED_BLOCK_SIZE_BYTES is e.g. 256, and we add 2 items:
+        //   datablocks = 200, metablocks = 512
+        //   add: required = 712 > 500 → false (correct)
+        //   sub: required = 0 (saturating) → 500 > 0 → true (wrong!)
+        cache.add_to_pending_append_queue(&key, 1, 1, 100, 1, make_queue_item(Some(100)));
+        cache.add_to_pending_append_queue(&key, 2, 2, 100, 2, make_queue_item(Some(100)));
+
+        // Should return false - not enough space for both data AND metadata
+        assert!(!cache.has_enough_free_space());
+    }
 }

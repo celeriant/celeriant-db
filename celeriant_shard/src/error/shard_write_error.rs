@@ -57,6 +57,9 @@ impl From<ShardFsyncError> for ShardWriteError {
             ShardFsyncError::DatablocksCarryOverBufferNotPresent => {
                 Self::IoError("Datablocks carry-over buffer not present".to_string())
             }
+            ShardFsyncError::NotEnoughLogFreeSpace { required, available } => {
+                Self::IoError(format!("Not enough free log space, required: {required} but available: {available}"))
+            }
         }
     }
 }
