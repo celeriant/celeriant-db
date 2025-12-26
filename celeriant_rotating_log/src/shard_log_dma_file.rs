@@ -130,7 +130,7 @@ impl ShardLogDmaFile {
         };
 
         let mut dma_file = self.dma_file.as_mut()
-            .ok_or(RotatingLogError::IoError("No file handle available to execute write_new_headers_and_fsync".to_string()))?;
+            .ok_or_else(|| RotatingLogError::IoError("No file handle available to execute write_new_headers_and_fsync".to_string()))?;
 
         let header_end_start_pos = self.file_len.saturating_sub(FIXED_BLOCK_SIZE_BYTES as u64);
 

@@ -64,7 +64,7 @@ impl<E: Clone> Coordinator<E> {
                         }
                     },
                     Err(_) => {
-                        match read_with_timeout(&self.lock_orchestrator).await {
+                        match read_with_timeout(&self.lock_orchestrator, "request_sync_read_be_follower").await {
                             Ok(guard) => match guard.as_ref() {
                                 Some(event) => Acquired::Follower(event.clone()),
                                 None => Acquired::Retry,
@@ -78,7 +78,7 @@ impl<E: Clone> Coordinator<E> {
             match acquired {
                 Acquired::Leader(event) => {
                     glommio::timer::sleep(delay).await;
-                    let _ = write_with_timeout(&self.lock_orchestrator).await.map(|mut g| g.take());
+                    let _ = write_with_timeout(&self.lock_orchestrator, "request_sync_write_leader_clear_lock_orchestrator").await.map(|mut g| g.take());
                     self.lock_orchestrator.write().await.unwrap().take();
                     let result = sync_fn().await;
                     event.notify(result.clone());

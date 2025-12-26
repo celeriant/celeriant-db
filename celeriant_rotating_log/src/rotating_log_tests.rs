@@ -98,7 +98,7 @@ mod rotating_log_cache_tests {
     }
 
     #[test]
-    fn test_get_active_file_returns_same_instance() {
+    fn test_get_active_file_returns_reader_instance() {
         let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
             .spawn(|| async move {
                 let (_tempdir, shard_dir) = create_test_dir();
@@ -120,7 +120,9 @@ mod rotating_log_cache_tests {
                 drop(guard);
 
                 let fetched = cache.get(active_log_id).await.unwrap();
-                assert!(std::rc::Rc::ptr_eq(&active1, &fetched));
+                
+                //Should be different Rc
+                assert!(!std::rc::Rc::ptr_eq(&active1, &fetched));
 
                 cache.close().await.unwrap();
             })

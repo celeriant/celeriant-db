@@ -128,7 +128,7 @@ impl ShardWal {
 
         let shard_mem_cache = {
             let active_lock = rotating_log_cache.active();
-            let active_log_file = read_with_timeout(&active_lock).await?;
+            let active_log_file = read_with_timeout(&active_lock, "shard_wal_open_active").await?;
             let datablocks_carry_over = active_log_file.read_datablocks_carry_over_bytes().await?;
 
             ShardMemCache::new(
@@ -435,6 +435,7 @@ impl ShardWal {
     async fn move_aggregate_client_to_memcache(&self, aggregate_key: &AggregateKey, client_id: u128) -> Result<(), ShardWriteError> {
         let in_cache = self.shard_mem_cache.borrow_mut().get_client_event_index(aggregate_key, client_id).is_some();
         
+        //TODO: Need a RwLock at per-aggregate-client level to avoid a multiple writers for same aggregate storming herd
         if !in_cache {
             if let Some(last_client_event_index) = self.load_aggregate_client_from_disk(aggregate_key, client_id).await? {
                 self.shard_mem_cache.borrow_mut().put_aggregate_client_into_cache(aggregate_key.clone(), client_id, last_client_event_index);
@@ -449,6 +450,7 @@ impl ShardWal {
         // Check cache without holding borrow across await
         let in_cache = self.shard_mem_cache.borrow().aggregate_snapshot_in_cache(aggregate_key);
         
+        //TODO: Need a RwLock at per-aggregate level to avoid a multiple writers for same aggregate storming herd
         if !in_cache {
             if let (Some(snapshot), last_client_event_index) = self.load_aggregate_snapshot_from_disk(aggregate_key, client_id).await? {
                 self.shard_mem_cache.borrow_mut().put_aggregate_into_cache(aggregate_key.clone(), snapshot, client_id, last_client_event_index);
@@ -678,7 +680,7 @@ async fn sync_with_rollback(
 ) -> Result<(), ShardFsyncError> {
     // Lock the writer before we take the snapshot of the queue
     let lockable_active_log_file = rotating_log_cache.active();
-    let mut shard_log_dma_file = write_with_timeout(&lockable_active_log_file).await?;
+    let mut shard_log_dma_file = write_with_timeout(&lockable_active_log_file, "sync_with_rollback").await?;
 
     let (
         has_enough_free_space,
@@ -724,7 +726,7 @@ async fn sync_with_rollback(
             .rotate_to_next_log(shard_dir.as_ref().unwrap(), preallocate_bytes)
             .await?;
         rotating_log_cache
-            .rotate_to_next_log(shard_log_dma_file.log_id, previous_shard_log_dma_file);
+            .rotate_to_next_log(shard_log_dma_file.log_id, previous_shard_log_dma_file).await?;
 
         // Can only acquire shard_mem_cache after async operations
         let mut shard_mem_cache = shard_mem_cache.borrow_mut();

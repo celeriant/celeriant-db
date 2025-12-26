@@ -1,4 +1,4 @@
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
@@ -9,13 +9,15 @@ use celeriant_wal::{
     compression_type::CompressionType,
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
 };
+use tokio::sync::Barrier;
 use tokio::time::Instant;
 
-const NUM_CONNECTIONS: usize = 12*1024; // 28k max source port limit ~25000;
-const TEST_DURATION_SECS: u64 = 15;
-const NUM_AGGREGATES: usize = 1024;
+const NUM_CONNECTIONS: usize = 2; // 28k max source port limit ~25000;
+const TEST_DURATION_SECS: u64 = 5;
+const NUM_AGGREGATES: usize = 320;
 const USE_MICRO_PAYLOAD: bool = true;
-const SERVER_ADDR: &str = "0.0.0.0:10000";
+const SERVER_ADDR: &str = "0.0.0.0:10009";
+const CLIENTSIDE_TIMEOUT_S: u64 = 5;
 
 struct TaskStats {
     request_count: u64,
@@ -25,17 +27,77 @@ struct TaskStats {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
+        "Establishing {} connections...",
+        NUM_CONNECTIONS
+    );
+
+    let connect_start = Instant::now();
+
+    // Establish all connections first
+    let mut connection_tasks = Vec::with_capacity(NUM_CONNECTIONS);
+    for connection_id in 0..NUM_CONNECTIONS {
+        let task = tokio::spawn(async move {
+            let client = CeleriantClient::connect_with_timeout(
+                SERVER_ADDR,
+                Some(Duration::from_secs(CLIENTSIDE_TIMEOUT_S)),
+            )
+            .await
+            .map_err(|e| format!("Connection {} error: {}", connection_id, e))?
+            .with_timeout(Duration::from_secs(CLIENTSIDE_TIMEOUT_S));
+            Ok::<_, String>((connection_id, client))
+        });
+        connection_tasks.push(task);
+    }
+
+    // Collect all established connections
+    let mut clients = Vec::with_capacity(NUM_CONNECTIONS);
+    let mut failed_connections = 0;
+    for task in connection_tasks {
+        match task.await {
+            Ok(Ok((connection_id, client))) => {
+                clients.push((connection_id, client));
+            }
+            Ok(Err(e)) => {
+                eprintln!("{}", e);
+                failed_connections += 1;
+            }
+            Err(e) => {
+                eprintln!("Join error: {}", e);
+                failed_connections += 1;
+            }
+        }
+    }
+
+    let connect_duration = connect_start.elapsed();
+    println!(
+        "Established {} connections in {:.2}s ({} failed)",
+        clients.len(),
+        connect_duration.as_secs_f64(),
+        failed_connections
+    );
+
+    if clients.is_empty() {
+        return Err("No connections established".into());
+    }
+
+    // Create a barrier to synchronize all tasks to start at the same time
+    let barrier = Arc::new(Barrier::new(clients.len()));
+
+    println!(
         "Starting benchmark with {} concurrent connections for {} seconds...",
-        NUM_CONNECTIONS, TEST_DURATION_SECS
+        clients.len(),
+        TEST_DURATION_SECS
     );
 
     let start_time = Instant::now();
 
-    // Spawn all tasks
-    let mut tasks = Vec::with_capacity(NUM_CONNECTIONS);
-
-    for connection_id in 0..NUM_CONNECTIONS {
-        let task = tokio::spawn(async move { run_connection_benchmark(connection_id).await });
+    // Spawn benchmark tasks with pre-established connections
+    let mut tasks = Vec::with_capacity(clients.len());
+    for (connection_id, client) in clients {
+        let barrier = Arc::clone(&barrier);
+        let task = tokio::spawn(async move {
+            run_connection_benchmark(connection_id, client, barrier).await
+        });
         tasks.push(task);
     }
 
@@ -88,13 +150,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn run_connection_benchmark(connection_id: usize) -> Result<TaskStats, String> {
-    // Connect to the server
-    let mut client = CeleriantClient::connect_with_timeout(SERVER_ADDR, Some(Duration::from_secs(5)))
-        .await  
-        .map_err(|e| format!("Connection error: {}", e))?
-        .with_timeout(Duration::from_secs(5));
-
+async fn run_connection_benchmark(
+    connection_id: usize,
+    mut client: CeleriantClient,
+    barrier: Arc<Barrier>,
+) -> Result<TaskStats, String> {
     let event_1 = DatablockAggregateEvent {
         client_event_index: 3,
         event_index: 0,
@@ -128,14 +188,25 @@ async fn run_connection_benchmark(connection_id: usize) -> Result<TaskStats, Str
     };
 
     let mut writes = HashMap::new();
-    writes.insert(AggregateKey::new((connection_id % NUM_AGGREGATES) as u128, 3, (connection_id % NUM_AGGREGATES) as u128), SingleAggregateWrite {
-        events: if USE_MICRO_PAYLOAD { vec![event_1] } else { vec![event_1, event_2] },
-        allow_create: true,
-        expected_event_batch_index: None,
-        enforce_client_idempotency: false,
-        compression_type: CompressionType::None,
-    });
-    
+    writes.insert(
+        AggregateKey::new(
+            (connection_id % NUM_AGGREGATES) as u128,
+            3,
+            (connection_id % NUM_AGGREGATES) as u128,
+        ),
+        SingleAggregateWrite {
+            events: if USE_MICRO_PAYLOAD {
+                vec![event_1]
+            } else {
+                vec![event_1, event_2]
+            },
+            allow_create: true,
+            expected_event_batch_index: None,
+            enforce_client_idempotency: false,
+            compression_type: CompressionType::None,
+        },
+    );
+
     let request = Request::Write(WriteRequest {
         correlation_id: None,
         client_id: connection_id as u128,
@@ -145,6 +216,9 @@ async fn run_connection_benchmark(connection_id: usize) -> Result<TaskStats, Str
 
     let mut request_count = 0u64;
     let mut latencies = Vec::new();
+
+    // Wait for all connections to be ready before starting the benchmark
+    barrier.wait().await;
 
     let deadline = Instant::now() + Duration::from_secs(TEST_DURATION_SECS);
 
@@ -159,11 +233,19 @@ async fn run_connection_benchmark(connection_id: usize) -> Result<TaskStats, Str
                 request_count += 1;
             }
             Err(ClientError::CeleriantError(err_resp)) => {
-                eprintln!("Connection {} server error: {} ({})", connection_id, err_resp.error_message, err_resp.error_code);
+                eprintln!(
+                    "Connection {} server error: {} ({})",
+                    connection_id, err_resp.error_message, err_resp.error_code
+                );
             }
             Err(e) => {
-                eprintln!("Connection {} Error: {}", connection_id, e);
-                break; // Exit on connection errors
+                match e {
+                    ClientError::RequestTimeout => eprintln!("Connection {} Timeout: {}", connection_id, e),
+                    _ => {
+                        eprintln!("Connection {} Error: {}", connection_id, e);
+                        break; // Exit on connection errors
+                    },
+                }
             }
         }
     }

@@ -716,7 +716,19 @@ async fn handle_request_and_further_pipelining(
                 shard_data.config.slow_client_timeout,
             )
             .await;
+
+            // TESTING - ZERO WORK
+            // let response = celeriant_msg::process_responses::Response::Write(SuccessResponse{ correlation_id: None });
+            // let _ = write_response_with_timeout(
+            //     &mut tcp_stream,
+            //     &response,
+            //     celeriant_wal::compression_type::CompressionType::None,
+            //     2,
+            //     Duration::from_secs(100),
+            // )
+            // .await;
         }
+
 
         if shard_data.shutdown_requested.get() {
             break;
