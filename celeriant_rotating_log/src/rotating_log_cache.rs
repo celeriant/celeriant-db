@@ -8,7 +8,7 @@ use celeriant_wal::constants::FIXED_BLOCK_SIZE_BYTES;
 use glommio::sync::RwLock;
 use lru::LruCache;
 
-use crate::{rotating_log_error::RotatingLogError, rwlock_timeout::{read_with_timeout, write_with_timeout}, shard_log_dma_file::ShardLogDmaFile};
+use crate::{rotating_log_error::RotatingLogError, rwlock_timeout::write_with_timeout, shard_log_dma_file::ShardLogDmaFile};
 
 /// Manages DmaFile handles for a shard with LRU caching.
 ///

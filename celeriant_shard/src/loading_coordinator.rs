@@ -14,36 +14,20 @@ use glommio::sync::RwLock;
 ///
 /// Locks are created on-demand and cleaned up when no longer referenced.
 /// Not thread-safe—designed for single-threaded async runtimes like glommio.
-///
-/// # Usage Pattern
-///
-/// ```ignore
-/// // 1. Fast path - check cache without lock
-/// if cache.contains(&key) { return Ok(value); }
-///
-/// // 2. Acquire loading lock
-/// let lock = coordinator.acquire(&key);
-/// let _guard = lock.write().await?;
-///
-/// // 3. Re-check cache (another task may have loaded while we waited)
-/// if cache.contains(&key) {
-///     drop(_guard);
-///     drop(lock);
-///     coordinator.release(&key);
-///     return Ok(value);
-/// }
-///
-/// // 4. Load from disk and update cache
-/// let value = load_from_disk(&key).await?;
-/// cache.insert(key.clone(), value);
-///
-/// // 5. Cleanup
-/// drop(_guard);
-/// drop(lock);
-/// coordinator.release(&key);
-/// ```
 pub struct LoadingCoordinator<K> {
     pending: RefCell<HashMap<K, Rc<RwLock<()>>>>,
+}
+
+impl<K: Eq + Hash + Clone> Default for LoadingCoordinator<K> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct LoadingGuard<'a, K: Eq + Hash + Clone> {
+    coordinator: &'a LoadingCoordinator<K>,
+    key: K,
+    lock: Rc<RwLock<()>>,
 }
 
 impl<K: Eq + Hash + Clone> LoadingCoordinator<K> {
@@ -53,32 +37,37 @@ impl<K: Eq + Hash + Clone> LoadingCoordinator<K> {
         }
     }
 
-    /// Get or create a lock for serializing load operations on this key.
-    ///
-    /// Caller must call `release()` after dropping the lock Rc.
-    pub fn acquire(&self, key: &K) -> Rc<RwLock<()>> {
-        self.pending
+    pub fn acquire(&self, key: &K) -> LoadingGuard<'_, K> {
+        let lock = self.pending
             .borrow_mut()
             .entry(key.clone())
             .or_insert_with(|| Rc::new(RwLock::new(())))
-            .clone()
+            .clone();
+        
+        LoadingGuard {
+            coordinator: self,
+            key: key.clone(),
+            lock,
+        }
     }
+}
 
-    /// Attempt to clean up the lock if no other tasks hold references.
-    ///
-    /// Must be called after dropping the Rc from `acquire()`.
-    pub fn release(&self, key: &K) {
-        let mut pending = self.pending.borrow_mut();
-        if let Some(lock) = pending.get(key) {
-            if Rc::strong_count(lock) == 1 {
-                pending.remove(key);
+impl<K: Eq + Hash + Clone> Drop for LoadingGuard<'_, K> {
+    fn drop(&mut self) {
+        let mut pending = self.coordinator.pending.borrow_mut();
+        if let Some(lock) = pending.get(&self.key) {
+            // Count is 2 when only HashMap + this guard hold references
+            // (checked before our Rc drops)
+            if Rc::strong_count(lock) == 2 {
+                pending.remove(&self.key);
             }
         }
     }
 }
 
-impl<K: Eq + Hash + Clone> Default for LoadingCoordinator<K> {
-    fn default() -> Self {
-        Self::new()
+impl<K: Eq + Hash + Clone> std::ops::Deref for LoadingGuard<'_, K> {
+    type Target = RwLock<()>;
+    fn deref(&self) -> &Self::Target {
+        &self.lock
     }
 }

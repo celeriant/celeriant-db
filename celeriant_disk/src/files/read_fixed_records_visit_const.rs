@@ -21,7 +21,7 @@ pub async fn read_fixed_records_visit_const<const N: usize, E>(
     start: u64,
     end: u64,
     chunk_size: u64,
-    on_record: impl FnMut(&[u8; N]) -> Result<bool, E>,
+    on_record: impl FnMut(u64, &[u8; N]) -> Result<bool, E>,
 ) -> Result<usize, ReadVisitError<E>> {
     assert!(N > 0, "record size N must be > 0");
 
@@ -52,7 +52,7 @@ async fn read_forward_aligned<const N: usize, E>(
     start: u64,
     end: u64,
     chunk_size: u64,
-    mut on_record: impl FnMut(&[u8; N]) -> Result<bool, E>,
+    mut on_record: impl FnMut(u64, &[u8; N]) -> Result<bool, E>,
 ) -> Result<usize, ReadVisitError<E>> {
     let n = N as u64;
     let valid_end = start + ((end - start) / n) * n;
@@ -70,8 +70,9 @@ async fn read_forward_aligned<const N: usize, E>(
         };
 
         let (full, _) = chunk.as_chunks::<N>();
-        for rec in full {
-            match on_record(rec) {
+        for (i, rec) in full.iter().enumerate() {
+            let record_pos = pos + (i as u64 * n);
+            match on_record(record_pos, rec) {
                 Ok(true) => {
                     records += 1;
                     return Ok(records); // early exit requested
@@ -94,7 +95,7 @@ async fn read_reverse_aligned<const N: usize, E>(
     start: u64,
     end: u64,
     chunk_size: u64,
-    mut on_record: impl FnMut(&[u8; N]) -> Result<bool, E>,
+    mut on_record: impl FnMut(u64, &[u8; N]) -> Result<bool, E>,
 ) -> Result<usize, ReadVisitError<E>> {
     let n = N as u64;
     let valid_end = start + ((end - start) / n) * n;
@@ -116,8 +117,9 @@ async fn read_reverse_aligned<const N: usize, E>(
         };
 
         let (full, _) = chunk.as_chunks::<N>();
-        for rec in full.iter().rev() {
-            match on_record(rec) {
+        for (i, rec) in full.iter().enumerate().rev() {
+            let record_pos = read_start + (i as u64 * n);
+            match on_record(record_pos, rec) {
                 Ok(true) => {
                     records += 1;
                     return Ok(records); // early exit requested
@@ -167,7 +169,7 @@ mod test_aligned {
                         0,
                         file_len(&file).await,
                         chunk_size,
-                        |rec| {
+                        |_pos, rec| {
                             assert!(rec.iter().all(|&b| b == rec[0]));
                             seen.push(rec[0]);
                             Ok(false)
@@ -203,7 +205,7 @@ mod test_aligned {
                         0,
                         file_len(&file).await,
                         chunk_size,
-                        |rec| {
+                        |_pos, rec| {
                             seen.push(rec[0]);
                             Ok(false)
                         },
@@ -236,13 +238,13 @@ mod test_aligned {
                     let mut forward: Vec<u8> = Vec::new();
                     read_fixed_records_visit_const::<N, ()>(
                         &file, false, 0, end, chunk_size,
-                        |rec| { forward.push(rec[0]); Ok(false) },
+                        |_pos, rec| { forward.push(rec[0]); Ok(false) },
                     ).await.unwrap();
 
                     let mut reverse: Vec<u8> = Vec::new();
                     read_fixed_records_visit_const::<N, ()>(
                         &file, true, 0, end, chunk_size,
-                        |rec| { reverse.push(rec[0]); Ok(false) },
+                        |_pos, rec| { reverse.push(rec[0]); Ok(false) },
                     ).await.unwrap();
 
                     reverse.reverse();
@@ -268,7 +270,7 @@ mod test_aligned {
                 let mut count = 0;
                 let ret = read_fixed_records_visit_const::<N, ()>(
                     &file, false, 0, file_len(&file).await, 65536,
-                    |_| { count += 1; Ok(false) },
+                    |_,_| { count += 1; Ok(false) },
                 ).await.unwrap();
 
                 assert_eq!(ret, record_count);
@@ -294,7 +296,7 @@ mod test_aligned {
                     let mut count = 0;
                     read_fixed_records_visit_const::<N, ()>(
                         &file, reverse, 0, file_len(&file).await, 4096,
-                        |rec| { assert!(rec.iter().all(|&b| b == 0)); count += 1; Ok(false) },
+                        |_pos, rec| { assert!(rec.iter().all(|&b| b == 0)); count += 1; Ok(false) },
                     ).await.unwrap();
                     assert_eq!(count, 1);
                 }
@@ -325,14 +327,14 @@ mod test_aligned {
                 let mut fwd: Vec<u8> = Vec::new();
                 read_fixed_records_visit_const::<N, ()>(
                     &dma, false, 0, file_len(&dma).await, 4096,
-                    |rec| { fwd.push(rec[0]); Ok(false) },
+                    |_pos, rec| { fwd.push(rec[0]); Ok(false) },
                 ).await.unwrap();
                 assert_eq!(fwd, vec![0, 1, 2, 3, 4]);
 
                 let mut rev: Vec<u8> = Vec::new();
                 read_fixed_records_visit_const::<N, ()>(
                     &dma, true, 0, file_len(&dma).await, 4096,
-                    |rec| { rev.push(rec[0]); Ok(false) },
+                    |_pos, rec| { rev.push(rec[0]); Ok(false) },
                 ).await.unwrap();
                 assert_eq!(rev, vec![4, 3, 2, 1, 0]);
             })
@@ -356,14 +358,14 @@ mod test_aligned {
                 let mut fwd: Vec<u8> = Vec::new();
                 read_fixed_records_visit_const::<N, ()>(
                     &file, false, start, file_len(&file).await, 4096,
-                    |rec| { fwd.push(rec[0]); Ok(false) },
+                    |_pos, rec| { fwd.push(rec[0]); Ok(false) },
                 ).await.unwrap();
                 assert_eq!(fwd, vec![5, 6, 7, 8, 9]);
 
                 let mut rev: Vec<u8> = Vec::new();
                 read_fixed_records_visit_const::<N, ()>(
                     &file, true, start, file_len(&file).await, 4096,
-                    |rec| { rev.push(rec[0]); Ok(false) },
+                    |_pos, rec| { rev.push(rec[0]); Ok(false) },
                 ).await.unwrap();
                 assert_eq!(rev, vec![9, 8, 7, 6, 5]);
             })
@@ -385,7 +387,7 @@ mod test_aligned {
                 let mut count = 0;
                 let result = read_fixed_records_visit_const::<N, &str>(
                     &file, false, 0, file_len(&file).await, 4096,
-                    |_| {
+                    |_,_| {
                         count += 1;
                         if count == 3 { Err("stop") } else { Ok(false) }
                     },
@@ -412,7 +414,7 @@ mod test_aligned {
                 let _ = read_fixed_records_visit_const::<N, ()>(
                     &file, false, 0, file_len(&file).await,
                     1500, // not multiple of 1024
-                    |_| Ok(false),
+                    |_,_| Ok(false),
                 ).await;
             })
             .unwrap();
@@ -432,7 +434,7 @@ mod test_aligned {
                 let file = DmaFile::open(&file_path).await.unwrap();
                 let _ = read_fixed_records_visit_const::<N, ()>(
                     &file, false, 100, file_len(&file).await, 4096,
-                    |_| Ok(false),
+                    |_,_| Ok(false),
                 ).await;
             })
             .unwrap();
@@ -452,7 +454,7 @@ mod test_aligned {
                 let file = DmaFile::open(&file_path).await.unwrap();
                 let _ = read_fixed_records_visit_const::<N, ()>(
                     &file, false, 1024, 1024, 4096,
-                    |_| Ok(false),
+                    |_,_| Ok(false),
                 ).await;
             })
             .unwrap();
@@ -474,7 +476,7 @@ mod test_aligned {
                 let mut seen_fwd: Vec<u8> = Vec::new();
                 let count = read_fixed_records_visit_const::<N, ()>(
                     &file, false, 0, file_len(&file).await, 4096,
-                    |rec| {
+                    |_pos, rec| {
                         seen_fwd.push(rec[0]);
                         Ok(seen_fwd.len() >= 5) // return true to stop
                     },
@@ -486,13 +488,62 @@ mod test_aligned {
                 let mut seen_rev: Vec<u8> = Vec::new();
                 let count = read_fixed_records_visit_const::<N, ()>(
                     &file, true, 0, file_len(&file).await, 4096,
-                    |rec| {
+                    |_pos, rec| {
                         seen_rev.push(rec[0]);
                         Ok(seen_rev.len() >= 3)
                     },
                 ).await.unwrap();
                 assert_eq!(count, 3);
                 assert_eq!(seen_rev, vec![9, 8, 7]);
+            })
+            .unwrap();
+        handle.join().unwrap();
+    }
+    
+    /// Verify pos is correct in callback, including with initial offset
+    #[test]
+    fn test_aligned_pos_correctness() {
+        const N: usize = 512;
+        let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
+            .spawn(|| async move {
+                let tmp = tempdir().unwrap();
+                let dir = tmp.path().to_str().unwrap();
+                let (file_path, _) = create_fixed_record_file(dir, N, 20);
+
+                let file = DmaFile::open(&file_path).await.unwrap();
+                let start_offset = (7 * N) as u64; // start at record 7
+                let end = file_len(&file).await;
+
+                // Forward: positions should be start_offset, start_offset + N, ...
+                let mut positions_fwd: Vec<u64> = Vec::new();
+                read_fixed_records_visit_const::<N, ()>(
+                    &file, false, start_offset, end, 4096,
+                    |pos, rec| {
+                        // Verify pos matches expected record value
+                        let expected_record_idx = (pos / N as u64) as u8;
+                        assert_eq!(rec[0], expected_record_idx, "record content mismatch at pos {}", pos);
+                        positions_fwd.push(pos);
+                        Ok(false)
+                    },
+                ).await.unwrap();
+
+                let expected_fwd: Vec<u64> = (7..20).map(|i| (i * N) as u64).collect();
+                assert_eq!(positions_fwd, expected_fwd);
+
+                // Reverse: positions should be (19*N), (18*N), ..., start_offset
+                let mut positions_rev: Vec<u64> = Vec::new();
+                read_fixed_records_visit_const::<N, ()>(
+                    &file, true, start_offset, end, 4096,
+                    |pos, rec| {
+                        let expected_record_idx = (pos / N as u64) as u8;
+                        assert_eq!(rec[0], expected_record_idx, "record content mismatch at pos {}", pos);
+                        positions_rev.push(pos);
+                        Ok(false)
+                    },
+                ).await.unwrap();
+
+                let expected_rev: Vec<u64> = (7..20).rev().map(|i| (i * N) as u64).collect();
+                assert_eq!(positions_rev, expected_rev);
             })
             .unwrap();
         handle.join().unwrap();

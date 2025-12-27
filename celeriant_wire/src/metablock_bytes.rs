@@ -9,10 +9,10 @@ use celeriant_wal::aggregate_key::AggregateKey;
 use crate::version_aware_wire_format::HEADER_SIZE;
 
 /// Discriminant value for MetablockKind::EventBatchMetadata
-pub const DISCRIMINANT_EVENT_BATCH_METADATA: u8 = 0;
+const DISCRIMINANT_EVENT_BATCH_METADATA: u8 = 0;
 
 /// Base offset where MetablockEventBatch payload starts
-pub const EVENT_BATCH_PAYLOAD_OFFSET: usize = 
+const EVENT_BATCH_PAYLOAD_OFFSET: usize = 
     HEADER_SIZE + Metablock::OFFSET_WAL_METABLOCK_TYPE + WIRE_SIZE_ENUM_DISCRIMINANT;
 
 /// Read the MetablockKind discriminant from raw bytes
@@ -28,9 +28,14 @@ pub fn read_wal_index(bytes: &[u8]) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }
 
+#[inline]
+pub fn is_metablock_kind_event_batch_metadata(bytes: &[u8]) -> bool {
+    read_metablock_kind_discriminant(bytes) == DISCRIMINANT_EVENT_BATCH_METADATA
+}
+
 /// Check if this metablock is an EventBatchMetadata for the given aggregate
 #[inline]
-pub fn matches_aggregate_key(bytes: &[u8], target: &AggregateKey) -> bool {
+pub fn is_matches_aggregate_key(bytes: &[u8], target: &AggregateKey) -> bool {
     if read_metablock_kind_discriminant(bytes) != DISCRIMINANT_EVENT_BATCH_METADATA {
         return false;
     }
@@ -42,23 +47,6 @@ pub fn matches_aggregate_key(bytes: &[u8], target: &AggregateKey) -> bool {
     org_id == target.org_id 
         && type_id == target.aggregate_type_id 
         && agg_id == target.aggregate_id
-}
-
-/// Check if metablock matches aggregate and optionally client_id
-#[inline]
-pub fn matches_aggregate_and_client(
-    bytes: &[u8], 
-    target: &AggregateKey, 
-    client_id: Option<u128>,
-) -> bool {
-    if !matches_aggregate_key(bytes, target) {
-        return false;
-    }
-
-    match client_id {
-        Some(cid) => read_event_batch_client_id(bytes) == cid,
-        None => true,
-    }
 }
 
 // --- EventBatch field readers ---
@@ -109,4 +97,8 @@ pub fn read_event_batch_client_id(bytes: &[u8]) -> u128 {
 pub fn read_event_batch_max_client_event_index(bytes: &[u8]) -> u64 {
     let offset = EVENT_BATCH_PAYLOAD_OFFSET + MetablockEventBatch::OFFSET_MAX_CLIENT_EVENT_INDEX;
     read_u64_le(bytes, offset)
+}
+
+pub fn read_event_batch_aggregate_key(bytes: &[u8]) -> AggregateKey {
+    AggregateKey::new(read_event_batch_org_id(bytes), read_event_batch_aggregate_type_id(bytes), read_event_batch_aggregate_id(bytes))
 }

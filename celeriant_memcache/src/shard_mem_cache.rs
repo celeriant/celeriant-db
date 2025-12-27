@@ -1,8 +1,9 @@
 use crate::{
     aggregate_recent_write::AggregateRecentWrites, internal_shard_config::InternalShardConfig, mem_snapshot_aggregate::MemSnapshotAggregate, queue_aggregate_positions::QueueAggregatePositions, recent_write::RecentWrite, shard_log_queue_item::ShardLogQueueItem, sync_positions_snapshot::SyncPositionsSnapshot};
-use celeriant_wal::{aggregate_client_key::AggregateClientKey, aggregate_key::AggregateKey, constants::FIXED_BLOCK_SIZE_BYTES, datablocks::datablock::Datablock, metablocks::metablock::Metablock};
+use celeriant_wal::{aggregate_client_key::AggregateClientKey, aggregate_key::AggregateKey, constants::FIXED_BLOCK_SIZE_BYTES, datablocks::datablock::Datablock, metablock_position::MetablockPosition, metablocks::metablock::Metablock};
 use lru::LruCache;
 use std::{collections::{HashMap, VecDeque}, num::NonZeroUsize, path::PathBuf};
+use std::hash::Hash;
 
 pub struct ShardMemCache {
     config: InternalShardConfig,
@@ -67,19 +68,18 @@ impl ShardMemCache {
     /// Returns (is_loaded, last_client_event_index)
     /// - is_loaded: true if we've already checked disk for this aggregate+client
     /// - last_client_event_index: Some(idx) if client has written, None if not found
-    pub fn client_load_status(&mut self, aggregate_key: &AggregateKey, client_id: u128) -> (bool, Option<u64>) {
+    pub fn aggregate_client_load_status(&mut self, aggregate_key: &AggregateKey, aggregate_client_key: &AggregateClientKey) -> (bool, Option<u64>) {
         // Check queue first
         if let Some(queue_pos) = self.aggregate_queue_positions.get(aggregate_key) {
-            if let Some(&idx) = queue_pos.client_event_indexes.get(&client_id) {
+            if let Some(&idx) = queue_pos.client_event_indexes.get(&aggregate_client_key.client_id) {
                 return (true, Some(idx));
             }
         }
 
         // Check LRU cache
-        let client_key = AggregateClientKey::new(aggregate_key.clone(), client_id);
-        if let Some(&idx) = self.aggregate_client_snapshots.peek(&client_key) {
+        if let Some(&client_event_index) = self.aggregate_client_snapshots.get(&aggregate_client_key) {
             // 0 is sentinel for "checked but client never wrote"
-            let result = if idx == 0 { None } else { Some(idx) };
+            let result = if client_event_index == 0 { None } else { Some(client_event_index) };
             return (true, result);
         }
         
@@ -89,14 +89,14 @@ impl ShardMemCache {
     /// Returns (is_loaded, exists)
     /// - is_loaded: true if we've already checked disk for this aggregate  
     /// - exists: true if the aggregate has actual data (on disk or in queue)
-    pub fn aggregate_load_status(&self, aggregate_key: &AggregateKey) -> (bool, bool) {
+    pub fn aggregate_load_status(&mut self, aggregate_key: &AggregateKey) -> (bool, bool) {
         // Check if in queue (being created/modified)
         if self.aggregate_queue_positions.contains_key(aggregate_key) {
             return (true, true);
         }
         
         // Check if in snapshots cache
-        if let Some(snapshot) = self.aggregate_snapshots.peek(aggregate_key) {
+        if let Some(snapshot) = self.aggregate_snapshots.get(aggregate_key) {
             // event_batch_index > 0 means real data exists on disk
             let exists = snapshot.event_batch_index > 0;
             return (true, exists);
@@ -308,29 +308,48 @@ impl ShardMemCache {
         self.aggregate_queue_positions.clear();
     }
 
-    pub fn put_aggregate_client_into_cache(
+    pub fn is_aggregate_snapshot_full_or_contains(&self, aggregate_key: &AggregateKey) -> bool {
+        if self.aggregate_snapshots.len() == self.aggregate_snapshots.cap().get() {
+            return true;
+        }
+        self.aggregate_snapshots.contains(&aggregate_key)
+    }
+
+    pub fn is_aggregate_client_cache_full_or_contains(&self, aggregate_client_key: &AggregateClientKey) -> bool {
+        if self.aggregate_client_snapshots.len() == self.aggregate_client_snapshots.cap().get() {
+            return true;
+        }
+        self.aggregate_client_snapshots.contains(&aggregate_client_key)
+    }
+
+    pub fn put_aggregate_into_cache_as_not_found(
         &mut self,
         aggregate_key: AggregateKey,
-        client_id: u128,
-        last_client_event_index: u64,
     ) {
-        let client_key = AggregateClientKey::new(aggregate_key, client_id);
-        self.aggregate_client_snapshots.put(client_key, last_client_event_index);
+        let snapshot = MemSnapshotAggregate::not_found();
+        put_with_priority(&mut self.aggregate_snapshots, aggregate_key, snapshot, false);
+    }
+
+    pub fn put_aggregate_client_into_cache(
+        &mut self,
+        aggregate_client_key: AggregateClientKey,
+        last_client_event_index: u64,
+        low_priority: bool,
+    ) {
+        put_with_priority(&mut self.aggregate_client_snapshots, aggregate_client_key, last_client_event_index, low_priority);
     }
 
     pub fn put_aggregate_into_cache(
         &mut self,
         aggregate_key: AggregateKey,
         snapshot: MemSnapshotAggregate,
-        client_id: Option<u128>,
-        last_client_event_index: Option<u64>,
+        client_id: u128,
+        last_client_event_index: u64,
+        low_priority: bool,
     ) {
-        self.aggregate_snapshots.put(aggregate_key.clone(), snapshot);
-
-        if let (Some(client_id), Some(last_client_event_index)) = (client_id, last_client_event_index) {
-            let client_key = AggregateClientKey::new(aggregate_key, client_id);
-            self.aggregate_client_snapshots.put(client_key, last_client_event_index);
-        }
+        let client_key = AggregateClientKey::new(aggregate_key.clone(), client_id);
+        put_with_priority(&mut self.aggregate_client_snapshots, client_key, last_client_event_index, low_priority);
+        put_with_priority(&mut self.aggregate_snapshots, aggregate_key, snapshot, low_priority);
     }
 
     /// Provide the aggregate_queue_positions snapshotted before disk write begun
@@ -363,6 +382,8 @@ impl ShardMemCache {
                 self.aggregate_snapshots.put(
                     key.clone(),
                     MemSnapshotAggregate {
+                        log_id: queue_positions.log_id,
+                        metablock_absolute_pos: queue_positions.metablock_absolute_pos,
                         event_index: queue_positions.event_index,
                         event_batch_index: queue_positions.event_batch_index,
                     },
@@ -408,6 +429,21 @@ impl ShardMemCache {
             .get(&client_key)
             .copied()
             .filter(|&idx| idx > 0)  // 0 is sentinel for "checked but not found"
+    }
+
+    /// The log file and position of the last known written metablock for an aggregate
+    pub fn get_aggregate_last_metablock_pos(&mut self, aggregate_key: &AggregateKey) -> MetablockPosition {
+        if let Some(file_pos) = self.aggregate_snapshots.get(aggregate_key) {
+            return MetablockPosition {
+                log_id: file_pos.log_id,
+                metablock_absolute_pos: file_pos.metablock_absolute_pos,
+            };
+        }
+
+        MetablockPosition {
+            log_id: 0,
+            metablock_absolute_pos: 0,
+        }
     }
 
     /// Get the latest batch and event index for an aggregate
@@ -473,6 +509,26 @@ impl ShardMemCache {
 pub struct EventIndexes {
     pub event_batch_index: u64,
     pub event_index: u64,
+}
+
+/// Inserts into the cache. If `low_priority` is true, only inserts when there's
+/// spare capacity and immediately demotes the entry to LRU position.
+/// Will not change the position if the low priority key already is in the lru
+fn put_with_priority<K, V>(cache: &mut LruCache<K, V>, key: K, value: V, low_priority: bool)
+where
+    K: Hash + Eq + Clone,
+{
+    if low_priority {
+        if cache.contains(&key) {
+            return;
+        }
+        if cache.len() < cache.cap().get() {
+            cache.put(key.clone(), value);
+            cache.demote(&key);
+        }
+    } else {
+        cache.put(key, value);
+    }
 }
 
 #[cfg(test)]

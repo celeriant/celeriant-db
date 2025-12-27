@@ -2,6 +2,8 @@
 
 Low-level disk I/O primitives for Celeriant using Direct Memory Access (DMA). This crate provides alignment-aware file reading optimized for the glommio async runtime.
 
+**README WAS LLM GENERATED AND HUMAN REVIEWED 2025-12-27**
+
 ## Overview
 
 This crate handles the complexities of DMA I/O—alignment requirements, chunked reads, gap skipping—so higher layers can work with simple byte ranges and records.
@@ -76,7 +78,7 @@ pub async fn read_fixed_records_visit_const<const N: usize, E>(
     start: u64,
     end_exclusive: Option<u64>,
     max_chunk_size: u64,
-    mut on_record: impl FnMut(&[u8; N]) -> Result<(), E>,
+    mut on_record: impl FnMut(u64, &[u8; N]) -> Result<(), E>,
 ) -> Result<usize, ReadVisitError<E>>
 ```
 
@@ -95,7 +97,7 @@ let count = read_fixed_records_visit_const::<256, ()>(
     0,           // start offset
     None,        // read to EOF
     64 * 1024,   // 64KB chunks
-    |record| {
+    |pos, record| {
         // Process 256-byte record
         process_record(record)?;
         Ok(())

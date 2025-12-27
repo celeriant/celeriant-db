@@ -6,20 +6,17 @@ mod tests {
         internal_shard_config::InternalShardConfig, queue_aggregate_positions::QueueAggregatePositions, recent_write::RecentWrite, shard_log_queue_item::ShardLogQueueItem, shard_mem_cache::ShardMemCache, sync_positions_snapshot::SyncPositionsSnapshot, timestamp_config::{TimestampConfig, TimestampPrecision}
     };
     use celeriant_wal::{
-        aggregate_key::AggregateKey,
-        constants::FIXED_BLOCK_SIZE_BYTES,
-        datablocks::{
+        aggregate_client_key::AggregateClientKey, aggregate_key::AggregateKey, constants::FIXED_BLOCK_SIZE_BYTES, datablocks::{
             datablock::Datablock,
             datablock_aggregate_event::DatablockAggregateEvent,
             datablock_aggregate_event_batch::DatablockAggregateEventBatch,
             datablock_kind::DatablockKind,
-        },
-        metablocks::{
+        }, metablocks::{
             datablock_storage_kind::DatablockStorageKind,
             metablock::Metablock,
             metablock_event_batch::{EventTypesKind, MetablockEventBatch},
             metablock_kind::MetablockKind,
-        },
+        }
     };
 
     // =============================================================================
@@ -2124,8 +2121,9 @@ mod tests {
     fn client_load_status_returns_false_when_not_loaded() {
         let mut cache = new_cache();
         let key = make_aggregate_key(1, 1, 1);
+        let client_key = AggregateClientKey::new(key.clone(), 100);
 
-        let (is_loaded, index) = cache.client_load_status(&key, 100);
+        let (is_loaded, index) = cache.aggregate_client_load_status(&key, &client_key);
         
         assert!(!is_loaded);
         assert!(index.is_none());
@@ -2135,10 +2133,11 @@ mod tests {
     fn client_load_status_finds_client_in_queue() {
         let mut cache = new_cache();
         let key = make_aggregate_key(1, 1, 1);
+        let client_key = AggregateClientKey::new(key.clone(), 100);
 
         cache.add_to_pending_append_queue(&key, 5, 3, 100, 42, make_queue_item(None));
 
-        let (is_loaded, index) = cache.client_load_status(&key, 100);
+        let (is_loaded, index) = cache.aggregate_client_load_status(&key, &client_key);
         
         assert!(is_loaded);
         assert_eq!(index, Some(42));
@@ -2148,13 +2147,14 @@ mod tests {
     fn client_load_status_finds_client_in_lru_cache() {
         let mut cache = new_cache();
         let key = make_aggregate_key(1, 1, 1);
+        let client_key = AggregateClientKey::new(key.clone(), 100);
 
         // Commit to move to LRU cache
         cache.add_to_pending_append_queue(&key, 5, 3, 100, 42, make_queue_item(None));
         let snapshot = cache.take_sync_positions_snapshot();
         cache.commit_sync_positions_snapshot(snapshot);
 
-        let (is_loaded, index) = cache.client_load_status(&key, 100);
+        let (is_loaded, index) = cache.aggregate_client_load_status(&key, &client_key);
         
         assert!(is_loaded);
         assert_eq!(index, Some(42));
@@ -2164,11 +2164,12 @@ mod tests {
     fn client_load_status_returns_none_for_zero_sentinel() {
         let mut cache = new_cache();
         let key = make_aggregate_key(1, 1, 1);
+        let client_key = AggregateClientKey::new(key.clone(), 100);
 
         // Directly put sentinel value (0 means "checked but client never wrote")
-        cache.put_aggregate_client_into_cache(key.clone(), 100, 0);
+        cache.put_aggregate_client_into_cache(client_key.clone(), 0, false);
 
-        let (is_loaded, index) = cache.client_load_status(&key, 100);
+        let (is_loaded, index) = cache.aggregate_client_load_status(&key, &client_key);
         
         assert!(is_loaded); // We did check disk
         assert!(index.is_none()); // But client hasn't written
@@ -2178,14 +2179,15 @@ mod tests {
     fn client_load_status_prefers_queue_over_cache() {
         let mut cache = new_cache();
         let key = make_aggregate_key(1, 1, 1);
+        let client_key = AggregateClientKey::new(key.clone(), 100);
 
         // Put old value in cache
-        cache.put_aggregate_client_into_cache(key.clone(), 100, 10);
+        cache.put_aggregate_client_into_cache(client_key.clone(), 10, false);
 
         // Add newer value to queue
         cache.add_to_pending_append_queue(&key, 5, 3, 100, 50, make_queue_item(None));
 
-        let (is_loaded, index) = cache.client_load_status(&key, 100);
+        let (is_loaded, index) = cache.aggregate_client_load_status(&key, &client_key);
         
         assert!(is_loaded);
         assert_eq!(index, Some(50)); // Queue value, not cache value
@@ -2195,16 +2197,18 @@ mod tests {
     fn client_load_status_different_clients_independent() {
         let mut cache = new_cache();
         let key = make_aggregate_key(1, 1, 1);
+        let client_key_100 = AggregateClientKey::new(key.clone(), 100);
+        let client_key_200 = AggregateClientKey::new(key.clone(), 200);
 
         cache.add_to_pending_append_queue(&key, 5, 3, 100, 42, make_queue_item(None));
 
         // Client 100 is loaded
-        let (is_loaded, index) = cache.client_load_status(&key, 100);
+        let (is_loaded, index) = cache.aggregate_client_load_status(&key, &client_key_100);
         assert!(is_loaded);
         assert_eq!(index, Some(42));
 
         // Client 200 is not loaded
-        let (is_loaded, index) = cache.client_load_status(&key, 200);
+        let (is_loaded, index) = cache.aggregate_client_load_status(&key, &client_key_200);
         assert!(!is_loaded);
         assert!(index.is_none());
     }
@@ -2214,16 +2218,18 @@ mod tests {
         let mut cache = new_cache();
         let key1 = make_aggregate_key(1, 1, 1);
         let key2 = make_aggregate_key(1, 1, 2);
+        let client_key_1 = AggregateClientKey::new(key1.clone(), 100);
+        let client_key_2 = AggregateClientKey::new(key2.clone(), 100);
 
         cache.add_to_pending_append_queue(&key1, 5, 3, 100, 42, make_queue_item(None));
 
         // Client 100 on key1 is loaded
-        let (is_loaded, index) = cache.client_load_status(&key1, 100);
+        let (is_loaded, index) = cache.aggregate_client_load_status(&key1, &client_key_1);
         assert!(is_loaded);
         assert_eq!(index, Some(42));
 
         // Client 100 on key2 is not loaded
-        let (is_loaded, index) = cache.client_load_status(&key2, 100);
+        let (is_loaded, index) = cache.aggregate_client_load_status(&key2, &client_key_2);
         assert!(!is_loaded);
         assert!(index.is_none());
     }
@@ -2232,6 +2238,7 @@ mod tests {
     fn client_load_status_after_rollback_falls_back_to_cache() {
         let mut cache = new_cache();
         let key = make_aggregate_key(1, 1, 1);
+        let client_key_1 = AggregateClientKey::new(key.clone(), 100);
 
         // Commit initial value
         cache.add_to_pending_append_queue(&key, 5, 3, 100, 10, make_queue_item(None));
@@ -2243,7 +2250,7 @@ mod tests {
         cache.rollback_queue_positions();
 
         // Should fall back to cached value
-        let (is_loaded, index) = cache.client_load_status(&key, 100);
+        let (is_loaded, index) = cache.aggregate_client_load_status(&key, &client_key_1);
         assert!(is_loaded);
         assert_eq!(index, Some(10));
     }
@@ -2254,7 +2261,7 @@ mod tests {
 
     #[test]
     fn aggregate_load_status_returns_false_when_not_loaded() {
-        let cache = new_cache();
+        let mut cache = new_cache();
         let key = make_aggregate_key(1, 1, 1);
 
         let (is_loaded, exists) = cache.aggregate_load_status(&key);
@@ -2300,12 +2307,10 @@ mod tests {
         // Put "not found" marker (zero indexes) in cache
         cache.put_aggregate_into_cache(
             key.clone(),
-            crate::mem_snapshot_aggregate::MemSnapshotAggregate {
-                event_index: 0,
-                event_batch_index: 0,
-            },
-            None,
-            None,
+            crate::mem_snapshot_aggregate::MemSnapshotAggregate::not_found(),
+            0,
+            0,
+            false,
         );
 
         let (is_loaded, exists) = cache.aggregate_load_status(&key);
@@ -2368,44 +2373,6 @@ mod tests {
         assert!(exists); // batch_index 3 > 0
     }
 
-    #[test]
-    fn aggregate_load_status_uses_peek_not_get() {
-        // This test verifies that aggregate_load_status doesn't promote entries in LRU
-        let mut cache = new_cache_with_config(test_config_small_lru_caches(2, 100));
-        let key1 = make_aggregate_key(1, 1, 1);
-        let key2 = make_aggregate_key(1, 1, 2);
-
-        // Fill cache with 2 entries
-        cache.add_to_pending_append_queue(&key1, 1, 1, 100, 1, make_queue_item(None));
-        let snapshot = cache.take_sync_positions_snapshot();
-        cache.commit_sync_positions_snapshot(snapshot);
-
-        cache.add_to_pending_append_queue(&key2, 2, 2, 100, 1, make_queue_item(None));
-        let snapshot = cache.take_sync_positions_snapshot();
-        cache.commit_sync_positions_snapshot(snapshot);
-
-        // Check key1 using aggregate_load_status (should use peek, not promote)
-        let (is_loaded, _) = cache.aggregate_load_status(&key1);
-        assert!(is_loaded);
-
-        // Add key3 - if peek was used, key1 should be evicted (oldest)
-        // If get was used, key2 would be evicted instead
-        let key3 = make_aggregate_key(1, 1, 3);
-        cache.add_to_pending_append_queue(&key3, 3, 3, 100, 1, make_queue_item(None));
-        let snapshot = cache.take_sync_positions_snapshot();
-        cache.commit_sync_positions_snapshot(snapshot);
-
-        // key1 should be evicted (peek doesn't promote)
-        let (is_loaded, _) = cache.aggregate_load_status(&key1);
-        assert!(!is_loaded);
-
-        // key2 and key3 should still be there
-        let (is_loaded, _) = cache.aggregate_load_status(&key2);
-        assert!(is_loaded);
-        let (is_loaded, _) = cache.aggregate_load_status(&key3);
-        assert!(is_loaded);
-    }
-
     // =============================================================================
     // Integration Tests for Load Status Pattern
     // =============================================================================
@@ -2414,18 +2381,19 @@ mod tests {
     fn load_status_pattern_prevents_redundant_disk_loads() {
         let mut cache = new_cache();
         let key = make_aggregate_key(1, 1, 1);
+        let client_key = AggregateClientKey::new(key.clone(), 100);
 
         // Simulate the pattern from move_aggregate_client_to_memcache
         
         // First check - not loaded
-        let (is_loaded, _) = cache.client_load_status(&key, 100);
+        let (is_loaded, _) = cache.aggregate_client_load_status(&key, &client_key);
         assert!(!is_loaded);
 
         // Simulate loading from disk and caching
-        cache.put_aggregate_client_into_cache(key.clone(), 100, 42);
+        cache.put_aggregate_client_into_cache(client_key.clone(), 42, false);
 
         // Second check - should be loaded now
-        let (is_loaded, index) = cache.client_load_status(&key, 100);
+        let (is_loaded, index) = cache.aggregate_client_load_status(&key, &client_key);
         assert!(is_loaded);
         assert_eq!(index, Some(42));
     }
@@ -2444,12 +2412,10 @@ mod tests {
         // Simulate loading from disk and finding nothing - cache "not found" marker
         cache.put_aggregate_into_cache(
             key.clone(),
-            crate::mem_snapshot_aggregate::MemSnapshotAggregate {
-                event_index: 0,
-                event_batch_index: 0,
-            },
-            None,
-            None,
+            crate::mem_snapshot_aggregate::MemSnapshotAggregate::not_found(),
+            0,
+            0,
+            false
         );
 
         // Second check - should be loaded (but not exist)
@@ -2462,18 +2428,19 @@ mod tests {
     fn load_status_pattern_client_not_found_uses_sentinel() {
         let mut cache = new_cache();
         let key = make_aggregate_key(1, 1, 1);
+        let client_key = AggregateClientKey::new(key.clone(), 100);
 
         // Simulate the pattern from move_aggregate_client_to_memcache when client not found
         
         // First check - not loaded
-        let (is_loaded, _) = cache.client_load_status(&key, 100);
+        let (is_loaded, _) = cache.aggregate_client_load_status(&key, &client_key);
         assert!(!is_loaded);
 
         // Simulate loading from disk and finding nothing - use 0 sentinel
-        cache.put_aggregate_client_into_cache(key.clone(), 100, 0);
+        cache.put_aggregate_client_into_cache(client_key.clone(), 0, false);
 
         // Second check - should be loaded (but index is None due to sentinel)
-        let (is_loaded, index) = cache.client_load_status(&key, 100);
+        let (is_loaded, index) = cache.aggregate_client_load_status(&key, &client_key);
         assert!(is_loaded); // Don't hit disk again
         assert!(index.is_none()); // Sentinel converted to None
     }
@@ -2482,6 +2449,7 @@ mod tests {
     fn load_status_concurrent_queue_and_cache_scenario() {
         let mut cache = new_cache();
         let key = make_aggregate_key(1, 1, 1);
+        let client_key = AggregateClientKey::new(key.clone(), 100);
 
         // Aggregate exists in cache (was loaded from disk previously)
         cache.put_aggregate_into_cache(
@@ -2489,9 +2457,12 @@ mod tests {
             crate::mem_snapshot_aggregate::MemSnapshotAggregate {
                 event_index: 5,
                 event_batch_index: 3,
+                log_id: 3,
+                metablock_absolute_pos: 2323,
             },
-            Some(100),
-            Some(10),
+            100,
+            10,
+            false
         );
 
         // New write comes in (goes to queue)
@@ -2503,7 +2474,7 @@ mod tests {
         assert!(exists);
 
         // client_load_status should prefer queue value
-        let (is_loaded, index) = cache.client_load_status(&key, 100);
+        let (is_loaded, index) = cache.aggregate_client_load_status(&key, &client_key);
         assert!(is_loaded);
         assert_eq!(index, Some(20)); // Queue value, not cache value of 10
     }

@@ -1252,7 +1252,7 @@ mod datablocks_carry_over_tests {
                 let carry_over = result.unwrap();
                 // The carry-over size should be align_up(unaligned_pos) - unaligned_pos
                 // align_up rounds up to next 512 boundary
-                let expected_size = (FIXED_BLOCK_SIZE_BYTES - (unaligned_pos as usize % FIXED_BLOCK_SIZE_BYTES)) % FIXED_BLOCK_SIZE_BYTES;
+                let _expected_size = (FIXED_BLOCK_SIZE_BYTES - (unaligned_pos as usize % FIXED_BLOCK_SIZE_BYTES)) % FIXED_BLOCK_SIZE_BYTES;
                 // Actually: align_up(x) - x when x is not aligned
                 // If unaligned_pos = 65024 - 100 = 64924
                 // 64924 % 512 = 412, so align_up = 64924 + (512 - 412) = 64924 + 100 = 65024

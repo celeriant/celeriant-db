@@ -1,3 +1,4 @@
+use celeriant_rotating_log::{rotating_log_error::RotatingLogError, rwlock_timeout::LockTimeoutError};
 use celeriant_wire::wire_format_error::WireFormatError;
 use glommio::GlommioError;
 
@@ -36,6 +37,17 @@ pub enum ShardWriteError {
     AggregateNotExists,
 }
 
+impl From<RotatingLogError> for ShardWriteError {
+    fn from(e: RotatingLogError) -> Self {
+        Self::IoError(e.to_string())
+    }
+}
+
+impl From<LockTimeoutError> for ShardWriteError {
+    fn from(e: LockTimeoutError) -> Self {
+        Self::IoError(e.to_string())
+    }
+}
 
 impl From<ShardFsyncError> for ShardWriteError {
     fn from(e: ShardFsyncError) -> Self {

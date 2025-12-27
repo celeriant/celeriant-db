@@ -9,14 +9,16 @@ pub struct ReverseMetablockScanner<'a> {
     log_cache: &'a RotatingLogCache,
     current_log_id: u64,
     chunk_size: u64,
+    start_from_position: Option<u64>,
 }
 
 impl<'a> ReverseMetablockScanner<'a> {
-    pub fn new(log_cache: &'a RotatingLogCache, starting_log_id: u64, chunk_size: u64) -> Self {
+    pub fn new(log_cache: &'a RotatingLogCache, starting_log_id: u64, start_from_position: Option<u64>, chunk_size: u64) -> Self {
         Self {
             log_cache,
             current_log_id: starting_log_id,
             chunk_size,
+            start_from_position
         }
     }
 
@@ -27,13 +29,17 @@ impl<'a> ReverseMetablockScanner<'a> {
     /// - Err(e) to abort with error
     pub async fn scan<T, E>(
         &mut self,
-        mut visitor: impl FnMut(&[u8; FIXED_BLOCK_SIZE_BYTES]) -> Result<Option<T>, E>,
+        mut visitor: impl FnMut(u64, u64, &[u8; FIXED_BLOCK_SIZE_BYTES]) -> Result<Option<T>, E>,
     ) -> Result<Option<T>, RotatingLogError>
     where
         E: std::fmt::Debug,
     {
+        // Use start_from_position only for the first log, then clear it
+        let mut override_end = self.start_from_position.take();
+
         while self.current_log_id >= 1 {
-            let result = self.scan_single_log(&mut visitor).await?;
+            let result = self.scan_single_log(&mut visitor, override_end).await?;
+            override_end = None; // Only applies to first log
             
             if let Some(found) = result {
                 return Ok(Some(found));
@@ -50,7 +56,8 @@ impl<'a> ReverseMetablockScanner<'a> {
 
     async fn scan_single_log<T, E>(
         &self,
-        visitor: &mut impl FnMut(&[u8; FIXED_BLOCK_SIZE_BYTES]) -> Result<Option<T>, E>,
+        visitor: &mut impl FnMut(u64, u64, &[u8; FIXED_BLOCK_SIZE_BYTES]) -> Result<Option<T>, E>,
+        override_end: Option<u64>,
     ) -> Result<Option<T>, RotatingLogError>
     where
         E: std::fmt::Debug,
@@ -62,7 +69,9 @@ impl<'a> ReverseMetablockScanner<'a> {
         .ok_or_else(|| RotatingLogError::IoError("No file handle".to_string()))?;
     
         let metablocks_start = FIXED_BLOCK_SIZE_BYTES as u64;
-        let metablocks_end = guard.shard_log_header.metablocks_position;
+        let metablocks_end = override_end
+            .unwrap_or(guard.shard_log_header.metablocks_position)
+            .min(guard.shard_log_header.metablocks_position);
 
         if metablocks_end <= metablocks_start {
             return Ok(None); // No metablocks in this log
@@ -76,8 +85,8 @@ impl<'a> ReverseMetablockScanner<'a> {
             metablocks_start,
             metablocks_end,
             self.chunk_size,
-            |block| {
-                match visitor(block) {
+            |pos, block| {
+                match visitor(self.current_log_id, pos, block) {
                     Ok(Some(result)) => {
                         found = Some(result);
                         Ok(true) // stop scanning
