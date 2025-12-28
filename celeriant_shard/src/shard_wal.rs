@@ -6,6 +6,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use celeriant_disk::files::read_objects_absolute;
 use celeriant_memcache::internal_shard_config::InternalShardConfig;
 use celeriant_memcache::mem_snapshot_aggregate::MemSnapshotAggregate;
 use celeriant_memcache::shard_log_queue_item::ShardLogQueueItem;
@@ -27,6 +28,8 @@ use celeriant_wal::constants::{FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, 
 use celeriant_wal::datablocks::datablock::Datablock;
 use celeriant_wal::datablocks::datablock_aggregate_event_batch::DatablockAggregateEventBatch;
 use celeriant_wal::datablocks::datablock_kind::DatablockKind;
+use celeriant_wal::metablocks::datablock_block_ref::DatablockBlockRef;
+use celeriant_wal::metablocks::datablock_inline_data::DatablockInlineData;
 use celeriant_wal::metablocks::datablock_storage_kind::DatablockStorageKind;
 use celeriant_wal::metablocks::metablock::Metablock;
 use celeriant_wal::metablocks::metablock_event_batch::{EventTypesKind, MetablockEventBatch};
@@ -34,7 +37,7 @@ use celeriant_wal::metablocks::metablock_kind::MetablockKind;
 use celeriant_watch::aggregate_reader::AggregateReader;
 use celeriant_watch::aggregate_watch_event::{AggregateWatchEvent, AggregateWatchEventOperation};
 use celeriant_watch::aggregate_watchers::AggregateWatchers;
-use celeriant_wire::datablock_serialization::serialize_datablock;
+use celeriant_wire::datablock_serialization::{self, serialize_datablock};
 use celeriant_wire::metablock_bytes;
 use celeriant_wire::version_aware_wire_format::serialize_versioned_message;
 use deepsize::DeepSizeOf;
@@ -43,11 +46,12 @@ use glommio::sync::RwLock;
 use crate::amortisation::coordinator::Coordinator;
 use crate::bloom::bloom_filter_cache::BloomFilterCache;
 use crate::bloom::event_type_filter::extract_unique_event_types;
+use crate::error::shard_cache_load_error::ShardCacheError;
 use crate::error::shard_error::ShardError;
 use crate::error::shard_fsync_error::ShardFsyncError;
 use crate::error::shard_read_error::ShardReadError;
 use crate::error::shard_write_error::ShardWriteError;
-use crate::in_memory_filtering::{apply_event_filters, trim_end_if_exceeds_max_bytes};
+use crate::in_memory_filtering;
 use crate::loading_coordinator::LoadingCoordinator;
 
 /// Write-ahead log for a single shard.
@@ -93,19 +97,10 @@ impl AggregateReader for ShardWal {
 }
 
 impl ShardWal {
-    pub async fn process_request(
-        &self,
-        lease_index: Option<u64>,
-        request: Request,
-    ) -> Result<Response, ShardError> {
+    pub async fn process_request(&self, lease_index: Option<u64>, request: Request) -> Result<Response, ShardError> {
         match request {
-            Request::Exists(_exists_request) => Err(ShardError::Read(ShardReadError::NotExists)),
-            Request::Read(read_request) => {
-                self.read(&read_request)
-                    .await
-                    .map(Response::Read)
-                    .map_err(ShardError::Read)
-            },
+            Request::Exists(_exists_request) => Err(ShardError::Read(ShardReadError::AggregateNotExists)),
+            Request::Read(read_request) => self.read(&read_request).await.map(Response::Read).map_err(ShardError::Read),
             Request::Write(write_request) => {
                 let lease_index = lease_index.ok_or(ShardWriteError::InvalidLeaseIndex)?;
                 self.write(lease_index, write_request)
@@ -113,10 +108,8 @@ impl ShardWal {
                     .map(Response::Write)
                     .map_err(ShardError::Write)
             }
-            Request::TrimStart(_trim_start_request) => {
-                Err(ShardError::Read(ShardReadError::NotExists))
-            }
-            Request::Delete(_delete_request) => Err(ShardError::Read(ShardReadError::NotExists)),
+            Request::TrimStart(_trim_start_request) => Err(ShardError::Read(ShardReadError::AggregateNotExists)),
+            Request::Delete(_delete_request) => Err(ShardError::Read(ShardReadError::AggregateNotExists)),
             Request::Watch(_) => Err(ShardError::Read(ShardReadError::IoError(
                 "Watch unprocessable via request/response model".to_string(),
             ))),
@@ -175,11 +168,7 @@ impl ShardWal {
     /// # Arguments
     /// * `lease_index` - Current lease for write authorization
     /// * `request` - Write request with events to append
-    pub async fn write(
-        &self,
-        lease_index: u64,
-        write_request: WriteRequest,
-    ) -> Result<SuccessResponse, ShardWriteError> {
+    pub async fn write(&self, lease_index: u64, write_request: WriteRequest) -> Result<SuccessResponse, ShardWriteError> {
         // Make sure we have at least one aggregate to write
         if write_request.writes.is_empty() {
             return Err(ShardWriteError::EmptyEventsList);
@@ -197,20 +186,14 @@ impl ShardWal {
             }
 
             // Validate that no event uses the sentinel 0 event type
-            if let Some(ev) = single_write
-                .events
-                .iter()
-                .find(|e| e.event_type_major == 0)
-            {
+            if let Some(ev) = single_write.events.iter().find(|e| e.event_type_major == 0) {
                 return Err(ShardWriteError::ZeroEventType {
                     client_event_index: ev.client_event_index,
                 });
             }
 
             // Ensure aggregate snapshot is in memcache, loading from disk if necessary
-            if !self.aggregate_exists_and_cache(aggregate_key).await?
-                && !single_write.allow_create
-            {
+            if !self.aggregate_exists_and_cache(aggregate_key).await? && !single_write.allow_create {
                 return Err(ShardWriteError::AggregateNotExists);
             }
 
@@ -232,7 +215,7 @@ impl ShardWal {
                 single_write.clone(),
                 wal_index,
             )?;
-            
+
             prepared_writes.push(prepared);
         }
 
@@ -242,121 +225,126 @@ impl ShardWal {
         // Now we wait on disk write before ack to client
         self.sync_durable(force_durable).await?;
 
-        Ok(SuccessResponse { correlation_id: write_request.correlation_id })
+        Ok(SuccessResponse {
+            correlation_id: write_request.correlation_id,
+        })
     }
 
     /// Read event batches from an aggregate.
     /// Reads from cache when possible, falls back to disk for older batches.
     pub async fn read(&self, request: &ReadRequest) -> Result<ReadResponse, ShardReadError> {
-        let shard_mem_cache = self.shard_mem_cache.borrow();
-
         // Currently read is only served from the recent write cache.
         // We always prioritise the recent write cache, but if the read bounds
         // can't be served due to missing batches, we need to pull them from disk
         // and join it to the already cached data; then return what the client wants
-        // If the recent write cache is not *full* we can opportunistically add the 
+        // If the recent write cache is not *full* we can opportunistically add the
         // data that we got from disk to the recent write cache for that aggregate;
         // but only if the data is contiguous (creates no event batch index gaps!)
         // and we can't just add *all* the read batches, only add in reverse until cache is full
 
-        // Check if aggregate exists
-        if !shard_mem_cache.aggregate_snapshot_in_cache(&request.aggregate_key) {
-            return Err(ShardReadError::NotExists);
-        }
+        let aggregate_key = &request.aggregate_key;
 
-        // Get cached writes starting from the requested batch index
-        let cached_writes = match shard_mem_cache
-            .get_cached_writes_from(&request.aggregate_key, request.filters.from_event_batch_index)
+        // Searches through WAL if not in cache and finds last entry, loads into cache
+        let exists = self.aggregate_exists_and_cache(aggregate_key).await?;
+
+        // We need a mutable ref sometimes as we want to bump the LRU positions
+        // Don't hold this over any async boundaries
+        let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
+
+        // Gets us the log id and metablock absolute pos of last known write
+        let last_known_metablock = shard_mem_cache.get_aggregate_last_metablock_pos(aggregate_key);
+
+        // An iterator to allow us to pull recent writes from cache for filtering.
+        let cached_writes = shard_mem_cache.get_cached_writes_from(&request.aggregate_key, request.filters.from_event_batch_index);
+
+        // given a DatablockAggregateEventBatch, cut down the events inside it based on the filters
+        let mut event_batch = DatablockAggregateEventBatch::default();
+        in_memory_filtering::apply_event_filters(&mut event_batch, &request.filters);
+
+        // Determine if we can skip this entire event batch based on the filters
+        let metablock = Metablock::default_inline_event_batch_metadata(AggregateKey::new(1, 1, 1));
+        let include_batch = in_memory_filtering::is_include_batch(&metablock, &request.filters);
+
+        // Remove from the end of metablocks if we have exceeded max size in bytes. Only removes batches, not events within a batch.
+        let mut metablocks: Vec<Metablock> = vec![];
+        let next_event_batch_index =
+            in_memory_filtering::trim_end_if_exceeds_max_bytes(&mut metablocks, &request.filters, Some(self.config.max_response_size as usize));
+
+        // Data that comes from the datablock region of the WAL
+        let external_data: Option<&[u8]> = None;
+
+        // After we filter batches and applying pagination, we can get the actual datablocks that are not inline in the metablock (larger messages)
         {
-            Some(writes) => writes,
-            None => {
-                return Err(ShardReadError::UnavailableBatchIndex {
-                    requested_event_batch_index: request.filters.from_event_batch_index,
-                    minimum_available_event_batch_index: u64::MAX,
-                });
-            }
-        };
+            let shard_log_file_rwlock = self.rotating_log_cache.get(999).await?;
+            let shard_log_file = read_with_timeout(&shard_log_file_rwlock, "read_objects_absolute").await?;
+            
+            // Set of start_pos->end_pos that allow us to pull byte chunks from a wal segment
+            // These object_positions are forward-ordered in the WAL, not in reverse like ReverseMetablockScanner
+            let object_positions: Vec<read_objects_absolute::AbsoluteObjectPosition> = vec![];
 
-        // Collect writes into a vec for processing
-        let writes: Vec<_> = cached_writes.collect();
-
-        if writes.is_empty() {
-            return Err(ShardReadError::UnavailableBatchIndex {
-                requested_event_batch_index: request.filters.from_event_batch_index,
-                minimum_available_event_batch_index: u64::MAX,
-            });
-        }
-
-        // Check if the first available batch matches what was requested (detect gaps)
-        let first_batch_index = match &writes[0].1.metablock.wal_metablock_type {
-            MetablockKind::EventBatchMetadata(m) => m.event_batch_index,
-            _ => {
-                return Err(ShardReadError::UnavailableBatchIndex {
-                    requested_event_batch_index: request.filters.from_event_batch_index,
-                    minimum_available_event_batch_index: u64::MAX,
-                })
-            }
-        };
-
-        if first_batch_index > request.filters.from_event_batch_index {
-            return Err(ShardReadError::UnavailableBatchIndex {
-                requested_event_batch_index: request.filters.from_event_batch_index,
-                minimum_available_event_batch_index: first_batch_index,
-            });
-        }
-
-        // Extract metablocks for filtering
-        let mut metablocks: Vec<Metablock> = writes
-            .iter()
-            .map(|(_, write)| write.metablock.clone())
-            .collect();
-
-        // Apply batch-level filters and pagination based on max_response_size
-        let next_event_batch_index = trim_end_if_exceeds_max_bytes(
-            &mut metablocks,
-            &request.filters,
-            Some(self.config.max_response_size as usize),
-        )?;
-
-        // Build set of batch indexes that passed filtering
-        let kept_batch_indexes: std::collections::HashSet<u64> = metablocks
-            .iter()
-            .filter_map(|m| match &m.wal_metablock_type {
-                MetablockKind::EventBatchMetadata(meta) => Some(meta.event_batch_index),
-                _ => None,
-            })
-            .collect();
-
-        // Extract and filter event batches
-        let mut event_batches: Vec<AggregateEventBatch> = Vec::new();
-
-        for (_, write) in &writes {
-            let (event_batch_index, client_id, user_id) = match &write.metablock.wal_metablock_type {
-                MetablockKind::EventBatchMetadata(m) => (m.event_batch_index, m.client_id, m.user_id),
-                _ => continue,
+            // On server shutdown the dma_file could be getting cleaned up for each log segment
+            let Some(dma_file) = shard_log_file.dma_file.as_ref() else {
+                return Err(ShardReadError::IoError(format!("DMA file not available for log {}",999)));
             };
 
-            if !kept_batch_indexes.contains(&event_batch_index) {
-                continue;
-            }
-
-            if let Some(datablock) = &write.datablock {
-                if let DatablockKind::EventBatchItem(batch) = &datablock.datablock_kind {
-                    let mut batch_clone = batch.clone();
-                    apply_event_filters(&mut batch_clone, &request.filters);
-                    if !batch_clone.events.is_empty() {
-                        event_batches.push(AggregateEventBatch {
-                            event_batch_index,
-                            client_id,
-                            user_id,
-                            server_timestamp: write.metablock.server_timestamp,
-                            events: batch_clone.events,
-                        });
-                    }
-                }
-            }
+            // Perform the actualy async read from disk
+            let datablock_bytes_blocks: Vec<Vec<u8>> = read_objects_absolute::read_objects_absolute(
+                dma_file,
+                shard_log_file.file_len,
+                &object_positions,
+                self.config.read_max_chunk_size,
+            )
+            .await?;
         }
 
+        // Get back a Datablock (comes from minibatch or external data). Can throw a checksum or deserialisation WireFormatError
+        let datablock_storage_kind = DatablockStorageKind::Inline(DatablockInlineData {
+            minibatch: [0u8; celeriant_wal::constants::MINIBATCH_SIZE_BYTES],
+        });
+        let datablock = datablock_serialization::deserialize_datablock(&datablock_storage_kind, external_data)?;
+
+        // If we have an event batch wal entry, turn it into what we send back to the client. Clones in the events.
+        let maybe_result_batch = AggregateEventBatch::from_wal(&metablock, &datablock);
+
+        // No entries in cache with batch > 0 and not present in any WAL segments
+        let _ = ShardReadError::AggregateNotExists;
+
+        // Max response bytes is so small that we can't send a single batch over the wire
+        let _ = ShardReadError::MaxBytesTooSmall {
+            current_max_bytes: 999,
+            required_max_bytes: 999,
+        };
+
+        // User requested a batch index that we no longer have in the WAL. They should get it somewhere else instead.
+        let _ = ShardReadError::UnavailableBatchIndex {
+            minimum_available: 999,
+            requested: 999,
+        };
+
+        // ReverseMetablockScanner can be used anytime to traverse through the WAL metablocks in reverse order using scan()
+        let mut reverse_metablock_scanner = ReverseMetablockScanner::new(
+            &self.rotating_log_cache,
+            last_known_metablock.log_id,
+            Some(last_known_metablock.metablock_absolute_pos),
+            self.config.read_max_chunk_size,
+        );
+
+        // The actual scan process, with a sync visitor callback. Visitor decids when to terminate by sending Ok(Some(value)) or erroring.
+        let final_result = reverse_metablock_scanner
+            .scan::<bool, ()>(|log_id, absolute_position, metablock_bytes| {
+                // Finish and return a value
+                return Ok(Some(true));
+
+                // Keep searching backwards
+                return Ok(None);
+
+                // Something bad happened (eg. WireFormatError)
+                return Err(());
+            })
+            .await?;
+
+        // What we return to the client
+        let mut event_batches: Vec<AggregateEventBatch> = vec![];
         Ok(ReadResponse {
             correlation_id: request.correlation_id,
             event_batches,
@@ -375,9 +363,12 @@ impl ShardWal {
     }
 
     async fn cache_aggregate_client(&self, aggregate_key: &AggregateKey, aggregate_client_key: &AggregateClientKey) -> Result<(), ShardWriteError> {
-
         // If we are cached already
-        if let (true, _exists) = self.shard_mem_cache.borrow_mut().aggregate_client_load_status(aggregate_key, aggregate_client_key) {
+        if let (true, _exists) = self
+            .shard_mem_cache
+            .borrow_mut()
+            .aggregate_client_load_status(aggregate_key, aggregate_client_key)
+        {
             return Ok(());
         }
 
@@ -386,7 +377,11 @@ impl ShardWal {
         let _ = write_with_timeout(&aggregate_lock, "cache_aggregate_client").await?;
 
         // We have exclusive access now, check if another concurrent task has already done the work
-        if let (true, _exists) = self.shard_mem_cache.borrow_mut().aggregate_client_load_status(aggregate_key, aggregate_client_key) {
+        if let (true, _exists) = self
+            .shard_mem_cache
+            .borrow_mut()
+            .aggregate_client_load_status(aggregate_key, aggregate_client_key)
+        {
             return Ok(());
         }
 
@@ -394,50 +389,51 @@ impl ShardWal {
 
         // Begin the search from the last_known_metablock, moving backwards
         let mut scanner = ReverseMetablockScanner::new(
-            &self.rotating_log_cache, 
+            &self.rotating_log_cache,
             last_known_metablock.log_id,
             Some(last_known_metablock.metablock_absolute_pos.saturating_sub(FIXED_BLOCK_SIZE_BYTES as u64)), //Include SELF
             self.config.read_max_chunk_size,
         );
 
-        let find_result = scanner.scan::<bool, ()>(|_log_id, _metablock_absolute_pos, metablock_bytes| {
-            if !metablock_bytes::is_matches_aggregate_key(metablock_bytes, aggregate_key) {
-                return Ok(None);
-            }
+        let find_result = scanner
+            .scan::<bool, ()>(|_log_id, _metablock_absolute_pos, metablock_bytes| {
+                if !metablock_bytes::is_matches_aggregate_key(metablock_bytes, aggregate_key) {
+                    return Ok(None);
+                }
 
-            let client_id = metablock_bytes::read_event_batch_client_id(metablock_bytes);
-            let low_priority= client_id != aggregate_client_key.client_id;
-            let target_aggregate_client_key = AggregateClientKey::new(aggregate_key.clone(), client_id);
+                let client_id = metablock_bytes::read_event_batch_client_id(metablock_bytes);
+                let low_priority = client_id != aggregate_client_key.client_id;
+                let target_aggregate_client_key = AggregateClientKey::new(aggregate_key.clone(), client_id);
 
-            let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
+                let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
 
-            // Not the aggregate we are searching for. Can we eager cache it? If not, skip it.
-            if low_priority && shard_mem_cache.is_aggregate_client_cache_full_or_contains(&target_aggregate_client_key) {
-                return Ok(None)
-            }
+                // Not the aggregate we are searching for. Can we eager cache it? If not, skip it.
+                if low_priority && shard_mem_cache.is_aggregate_client_cache_full_or_contains(&target_aggregate_client_key) {
+                    return Ok(None);
+                }
 
-            let last_client_event_index = metablock_bytes::read_event_batch_max_client_event_index(metablock_bytes);
+                let last_client_event_index = metablock_bytes::read_event_batch_max_client_event_index(metablock_bytes);
 
-            shard_mem_cache.put_aggregate_client_into_cache(target_aggregate_client_key, last_client_event_index, low_priority);
+                shard_mem_cache.put_aggregate_client_into_cache(target_aggregate_client_key, last_client_event_index, low_priority);
 
-            if low_priority {
-                Ok(None)    //Haven't found aggregate client yet
-            } else {
-                Ok(Some(true)) //Done searching
-            }
-        }).await?;
+                if low_priority {
+                    Ok(None) //Haven't found aggregate client yet
+                } else {
+                    Ok(Some(true)) //Done searching
+                }
+            })
+            .await?;
 
         let found = find_result.unwrap_or(false);
         if !found {
             let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
             shard_mem_cache.put_aggregate_into_cache_as_not_found(aggregate_key.clone());
         }
-        
+
         Ok(())
     }
 
-    async fn aggregate_exists_and_cache(&self, searching_for_aggregate_key: &AggregateKey) -> Result<bool, ShardWriteError> {
-
+    async fn aggregate_exists_and_cache(&self, searching_for_aggregate_key: &AggregateKey) -> Result<bool, ShardCacheError> {
         // If we are cached already
         if let (true, exists) = self.shard_mem_cache.borrow_mut().aggregate_load_status(searching_for_aggregate_key) {
             return Ok(exists);
@@ -454,52 +450,54 @@ impl ShardWal {
 
         // Begin the search from the active log, moving backwards
         let mut scanner = ReverseMetablockScanner::new(
-            &self.rotating_log_cache, 
+            &self.rotating_log_cache,
             self.rotating_log_cache.active_log_id(),
             None,
             self.config.read_max_chunk_size,
         );
 
-        let find_result = scanner.scan::<bool, ()>(|log_id, metablock_absolute_pos, metablock_bytes| {
-            if !metablock_bytes::is_metablock_kind_event_batch_metadata(metablock_bytes) {
-                return Ok(None);
-            }
+        let find_result = scanner
+            .scan::<bool, ()>(|log_id, metablock_absolute_pos, metablock_bytes| {
+                if !metablock_bytes::is_metablock_kind_event_batch_metadata(metablock_bytes) {
+                    return Ok(None);
+                }
 
-            let current_aggregate_key = metablock_bytes::read_event_batch_aggregate_key(metablock_bytes);
-            let low_priority= *searching_for_aggregate_key != current_aggregate_key;
+                let current_aggregate_key = metablock_bytes::read_event_batch_aggregate_key(metablock_bytes);
+                let low_priority = *searching_for_aggregate_key != current_aggregate_key;
 
-            let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
+                let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
 
-            // Not the aggregate we are searching for. Can we eager cache it? If not, skip it.
-            if low_priority && shard_mem_cache.is_aggregate_snapshot_full_or_contains(&current_aggregate_key) {
-                return Ok(None)
-            }
+                // Not the aggregate we are searching for. Can we eager cache it? If not, skip it.
+                if low_priority && shard_mem_cache.is_aggregate_snapshot_full_or_contains(&current_aggregate_key) {
+                    return Ok(None);
+                }
 
-            let snapshot = MemSnapshotAggregate {
-                event_index: metablock_bytes::read_event_batch_max_event_index(metablock_bytes),
-                event_batch_index: metablock_bytes::read_event_batch_event_batch_index(metablock_bytes),
-                log_id,
-                metablock_absolute_pos,
-            };
+                let snapshot = MemSnapshotAggregate {
+                    event_index: metablock_bytes::read_event_batch_max_event_index(metablock_bytes),
+                    event_batch_index: metablock_bytes::read_event_batch_event_batch_index(metablock_bytes),
+                    log_id,
+                    metablock_absolute_pos,
+                };
 
-            let client_id = metablock_bytes::read_event_batch_client_id(metablock_bytes);
-            let last_client_event_index = metablock_bytes::read_event_batch_max_client_event_index(metablock_bytes);
+                let client_id = metablock_bytes::read_event_batch_client_id(metablock_bytes);
+                let last_client_event_index = metablock_bytes::read_event_batch_max_client_event_index(metablock_bytes);
 
-            shard_mem_cache.put_aggregate_into_cache(current_aggregate_key, snapshot, client_id, last_client_event_index, low_priority);
+                shard_mem_cache.put_aggregate_into_cache(current_aggregate_key, snapshot, client_id, last_client_event_index, low_priority);
 
-            if low_priority {
-                Ok(None)    //Haven't found aggregate yet
-            } else {
-                Ok(Some(true)) //Done searching
-            }
-        }).await?;
+                if low_priority {
+                    Ok(None) //Haven't found aggregate yet
+                } else {
+                    Ok(Some(true)) //Done searching
+                }
+            })
+            .await?;
 
         let found = find_result.unwrap_or(false);
         if !found {
             let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
             shard_mem_cache.put_aggregate_into_cache_as_not_found(searching_for_aggregate_key.clone());
         }
-        
+
         Ok(found)
     }
 
@@ -518,15 +516,8 @@ impl ShardWal {
 
         // Validate client idempotency
         if write_request.enforce_client_idempotency {
-            if let Some(last_client_event_index) = shard_mem_cache
-                .get_client_event_index(aggregate_key, client_id)
-            {
-                let attempted_client_event_index = write_request
-                    .events
-                    .iter()
-                    .map(|e| e.client_event_index)
-                    .min()
-                    .unwrap_or(0);
+            if let Some(last_client_event_index) = shard_mem_cache.get_client_event_index(aggregate_key, client_id) {
+                let attempted_client_event_index = write_request.events.iter().map(|e| e.client_event_index).min().unwrap_or(0);
                 if attempted_client_event_index <= last_client_event_index {
                     return Err(ShardWriteError::ClientIdempotencyViolation {
                         last_client_event_index,
@@ -588,8 +579,7 @@ impl ShardWal {
         };
 
         // Serialize datablock - this can fail
-        let serialized_datablock =
-            serialize_datablock(&datablock, write_request.compression_type, 0)?;
+        let serialized_datablock = serialize_datablock(&datablock, write_request.compression_type, 0)?;
 
         let server_timestamp = self.config.timestamp_config.now();
 
@@ -602,11 +592,7 @@ impl ShardWal {
             wal_metablock_type: MetablockKind::EventBatchMetadata(metablock_event_batch),
         };
 
-        let shard_log_queue_item = ShardLogQueueItem::new(
-            Some(datablock),
-            serialized_datablock.external_data,
-            metablock,
-        );
+        let shard_log_queue_item = ShardLogQueueItem::new(Some(datablock), serialized_datablock.external_data, metablock);
 
         Ok(PreparedWrite {
             aggregate_key: aggregate_key.clone(),
@@ -620,11 +606,7 @@ impl ShardWal {
 
     /// Append all prepared writes to the pending queue.
     /// This mutates shard_mem_cache but cannot fail.
-    fn append_prepared_writes_to_queue(
-        &self,
-        prepared_writes: Vec<PreparedWrite>,
-        final_wal_index: u64,
-    ) -> bool {
+    fn append_prepared_writes_to_queue(&self, prepared_writes: Vec<PreparedWrite>, final_wal_index: u64) -> bool {
         let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
 
         for prepared in prepared_writes {
@@ -652,9 +634,7 @@ impl ShardWal {
 
         if force_immediate {
             self.fsync_coordinator
-                .request_sync(None, move || {
-                    sync_with_rollback(rotating_log_cache, shard_mem_cache, watched_aggregates)
-                })
+                .request_sync(None, move || sync_with_rollback(rotating_log_cache, shard_mem_cache, watched_aggregates))
                 .await
         } else if !self.config.non_durable_writes {
             self.fsync_coordinator
@@ -666,9 +646,7 @@ impl ShardWal {
             let fsync_coordinator = self.fsync_coordinator.clone();
             glommio::spawn_local(async move {
                 let _ = fsync_coordinator
-                    .request_sync(None, move || {
-                        sync_with_rollback(rotating_log_cache, shard_mem_cache, watched_aggregates)
-                    })
+                    .request_sync(None, move || sync_with_rollback(rotating_log_cache, shard_mem_cache, watched_aggregates))
                     .await;
             })
             .detach();
@@ -678,10 +656,7 @@ impl ShardWal {
 }
 
 /// Extends the write batch index bounds in an AggregateWatchEventOperation when writing mulitple batches for the same aggregate.
-fn add_write_event(
-    write_events: &mut HashMap<AggregateKey, AggregateWatchEventOperation>,
-    metablock_event_batch: &MetablockEventBatch,
-) {
+fn add_write_event(write_events: &mut HashMap<AggregateKey, AggregateWatchEventOperation>, metablock_event_batch: &MetablockEventBatch) {
     write_events
         .entry(metablock_event_batch.aggregate_key.clone())
         .and_modify(|event| {
@@ -705,13 +680,8 @@ fn add_write_event(
 }
 
 /// Records a create event for an aggregate.
-fn add_create_event(
-    create_events: &mut HashMap<AggregateKey, AggregateWatchEventOperation>,
-    aggregate_key: AggregateKey,
-) {
-    create_events
-        .entry(aggregate_key)
-        .or_insert(AggregateWatchEventOperation::Create {});
+fn add_create_event(create_events: &mut HashMap<AggregateKey, AggregateWatchEventOperation>, aggregate_key: AggregateKey) {
+    create_events.entry(aggregate_key).or_insert(AggregateWatchEventOperation::Create {});
 }
 
 async fn sync_with_rollback(
@@ -723,21 +693,13 @@ async fn sync_with_rollback(
     let lockable_active_log_file = rotating_log_cache.active();
     let mut shard_log_dma_file = write_with_timeout(&lockable_active_log_file, "sync_with_rollback").await?;
 
-    let (
-        has_enough_free_space,
-        _current_log_id,
-        preallocate_bytes,
-        shard_dir,
-        sync_positions_snapshot,
-    ) = {
+    let (has_enough_free_space, _current_log_id, preallocate_bytes, shard_dir, sync_positions_snapshot) = {
         let mut shard_mem_cache = shard_mem_cache.borrow_mut();
         if !shard_mem_cache.requires_write() {
             // Queue is empty - either another coordinator synced our items,
             // or a previous sync failed and cleared the queue
             if shard_mem_cache.force_durable_on_next_write() {
-                return Err(ShardFsyncError::IoError(
-                    "Disk sync failure forced queue clear".to_string(),
-                ));
+                return Err(ShardFsyncError::IoError("Disk sync failure forced queue clear".to_string()));
             }
             // Another coordinator successfully synced our items
             return Ok(());
@@ -765,7 +727,9 @@ async fn sync_with_rollback(
     let mut sync_positions_snapshot = if !has_enough_free_space {
         let shard_dir = shard_dir.as_ref().unwrap();
 
-        rotating_log_cache.rotate_to_next_log(&mut shard_log_dma_file, &shard_dir, preallocate_bytes).await?;
+        rotating_log_cache
+            .rotate_to_next_log(&mut shard_log_dma_file, &shard_dir, preallocate_bytes)
+            .await?;
 
         // Can only acquire shard_mem_cache after async operations
         let mut shard_mem_cache = shard_mem_cache.borrow_mut();
@@ -782,24 +746,27 @@ async fn sync_with_rollback(
         sync_positions_snapshot.unwrap()
     };
 
-    match sync(rotating_log_cache.active_log_id(), &mut shard_log_dma_file, rotating_log_cache.active_reader(), &mut sync_positions_snapshot).await {
+    match sync(
+        rotating_log_cache.active_log_id(),
+        &mut shard_log_dma_file,
+        rotating_log_cache.active_reader(),
+        &mut sync_positions_snapshot,
+    )
+    .await
+    {
         Ok(_) => {
             let mut shard_mem_cache = shard_mem_cache.borrow_mut();
 
             // Commit moves the carry over bytes back into memcache, so take queue first
-            let pending_append_queue =
-                std::mem::take(&mut sync_positions_snapshot.pending_append_queue);
+            let pending_append_queue = std::mem::take(&mut sync_positions_snapshot.pending_append_queue);
             shard_mem_cache.commit_sync_positions_snapshot(sync_positions_snapshot);
 
             // Transform the queue into recent writes and broadcast events
-            let mut write_events: HashMap<AggregateKey, AggregateWatchEventOperation> =
-                HashMap::new();
-            let mut create_events: HashMap<AggregateKey, AggregateWatchEventOperation> =
-                HashMap::new();
+            let mut write_events: HashMap<AggregateKey, AggregateWatchEventOperation> = HashMap::new();
+            let mut create_events: HashMap<AggregateKey, AggregateWatchEventOperation> = HashMap::new();
             for queue_item in pending_append_queue {
                 match &queue_item.metablock.wal_metablock_type {
                     MetablockKind::EventBatchMetadata(event_batch_metadata) => {
-                        
                         // Build watched_aggregates events
                         add_write_event(&mut write_events, event_batch_metadata);
 
@@ -808,9 +775,7 @@ async fn sync_with_rollback(
                             add_create_event(&mut create_events, event_batch_metadata.aggregate_key.clone());
                         }
 
-                        let size_bytes = ((queue_item.metablock.deep_size_of()
-                            + queue_item.datablock.deep_size_of())
-                            * 3) as u64;
+                        let size_bytes = ((queue_item.metablock.deep_size_of() + queue_item.datablock.deep_size_of()) * 3) as u64;
 
                         // Cache the write (only happens after durable write confirmed)
                         shard_mem_cache.cache_recent_write(
@@ -826,12 +791,9 @@ async fn sync_with_rollback(
             }
 
             for (aggregate_key, operation) in create_events {
-                watched_aggregates.broadcast(AggregateWatchEvent {
-                    aggregate_key,
-                    operation,
-                });
+                watched_aggregates.broadcast(AggregateWatchEvent { aggregate_key, operation });
             }
-            
+
             for (aggregate_key, operation) in write_events {
                 watched_aggregates.broadcast(AggregateWatchEvent {
                     aggregate_key: aggregate_key.clone(),
@@ -865,8 +827,12 @@ async fn sync(
 
     // Write datablocks first so we can get the positions to include into metablocks
     if !sync_positions_snapshot.has_enough_free_space() {
-        let free_space = sync_positions_snapshot.datablocks_position.saturating_sub(sync_positions_snapshot.metablocks_position);
-        let required_space = sync_positions_snapshot.buffer_size_datablocks().saturating_add(sync_positions_snapshot.buffer_size_metablocks());
+        let free_space = sync_positions_snapshot
+            .datablocks_position
+            .saturating_sub(sync_positions_snapshot.metablocks_position);
+        let required_space = sync_positions_snapshot
+            .buffer_size_datablocks()
+            .saturating_add(sync_positions_snapshot.buffer_size_metablocks());
 
         return Err(ShardFsyncError::NotEnoughLogFreeSpace {
             required: required_space,
@@ -875,22 +841,15 @@ async fn sync(
     }
     let buffer_size_datablocks: u64 = sync_positions_snapshot.buffer_size_datablocks();
 
-    let mut datablocks_absolute_write_positions: Vec<u64> =
-        Vec::with_capacity(sync_positions_snapshot.pending_append_queue.len());
+    let mut datablocks_absolute_write_positions: Vec<u64> = Vec::with_capacity(sync_positions_snapshot.pending_append_queue.len());
     let mut new_datablocks_position = sync_positions_snapshot.datablocks_position;
-    let mut datablocks_carry_over: Option<Vec<u8>> =
-        sync_positions_snapshot.datablocks_carry_over.take();
+    let mut datablocks_carry_over: Option<Vec<u8>> = sync_positions_snapshot.datablocks_carry_over.take();
     if buffer_size_datablocks > 0 {
         let write_to_pos = dma_file_writer.align_up(sync_positions_snapshot.datablocks_position);
-        let write_from_pos = dma_file_writer.align_down(
-            sync_positions_snapshot
-                .datablocks_position
-                .saturating_sub(buffer_size_datablocks),
-        );
+        let write_from_pos = dma_file_writer.align_down(sync_positions_snapshot.datablocks_position.saturating_sub(buffer_size_datablocks));
         let aligned_buffer_size_datablocks = write_to_pos.saturating_sub(write_from_pos);
 
-        let mut buffer_datablocks =
-            dma_file_writer.alloc_dma_buffer(aligned_buffer_size_datablocks as usize);
+        let mut buffer_datablocks = dma_file_writer.alloc_dma_buffer(aligned_buffer_size_datablocks as usize);
         let buffer_datablocks_slice = buffer_datablocks.as_bytes_mut();
         buffer_datablocks_slice.fill(0);
 
@@ -899,22 +858,15 @@ async fn sync(
             .saturating_sub(sync_positions_snapshot.datablocks_position);
 
         if end_carry_over > 0 {
-            if datablocks_carry_over.is_none()
-                || datablocks_carry_over.as_ref().unwrap().len() != end_carry_over as usize
-            {
+            if datablocks_carry_over.is_none() || datablocks_carry_over.as_ref().unwrap().len() != end_carry_over as usize {
                 return Err(ShardFsyncError::DatablocksCarryOverBufferNotPresent);
             }
-            buffer_datablocks_slice
-                [(aligned_buffer_size_datablocks.saturating_sub(end_carry_over)) as usize..]
+            buffer_datablocks_slice[(aligned_buffer_size_datablocks.saturating_sub(end_carry_over)) as usize..]
                 .copy_from_slice(&datablocks_carry_over.as_ref().unwrap());
         }
 
-        new_datablocks_position = sync_positions_snapshot
-            .datablocks_position
-            .saturating_sub(buffer_size_datablocks);
-        let front_carry_over = new_datablocks_position
-            .saturating_sub(dma_file_writer.align_down(new_datablocks_position))
-            as usize;
+        new_datablocks_position = sync_positions_snapshot.datablocks_position.saturating_sub(buffer_size_datablocks);
+        let front_carry_over = new_datablocks_position.saturating_sub(dma_file_writer.align_down(new_datablocks_position)) as usize;
         if front_carry_over > 0 {
             buffer_datablocks_slice[..front_carry_over].fill(0);
         }
@@ -925,29 +877,21 @@ async fn sync(
                 let len = datablock_bytes.len();
                 let start_idx = front_carry_over + position;
                 let end_idx = front_carry_over + position + len;
-                
+
                 datablocks_absolute_write_positions.push(new_datablocks_position + position as u64);
                 buffer_datablocks_slice[start_idx..end_idx].copy_from_slice(datablock_bytes);
                 position += len;
             }
         }
 
-        let datablocks_carry_over_size = dma_file_writer
-            .align_up(new_datablocks_position)
-            .saturating_sub(new_datablocks_position);
+        let datablocks_carry_over_size = dma_file_writer.align_up(new_datablocks_position).saturating_sub(new_datablocks_position);
         if datablocks_carry_over_size > 0 {
-            datablocks_carry_over = Some(
-                buffer_datablocks_slice
-                    [front_carry_over..(front_carry_over + datablocks_carry_over_size as usize)]
-                    .to_vec(),
-            );
+            datablocks_carry_over =
+                Some(buffer_datablocks_slice[front_carry_over..(front_carry_over + datablocks_carry_over_size as usize)].to_vec());
         }
 
         dma_file_writer
-            .write_at(
-                buffer_datablocks,
-                new_datablocks_position.saturating_sub(front_carry_over as u64),
-            )
+            .write_at(buffer_datablocks, new_datablocks_position.saturating_sub(front_carry_over as u64))
             .await?;
     }
 
@@ -972,48 +916,32 @@ async fn sync(
 
         // Track the absolute position where this metablock is written
         let metablock_absolute_pos = sync_positions_snapshot.metablocks_position + position as u64;
-        
+
         // Update aggregate positions tracking for event batches (only if entry exists)
         if let MetablockKind::EventBatchMetadata(event_batch) = &item.metablock.wal_metablock_type {
-            if let Some(aggregate_positions) = sync_positions_snapshot
-                .aggregate_queue_positions
-                .get_mut(&event_batch.aggregate_key)
-            {
+            if let Some(aggregate_positions) = sync_positions_snapshot.aggregate_queue_positions.get_mut(&event_batch.aggregate_key) {
                 aggregate_positions.log_id = log_id;
                 aggregate_positions.metablock_absolute_pos = metablock_absolute_pos;
             }
         }
 
         let mut metablock_bytes = [0u8; FIXED_BLOCK_SIZE_BYTES];
-        serialize_versioned_message(
-            &item.metablock,
-            WIRE_VERSION_WAL_METABLOCK,
-            &mut metablock_bytes,
-        )?;
+        serialize_versioned_message(&item.metablock, WIRE_VERSION_WAL_METABLOCK, &mut metablock_bytes)?;
 
         //let metablock_bytes: [u8; FIXED_BLOCK_SIZE_BYTES]
-        buffer_metablocks_slice[position..position + FIXED_BLOCK_SIZE_BYTES]
-            .copy_from_slice(&metablock_bytes);
+        buffer_metablocks_slice[position..position + FIXED_BLOCK_SIZE_BYTES].copy_from_slice(&metablock_bytes);
         position += FIXED_BLOCK_SIZE_BYTES;
     }
 
     //Write header front & back
-    let new_metablocks_position =
-        sync_positions_snapshot.metablocks_position + buffer_metablocks.len() as u64;
+    let new_metablocks_position = sync_positions_snapshot.metablocks_position + buffer_metablocks.len() as u64;
 
     dma_file_writer
-        .write_at(
-            buffer_metablocks,
-            sync_positions_snapshot.metablocks_position,
-        )
+        .write_at(buffer_metablocks, sync_positions_snapshot.metablocks_position)
         .await?;
 
     shard_log_dma_file
-        .write_new_headers_and_fsync(
-            new_datablocks_position,
-            new_metablocks_position,
-            new_wal_index,
-        )
+        .write_new_headers_and_fsync(new_datablocks_position, new_metablocks_position, new_wal_index)
         .await?;
 
     {

@@ -1,6 +1,6 @@
 use std::{cell::Cell, collections::HashSet, fmt, rc::Rc, time::Duration};
 
-use celeriant_shard::{error::{shard_error::ShardError, shard_read_error::ShardReadError, shard_write_error::ShardWriteError}, shard_wal::ShardWal};
+use celeriant_shard::{error::{shard_error::ShardError, shard_read_error::ShardReadError, shard_write_error::ShardWriteError, watch_session_error::WatchSessionError}, shard_wal::ShardWal};
 use celeriant_watch::{watch_output_type::WatchOutputType, watch_session::WatchSession};
 use celeriant_msg::{
     request::requests::{WatchRequest, WriteRequest},
@@ -300,9 +300,8 @@ fn read_write_error_to_response(
 ) -> celeriant_msg::process_responses::Response {
     let (error_code, error_message) = match error {
         ShardError::Read(read_error) => match read_error {
-            ShardReadError::NotExists => (404, "Aggregate does not exist".to_string()),
+            ShardReadError::AggregateNotExists => (404, "Aggregate does not exist".to_string()),
             ShardReadError::IoError(msg) => (500, format!("IO error: {}", msg)),
-            ShardReadError::CannotCreateFolders(msg) => (500, format!("Cannot create folders: {}", msg)),
             ShardReadError::MaxBytesTooSmall {
                 current_max_bytes,
                 required_max_bytes,
@@ -317,39 +316,13 @@ fn read_write_error_to_response(
                 (500, format!("Serialization error: {:?}", wire_error))
             }
             ShardReadError::UnavailableBatchIndex {
-                minimum_available_event_batch_index,
-                requested_event_batch_index,
+                minimum_available,
+                requested,
             } => (
                 410,
                 format!(
                     "Batch index unavailable: requested={}, minimum available={}",
-                    requested_event_batch_index, minimum_available_event_batch_index
-                ),
-            ),
-            ShardReadError::CorruptMetadata { file_pos_metadata } => (
-                500,
-                format!("Corrupt metadata at position {}", file_pos_metadata),
-            ),
-            ShardReadError::CorruptEventBatch {
-                expected_crc,
-                actual_crc,
-                event_batch_index,
-                file_pos_event_batch,
-            } => (
-                500,
-                format!(
-                    "Corrupt event batch: index={}, expected_crc={}, actual_crc={}, batch_pos={}",
-                    event_batch_index,
-                    expected_crc,
-                    actual_crc,
-                    file_pos_event_batch
-                ),
-            ),
-            ShardReadError::WatchLatencyTooHigh { latency_ms, max_latency_ms } => (
-                400,
-                format!(
-                    "Requested watch latency {}ms exceeds server max of {}ms",
-                    latency_ms, max_latency_ms
+                    requested, minimum_available
                 ),
             ),
         },
@@ -385,6 +358,20 @@ fn read_write_error_to_response(
             ),
             ShardWriteError::InvalidLeaseIndex => (400, "Invalid lease index".to_string()),
             ShardWriteError::AggregateNotExists => (404, "Aggregate not found".to_string()),
+        },
+        ShardError::WatchSession(watch_session_error) => {
+            match watch_session_error {
+                celeriant_shard::error::watch_session_error::WatchSessionError::WatchLatencyTooHigh { 
+                    latency_ms, 
+                    max_latency_ms 
+                } => (
+                    400,
+                    format!(
+                        "Requested watch latency {}ms exceeds server max of {}ms",
+                        latency_ms, max_latency_ms
+                    ),
+                ),
+            }
         },
     };
 
@@ -563,7 +550,7 @@ async fn create_watch_session(
     shard_wal: Rc<ShardWal>,
     request: WatchRequest,
     max_requested_latency: Duration,
-) -> Result<WatchSession<ShardWal>, ShardError> {
+) -> Result<WatchSession<ShardWal>, WatchSessionError> {
 
     // Don't allow setup of a watch with a latency too high
     // as this creates too much load on the server
@@ -571,7 +558,7 @@ async fn create_watch_session(
     if let Some(latency_ms) = request.requested_latency_ms
         && Duration::from_millis(latency_ms) > max_requested_latency
     {
-        return Err(ShardReadError::WatchLatencyTooHigh {
+        return Err(WatchSessionError::WatchLatencyTooHigh {
             latency_ms,
             max_latency_ms: max_requested_latency.as_millis() as u64,
         })?;
@@ -608,7 +595,7 @@ async fn handle_watch_request(
     {
         Ok(session) => session,
         Err(error) => {
-            let response = read_write_error_to_response(correlation_id, error);
+            let response = read_write_error_to_response(correlation_id, error.into());
             let compression_type =
                 celeriant_msg::process_responses::Response::determine_compression_type(&response);
             let _ = write_response_with_timeout(

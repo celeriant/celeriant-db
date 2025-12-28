@@ -209,7 +209,7 @@ pub fn trim_end_if_exceeds_max_bytes(
     metablocks: &mut Vec<Metablock>,
     read_filters: &ReadFilters,
     max_bytes: Option<usize>,
-) -> Result<Option<u64>, ShardReadError> {
+) -> Option<u64> {
     // Only keep batches where include is true
     metablocks
         .retain(|metablock| is_include_batch(metablock, read_filters));
@@ -217,12 +217,12 @@ pub fn trim_end_if_exceeds_max_bytes(
     // If no max_bytes limit is specified, we don't need to trim
     let max_bytes = match max_bytes {
         Some(limit) => limit as u64,
-        None => return Ok(None),
+        None => return None,
     };
 
     // If after filtering we don't have any batches, return None
     if metablocks.is_empty() {
-        return Ok(None);
+        return None;
     }
 
     // Calculate cumulative compressed size
@@ -255,18 +255,10 @@ pub fn trim_end_if_exceeds_max_bytes(
         // Keep only the batches that fit within the max_bytes limit
         metablocks.truncate(index);
 
-        if metablocks.is_empty() {
-            // Throw an error as max bytes was too small to return any event batches
-            return Err(ShardReadError::MaxBytesTooSmall {
-                current_max_bytes: max_bytes,
-                required_max_bytes: cumulative_size,
-            });
-        }
-
-        Ok(next_event_batch_index)
+        next_event_batch_index
     } else {
         // No trimming needed, all batches fit within the limit
-        Ok(None)
+        None
     }
 }
 
@@ -616,7 +608,7 @@ mod tests {
         // No additional filtering (include all)
         let filters = ReadFilters::new(1);
 
-        let next = trim_end_if_exceeds_max_bytes(&mut v, &filters, Some(250)).unwrap();
+        let next = trim_end_if_exceeds_max_bytes(&mut v, &filters, Some(250));
         assert_eq!(next, Some(11));
         assert_eq!(v.len(), 1);
         assert_eq!(get_event_batch_index(&v[0]).event_batch_index, 10);
@@ -630,7 +622,7 @@ mod tests {
         let mut v = vec![m1, m2];
         let filters = ReadFilters::new(1);
 
-        let next = trim_end_if_exceeds_max_bytes(&mut v, &filters, Some(300)).unwrap();
+        let next = trim_end_if_exceeds_max_bytes(&mut v, &filters, Some(300));
         assert_eq!(next, None);
         assert_eq!(v.len(), 2);
     }
@@ -642,14 +634,9 @@ mod tests {
         let mut v = vec![m1];
         let filters = ReadFilters::new(1);
 
-        let err = trim_end_if_exceeds_max_bytes(&mut v, &filters, Some(100)).unwrap_err();
-        match err {
-            ShardReadError::MaxBytesTooSmall { current_max_bytes, required_max_bytes } => {
-                assert_eq!(current_max_bytes, 100);
-                assert_eq!(required_max_bytes, 200);
-            }
-            e => panic!("unexpected error: {:?}", e),
-        }
+        let next = trim_end_if_exceeds_max_bytes(&mut v, &filters, Some(100));
+        assert_eq!(next, Some(99));
+        assert_eq!(v.len(), 0);
     }
 
     #[test]
@@ -674,7 +661,7 @@ mod tests {
 
         // Filter to a different client_id so batch gets filtered out
         let filters = ReadFilters::new(1).include_client_id(999);
-        let next = trim_end_if_exceeds_max_bytes(&mut v, &filters, Some(1000)).unwrap();
+        let next = trim_end_if_exceeds_max_bytes(&mut v, &filters, Some(1000));
 
         assert!(v.is_empty());
         assert_eq!(next, None);

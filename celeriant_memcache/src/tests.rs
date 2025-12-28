@@ -695,7 +695,7 @@ mod tests {
 
         cache.cache_recent_write(key.clone(), 1, metablock, Some(datablock), 100);
 
-        let writes: Vec<_> = cache.get_cached_writes_from(&key, 0).unwrap().collect();
+        let writes: Vec<_> = cache.get_cached_writes_from(&key, 0).collect();
         assert_eq!(writes.len(), 1);
         assert_eq!(writes[0].0, 1);
         assert_eq!(writes[0].1.size_bytes, 100);
@@ -709,7 +709,7 @@ mod tests {
 
         cache.cache_recent_write(key.clone(), 1, metablock, None, 100);
 
-        assert!(cache.get_cached_writes_from(&key, 0).is_none());
+        assert!(cache.get_cached_writes_from(&key, 0).next().is_none());
     }
 
     #[test]
@@ -722,7 +722,7 @@ mod tests {
             cache.cache_recent_write(key.clone(), batch_index, metablock, None, 100);
         }
 
-        let writes: Vec<_> = cache.get_cached_writes_from(&key, 0).unwrap().collect();
+        let writes: Vec<_> = cache.get_cached_writes_from(&key, 0).collect();
         assert_eq!(writes.len(), 5);
 
         // Verify ordering
@@ -741,8 +741,8 @@ mod tests {
         cache.cache_recent_write(key1.clone(), 2, make_metablock(2, key1.clone()), None, 100);
         cache.cache_recent_write(key2.clone(), 1, make_metablock(3, key2.clone()), None, 100);
 
-        let writes1: Vec<_> = cache.get_cached_writes_from(&key1, 0).unwrap().collect();
-        let writes2: Vec<_> = cache.get_cached_writes_from(&key2, 0).unwrap().collect();
+        let writes1: Vec<_> = cache.get_cached_writes_from(&key1, 0).collect();
+        let writes2: Vec<_> = cache.get_cached_writes_from(&key2, 0).collect();
 
         assert_eq!(writes1.len(), 2);
         assert_eq!(writes2.len(), 1);
@@ -759,7 +759,7 @@ mod tests {
         }
 
         // Get from batch 5 onwards
-        let writes: Vec<_> = cache.get_cached_writes_from(&key, 5).unwrap().collect();
+        let writes: Vec<_> = cache.get_cached_writes_from(&key, 5).collect();
         assert_eq!(writes.len(), 6); // batches 5, 6, 7, 8, 9, 10
 
         assert_eq!(writes[0].0, 5);
@@ -771,7 +771,7 @@ mod tests {
         let cache = new_cache();
         let key = make_aggregate_key(1, 1, 1);
 
-        assert!(cache.get_cached_writes_from(&key, 0).is_none());
+        assert!(cache.get_cached_writes_from(&key, 0).next().is_none());
     }
 
     #[test]
@@ -782,7 +782,7 @@ mod tests {
         cache.cache_recent_write(key.clone(), 1, make_metablock(1, key.clone()), None, 100);
         cache.cache_recent_write(key.clone(), 2, make_metablock(2, key.clone()), None, 100);
 
-        let writes: Vec<_> = cache.get_cached_writes_from(&key, 100).unwrap().collect();
+        let writes: Vec<_> = cache.get_cached_writes_from(&key, 100).collect();
         assert_eq!(writes.len(), 0);
     }
 
@@ -803,7 +803,7 @@ mod tests {
             cache.cache_recent_write(key.clone(), batch_index, metablock, None, 150);
         }
 
-        let writes: Vec<_> = cache.get_cached_writes_from(&key, 0).unwrap().collect();
+        let writes: Vec<_> = cache.get_cached_writes_from(&key, 0).collect();
 
         // First entry should have been evicted (oldest)
         assert!(!writes.iter().any(|(idx, _)| *idx == 1));
@@ -825,14 +825,14 @@ mod tests {
         }
 
         // All 4 entries fit (160 bytes)
-        let writes: Vec<_> = cache.get_cached_writes_from(&key, 0).unwrap().collect();
+        let writes: Vec<_> = cache.get_cached_writes_from(&key, 0).collect();
         assert_eq!(writes.len(), 4);
 
         // Now add a large entry (150 bytes) - should evict multiple old entries
         let metablock = make_metablock(5, key.clone());
         cache.cache_recent_write(key.clone(), 5, metablock, None, 150);
 
-        let writes: Vec<_> = cache.get_cached_writes_from(&key, 0).unwrap().collect();
+        let writes: Vec<_> = cache.get_cached_writes_from(&key, 0).collect();
 
         // Should have evicted entries until 150 bytes could fit
         // Total after should be <= 200 bytes
@@ -855,14 +855,14 @@ mod tests {
         cache.cache_recent_write(key1.clone(), 2, make_metablock(3, key1.clone()), None, 100);
 
         // All fit (300 bytes exactly)
-        assert!(cache.get_cached_writes_from(&key1, 0).is_some());
-        assert!(cache.get_cached_writes_from(&key2, 0).is_some());
+        assert!(cache.get_cached_writes_from(&key1, 0).next().is_some());
+        assert!(cache.get_cached_writes_from(&key2, 0).next().is_some());
 
         // Add one more - should evict key1/batch1 (oldest)
         cache.cache_recent_write(key2.clone(), 2, make_metablock(4, key2.clone()), None, 100);
 
-        let writes1: Vec<_> = cache.get_cached_writes_from(&key1, 0).unwrap().collect();
-        let writes2: Vec<_> = cache.get_cached_writes_from(&key2, 0).unwrap().collect();
+        let writes1: Vec<_> = cache.get_cached_writes_from(&key1, 0).collect();
+        let writes2: Vec<_> = cache.get_cached_writes_from(&key2, 0).collect();
 
         // key1 batch 1 should be evicted
         assert!(!writes1.iter().any(|(idx, _)| *idx == 1));
@@ -883,15 +883,15 @@ mod tests {
         cache.cache_recent_write(key2.clone(), 1, make_metablock(2, key2.clone()), None, 100);
 
         // Both exist
-        assert!(cache.get_cached_writes_from(&key1, 0).is_some());
-        assert!(cache.get_cached_writes_from(&key2, 0).is_some());
+        assert!(cache.get_cached_writes_from(&key1, 0).next().is_some());
+        assert!(cache.get_cached_writes_from(&key2, 0).next().is_some());
 
         // Add large entry that requires evicting key1's only entry
         cache.cache_recent_write(key2.clone(), 2, make_metablock(3, key2.clone()), None, 150);
 
         // key1 should be completely removed
-        assert!(cache.get_cached_writes_from(&key1, 0).is_none());
-        assert!(cache.get_cached_writes_from(&key2, 0).is_some());
+        assert!(cache.get_cached_writes_from(&key1, 0).next().is_none());
+        assert!(cache.get_cached_writes_from(&key2, 0).next().is_some());
     }
 
     #[test]
@@ -901,13 +901,13 @@ mod tests {
 
         // Add small entry first
         cache.cache_recent_write(key.clone(), 1, make_metablock(1, key.clone()), None, 50);
-        assert_eq!(cache.get_cached_writes_from(&key, 0).unwrap().count(), 1);
+        assert_eq!(cache.get_cached_writes_from(&key, 0).count(), 1);
 
         // Add entry larger than entire cache - will evict everything but still can't fit
         cache.cache_recent_write(key.clone(), 2, make_metablock(2, key.clone()), None, 200);
 
         // The large entry should still be added (eviction loop breaks when cache is empty)
-        let writes: Vec<_> = cache.get_cached_writes_from(&key, 0).unwrap().collect();
+        let writes: Vec<_> = cache.get_cached_writes_from(&key, 0).collect();
         assert_eq!(writes.len(), 1);
         assert_eq!(writes[0].0, 2);
     }
@@ -921,7 +921,7 @@ mod tests {
 
         cache.cache_recent_write(key.clone(), 1, metablock, Some(datablock), 100);
 
-        let writes: Vec<_> = cache.get_cached_writes_from(&key, 0).unwrap().collect();
+        let writes: Vec<_> = cache.get_cached_writes_from(&key, 0).collect();
         assert!(writes[0].1.datablock.is_some());
     }
 
@@ -933,7 +933,7 @@ mod tests {
 
         cache.cache_recent_write(key.clone(), 1, metablock, None, 100);
 
-        let writes: Vec<_> = cache.get_cached_writes_from(&key, 0).unwrap().collect();
+        let writes: Vec<_> = cache.get_cached_writes_from(&key, 0).collect();
         assert!(writes[0].1.datablock.is_none());
     }
 
@@ -1229,7 +1229,7 @@ mod tests {
         cache.cache_recent_write(key.clone(), 1, metablock, Some(datablock), 100);
 
         // Verify cache is populated
-        let cached: Vec<_> = cache.get_cached_writes_from(&key, 0).unwrap().collect();
+        let cached: Vec<_> = cache.get_cached_writes_from(&key, 0).collect();
         assert_eq!(cached.len(), 1);
         assert!(cached[0].1.datablock.is_some());
     }
@@ -1349,13 +1349,13 @@ mod tests {
         cache.cache_recent_write(key.clone(), 3, make_metablock(3, key.clone()), None, 100);
 
         // All 3 should fit
-        let writes: Vec<_> = cache.get_cached_writes_from(&key, 0).unwrap().collect();
+        let writes: Vec<_> = cache.get_cached_writes_from(&key, 0).collect();
         assert_eq!(writes.len(), 3);
 
         // Add one more byte - should trigger eviction
         cache.cache_recent_write(key.clone(), 4, make_metablock(4, key.clone()), None, 1);
 
-        let writes: Vec<_> = cache.get_cached_writes_from(&key, 0).unwrap().collect();
+        let writes: Vec<_> = cache.get_cached_writes_from(&key, 0).collect();
         // First entry should be evicted
         assert!(!writes.iter().any(|(idx, _)| *idx == 1));
         assert_eq!(writes.len(), 3); // entries 2, 3, 4
@@ -1371,7 +1371,7 @@ mod tests {
         cache.cache_recent_write(key.clone(), 2, make_metablock(2, key.clone()), None, 0);
         cache.cache_recent_write(key.clone(), 3, make_metablock(3, key.clone()), None, 0);
 
-        let writes: Vec<_> = cache.get_cached_writes_from(&key, 0).unwrap().collect();
+        let writes: Vec<_> = cache.get_cached_writes_from(&key, 0).collect();
         assert_eq!(writes.len(), 3);
 
         // All have zero size
@@ -1518,7 +1518,7 @@ mod tests {
         }
 
         // Only most recent entries should remain (1000 / 50 = 20 max entries)
-        let writes: Vec<_> = cache.get_cached_writes_from(&key, 0).unwrap().collect();
+        let writes: Vec<_> = cache.get_cached_writes_from(&key, 0).collect();
         assert!(writes.len() <= 20);
 
         // Most recent should be present
@@ -1757,11 +1757,11 @@ mod tests {
         }
 
         // Read from cache - should get all 5 batches
-        let all_writes: Vec<_> = cache.get_cached_writes_from(&key, 1).unwrap().collect();
+        let all_writes: Vec<_> = cache.get_cached_writes_from(&key, 1).collect();
         assert_eq!(all_writes.len(), 5);
 
         // Read from batch 3 onwards
-        let recent_writes: Vec<_> = cache.get_cached_writes_from(&key, 3).unwrap().collect();
+        let recent_writes: Vec<_> = cache.get_cached_writes_from(&key, 3).collect();
         assert_eq!(recent_writes.len(), 3);
         assert_eq!(recent_writes[0].0, 3);
         assert_eq!(recent_writes[2].0, 5);
@@ -2054,32 +2054,6 @@ mod tests {
 
         // Should have updated value
         assert_eq!(cache.get_client_event_index(&key, 100), Some(15));
-    }
-
-    #[test]
-    fn aggregate_snapshot_in_cache_checks_both_queue_and_lru() {
-        let mut cache = new_cache_with_config(test_config_small_lru_caches(100, 100));
-        let key1 = make_aggregate_key(1, 1, 1);
-        let key2 = make_aggregate_key(1, 1, 2);
-        let key3 = make_aggregate_key(1, 1, 3);
-
-        // key1 only in queue (not committed)
-        cache.add_to_pending_append_queue(&key1, 1, 1, 100, 1, make_queue_item(None));
-
-        // key2 committed to LRU
-        cache.add_to_pending_append_queue(&key2, 1, 1, 100, 1, make_queue_item(None));
-        let snapshot = cache.take_sync_positions_snapshot();
-        cache.commit_sync_positions_snapshot(snapshot);
-
-        // key1 should still be in queue
-        cache.add_to_pending_append_queue(&key1, 2, 2, 100, 2, make_queue_item(None));
-
-        // Both should return true
-        assert!(cache.aggregate_snapshot_in_cache(&key1)); // in queue
-        assert!(cache.aggregate_snapshot_in_cache(&key2)); // in LRU
-
-        // key3 not anywhere
-        assert!(!cache.aggregate_snapshot_in_cache(&key3));
     }
 
     #[test]

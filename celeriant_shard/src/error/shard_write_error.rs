@@ -2,7 +2,7 @@ use celeriant_rotating_log::{rotating_log_error::RotatingLogError, rwlock_timeou
 use celeriant_wire::wire_format_error::WireFormatError;
 use glommio::GlommioError;
 
-use crate::error::shard_fsync_error::ShardFsyncError;
+use crate::error::{shard_cache_load_error::ShardCacheError, shard_fsync_error::ShardFsyncError};
 
 /// Storage/infrastructure errors—may be transient.
 #[derive(Debug, Clone)]
@@ -35,6 +35,14 @@ pub enum ShardWriteError {
     InvalidLeaseIndex,
 
     AggregateNotExists,
+}
+
+impl From<ShardCacheError> for ShardWriteError {
+    fn from(value: ShardCacheError) -> Self {
+        match value {
+            ShardCacheError::IoError(error) => ShardWriteError::IoError(error.to_string()),
+        }
+    }
 }
 
 impl From<RotatingLogError> for ShardWriteError {

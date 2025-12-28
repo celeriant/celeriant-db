@@ -3,7 +3,7 @@ use std::u128;
 use bincode::{Decode, Encode};
 use deepsize::DeepSizeOf;
 
-use crate::metablocks::{datablock_storage_kind::DatablockStorageKind, metablock_kind::MetablockKind};
+use crate::{aggregate_key::AggregateKey, constants::MINIBATCH_SIZE_BYTES, metablocks::{datablock_inline_data::DatablockInlineData, datablock_storage_kind::DatablockStorageKind, metablock_event_batch::{EventTypesKind, MetablockEventBatch}, metablock_kind::MetablockKind}};
 
 /// Metablocks are fixed size 512 byte blocks. They read fast and allow
 /// us to avoid pulling in large message payloads (stored in datablocks)
@@ -45,4 +45,29 @@ impl Metablock {
 
     pub const OFFSET_WAL_METABLOCK_TYPE: usize = 
         Self::OFFSET_NODE_ID + Self::WIRE_SIZE_NODE_ID;
+
+    pub fn default_inline_event_batch_metadata(aggregate_key: AggregateKey) -> Self {
+        Self { 
+            wal_index: 0, 
+            server_timestamp: 0, 
+            lease_index: 0, 
+            node_id: 0, 
+            wal_metablock_type: MetablockKind::EventBatchMetadata(MetablockEventBatch { 
+                aggregate_key, 
+                event_batch_index: 0, 
+                min_client_event_index: 0, 
+                max_client_event_index: 0, 
+                min_event_timestamp: 0, 
+                max_event_timestamp: 0, 
+                min_event_index: 0, 
+                max_event_index: 0, 
+                client_id: 0, 
+                user_id: None, 
+                event_types_data: EventTypesKind::Direct([0u64; 4]) 
+            }), 
+            datablock: DatablockStorageKind::Inline(DatablockInlineData {
+                minibatch: [0u8; MINIBATCH_SIZE_BYTES]
+            })
+        }
+    }
 }

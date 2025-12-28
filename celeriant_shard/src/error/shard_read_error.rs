@@ -1,35 +1,47 @@
 use celeriant_disk::files::read_fixed_records_visit_const::ReadVisitError;
+use celeriant_rotating_log::{rotating_log_error::RotatingLogError, rwlock_timeout::LockTimeoutError};
 use celeriant_watch::aggregate_reader::WatchReadError;
 use celeriant_wire::wire_format_error::WireFormatError;
 use glommio::GlommioError;
 
+use crate::error::shard_cache_load_error::ShardCacheError;
+
 #[derive(Debug, Clone)]
 pub enum ShardReadError {
-    NotExists,
     IoError(String),
-    CannotCreateFolders(String),
     MaxBytesTooSmall {
         current_max_bytes: u64,
         required_max_bytes: u64,
     },
     SerializationError(WireFormatError),
     UnavailableBatchIndex {
-        minimum_available_event_batch_index: u64,
-        requested_event_batch_index: u64,
+        minimum_available: u64,
+        requested: u64,
     },
-    WatchLatencyTooHigh {
-        latency_ms: u64,
-        max_latency_ms: u64,
-    },
-    CorruptMetadata {
-        file_pos_metadata: u64,
-    },
-    CorruptEventBatch {
-        expected_crc: u32,
-        actual_crc: u32,
-        event_batch_index: u64,
-        file_pos_event_batch: u64,
-    },
+    AggregateNotExists,
+}
+
+impl From<LockTimeoutError> for ShardReadError {
+    fn from(e: LockTimeoutError) -> Self {
+        Self::IoError(e.to_string())
+    }
+}
+
+impl From<RotatingLogError> for ShardReadError {
+    fn from(value: RotatingLogError) -> Self {
+        match value {
+            RotatingLogError::IoError(e) => ShardReadError::IoError(e),
+            _ => ShardReadError::IoError(value.to_string()),
+        }
+    }
+}
+
+impl From<ShardCacheError> for ShardReadError {
+    fn from(value: ShardCacheError) -> Self {
+        match value {
+            ShardCacheError::IoError(error) => ShardReadError::IoError(error.to_string()),
+        }
+    }
 }
 
 impl From<std::io::Error> for ShardReadError {

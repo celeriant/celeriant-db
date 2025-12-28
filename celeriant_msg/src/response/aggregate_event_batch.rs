@@ -1,4 +1,8 @@
 use bincode::{Decode, Encode};
+use celeriant_wal::datablocks::datablock::Datablock;
+use celeriant_wal::datablocks::datablock_kind::DatablockKind;
+use celeriant_wal::metablocks::metablock::Metablock;
+use celeriant_wal::metablocks::metablock_kind::MetablockKind;
 use serde::{Deserialize, Serialize};
 
 use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
@@ -27,9 +31,30 @@ pub struct AggregateEventBatch {
     pub user_id: Option<u128>,
 
     /// Server timestamp when batch was processed
+    #[serde(rename = "st")]
     pub server_timestamp: u64,
 
     /// Events present in this batch, all from the same client / user
     #[serde(rename = "ev")]
     pub events: Vec<DatablockAggregateEvent>,
+}
+
+impl AggregateEventBatch {
+    pub fn from_wal(metablock: &Metablock, datablock: &Datablock) -> Option<Self> {
+        let MetablockKind::EventBatchMetadata(metablock_event_batch) = &metablock.wal_metablock_type else {
+            return None;
+        };
+        
+        let DatablockKind::EventBatchItem(datablock_event_batch) = &datablock.datablock_kind else {
+            return None;
+        };
+
+        Some(Self { 
+            event_batch_index: metablock_event_batch.event_batch_index, 
+            client_id: metablock_event_batch.client_id, 
+            user_id: metablock_event_batch.user_id, 
+            server_timestamp: metablock.server_timestamp, 
+            events: datablock_event_batch.events.clone()
+        })
+    }
 }

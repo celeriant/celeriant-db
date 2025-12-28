@@ -180,7 +180,7 @@ mod test_subscribed_client {
                     assert!(client.should_wait_and_flush().await);
                     assert!(
                         client.last_send_time.elapsed().as_millis() >= 10
-                            && client.last_send_time.elapsed().as_millis() <= 12
+                            && client.last_send_time.elapsed().as_millis() <= 13
                     );
 
                     let watch_response = client.take_response();

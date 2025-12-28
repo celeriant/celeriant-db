@@ -182,10 +182,11 @@ impl ShardMemCache {
         &self,
         aggregate_key: &AggregateKey,
         from_batch_index: u64,
-    ) -> Option<impl Iterator<Item = (u64, &RecentWrite)>> {
+    ) -> impl Iterator<Item = (u64, &RecentWrite)> {
         self.aggregate_recent_writes
             .get(aggregate_key)
-            .map(|aggregate_writes| aggregate_writes.iter_from(from_batch_index))
+            .into_iter()
+            .flat_map(move |aggregate_writes| aggregate_writes.iter_from(from_batch_index))
     }
     
     pub fn shard_dir(&self) -> PathBuf {
@@ -402,11 +403,6 @@ impl ShardMemCache {
                 }
             }
         }
-    }
-
-    pub fn aggregate_snapshot_in_cache(&self, aggregate_key: &AggregateKey) -> bool {
-        self.aggregate_snapshots.contains(aggregate_key)
-            || self.aggregate_queue_positions.contains_key(aggregate_key)
     }
 
     /// Get the latest event index for a client within an aggregate
