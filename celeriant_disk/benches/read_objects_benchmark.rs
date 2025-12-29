@@ -130,7 +130,7 @@ fn execute_read_fixed_records(file_size: u64, max_chunk_size: u64, folder: &str,
                             0,
                             file_size,
                             max_chunk_size,
-                            |_rec| {
+                            |_pos,_rec| {
                                 count += 1;
                                 Ok(false)
                             }

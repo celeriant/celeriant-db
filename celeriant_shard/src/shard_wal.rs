@@ -3,9 +3,11 @@
 //! Coordinates validation, building, caching, and durability for a single shard.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
+use celeriant_msg::request::read_filters::ReadFilters;
+use celeriant_wal::metablock_position::MetablockPosition;
 use celeriant_disk::files::read_objects_absolute;
 use celeriant_memcache::internal_shard_config::InternalShardConfig;
 use celeriant_memcache::mem_snapshot_aggregate::MemSnapshotAggregate;
@@ -37,7 +39,7 @@ use celeriant_wal::metablocks::metablock_kind::MetablockKind;
 use celeriant_watch::aggregate_reader::AggregateReader;
 use celeriant_watch::aggregate_watch_event::{AggregateWatchEvent, AggregateWatchEventOperation};
 use celeriant_watch::aggregate_watchers::AggregateWatchers;
-use celeriant_wire::datablock_serialization::{self, serialize_datablock};
+use celeriant_wire::datablock_serialization::{self, deserialize_datablock, serialize_datablock};
 use celeriant_wire::metablock_bytes;
 use celeriant_wire::version_aware_wire_format::serialize_versioned_message;
 use deepsize::DeepSizeOf;
@@ -230,125 +232,41 @@ impl ShardWal {
         })
     }
 
-    /// Read event batches from an aggregate.
+        /// Read event batches from an aggregate.
     /// Reads from cache when possible, falls back to disk for older batches.
     pub async fn read(&self, request: &ReadRequest) -> Result<ReadResponse, ShardReadError> {
-        // Currently read is only served from the recent write cache.
-        // We always prioritise the recent write cache, but if the read bounds
-        // can't be served due to missing batches, we need to pull them from disk
-        // and join it to the already cached data; then return what the client wants
-        // If the recent write cache is not *full* we can opportunistically add the
-        // data that we got from disk to the recent write cache for that aggregate;
-        // but only if the data is contiguous (creates no event batch index gaps!)
-        // and we can't just add *all* the read batches, only add in reverse until cache is full
-
         let aggregate_key = &request.aggregate_key;
+        let filters = &request.filters;
+        let max_bytes = self.config.max_response_size as u64;
 
-        // Searches through WAL if not in cache and finds last entry, loads into cache
-        let exists = self.aggregate_exists_and_cache(aggregate_key).await?;
-
-        // We need a mutable ref sometimes as we want to bump the LRU positions
-        // Don't hold this over any async boundaries
-        let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
-
-        // Gets us the log id and metablock absolute pos of last known write
-        let last_known_metablock = shard_mem_cache.get_aggregate_last_metablock_pos(aggregate_key);
-
-        // An iterator to allow us to pull recent writes from cache for filtering.
-        let cached_writes = shard_mem_cache.get_cached_writes_from(&request.aggregate_key, request.filters.from_event_batch_index);
-
-        // given a DatablockAggregateEventBatch, cut down the events inside it based on the filters
-        let mut event_batch = DatablockAggregateEventBatch::default();
-        in_memory_filtering::apply_event_filters(&mut event_batch, &request.filters);
-
-        // Determine if we can skip this entire event batch based on the filters
-        let metablock = Metablock::default_inline_event_batch_metadata(AggregateKey::new(1, 1, 1));
-        let include_batch = in_memory_filtering::is_include_batch(&metablock, &request.filters);
-
-        // Remove from the end of metablocks if we have exceeded max size in bytes. Only removes batches, not events within a batch.
-        let mut metablocks: Vec<Metablock> = vec![];
-        let next_event_batch_index =
-            in_memory_filtering::trim_end_if_exceeds_max_bytes(&mut metablocks, &request.filters, Some(self.config.max_response_size as usize));
-
-        // Data that comes from the datablock region of the WAL
-        let external_data: Option<&[u8]> = None;
-
-        // After we filter batches and applying pagination, we can get the actual datablocks that are not inline in the metablock (larger messages)
-        {
-            let shard_log_file_rwlock = self.rotating_log_cache.get(999).await?;
-            let shard_log_file = read_with_timeout(&shard_log_file_rwlock, "read_objects_absolute").await?;
-            
-            // Set of start_pos->end_pos that allow us to pull byte chunks from a wal segment
-            // These object_positions are forward-ordered in the WAL, not in reverse like ReverseMetablockScanner
-            let object_positions: Vec<read_objects_absolute::AbsoluteObjectPosition> = vec![];
-
-            // On server shutdown the dma_file could be getting cleaned up for each log segment
-            let Some(dma_file) = shard_log_file.dma_file.as_ref() else {
-                return Err(ShardReadError::IoError(format!("DMA file not available for log {}",999)));
-            };
-
-            // Perform the actualy async read from disk
-            let datablock_bytes_blocks: Vec<Vec<u8>> = read_objects_absolute::read_objects_absolute(
-                dma_file,
-                shard_log_file.file_len,
-                &object_positions,
-                self.config.read_max_chunk_size,
-            )
-            .await?;
+        // 1. Ensure aggregate exists and is cached
+        if !self.aggregate_exists_and_cache(aggregate_key).await? {
+            return Err(ShardReadError::AggregateNotExists);
         }
 
-        // Get back a Datablock (comes from minibatch or external data). Can throw a checksum or deserialisation WireFormatError
-        let datablock_storage_kind = DatablockStorageKind::Inline(DatablockInlineData {
-            minibatch: [0u8; celeriant_wal::constants::MINIBATCH_SIZE_BYTES],
-        });
-        let datablock = datablock_serialization::deserialize_datablock(&datablock_storage_kind, external_data)?;
+        let last_known = self.shard_mem_cache.borrow_mut()
+            .get_aggregate_last_metablock_pos(aggregate_key);
 
-        // If we have an event batch wal entry, turn it into what we send back to the client. Clones in the events.
-        let maybe_result_batch = AggregateEventBatch::from_wal(&metablock, &datablock);
+        // 2. Collect metablocks with size-bounded accumulation (NO datablocks yet)
+        let collection = self.collect_metablocks_bounded(
+            aggregate_key,
+            filters,
+            max_bytes,
+            last_known,
+        ).await?;
 
-        // No entries in cache with batch > 0 and not present in any WAL segments
-        let _ = ShardReadError::AggregateNotExists;
+        // 3. Fetch datablocks only for kept metablocks
+        let batches_with_data = self.fetch_datablocks_for_metablocks(
+            &collection.kept_metablocks,
+        ).await?;
 
-        // Max response bytes is so small that we can't send a single batch over the wire
-        let _ = ShardReadError::MaxBytesTooSmall {
-            current_max_bytes: 999,
-            required_max_bytes: 999,
-        };
+        // 4. Deserialize and apply event-level filters
+        let event_batches = self.build_filtered_response(batches_with_data, filters)?;
 
-        // User requested a batch index that we no longer have in the WAL. They should get it somewhere else instead.
-        let _ = ShardReadError::UnavailableBatchIndex {
-            minimum_available: 999,
-            requested: 999,
-        };
-
-        // ReverseMetablockScanner can be used anytime to traverse through the WAL metablocks in reverse order using scan()
-        let mut reverse_metablock_scanner = ReverseMetablockScanner::new(
-            &self.rotating_log_cache,
-            last_known_metablock.log_id,
-            Some(last_known_metablock.metablock_absolute_pos),
-            self.config.read_max_chunk_size,
-        );
-
-        // The actual scan process, with a sync visitor callback. Visitor decids when to terminate by sending Ok(Some(value)) or erroring.
-        let final_result = reverse_metablock_scanner
-            .scan::<bool, ()>(|log_id, absolute_position, metablock_bytes| {
-                // Finish and return a value
-                return Ok(Some(true));
-
-                // Keep searching backwards
-                return Ok(None);
-
-                // Something bad happened (eg. WireFormatError)
-                return Err(());
-            })
-            .await?;
-
-        // What we return to the client
-        let mut event_batches: Vec<AggregateEventBatch> = vec![];
         Ok(ReadResponse {
             correlation_id: request.correlation_id,
             event_batches,
-            next_event_batch_index,
+            next_event_batch_index: collection.next_event_batch_index,
         })
     }
 
@@ -967,4 +885,339 @@ struct PreparedWrite {
     event_batch_index: u64,
     latest_client_event_index: u64,
     shard_log_queue_item: ShardLogQueueItem,
+}
+
+
+/// Metablock kept after size-bounded collection
+struct KeptMetablock {
+    log_id: u64,
+    metablock: Metablock,
+    /// If from recent write cache, we already have the datablock
+    datablock: Option<Datablock>,
+    /// Cached size from DatablockStorageKind for running total
+    uncompressed_size: u64,
+}
+
+/// Result of size-bounded metablock collection
+struct MetablockCollection {
+    /// Metablocks that fit within max_bytes, sorted by batch index ascending
+    kept_metablocks: Vec<KeptMetablock>,
+    /// If we hit the size limit, this is the next batch index to continue from
+    next_event_batch_index: Option<u64>,
+}
+
+impl ShardWal {
+    fn get_batch_index(metablock: &Metablock) -> u64 {
+        match &metablock.wal_metablock_type {
+            MetablockKind::EventBatchMetadata(m) => m.event_batch_index,
+            _ => 0,
+        }
+    }
+
+    async fn collect_metablocks_bounded(
+        &self,
+        aggregate_key: &AggregateKey,
+        filters: &ReadFilters,
+        max_bytes: u64,
+        last_known: MetablockPosition,
+    ) -> Result<MetablockCollection, ShardReadError> {
+        let mut kept: Vec<KeptMetablock> = Vec::new();
+        let mut cumulative_size: u64 = 0;
+        let mut evicted_batch_index: Option<u64> = None;
+
+        // Try cache first (iterates forward from from_event_batch_index)
+        self.collect_from_cache_bounded(
+            aggregate_key,
+            filters,
+            max_bytes,
+            &mut kept,
+            &mut cumulative_size,
+            &mut evicted_batch_index,
+        );
+
+        // Check if we need disk (cache doesn't cover from_event_batch_index)
+        let cache_min_batch = kept.first().map(|k| Self::get_batch_index(&k.metablock));
+        let need_disk = cache_min_batch
+            .map(|min| min > filters.from_event_batch_index)
+            .unwrap_or(true);
+
+        if need_disk && last_known.metablock_absolute_pos > 0 {
+            let disk_to = cache_min_batch.map(|min| min.saturating_sub(1));
+
+            self.collect_from_disk_bounded(
+                aggregate_key,
+                filters.from_event_batch_index,
+                disk_to.or(filters.to_event_batch_index),
+                last_known,
+                filters,
+                max_bytes,
+                &mut kept,
+                &mut cumulative_size,
+                &mut evicted_batch_index,
+            ).await?;
+        }
+
+        // Sort by batch index ascending (disk results were added in reverse)
+        kept.sort_by_key(|k| Self::get_batch_index(&k.metablock));
+
+        Ok(MetablockCollection {
+            kept_metablocks: kept,
+            next_event_batch_index: evicted_batch_index,
+        })
+    }
+
+    fn collect_from_cache_bounded(
+        &self,
+        aggregate_key: &AggregateKey,
+        filters: &ReadFilters,
+        max_bytes: u64,
+        kept: &mut Vec<KeptMetablock>,
+        cumulative_size: &mut u64,
+        evicted_batch_index: &mut Option<u64>,
+    ) {
+        let shard_mem_cache = self.shard_mem_cache.borrow();
+
+        // Cache iterates forward (ascending batch index) from from_event_batch_index
+        for (batch_idx, write) in shard_mem_cache
+            .get_cached_writes_from(aggregate_key, filters.from_event_batch_index)
+        {
+            // Stop if past upper bound
+            if filters.to_event_batch_index.map_or(false, |to| batch_idx > to) {
+                break;
+            }
+
+            // Apply metablock-level filters
+            if !in_memory_filtering::is_include_batch(&write.metablock, filters) {
+                continue;
+            }
+
+            let batch_size = in_memory_filtering::get_uncompressed_size(&write.metablock.datablock);
+
+            // Check if adding this batch would exceed budget
+            // (allow at least one batch even if over budget)
+            if *cumulative_size + batch_size > max_bytes && !kept.is_empty() {
+                *evicted_batch_index = Some(batch_idx);
+                break;
+            }
+
+            *cumulative_size += batch_size;
+            kept.push(KeptMetablock {
+                log_id: 0, // Cache entries don't need log_id for fetch
+                metablock: write.metablock.clone(),
+                uncompressed_size: batch_size,
+                datablock: write.datablock.clone(),
+            });
+        }
+    }
+
+    async fn collect_from_disk_bounded(
+        &self,
+        aggregate_key: &AggregateKey,
+        from_batch: u64,
+        to_batch: Option<u64>,
+        last_known: MetablockPosition,
+        filters: &ReadFilters,
+        max_bytes: u64,
+        kept: &mut Vec<KeptMetablock>,
+        cumulative_size: &mut u64,
+        evicted_batch_index: &mut Option<u64>,
+    ) -> Result<(), ShardReadError> {
+        // Use a VecDeque for efficient eviction from the "newest" end
+        let mut disk_kept: VecDeque<KeptMetablock> = VecDeque::new();
+        let mut disk_cumulative: u64 = 0;
+
+        let mut scanner = ReverseMetablockScanner::new(
+            &self.rotating_log_cache,
+            last_known.log_id,
+            Some(last_known.metablock_absolute_pos.saturating_add(FIXED_BLOCK_SIZE_BYTES as u64)),
+            self.config.read_max_chunk_size,
+        );
+
+        // Budget remaining after cache entries
+        let budget_for_disk = max_bytes.saturating_sub(*cumulative_size);
+
+        scanner.scan::<(), ShardReadError>(|log_id, _pos, bytes| {
+            if !metablock_bytes::is_matches_aggregate_key(bytes, aggregate_key) {
+                return Ok(None); // Continue - different aggregate
+            }
+
+            let batch_index = metablock_bytes::read_event_batch_event_batch_index(bytes);
+
+            // Stop when we've gone past our requested range
+            if batch_index < from_batch {
+                return Ok(Some(())); // Stop - past our range
+            }
+
+            // Skip if above the range we need (cache already has newer)
+            if to_batch.map_or(false, |to| batch_index > to) {
+                return Ok(None); // Continue - will be served from cache
+            }
+
+            // Deserialize metablock for filter check
+            let (metablock, _version) = celeriant_wire::version_aware_wire_format::deserialize_versioned_metablock(bytes)?;
+
+            if !in_memory_filtering::is_include_batch(&metablock, filters) {
+                return Ok(None); // Continue - filtered out
+            }
+
+            let batch_size = in_memory_filtering::get_uncompressed_size(&metablock.datablock);
+
+            // Add to back (we're scanning backwards, newest seen first)
+            disk_cumulative += batch_size;
+            disk_kept.push_back(KeptMetablock {
+                log_id,
+                metablock,
+                uncompressed_size: batch_size,
+                datablock: None,
+            });
+
+            // Evict from FRONT (newest) until under budget
+            while disk_cumulative > budget_for_disk && disk_kept.len() > 1 {
+                if let Some(evicted) = disk_kept.pop_front() {
+                    disk_cumulative -= evicted.uncompressed_size;
+                    let evicted_idx = Self::get_batch_index(&evicted.metablock);
+                    // Track lowest evicted as continuation point
+                    match evicted_batch_index {
+                        Some(existing) if evicted_idx < *existing => {
+                            *evicted_batch_index = Some(evicted_idx);
+                        }
+                        None => {
+                            *evicted_batch_index = Some(evicted_idx);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            Ok(None) // Continue scanning to from_batch
+        }).await?;
+
+        *cumulative_size += disk_cumulative;
+        kept.extend(disk_kept.into_iter());
+
+        Ok(())
+    }
+
+    async fn fetch_datablocks_for_metablocks(
+        &self,
+        kept_metablocks: &[KeptMetablock],
+    ) -> Result<Vec<(Metablock, Option<Datablock>)>, ShardReadError> {
+        let mut results: Vec<(Metablock, Option<Datablock>)> = Vec::with_capacity(kept_metablocks.len());
+        let mut disk_fetches: Vec<(usize, u64, &Metablock)> = Vec::new();
+
+        for (idx, kept) in kept_metablocks.iter().enumerate() {
+            // If we have datablock from cache, use it directly
+            if kept.datablock.is_some() {
+                results.push((kept.metablock.clone(), kept.datablock.clone()));
+                continue;
+            }
+
+            match &kept.metablock.datablock {
+                DatablockStorageKind::None => {
+                    results.push((kept.metablock.clone(), None));
+                }
+                DatablockStorageKind::Inline(_) => {
+                    // Can deserialize immediately - no disk I/O needed
+                    let datablock = deserialize_datablock(&kept.metablock.datablock, None)?;
+                    results.push((kept.metablock.clone(), Some(datablock)));
+                }
+                DatablockStorageKind::Block(_) => {
+                    // Need to fetch from disk
+                    results.push((kept.metablock.clone(), None)); // Placeholder
+                    disk_fetches.push((idx, kept.log_id, &kept.metablock));
+                }
+            }
+        }
+
+        if disk_fetches.is_empty() {
+            return Ok(results);
+        }
+
+        // Group fetches by log_id for batch I/O
+        let mut by_log: HashMap<u64, Vec<(usize, &Metablock)>> = HashMap::new();
+        for (idx, log_id, meta) in disk_fetches {
+            by_log.entry(log_id).or_default().push((idx, meta));
+        }
+
+        // Batch fetch per log file
+        for (log_id, log_fetches) in by_log {
+            let positions: Vec<(usize, read_objects_absolute::AbsoluteObjectPosition)> = log_fetches.iter()
+                .filter_map(|(idx, meta)| {
+                    if let DatablockStorageKind::Block(r) = &meta.datablock {
+                        Some((*idx, read_objects_absolute::AbsoluteObjectPosition {
+                            start_pos: r.datablock_position,
+                            end_pos: r.datablock_position + r.compressed_size,
+                        }))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            if positions.is_empty() {
+                continue;
+            }
+
+            // Sort positions AND indices together by start_pos
+            let mut indexed_positions = positions;
+            indexed_positions.sort_by_key(|(_, p)| p.start_pos);
+
+            let indices: Vec<usize> = indexed_positions.iter().map(|(i, _)| *i).collect();
+            let pos_only: Vec<read_objects_absolute::AbsoluteObjectPosition> = indexed_positions
+                .into_iter()
+                .map(|(_, p)| p)
+                .collect();
+
+            let file = self.rotating_log_cache.get(log_id).await?;
+            let guard = read_with_timeout(&file, "fetch_datablocks").await?;
+            let dma = guard.dma_file.as_ref()
+                .ok_or_else(|| ShardReadError::IoError(format!("No file handle for log {}", log_id)))?;
+
+            let blobs = read_objects_absolute::read_objects_absolute(
+                dma, 
+                guard.file_len, 
+                &pos_only,
+                self.config.read_max_chunk_size
+            ).await?;
+
+            // Deserialize and update results
+            for (result_idx, blob) in indices.into_iter().zip(blobs) {
+                let metablock = &results[result_idx].0;
+                let datablock = deserialize_datablock(&metablock.datablock, Some(&blob))?;
+                results[result_idx].1 = Some(datablock);
+            }
+        }
+
+        Ok(results)
+    }
+
+    fn build_filtered_response(
+        &self,
+        batches_with_data: Vec<(Metablock, Option<Datablock>)>,
+        filters: &ReadFilters,
+    ) -> Result<Vec<AggregateEventBatch>, ShardReadError> {
+        let mut event_batches = Vec::with_capacity(batches_with_data.len());
+
+        for (metablock, datablock) in batches_with_data {
+            let Some(mut datablock) = datablock else {
+                continue;
+            };
+
+            // Apply event-level filters (bloom filter may have false positives)
+            if let DatablockKind::EventBatchItem(ref mut eb) = datablock.datablock_kind {
+                in_memory_filtering::apply_event_filters(eb, filters);
+                if eb.events.is_empty() {
+                    continue;
+                }
+            }
+
+            let Some(batch) = AggregateEventBatch::from_wal(&metablock, &datablock) else {
+                continue;
+            };
+
+            event_batches.push(batch);
+        }
+
+        Ok(event_batches)
+    }
 }

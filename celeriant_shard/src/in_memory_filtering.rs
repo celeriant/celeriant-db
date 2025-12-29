@@ -2,8 +2,6 @@ use celeriant_msg::request::read_filters::ReadFilters;
 use celeriant_wal::{constants::{BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED, MINIBATCH_SIZE_BYTES}, datablocks::datablock_aggregate_event_batch::DatablockAggregateEventBatch, metablocks::{datablock_storage_kind::DatablockStorageKind, metablock::Metablock, metablock_event_batch::EventTypesKind, metablock_kind::MetablockKind}};
 use fastbloom::BloomFilter;
 
-use crate::error::shard_read_error::ShardReadError;
-
 pub fn apply_event_filters(event_batch: &mut DatablockAggregateEventBatch, read_filters: &ReadFilters) {
     // Final event type filtering (bloom filter might have false positives)
     if let Some(event_types) = read_filters.include_event_types.as_deref() && !event_types.is_empty() {
@@ -197,7 +195,7 @@ fn bloom_filter_from_bytes(bloom_bytes: &[u64; BLOOM_BYTES / 8]) -> BloomFilter 
         .hashes(BLOOM_HASH_COUNT)
 }
 
-fn get_uncompressed_size(datablock: &DatablockStorageKind) -> u64 {
+pub fn get_uncompressed_size(datablock: &DatablockStorageKind) -> u64 {
     match datablock {
         DatablockStorageKind::None => 0,
         DatablockStorageKind::Inline(_) => MINIBATCH_SIZE_BYTES as u64,

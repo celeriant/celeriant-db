@@ -71,8 +71,8 @@ Single node, NVMe, 16 cores:
 
 | Mode | Throughput | Notes |
 |------|------------|-------|
-| Durable (fsync before ACK) | 320,000 writes/sec | Amortized fsync via batching for strong guarantees |
-| Async (fsync in background) | 2,500,000 writes/sec | For when durability can lag by 100-200ms |
+| Durable (fsync before ACK) | 370,000 writes/sec | Amortized fsync via batching for strong guarantees |
+| Async (fsync in background) | 700,000 writes/sec | For when durability can lag by 100-200ms |
 
 Latency (durable mode, p99): < 10ms
 

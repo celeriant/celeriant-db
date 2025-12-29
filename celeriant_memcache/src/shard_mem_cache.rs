@@ -264,11 +264,10 @@ impl ShardMemCache {
     /// When we begin writing to disk, we need to take the queue positions
     /// While disk is writing the queue is still available for the next batch
     pub fn take_sync_positions_snapshot(&mut self) -> SyncPositionsSnapshot {
-        let mut aggregate_queue_positions = HashMap::new();
-        std::mem::swap(
-            &mut aggregate_queue_positions,
-            &mut self.aggregate_queue_positions,
-        );
+        // Clone instead of swap - queue positions must remain visible for new writes
+        // that arrive while this sync is in progress. The queue always represents
+        // the latest indexes, even if they haven't been committed to disk yet.
+        let aggregate_queue_positions = self.aggregate_queue_positions.clone();
 
         let mut pending_append_queue = vec![];
         std::mem::swap(&mut pending_append_queue, &mut self.pending_append_queue);
@@ -402,6 +401,19 @@ impl ShardMemCache {
                     self.aggregate_client_snapshots.put(client_key, client_event_index);
                 }
             }
+
+            // Clean up queue entry only if it hasn't been updated by a newer write.
+            // If a new write came in during sync, the queue will have higher indexes.
+            if let Some(current_queue_pos) = self.aggregate_queue_positions.get(&key) {
+                if current_queue_pos.event_batch_index == queue_positions.event_batch_index {
+                    self.aggregate_queue_positions.remove(&key);
+                }
+            }
+        }
+
+        // Periodically reclaim memory from the queue HashMap
+        if self.aggregate_queue_positions.capacity() > self.aggregate_queue_positions.len().saturating_mul(2) {
+            self.aggregate_queue_positions.shrink_to_fit();
         }
     }
 
