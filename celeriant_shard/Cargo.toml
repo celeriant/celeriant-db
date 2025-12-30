@@ -24,3 +24,10 @@ tempfile.workspace = true
 uuid.workspace = true
 criterion.workspace = true
 num_cpus.workspace = true
+
+[lib]
+bench = false
+
+[[bench]]
+name = "exists_benchmark"
+harness = false

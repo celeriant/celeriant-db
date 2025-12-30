@@ -16,9 +16,9 @@ use celeriant_memcache::shard_mem_cache::ShardMemCache;
 use celeriant_memcache::sync_positions_snapshot::SyncPositionsSnapshot;
 use celeriant_msg::process_requests::Request;
 use celeriant_msg::process_responses::Response;
-use celeriant_msg::request::requests::{ReadRequest, SingleAggregateWrite, WriteRequest};
+use celeriant_msg::request::requests::{ExistsRequest, ReadRequest, SingleAggregateWrite, WriteRequest};
 use celeriant_msg::response::aggregate_event_batch::AggregateEventBatch;
-use celeriant_msg::response::responses::{ReadResponse, SuccessResponse};
+use celeriant_msg::response::responses::{ExistsResponse, ReadResponse, SuccessResponse};
 use celeriant_rotating_log::reverse_metablock_scanner::ReverseMetablockScanner;
 use celeriant_rotating_log::rotating_log_cache::RotatingLogCache;
 use celeriant_rotating_log::rotating_log_error::RotatingLogError;
@@ -101,7 +101,7 @@ impl AggregateReader for ShardWal {
 impl ShardWal {
     pub async fn process_request(&self, lease_index: Option<u64>, request: Request) -> Result<Response, ShardError> {
         match request {
-            Request::Exists(_exists_request) => Err(ShardError::Read(ShardReadError::AggregateNotExists)),
+            Request::Exists(exists_request) => self.exists(&exists_request).await.map(Response::Exists).map_err(ShardError::Read),
             Request::Read(read_request) => self.read(&read_request).await.map(Response::Read).map_err(ShardError::Read),
             Request::Write(write_request) => {
                 let lease_index = lease_index.ok_or(ShardWriteError::InvalidLeaseIndex)?;
@@ -156,6 +156,46 @@ impl ShardWal {
             aggregate_loading: LoadingCoordinator::new(),
             aggregate_client_loading: LoadingCoordinator::new(),
         })
+    }
+
+    pub async fn exists(&self, exists_request: &ExistsRequest) -> Result<ExistsResponse, ShardReadError> {
+
+        let exists = self.aggregate_exists_and_cache(&exists_request.aggregate_key).await?;
+        if !exists {
+            return Ok(ExistsResponse { correlation_id: exists_request.correlation_id, min_event_batch_index: 0 });
+        }
+
+        let last_known_metablock = self.shard_mem_cache.borrow_mut().get_aggregate_last_metablock_pos(&exists_request.aggregate_key);
+
+        // Find the min_event_batch_index available in the WAL for this aggregate
+        let mut min_event_batch_index: u64 = last_known_metablock.event_batch_index;
+        let aggregate_key = &exists_request.aggregate_key;
+
+        let mut scanner = ReverseMetablockScanner::new(
+            &self.rotating_log_cache,
+            last_known_metablock.log_id,
+            Some(last_known_metablock.metablock_absolute_pos.saturating_add(FIXED_BLOCK_SIZE_BYTES as u64)), // Start after to include last known
+            self.config.read_max_chunk_size,
+        );
+
+        scanner
+            .scan::<(), ()>(|_log_id, _metablock_absolute_pos, metablock_bytes| {
+                // Skip metablocks for other aggregates
+                if !metablock_bytes::is_matches_aggregate_key(metablock_bytes, aggregate_key) {
+                    return Ok(None);
+                }
+
+                let batch_index = metablock_bytes::read_event_batch_event_batch_index(metablock_bytes);
+                
+                // Update minimum - since we scan backwards, each match could be older
+                min_event_batch_index = min_event_batch_index.min(batch_index);
+
+                // Never stop early - must scan entire WAL to find true minimum
+                Ok(None)
+            })
+            .await?;
+        
+        Ok(ExistsResponse { correlation_id: exists_request.correlation_id, min_event_batch_index })
     }
 
     /// Write events to an aggregate.

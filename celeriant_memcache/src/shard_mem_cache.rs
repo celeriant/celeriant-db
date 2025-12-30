@@ -445,12 +445,16 @@ impl ShardMemCache {
             return MetablockPosition {
                 log_id: file_pos.log_id,
                 metablock_absolute_pos: file_pos.metablock_absolute_pos,
+                event_batch_index: file_pos.event_batch_index,
+                event_index: file_pos.event_index,
             };
         }
 
         MetablockPosition {
             log_id: 0,
             metablock_absolute_pos: 0,
+            event_batch_index: 0,
+            event_index: 0,
         }
     }
 

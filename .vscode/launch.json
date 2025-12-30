@@ -4,6 +4,30 @@
         {
             "type": "lldb",
             "request": "launch",
+            "name": "Debug exists_benchmark",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bench",
+                    "exists_benchmark",
+                    "-p",
+                    "celeriant_shard"
+                ],
+                "filter": {
+                    "name": "exists_benchmark",
+                    "kind": "bench"
+                }
+            },
+            "args": [
+                "--bench",
+                "--nocapture"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {}
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
             "name": "Debug celeriant (debug build)",
             "cargo": {
                 "args": [
@@ -16,7 +40,15 @@
                     "kind": "bin"
                 }
             },
-            "args": ["--listen-address", "0.0.0.0:10000", "--num-shards", "1", "--shard-log-preallocate-bytes", "20971520", "--non-durable-writes"],
+            "args": [
+                "--listen-address",
+                "0.0.0.0:10000",
+                "--num-shards",
+                "1",
+                "--shard-log-preallocate-bytes",
+                "20971520",
+                "--non-durable-writes"
+            ],
             "cwd": "${workspaceFolder}",
             "env": {}
         },

@@ -52,7 +52,7 @@ pub struct AggregateContextInfo {
 
 pub struct App {
     pub server_address: String,
-    pub client: Option<CeleriantClient>,
+    pub is_active: bool,
     pub screen: Screen,
     pub previous_screen: Option<Screen>,
     pub input_mode: InputMode,
@@ -162,7 +162,7 @@ impl App {
 
         Self {
             server_address: server_address.clone(),
-            client: None,
+            is_active: false,
             screen: Screen::Home,
             previous_screen: None,
             input_mode: InputMode::Normal,
@@ -238,7 +238,7 @@ impl App {
     }
 
     pub fn is_connected(&self) -> bool {
-        self.client.is_some()
+        self.is_active
     }
     
     pub fn set_status(&mut self, msg: &str) {
@@ -279,12 +279,14 @@ impl App {
     }
     
     pub async fn connect(&mut self) -> Result<(), String> {
-        self.set_status(&format!("Connecting to {}...", self.server_address));
+        self.set_status(&format!("Testing connection to {}...", self.server_address));
         
+        // Just test connectivity - connection will be dropped after this
         match CeleriantClient::connect(&self.server_address).await {
-            Ok(client) => {
-                self.client = Some(client);
-                self.set_status(&format!("Connected to {}", self.server_address));
+            Ok(_client) => {
+                // Connection successful, client drops here
+                self.is_active = true;
+                self.set_status(&format!("Ready to use {}", self.server_address));
                 Ok(())
             }
             Err(e) => {
@@ -296,15 +298,18 @@ impl App {
     }
     
     pub async fn disconnect(&mut self) {
-        self.client = None;
+        self.is_active = false;
         self.selected_org = None;
         self.aggregate_context = None;
         self.set_status("Disconnected");
     }
     
     pub async fn check_aggregate_exists(&mut self) -> Result<(), String> {
-        let client = self.client.as_mut().ok_or("Not connected")?;
         let ctx = self.aggregate_context.as_mut().ok_or("No aggregate selected")?;
+        
+        let mut client = CeleriantClient::connect(&self.server_address)
+            .await
+            .map_err(|e| format!("Connection failed: {}", e))?;
         
         let key = AggregateKey::new(ctx.org_id, ctx.aggregate_type_id, ctx.aggregate_id);
         let request = Request::Exists(ExistsRequest {
@@ -330,8 +335,11 @@ impl App {
     }
     
     pub async fn read_events(&mut self) -> Result<(), String> {
-        let client = self.client.as_mut().ok_or("Not connected")?;
         let ctx = self.aggregate_context.as_ref().ok_or("No aggregate selected")?;
+        
+        let mut client = CeleriantClient::connect(&self.server_address)
+            .await
+            .map_err(|e| format!("Connection failed: {}", e))?;
         
         let from: u64 = self.read_from_index.parse().unwrap_or(1);
         let to: Option<u64> = if self.read_to_index.is_empty() {
@@ -404,8 +412,11 @@ impl App {
     }
         
     pub async fn write_event(&mut self) -> Result<(), String> {
-        let client = self.client.as_mut().ok_or("Not connected")?;
         let ctx = self.aggregate_context.as_ref().ok_or("No aggregate selected")?;
+        
+        let mut client = CeleriantClient::connect(&self.server_address)
+            .await
+            .map_err(|e| format!("Connection failed: {}", e))?;
         
         let event_type: u64 = self.write_event_type.parse().map_err(|_| "Invalid event type")?;
         
@@ -468,8 +479,11 @@ impl App {
     }
     
     pub async fn delete_aggregate(&mut self) -> Result<(), String> {
-        let client = self.client.as_mut().ok_or("Not connected")?;
         let ctx = self.aggregate_context.as_ref().ok_or("No aggregate selected")?;
+        
+        let mut client = CeleriantClient::connect(&self.server_address)
+            .await
+            .map_err(|e| format!("Connection failed: {}", e))?;
         
         let key = AggregateKey::new(ctx.org_id, ctx.aggregate_type_id, ctx.aggregate_id);
         let request = Request::Delete(DeleteRequest {
@@ -492,8 +506,11 @@ impl App {
     }
     
     pub async fn trim_aggregate(&mut self) -> Result<(), String> {
-        let client = self.client.as_mut().ok_or("Not connected")?;
         let ctx = self.aggregate_context.as_ref().ok_or("No aggregate selected")?;
+        
+        let mut client = CeleriantClient::connect(&self.server_address)
+            .await
+            .map_err(|e| format!("Connection failed: {}", e))?;
         
         let keep_from: u64 = self.trim_keep_from.parse()
             .map_err(|_| "Invalid batch index")?;

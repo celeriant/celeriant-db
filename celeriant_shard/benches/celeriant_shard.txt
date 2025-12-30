@@ -1,0 +1,14 @@
+group                                           celeriant_shard
+-----                                           ---------------
+exists_wal_scan/known_aggregate/1seg_128mb      1.00     39.7±0.11ms     3.2 GB/sec
+exists_wal_scan/known_aggregate/2seg_256mb      1.00     81.8±0.26ms     3.1 GB/sec
+exists_wal_scan/known_aggregate/4seg_512mb      1.00    166.8±0.31ms     3.0 GB/sec
+exists_wal_scan/known_aggregate/8seg_1gb        1.00    341.2±0.56ms     2.9 GB/sec
+exists_wal_scan/unknown_aggregate/1seg_128mb    1.00     30.3±0.20ms     4.1 GB/sec
+exists_wal_scan/unknown_aggregate/2seg_256mb    1.00     80.7±0.67ms     3.1 GB/sec
+exists_wal_scan/unknown_aggregate/4seg_512mb    1.00    175.5±1.15ms     2.8 GB/sec
+exists_wal_scan/unknown_aggregate/8seg_1gb      1.00    352.5±1.16ms     2.8 GB/sec
+exists_wal_scan/wal_size/1seg_128mb             1.00     41.5±0.11ms     3.0 GB/sec
+exists_wal_scan/wal_size/2seg_256mb             1.00     80.7±0.13ms     3.1 GB/sec
+exists_wal_scan/wal_size/4seg_512mb             1.00    164.0±0.24ms     3.0 GB/sec
+exists_wal_scan/wal_size/8seg_1gb               1.00    327.6±0.59ms     3.1 GB/sec
