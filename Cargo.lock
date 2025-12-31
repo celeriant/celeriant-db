@@ -422,6 +422,7 @@ dependencies = [
  "celeriant_wal",
  "celeriant_wire",
  "criterion",
+ "fastbloom",
  "futures-lite",
  "glommio",
  "lru 0.16.2",

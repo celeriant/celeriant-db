@@ -31,3 +31,7 @@ bench = false
 [[bench]]
 name = "exists_benchmark"
 harness = false
+
+[[bench]]
+name = "write_benchmark"
+harness = false

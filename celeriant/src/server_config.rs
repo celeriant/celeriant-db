@@ -124,9 +124,9 @@ pub struct ServerConfig {
 
     #[arg(
         long,
-        default_value_t = 10000,
+        default_value_t = 17000,
         env = "CELERIANT_FSYNC_DELAY_US",
-        help = "Amortised fsync duration block (10ms)"
+        help = "Amortised fsync duration block (17ms)"
     )]
     pub fsync_delay_us: u64,
 
@@ -333,7 +333,7 @@ impl Default for ServerConfig {
             s3_secret_access_key: None,
             s3_subfolder: None,
             shard_log_preallocate_bytes: 1024 * 1024 * 1024,
-            fsync_delay_us: 10000,
+            fsync_delay_us: 17000,
             non_durable_writes: false,
             recent_write_cache_bytes: 512 * 1024 * 1024,
             client_connection_timeout_ms: 30000,

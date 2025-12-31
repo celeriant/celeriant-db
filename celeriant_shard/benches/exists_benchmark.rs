@@ -47,7 +47,7 @@ fn create_config(shard_dir: PathBuf) -> InternalShardConfig {
         node_id: 1,
         max_open_files: 256,
         shard_log_preallocate_bytes: SEGMENT_SIZE_BYTES,
-        fsync_delay: Duration::from_millis(1),
+        fsync_delay: Duration::from_millis(10),
         recent_write_cache_bytes: 64 * 1024 * 1024,
         non_durable_writes: false,
         shard_dir,

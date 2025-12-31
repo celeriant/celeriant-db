@@ -1,213 +1,298 @@
 # Celeriant
 
-A distributed, append-only event store. Built for teams who need a fast, correct WAL substrate for event sourcing without the complexity of traditional distributed databases or messaging systems.
+A fast, correct write-ahead log for event sourcing.
 
-Celeriant is a write-ahead log designed specifically for event sourcing workloads. Think of it as a distributed, redundant WAL with per-aggregate total ordering and optimistic concurrency control.
+Not a database. Not a stream. Just the write side of CQRS, done properly.
 
-It is **not** a general-purpose database. It stores opaque byte arrays organised by aggregate. Minimal indexes. No query language. No read-side projections. Just a fast, correct log you can build on top of. It's the write side of CQRS.
+## The Problem
 
-```
-org_id / aggregate_type_id / aggregate_id → append-only event stream
-```
+Event sourcing keeps getting built on the wrong foundations.
 
-Each aggregate is an independent, totally-ordered event stream. Writes are acknowledged only after a durable disk write and quorum replication.
+**Postgres** — Transactions and ACID are great. But append-only, high-cardinality, small-write workloads are its worst case. You'll spend more time tuning vacuum and fighting WAL amplification than building your product.
 
-## Why It Exists
+**Kafka** — Excellent at fan-out and replay. Terrible at per-aggregate ordering and optimistic concurrency. Partitions aren't aggregates. No way for consumers to filter by aggregate or event types. Operationally complex. And it dies at ~200k topics per partition. Want one topic per aggregate? Good luck.
 
-Event sourcing has a tooling problem.
+**KurrentDB** — Closest competitor. But it mixes read and write concerns, it's slow, and the licensing is complicated.
 
-**PostgreSQL** - Teams reach for it because they need transactions and OCC. But Postgres wasn't built for append-only workloads with millions of small writes. You end up fighting WAL amplification, vacuum pressure, and replication lag. It works, but its heavy. Chatty commit protocols. Not serverless-friendly. You're paying for B-trees and query planners you don't need.
+## What Celeriant Is
 
-**EventStoreDB** - The closest competitor. But it conflates write and read concerns, it's not really open source, and it's built on .NET with all the operational baggage that entails. Including projections in the core was a design mistake.
-
-**Kafka** - Great for streaming, wrong abstraction for event sourcing. No per-aggregate ordering guarantees without careful partitioning. No optimistic concurrency control. Consumer groups are opaque broker magic. No fsync by default. No filtering by aggregate or event type.
-
-Celeriant solves the write side of CQRS. Nothing more.
-
-## Architecture
-
-### Thread-Per-Core, Share Nothing
-
-Each server runs one executor per CPU core. Each core owns a subset of aggregates. No locks. No cross-thread coordination for hot-path operations. Similar to ScyllaDB and TigerBeetle's approach.
-
-### S3 as Control Plane
-
-We don't implement Raft or Paxos. Instead, we use S3's conditional writes (If-Match/If-None-Match) for lease-based coordination.
-
-1. S3 provides strong read-after-write consistency
-2. Conditional writes give you compare-and-swap semantics
-3. Leader doesn't renew lease with S3 constantly, only in leader transition. If S3 goes down, your cluster stays up.
-4. The cluster only runs with two nodes, a leader and a follower. If the follower goes down, data is replicated to S3 before ack to client. If the leader goes down, the follower becomes leader and the cluster continues to operate.
-
-Leases are stored in S3. This design requires syncronised clocks but simplifies everything else. 
-
-### Data Path
+A distributed, append-only log organised by aggregate.
 
 ```
-Client Write Request
-    │
-    ▼
-Lease Check (cached, validated against S3)
-    │
-    └─ Not leader? Tell client who is leader.
-    │
-    ▼
-Local Append + amortised fsync
-    │
-    ▼
-Concurrent Replication to Follower
-    │
-    └─ Timeout? Replicate to S3 instead
-    │
-    ▼
-Client ACK
+org_id / aggregate_type_id / aggregate_id → ordered event stream
 ```
 
-Clients get explicit control. No broker-managed offsets. No consumer groups. You read from a batch index, you get events from that point forward. Server side filtering allows clients to get the event types they are interested in.
+Each aggregate is an independent, totally-ordered stream. Writes are acknowledged after durable disk write and quorum replication.
+
+**You get:**
+- Per-aggregate total ordering (no gaps, no reordering)
+- Optimistic concurrency control (expected batch index)
+- Dynamic consistency boundaries - Conditionally, atomically write events to multiple aggregates
+- Client idempotency (duplicate writes rejected)
+- Infinite cardinality (millions of aggregates, no tuning)
+- Schema validation (aggregate type x event type)
+- Explicit offsets (you control your read position)
+- Event type filtering (bloom filter accelerated)
+- Watch API (real-time change notifications)
+- Compression (zstd, snappy, brotli, gzip)
+- In-memory read cache (recent events served from memory)
+
+**You don't get:**
+- Queries
+- Indexes
+- Projections
+- Consumer groups
+- Automatic offset management
+
+It's not a state machine, a message streaming platform or a queue. You have to build your read side yourself.
+
+## Infinite Cardinality
+
+Kafka partitions don't scale past ~200k topics. Postgres tables with millions of aggregate IDs need careful indexing and partitioning. Most event stores require memory proportional to the number of aggregates.
+
+Celeriant doesn't.
+
+Memory usage is bounded and predictable regardless of how many aggregates you have. One aggregate or ten million - it's same memory footprint.
+
+How:
+- Bloom filters
+- LRU caches with fixed size bounds (not unbounded maps)
+- Reverse WAL scanning for cold aggregates (disk is cheap, RAM isn't)
+
+The tradeoff: cold aggregate reads hit disk. Hot aggregates are cached. You get predictable performance without capacity planning.
+
+This means you can model:
+- One stream per user
+- One stream per device
+- One stream per game match
+- One stream per order
+- One stream per anything
+
+Without worrying about whether your infrastructure will fall over.
 
 ## Performance
 
 Single node, NVMe, 16 cores:
 
-| Mode | Throughput | Notes |
-|------|------------|-------|
-| Durable (fsync before ACK) | 370,000 writes/sec | Amortized fsync via batching for strong guarantees |
-| Async (fsync in background) | 700,000 writes/sec | For when durability can lag by 100-200ms |
+| Mode | Throughput | Latency (p99) |
+|------|------------|---------------|
+| Durable (fsync before ACK) | 370,000 writes/sec | < 30ms |
+| Async (fsync in background) | 700,000 writes/sec | < 10ms |
 
-Latency (durable mode, p99): < 10ms
+Kafka on the same hardware with default settings: ~40,000 writes/sec.
 
-Kafka on the same hardware with default settings (no fsync): ~40,000 writes/sec.
-
-## Features
-
-### What You Get
-
-- **Per-aggregate total ordering** - Events within an aggregate are strictly ordered, no gaps
-- **Optimistic concurrency control** - Writes can specify expected batch index
-- **Dynamic Consistency Boundaries** - Conditionally, atomically write events to multiple aggregates
-- **Client idempotency** - Deduplication via client-assigned event indexes
-- **Event type filtering** - Read only events of specific types, bloom filter acceleration
-- **Schema Validation** - Enforce schemas at the event type level per aggregate type
-- **Compression** - Zstd, Snappy, Brotli, Gzip per-batch
-- **In-memory read cache** - Recent events served from memory
-- **Explicit offsets** - You control your read position for each aggregate
-- **Distributed, Redundant Replication** - Synchronous replication to follower node
-- **Watch API** - Get notified immediately when other clients perform operations on aggregates
-
-### What You Don't Get
-
-- Query language
-- Indexes
-- Projections / read models
-- Consumer groups
-- Automatic offset management
-
-It's not a state machine, a message streaming platform or a queue.
-
-## API
-
-The protocol is binary over TCP. Request types:
-
-| Operation | Description |
-|-----------|-------------|
-| `Write` | Append events to an aggregate |
-| `Read` | Read events with filters |
-| `Exists` | Check if aggregate exists |
-| `TrimStart` | Remove old events (retention) |
-| `Delete` | Remove the entire aggregate |
-| `Watch` | Get notified immediately with new events for an aggregate |
-
-Events are opaque byte array payloads. You handle serialization.
-
-Clients support automatic leader discovery and timeouts.
-
-## Deployment
-
-This server is LINUX ONLY due to io_uring use. It can run inside mac/windows using docker/wsl however.
-
-### Single Node
-
-```bash
-./celeriant --data-root /var/lib/celeriant
-```
-
-By default Celeriant will utilise all CPU cores on your server.
-
-### Testing Replicated Clusters
-
-Make sure your AWS CLI is setup and you've got your creds in `~/.aws/credentials` and region in `~/.aws/config`.
-
-```bash
-chmod +x s3_server.sh
-./s3_server.sh test-bucket test-folder --listen-address 0.0.0.0:9001 --data-root data1
-./s3_server.sh test-bucket test-folder --listen-address 0.0.0.0:9002 --data-root data2
-```
-
-Nodes discover each other via S3 membership. No static configuration required.
-
-### Docker
+## Quick Start
 
 ```bash
 docker run -d \
-    --name celeriant \
-    -p 10000:10000 \
-    -v celeriant-data:/app/data \
-    celeriant/celeriant-db:latest
+  -p 10000:10000 \
+  -v celeriant-data:/data \
+  celeriant/celeriant:latest
 ```
 
-## Use Cases
+```rust
+// Write events
+let response = client.write(WriteRequest {
+    aggregate_key: AggregateKey { org_id, aggregate_type_id, aggregate_id },
+    events: vec![Event { event_type: 1, payload: bytes }],
+    expected_event_batch_index: Some(0), // OCC
+    allow_create: true,
+    ..Default::default()
+}).await?;
 
-Celeriant is the write side for:
-
-- **Event-sourced microservices** - Aggregates shared between services, adding events requires current aggregate state as invariant
-- **Financial systems** - Per-account event logs with strict ordering
-- **Audit trails** - Immutable, append-only records
-- **Game state** - Low latency, high throughput per-player or per-match event streams
-- **Offline first and collaborative apps** - Avoid CRDTs and store events instead with local projections
-- **IoT event ingestion** - Per-device event series with no complex indexing or bucketing
-
-If you need a fast, correct log per "thing" and you'll build the read side yourself, this is for you.
-
-## When Not to Use It
-
-- You need ad-hoc queries over aggregate state (use a read database)
-- You want server-managed consumer groups for message fan-out (use Kafka)
-
-## Status
-
-**Alpha**. The core is stable and we're running it in production, but the API may change.
-
-### Roadmap
-- Data tiering - reduce costs by offloading data to object storage / glacier
-- Hosted services - managed Celeriant as a service
-- Admin UI / control plane
-- Fine-grained permissions - OAuth2, etc.
-
-## Building
-
-Requires Rust 1.91+ and Linux (for io_uring via glommio).
-
-```bash
-cargo build --release -p celeriant_server
+// Read events
+let events = client.read(ReadRequest {
+    aggregate_key,
+    from_event_batch_index: Some(0),
+    include_event_types: Some(vec![1, 2, 3]),
+    ..Default::default()
+}).await?;
 ```
 
-## Contributing
+## Schema Validation
 
-Discussions and PRs welcome. The codebase prioritises correctness and simplicity. If you're proposing a change, include tests and updated benchmarks.
+Enforce schemas at write time. No invalid events hit the log.
 
-- Questions or bugs? [Open a GitHub Discussion](https://github.com/celeriant/celeriant-server/discussions)
-- Commercial inquiries? [LinkedIn](https://www.linkedin.com/in/tyson-brown-208b88b6)
+```rust
+// Register a schema for an event type
+client.register_schema(RegisterSchemaRequest {
+    org_id,
+    aggregate_type_id,
+    event_type: 1,
+    schema_format: SchemaFormat::JsonSchema,
+    schema: json_schema_bytes,
+}).await?;
+
+// Writes with event_type=1 are now validated against this schema
+// Invalid payloads are rejected before persistence
+```
+
+Supported formats:
+- JSON Schema
+- Avro
+- Protobuf
+- MessagePack (with schema)
+
+Schemas are versioned. Event types can bump their major version for breaking changes.
+
+## Architecture
+
+### Thread-Per-Core
+
+One executor per CPU core. Each core owns a subset of aggregates. No locks on the hot path. Similar to ScyllaDB and TigerBeetle.
+
+### Replication
+
+Two nodes: leader and follower. Synchronous replication before client ACK.
+
+No Raft. No Paxos. We use S3 conditional writes for lease-based coordination.
+
+Why? Consensus protocols are operationally complex and mostly overkill for append-only workloads. S3 provides strong read-after-write consistency and compare-and-swap via ETags. That's enough.
+
+If the follower is unreachable, we replicate to S3 instead. No write is acknowledged until it's on two storage systems.
+
+### Failure Modes
+
+We document them. Explicitly.
+
+| Scenario | Behaviour |
+|----------|-----------|
+| Leader crash | Follower takes over after lease expiry (~15s) |
+| Follower crash | Leader replicates to S3, continues accepting writes |
+| Network partition | Fencing tokens prevent split-brain data corruption |
+| S3 outage | Replication continues to follower, coordination degrades gracefully |
+
+Clock skew must be < 15 seconds. Use NTP.
+
+## Multi-Aggregate Writes
+
+Atomic writes across multiple aggregates with OCC on all of them.
+
+```rust
+client.write(WriteRequest {
+    writes: hashmap! {
+        aggregate_a => WriteData { events: [...], expected_event_batch_index: Some(5) },
+        aggregate_b => WriteData { events: [...], expected_event_batch_index: Some(12) },
+    },
+    ..Default::default()
+}).await?;
+```
+
+All aggregates must hash to the same shard. If any OCC check fails, the entire write is rejected. No partial writes.
+
+## Watch API
+
+Subscribe to aggregate changes in real-time.
+
+```rust
+let mut watch = client.watch(WatchRequest {
+    aggregates: Some(hashset![aggregate_key]),
+    requested_latency_ms: 10,
+}).await?;
+
+while let Some(event) = watch.next().await {
+    // event.aggregate_key, event.operation, event.from_batch_index, event.to_batch_index
+}
+```
+
+Backpressure via bounded channels. If you can't keep up, you get disconnected.
+
+## Listing and Discovery
+
+Filesystem-style navigation for when you need to find things.
+
+```rust
+// List all orgs
+let orgs = client.list_orgs().await?;
+
+// List aggregate types in an org
+let types = client.list_aggregate_types(org_id).await?;
+
+// List aggregates of a type (paginated)
+let aggregates = client.list_aggregates(ListAggregatesRequest {
+    org_id,
+    aggregate_type_id,
+    cursor: None,
+    limit: 1000,
+}).await?;
+
+// Check if an aggregate exists (without loading it)
+let exists = client.exists(aggregate_key).await?;
+```
+
+## Sharding
+
+Aggregates are assigned to shards by configurable routing:
+
+| Rule | Routes By |
+|------|-----------|
+| `OrgId` | `org_id % num_shards` |
+| `AggregateTypeId` | `aggregate_type_id % num_shards` |
+| `AggregateId` | `aggregate_id % num_shards` |
+
+Clients connect to any node. Requests are redirected to the owning shard automatically.
+
+## Multi-Tenancy
+
+Aggregates are namespaced by `org_id`. Isolation is at the aggregate level, not the connection level.
+
+No shared state between orgs. No cross-org queries. Each org's data is completely independent.
+
+## Other Operations
+
+### Retention
+
+```rust
+client.trim_start(TrimStartRequest {
+    aggregate_key,
+    trim_to_event_batch_index: 1000, // Delete batches 0-999
+}).await?;
+```
+
+### Deletion
+
+```rust
+client.delete(DeleteRequest { aggregate_key }).await?;
+```
+
+### Metrics
+
+Prometheus endpoint at `/metrics`. Tracks:
+- Write/read throughput and latency
+- Fsync batch size and amortisation
+- Cache hit rates
+- Replication lag
+- Watcher backpressure
+
+### Backups
+
+- Copy the data directory at any time.
+- Spin up a server with the Watch API running
+- Or run a follower and snapshot it.
+
+## Client Libraries
+
+| Language | Status |
+|----------|--------|
+| Rust | Stable |
+| Go | Stable |
+| Node.js | Stable |
+| .NET | Beta |
+| Java | Beta |
+
+## When Not to Use Celeriant
+
+- You need ad-hoc queries over aggregate state → use a read database
+- You want server-managed consumer groups → use Kafka
+- You need transactions across arbitrary keys → use a database
+- You're not doing event sourcing → this is the wrong tool
 
 ## License
 
 Apache-2.0
 
-## Readme TODOs
+## Links
 
-- IoT, Running on low power devices, green, cheap database attributes
-- Notes on infinite cardinality design ethos
-- Guiding devs on what to do for read side? eg. DuckDB, etc.
-- Notes on AI usage in celeriant, best practices & techniques
-- Embedding instead of using as server
-- Client use + serverless friendly notes
-- Notes on head-of-line blocking mitigation
+- [Documentation](https://docs.celeriant.io)
+- [GitHub Discussions](https://github.com/celeriant/celeriant/discussions)
+- [Discord](https://discord.gg/celeriant)
