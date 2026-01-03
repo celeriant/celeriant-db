@@ -35,3 +35,7 @@ harness = false
 [[bench]]
 name = "write_benchmark"
 harness = false
+
+[[bench]]
+name = "aggregate_count_benchmark"
+harness = false

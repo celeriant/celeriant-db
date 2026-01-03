@@ -1,24 +1,24 @@
-use std::{rc::Rc, time::Duration};
+use crate::amortisation::local_event::LocalEvent;
 use celeriant_rotating_log::rwlock_timeout::{read_with_timeout, write_with_timeout};
 use glommio::sync::RwLock;
-use crate::amortisation::local_event::LocalEvent;
+use std::{rc::Rc, time::Duration};
 
 /// Result of a sync operation.
 pub type SyncResult<E> = Result<(), E>;
 
 /// Coordinates delayed sync with writer coalescing.
-/// 
+///
 /// Designed for the fsync batching pattern:
 /// 1. Writer calls `request_sync()`
 /// 2. First writer becomes leader, others become followers
 /// 3. Leader sleeps for `delay` while more writers accumulate
 /// 4. Leader calls the provided sync function
 /// 5. All waiters receive the result
-/// 
+///
 /// # Example
 /// ```ignore
 /// let coordinator = SyncCoordinator::new();
-/// 
+///
 /// // Called from multiple concurrent writers
 /// coordinator.request_sync(
 ///     Some(Duration::from_millis(5)),
@@ -27,12 +27,14 @@ pub type SyncResult<E> = Result<(), E>;
 /// ```
 pub struct Coordinator<E: Clone> {
     lock_orchestrator: RwLock<Option<Rc<LocalEvent<SyncResult<E>>>>>,
+    sync_serializer: RwLock<()>, // Ensures one sync at a time
 }
 
 impl<E: Clone> Coordinator<E> {
     pub fn new() -> Self {
         Self {
             lock_orchestrator: RwLock::new(None),
+            sync_serializer: RwLock::new(()),
         }
     }
 
@@ -63,24 +65,29 @@ impl<E: Clone> Coordinator<E> {
                             Acquired::Leader(event)
                         }
                     },
-                    Err(_) => {
-                        match read_with_timeout(&self.lock_orchestrator, "request_sync_read_be_follower").await {
-                            Ok(guard) => match guard.as_ref() {
-                                Some(event) => Acquired::Follower(event.clone()),
-                                None => Acquired::Retry,
-                            },
-                            Err(_) => Acquired::Retry,
-                        }
-                    }
+                    Err(_) => match read_with_timeout(&self.lock_orchestrator, "request_sync_read_be_follower").await {
+                        Ok(guard) => match guard.as_ref() {
+                            Some(event) => Acquired::Follower(event.clone()),
+                            None => Acquired::Retry,
+                        },
+                        Err(_) => Acquired::Retry,
+                    },
                 }
             }; // Guards dropped here automatically
 
             match acquired {
                 Acquired::Leader(event) => {
                     glommio::timer::sleep(delay).await;
-                    let _ = write_with_timeout(&self.lock_orchestrator, "request_sync_write_leader_clear_lock_orchestrator").await.map(|mut g| g.take());
-                    self.lock_orchestrator.write().await.unwrap().take();
+
+                    if let Ok(mut guard) = write_with_timeout(&self.lock_orchestrator, "request_sync_clear_orchestrator").await {
+                        guard.take();
+                    }
+
+                    // Serialize sync operations - wait for previous sync to complete
+                    let _sync_guard = self.sync_serializer.write().await.ok();
                     let result = sync_fn().await;
+                    drop(_sync_guard);
+
                     event.notify(result.clone());
                     return result;
                 }
@@ -94,10 +101,10 @@ impl<E: Clone> Coordinator<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_lite::future::yield_now;
+    use glommio::{LocalExecutorBuilder, Placement, spawn_local};
     use std::cell::{Cell, RefCell};
     use std::future::Future;
-    use futures_lite::future::yield_now;
-    use glommio::{spawn_local, LocalExecutorBuilder, Placement};
 
     fn run_with_glommio<G, F, T>(fut_gen: G)
     where
@@ -301,9 +308,7 @@ mod tests {
                 let res = results.clone();
 
                 handles.push(spawn_local(async move {
-                    let result = coord
-                        .request_sync(Some(Duration::from_millis(5)), || async { Ok(()) })
-                        .await;
+                    let result = coord.request_sync(Some(Duration::from_millis(5)), || async { Ok(()) }).await;
                     res.borrow_mut().push(result);
                 }));
 
@@ -431,9 +436,7 @@ mod tests {
             let coordinator: Coordinator<String> = Coordinator::new();
 
             let result = coordinator
-                .request_sync(Some(Duration::from_millis(1)), || async {
-                    Err("sync failed".to_string())
-                })
+                .request_sync(Some(Duration::from_millis(1)), || async { Err("sync failed".to_string()) })
                 .await;
 
             assert!(result.is_err());
@@ -455,9 +458,7 @@ mod tests {
 
                 handles.push(spawn_local(async move {
                     let result = coord
-                        .request_sync(Some(Duration::from_millis(5)), || async move {
-                            Err(format!("error from task {}", i))
-                        })
+                        .request_sync(Some(Duration::from_millis(5)), || async move { Err(format!("error from task {}", i)) })
                         .await;
                     res.borrow_mut().push(result);
                 }));
@@ -491,11 +492,7 @@ mod tests {
             let sf = should_fail.clone();
             let result = coord
                 .request_sync(Some(Duration::from_millis(1)), || async move {
-                    if sf.get() {
-                        Err("first failure".to_string())
-                    } else {
-                        Ok(())
-                    }
+                    if sf.get() { Err("first failure".to_string()) } else { Ok(()) }
                 })
                 .await;
             assert!(result.is_err());
@@ -504,9 +501,7 @@ mod tests {
             should_fail.set(false);
             glommio::timer::sleep(Duration::from_millis(5)).await;
 
-            let result = coordinator
-                .request_sync(Some(Duration::from_millis(1)), || async { Ok(()) })
-                .await;
+            let result = coordinator.request_sync(Some(Duration::from_millis(1)), || async { Ok(()) }).await;
             assert!(result.is_ok());
         });
     }
@@ -633,11 +628,7 @@ mod tests {
             let follower_sync_called = Rc::new(Cell::new(false));
 
             let coord = coordinator.clone();
-            let leader = spawn_local(async move {
-                coord
-                    .request_sync(Some(Duration::from_millis(10)), || async { Ok(()) })
-                    .await
-            });
+            let leader = spawn_local(async move { coord.request_sync(Some(Duration::from_millis(10)), || async { Ok(()) }).await });
 
             yield_now().await;
 
@@ -673,9 +664,7 @@ mod tests {
             let coordinator: Coordinator<String> = Coordinator::new();
 
             for i in 0..5 {
-                let result = coordinator
-                    .request_sync(Some(Duration::from_millis(1)), || async { Ok(()) })
-                    .await;
+                let result = coordinator.request_sync(Some(Duration::from_millis(1)), || async { Ok(()) }).await;
                 assert!(result.is_ok(), "Iteration {} failed", i);
 
                 glommio::timer::sleep(Duration::from_millis(5)).await;
@@ -791,9 +780,7 @@ mod tests {
 
                 handles.push(spawn_local(async move {
                     let _ = coord
-                        .request_sync(Some(Duration::from_millis(5)), || async {
-                            Err("intentional error".to_string())
-                        })
+                        .request_sync(Some(Duration::from_millis(5)), || async { Err("intentional error".to_string()) })
                         .await;
                     // This should still execute
                     cc.set(cc.get() + 1);
