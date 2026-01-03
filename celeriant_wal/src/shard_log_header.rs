@@ -2,8 +2,13 @@
 use bincode::{Decode, Encode};
 use deepsize::DeepSizeOf;
 
-use crate::constants::{FIXED_BLOCK_SIZE_BYTES};
+use crate::constants::{AGGREGATE_BLOOM_BYTES, FIXED_BLOCK_SIZE_BYTES};
 
+
+    /// Bloom filter for aggregate keys written to this log segment.
+    /// Used to quickly skip log segments during aggregate existence checks.
+    /// A "definitely not in set" result means no metablocks for that aggregate exist.
+    // pub aggregate_bloom: [u64; AGGREGATE_BLOOM_BYTES / 8],
 /// The header is written at the start and end of the 1GB fixed size file
 /// Writing both, protected by crc checks, allows recovery on torn writes
 #[derive(Debug, Clone, Encode, Decode, DeepSizeOf)]
@@ -28,6 +33,7 @@ impl ShardLogHeader {
     const WIRE_SIZE_METABLOCKS_POSITION: usize = 8;
     const WIRE_SIZE_DATABLOCKS_POSITION: usize = 8;
     const WIRE_SIZE_WAL_INDEX: usize = 8;
+    const WIRE_SIZE_AGGREGATE_BLOOM: usize = AGGREGATE_BLOOM_BYTES;
 
     pub const OFFSET_METABLOCKS_POSITION: usize = 0;
 
@@ -37,15 +43,19 @@ impl ShardLogHeader {
     pub const OFFSET_WAL_INDEX: usize = 
         Self::OFFSET_DATABLOCKS_POSITION + Self::WIRE_SIZE_DATABLOCKS_POSITION;
 
+    pub const OFFSET_AGGREGATE_BLOOM: usize =
+        Self::OFFSET_WAL_INDEX + Self::WIRE_SIZE_WAL_INDEX;
+
     /// Total wire size of ShardLogHeader
     pub const WIRE_SIZE_TOTAL: usize = 
-        Self::OFFSET_WAL_INDEX + Self::WIRE_SIZE_WAL_INDEX; // = 24 bytes
+        Self::OFFSET_AGGREGATE_BLOOM + Self::WIRE_SIZE_AGGREGATE_BLOOM; // = 152 bytes
         
     pub fn new(file_len: u64) -> Self {
         Self {
             metablocks_position: FIXED_BLOCK_SIZE_BYTES as u64,
             datablocks_position: file_len.saturating_sub(FIXED_BLOCK_SIZE_BYTES as u64),
             wal_index: 0,
+            // aggregate_bloom: [0u64; AGGREGATE_BLOOM_BYTES / 8],
         }
     }
 

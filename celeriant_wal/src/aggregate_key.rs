@@ -50,6 +50,12 @@ impl AggregateKey {
         }
     }
 
+    /// Returns the pre-computed hash as bytes for bloom filter insertion.
+    #[inline]
+    pub fn hash_bytes(&self) -> [u8; 8] {
+        self.hash.to_le_bytes()
+    }
+
     fn compute_hash(org_id: u128, aggregate_type_id: u128, aggregate_id: u128) -> u64 {
         use std::collections::hash_map::DefaultHasher;
         let mut hasher = DefaultHasher::new();
