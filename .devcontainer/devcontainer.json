@@ -1,0 +1,15 @@
+{
+  "name": "rust-io-uring",
+  "image": "mcr.microsoft.com/devcontainers/rust:1-1-bookworm",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+  },
+  "runArgs": [
+    "--cap-add=SYS_ADMIN",
+    "--ulimit=memlock=-1:-1"
+  ],
+  "containerEnv": {
+    "RUST_BACKTRACE": "1"
+  },
+  "postCreateCommand": "rustup component add rustfmt clippy"
+}

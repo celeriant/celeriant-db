@@ -647,6 +647,19 @@ async fn sync_with_rollback(
     shard_mem_cache: Rc<RefCell<ShardMemCache>>,
     watched_aggregates: Rc<AggregateWatchers>,
 ) -> Result<(), ShardFsyncError> {
+    {
+        let cache = shard_mem_cache.borrow();
+        if !cache.requires_write() {
+            // Queue is empty - another batch already synced our data
+            if cache.force_durable_on_next_write() {
+                return Err(ShardFsyncError::IoError(
+                    "Disk sync failure forced queue clear".to_string()
+                ));
+            }
+            return Ok(());
+        }
+    }
+    
     // Lock the writer before we take the snapshot of the queue
     let lockable_active_log_file = rotating_log_cache.active();
     let mut shard_log_dma_file = write_with_timeout(&lockable_active_log_file, "sync_with_rollback").await?;
@@ -1208,17 +1221,19 @@ impl ShardWal {
                 .map(|(_, p)| p)
                 .collect();
 
-            let file = self.rotating_log_cache.get(log_id).await?;
-            let guard = read_with_timeout(&file, "fetch_datablocks").await?;
-            let dma = guard.dma_file.as_ref()
-                .ok_or_else(|| ShardReadError::IoError(format!("No file handle for log {}", log_id)))?;
+            let blobs = {
+                let file = self.rotating_log_cache.get(log_id).await?;
+                let guard = read_with_timeout(&file, "fetch_datablocks").await?;
+                let dma = guard.dma_file.as_ref()
+                    .ok_or_else(|| ShardReadError::IoError(format!("No file handle for log {}", log_id)))?;
 
-            let blobs = read_objects_absolute::read_objects_absolute(
-                dma, 
-                guard.file_len, 
-                &pos_only,
-                self.config.read_max_chunk_size
-            ).await?;
+                read_objects_absolute::read_objects_absolute(
+                    dma, 
+                    guard.file_len, 
+                    &pos_only,
+                    self.config.read_max_chunk_size
+                ).await?
+            };
 
             // Deserialize and update results
             for (result_idx, blob) in indices.into_iter().zip(blobs) {
