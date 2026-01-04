@@ -1,24 +1,24 @@
 use celeriant_disk::files::read_fixed_records_visit_const::read_fixed_records_visit_const;
-use celeriant_wal::constants::FIXED_BLOCK_SIZE_BYTES;
+use celeriant_wal::{constants::FIXED_BLOCK_SIZE_BYTES};
 
-use crate::{rotating_log_cache::RotatingLogCache, rotating_log_error::RotatingLogError, rwlock_timeout::read_with_timeout};
+use crate::{log_segments_cache::LogSegmentsCache, rotating_log_error::RotatingLogError};
 
 /// Scans metablocks in reverse order across all log files.
 /// Starts from the active log and works backwards through older logs.
 pub struct ReverseMetablockScanner<'a> {
-    log_cache: &'a RotatingLogCache,
+    log_cache: &'a LogSegmentsCache,
     current_log_id: u64,
     chunk_size: u64,
     start_from_position: Option<u64>,
 }
 
 impl<'a> ReverseMetablockScanner<'a> {
-    pub fn new(log_cache: &'a RotatingLogCache, starting_log_id: u64, start_from_position: Option<u64>, chunk_size: u64) -> Self {
+    pub fn new(log_cache: &'a LogSegmentsCache, starting_log_id: u64, start_from_position: Option<u64>, chunk_size: u64) -> Self {
         Self {
             log_cache,
             current_log_id: starting_log_id,
             chunk_size,
-            start_from_position
+            start_from_position,
         }
     }
 
@@ -40,7 +40,7 @@ impl<'a> ReverseMetablockScanner<'a> {
         while self.current_log_id >= 1 {
             let result = self.scan_single_log(&mut visitor, override_end).await?;
             override_end = None; // Only applies to first log
-            
+
             if let Some(found) = result {
                 return Ok(Some(found));
             }
@@ -62,16 +62,12 @@ impl<'a> ReverseMetablockScanner<'a> {
     where
         E: std::fmt::Debug,
     {
-        let file_rc = self.log_cache.get(self.current_log_id).await?;
-        let guard = read_with_timeout(&file_rc, "scan_single_log").await?;
-
-        let dma_file = guard.dma_file.as_ref()
-        .ok_or_else(|| RotatingLogError::IoError("No file handle".to_string()))?;
-    
+        let log_segment_file = self.log_cache.get(self.current_log_id).await?;
+        let metablock_position = log_segment_file.metadata.borrow().metablocks_position;
+        let guard = log_segment_file.lock_reader("scan_single_log").await?;
+        let dma_file = guard.as_ref().ok_or_else(|| RotatingLogError::IoError("No file handle".to_string()))?;
         let metablocks_start = FIXED_BLOCK_SIZE_BYTES as u64;
-        let metablocks_end = override_end
-            .unwrap_or(guard.shard_log_header.metablocks_position)
-            .min(guard.shard_log_header.metablocks_position);
+        let metablocks_end = override_end.unwrap_or(metablock_position).min(metablock_position);
 
         if metablocks_end <= metablocks_start {
             return Ok(None); // No metablocks in this log

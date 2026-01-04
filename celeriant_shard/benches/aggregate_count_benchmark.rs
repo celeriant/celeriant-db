@@ -5,8 +5,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use celeriant_memcache::internal_shard_config::InternalShardConfig;
-use celeriant_memcache::timestamp_config::TimestampConfig;
+use celeriant_shard::internal_shard_config::InternalShardConfig;
+use celeriant_shard::timestamp_config::TimestampConfig;
 use celeriant_msg::request::requests::{SingleAggregateWrite, WriteRequest};
 use celeriant_shard::shard_wal::ShardWal;
 use celeriant_wal::aggregate_key::AggregateKey;
@@ -43,8 +43,6 @@ fn aggregate_count_configs() -> Vec<(&'static str, usize)> {
         ("agg_1000", 1000),
         ("agg_5000", 5000),
         ("agg_15000", 15000),
-        ("agg_30000", 30000),
-        ("agg_60000", 60000),
     ]
 }
 

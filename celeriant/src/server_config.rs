@@ -1,6 +1,6 @@
-use celeriant_memcache::timestamp_config::{TimestampConfig, TimestampPrecision};
 use celeriant_runtimes::RoutingRule;
 use celeriant_runtimes::{ShardConfig, SidecarConfig};
+use celeriant_shard::timestamp_config::{TimestampConfig, TimestampPrecision};
 use celeriant_sidecar::s3_config::S3Config;
 use clap::Parser;
 use std::{path::PathBuf, time::Duration};

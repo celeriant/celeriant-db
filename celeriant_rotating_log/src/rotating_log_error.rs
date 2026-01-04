@@ -7,6 +7,7 @@ use crate::rwlock_timeout::LockTimeoutError;
 #[derive(Debug, Clone)]
 pub enum RotatingLogError {
     InvalidPreallocatedBytes(u64),
+    BatchesTooLarge(u64),
     IoError(String),
     WireFormat(WireFormatError),
     HeaderCorrupted { log_id: Option<u64> },
@@ -24,6 +25,7 @@ impl std::fmt::Display for RotatingLogError {
                 None => write!(f, "Header corrupted, repair required"),
             },
             Self::LogFileNotFound { log_id } => write!(f, "Log file not found: {}", log_id),
+            Self::BatchesTooLarge(b) => write!(f, "Batches too large, log segment file only: {} bytes", b),
         }
     }
 }

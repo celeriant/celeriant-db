@@ -6,32 +6,29 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
-use celeriant_msg::request::read_filters::ReadFilters;
-use celeriant_wal::metablock_position::MetablockPosition;
 use celeriant_disk::files::read_objects_absolute;
-use celeriant_memcache::internal_shard_config::InternalShardConfig;
 use celeriant_memcache::mem_snapshot_aggregate::MemSnapshotAggregate;
 use celeriant_memcache::shard_log_queue_item::ShardLogQueueItem;
-use celeriant_memcache::shard_mem_cache::ShardMemCache;
+use celeriant_memcache::shard_mem_cache::{ShardMemCache};
 use celeriant_memcache::sync_positions_snapshot::SyncPositionsSnapshot;
 use celeriant_msg::process_requests::Request;
 use celeriant_msg::process_responses::Response;
+use celeriant_msg::request::read_filters::ReadFilters;
 use celeriant_msg::request::requests::{ExistsRequest, ReadRequest, SingleAggregateWrite, WriteRequest};
 use celeriant_msg::response::aggregate_event_batch::AggregateEventBatch;
 use celeriant_msg::response::responses::{ExistsResponse, ReadResponse, SuccessResponse};
+use celeriant_rotating_log::log_segment_file::LogSegmentFile;
+use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
 use celeriant_rotating_log::reverse_metablock_scanner::ReverseMetablockScanner;
-use celeriant_rotating_log::rotating_log_cache::RotatingLogCache;
 use celeriant_rotating_log::rotating_log_error::RotatingLogError;
-use celeriant_rotating_log::rwlock_timeout::{read_with_timeout, write_with_timeout};
-use celeriant_rotating_log::shard_log_dma_file::ShardLogDmaFile;
-use celeriant_wal::aggregate_client_key::{self, AggregateClientKey};
+use celeriant_rotating_log::rwlock_timeout::{write_with_timeout};
+use celeriant_wal::aggregate_client_key::{AggregateClientKey};
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::constants::{FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_METABLOCK};
 use celeriant_wal::datablocks::datablock::Datablock;
 use celeriant_wal::datablocks::datablock_aggregate_event_batch::DatablockAggregateEventBatch;
 use celeriant_wal::datablocks::datablock_kind::DatablockKind;
-use celeriant_wal::metablocks::datablock_block_ref::DatablockBlockRef;
-use celeriant_wal::metablocks::datablock_inline_data::DatablockInlineData;
+use celeriant_wal::metablock_position::MetablockPosition;
 use celeriant_wal::metablocks::datablock_storage_kind::DatablockStorageKind;
 use celeriant_wal::metablocks::metablock::Metablock;
 use celeriant_wal::metablocks::metablock_event_batch::{EventTypesKind, MetablockEventBatch};
@@ -39,11 +36,10 @@ use celeriant_wal::metablocks::metablock_kind::MetablockKind;
 use celeriant_watch::aggregate_reader::AggregateReader;
 use celeriant_watch::aggregate_watch_event::{AggregateWatchEvent, AggregateWatchEventOperation};
 use celeriant_watch::aggregate_watchers::AggregateWatchers;
-use celeriant_wire::datablock_serialization::{self, deserialize_datablock, serialize_datablock};
+use celeriant_wire::datablock_serialization::{deserialize_datablock, serialize_datablock};
 use celeriant_wire::metablock_bytes;
 use celeriant_wire::version_aware_wire_format::serialize_versioned_message;
 use deepsize::DeepSizeOf;
-use glommio::sync::RwLock;
 
 use crate::amortisation::coordinator::Coordinator;
 use crate::bloom::bloom_filter_cache::BloomFilterCache;
@@ -54,6 +50,7 @@ use crate::error::shard_fsync_error::ShardFsyncError;
 use crate::error::shard_read_error::ShardReadError;
 use crate::error::shard_write_error::ShardWriteError;
 use crate::in_memory_filtering;
+use crate::internal_shard_config::InternalShardConfig;
 use crate::loading_coordinator::LoadingCoordinator;
 
 /// Write-ahead log for a single shard.
@@ -72,7 +69,7 @@ pub struct ShardWal {
     shard_mem_cache: Rc<RefCell<ShardMemCache>>,
 
     /// Uses interior mutability with glommio RwLocks for async access to log files
-    rotating_log_cache: Rc<RotatingLogCache>,
+    log_segments_cache: Rc<LogSegmentsCache>,
 
     /// Uses interior mutability with glommio RwLocks to select an fsync leader
     fsync_coordinator: Rc<Coordinator<ShardFsyncError>>,
@@ -123,32 +120,22 @@ impl ShardWal {
     /// If the shard directory exists with log files, reopens from the latest.
     /// Otherwise creates a new shard with an empty log file.
     pub async fn open(config: InternalShardConfig) -> Result<Self, RotatingLogError> {
-        let rotating_log_cache = RotatingLogCache::new(
+        let shard_mem_cache = ShardMemCache::new(
+            config.recent_write_cache_bytes,
+            config.aggregate_snapshots_cache_bytes,
+            config.aggregate_client_snapshots_cache_bytes,
+        );
+
+        let log_segments_cache = LogSegmentsCache::ready_up(
             config.shard_dir.clone(),
             config.shard_log_preallocate_bytes,
             config.max_open_files as usize,
         )
         .await?;
 
-        let shard_mem_cache = {
-            let active_lock = rotating_log_cache.active();
-            let active_log_file = read_with_timeout(&active_lock, "shard_wal_open_active").await?;
-            let datablocks_carry_over = active_log_file.read_datablocks_carry_over_bytes().await?;
-
-            ShardMemCache::new(
-                active_log_file.file_len,
-                active_log_file.shard_log_header.metablocks_position,
-                active_log_file.shard_log_header.datablocks_position,
-                active_log_file.shard_log_header.wal_index,
-                datablocks_carry_over,
-                config.clone(),
-                active_log_file.log_id,
-            )
-        };
-
         Ok(Self {
             shard_mem_cache: Rc::new(RefCell::new(shard_mem_cache)),
-            rotating_log_cache: Rc::new(rotating_log_cache),
+            log_segments_cache: Rc::new(log_segments_cache),
             fsync_coordinator: Rc::new(Coordinator::new()),
             watched_aggregates: Rc::new(AggregateWatchers::new()),
             bloom_filter_cache: Rc::new(BloomFilterCache::new()),
@@ -159,20 +146,25 @@ impl ShardWal {
     }
 
     pub async fn exists(&self, exists_request: &ExistsRequest) -> Result<ExistsResponse, ShardReadError> {
-
         let exists = self.aggregate_exists_and_cache(&exists_request.aggregate_key).await?;
         if !exists {
-            return Ok(ExistsResponse { correlation_id: exists_request.correlation_id, min_event_batch_index: 0 });
+            return Ok(ExistsResponse {
+                correlation_id: exists_request.correlation_id,
+                min_event_batch_index: 0,
+            });
         }
 
-        let last_known_metablock = self.shard_mem_cache.borrow_mut().get_aggregate_last_metablock_pos(&exists_request.aggregate_key);
+        let last_known_metablock = self
+            .shard_mem_cache
+            .borrow_mut()
+            .get_aggregate_last_metablock_pos(&exists_request.aggregate_key);
 
         // Find the min_event_batch_index available in the WAL for this aggregate
         let mut min_event_batch_index: u64 = last_known_metablock.event_batch_index;
         let aggregate_key = &exists_request.aggregate_key;
 
         let mut scanner = ReverseMetablockScanner::new(
-            &self.rotating_log_cache,
+            &self.log_segments_cache,
             last_known_metablock.log_id,
             Some(last_known_metablock.metablock_absolute_pos.saturating_add(FIXED_BLOCK_SIZE_BYTES as u64)), // Start after to include last known
             self.config.read_max_chunk_size,
@@ -186,7 +178,7 @@ impl ShardWal {
                 }
 
                 let batch_index = metablock_bytes::read_event_batch_event_batch_index(metablock_bytes);
-                
+
                 // Update minimum - since we scan backwards, each match could be older
                 min_event_batch_index = min_event_batch_index.min(batch_index);
 
@@ -194,8 +186,11 @@ impl ShardWal {
                 Ok(None)
             })
             .await?;
-        
-        Ok(ExistsResponse { correlation_id: exists_request.correlation_id, min_event_batch_index })
+
+        Ok(ExistsResponse {
+            correlation_id: exists_request.correlation_id,
+            min_event_batch_index,
+        })
     }
 
     /// Write events to an aggregate.
@@ -219,7 +214,6 @@ impl ShardWal {
         // Phase 1: Validation and preparation - all checks that can fail happen here
         // No mutations to shard_mem_cache until all validations pass
         let mut prepared_writes = Vec::with_capacity(write_request.writes.len());
-        let mut wal_index = self.shard_mem_cache.borrow_mut().get_wal_index();
 
         for (aggregate_key, single_write) in &write_request.writes {
             // Validate events list is not empty
@@ -246,8 +240,6 @@ impl ShardWal {
                 self.cache_aggregate_client(aggregate_key, &aggregate_client_key).await?;
             }
 
-            wal_index = wal_index.saturating_add(1);
-
             // Validate and prepare - reads from memcache but does not mutate
             let prepared = self.validate_and_prepare_write(
                 lease_index,
@@ -255,24 +247,23 @@ impl ShardWal {
                 write_request.client_id,
                 write_request.user_id,
                 single_write.clone(),
-                wal_index,
             )?;
 
             prepared_writes.push(prepared);
         }
 
         // Phase 2: Append all prepared writes to queue - cannot fail
-        let force_durable = self.append_prepared_writes_to_queue(prepared_writes, wal_index);
+        self.append_prepared_writes_to_queue(prepared_writes);
 
         // Now we wait on disk write before ack to client
-        self.sync_durable(force_durable).await?;
+        self.sync_durable().await?;
 
         Ok(SuccessResponse {
             correlation_id: write_request.correlation_id,
         })
     }
 
-        /// Read event batches from an aggregate.
+    /// Read event batches from an aggregate.
     /// Reads from cache when possible, falls back to disk for older batches.
     pub async fn read(&self, request: &ReadRequest) -> Result<ReadResponse, ShardReadError> {
         let aggregate_key = &request.aggregate_key;
@@ -284,21 +275,13 @@ impl ShardWal {
             return Err(ShardReadError::AggregateNotExists);
         }
 
-        let last_known = self.shard_mem_cache.borrow_mut()
-            .get_aggregate_last_metablock_pos(aggregate_key);
+        let last_known = self.shard_mem_cache.borrow_mut().get_aggregate_last_metablock_pos(aggregate_key);
 
         // 2. Collect metablocks with size-bounded accumulation (NO datablocks yet)
-        let collection = self.collect_metablocks_bounded(
-            aggregate_key,
-            filters,
-            max_bytes,
-            last_known,
-        ).await?;
+        let collection = self.collect_metablocks_bounded(aggregate_key, filters, max_bytes, last_known).await?;
 
         // 3. Fetch datablocks only for kept metablocks
-        let batches_with_data = self.fetch_datablocks_for_metablocks(
-            &collection.kept_metablocks,
-        ).await?;
+        let batches_with_data = self.fetch_datablocks_for_metablocks(&collection.kept_metablocks).await?;
 
         // 4. Deserialize and apply event-level filters
         let event_batches = self.build_filtered_response(batches_with_data, filters)?;
@@ -312,7 +295,7 @@ impl ShardWal {
 
     /// Close the shard WAL, flushing any pending writes.
     pub async fn close(&self) -> Result<(), RotatingLogError> {
-        self.rotating_log_cache.close().await
+        self.log_segments_cache.close().await
     }
 
     /// Get the watched aggregates registry for this shard.
@@ -347,7 +330,7 @@ impl ShardWal {
 
         // Begin the search from the last_known_metablock, moving backwards
         let mut scanner = ReverseMetablockScanner::new(
-            &self.rotating_log_cache,
+            &self.log_segments_cache,
             last_known_metablock.log_id,
             Some(last_known_metablock.metablock_absolute_pos.saturating_sub(FIXED_BLOCK_SIZE_BYTES as u64)), //Include SELF
             self.config.read_max_chunk_size,
@@ -408,8 +391,8 @@ impl ShardWal {
 
         // Begin the search from the active log, moving backwards
         let mut scanner = ReverseMetablockScanner::new(
-            &self.rotating_log_cache,
-            self.rotating_log_cache.active_log_id(),
+            &self.log_segments_cache,
+            self.log_segments_cache.active_log_id(),
             None,
             self.config.read_max_chunk_size,
         );
@@ -468,7 +451,6 @@ impl ShardWal {
         client_id: u128,
         user_id: Option<u128>,
         mut write_request: SingleAggregateWrite,
-        wal_index: u64,
     ) -> Result<PreparedWrite, ShardWriteError> {
         let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
 
@@ -542,7 +524,7 @@ impl ShardWal {
         let server_timestamp = self.config.timestamp_config.now();
 
         let metablock = Metablock {
-            wal_index,
+            wal_index: 0,
             server_timestamp,
             lease_index,
             node_id: self.config.node_id,
@@ -564,7 +546,7 @@ impl ShardWal {
 
     /// Append all prepared writes to the pending queue.
     /// This mutates shard_mem_cache but cannot fail.
-    fn append_prepared_writes_to_queue(&self, prepared_writes: Vec<PreparedWrite>, final_wal_index: u64) -> bool {
+    fn append_prepared_writes_to_queue(&self, prepared_writes: Vec<PreparedWrite>) {
         let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
 
         for prepared in prepared_writes {
@@ -577,20 +559,15 @@ impl ShardWal {
                 prepared.shard_log_queue_item,
             );
         }
-
-        // Update the wal_index to reflect all appended writes
-        shard_mem_cache.set_queue_wal_index(final_wal_index);
-
-        shard_mem_cache.force_durable_on_next_write()
     }
 
     /// Perform sync with potential delay for amortisation.
-    async fn sync_durable(&self, force_immediate: bool) -> Result<(), ShardFsyncError> {
-        let rotating_log_cache = self.rotating_log_cache.clone();
+    async fn sync_durable(&self) -> Result<(), ShardFsyncError> {
+        let rotating_log_cache = self.log_segments_cache.clone();
         let shard_mem_cache = self.shard_mem_cache.clone();
         let watched_aggregates = self.watched_aggregates.clone();
 
-        if force_immediate {
+        if rotating_log_cache.force_immediate.get() {
             self.fsync_coordinator
                 .request_sync(None, move || sync_with_rollback(rotating_log_cache, shard_mem_cache, watched_aggregates))
                 .await
@@ -643,84 +620,31 @@ fn add_create_event(create_events: &mut HashMap<AggregateKey, AggregateWatchEven
 }
 
 async fn sync_with_rollback(
-    rotating_log_cache: Rc<RotatingLogCache>,
+    log_segments_cache: Rc<LogSegmentsCache>,
     shard_mem_cache: Rc<RefCell<ShardMemCache>>,
     watched_aggregates: Rc<AggregateWatchers>,
 ) -> Result<(), ShardFsyncError> {
-    {
-        let cache = shard_mem_cache.borrow();
-        if !cache.requires_write() {
-            // Queue is empty - another batch already synced our data
-            if cache.force_durable_on_next_write() {
-                return Err(ShardFsyncError::IoError(
-                    "Disk sync failure forced queue clear".to_string()
-                ));
-            }
-            return Ok(());
-        }
-    }
-    
-    // Lock the writer before we take the snapshot of the queue
-    let lockable_active_log_file = rotating_log_cache.active();
-    let mut shard_log_dma_file = write_with_timeout(&lockable_active_log_file, "sync_with_rollback").await?;
 
-    let (has_enough_free_space, _current_log_id, preallocate_bytes, shard_dir, sync_positions_snapshot) = {
+    let (required_disk_space, mut sync_positions_snapshot) = {
         let mut shard_mem_cache = shard_mem_cache.borrow_mut();
-        if !shard_mem_cache.requires_write() {
-            // Queue is empty - either another coordinator synced our items,
-            // or a previous sync failed and cleared the queue
-            if shard_mem_cache.force_durable_on_next_write() {
-                return Err(ShardFsyncError::IoError("Disk sync failure forced queue clear".to_string()));
-            }
-            // Another coordinator successfully synced our items
+
+        if shard_mem_cache.pending_append_queue_is_empty() {
             return Ok(());
         }
 
-        if !shard_mem_cache.has_enough_free_space() {
-            (
-                false,
-                shard_mem_cache.current_log_id(),
-                shard_mem_cache.shard_log_preallocate_bytes(),
-                Some(shard_mem_cache.shard_dir()),
-                None,
-            )
-        } else {
-            (
-                true,
-                shard_mem_cache.current_log_id(),
-                shard_mem_cache.shard_log_preallocate_bytes(),
-                None,
-                Some(shard_mem_cache.take_sync_positions_snapshot()),
-            )
-        }
+        let required_disk_space = shard_mem_cache.buffer_size_datablocks().saturating_add(shard_mem_cache.buffer_size_metablocks());
+        let sync_positions_snapshot = shard_mem_cache.take_sync_positions_snapshot();
+
+        (required_disk_space, sync_positions_snapshot)
     };
 
-    let mut sync_positions_snapshot = if !has_enough_free_space {
-        let shard_dir = shard_dir.as_ref().unwrap();
-
-        rotating_log_cache
-            .rotate_to_next_log(&mut shard_log_dma_file, &shard_dir, preallocate_bytes)
-            .await?;
-
-        // Can only acquire shard_mem_cache after async operations
-        let mut shard_mem_cache = shard_mem_cache.borrow_mut();
-        shard_mem_cache.rotate_to_next_log(
-            shard_log_dma_file.log_id,
-            shard_log_dma_file.shard_log_header.metablocks_position,
-            shard_log_dma_file.shard_log_header.datablocks_position,
-            shard_log_dma_file.file_len,
-        );
-        let snapshot = shard_mem_cache.take_sync_positions_snapshot();
-
-        snapshot
-    } else {
-        sync_positions_snapshot.unwrap()
-    };
+    //TODO: Under rare scenarios (eg. embedded and small log size) this is not enough
+    //It should really be partitioning the pending queue into chunks < log size and looping
+    log_segments_cache.rotate_to_next_log(required_disk_space).await?;
+    let active_log_segment = log_segments_cache.active();
 
     match sync(
-        rotating_log_cache.active_log_id(),
-        &mut shard_log_dma_file,
-        rotating_log_cache.active_reader(),
+        active_log_segment,
         &mut sync_positions_snapshot,
     )
     .await
@@ -777,69 +701,51 @@ async fn sync_with_rollback(
         Err(e) => {
             let mut shard_mem_cache = shard_mem_cache.borrow_mut();
             shard_mem_cache.rollback_queue_positions();
+            log_segments_cache.force_immediate.set(true);
             return Err(e);
         }
     }
 }
 
 async fn sync(
-    log_id: u64,
-    shard_log_dma_file: &mut ShardLogDmaFile,
-    reader_shard_log_dma_file: Rc<RwLock<ShardLogDmaFile>>,
+    log_segment_file: Rc<LogSegmentFile>,
     sync_positions_snapshot: &mut SyncPositionsSnapshot,
 ) -> Result<(), ShardFsyncError> {
-    let dma_file_writer = shard_log_dma_file.dma_file.as_mut();
 
-    let dma_file_writer = if let Some(dma_file_writer) = dma_file_writer {
-        dma_file_writer
-    } else {
-        return Err(ShardFsyncError::DmaFileNotInitialized);
-    };
+    let mut log_segment_file_metadata = log_segment_file.metadata.borrow().clone();
+
+    let dma_file_writer = log_segment_file.lock_writer("sync").await?;
+    let dma_file_writer = dma_file_writer.as_ref().ok_or_else(|| RotatingLogError::IoError("No file handle".to_string()))?;
 
     // Write datablocks first so we can get the positions to include into metablocks
-    if !sync_positions_snapshot.has_enough_free_space() {
-        let free_space = sync_positions_snapshot
-            .datablocks_position
-            .saturating_sub(sync_positions_snapshot.metablocks_position);
-        let required_space = sync_positions_snapshot
-            .buffer_size_datablocks()
-            .saturating_add(sync_positions_snapshot.buffer_size_metablocks());
-
-        return Err(ShardFsyncError::NotEnoughLogFreeSpace {
-            required: required_space,
-            available: free_space,
-        });
-    }
     let buffer_size_datablocks: u64 = sync_positions_snapshot.buffer_size_datablocks();
 
     let mut datablocks_absolute_write_positions: Vec<u64> = Vec::with_capacity(sync_positions_snapshot.pending_append_queue.len());
-    let mut new_datablocks_position = sync_positions_snapshot.datablocks_position;
-    let mut datablocks_carry_over: Option<Vec<u8>> = sync_positions_snapshot.datablocks_carry_over.take();
+    let mut new_datablocks_position = log_segment_file_metadata.datablocks_position;
+    let mut datablocks_carry_over: Option<Vec<u8>> = log_segment_file_metadata.datablocks_carry_over.take();
+
     if buffer_size_datablocks > 0 {
-        let write_to_pos = dma_file_writer.align_up(sync_positions_snapshot.datablocks_position);
-        let write_from_pos = dma_file_writer.align_down(sync_positions_snapshot.datablocks_position.saturating_sub(buffer_size_datablocks));
+        
+        let write_to_pos = dma_file_writer.align_up(log_segment_file_metadata.datablocks_position);
+        new_datablocks_position = log_segment_file_metadata.datablocks_position.saturating_sub(buffer_size_datablocks);
+        let write_from_pos = dma_file_writer.align_down(new_datablocks_position);
         let aligned_buffer_size_datablocks = write_to_pos.saturating_sub(write_from_pos);
 
-        let mut buffer_datablocks = dma_file_writer.alloc_dma_buffer(aligned_buffer_size_datablocks as usize);
-        let buffer_datablocks_slice = buffer_datablocks.as_bytes_mut();
-        buffer_datablocks_slice.fill(0);
 
-        let end_carry_over = dma_file_writer
-            .align_up(sync_positions_snapshot.datablocks_position)
-            .saturating_sub(sync_positions_snapshot.datablocks_position);
+        let front_carry_over = new_datablocks_position.saturating_sub(write_from_pos) as usize;
+        let end_carry_over = write_to_pos.saturating_sub(log_segment_file_metadata.datablocks_position) as usize;
+
+        let mut buffer_datablocks = dma_file_writer.alloc_dma_buffer(front_carry_over + buffer_size_datablocks as usize + end_carry_over);
+        let buffer_datablocks_slice = buffer_datablocks.as_bytes_mut();
+
+        buffer_datablocks_slice.fill(0);
 
         if end_carry_over > 0 {
             if datablocks_carry_over.is_none() || datablocks_carry_over.as_ref().unwrap().len() != end_carry_over as usize {
                 return Err(ShardFsyncError::DatablocksCarryOverBufferNotPresent);
             }
-            buffer_datablocks_slice[(aligned_buffer_size_datablocks.saturating_sub(end_carry_over)) as usize..]
+            buffer_datablocks_slice[(aligned_buffer_size_datablocks.saturating_sub(end_carry_over as u64)) as usize..]
                 .copy_from_slice(&datablocks_carry_over.as_ref().unwrap());
-        }
-
-        new_datablocks_position = sync_positions_snapshot.datablocks_position.saturating_sub(buffer_size_datablocks);
-        let front_carry_over = new_datablocks_position.saturating_sub(dma_file_writer.align_down(new_datablocks_position)) as usize;
-        if front_carry_over > 0 {
-            buffer_datablocks_slice[..front_carry_over].fill(0);
         }
 
         let mut position = 0usize;
@@ -871,8 +777,8 @@ async fn sync(
     let buffer_metablocks_slice = buffer_metablocks.as_bytes_mut();
     let mut position = 0usize;
     let mut index = 0;
-    let mut new_wal_index = 0;
     for item in &mut sync_positions_snapshot.pending_append_queue {
+
         if item.datablock_bytes.is_some() && item.datablock.is_some() {
             match &mut item.metablock.datablock {
                 DatablockStorageKind::Block(datablock_block_ref) => {
@@ -883,15 +789,16 @@ async fn sync(
             index += 1;
         }
 
-        new_wal_index = item.metablock.wal_index;
+        log_segment_file_metadata.wal_index = log_segment_file_metadata.wal_index.saturating_add(1);
+        item.metablock.wal_index = log_segment_file_metadata.wal_index;
 
         // Track the absolute position where this metablock is written
-        let metablock_absolute_pos = sync_positions_snapshot.metablocks_position + position as u64;
+        let metablock_absolute_pos = log_segment_file_metadata.metablocks_position + position as u64;
 
         // Update aggregate positions tracking for event batches (only if entry exists)
         if let MetablockKind::EventBatchMetadata(event_batch) = &item.metablock.wal_metablock_type {
             if let Some(aggregate_positions) = sync_positions_snapshot.aggregate_queue_positions.get_mut(&event_batch.aggregate_key) {
-                aggregate_positions.log_id = log_id;
+                aggregate_positions.log_id = log_segment_file_metadata.log_id;
                 aggregate_positions.metablock_absolute_pos = metablock_absolute_pos;
             }
         }
@@ -904,28 +811,24 @@ async fn sync(
         position += FIXED_BLOCK_SIZE_BYTES;
     }
 
-    //Write header front & back
-    let new_metablocks_position = sync_positions_snapshot.metablocks_position + buffer_metablocks.len() as u64;
-
+    //Write metablocks
+    let new_metablocks_position = log_segment_file_metadata.metablocks_position + buffer_metablocks.len() as u64;
     dma_file_writer
-        .write_at(buffer_metablocks, sync_positions_snapshot.metablocks_position)
+        .write_at(buffer_metablocks, log_segment_file_metadata.metablocks_position)
         .await?;
+    log_segment_file_metadata.metablocks_position = new_metablocks_position;
+    log_segment_file_metadata.datablocks_carry_over = datablocks_carry_over;
+    log_segment_file_metadata.datablocks_position = new_datablocks_position;
 
-    shard_log_dma_file
-        .write_new_headers_and_fsync(new_datablocks_position, new_metablocks_position, new_wal_index)
-        .await?;
+    // Write header
+    let header_end_start_pos = log_segment_file_metadata.file_len.saturating_sub(FIXED_BLOCK_SIZE_BYTES as u64);
+    let header = log_segment_file_metadata.to_shard_log_header();
+    celeriant_rotating_log::log_segment_file::write_dual_shard_log_header(&dma_file_writer, header_end_start_pos, &header).await?;
 
-    {
-        // Now we are 'committed' we need to update the reader, minimising our write lock duration
-        // Other tasks use to read and we async lock the metadata and the DmaFile together, so async write lock here is unavoidable
-        let mut reader_shard_log_dma_file = write_with_timeout(&reader_shard_log_dma_file, "sync_update_reader").await?;
-        reader_shard_log_dma_file.update_from_writer(&shard_log_dma_file);
-    }
+    dma_file_writer.fdatasync().await?;
 
-    sync_positions_snapshot.datablocks_position = new_datablocks_position;
-    sync_positions_snapshot.datablocks_carry_over = datablocks_carry_over;
-    sync_positions_snapshot.metablocks_position = new_metablocks_position;
-    sync_positions_snapshot.wal_index = new_wal_index;
+    let mut updated_log_segment_file_metadata = log_segment_file.metadata.borrow_mut();
+    *updated_log_segment_file_metadata = log_segment_file_metadata;
 
     Ok(())
 }
@@ -939,7 +842,6 @@ struct PreparedWrite {
     latest_client_event_index: u64,
     shard_log_queue_item: ShardLogQueueItem,
 }
-
 
 /// Metablock kept after size-bounded collection
 struct KeptMetablock {
@@ -990,9 +892,7 @@ impl ShardWal {
 
         // Check if we need disk (cache doesn't cover from_event_batch_index)
         let cache_min_batch = kept.first().map(|k| Self::get_batch_index(&k.metablock));
-        let need_disk = cache_min_batch
-            .map(|min| min > filters.from_event_batch_index)
-            .unwrap_or(true);
+        let need_disk = cache_min_batch.map(|min| min > filters.from_event_batch_index).unwrap_or(true);
 
         if need_disk && last_known.metablock_absolute_pos > 0 {
             let disk_to = cache_min_batch.map(|min| min.saturating_sub(1));
@@ -1007,7 +907,8 @@ impl ShardWal {
                 &mut kept,
                 &mut cumulative_size,
                 &mut evicted_batch_index,
-            ).await?;
+            )
+            .await?;
         }
 
         // Sort by batch index ascending (disk results were added in reverse)
@@ -1031,9 +932,7 @@ impl ShardWal {
         let shard_mem_cache = self.shard_mem_cache.borrow();
 
         // Cache iterates forward (ascending batch index) from from_event_batch_index
-        for (batch_idx, write) in shard_mem_cache
-            .get_cached_writes_from(aggregate_key, filters.from_event_batch_index)
-        {
+        for (batch_idx, write) in shard_mem_cache.get_cached_writes_from(aggregate_key, filters.from_event_batch_index) {
             // Stop if past upper bound
             if filters.to_event_batch_index.map_or(false, |to| batch_idx > to) {
                 break;
@@ -1080,7 +979,7 @@ impl ShardWal {
         let mut disk_cumulative: u64 = 0;
 
         let mut scanner = ReverseMetablockScanner::new(
-            &self.rotating_log_cache,
+            &self.log_segments_cache,
             last_known.log_id,
             Some(last_known.metablock_absolute_pos.saturating_add(FIXED_BLOCK_SIZE_BYTES as u64)),
             self.config.read_max_chunk_size,
@@ -1089,61 +988,63 @@ impl ShardWal {
         // Budget remaining after cache entries
         let budget_for_disk = max_bytes.saturating_sub(*cumulative_size);
 
-        scanner.scan::<(), ShardReadError>(|log_id, _pos, bytes| {
-            if !metablock_bytes::is_matches_aggregate_key(bytes, aggregate_key) {
-                return Ok(None); // Continue - different aggregate
-            }
+        scanner
+            .scan::<(), ShardReadError>(|log_id, _pos, bytes| {
+                if !metablock_bytes::is_matches_aggregate_key(bytes, aggregate_key) {
+                    return Ok(None); // Continue - different aggregate
+                }
 
-            let batch_index = metablock_bytes::read_event_batch_event_batch_index(bytes);
+                let batch_index = metablock_bytes::read_event_batch_event_batch_index(bytes);
 
-            // Stop when we've gone past our requested range
-            if batch_index < from_batch {
-                return Ok(Some(())); // Stop - past our range
-            }
+                // Stop when we've gone past our requested range
+                if batch_index < from_batch {
+                    return Ok(Some(())); // Stop - past our range
+                }
 
-            // Skip if above the range we need (cache already has newer)
-            if to_batch.map_or(false, |to| batch_index > to) {
-                return Ok(None); // Continue - will be served from cache
-            }
+                // Skip if above the range we need (cache already has newer)
+                if to_batch.map_or(false, |to| batch_index > to) {
+                    return Ok(None); // Continue - will be served from cache
+                }
 
-            // Deserialize metablock for filter check
-            let (metablock, _version) = celeriant_wire::version_aware_wire_format::deserialize_versioned_metablock(bytes)?;
+                // Deserialize metablock for filter check
+                let (metablock, _version) = celeriant_wire::version_aware_wire_format::deserialize_versioned_metablock(bytes)?;
 
-            if !in_memory_filtering::is_include_batch(&metablock, filters) {
-                return Ok(None); // Continue - filtered out
-            }
+                if !in_memory_filtering::is_include_batch(&metablock, filters) {
+                    return Ok(None); // Continue - filtered out
+                }
 
-            let batch_size = in_memory_filtering::get_uncompressed_size(&metablock.datablock);
+                let batch_size = in_memory_filtering::get_uncompressed_size(&metablock.datablock);
 
-            // Add to back (we're scanning backwards, newest seen first)
-            disk_cumulative += batch_size;
-            disk_kept.push_back(KeptMetablock {
-                log_id,
-                metablock,
-                uncompressed_size: batch_size,
-                datablock: None,
-            });
+                // Add to back (we're scanning backwards, newest seen first)
+                disk_cumulative += batch_size;
+                disk_kept.push_back(KeptMetablock {
+                    log_id,
+                    metablock,
+                    uncompressed_size: batch_size,
+                    datablock: None,
+                });
 
-            // Evict from FRONT (newest) until under budget
-            while disk_cumulative > budget_for_disk && disk_kept.len() > 1 {
-                if let Some(evicted) = disk_kept.pop_front() {
-                    disk_cumulative -= evicted.uncompressed_size;
-                    let evicted_idx = Self::get_batch_index(&evicted.metablock);
-                    // Track lowest evicted as continuation point
-                    match evicted_batch_index {
-                        Some(existing) if evicted_idx < *existing => {
-                            *evicted_batch_index = Some(evicted_idx);
+                // Evict from FRONT (newest) until under budget
+                while disk_cumulative > budget_for_disk && disk_kept.len() > 1 {
+                    if let Some(evicted) = disk_kept.pop_front() {
+                        disk_cumulative -= evicted.uncompressed_size;
+                        let evicted_idx = Self::get_batch_index(&evicted.metablock);
+                        // Track lowest evicted as continuation point
+                        match evicted_batch_index {
+                            Some(existing) if evicted_idx < *existing => {
+                                *evicted_batch_index = Some(evicted_idx);
+                            }
+                            None => {
+                                *evicted_batch_index = Some(evicted_idx);
+                            }
+                            _ => {}
                         }
-                        None => {
-                            *evicted_batch_index = Some(evicted_idx);
-                        }
-                        _ => {}
                     }
                 }
-            }
 
-            Ok(None) // Continue scanning to from_batch
-        }).await?;
+                Ok(None) // Continue scanning to from_batch
+            })
+            .await?;
 
         *cumulative_size += disk_cumulative;
         kept.extend(disk_kept.into_iter());
@@ -1194,13 +1095,17 @@ impl ShardWal {
 
         // Batch fetch per log file
         for (log_id, log_fetches) in by_log {
-            let positions: Vec<(usize, read_objects_absolute::AbsoluteObjectPosition)> = log_fetches.iter()
+            let positions: Vec<(usize, read_objects_absolute::AbsoluteObjectPosition)> = log_fetches
+                .iter()
                 .filter_map(|(idx, meta)| {
                     if let DatablockStorageKind::Block(r) = &meta.datablock {
-                        Some((*idx, read_objects_absolute::AbsoluteObjectPosition {
-                            start_pos: r.datablock_position,
-                            end_pos: r.datablock_position + r.compressed_size,
-                        }))
+                        Some((
+                            *idx,
+                            read_objects_absolute::AbsoluteObjectPosition {
+                                start_pos: r.datablock_position,
+                                end_pos: r.datablock_position + r.compressed_size,
+                            },
+                        ))
                     } else {
                         None
                     }
@@ -1216,23 +1121,17 @@ impl ShardWal {
             indexed_positions.sort_by_key(|(_, p)| p.start_pos);
 
             let indices: Vec<usize> = indexed_positions.iter().map(|(i, _)| *i).collect();
-            let pos_only: Vec<read_objects_absolute::AbsoluteObjectPosition> = indexed_positions
-                .into_iter()
-                .map(|(_, p)| p)
-                .collect();
+            let pos_only: Vec<read_objects_absolute::AbsoluteObjectPosition> = indexed_positions.into_iter().map(|(_, p)| p).collect();
 
             let blobs = {
-                let file = self.rotating_log_cache.get(log_id).await?;
-                let guard = read_with_timeout(&file, "fetch_datablocks").await?;
-                let dma = guard.dma_file.as_ref()
+                let log_segment_file = self.log_segments_cache.get(log_id).await?;
+                let file_len = log_segment_file.metadata.borrow().file_len;
+                let guard = log_segment_file.lock_reader("fetch_datablocks").await?;
+                let dma = guard
+                    .as_ref()
                     .ok_or_else(|| ShardReadError::IoError(format!("No file handle for log {}", log_id)))?;
 
-                read_objects_absolute::read_objects_absolute(
-                    dma, 
-                    guard.file_len, 
-                    &pos_only,
-                    self.config.read_max_chunk_size
-                ).await?
+                read_objects_absolute::read_objects_absolute(dma, file_len, &pos_only, self.config.read_max_chunk_size).await?
             };
 
             // Deserialize and update results

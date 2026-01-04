@@ -5,8 +5,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use celeriant_memcache::internal_shard_config::InternalShardConfig;
-use celeriant_memcache::timestamp_config::TimestampConfig;
+use celeriant_shard::internal_shard_config::InternalShardConfig;
+use celeriant_shard::timestamp_config::TimestampConfig;
 use celeriant_msg::request::requests::{SingleAggregateWrite, WriteRequest};
 use celeriant_shard::shard_wal::ShardWal;
 use celeriant_wal::aggregate_key::AggregateKey;

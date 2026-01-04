@@ -101,7 +101,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use celeriant_wal::{aggregate_key::AggregateKey, buffer_read::{read_option_u128_le, read_u64_le, read_u128_le}, constants::{FIXED_BLOCK_SIZE_BYTES, WIRE_SIZE_ENUM_DISCRIMINANT}, metablocks::{metablock_event_batch::MetablockEventBatch, metablock_snapshot_aggregate::MetablockSnapshotAggregate}, shard_log_header::ShardLogHeader};
+    use celeriant_wal::{aggregate_key::AggregateKey, buffer_read::{read_option_u128_le, read_u64_le, read_u128_le}, constants::{AGGREGATE_BLOOM_BYTES, FIXED_BLOCK_SIZE_BYTES, WIRE_SIZE_ENUM_DISCRIMINANT}, metablocks::{metablock_event_batch::MetablockEventBatch, metablock_snapshot_aggregate::MetablockSnapshotAggregate}, shard_log_header::ShardLogHeader};
 
     fn indexing_metablock_event_batch() -> Metablock {
         Metablock {
@@ -292,6 +292,7 @@ mod tests {
             metablocks_position: 0x1234_5678_9ABC_DEF0,
             datablocks_position: 0xFEDC_BA98_7654_3210,
             wal_index: 0x0FED_CBA9_8765_4321,
+            aggregate_bloom: [0u64; AGGREGATE_BLOOM_BYTES / 8],
         };
 
         let mut buffer = [0u8; FIXED_BLOCK_SIZE_BYTES];
@@ -319,6 +320,7 @@ mod tests {
             metablocks_position: 11,
             datablocks_position: 12,
             wal_index: 13,
+            aggregate_bloom: [0u64; AGGREGATE_BLOOM_BYTES / 8],
         };
 
         let mut buffer = [0u8; FIXED_BLOCK_SIZE_BYTES];
@@ -338,6 +340,7 @@ mod tests {
             metablocks_position: 11,
             datablocks_position: 12,
             wal_index: 13,
+            aggregate_bloom: [0u64; AGGREGATE_BLOOM_BYTES / 8],
         };
 
         let mut buffer = [0u8; FIXED_BLOCK_SIZE_BYTES];
@@ -356,6 +359,7 @@ mod tests {
             metablocks_position: 0x1111_1111_1111_1111,
             datablocks_position: 0x2222_2222_2222_2222,
             wal_index: 0x3333_3333_3333_3333,
+            aggregate_bloom: [0u64; AGGREGATE_BLOOM_BYTES / 8],
         };
 
         let mut buffer = [0u8; FIXED_BLOCK_SIZE_BYTES];
@@ -377,6 +381,7 @@ mod tests {
             metablocks_position: 11,
             datablocks_position: 12,
             wal_index: 13,
+            aggregate_bloom: [0u64; AGGREGATE_BLOOM_BYTES / 8],
         };
 
         let mut buffer = [0u8; FIXED_BLOCK_SIZE_BYTES];
@@ -398,6 +403,7 @@ mod tests {
             metablocks_position: 11,
             datablocks_position: 12,
             wal_index: 13,
+            aggregate_bloom: [0u64; AGGREGATE_BLOOM_BYTES / 8],
         };
 
         let mut buffer = [0u8; FIXED_BLOCK_SIZE_BYTES];
@@ -419,6 +425,7 @@ mod tests {
             metablocks_position: 11,
             datablocks_position: 12,
             wal_index: 13,
+            aggregate_bloom: [0u64; AGGREGATE_BLOOM_BYTES / 8],
         };
 
         let mut buffer = [0u8; FIXED_BLOCK_SIZE_BYTES];
@@ -442,6 +449,7 @@ mod tests {
             metablocks_position: 11,
             datablocks_position: 12,
             wal_index: 13,
+            aggregate_bloom: [0u64; AGGREGATE_BLOOM_BYTES / 8],
         };
 
         let mut buffer = [0u8; FIXED_BLOCK_SIZE_BYTES];

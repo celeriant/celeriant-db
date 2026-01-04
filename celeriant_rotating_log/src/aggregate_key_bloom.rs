@@ -1,14 +1,14 @@
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::constants::{AGGREGATE_BLOOM_BYTES, AGGREGATE_BLOOM_HASH_COUNT, AGGREGATE_BLOOM_HASH_SEED};
 use fastbloom::BloomFilter;
-use std::cell::RefCell;
 
 /// Bloom filter cache for aggregate keys in log segment headers.
 ///
 /// Uses the pre-computed hash from AggregateKey for efficient insertion/lookup.
 /// This struct is not thread-safe - designed for single-threaded shard access.
+#[derive(Clone)]
 pub struct AggregateKeyBloom {
-    bloom_filter: RefCell<BloomFilter>,
+    bloom_filter: BloomFilter,
 }
 
 impl Default for AggregateKeyBloom {
@@ -24,10 +24,8 @@ impl AggregateKeyBloom {
         let bloom_filter = BloomFilter::with_num_bits(AGGREGATE_BLOOM_BYTES * 8)
             .seed(&AGGREGATE_BLOOM_HASH_SEED)
             .hashes(AGGREGATE_BLOOM_HASH_COUNT);
-
-        Self {
-            bloom_filter: RefCell::new(bloom_filter),
-        }
+        
+        Self { bloom_filter }
     }
 
     /// Create from existing bloom bytes (e.g., loaded from disk).
@@ -37,29 +35,24 @@ impl AggregateKeyBloom {
             .seed(&AGGREGATE_BLOOM_HASH_SEED)
             .hashes(AGGREGATE_BLOOM_HASH_COUNT);
 
-        Self {
-            bloom_filter: RefCell::new(bloom_filter),
-        }
+        Self { bloom_filter }
     }
 
     /// Clear the bloom filter for reuse.
-    pub fn clear(&self) {
-        self.bloom_filter.borrow_mut().clear();
+    pub fn clear(&mut self) {
+        self.bloom_filter.clear();
     }
 
     /// Insert an aggregate key into the bloom filter.
-    pub fn insert(&self, aggregate_key: &AggregateKey) {
+    pub fn insert(&mut self, aggregate_key: &AggregateKey) {
         // Use the pre-computed hash from AggregateKey
-        self.bloom_filter
-            .borrow_mut()
-            .insert(&aggregate_key.hash_bytes());
+        self.bloom_filter.insert(&aggregate_key.hash_bytes());
     }
 
     /// Insert multiple aggregate keys.
-    pub fn insert_all(&self, aggregate_keys: &[AggregateKey]) {
-        let mut bloom = self.bloom_filter.borrow_mut();
+    pub fn insert_all(&mut self, aggregate_keys: &[AggregateKey]) {
         for key in aggregate_keys {
-            bloom.insert(&key.hash_bytes());
+            self.bloom_filter.insert(&key.hash_bytes());
         }
     }
 
@@ -67,19 +60,13 @@ impl AggregateKeyBloom {
     /// Returns `false` if definitely not in set, `true` if possibly in set.
     #[must_use]
     pub fn may_contain(&self, aggregate_key: &AggregateKey) -> bool {
-        self.bloom_filter
-            .borrow()
-            .contains(&aggregate_key.hash_bytes())
+        self.bloom_filter.contains(&aggregate_key.hash_bytes())
     }
 
     /// Export the bloom filter as bytes for storage in header.
     #[must_use]
     pub fn to_bytes(&self) -> [u64; AGGREGATE_BLOOM_BYTES / 8] {
-        self.bloom_filter
-            .borrow()
-            .as_slice()
-            .try_into()
-            .expect("Bloom filter size mismatch")
+        self.bloom_filter.as_slice().try_into().expect("Bloom filter size mismatch")
     }
 }
 
@@ -89,7 +76,7 @@ mod tests {
 
     #[test]
     fn test_insert_and_check() {
-        let bloom = AggregateKeyBloom::new();
+        let mut bloom = AggregateKeyBloom::new();
         let key1 = AggregateKey::new(1, 2, 3);
         let key2 = AggregateKey::new(4, 5, 6);
         let key3 = AggregateKey::new(7, 8, 9);
@@ -104,7 +91,7 @@ mod tests {
 
     #[test]
     fn test_from_bytes_roundtrip() {
-        let bloom = AggregateKeyBloom::new();
+        let mut bloom = AggregateKeyBloom::new();
         let key = AggregateKey::new(100, 200, 300);
         bloom.insert(&key);
 
@@ -116,7 +103,7 @@ mod tests {
 
     #[test]
     fn test_clear() {
-        let bloom = AggregateKeyBloom::new();
+        let mut bloom = AggregateKeyBloom::new();
         let key = AggregateKey::new(1, 2, 3);
         bloom.insert(&key);
         assert!(bloom.may_contain(&key));

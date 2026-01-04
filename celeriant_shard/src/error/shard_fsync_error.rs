@@ -61,6 +61,9 @@ impl From<RotatingLogError> for ShardFsyncError {
             RotatingLogError::InvalidPreallocatedBytes(b) => {
                 Self::IoError(format!("Invalid preallocated bytes: {}", b))
             }
+            RotatingLogError::BatchesTooLarge(b) => {
+                Self::IoError(format!("Batches too large for log segment file of preallocated bytes: {}", b))
+            }
             RotatingLogError::IoError(msg) => Self::IoError(msg),
             RotatingLogError::WireFormat(e) => Self::WireFormat(e),
             RotatingLogError::HeaderCorrupted { log_id } => Self::HeaderCorrupted { log_id },

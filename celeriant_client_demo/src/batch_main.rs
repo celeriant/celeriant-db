@@ -15,7 +15,7 @@ use tokio::time::Instant;
 const NUM_CONNECTIONS: usize = 12*1024; // 28k max source port limit ~25000;
 const TEST_DURATION_SECS: u64 = 30;
 const NUM_AGGREGATES: usize = NUM_CONNECTIONS / 64;
-const USE_MICRO_PAYLOAD: bool = true;
+const USE_MICRO_PAYLOAD: bool = false;
 const SERVER_ADDR: &str = "0.0.0.0:10000";
 const CLIENTSIDE_TIMEOUT_S: u64 = 5;
 

@@ -1,5 +1,8 @@
 use std::{collections::HashMap};
 
+/// Metadata for an aggregate, representing the queued writes.
+/// Write initially queues items, and bumps event, batch and cliet indexes
+/// On write to disk, we set the log id and metablock positions for cache update
 #[derive(Default, Clone)]
 pub struct QueueAggregatePositions {
     pub log_id: u64,

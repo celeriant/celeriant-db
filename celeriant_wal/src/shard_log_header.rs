@@ -4,11 +4,6 @@ use deepsize::DeepSizeOf;
 
 use crate::constants::{AGGREGATE_BLOOM_BYTES, FIXED_BLOCK_SIZE_BYTES};
 
-
-    /// Bloom filter for aggregate keys written to this log segment.
-    /// Used to quickly skip log segments during aggregate existence checks.
-    /// A "definitely not in set" result means no metablocks for that aggregate exist.
-    // pub aggregate_bloom: [u64; AGGREGATE_BLOOM_BYTES / 8],
 /// The header is written at the start and end of the 1GB fixed size file
 /// Writing both, protected by crc checks, allows recovery on torn writes
 #[derive(Debug, Clone, Encode, Decode, DeepSizeOf)]
@@ -24,6 +19,11 @@ pub struct ShardLogHeader {
 
     /// Shard-global WAL index representing the last written metablock
     pub wal_index: u64,
+
+    /// Bloom filter for aggregate keys written to this log segment.
+    /// Used to quickly skip log segments during aggregate existence checks.
+    /// A "definitely not in set" result means no metablocks for that aggregate exist.
+    pub aggregate_bloom: [u64; AGGREGATE_BLOOM_BYTES / 8],
 }
 
 impl ShardLogHeader {
@@ -55,7 +55,7 @@ impl ShardLogHeader {
             metablocks_position: FIXED_BLOCK_SIZE_BYTES as u64,
             datablocks_position: file_len.saturating_sub(FIXED_BLOCK_SIZE_BYTES as u64),
             wal_index: 0,
-            // aggregate_bloom: [0u64; AGGREGATE_BLOOM_BYTES / 8],
+            aggregate_bloom: [0u64; AGGREGATE_BLOOM_BYTES / 8],
         }
     }
 
@@ -121,6 +121,7 @@ mod tests {
             metablocks_position: 1000,
             datablocks_position: 500,
             wal_index: 0,
+            aggregate_bloom: [0u64; AGGREGATE_BLOOM_BYTES / 8],
         };
 
         assert_eq!(header.available_space(), 0); // saturating_sub prevents underflow

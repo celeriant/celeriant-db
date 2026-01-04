@@ -45,7 +45,7 @@ impl<E: Clone> Coordinator<E> {
     {
         let delay = match delay {
             Some(d) if d.as_micros() > 0 => d,
-            _ => return sync_fn().await,
+            _ => Duration::from_millis(0),
         };
 
         enum Acquired<E: Clone> {

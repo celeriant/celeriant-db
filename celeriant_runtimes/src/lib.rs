@@ -1,5 +1,4 @@
-use celeriant_memcache::internal_shard_config::InternalShardConfig;
-use celeriant_shard::shard_wal::ShardWal;
+use celeriant_shard::{internal_shard_config::InternalShardConfig, shard_wal::ShardWal};
 use celeriant_sidecar::store::SidecarStoreTrait;
 use glommio::{
     CpuSet, LocalExecutorPoolBuilder, PoolPlacement,

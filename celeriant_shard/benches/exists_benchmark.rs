@@ -1,11 +1,11 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, rc::Rc};
 use std::hint::black_box;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use celeriant_memcache::internal_shard_config::InternalShardConfig;
-use celeriant_memcache::timestamp_config::TimestampConfig;
+use celeriant_shard::internal_shard_config::InternalShardConfig;
+use celeriant_shard::timestamp_config::TimestampConfig;
 use celeriant_msg::request::requests::{ExistsRequest, SingleAggregateWrite, WriteRequest};
 use celeriant_shard::shard_wal::ShardWal;
 use celeriant_wal::aggregate_key::AggregateKey;
@@ -105,36 +105,53 @@ fn setup_populated_wal(shard_dir: PathBuf, target_bytes: usize) -> usize {
     let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
         .spawn(move || async move {
             let config = create_config(shard_dir);
-            let shard_wal = ShardWal::open(config).await.unwrap();
+            let shard_wal = Rc::new(ShardWal::open(config).await.unwrap());
 
             // Estimate bytes per write (events + metadata overhead ~512 bytes)
             let bytes_per_write_estimate = (EVENT_SIZE_BYTES * EVENTS_PER_BATCH) + 512;
             let total_writes = target_bytes / bytes_per_write_estimate;
 
-            // Track client_event_index per aggregate for idempotency
+            // Pre-compute all write requests to avoid mutable borrow issues with concurrent tasks
+            let mut write_requests = Vec::with_capacity(total_writes);
             let mut aggregate_event_indices: HashMap<u128, u64> = HashMap::new();
 
             for i in 0..total_writes {
                 let aggregate_id = (i % NUM_AGGREGATES) as u128;
                 let aggregate_key = AggregateKey::new(1, 1, aggregate_id);
 
-                let base_index = aggregate_event_indices
-                    .entry(aggregate_id)
-                    .or_insert(0);
-                
+                let base_index = aggregate_event_indices.entry(aggregate_id).or_insert(0);
+
                 let events = create_events(EVENTS_PER_BATCH, EVENT_SIZE_BYTES, *base_index);
                 *base_index += EVENTS_PER_BATCH as u64;
 
                 let write_request = create_write_request(aggregate_key, events, i as u128);
-
-                shard_wal.write(0, write_request).await.unwrap();
-
-                // Progress indicator for large WALs
-                if i % 1000 == 0 && i > 0 {
-                    let progress = (i as f64 / total_writes as f64) * 100.0;
-                    eprintln!("  Setup progress: {:.1}% ({}/{})", progress, i, total_writes);
-                }
+                write_requests.push(write_request);
             }
+
+            // Spawn all writes concurrently
+            let mut handles = Vec::with_capacity(total_writes);
+            for (i, write_request) in write_requests.into_iter().enumerate() {
+
+                //TODO: Required to prevent a thundering herd of writes larger than the log segment file size
+                glommio::timer::sleep(Duration::from_micros(1000)).await;
+
+                let shard_wal = shard_wal.clone();
+                handles.push(glommio::spawn_local(async move {
+                    shard_wal.write(0, write_request).await.unwrap();
+
+                    // Progress indicator for large WALs
+                    if i % 1000 == 0 && i > 0 {
+                        let progress = (i as f64 / total_writes as f64) * 100.0;
+                        eprintln!("  Setup progress: {:.1}% ({}/{})", progress, i, total_writes);
+                    }
+                }));
+            }
+
+            // Await all write tasks
+            for h in handles {
+                h.await;
+            }
+
 
             total_writes * bytes_per_write_estimate
         })
@@ -170,37 +187,35 @@ fn bench_exists_wal_sizes(c: &mut Criterion) {
 
         group.bench_with_input(
             BenchmarkId::new("known_aggregate", size_name),
-            &(shard_dir.clone(), existing_aggregate),
-            |b, (shard_dir, test_aggregate)| {
+            &shard_dir.clone(),
+            |b, shard_dir| {
                 b.iter_custom(|iters| {
                     let shard_dir = shard_dir.clone();
-                    let test_aggregate = test_aggregate.clone();
 
                     let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
                         .spawn(move || async move {
                             let config = create_config(shard_dir);
                             let shard_wal = ShardWal::open(config).await.unwrap();
 
-                            // Warm-up: populate caches with one exists call (not timed)
-                            let warmup_request = ExistsRequest {
-                                correlation_id: None,
-                                aggregate_key: test_aggregate.clone(),
-                            };
-                            let _ = shard_wal.exists(&warmup_request).await;
-
-                            // Timed iterations
+                            // Timed iterations - cycle through all known aggregates
                             let mut total_duration = Duration::ZERO;
 
-                            for _ in 0..iters {
+                            for i in 0..iters {
+                                // Cycle through all known aggregate IDs (0 to NUM_AGGREGATES-1)
+                                let aggregate_id = (i as usize % NUM_AGGREGATES) as u128;
+                                let test_aggregate = AggregateKey::new(1, 1, aggregate_id);
+
                                 let exists_request = ExistsRequest {
                                     correlation_id: None,
-                                    aggregate_key: test_aggregate.clone(),
+                                    aggregate_key: test_aggregate,
                                 };
 
                                 let start = std::time::Instant::now();
                                 let result = shard_wal.exists(&exists_request).await.unwrap();
                                 total_duration += start.elapsed();
 
+                                // Verify it's actually found
+                                debug_assert!(result.min_event_batch_index > 0 || result.min_event_batch_index > 0);
                                 black_box(result);
                             }
 

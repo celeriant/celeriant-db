@@ -43,11 +43,12 @@
             "args": [
                 "--listen-address",
                 "0.0.0.0:10000",
+                "--routing-rule",
+                "org",
                 "--num-shards",
                 "1",
                 "--shard-log-preallocate-bytes",
                 "20971520",
-                "--non-durable-writes"
             ],
             "cwd": "${workspaceFolder}",
             "env": {}

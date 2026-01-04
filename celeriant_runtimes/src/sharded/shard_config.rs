@@ -1,6 +1,6 @@
 use std::{path::PathBuf, time::Duration};
 
-use celeriant_memcache::timestamp_config::TimestampConfig;
+use celeriant_shard::timestamp_config::TimestampConfig;
 
 use crate::sharded::routing_rule::RoutingRule;
 
