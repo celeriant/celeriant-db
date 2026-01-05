@@ -39,3 +39,7 @@ harness = false
 [[bench]]
 name = "aggregate_count_benchmark"
 harness = false
+
+[[bench]]
+name = "bloom_size_benchmark"
+harness = false

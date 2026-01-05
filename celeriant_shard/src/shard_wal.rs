@@ -24,11 +24,11 @@ use celeriant_rotating_log::rotating_log_error::RotatingLogError;
 use celeriant_rotating_log::rwlock_timeout::{write_with_timeout};
 use celeriant_wal::aggregate_client_key::{AggregateClientKey};
 use celeriant_wal::aggregate_key::AggregateKey;
-use celeriant_wal::constants::{FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_METABLOCK};
+use celeriant_wal::constants::{FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_METABLOCK};
 use celeriant_wal::datablocks::datablock::Datablock;
 use celeriant_wal::datablocks::datablock_aggregate_event_batch::DatablockAggregateEventBatch;
 use celeriant_wal::datablocks::datablock_kind::DatablockKind;
-use celeriant_wal::metablock_position::MetablockPosition;
+use celeriant_memcache::metablock_position::MetablockPosition;
 use celeriant_wal::metablocks::datablock_storage_kind::DatablockStorageKind;
 use celeriant_wal::metablocks::metablock::Metablock;
 use celeriant_wal::metablocks::metablock_event_batch::{EventTypesKind, MetablockEventBatch};
@@ -159,37 +159,9 @@ impl ShardWal {
             .borrow_mut()
             .get_aggregate_last_metablock_pos(&exists_request.aggregate_key);
 
-        // Find the min_event_batch_index available in the WAL for this aggregate
-        let mut min_event_batch_index: u64 = last_known_metablock.event_batch_index;
-        let aggregate_key = &exists_request.aggregate_key;
-
-        let mut scanner = ReverseMetablockScanner::new(
-            &self.log_segments_cache,
-            last_known_metablock.log_id,
-            Some(last_known_metablock.metablock_absolute_pos.saturating_add(FIXED_BLOCK_SIZE_BYTES as u64)), // Start after to include last known
-            self.config.read_max_chunk_size,
-        );
-
-        scanner
-            .scan::<(), ()>(|_log_id, _metablock_absolute_pos, metablock_bytes| {
-                // Skip metablocks for other aggregates
-                if !metablock_bytes::is_matches_aggregate_key(metablock_bytes, aggregate_key) {
-                    return Ok(None);
-                }
-
-                let batch_index = metablock_bytes::read_event_batch_event_batch_index(metablock_bytes);
-
-                // Update minimum - since we scan backwards, each match could be older
-                min_event_batch_index = min_event_batch_index.min(batch_index);
-
-                // Never stop early - must scan entire WAL to find true minimum
-                Ok(None)
-            })
-            .await?;
-
         Ok(ExistsResponse {
             correlation_id: exists_request.correlation_id,
-            min_event_batch_index,
+            min_event_batch_index: last_known_metablock.min_event_batch_index,
         })
     }
 
@@ -332,9 +304,10 @@ impl ShardWal {
         let mut scanner = ReverseMetablockScanner::new(
             &self.log_segments_cache,
             last_known_metablock.log_id,
-            Some(last_known_metablock.metablock_absolute_pos.saturating_sub(FIXED_BLOCK_SIZE_BYTES as u64)), //Include SELF
+            Some(last_known_metablock.metablock_absolute_pos.saturating_add(FIXED_BLOCK_SIZE_BYTES as u64)), //Include SELF
             self.config.read_max_chunk_size,
-        );
+        )
+        .with_bloom_filter(aggregate_key);
 
         let find_result = scanner
             .scan::<bool, ()>(|_log_id, _metablock_absolute_pos, metablock_bytes| {
@@ -395,7 +368,8 @@ impl ShardWal {
             self.log_segments_cache.active_log_id(),
             None,
             self.config.read_max_chunk_size,
-        );
+        )
+        .with_bloom_filter(searching_for_aggregate_key);
 
         let find_result = scanner
             .scan::<bool, ()>(|log_id, metablock_absolute_pos, metablock_bytes| {
@@ -418,6 +392,7 @@ impl ShardWal {
                     event_batch_index: metablock_bytes::read_event_batch_event_batch_index(metablock_bytes),
                     log_id,
                     metablock_absolute_pos,
+                    min_event_batch_index: metablock_bytes::read_event_batch_min_event_batch_index(metablock_bytes),
                 };
 
                 let client_id = metablock_bytes::read_event_batch_client_id(metablock_bytes);
@@ -486,6 +461,10 @@ impl ShardWal {
         let mut events_in_batch = std::mem::take(&mut write_request.events);
         let mut event_index = aggregate_current_indexes.event_index;
         let event_batch_index = aggregate_current_indexes.event_batch_index.saturating_add(1);
+        let mut min_event_batch_index = aggregate_current_indexes.min_event_batch_index;
+        if min_event_batch_index == 0 {
+            min_event_batch_index = 1;
+        }
 
         for e in events_in_batch.iter_mut() {
             event_index = event_index.saturating_add(1);
@@ -509,6 +488,7 @@ impl ShardWal {
             client_id,
             user_id,
             aggregate_key.clone(),
+            min_event_batch_index,
             &datablock_aggregate_event_batch,
             event_types_data,
         );
@@ -816,12 +796,22 @@ async fn sync(
     dma_file_writer
         .write_at(buffer_metablocks, log_segment_file_metadata.metablocks_position)
         .await?;
+
+
+    // Update bloom filter with aggregate keys from this batch
+    for item in &sync_positions_snapshot.pending_append_queue {
+        if let MetablockKind::EventBatchMetadata(event_batch) = &item.metablock.wal_metablock_type {
+            log_segment_file_metadata.aggregate_key_bloom.insert(&event_batch.aggregate_key);
+        }
+    }
+
+    // Update positions and carry over
     log_segment_file_metadata.metablocks_position = new_metablocks_position;
     log_segment_file_metadata.datablocks_carry_over = datablocks_carry_over;
     log_segment_file_metadata.datablocks_position = new_datablocks_position;
 
     // Write header
-    let header_end_start_pos = log_segment_file_metadata.file_len.saturating_sub(FIXED_BLOCK_SIZE_BYTES as u64);
+    let header_end_start_pos = log_segment_file_metadata.file_len.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64);
     let header = log_segment_file_metadata.to_shard_log_header();
     celeriant_rotating_log::log_segment_file::write_dual_shard_log_header(&dma_file_writer, header_end_start_pos, &header).await?;
 
@@ -983,7 +973,8 @@ impl ShardWal {
             last_known.log_id,
             Some(last_known.metablock_absolute_pos.saturating_add(FIXED_BLOCK_SIZE_BYTES as u64)),
             self.config.read_max_chunk_size,
-        );
+        )
+        .with_bloom_filter(aggregate_key);
 
         // Budget remaining after cache entries
         let budget_for_disk = max_bytes.saturating_sub(*cumulative_size);

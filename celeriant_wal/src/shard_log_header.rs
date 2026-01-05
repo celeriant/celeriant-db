@@ -1,11 +1,11 @@
-
 use bincode::{Decode, Encode};
 use deepsize::DeepSizeOf;
 
-use crate::constants::{AGGREGATE_BLOOM_BYTES, FIXED_BLOCK_SIZE_BYTES};
+use crate::constants::{AGGREGATE_BLOOM_BYTES, HEADER_BLOCK_SIZE_BYTES};
 
-/// The header is written at the start and end of the 1GB fixed size file
-/// Writing both, protected by crc checks, allows recovery on torn writes
+/// The header is written at the start and end of the fixed size log segment file.
+/// Writing both, protected by crc checks, allows recovery on torn writes.
+/// Header uses HEADER_BLOCK_SIZE_BYTES (16KB) to accommodate the bloom filter.
 #[derive(Debug, Clone, Encode, Decode, DeepSizeOf)]
 pub struct ShardLogHeader {
     /// A metablock is 512 byte fixed size, written from the start of the file
@@ -23,7 +23,7 @@ pub struct ShardLogHeader {
     /// Bloom filter for aggregate keys written to this log segment.
     /// Used to quickly skip log segments during aggregate existence checks.
     /// A "definitely not in set" result means no metablocks for that aggregate exist.
-    pub aggregate_bloom: [u64; AGGREGATE_BLOOM_BYTES / 8],
+    pub aggregate_bloom: Vec<u64>,
 }
 
 impl ShardLogHeader {
@@ -48,14 +48,14 @@ impl ShardLogHeader {
 
     /// Total wire size of ShardLogHeader
     pub const WIRE_SIZE_TOTAL: usize = 
-        Self::OFFSET_AGGREGATE_BLOOM + Self::WIRE_SIZE_AGGREGATE_BLOOM; // = 152 bytes
+        Self::OFFSET_AGGREGATE_BLOOM + Self::WIRE_SIZE_AGGREGATE_BLOOM;
         
     pub fn new(file_len: u64) -> Self {
         Self {
-            metablocks_position: FIXED_BLOCK_SIZE_BYTES as u64,
-            datablocks_position: file_len.saturating_sub(FIXED_BLOCK_SIZE_BYTES as u64),
+            metablocks_position: HEADER_BLOCK_SIZE_BYTES as u64,
+            datablocks_position: file_len.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64),
             wal_index: 0,
-            aggregate_bloom: [0u64; AGGREGATE_BLOOM_BYTES / 8],
+            aggregate_bloom: vec![],
         }
     }
 
@@ -91,26 +91,26 @@ mod tests {
     fn test_new_initializes_positions_correctly() {
         let header = ShardLogHeader::new(TEST_FILE_LEN);
 
-        assert_eq!(header.metablocks_position, FIXED_BLOCK_SIZE_BYTES as u64);
+        assert_eq!(header.metablocks_position, HEADER_BLOCK_SIZE_BYTES as u64);
         assert_eq!(
             header.datablocks_position,
-            TEST_FILE_LEN - FIXED_BLOCK_SIZE_BYTES as u64
+            TEST_FILE_LEN - HEADER_BLOCK_SIZE_BYTES as u64
         );
     }
 
     #[test]
     fn test_new_handles_small_file_len() {
-        let small_file_len = (FIXED_BLOCK_SIZE_BYTES / 2) as u64;
+        let small_file_len = (HEADER_BLOCK_SIZE_BYTES / 2) as u64;
         let header = ShardLogHeader::new(small_file_len);
 
-        assert_eq!(header.metablocks_position, FIXED_BLOCK_SIZE_BYTES as u64);
+        assert_eq!(header.metablocks_position, HEADER_BLOCK_SIZE_BYTES as u64);
         assert_eq!(header.datablocks_position, 0); // saturating_sub prevents underflow
     }
 
     #[test]
     fn test_available_space() {
         let header = ShardLogHeader::new(TEST_FILE_LEN);
-        let expected = TEST_FILE_LEN - 2 * FIXED_BLOCK_SIZE_BYTES as u64;
+        let expected = TEST_FILE_LEN - 2 * HEADER_BLOCK_SIZE_BYTES as u64;
 
         assert_eq!(header.available_space(), expected);
     }
@@ -121,7 +121,7 @@ mod tests {
             metablocks_position: 1000,
             datablocks_position: 500,
             wal_index: 0,
-            aggregate_bloom: [0u64; AGGREGATE_BLOOM_BYTES / 8],
+            aggregate_bloom: vec![],
         };
 
         assert_eq!(header.available_space(), 0); // saturating_sub prevents underflow
@@ -169,11 +169,11 @@ mod tests {
 
         assert_eq!(
             header.metablocks_position,
-            FIXED_BLOCK_SIZE_BYTES as u64 + 250
+            HEADER_BLOCK_SIZE_BYTES as u64 + 250
         );
         assert_eq!(
             header.datablocks_position,
-            TEST_FILE_LEN - FIXED_BLOCK_SIZE_BYTES as u64 - 500
+            TEST_FILE_LEN - HEADER_BLOCK_SIZE_BYTES as u64 - 500
         );
     }
 
@@ -185,5 +185,15 @@ mod tests {
         header.append_event_batches(100, 200);
 
         assert_eq!(header.available_space(), initial_space - 300);
+    }
+
+    #[test]
+    fn test_wire_size_fits_in_header_block() {
+        assert!(
+            ShardLogHeader::WIRE_SIZE_TOTAL <= HEADER_BLOCK_SIZE_BYTES,
+            "ShardLogHeader wire size ({}) exceeds header block size ({})",
+            ShardLogHeader::WIRE_SIZE_TOTAL,
+            HEADER_BLOCK_SIZE_BYTES
+        );
     }
 }

@@ -1,4 +1,4 @@
-use celeriant_wal::constants::FIXED_BLOCK_SIZE_BYTES;
+use celeriant_wal::constants::HEADER_BLOCK_SIZE_BYTES;
 use lru::LruCache;
 use std::{cell::{Cell, RefCell}, num::NonZeroUsize, path::PathBuf, rc::Rc};
 
@@ -38,7 +38,7 @@ impl LogSegmentsCache {
             return Ok(false)
         }
 
-        if self.preallocate_bytes.saturating_sub(required_disk_space).saturating_sub(FIXED_BLOCK_SIZE_BYTES as u64 * 2) == 0 {
+        if self.preallocate_bytes.saturating_sub(required_disk_space).saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64 * 2) == 0 {
             return Err(RotatingLogError::BatchesTooLarge(self.preallocate_bytes));
         }
 
@@ -56,7 +56,7 @@ impl LogSegmentsCache {
 
     /// Called when starting up a shard, ensures we always have an active log file to write to
     pub async fn ready_up(shard_dir: PathBuf, preallocate_bytes: u64, max_cached_files: usize) -> Result<Self, RotatingLogError> {
-        if preallocate_bytes <= FIXED_BLOCK_SIZE_BYTES as u64 * 2 || preallocate_bytes % FIXED_BLOCK_SIZE_BYTES as u64 != 0 {
+        if preallocate_bytes <= HEADER_BLOCK_SIZE_BYTES as u64 * 2 || preallocate_bytes % HEADER_BLOCK_SIZE_BYTES as u64 != 0 {
             return Err(RotatingLogError::InvalidPreallocatedBytes(preallocate_bytes));
         }
 

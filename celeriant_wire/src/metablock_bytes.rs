@@ -76,6 +76,12 @@ pub fn read_event_batch_aggregate_id(bytes: &[u8]) -> u128 {
 }
 
 #[inline]
+pub fn read_event_batch_min_event_batch_index(bytes: &[u8]) -> u64 {
+    let offset = EVENT_BATCH_PAYLOAD_OFFSET + MetablockEventBatch::OFFSET_MIN_EVENT_BATCH_INDEX;
+    read_u64_le(bytes, offset)
+}
+
+#[inline]
 pub fn read_event_batch_event_batch_index(bytes: &[u8]) -> u64 {
     let offset = EVENT_BATCH_PAYLOAD_OFFSET + MetablockEventBatch::OFFSET_EVENT_BATCH_INDEX;
     read_u64_le(bytes, offset)

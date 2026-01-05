@@ -55,6 +55,7 @@ impl Metablock {
             wal_metablock_type: MetablockKind::EventBatchMetadata(MetablockEventBatch { 
                 aggregate_key, 
                 event_batch_index: 0, 
+                min_event_batch_index: 0,
                 min_client_event_index: 0, 
                 max_client_event_index: 0, 
                 min_event_timestamp: 0, 

@@ -1,5 +1,6 @@
 use celeriant_disk::files::read_fixed_records_visit_const::read_fixed_records_visit_const;
-use celeriant_wal::{constants::FIXED_BLOCK_SIZE_BYTES};
+use celeriant_wal::{aggregate_key::AggregateKey, constants::HEADER_BLOCK_SIZE_BYTES};
+use celeriant_wal::constants::FIXED_BLOCK_SIZE_BYTES;
 
 use crate::{log_segments_cache::LogSegmentsCache, rotating_log_error::RotatingLogError};
 
@@ -10,6 +11,9 @@ pub struct ReverseMetablockScanner<'a> {
     current_log_id: u64,
     chunk_size: u64,
     start_from_position: Option<u64>,
+    /// Optional aggregate key for bloom filter optimization.
+    /// When set, log segments where the bloom filter says "definitely not present" are skipped.
+    bloom_filter_key: Option<&'a AggregateKey>,
 }
 
 impl<'a> ReverseMetablockScanner<'a> {
@@ -19,7 +23,16 @@ impl<'a> ReverseMetablockScanner<'a> {
             current_log_id: starting_log_id,
             chunk_size,
             start_from_position,
+            bloom_filter_key: None,
         }
+    }
+
+    /// Enable bloom filter optimization for a specific aggregate key.
+    /// Log segments where the bloom filter says "definitely not present" will be skipped entirely.
+    #[must_use]
+    pub fn with_bloom_filter(mut self, aggregate_key: &'a AggregateKey) -> Self {
+        self.bloom_filter_key = Some(aggregate_key);
+        self
     }
 
     /// Scan metablocks in reverse, calling visitor for each 512-byte block.
@@ -63,10 +76,18 @@ impl<'a> ReverseMetablockScanner<'a> {
         E: std::fmt::Debug,
     {
         let log_segment_file = self.log_cache.get(self.current_log_id).await?;
+        
+        // Check bloom filter - skip entire log segment if aggregate definitely not present
+        if let Some(key) = self.bloom_filter_key {
+            if !log_segment_file.metadata.borrow().aggregate_key_bloom.may_contain(key) {
+                return Ok(None);
+            }
+        }
+
         let metablock_position = log_segment_file.metadata.borrow().metablocks_position;
         let guard = log_segment_file.lock_reader("scan_single_log").await?;
         let dma_file = guard.as_ref().ok_or_else(|| RotatingLogError::IoError("No file handle".to_string()))?;
-        let metablocks_start = FIXED_BLOCK_SIZE_BYTES as u64;
+        let metablocks_start = HEADER_BLOCK_SIZE_BYTES as u64;
         let metablocks_end = override_end.unwrap_or(metablock_position).min(metablock_position);
 
         if metablocks_end <= metablocks_start {

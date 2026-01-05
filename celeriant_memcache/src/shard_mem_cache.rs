@@ -1,3 +1,4 @@
+use crate::metablock_position::MetablockPosition;
 use crate::{
     aggregate_recent_write::AggregateRecentWrites, mem_snapshot_aggregate::MemSnapshotAggregate,
     queue_aggregate_positions::QueueAggregatePositions, recent_write::RecentWrite, shard_log_queue_item::ShardLogQueueItem,
@@ -5,7 +6,7 @@ use crate::{
 };
 use celeriant_wal::{
     aggregate_client_key::AggregateClientKey, aggregate_key::AggregateKey, constants::FIXED_BLOCK_SIZE_BYTES, datablocks::datablock::Datablock,
-    metablock_position::MetablockPosition, metablocks::metablock::Metablock,
+    metablocks::metablock::Metablock,
 };
 use lru::LruCache;
 use std::hash::Hash;
@@ -298,6 +299,7 @@ impl ShardMemCache {
                         metablock_absolute_pos: queue_positions.metablock_absolute_pos,
                         event_index: queue_positions.event_index,
                         event_batch_index: queue_positions.event_batch_index,
+                        min_event_batch_index: queue_positions.min_event_batch_index,
                     },
                 );
             }
@@ -352,6 +354,7 @@ impl ShardMemCache {
                 metablock_absolute_pos: file_pos.metablock_absolute_pos,
                 event_batch_index: file_pos.event_batch_index,
                 event_index: file_pos.event_index,
+                min_event_batch_index: file_pos.min_event_batch_index,
             };
         }
 
@@ -360,6 +363,7 @@ impl ShardMemCache {
             metablock_absolute_pos: 0,
             event_batch_index: 0,
             event_index: 0,
+            min_event_batch_index: 0,
         }
     }
 
@@ -371,6 +375,7 @@ impl ShardMemCache {
             return EventIndexes {
                 event_batch_index: queue_pos.event_batch_index,
                 event_index: queue_pos.event_index,
+                min_event_batch_index: queue_pos.min_event_batch_index,
             };
         }
 
@@ -379,12 +384,14 @@ impl ShardMemCache {
             return EventIndexes {
                 event_batch_index: file_pos.event_batch_index,
                 event_index: file_pos.event_index,
+                min_event_batch_index: file_pos.min_event_batch_index,
             };
         }
 
         EventIndexes {
             event_batch_index: 0,
             event_index: 0,
+            min_event_batch_index: 0,
         }
     }
 
@@ -410,6 +417,7 @@ impl ShardMemCache {
 
 pub struct EventIndexes {
     pub event_batch_index: u64,
+    pub min_event_batch_index: u64,
     pub event_index: u64,
 }
 

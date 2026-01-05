@@ -1,21 +1,19 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
-use celeriant_msg::{process_requests::Request, request::requests::SingleAggregateWrite};
-use celeriant_msg::request::requests::WriteRequest;
+use celeriant_msg::{process_requests::Request};
+use celeriant_msg::request::requests::{ExistsRequest};
 use celeriant_wal::{
     aggregate_key::AggregateKey,
     compression_type::CompressionType,
-    datablocks::datablock_aggregate_event::DatablockAggregateEvent,
 };
 use tokio::sync::Barrier;
 use tokio::time::Instant;
 
 const NUM_CONNECTIONS: usize = 12*1024; // 28k max source port limit ~25000;
-const TEST_DURATION_SECS: u64 = 30;
+const TEST_DURATION_SECS: u64 = 10;
 const NUM_AGGREGATES: usize = 250000;
-const USE_MICRO_PAYLOAD: bool = true;
 const SERVER_ADDR: &str = "0.0.0.0:10000";
 const CLIENTSIDE_TIMEOUT_S: u64 = 5;
 
@@ -165,67 +163,16 @@ async fn run_connection_benchmark(
 
     // Send requests until deadline
     while Instant::now() < deadline {
-        let prefix = format!("[connection-{}-event-{}] ", connection_id, request_count);
-
-        let event_1 = DatablockAggregateEvent {
-            client_event_index: 3,
-            event_index: 0,
-            event_id: Some(1234567890),
-            event_timestamp: 0,
-            event_type_major: 2,
-            event_type_minor: 3,
-            event_value: std::sync::Arc::new(format!("{}Hello World!", prefix).into_bytes()),
-            iv: None,
-        };
-
-        let event_2 = DatablockAggregateEvent {
-            client_event_index: 3,
-            event_index: 0,
-            event_id: Some(1234567890),
-            event_timestamp: 0,
-            event_type_major: 2,
-            event_type_minor: 3,
-            event_value: std::sync::Arc::new(format!("{}She should have died hereafter;
-            There would have been a time for such a word.
-            Tomorrow, and tomorrow, and tomorrow,
-            Creeps in this petty pace from day to day
-            To the last syllable of recorded time,
-            And all our yesterdays have lighted fools
-            The way to dusty death. Out, out, brief candle!
-            Life's but a walking shadow, a poor player
-            That struts and frets his hour upon the stage
-            And then is heard no more. It is a tale
-            Told by an idiot, full of sound and fury, Signifying nothing. ", prefix).into_bytes()),
-            iv: None,
-        };
-
         let aggregate_id = (connection_id + request_count as usize) % NUM_AGGREGATES;
-
-        let mut writes = HashMap::new();
-        writes.insert(
-            AggregateKey::new(
-                1,
-                1,
-                aggregate_id as u128,
-            ),
-            SingleAggregateWrite {
-                events: if USE_MICRO_PAYLOAD {
-                    vec![event_1]
-                } else {
-                    vec![event_1, event_2]
-                },
-                allow_create: true,
-                expected_event_batch_index: None,
-                enforce_client_idempotency: false,
-                compression_type: CompressionType::None,
-            },
+        let aggregate_key = AggregateKey::new(
+            2, //INTENTIONALLY DIFFERENT FROM batch_main writes org
+            1,
+            aggregate_id as u128,
         );
-
-        let request = Request::Write(WriteRequest {
+        
+        let request = Request::Exists(ExistsRequest {
             correlation_id: None,
-            client_id: connection_id as u128,
-            user_id: None,
-            writes,
+            aggregate_key
         });
 
         let req_start = Instant::now();

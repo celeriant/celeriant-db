@@ -133,7 +133,7 @@ fn setup_populated_wal(shard_dir: PathBuf, target_bytes: usize) -> usize {
             for (i, write_request) in write_requests.into_iter().enumerate() {
 
                 //TODO: Required to prevent a thundering herd of writes larger than the log segment file size
-                glommio::timer::sleep(Duration::from_micros(1000)).await;
+                glommio::timer::sleep(Duration::from_micros(1)).await;
 
                 let shard_wal = shard_wal.clone();
                 handles.push(glommio::spawn_local(async move {

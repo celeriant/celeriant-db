@@ -101,7 +101,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use celeriant_wal::{aggregate_key::AggregateKey, buffer_read::{read_option_u128_le, read_u64_le, read_u128_le}, constants::{AGGREGATE_BLOOM_BYTES, FIXED_BLOCK_SIZE_BYTES, WIRE_SIZE_ENUM_DISCRIMINANT}, metablocks::{metablock_event_batch::MetablockEventBatch, metablock_snapshot_aggregate::MetablockSnapshotAggregate}, shard_log_header::ShardLogHeader};
+    use celeriant_wal::{aggregate_key::AggregateKey, buffer_read::{read_option_u128_le, read_u64_le, read_u128_le}, constants::{AGGREGATE_BLOOM_BYTES, FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, WIRE_SIZE_ENUM_DISCRIMINANT}, metablocks::{metablock_event_batch::MetablockEventBatch, metablock_snapshot_aggregate::MetablockSnapshotAggregate}, shard_log_header::ShardLogHeader};
 
     fn indexing_metablock_event_batch() -> Metablock {
         Metablock {
@@ -292,10 +292,10 @@ mod tests {
             metablocks_position: 0x1234_5678_9ABC_DEF0,
             datablocks_position: 0xFEDC_BA98_7654_3210,
             wal_index: 0x0FED_CBA9_8765_4321,
-            aggregate_bloom: [0u64; AGGREGATE_BLOOM_BYTES / 8],
+            aggregate_bloom: vec![],
         };
 
-        let mut buffer = [0u8; FIXED_BLOCK_SIZE_BYTES];
+        let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
         serialize_versioned_message(&header, WIRE_VERSION_WAL_SHARD_LOG_HEADER, &mut buffer).unwrap();
 
         let (deserialized, _) = deserialize_versioned_shard_log_header(&buffer).unwrap();
@@ -320,10 +320,10 @@ mod tests {
             metablocks_position: 11,
             datablocks_position: 12,
             wal_index: 13,
-            aggregate_bloom: [0u64; AGGREGATE_BLOOM_BYTES / 8],
+            aggregate_bloom: vec![],
         };
 
-        let mut buffer = [0u8; FIXED_BLOCK_SIZE_BYTES];
+        let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
         serialize_versioned_message(&header, 1, &mut buffer).unwrap();
 
         let (deserialized, version) = deserialize_versioned_shard_log_header(&buffer).unwrap();
@@ -340,10 +340,10 @@ mod tests {
             metablocks_position: 11,
             datablocks_position: 12,
             wal_index: 13,
-            aggregate_bloom: [0u64; AGGREGATE_BLOOM_BYTES / 8],
+            aggregate_bloom: vec![],
         };
 
-        let mut buffer = [0u8; FIXED_BLOCK_SIZE_BYTES];
+        let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
         serialize_versioned_message(&header, 1, &mut buffer).unwrap();
 
         // Corrupt a byte in the version field (not payload - see crc_covers_payload_data test)
@@ -359,10 +359,10 @@ mod tests {
             metablocks_position: 0x1111_1111_1111_1111,
             datablocks_position: 0x2222_2222_2222_2222,
             wal_index: 0x3333_3333_3333_3333,
-            aggregate_bloom: [0u64; AGGREGATE_BLOOM_BYTES / 8],
+            aggregate_bloom: vec![],
         };
 
-        let mut buffer = [0u8; FIXED_BLOCK_SIZE_BYTES];
+        let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
         serialize_versioned_message(&header, WIRE_VERSION_WAL_SHARD_LOG_HEADER, &mut buffer).unwrap();
 
         // Corrupt a byte in the actual payload area (after HEADER_SIZE)
@@ -381,10 +381,10 @@ mod tests {
             metablocks_position: 11,
             datablocks_position: 12,
             wal_index: 13,
-            aggregate_bloom: [0u64; AGGREGATE_BLOOM_BYTES / 8],
+            aggregate_bloom: vec![],
         };
 
-        let mut buffer = [0u8; FIXED_BLOCK_SIZE_BYTES];
+        let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
         serialize_versioned_message(&header, WIRE_VERSION_WAL_SHARD_LOG_HEADER, &mut buffer).unwrap();
 
         // Corrupt a byte in the version field (bytes CRC_SIZE..HEADER_SIZE)
@@ -403,10 +403,10 @@ mod tests {
             metablocks_position: 11,
             datablocks_position: 12,
             wal_index: 13,
-            aggregate_bloom: [0u64; AGGREGATE_BLOOM_BYTES / 8],
+            aggregate_bloom: vec![],
         };
 
-        let mut buffer = [0u8; FIXED_BLOCK_SIZE_BYTES];
+        let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
         serialize_versioned_message(&header, WIRE_VERSION_WAL_SHARD_LOG_HEADER, &mut buffer).unwrap();
 
         // Corrupting the CRC field itself should cause mismatch (not pass silently)
@@ -425,10 +425,10 @@ mod tests {
             metablocks_position: 11,
             datablocks_position: 12,
             wal_index: 13,
-            aggregate_bloom: [0u64; AGGREGATE_BLOOM_BYTES / 8],
+            aggregate_bloom: vec![],
         };
 
-        let mut buffer = [0u8; FIXED_BLOCK_SIZE_BYTES];
+        let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
         serialize_versioned_message(&header, WIRE_VERSION_WAL_SHARD_LOG_HEADER, &mut buffer).unwrap();
 
         // Overwrite version with unsupported value
@@ -449,10 +449,10 @@ mod tests {
             metablocks_position: 11,
             datablocks_position: 12,
             wal_index: 13,
-            aggregate_bloom: [0u64; AGGREGATE_BLOOM_BYTES / 8],
+            aggregate_bloom: vec![],
         };
 
-        let mut buffer = [0u8; FIXED_BLOCK_SIZE_BYTES];
+        let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
         serialize_versioned_message(&header, WIRE_VERSION_WAL_SHARD_LOG_HEADER, &mut buffer).unwrap();
 
         let version_bytes = &buffer[CRC_SIZE..HEADER_SIZE];

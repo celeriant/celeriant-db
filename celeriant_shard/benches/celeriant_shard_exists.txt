@@ -1,10 +1,10 @@
 group                                           exists_baseline
 -----                                           ---------------
-exists_wal_scan/known_aggregate/1seg_128mb      1.00     10.1±0.07ms    12.4 GB/sec
-exists_wal_scan/known_aggregate/2seg_256mb      1.00     20.0±0.20ms    12.5 GB/sec
-exists_wal_scan/known_aggregate/4seg_512mb      1.00     39.5±0.25ms    12.7 GB/sec
-exists_wal_scan/known_aggregate/8seg_1gb        1.00     80.4±0.51ms    12.4 GB/sec
-exists_wal_scan/unknown_aggregate/1seg_128mb    1.00     10.7±0.14ms    11.7 GB/sec
-exists_wal_scan/unknown_aggregate/2seg_256mb    1.00     21.8±0.23ms    11.5 GB/sec
-exists_wal_scan/unknown_aggregate/4seg_512mb    1.00     42.5±0.39ms    11.8 GB/sec
-exists_wal_scan/unknown_aggregate/8seg_1gb      1.00     85.3±0.54ms    11.7 GB/sec
+exists_wal_scan/known_aggregate/1seg_128mb      1.00     42.9±0.99ns 2914147.0 GB/sec
+exists_wal_scan/known_aggregate/2seg_256mb      1.00     43.1±1.13ns 5796297.0 GB/sec
+exists_wal_scan/known_aggregate/4seg_512mb      1.00     42.9±0.79ns 11664331.2 GB/sec
+exists_wal_scan/known_aggregate/8seg_1gb        1.00     44.0±1.03ns 22722883.9 GB/sec
+exists_wal_scan/unknown_aggregate/1seg_128mb    1.00    180.9±4.03ns 691067.2 GB/sec
+exists_wal_scan/unknown_aggregate/2seg_256mb    1.00    204.1±4.67ns 1225098.9 GB/sec
+exists_wal_scan/unknown_aggregate/4seg_512mb    1.00    251.1±4.46ns 1991182.1 GB/sec
+exists_wal_scan/unknown_aggregate/8seg_1gb      1.00    347.4±6.16ns 2878451.2 GB/sec

@@ -30,7 +30,7 @@ impl AggregateKeyBloom {
 
     /// Create from existing bloom bytes (e.g., loaded from disk).
     #[must_use]
-    pub fn from_bytes(bytes: &[u64; AGGREGATE_BLOOM_BYTES / 8]) -> Self {
+    pub fn from_bytes(bytes: &[u64]) -> Self {
         let bloom_filter = BloomFilter::from_vec(bytes.to_vec())
             .seed(&AGGREGATE_BLOOM_HASH_SEED)
             .hashes(AGGREGATE_BLOOM_HASH_COUNT);
@@ -65,8 +65,8 @@ impl AggregateKeyBloom {
 
     /// Export the bloom filter as bytes for storage in header.
     #[must_use]
-    pub fn to_bytes(&self) -> [u64; AGGREGATE_BLOOM_BYTES / 8] {
-        self.bloom_filter.as_slice().try_into().expect("Bloom filter size mismatch")
+    pub fn to_bytes(&self) -> Vec<u64> {
+        self.bloom_filter.iter().collect()
     }
 }
 

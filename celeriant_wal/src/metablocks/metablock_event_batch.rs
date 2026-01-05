@@ -10,6 +10,10 @@ pub struct MetablockEventBatch {
     pub aggregate_key: AggregateKey,
     /// Server-assigned ID for this batch within the aggregate
     pub event_batch_index: u64,
+    
+    /// Since its small and speeds up exists checks a lot, 
+    /// cache the min event batch index on each batch write
+    pub min_event_batch_index: u64,
 
     pub min_client_event_index: u64,
     pub max_client_event_index: u64,
@@ -42,6 +46,7 @@ impl MetablockEventBatch {
     // AggregateKey contains 3 x u64 fields (org_id, aggregate_type_id, aggregate_id)
     const WIRE_SIZE_AGGREGATE_KEY: usize = AggregateKey::WIRE_SIZE_TOTAL;
     const WIRE_SIZE_EVENT_BATCH_INDEX: usize = 8;
+    const WIRE_SIZE_MIN_EVENT_BATCH_INDEX: usize = 8;
     const WIRE_SIZE_MIN_CLIENT_EVENT_INDEX: usize = 8;
     const WIRE_SIZE_MAX_CLIENT_EVENT_INDEX: usize = 8;
     const WIRE_SIZE_MIN_EVENT_TIMESTAMP: usize = 8;
@@ -59,8 +64,11 @@ impl MetablockEventBatch {
     pub const OFFSET_EVENT_BATCH_INDEX: usize = 
         Self::OFFSET_AGGREGATE_KEY + Self::WIRE_SIZE_AGGREGATE_KEY;
 
+    pub const OFFSET_MIN_EVENT_BATCH_INDEX: usize = 
+        Self::OFFSET_EVENT_BATCH_INDEX + Self::WIRE_SIZE_EVENT_BATCH_INDEX;    
+
     pub const OFFSET_MIN_CLIENT_EVENT_INDEX: usize = 
-        Self::OFFSET_EVENT_BATCH_INDEX + Self::WIRE_SIZE_EVENT_BATCH_INDEX;
+        Self::OFFSET_MIN_EVENT_BATCH_INDEX + Self::WIRE_SIZE_MIN_EVENT_BATCH_INDEX;
 
     pub const OFFSET_MAX_CLIENT_EVENT_INDEX: usize = 
         Self::OFFSET_MIN_CLIENT_EVENT_INDEX + Self::WIRE_SIZE_MIN_CLIENT_EVENT_INDEX;
@@ -97,6 +105,7 @@ impl MetablockEventBatch {
         client_id: u128,
         user_id: Option<u128>,
         aggregate_key: AggregateKey,
+        min_event_batch_index: u64,
         event_batch_item: &DatablockAggregateEventBatch,
         event_types_data: EventTypesKind,
     ) -> Self {
@@ -143,6 +152,7 @@ impl MetablockEventBatch {
             aggregate_key,
             event_types_data,
             event_batch_index: event_batch_item.event_batch_index,
+            min_event_batch_index,
             client_id,
             user_id,
             min_client_event_index,
@@ -189,6 +199,7 @@ mod tests {
             0xA,
             None,
             aggregate_key,
+            1,
             &batch,
             EventTypesKind::Direct([2, 4, 0, 0]),
         );
@@ -197,6 +208,7 @@ mod tests {
         assert_eq!(meta.aggregate_key.aggregate_type_id, 4);
         assert_eq!(meta.aggregate_key.aggregate_id, 5);
         assert_eq!(meta.event_batch_index, 42);
+        assert_eq!(meta.min_event_batch_index, 1);
         assert_eq!(meta.client_id, 0xA);
         assert_eq!(meta.user_id, None);
 
@@ -222,6 +234,7 @@ mod tests {
             0x1,
             None,
             aggregate_key,
+            1,
             &batch,
             EventTypesKind::Direct([0, 0, 0, 0]),
         );

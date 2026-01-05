@@ -24,7 +24,7 @@ critcmp --export write_baseline > ./celeriant_shard/benches/celeriant_shard_writ
 
 # Run only aggregate count
 cargo bench --package celeriant_shard --bench aggregate_count_benchmark -- --save-baseline aggregate_count_baseline
-critcmp --export write_baseline > ./celeriant_shard/benches/celeriant_shard_write.json
+critcmp --export aggregate_count_baseline > ./celeriant_shard/benches/celeriant_shard_aggregate_count.json
 
 # Run only exists_benchmark
 cargo bench --package celeriant_shard --bench exists_benchmark -- --save-baseline exists_baseline

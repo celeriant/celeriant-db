@@ -2,7 +2,7 @@ use std::{cell::RefCell, path::PathBuf, rc::Rc};
 
 use celeriant_disk::files::open_dma_files::{existing_file_dma, open_or_create_file_dma};
 use celeriant_wal::{
-    constants::{AGGREGATE_BLOOM_BYTES, FIXED_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_SHARD_LOG_HEADER},
+    constants::{AGGREGATE_BLOOM_BYTES, HEADER_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_SHARD_LOG_HEADER},
     shard_log_header::ShardLogHeader,
 };
 use celeriant_wire::version_aware_wire_format::{deserialize_versioned_shard_log_header, serialize_versioned_message};
@@ -91,13 +91,13 @@ async fn load_log_file(mut dma_file: &mut DmaFile, file_len: u64, existing_file:
 /// Tries to load the header. Will try the front of the file first,
 /// then the end of the file if the front is corrupted.
 async fn load_header_detecting_corruption(dma_file: &mut DmaFile, file_len: u64, log_id: u64) -> Result<ShardLogHeader, RotatingLogError> {
-    let header_bytes = dma_file.read_at(0, FIXED_BLOCK_SIZE_BYTES).await?;
+    let header_bytes = dma_file.read_at(0, HEADER_BLOCK_SIZE_BYTES).await?;
     match deserialize_versioned_shard_log_header(&header_bytes) {
         Ok((shard_log_header, _version)) => Ok(shard_log_header),
         Err(_primary_err) => {
             // Primary header failed, try backup at end of file
             let header_bytes = dma_file
-                .read_at(file_len.saturating_sub(FIXED_BLOCK_SIZE_BYTES as u64), FIXED_BLOCK_SIZE_BYTES)
+                .read_at(file_len.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64), HEADER_BLOCK_SIZE_BYTES)
                 .await?;
             match deserialize_versioned_shard_log_header(&header_bytes) {
                 Ok((shard_log_header, _version)) => Ok(shard_log_header),
@@ -112,10 +112,10 @@ async fn load_header_detecting_corruption(dma_file: &mut DmaFile, file_len: u64,
 /// file and fsync the parent directory.
 async fn setup_new_file(dma_file: &mut DmaFile, file_len: u64) -> Result<ShardLogHeader, RotatingLogError> {
     let header = ShardLogHeader {
-        metablocks_position: FIXED_BLOCK_SIZE_BYTES as u64,
-        datablocks_position: file_len.saturating_sub(FIXED_BLOCK_SIZE_BYTES as u64),
+        metablocks_position: HEADER_BLOCK_SIZE_BYTES as u64,
+        datablocks_position: file_len.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64),
         wal_index: 0,
-        aggregate_bloom: [0u64; AGGREGATE_BLOOM_BYTES / 8],
+        aggregate_bloom: vec![0u64; AGGREGATE_BLOOM_BYTES / 8],
     };
 
     write_dual_shard_log_header(dma_file, header.datablocks_position, &header).await?;
@@ -139,11 +139,11 @@ async fn setup_new_file(dma_file: &mut DmaFile, file_len: u64) -> Result<ShardLo
 
 /// Writes the provided header to both start and end header positions
 pub async fn write_dual_shard_log_header(dma_file: &DmaFile, header_end_start_pos: u64, header: &ShardLogHeader) -> Result<(), RotatingLogError> {
-    let mut header_bytes = dma_file.alloc_dma_buffer(FIXED_BLOCK_SIZE_BYTES);
+    let mut header_bytes = dma_file.alloc_dma_buffer(HEADER_BLOCK_SIZE_BYTES);
     serialize_versioned_message(&header, WIRE_VERSION_WAL_SHARD_LOG_HEADER, header_bytes.as_bytes_mut())?;
     dma_file.write_at(header_bytes, 0).await?;
 
-    let mut header_bytes = dma_file.alloc_dma_buffer(FIXED_BLOCK_SIZE_BYTES);
+    let mut header_bytes = dma_file.alloc_dma_buffer(HEADER_BLOCK_SIZE_BYTES);
     serialize_versioned_message(&header, WIRE_VERSION_WAL_SHARD_LOG_HEADER, header_bytes.as_bytes_mut())?;
     dma_file.write_at(header_bytes, header_end_start_pos).await?;
 
