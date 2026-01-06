@@ -3,7 +3,7 @@ use std::{cell::Cell, collections::HashSet, fmt, rc::Rc, time::Duration};
 use celeriant_shard::{error::{shard_error::ShardError, shard_read_error::ShardReadError, shard_write_error::ShardWriteError, watch_session_error::WatchSessionError}, shard_wal::ShardWal};
 use celeriant_watch::{watch_output_type::WatchOutputType, watch_session::WatchSession};
 use celeriant_msg::{
-    request::requests::{WatchRequest, WriteRequest},
+    request::requests::{DeleteRequest, WatchRequest, WriteRequest},
     response::responses::{ErrorResponse, WatchResponse},
 };
 use celeriant_wire::wire_error::WireError;
@@ -187,6 +187,9 @@ fn determine_shard_route(
         celeriant_msg::process_requests::Request::Write(write_request) => {
             determine_shard_route_write_request(write_request, config)
         },
+        celeriant_msg::process_requests::Request::Delete(delete_request) => {
+            determine_shard_route_delete_request(delete_request, config)
+        },
         the_rest => {
             let shard_id = match config.routing_rule {
                 crate::RoutingRule::OrgId => the_rest.org_id() % num_shards,
@@ -222,6 +225,38 @@ fn determine_shard_route_write_request(
         return Err(ShardRoutingError::IncompatibleFilters(
             format!(
                 "Write request spans multiple shards. All writes must route to the same shard when using {} routing.",
+                config.routing_rule
+            ),
+        ));
+    }
+
+    Ok(shard_ids.into_iter().next().unwrap())
+}
+
+fn determine_shard_route_delete_request(
+    write_request: &DeleteRequest,
+    config: Rc<ShardConfig>,
+) -> Result<usize, ShardRoutingError> {
+    let num_shards = config.num_shards as u128;
+
+    if write_request.deletes.is_empty() {
+        return Err(ShardRoutingError::IncompatibleFilters(
+            "Delete request must contain at least one delete operation.".into(),
+        ));
+    }
+
+    let mut shard_ids: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+    for aggregate_key in write_request.deletes.keys() {
+        let routing_id = config.routing_rule.routing_id_for_rule(aggregate_key);
+        let shard_id = (routing_id % num_shards) as usize;
+        shard_ids.insert(shard_id);
+    }
+
+    if shard_ids.len() > 1 {
+        return Err(ShardRoutingError::IncompatibleFilters(
+            format!(
+                "Delete request spans multiple shards. All delete must route to the same shard when using {} routing.",
                 config.routing_rule
             ),
         ));
@@ -358,6 +393,8 @@ fn read_write_error_to_response(
             ),
             ShardWriteError::InvalidLeaseIndex => (400, "Invalid lease index".to_string()),
             ShardWriteError::AggregateNotExists => (404, "Aggregate not found".to_string()),
+            ShardWriteError::AggregatePendingDelete => (400, "Aggregate pending deletion. Cannot write new events.".to_string()),
+            ShardWriteError::AggregateRecreateNotAllowed => (400, "Aggregate recreate not allowed. Cannot write new events.".to_string()),
         },
         ShardError::WatchSession(watch_session_error) => {
             match watch_session_error {

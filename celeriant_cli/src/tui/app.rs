@@ -486,9 +486,19 @@ impl App {
             .map_err(|e| format!("Connection failed: {}", e))?;
         
         let key = AggregateKey::new(ctx.org_id, ctx.aggregate_type_id, ctx.aggregate_id);
+
+        let mut deletes = HashMap::new();
+        deletes.insert(key, SingleAggregateDelete {
+            allow_recreate: true,
+            allow_index_continuation: true,
+            expected_event_batch_index: None,
+        });
+        
         let request = Request::Delete(DeleteRequest {
             correlation_id: None,
-            aggregate_key: key,
+            client_id: self.client_id,  // Use app's client_id
+            user_id: None,
+            deletes,
         });
         
         match client.send_request(&request, CompressionType::None).await {

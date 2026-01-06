@@ -7,32 +7,33 @@ use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use celeriant_disk::files::read_objects_absolute;
-use celeriant_memcache::mem_snapshot_aggregate::MemSnapshotAggregate;
+use celeriant_memcache::mem_snapshot_aggregate::{AggregateStatus, MemSnapshotAggregate};
+use celeriant_memcache::metablock_position::MetablockPosition;
 use celeriant_memcache::shard_log_queue_item::ShardLogQueueItem;
-use celeriant_memcache::shard_mem_cache::{ShardMemCache};
+use celeriant_memcache::shard_mem_cache::ShardMemCache;
 use celeriant_memcache::sync_positions_snapshot::SyncPositionsSnapshot;
 use celeriant_msg::process_requests::Request;
 use celeriant_msg::process_responses::Response;
 use celeriant_msg::request::read_filters::ReadFilters;
-use celeriant_msg::request::requests::{ExistsRequest, ReadRequest, SingleAggregateWrite, WriteRequest};
+use celeriant_msg::request::requests::{DeleteRequest, ExistsRequest, ReadRequest, SingleAggregateWrite, WriteRequest};
 use celeriant_msg::response::aggregate_event_batch::AggregateEventBatch;
 use celeriant_msg::response::responses::{ExistsResponse, ReadResponse, SuccessResponse};
 use celeriant_rotating_log::log_segment_file::LogSegmentFile;
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
 use celeriant_rotating_log::reverse_metablock_scanner::ReverseMetablockScanner;
 use celeriant_rotating_log::rotating_log_error::RotatingLogError;
-use celeriant_rotating_log::rwlock_timeout::{write_with_timeout};
-use celeriant_wal::aggregate_client_key::{AggregateClientKey};
+use celeriant_rotating_log::rwlock_timeout::write_with_timeout;
+use celeriant_wal::aggregate_client_key::AggregateClientKey;
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::constants::{FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_METABLOCK};
 use celeriant_wal::datablocks::datablock::Datablock;
 use celeriant_wal::datablocks::datablock_aggregate_event_batch::DatablockAggregateEventBatch;
 use celeriant_wal::datablocks::datablock_kind::DatablockKind;
-use celeriant_memcache::metablock_position::MetablockPosition;
 use celeriant_wal::metablocks::datablock_storage_kind::DatablockStorageKind;
 use celeriant_wal::metablocks::metablock::Metablock;
 use celeriant_wal::metablocks::metablock_event_batch::{EventTypesKind, MetablockEventBatch};
 use celeriant_wal::metablocks::metablock_kind::MetablockKind;
+use celeriant_wal::metablocks::metablock_soft_delete::MetablockSoftDelete;
 use celeriant_watch::aggregate_reader::AggregateReader;
 use celeriant_watch::aggregate_watch_event::{AggregateWatchEvent, AggregateWatchEventOperation};
 use celeriant_watch::aggregate_watchers::AggregateWatchers;
@@ -108,7 +109,13 @@ impl ShardWal {
                     .map_err(ShardError::Write)
             }
             Request::TrimStart(_trim_start_request) => Err(ShardError::Read(ShardReadError::AggregateNotExists)),
-            Request::Delete(_delete_request) => Err(ShardError::Read(ShardReadError::AggregateNotExists)),
+            Request::Delete(delete_request) => {
+                let lease_index = lease_index.ok_or(ShardWriteError::InvalidLeaseIndex)?;
+                self.delete(lease_index, delete_request)
+                    .await
+                    .map(Response::Delete)
+                    .map_err(ShardError::Write)
+            }
             Request::Watch(_) => Err(ShardError::Read(ShardReadError::IoError(
                 "Watch unprocessable via request/response model".to_string(),
             ))),
@@ -165,6 +172,78 @@ impl ShardWal {
         })
     }
 
+    pub async fn delete(&self, lease_index: u64, delete_request: DeleteRequest) -> Result<SuccessResponse, ShardWriteError> {
+        // Make sure we have at least one aggregate to write
+        if delete_request.deletes.is_empty() {
+            return Err(ShardWriteError::EmptyEventsList);
+        }
+
+        let mut prepared_deletes = Vec::with_capacity(delete_request.deletes.len());
+        for (aggregate_key, single_delete) in &delete_request.deletes {
+            // Ensure aggregate snapshot is in memcache, loading from disk if necessary
+            if !self.aggregate_exists_and_cache(aggregate_key).await? {
+                return Err(ShardWriteError::AggregateNotExists);
+            }
+
+            let aggregate_current_indexes = self.shard_mem_cache.borrow_mut().get_event_indexes(aggregate_key);
+
+            // Validate optimistic concurrency
+            if let Some(expected) = single_delete.expected_event_batch_index {
+                if expected != aggregate_current_indexes.event_batch_index {
+                    return Err(ShardWriteError::OptimisticConcurrencyViolation {
+                        expected_event_batch_index: expected,
+                        current_event_batch_index: aggregate_current_indexes.event_batch_index,
+                    });
+                }
+            }
+
+            let server_timestamp = self.config.timestamp_config.now();
+
+            let metablock_soft_delete = MetablockSoftDelete {
+                aggregate_key: aggregate_key.clone(),
+                event_batch_index: aggregate_current_indexes.event_batch_index,
+                event_index: aggregate_current_indexes.event_index,
+                client_id: delete_request.client_id,
+                user_id: delete_request.user_id,
+                allow_recreate: single_delete.allow_recreate,
+                allow_index_continuation: single_delete.allow_index_continuation,
+            };
+            let metablock = Metablock {
+                wal_index: 0,
+                server_timestamp,
+                lease_index,
+                node_id: self.config.node_id,
+                datablock: DatablockStorageKind::None,
+                wal_metablock_type: MetablockKind::SoftDelete(metablock_soft_delete.clone()),
+            };
+
+            let shard_log_queue_item = ShardLogQueueItem::new(None, None, metablock);
+            prepared_deletes.push((aggregate_key.clone(), metablock_soft_delete, shard_log_queue_item));
+        }
+
+        // Phase 2: Append all prepared deletes to queue - cannot fail
+        {
+            let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
+            for (aggregate_key, soft_delete, shard_log_queue_item) in prepared_deletes {
+                shard_mem_cache.add_pending_delete_to_queue(
+                    &aggregate_key,
+                    soft_delete.event_index,
+                    soft_delete.event_batch_index,
+                    soft_delete.allow_recreate,
+                    soft_delete.allow_index_continuation,
+                    shard_log_queue_item,
+                );
+            }
+        }
+
+        // Now we wait on disk write before ack to client
+        self.sync_durable().await?;
+
+        Ok(SuccessResponse {
+            correlation_id: delete_request.correlation_id,
+        })
+    }
+
     /// Write events to an aggregate.
     ///
     /// # Flow
@@ -201,8 +280,21 @@ impl ShardWal {
             }
 
             // Ensure aggregate snapshot is in memcache, loading from disk if necessary
-            if !self.aggregate_exists_and_cache(aggregate_key).await? && !single_write.allow_create {
-                return Err(ShardWriteError::AggregateNotExists);
+            // Returns true for Found, false for NotFound/Deleted
+            let aggregate_exists = self.aggregate_exists_and_cache(aggregate_key).await?;
+            
+            if !aggregate_exists {
+                // Check if it was deleted with allow_recreate = false
+                let (is_loaded, status) = self.shard_mem_cache.borrow_mut().aggregate_load_status(aggregate_key);
+                if is_loaded && status == AggregateStatus::Deleted {
+                    let indexes = self.shard_mem_cache.borrow_mut().get_event_indexes(aggregate_key);
+                    if !indexes.allow_recreate {
+                        return Err(ShardWriteError::AggregateRecreateNotAllowed);
+                    }
+                    // allow_recreate is true, so we can proceed with create
+                } else if !single_write.allow_create {
+                    return Err(ShardWriteError::AggregateNotExists);
+                }
             }
 
             let aggregate_client_key = AggregateClientKey::new(aggregate_key.clone(), write_request.client_id);
@@ -349,8 +441,8 @@ impl ShardWal {
 
     async fn aggregate_exists_and_cache(&self, searching_for_aggregate_key: &AggregateKey) -> Result<bool, ShardCacheError> {
         // If we are cached already
-        if let (true, exists) = self.shard_mem_cache.borrow_mut().aggregate_load_status(searching_for_aggregate_key) {
-            return Ok(exists);
+        if let (true, status) = self.shard_mem_cache.borrow_mut().aggregate_load_status(searching_for_aggregate_key) {
+            return Ok(status == AggregateStatus::Found);
         }
 
         // Take an exclusive lock on this aggregate
@@ -358,8 +450,8 @@ impl ShardWal {
         let _ = write_with_timeout(&aggregate_lock, "move_aggregate_to_memcache").await?;
 
         // We have exclusive access now, check if another concurrent task has already done the work
-        if let (true, exists) = self.shard_mem_cache.borrow_mut().aggregate_load_status(searching_for_aggregate_key) {
-            return Ok(exists);
+        if let (true, status) = self.shard_mem_cache.borrow_mut().aggregate_load_status(searching_for_aggregate_key) {
+            return Ok(status == AggregateStatus::Found);
         }
 
         // Begin the search from the active log, moving backwards
@@ -373,6 +465,25 @@ impl ShardWal {
 
         let find_result = scanner
             .scan::<bool, ()>(|log_id, metablock_absolute_pos, metablock_bytes| {
+                // Check for soft delete first - if this aggregate was deleted, we're done
+                if metablock_bytes::is_soft_delete_for_aggregate(metablock_bytes, searching_for_aggregate_key) {
+                    // Deserialize to get the deletion options
+                    let (metablock, _version) = celeriant_wire::version_aware_wire_format::deserialize_versioned_metablock(metablock_bytes)
+                        .map_err(|_| ())?;
+                    
+                    if let MetablockKind::SoftDelete(soft_delete) = metablock.wal_metablock_type {
+                        let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
+                        shard_mem_cache.put_aggregate_into_cache_as_deleted(
+                            searching_for_aggregate_key.clone(),
+                            soft_delete.event_index,
+                            soft_delete.event_batch_index,
+                            soft_delete.allow_recreate,
+                            soft_delete.allow_index_continuation,
+                        );
+                    }
+                    return Ok(Some(false)); // Found but deleted
+                }
+
                 if !metablock_bytes::is_metablock_kind_event_batch_metadata(metablock_bytes) {
                     return Ok(None);
                 }
@@ -387,13 +498,14 @@ impl ShardWal {
                     return Ok(None);
                 }
 
-                let snapshot = MemSnapshotAggregate {
-                    event_index: metablock_bytes::read_event_batch_max_event_index(metablock_bytes),
-                    event_batch_index: metablock_bytes::read_event_batch_event_batch_index(metablock_bytes),
+
+                let snapshot = MemSnapshotAggregate::found(
                     log_id,
                     metablock_absolute_pos,
-                    min_event_batch_index: metablock_bytes::read_event_batch_min_event_batch_index(metablock_bytes),
-                };
+                    metablock_bytes::read_event_batch_max_event_index(metablock_bytes),
+                    metablock_bytes::read_event_batch_event_batch_index(metablock_bytes),
+                    metablock_bytes::read_event_batch_min_event_batch_index(metablock_bytes),
+                );
 
                 let client_id = metablock_bytes::read_event_batch_client_id(metablock_bytes);
                 let last_client_event_index = metablock_bytes::read_event_batch_max_client_event_index(metablock_bytes);
@@ -409,7 +521,8 @@ impl ShardWal {
             .await?;
 
         let found = find_result.unwrap_or(false);
-        if !found {
+        if find_result.is_none() {
+            // Never found any metablock for this aggregate
             let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
             shard_mem_cache.put_aggregate_into_cache_as_not_found(searching_for_aggregate_key.clone());
         }
@@ -444,7 +557,15 @@ impl ShardWal {
 
         let aggregate_current_indexes = shard_mem_cache.get_event_indexes(aggregate_key);
 
-        // Validate optimistic concurrency
+        // There is a soft delete entry in the queue that hasn't been committed yet
+        if aggregate_current_indexes.pending_delete {
+            if !aggregate_current_indexes.allow_recreate {
+                return Err(ShardWriteError::AggregateRecreateNotAllowed);
+            }
+            // Pending delete with allow_recreate - fall through to create logic
+        }
+
+        // Validate optimistic concurrency (only for existing aggregates, not recreates)
         if let Some(expected) = write_request.expected_event_batch_index {
             if expected != aggregate_current_indexes.event_batch_index {
                 return Err(ShardWriteError::OptimisticConcurrencyViolation {
@@ -457,14 +578,35 @@ impl ShardWal {
         // Drop the borrow before doing potentially expensive serialization
         drop(shard_mem_cache);
 
+        // Determine starting indexes based on whether this is a recreate with index continuation
+        let is_recreate = aggregate_current_indexes.pending_delete 
+            || aggregate_current_indexes.event_batch_index == 0;
+        
+        let (mut event_index, event_batch_index, mut min_event_batch_index) = if is_recreate && aggregate_current_indexes.allow_index_continuation {
+            // Continue from pre-deletion indexes
+            (
+                aggregate_current_indexes.event_index,
+                aggregate_current_indexes.event_batch_index.saturating_add(1),
+                aggregate_current_indexes.min_event_batch_index,
+            )
+        } else if is_recreate {
+            // Fresh start
+            (0, FIRST_EVENT_BATCH_INDEX, FIRST_EVENT_BATCH_INDEX)
+        } else {
+            // Normal append to existing aggregate
+            (
+                aggregate_current_indexes.event_index,
+                aggregate_current_indexes.event_batch_index.saturating_add(1),
+                aggregate_current_indexes.min_event_batch_index,
+            )
+        };
+
+        if min_event_batch_index == 0 {
+            min_event_batch_index = FIRST_EVENT_BATCH_INDEX;
+        }
+
         // Prepare event data
         let mut events_in_batch = std::mem::take(&mut write_request.events);
-        let mut event_index = aggregate_current_indexes.event_index;
-        let event_batch_index = aggregate_current_indexes.event_batch_index.saturating_add(1);
-        let mut min_event_batch_index = aggregate_current_indexes.min_event_batch_index;
-        if min_event_batch_index == 0 {
-            min_event_batch_index = 1;
-        }
 
         for e in events_in_batch.iter_mut() {
             event_index = event_index.saturating_add(1);
@@ -604,7 +746,6 @@ async fn sync_with_rollback(
     shard_mem_cache: Rc<RefCell<ShardMemCache>>,
     watched_aggregates: Rc<AggregateWatchers>,
 ) -> Result<(), ShardFsyncError> {
-
     let (required_disk_space, mut sync_positions_snapshot) = {
         let mut shard_mem_cache = shard_mem_cache.borrow_mut();
 
@@ -612,7 +753,9 @@ async fn sync_with_rollback(
             return Ok(());
         }
 
-        let required_disk_space = shard_mem_cache.buffer_size_datablocks().saturating_add(shard_mem_cache.buffer_size_metablocks());
+        let required_disk_space = shard_mem_cache
+            .buffer_size_datablocks()
+            .saturating_add(shard_mem_cache.buffer_size_metablocks());
         let sync_positions_snapshot = shard_mem_cache.take_sync_positions_snapshot();
 
         (required_disk_space, sync_positions_snapshot)
@@ -623,12 +766,7 @@ async fn sync_with_rollback(
     log_segments_cache.rotate_to_next_log(required_disk_space).await?;
     let active_log_segment = log_segments_cache.active();
 
-    match sync(
-        active_log_segment,
-        &mut sync_positions_snapshot,
-    )
-    .await
-    {
+    match sync(active_log_segment, &mut sync_positions_snapshot).await {
         Ok(_) => {
             let mut shard_mem_cache = shard_mem_cache.borrow_mut();
 
@@ -639,6 +777,8 @@ async fn sync_with_rollback(
             // Transform the queue into recent writes and broadcast events
             let mut write_events: HashMap<AggregateKey, AggregateWatchEventOperation> = HashMap::new();
             let mut create_events: HashMap<AggregateKey, AggregateWatchEventOperation> = HashMap::new();
+            let mut delete_events: HashMap<AggregateKey, AggregateWatchEventOperation> = HashMap::new();
+
             for queue_item in pending_append_queue {
                 match &queue_item.metablock.wal_metablock_type {
                     MetablockKind::EventBatchMetadata(event_batch_metadata) => {
@@ -661,6 +801,20 @@ async fn sync_with_rollback(
                             size_bytes,
                         );
                     }
+                    MetablockKind::SoftDelete(soft_delete) => {
+                        // Mark aggregate as deleted in cache
+                        shard_mem_cache.put_aggregate_into_cache_as_deleted(
+                            soft_delete.aggregate_key.clone(),
+                            soft_delete.event_index,
+                            soft_delete.event_batch_index,
+                            soft_delete.allow_recreate,
+                            soft_delete.allow_index_continuation,
+                        );
+                        
+                        // Track delete event for watchers
+                        delete_events.entry(soft_delete.aggregate_key.clone())
+                            .or_insert(AggregateWatchEventOperation::Delete {});
+                    }
                     _ => {}
                 }
             }
@@ -676,6 +830,10 @@ async fn sync_with_rollback(
                 });
             }
 
+            for (aggregate_key, operation) in delete_events {
+                watched_aggregates.broadcast(AggregateWatchEvent { aggregate_key, operation });
+            }
+
             return Ok(());
         }
         Err(e) => {
@@ -687,15 +845,13 @@ async fn sync_with_rollback(
     }
 }
 
-async fn sync(
-    log_segment_file: Rc<LogSegmentFile>,
-    sync_positions_snapshot: &mut SyncPositionsSnapshot,
-) -> Result<(), ShardFsyncError> {
-
+async fn sync(log_segment_file: Rc<LogSegmentFile>, sync_positions_snapshot: &mut SyncPositionsSnapshot) -> Result<(), ShardFsyncError> {
     let mut log_segment_file_metadata = log_segment_file.metadata.borrow().clone();
 
     let dma_file_writer = log_segment_file.lock_writer("sync").await?;
-    let dma_file_writer = dma_file_writer.as_ref().ok_or_else(|| RotatingLogError::IoError("No file handle".to_string()))?;
+    let dma_file_writer = dma_file_writer
+        .as_ref()
+        .ok_or_else(|| RotatingLogError::IoError("No file handle".to_string()))?;
 
     // Write datablocks first so we can get the positions to include into metablocks
     let buffer_size_datablocks: u64 = sync_positions_snapshot.buffer_size_datablocks();
@@ -705,12 +861,10 @@ async fn sync(
     let mut datablocks_carry_over: Option<Vec<u8>> = log_segment_file_metadata.datablocks_carry_over.take();
 
     if buffer_size_datablocks > 0 {
-        
         let write_to_pos = dma_file_writer.align_up(log_segment_file_metadata.datablocks_position);
         new_datablocks_position = log_segment_file_metadata.datablocks_position.saturating_sub(buffer_size_datablocks);
         let write_from_pos = dma_file_writer.align_down(new_datablocks_position);
         let aligned_buffer_size_datablocks = write_to_pos.saturating_sub(write_from_pos);
-
 
         let front_carry_over = new_datablocks_position.saturating_sub(write_from_pos) as usize;
         let end_carry_over = write_to_pos.saturating_sub(log_segment_file_metadata.datablocks_position) as usize;
@@ -758,7 +912,6 @@ async fn sync(
     let mut position = 0usize;
     let mut index = 0;
     for item in &mut sync_positions_snapshot.pending_append_queue {
-
         if item.datablock_bytes.is_some() && item.datablock.is_some() {
             match &mut item.metablock.datablock {
                 DatablockStorageKind::Block(datablock_block_ref) => {
@@ -796,7 +949,6 @@ async fn sync(
     dma_file_writer
         .write_at(buffer_metablocks, log_segment_file_metadata.metablocks_position)
         .await?;
-
 
     // Update bloom filter with aggregate keys from this batch
     for item in &sync_positions_snapshot.pending_append_queue {

@@ -35,6 +35,12 @@ pub enum ShardWriteError {
     InvalidLeaseIndex,
 
     AggregateNotExists,
+
+    // There is a soft delete entry in the queue that hasn't been committed yet
+    AggregatePendingDelete,
+
+    /// Aggregate was deleted with allow_recreate=false and cannot be recreated
+    AggregateRecreateNotAllowed,
 }
 
 impl From<ShardCacheError> for ShardWriteError {

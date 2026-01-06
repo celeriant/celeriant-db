@@ -101,7 +101,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use celeriant_wal::{aggregate_key::AggregateKey, buffer_read::{read_option_u128_le, read_u64_le, read_u128_le}, constants::{AGGREGATE_BLOOM_BYTES, FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, WIRE_SIZE_ENUM_DISCRIMINANT}, metablocks::{metablock_event_batch::MetablockEventBatch, metablock_snapshot_aggregate::MetablockSnapshotAggregate}, shard_log_header::ShardLogHeader};
+    use celeriant_wal::{aggregate_key::AggregateKey, buffer_read::{read_option_u128_le, read_u64_le, read_u128_le}, constants::{AGGREGATE_BLOOM_BYTES, FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, WIRE_SIZE_ENUM_DISCRIMINANT}, metablocks::{metablock_event_batch::MetablockEventBatch, metablock_snapshot_aggregate::MetablockSnapshotAggregate, metablock_snapshot_org::MetablockSnapshotOrg}, shard_log_header::ShardLogHeader};
 
     fn indexing_metablock_event_batch() -> Metablock {
         Metablock {
@@ -114,6 +114,7 @@ mod tests {
                     aggregate_key: AggregateKey::new(23423423423, 33420324432, 230234323),
                     event_types_data: celeriant_wal::metablocks::metablock_event_batch::EventTypesKind::Direct([33242342u64; 4]),
                     event_batch_index: 43242343,
+                    min_event_batch_index: 1,
                     client_id: 534534435,
                     user_id: Some(342352352),
                     min_client_event_index: 4,
@@ -165,7 +166,7 @@ mod tests {
         assert_eq!(kind_discriminant, 0); // EventBatchMetadata discriminant value
 
         metablock.wal_metablock_type = celeriant_wal::metablocks::metablock_kind::MetablockKind::SnapshotOrg(
-            celeriant_wal::datablocks::datablock_snapshot_org::DatablockSnapshotOrg { },
+            MetablockSnapshotOrg { org_id: 0 },
         );
 
         let mut buffer = [0u8; FIXED_BLOCK_SIZE_BYTES];

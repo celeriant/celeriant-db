@@ -51,6 +51,7 @@ fn create_metadata() -> MetablockEventBatch {
         aggregate_key: AggregateKey::new(1, 2, 3),
         event_types_data: EventTypesKind::Direct([1, 2, 3, 4]),
         event_batch_index: 42,
+        min_event_batch_index: 1,
         client_id: 0x123456789ABCDEF0,
         user_id: Some(0xFEDCBA9876543210),
         min_client_event_index: 0,

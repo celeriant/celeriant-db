@@ -11,8 +11,14 @@ use crate::version_aware_wire_format::HEADER_SIZE;
 /// Discriminant value for MetablockKind::EventBatchMetadata
 const DISCRIMINANT_EVENT_BATCH_METADATA: u8 = 0;
 
+/// Discriminant value for MetablockKind::SoftDelete
+const DISCRIMINANT_SOFT_DELETE: u8 = 4;
+
 /// Base offset where MetablockEventBatch payload starts
 const EVENT_BATCH_PAYLOAD_OFFSET: usize = 
+    HEADER_SIZE + Metablock::OFFSET_WAL_METABLOCK_TYPE + WIRE_SIZE_ENUM_DISCRIMINANT;
+
+const SOFT_DELETE_PAYLOAD_OFFSET: usize = 
     HEADER_SIZE + Metablock::OFFSET_WAL_METABLOCK_TYPE + WIRE_SIZE_ENUM_DISCRIMINANT;
 
 /// Read the MetablockKind discriminant from raw bytes
@@ -26,6 +32,11 @@ pub fn read_metablock_kind_discriminant(bytes: &[u8]) -> u8 {
 pub fn read_wal_index(bytes: &[u8]) -> u64 {
     let offset = HEADER_SIZE + Metablock::OFFSET_WAL_INDEX;
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+}
+
+#[inline]
+pub fn is_metablock_kind_soft_delete(bytes: &[u8]) -> bool {
+    read_metablock_kind_discriminant(bytes) == DISCRIMINANT_SOFT_DELETE
 }
 
 #[inline]
@@ -47,6 +58,43 @@ pub fn is_matches_aggregate_key(bytes: &[u8], target: &AggregateKey) -> bool {
     org_id == target.org_id 
         && type_id == target.aggregate_type_id 
         && agg_id == target.aggregate_id
+}
+
+/// Check if this metablock is a SoftDelete for the given aggregate
+#[inline]
+pub fn is_soft_delete_for_aggregate(bytes: &[u8], target: &AggregateKey) -> bool {
+    if read_metablock_kind_discriminant(bytes) != DISCRIMINANT_SOFT_DELETE {
+        return false;
+    }
+
+    // SoftDelete has same layout for aggregate_key at start of payload
+    let org_id = read_soft_delete_org_id(bytes);
+    let type_id = read_soft_delete_aggregate_type_id(bytes);
+    let agg_id = read_soft_delete_aggregate_id(bytes);
+
+    org_id == target.org_id 
+        && type_id == target.aggregate_type_id 
+        && agg_id == target.aggregate_id
+}
+
+// --- SoftDelete field readers ---
+
+#[inline]
+pub fn read_soft_delete_org_id(bytes: &[u8]) -> u128 {
+    let offset = SOFT_DELETE_PAYLOAD_OFFSET + AggregateKey::OFFSET_ORG_ID;
+    read_u128_le(bytes, offset)
+}
+
+#[inline]
+pub fn read_soft_delete_aggregate_type_id(bytes: &[u8]) -> u128 {
+    let offset = SOFT_DELETE_PAYLOAD_OFFSET + AggregateKey::OFFSET_AGGREGATE_TYPE_ID;
+    read_u128_le(bytes, offset)
+}
+
+#[inline]
+pub fn read_soft_delete_aggregate_id(bytes: &[u8]) -> u128 {
+    let offset = SOFT_DELETE_PAYLOAD_OFFSET + AggregateKey::OFFSET_AGGREGATE_ID;
+    read_u128_le(bytes, offset)
 }
 
 // --- EventBatch field readers ---

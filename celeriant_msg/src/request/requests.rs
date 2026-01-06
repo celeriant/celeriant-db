@@ -47,7 +47,16 @@ pub struct TrimStartRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct DeleteRequest {
     pub correlation_id: Option<u128>,
-    pub aggregate_key: AggregateKey,
+    pub client_id: u128,
+    pub user_id: Option<u128>,
+    pub deletes: HashMap<AggregateKey, SingleAggregateDelete>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub struct SingleAggregateDelete {
+    pub allow_recreate: bool,
+    pub allow_index_continuation: bool,
+    pub expected_event_batch_index: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]

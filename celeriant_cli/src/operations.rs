@@ -212,12 +212,21 @@ async fn trim_start(client: &mut CeleriantClient, args: TrimArgs) -> Result<()> 
     Ok(())
 }
 
-async fn delete_aggregate(client: &mut CeleriantClient, args: AggregateKeyArgs) -> Result<()> {
-    let key = AggregateKey::new(args.org, args.aggregate_type, args.id);
+async fn delete_aggregate(client: &mut CeleriantClient, args: DeleteArgs) -> Result<()> {
+    let key = AggregateKey::new(args.key.org, args.key.aggregate_type, args.key.id);
 
+    let mut deletes = HashMap::new();
+    deletes.insert(key, SingleAggregateDelete {
+        allow_recreate: args.allow_recreate,
+        allow_index_continuation: args.allow_index_continuation,
+        expected_event_batch_index: args.expected_index,
+    });
+    
     let request = Request::Delete(DeleteRequest {
-        correlation_id: args.correlation_id,
-        aggregate_key: key,
+        correlation_id: args.key.correlation_id,
+        client_id: args.client_id,
+        user_id: args.user_id,
+        deletes,
     });
 
     let response = client.send_request(&request, CompressionType::None).await?;

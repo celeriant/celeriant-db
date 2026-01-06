@@ -82,7 +82,7 @@ impl Request {
             Request::Read(req) => req.aggregate_key.aggregate_id,
             Request::Write(_req) => 0,
             Request::TrimStart(req) => req.aggregate_key.aggregate_id,
-            Request::Delete(req) => req.aggregate_key.aggregate_id,
+            Request::Delete(_req) => 0,
             Request::Watch(_req) => 0,
         }
     }
@@ -95,7 +95,7 @@ impl Request {
             Request::Read(req) => req.aggregate_key.org_id,
             Request::Write(_req) => 0,
             Request::TrimStart(req) => req.aggregate_key.org_id,
-            Request::Delete(req) => req.aggregate_key.org_id,
+            Request::Delete(_req) => 0,
             Request::Watch(_req) => 0,
         }
     }
@@ -108,7 +108,7 @@ impl Request {
             Request::Read(req) => req.aggregate_key.aggregate_type_id,
             Request::Write(_req) => 0,
             Request::TrimStart(req) => req.aggregate_key.aggregate_type_id,
-            Request::Delete(req) => req.aggregate_key.aggregate_type_id,
+            Request::Delete(_req) => 0,
             Request::Watch(_req) => 0,
         }
     }
@@ -210,7 +210,7 @@ mod tests {
     use celeriant_wal::aggregate_key::AggregateKey;
     use celeriant_wire::constants::{PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3};
     use futures_lite::{future::block_on, io::Cursor};
-    use crate::request::{read_filters::ReadFilters, requests::SingleAggregateWrite};
+    use crate::request::{read_filters::ReadFilters, requests::{SingleAggregateDelete, SingleAggregateWrite}};
 
     // UPDATE THIS when adding new RequestTypes - tests will fail if mismatched
     const REQUEST_TYPE_COUNT: usize = 6;
@@ -273,10 +273,23 @@ mod tests {
                 aggregate_key: key,
                 keep_from_event_batch_index: 10,
             }),
-            RequestType::Delete => Request::Delete(DeleteRequest {
-                correlation_id: Some(107),
-                aggregate_key: key,
-            }),
+            RequestType::Delete => {
+                let deletes = std::collections::HashMap::from([(
+                    key.clone(),
+                    SingleAggregateDelete {
+                        allow_recreate: true,
+                        allow_index_continuation: true,
+                        expected_event_batch_index: None,
+                    },
+                )]);
+
+                Request::Delete(DeleteRequest {
+                    correlation_id: Some(104),
+                    client_id: 999,
+                    user_id: Some(888),
+                    deletes,
+                })
+            },
             RequestType::Watch => Request::Watch(WatchRequest { 
                 correlation_id: Some(109), 
                 requested_latency_ms: Some(10),

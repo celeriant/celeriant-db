@@ -30,7 +30,7 @@ pub enum Commands {
     Trim(TrimArgs),
 
     /// Delete an aggregate
-    Delete(AggregateKeyArgs),
+    Delete(DeleteArgs),
 }
 
 #[derive(Args, Clone)]
@@ -134,6 +134,32 @@ pub struct ReadArgs {
     /// Output format
     #[arg(long, value_enum, default_value = "json")]
     pub format: OutputFormat,
+}
+
+#[derive(Args, Clone)]
+pub struct DeleteArgs {
+    #[command(flatten)]
+    pub key: AggregateKeyArgs,
+
+    /// Client ID for the write
+    #[arg(long)]
+    pub client_id: u128,
+
+    /// User ID (optional)
+    #[arg(long)]
+    pub user_id: Option<u128>,
+
+    /// Allow re-creating the aggregate after delete
+    #[arg(long)]
+    pub allow_recreate: bool,
+
+    /// On recreation after delete, continue from last batch and event indexes instead of resetting
+    #[arg(long)]
+    pub allow_index_continuation: bool,
+
+    /// Expected event batch index (for optimistic concurrency)
+    #[arg(long)]
+    pub expected_index: Option<u64>,
 }
 
 #[derive(Args, Clone)]

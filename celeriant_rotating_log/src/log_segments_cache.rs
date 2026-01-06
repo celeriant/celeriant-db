@@ -190,7 +190,7 @@ mod log_segments_cache_tests {
         let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
             .spawn(|| async move {
                 let (_tempdir, shard_dir) = create_test_dir();
-                let preallocate_bytes = 64 * 1024; // 64 KiB
+                let preallocate_bytes = 1024 * 1024 * 4;
 
                 let cache = LogSegmentsCache::ready_up(shard_dir.clone(), preallocate_bytes, 2)
                     .await

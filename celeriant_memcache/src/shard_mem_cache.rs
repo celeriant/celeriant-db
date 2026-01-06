@@ -1,3 +1,4 @@
+use crate::mem_snapshot_aggregate::AggregateStatus;
 use crate::metablock_position::MetablockPosition;
 use crate::{
     aggregate_recent_write::AggregateRecentWrites, mem_snapshot_aggregate::MemSnapshotAggregate,
@@ -68,23 +69,24 @@ impl ShardMemCache {
         (false, None)
     }
 
-    /// Returns (is_loaded, exists)
+    /// Returns (is_loaded, status)
     /// - is_loaded: true if we've already checked disk for this aggregate  
-    /// - exists: true if the aggregate has actual data (on disk or in queue)
-    pub fn aggregate_load_status(&mut self, aggregate_key: &AggregateKey) -> (bool, bool) {
+    /// - status: Found/NotFound/Deleted based on cache state
+    pub fn aggregate_load_status(&mut self, aggregate_key: &AggregateKey) -> (bool, AggregateStatus) {
         // Check if in queue (being created/modified)
-        if self.aggregate_queue_positions.contains_key(aggregate_key) {
-            return (true, true);
+        if let Some(queue_pos) = self.aggregate_queue_positions.get(aggregate_key) {
+            if queue_pos.pending_delete {
+                return (true, AggregateStatus::Deleted);
+            }
+            return (true, AggregateStatus::Found);
         }
 
         // Check if in snapshots cache
         if let Some(snapshot) = self.aggregate_snapshots.get(aggregate_key) {
-            // event_batch_index > 0 means real data exists on disk
-            let exists = snapshot.event_batch_index > 0;
-            return (true, exists);
+            return (true, snapshot.status);
         }
 
-        (false, false)
+        (false, AggregateStatus::NotFound)
     }
 
     /// Insert a write into the recent write cache. Call only after durable write.
@@ -161,6 +163,30 @@ impl ShardMemCache {
 
     pub fn pending_append_queue_is_empty(&self) -> bool {
         self.pending_append_queue.is_empty()
+    }
+
+    /// Add a pending delete to the queue
+    pub fn add_pending_delete_to_queue(
+        &mut self,
+        aggregate_key: &AggregateKey,
+        event_index: u64,
+        event_batch_index: u64,
+        allow_recreate: bool,
+        allow_index_continuation: bool,
+        shard_log_queue_item: ShardLogQueueItem,
+    ) {
+        let aggregate = self
+            .aggregate_queue_positions
+            .entry(aggregate_key.clone())
+            .or_insert_with(|| QueueAggregatePositions::default());
+
+        aggregate.pending_delete = true;
+        aggregate.allow_recreate = allow_recreate;
+        aggregate.allow_index_continuation = allow_index_continuation;
+        aggregate.event_batch_index = event_batch_index;
+        aggregate.event_index = event_index;
+
+        self.pending_append_queue.push(shard_log_queue_item);
     }
 
     /// Even though we haven't written to disk yet,
@@ -265,6 +291,32 @@ impl ShardMemCache {
         );
     }
 
+    pub fn put_aggregate_into_cache_as_deleted(
+        &mut self,
+        aggregate_key: AggregateKey,
+        event_index: u64,
+        event_batch_index: u64,
+        allow_recreate: bool,
+        allow_index_continuation: bool,
+    ) {
+        let snapshot = MemSnapshotAggregate::deleted(
+            event_index,
+            event_batch_index,
+            allow_recreate,
+            allow_index_continuation,
+        );
+        put_with_priority(&mut self.aggregate_snapshots, aggregate_key.clone(), snapshot, false);
+        
+        // Also clear any recent writes for this aggregate
+        if let Some(writes) = self.aggregate_recent_writes.remove(&aggregate_key) {
+            let bytes_removed: u64 = writes.writes.iter().map(|w| w.size_bytes).sum();
+            self.cache_current_bytes = self.cache_current_bytes.saturating_sub(bytes_removed);
+        }
+        
+        // Remove from eviction queue (will be cleaned up lazily, but mark for skip)
+        self.cache_eviction_queue.retain(|(k, _, _)| k != &aggregate_key);
+    }
+
     pub fn put_aggregate_into_cache(
         &mut self,
         aggregate_key: AggregateKey,
@@ -285,6 +337,7 @@ impl ShardMemCache {
         for (key, queue_positions) in sync_positions_snapshot.aggregate_queue_positions {
             // Update aggregate positions LRU
             if let Some(existing) = self.aggregate_snapshots.get_mut(&key) {
+                existing.status = AggregateStatus::Found;
                 if queue_positions.event_batch_index > existing.event_batch_index {
                     existing.event_batch_index = queue_positions.event_batch_index;
                 }
@@ -300,6 +353,9 @@ impl ShardMemCache {
                         event_index: queue_positions.event_index,
                         event_batch_index: queue_positions.event_batch_index,
                         min_event_batch_index: queue_positions.min_event_batch_index,
+                        status: crate::mem_snapshot_aggregate::AggregateStatus::Found,
+                        allow_index_continuation: false,
+                        allow_recreate: false,
                     },
                 );
             }
@@ -373,6 +429,9 @@ impl ShardMemCache {
         // Check queue first
         if let Some(queue_pos) = self.aggregate_queue_positions.get(aggregate_key) {
             return EventIndexes {
+                pending_delete: queue_pos.pending_delete,
+                allow_recreate: queue_pos.allow_recreate,
+                allow_index_continuation: queue_pos.allow_index_continuation,
                 event_batch_index: queue_pos.event_batch_index,
                 event_index: queue_pos.event_index,
                 min_event_batch_index: queue_pos.min_event_batch_index,
@@ -382,6 +441,9 @@ impl ShardMemCache {
         // Fall back to file LRU
         if let Some(file_pos) = self.aggregate_snapshots.get(aggregate_key) {
             return EventIndexes {
+                pending_delete: file_pos.status == AggregateStatus::Deleted,
+                allow_recreate: file_pos.allow_recreate,
+                allow_index_continuation: file_pos.allow_index_continuation,
                 event_batch_index: file_pos.event_batch_index,
                 event_index: file_pos.event_index,
                 min_event_batch_index: file_pos.min_event_batch_index,
@@ -389,6 +451,9 @@ impl ShardMemCache {
         }
 
         EventIndexes {
+            pending_delete: false,
+            allow_recreate: false,
+            allow_index_continuation: false,
             event_batch_index: 0,
             event_index: 0,
             min_event_batch_index: 0,
@@ -416,6 +481,9 @@ impl ShardMemCache {
 }
 
 pub struct EventIndexes {
+    pub pending_delete: bool,
+    pub allow_recreate: bool,
+    pub allow_index_continuation: bool,
     pub event_batch_index: u64,
     pub min_event_batch_index: u64,
     pub event_index: u64,

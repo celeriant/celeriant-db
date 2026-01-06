@@ -5,6 +5,9 @@ use std::{collections::HashMap};
 /// On write to disk, we set the log id and metablock positions for cache update
 #[derive(Default, Clone)]
 pub struct QueueAggregatePositions {
+    pub pending_delete: bool,
+    pub allow_recreate: bool,
+    pub allow_index_continuation: bool,
     pub log_id: u64,
     pub metablock_absolute_pos: u64,
     pub event_index: u64,
