@@ -395,6 +395,7 @@ fn read_write_error_to_response(
             ShardWriteError::AggregateNotExists => (404, "Aggregate not found".to_string()),
             ShardWriteError::AggregatePendingDelete => (400, "Aggregate pending deletion. Cannot write new events.".to_string()),
             ShardWriteError::AggregateRecreateNotAllowed => (400, "Aggregate recreate not allowed. Cannot write new events.".to_string()),
+            ShardWriteError::TrimIndexOutOfRange { requested, max_event_batch_index } => (400, format!("Trim index {requested} out of range, max event batch index is {max_event_batch_index}").to_string()),
         },
         ShardError::WatchSession(watch_session_error) => {
             match watch_session_error {

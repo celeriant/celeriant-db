@@ -4,7 +4,7 @@ use deepsize::DeepSizeOf;
 use crate::metablocks::{
     metablock_event_batch::MetablockEventBatch, metablock_snapshot_aggregate::MetablockSnapshotAggregate,
     metablock_snapshot_aggregate_type::MetablockSnapshotAggregateType, metablock_snapshot_org::MetablockSnapshotOrg,
-    metablock_soft_delete::MetablockSoftDelete,
+    metablock_soft_delete::MetablockSoftDelete, metablock_soft_trim::MetablockSoftTrim,
 };
 
 /// Different kinds of WAL metablocks, snapshots and event batch metadata
@@ -17,4 +17,5 @@ pub enum MetablockKind {
     SnapshotAggregateType(MetablockSnapshotAggregateType) = 2,
     SnapshotAggregate(MetablockSnapshotAggregate) = 3,
     SoftDelete(MetablockSoftDelete) = 4,
+    SoftTrim(MetablockSoftTrim) = 5,
 }

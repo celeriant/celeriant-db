@@ -15,7 +15,7 @@ use celeriant_memcache::sync_positions_snapshot::SyncPositionsSnapshot;
 use celeriant_msg::process_requests::Request;
 use celeriant_msg::process_responses::Response;
 use celeriant_msg::request::read_filters::ReadFilters;
-use celeriant_msg::request::requests::{DeleteRequest, ExistsRequest, ReadRequest, SingleAggregateWrite, WriteRequest};
+use celeriant_msg::request::requests::{DeleteRequest, ExistsRequest, ReadRequest, SingleAggregateWrite, TrimStartRequest, WriteRequest};
 use celeriant_msg::response::aggregate_event_batch::AggregateEventBatch;
 use celeriant_msg::response::responses::{ExistsResponse, ReadResponse, SuccessResponse};
 use celeriant_rotating_log::log_segment_file::LogSegmentFile;
@@ -34,6 +34,7 @@ use celeriant_wal::metablocks::metablock::Metablock;
 use celeriant_wal::metablocks::metablock_event_batch::{EventTypesKind, MetablockEventBatch};
 use celeriant_wal::metablocks::metablock_kind::MetablockKind;
 use celeriant_wal::metablocks::metablock_soft_delete::MetablockSoftDelete;
+use celeriant_wal::metablocks::metablock_soft_trim::MetablockSoftTrim;
 use celeriant_watch::aggregate_reader::AggregateReader;
 use celeriant_watch::aggregate_watch_event::{AggregateWatchEvent, AggregateWatchEventOperation};
 use celeriant_watch::aggregate_watchers::AggregateWatchers;
@@ -108,7 +109,13 @@ impl ShardWal {
                     .map(Response::Write)
                     .map_err(ShardError::Write)
             }
-            Request::TrimStart(_trim_start_request) => Err(ShardError::Read(ShardReadError::AggregateNotExists)),
+            Request::TrimStart(trim_start_request) => {
+                let lease_index = lease_index.ok_or(ShardWriteError::InvalidLeaseIndex)?;
+                self.trim_start(lease_index, trim_start_request)
+                    .await
+                    .map(Response::TrimStart)
+                    .map_err(ShardError::Write)
+            }
             Request::Delete(delete_request) => {
                 let lease_index = lease_index.ok_or(ShardWriteError::InvalidLeaseIndex)?;
                 self.delete(lease_index, delete_request)
@@ -172,6 +179,69 @@ impl ShardWal {
         })
     }
 
+    pub async fn trim_start(&self, lease_index: u64, trim_request: TrimStartRequest) -> Result<SuccessResponse, ShardWriteError> {
+        let aggregate_key = &trim_request.aggregate_key;
+
+        // Ensure aggregate exists
+        if !self.aggregate_exists_and_cache(aggregate_key).await? {
+            return Err(ShardWriteError::AggregateNotExists);
+        }
+
+        let current_indexes = self.shard_mem_cache.borrow_mut().get_event_indexes(aggregate_key);
+
+        // Validate trim index is within valid range
+        if trim_request.keep_from_event_batch_index <= current_indexes.min_event_batch_index {
+            // Already trimmed to this point or beyond, nothing to do
+            return Ok(SuccessResponse {
+                correlation_id: trim_request.correlation_id,
+            });
+        }
+
+        if trim_request.keep_from_event_batch_index > current_indexes.event_batch_index {
+            return Err(ShardWriteError::TrimIndexOutOfRange {
+                requested: trim_request.keep_from_event_batch_index,
+                max_event_batch_index: current_indexes.event_batch_index,
+            });
+        }
+
+        let server_timestamp = self.config.timestamp_config.now();
+
+        let metablock_soft_trim = MetablockSoftTrim {
+            aggregate_key: aggregate_key.clone(),
+            keep_from_event_batch_index: trim_request.keep_from_event_batch_index,
+            client_id: trim_request.client_id,
+            user_id: trim_request.user_id,
+        };
+
+        let metablock = Metablock {
+            wal_index: 0,
+            server_timestamp,
+            lease_index,
+            node_id: self.config.node_id,
+            datablock: DatablockStorageKind::None,
+            wal_metablock_type: MetablockKind::SoftTrim(metablock_soft_trim),
+        };
+
+        let shard_log_queue_item = ShardLogQueueItem::new(None, None, metablock);
+
+        // Add to queue
+        {
+            let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
+            shard_mem_cache.add_pending_trim_to_queue(
+                aggregate_key,
+                trim_request.keep_from_event_batch_index,
+                shard_log_queue_item,
+            );
+        }
+
+        // Wait for durable write
+        self.sync_durable().await?;
+
+        Ok(SuccessResponse {
+            correlation_id: trim_request.correlation_id,
+        })
+    }
+    
     pub async fn delete(&self, lease_index: u64, delete_request: DeleteRequest) -> Result<SuccessResponse, ShardWriteError> {
         // Make sure we have at least one aggregate to write
         if delete_request.deletes.is_empty() {
@@ -341,13 +411,21 @@ impl ShardWal {
 
         let last_known = self.shard_mem_cache.borrow_mut().get_aggregate_last_metablock_pos(aggregate_key);
 
-        // 2. Collect metablocks with size-bounded accumulation (NO datablocks yet)
+        // 2. Validate requested range is available (not trimmed)
+        if filters.from_event_batch_index < last_known.min_event_batch_index {
+            return Err(ShardReadError::UnavailableBatchIndex {
+                minimum_available: last_known.min_event_batch_index,
+                requested: filters.from_event_batch_index,
+            });
+        }
+
+        // 3. Collect metablocks with size-bounded accumulation (NO datablocks yet)
         let collection = self.collect_metablocks_bounded(aggregate_key, filters, max_bytes, last_known).await?;
 
-        // 3. Fetch datablocks only for kept metablocks
+        // 4. Fetch datablocks only for kept metablocks
         let batches_with_data = self.fetch_datablocks_for_metablocks(&collection.kept_metablocks).await?;
 
-        // 4. Deserialize and apply event-level filters
+        // 5. Deserialize and apply event-level filters
         let event_batches = self.build_filtered_response(batches_with_data, filters)?;
 
         Ok(ReadResponse {
@@ -454,6 +532,9 @@ impl ShardWal {
             return Ok(status == AggregateStatus::Found);
         }
 
+        // Track if we've seen a more recent trim
+        let mut seen_trim_min: Option<u64> = None;
+
         // Begin the search from the active log, moving backwards
         let mut scanner = ReverseMetablockScanner::new(
             &self.log_segments_cache,
@@ -484,6 +565,17 @@ impl ShardWal {
                     return Ok(Some(false)); // Found but deleted
                 }
 
+                // Check for soft trim - record min but keep scanning for EventBatch
+                if metablock_bytes::is_soft_trim_for_aggregate(metablock_bytes, searching_for_aggregate_key) {
+                    let trim_min = metablock_bytes::read_soft_trim_keep_from_event_batch_index(metablock_bytes);
+                    match seen_trim_min {
+                        None => seen_trim_min = Some(trim_min),
+                        Some(existing) if trim_min > existing => seen_trim_min = Some(trim_min),
+                        _ => {}
+                    }
+                    return Ok(None);
+                }
+
                 if !metablock_bytes::is_metablock_kind_event_batch_metadata(metablock_bytes) {
                     return Ok(None);
                 }
@@ -498,13 +590,23 @@ impl ShardWal {
                     return Ok(None);
                 }
 
+                let mut min_event_batch_index = metablock_bytes::read_event_batch_min_event_batch_index(metablock_bytes);
+                    
+                // Apply any more recent trim we saw
+                if !low_priority {
+                    if let Some(trim_min) = seen_trim_min {
+                        if trim_min > min_event_batch_index {
+                            min_event_batch_index = trim_min;
+                        }
+                    }
+                }
 
                 let snapshot = MemSnapshotAggregate::found(
                     log_id,
                     metablock_absolute_pos,
                     metablock_bytes::read_event_batch_max_event_index(metablock_bytes),
                     metablock_bytes::read_event_batch_event_batch_index(metablock_bytes),
-                    metablock_bytes::read_event_batch_min_event_batch_index(metablock_bytes),
+                    min_event_batch_index,
                 );
 
                 let client_id = metablock_bytes::read_event_batch_client_id(metablock_bytes);
@@ -778,6 +880,7 @@ async fn sync_with_rollback(
             let mut write_events: HashMap<AggregateKey, AggregateWatchEventOperation> = HashMap::new();
             let mut create_events: HashMap<AggregateKey, AggregateWatchEventOperation> = HashMap::new();
             let mut delete_events: HashMap<AggregateKey, AggregateWatchEventOperation> = HashMap::new();
+            let mut trim_events: HashMap<AggregateKey, AggregateWatchEventOperation> = HashMap::new();
 
             for queue_item in pending_append_queue {
                 match &queue_item.metablock.wal_metablock_type {
@@ -800,6 +903,19 @@ async fn sync_with_rollback(
                             queue_item.datablock,
                             size_bytes,
                         );
+                    }
+                    MetablockKind::SoftTrim(soft_trim) => {
+                        // Update aggregate min_event_batch_index in cache
+                        shard_mem_cache.update_aggregate_min_event_batch_index(
+                            &soft_trim.aggregate_key,
+                            soft_trim.keep_from_event_batch_index,
+                        );
+                        
+                        // Track trim event for watchers
+                        trim_events.entry(soft_trim.aggregate_key.clone())
+                            .or_insert(AggregateWatchEventOperation::TrimStart {
+                                keep_from_event_batch_index: soft_trim.keep_from_event_batch_index,
+                            });
                     }
                     MetablockKind::SoftDelete(soft_delete) => {
                         // Mark aggregate as deleted in cache
@@ -831,6 +947,10 @@ async fn sync_with_rollback(
             }
 
             for (aggregate_key, operation) in delete_events {
+                watched_aggregates.broadcast(AggregateWatchEvent { aggregate_key, operation });
+            }
+
+            for (aggregate_key, operation) in trim_events {
                 watched_aggregates.broadcast(AggregateWatchEvent { aggregate_key, operation });
             }
 

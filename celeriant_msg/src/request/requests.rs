@@ -42,6 +42,8 @@ pub struct TrimStartRequest {
     pub correlation_id: Option<u128>,
     pub aggregate_key: AggregateKey,
     pub keep_from_event_batch_index: u64,
+    pub client_id: u128,
+    pub user_id: Option<u128>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]

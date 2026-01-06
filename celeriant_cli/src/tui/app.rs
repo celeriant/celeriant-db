@@ -530,6 +530,8 @@ impl App {
             correlation_id: None,
             aggregate_key: key,
             keep_from_event_batch_index: keep_from,
+            client_id: self.client_id,  // Use app's client_id
+            user_id: None,
         });
         
         match client.send_request(&request, CompressionType::None).await {

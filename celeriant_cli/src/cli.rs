@@ -209,6 +209,14 @@ pub struct TrimArgs {
     #[command(flatten)]
     pub key: AggregateKeyArgs,
 
+    /// Client ID for the write
+    #[arg(long)]
+    pub client_id: u128,
+
+    /// User ID (optional)
+    #[arg(long)]
+    pub user_id: Option<u128>,
+
     /// Keep events from this batch index onwards
     #[arg(long)]
     pub keep_from: u64,

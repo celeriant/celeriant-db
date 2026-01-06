@@ -151,6 +151,57 @@ impl ShardMemCache {
         true
     }
 
+    /// Add a pending trim to the queue
+    pub fn add_pending_trim_to_queue(
+        &mut self,
+        aggregate_key: &AggregateKey,
+        keep_from_event_batch_index: u64,
+        shard_log_queue_item: ShardLogQueueItem,
+    ) {
+        let aggregate = self
+            .aggregate_queue_positions
+            .entry(aggregate_key.clone())
+            .or_insert_with(|| QueueAggregatePositions::default());
+
+        // Update min_event_batch_index if the new trim is higher
+        if keep_from_event_batch_index > aggregate.min_event_batch_index {
+            aggregate.min_event_batch_index = keep_from_event_batch_index;
+        }
+
+        self.pending_append_queue.push(shard_log_queue_item);
+    }
+
+    /// Update min_event_batch_index in the aggregate snapshot cache
+    pub fn update_aggregate_min_event_batch_index(
+        &mut self,
+        aggregate_key: &AggregateKey,
+        min_event_batch_index: u64,
+    ) {
+        if let Some(snapshot) = self.aggregate_snapshots.get_mut(aggregate_key) {
+            if min_event_batch_index > snapshot.min_event_batch_index {
+                snapshot.min_event_batch_index = min_event_batch_index;
+            }
+        }
+
+        // Also evict any cached writes that are now trimmed
+        if let Some(writes) = self.aggregate_recent_writes.get_mut(aggregate_key) {
+            while writes.first_batch_index < min_event_batch_index && !writes.is_empty() {
+                if let Some(front) = writes.writes.front() {
+                    self.cache_current_bytes = self.cache_current_bytes.saturating_sub(front.size_bytes);
+                }
+                writes.pop_front();
+            }
+            if writes.is_empty() {
+                self.aggregate_recent_writes.remove(aggregate_key);
+            }
+        }
+
+        // Clean up eviction queue for trimmed entries
+        self.cache_eviction_queue.retain(|(k, batch_idx, _)| {
+            k != aggregate_key || *batch_idx >= min_event_batch_index
+        });
+    }
+    
     /// Get cached writes for an aggregate from a starting batch index.
     /// Returns writes in batch order as (batch_index, &RecentWrite).
     /// Returns None if aggregate not in cache.

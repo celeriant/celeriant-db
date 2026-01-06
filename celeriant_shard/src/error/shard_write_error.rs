@@ -41,6 +41,11 @@ pub enum ShardWriteError {
 
     /// Aggregate was deleted with allow_recreate=false and cannot be recreated
     AggregateRecreateNotAllowed,
+
+    TrimIndexOutOfRange {
+        requested: u64,
+        max_event_batch_index: u64,
+    },
 }
 
 impl From<ShardCacheError> for ShardWriteError {

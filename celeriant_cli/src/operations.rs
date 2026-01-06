@@ -190,6 +190,8 @@ async fn trim_start(client: &mut CeleriantClient, args: TrimArgs) -> Result<()> 
         correlation_id: args.key.correlation_id,
         aggregate_key: key,
         keep_from_event_batch_index: args.keep_from,
+        client_id: args.client_id,
+        user_id: args.user_id,
     });
 
     let response = client.send_request(&request, CompressionType::None).await?;
