@@ -104,6 +104,30 @@ pub struct ServerConfig {
 
     #[arg(
         long,
+        default_value_t = 2000,
+        env = "CELERIANT_LIST_MAX_DURATION_MS",
+        help = "Maximum duration to scan the WAL for listings (2000ms)"
+    )]
+    pub list_max_duration_ms: u64,
+
+    #[arg(
+        long,
+        default_value_t = 20000,
+        env = "CELERIANT_LIST_PAGE_SIZE",
+        help = "Maximum number of entities to collate for listings per page (20000)"
+    )]
+    pub list_page_size: u64,
+
+    #[arg(
+        long,
+        default_value_t = 12 * 1024 * 1024,
+        env = "CELERIANT_LIST_WAL_INDEX_CACHE_BYTES",
+        help = "Memory to use to keep wal_index positions for listings paging optimisation (12MB)"
+    )]
+    pub list_wal_index_cache_bytes: u64,
+
+    #[arg(
+        long,
         default_value_t = 30000,
         env = "CELERIANT_CLIENT_CONNECTION_TIMEOUT_MS",
         help = "Maximum time a client has to pull down server messages over tcp (30s)"
@@ -249,6 +273,9 @@ impl ServerConfig {
                 },
                 epoch_offset_secs: self.timestamp_epoch_offset_secs,
             },
+            list_max_duration: Duration::from_millis(self.list_max_duration_ms),
+            list_page_size: self.list_page_size as usize,
+            list_wal_index_cache_bytes: self.list_wal_index_cache_bytes,
         }
     }
 
@@ -342,6 +369,9 @@ impl Default for ServerConfig {
             aggregate_snapshots_cache_bytes: 64 * 1024 * 1024,
             timestamp_precision: ConfigTimestampPrecision::Milliseconds,
             timestamp_epoch_offset_secs: 0,
+            list_max_duration_ms: 2000,
+            list_page_size: 20000,
+            list_wal_index_cache_bytes: 12 * 1024 * 1024,
         }
     }
 }

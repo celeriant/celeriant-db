@@ -21,6 +21,10 @@ path = "src/single_main.rs"
 name = "chaos_main"
 path = "src/chaos_main.rs"
 
+[[bin]]
+name = "chaos_delete_main"
+path = "src/chaos_delete_main.rs"
+
 [dependencies]
 celeriant_client_tokio = { path = "../celeriant_client_tokio" }
 celeriant_msg = { path = "../celeriant_msg" }

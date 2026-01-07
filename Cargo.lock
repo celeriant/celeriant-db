@@ -468,6 +468,7 @@ dependencies = [
  "fastbloom",
  "futures-lite",
  "glommio",
+ "lru 0.16.2",
  "num_cpus",
  "tempfile",
  "uuid",

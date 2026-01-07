@@ -2,9 +2,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
+use celeriant_client_tokio::list_operations::{ListOptions, ListOrgsIterator, ListAggregateTypesIterator, ListAggregatesIterator};
 use celeriant_msg::{
     process_requests::Request,
-    request::{read_filters::ReadFilters, requests::{ExistsRequest, ReadRequest, SingleAggregateWrite, WriteRequest}},
+    request::{read_filters::ReadFilters, requests::{DeleteRequest, ExistsRequest, ReadRequest, SingleAggregateDelete, SingleAggregateWrite, WriteRequest}},
 };
 use celeriant_wal::{
     aggregate_key::AggregateKey,
@@ -120,6 +121,106 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // === List Operations ===
+    println!("\n=== Listing Organizations ===");
+    let options = ListOptions::default();
+    let mut orgs_iter = ListOrgsIterator::new(&mut client, options);
+    let orgs = orgs_iter.collect().await?;
+    println!("Found {} organizations:", orgs.len());
+    for org in &orgs {
+        println!("  - Org ID: {}", org.org_id);
+    }
+    // Verify org_id 1 exists (both aggregates use org_id 1)
+    assert!(orgs.iter().any(|o| o.org_id == 1), "Expected org_id 1 to exist");
+    println!("✓ Verified org_id 1 exists");
+
+    println!("\n=== Listing Aggregate Types ===");
+    let options = ListOptions::default();
+    let mut types_iter = ListAggregateTypesIterator::new(&mut client, Some(1), options);
+    let agg_types = types_iter.collect().await?;
+    println!("Found {} aggregate types for org 1:", agg_types.len());
+    for agg_type in &agg_types {
+        println!("  - Org: {}, Type ID: {}", agg_type.org_id, agg_type.aggregate_type_id);
+    }
+    // Verify both aggregate types exist (2 and 34)
+    assert!(agg_types.iter().any(|t| t.aggregate_type_id == 2), "Expected aggregate_type_id 2 to exist");
+    assert!(agg_types.iter().any(|t| t.aggregate_type_id == 34), "Expected aggregate_type_id 34 to exist");
+    println!("✓ Verified aggregate types 2 and 34 exist");
+
+    println!("\n=== Listing Aggregates (before delete) ===");
+    let options = ListOptions::default();
+    let mut aggs_iter = ListAggregatesIterator::new(&mut client, Some(1), None, options);
+    let aggregates = aggs_iter.collect().await?;
+    println!("Found {} aggregates for org 1:", aggregates.len());
+    for agg in &aggregates {
+        println!("  - Org: {}, Type: {}, ID: {}, Deleted: {}", 
+            agg.org_id, agg.aggregate_type_id, agg.aggregate_id, agg.is_deleted);
+    }
+    // Verify both aggregates exist and are not deleted
+    assert!(aggregates.iter().any(|a| a.aggregate_id == 101 && !a.is_deleted), 
+        "Expected aggregate 101 to exist and not be deleted");
+    assert!(aggregates.iter().any(|a| a.aggregate_id == 201 && !a.is_deleted), 
+        "Expected aggregate 201 to exist and not be deleted");
+    println!("✓ Verified aggregates 101 and 201 exist and are not deleted");
+
+    // === Delete aggregate_1 ===
+    println!("\n=== Deleting aggregate 1 ===");
+    let mut deletes = HashMap::new();
+    deletes.insert(
+        aggregate_1.clone(),
+        SingleAggregateDelete {
+            allow_recreate: false,
+            allow_index_continuation: false,
+            expected_event_batch_index: Some(2), // We have 2 event batches now (0 and 1)
+        },
+    );
+    let delete_request = Request::Delete(DeleteRequest {
+        correlation_id: Some(3000),
+        client_id,
+        user_id: Some(42),
+        deletes,
+    });
+    match client.send_request(&delete_request, CompressionType::None).await {
+        Ok(response) => println!("Delete aggregate 1: {:?}", response),
+        Err(e) => println!("Delete aggregate 1 failed: {:?}", e),
+    }
+
+    // === List Aggregates again to verify delete ===
+    println!("\n=== Listing Aggregates (after delete, excluding deleted) ===");
+    let options = ListOptions::default();
+    let mut aggs_iter = ListAggregatesIterator::new(&mut client, Some(1), None, options);
+    let aggregates = aggs_iter.collect().await?;
+    println!("Found {} non-deleted aggregates for org 1:", aggregates.len());
+    for agg in &aggregates {
+        println!("  - Org: {}, Type: {}, ID: {}, Deleted: {}", 
+            agg.org_id, agg.aggregate_type_id, agg.aggregate_id, agg.is_deleted);
+    }
+    // Verify aggregate 101 is no longer in the list (filtered out as deleted)
+    assert!(!aggregates.iter().any(|a| a.aggregate_id == 101), 
+        "Expected aggregate 101 to be filtered out (deleted)");
+    assert!(aggregates.iter().any(|a| a.aggregate_id == 201 && !a.is_deleted), 
+        "Expected aggregate 201 to still exist and not be deleted");
+    println!("✓ Verified aggregate 101 is filtered out, aggregate 201 still exists");
+
+    println!("\n=== Listing Aggregates (after delete, including deleted) ===");
+    let options = ListOptions {
+        include_deleted: true,
+        ..Default::default()
+    };
+    let mut aggs_iter = ListAggregatesIterator::new(&mut client, Some(1), None, options);
+    let aggregates = aggs_iter.collect().await?;
+    println!("Found {} total aggregates for org 1 (including deleted):", aggregates.len());
+    for agg in &aggregates {
+        println!("  - Org: {}, Type: {}, ID: {}, Deleted: {}", 
+            agg.org_id, agg.aggregate_type_id, agg.aggregate_id, agg.is_deleted);
+    }
+    // Verify aggregate 101 shows as deleted
+    assert!(aggregates.iter().any(|a| a.aggregate_id == 101 && a.is_deleted), 
+        "Expected aggregate 101 to be marked as deleted");
+    assert!(aggregates.iter().any(|a| a.aggregate_id == 201 && !a.is_deleted), 
+        "Expected aggregate 201 to still exist and not be deleted");
+    println!("✓ Verified aggregate 101 is marked as deleted, aggregate 201 is not deleted");
+
     // Test expected_event_batch_index conflict
     println!("\n=== Testing expected_event_batch_index conflict ===");
     let conflict_event = create_event(2, "This should fail".to_string());
@@ -145,6 +246,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(response) => println!("Unexpected success: {:?}", response),
         Err(e) => println!("Expected conflict error: {:?}", e),
     }
+
+    println!("\n=== All tests completed successfully! ===");
 
     Ok(())
 }

@@ -9,10 +9,6 @@ pub struct DatablockBlockRef {
     pub datablock_position: u64,
     /// Datablock version for deserialisation
     pub version: u32,
-    /// Size of the uncompressed event batch data in bytes
-    pub uncompressed_size: u64,
-    /// Length of the compressed event batch data
-    pub compressed_size: u64,
     /// Compression algorithm used
     pub compression_type: u8,
 }

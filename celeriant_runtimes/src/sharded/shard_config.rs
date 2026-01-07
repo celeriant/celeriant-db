@@ -27,4 +27,7 @@ pub struct ShardConfig {
     pub aggregate_client_snapshots_cache_bytes: u64,
     pub aggregate_snapshots_cache_bytes: u64,
     pub timestamp_config: TimestampConfig,
+    pub list_max_duration: Duration,
+    pub list_page_size: usize,
+    pub list_wal_index_cache_bytes: u64,
 }

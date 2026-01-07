@@ -40,6 +40,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Screen::TrimStart => draw_trim_start(f, app, chunks[1]),
         Screen::Watch => draw_watch(f, app, chunks[1]),
         Screen::OrgWatch => draw_org_watch(f, app, chunks[1]),
+        Screen::List => draw_list(f, app, chunks[1]),
         Screen::Help => draw_help(f, app, chunks[1]),
     }
     
@@ -132,6 +133,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         Screen::TrimStart => "Trim Start".to_string(),
         Screen::Watch => "Watch Events".to_string(),
         Screen::OrgWatch => "Organisation Watch".to_string(),
+        Screen::List => "List".to_string(),
         Screen::Help => "Help".to_string(),
     };
 
@@ -183,9 +185,132 @@ fn get_screen_hints(screen: &Screen, input_mode: &InputMode) -> &'static str {
             Screen::ReadEvents | Screen::WriteEvent => "e/i: edit │ x: execute │ ↑↓: scroll │ q: back",
             Screen::Watch => "e/i: edit │ x: start │ s: stop │ ↑↓: scroll │ q: back",
             Screen::OrgWatch => "e/i: edit │ x: start │ s: stop │ ↑↓: scroll │ q: back",
+            Screen::List => "e/i: edit │ x: execute │ ↑↓: scroll │ q: back",
             Screen::Help => "q/Esc: back",
             _ => "q: back │ ?: help",
         },
+    }
+}
+
+fn draw_list(f: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(8),   // Input section
+            Constraint::Min(10),     // Results display
+        ])
+        .split(area);
+
+    // Input section
+    let input_block = Block::default()
+        .borders(Borders::ALL)
+        .title(" List - Leave fields empty to list at that level ");
+    let input_inner = input_block.inner(chunks[0]);
+    f.render_widget(input_block, chunks[0]);
+
+    let input_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),  // Org ID
+            Constraint::Length(3),  // Aggregate Type
+        ])
+        .split(input_inner);
+
+    // Org ID input
+    let org_style = if app.input_mode == InputMode::Editing && app.input_field_index == 0 {
+        Style::default().fg(EDITING_COLOR)
+    } else {
+        Style::default()
+    };
+    let org_input = Paragraph::new(app.list_org_id.as_str())
+        .style(org_style)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .title(" Organisation ID (empty = list all orgs) "));
+    f.render_widget(org_input, input_chunks[0]);
+
+    // Aggregate Type input
+    let type_style = if app.input_mode == InputMode::Editing && app.input_field_index == 1 {
+        Style::default().fg(EDITING_COLOR)
+    } else {
+        Style::default()
+    };
+    let type_input = Paragraph::new(app.list_aggregate_type.as_str())
+        .style(type_style)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .title(" Aggregate Type (empty = list types for org) "));
+    f.render_widget(type_input, input_chunks[1]);
+
+    // Set cursor position when editing
+    if app.input_mode == InputMode::Editing {
+        let (x, y) = match app.input_field_index {
+            0 => (input_chunks[0].x + app.list_org_id.len() as u16 + 1, input_chunks[0].y + 1),
+            1 => (input_chunks[1].x + app.list_aggregate_type.len() as u16 + 1, input_chunks[1].y + 1),
+            _ => (0, 0),
+        };
+        f.set_cursor_position((x, y));
+    }
+
+    // Results section
+    let visible_height = chunks[1].height.saturating_sub(2) as usize;
+    let total_lines = app.list_results.len();
+    let scroll_offset = app.list_scroll.min(total_lines.saturating_sub(visible_height));
+
+    let result_lines: Vec<Line> = app
+        .list_results
+        .iter()
+        .skip(scroll_offset)
+        .take(visible_height)
+        .map(|s| {
+            let style = if s.starts_with('━') {
+                Style::default().fg(HEADER_COLOR).bold()
+            } else if s.contains("[DELETED]") {
+                Style::default().fg(ERROR_COLOR)
+            } else if s.starts_with("  Org:") || s.starts_with("  Type:") || s.starts_with("  Aggregate:") {
+                Style::default().fg(SUCCESS_COLOR)
+            } else if s.starts_with("Total:") {
+                Style::default().fg(DIM_COLOR).italic()
+            } else if s.starts_with("  Error:") {
+                Style::default().fg(ERROR_COLOR)
+            } else {
+                Style::default()
+            };
+            Line::from(Span::styled(s.as_str(), style))
+        })
+        .collect();
+
+    // Determine what will be listed based on current input
+    let list_hint = if app.list_org_id.trim().is_empty() {
+        "Will list: Organisations"
+    } else if app.list_aggregate_type.trim().is_empty() {
+        "Will list: Aggregate Types"
+    } else {
+        "Will list: Aggregates"
+    };
+
+    let results_title = Line::from(vec![
+        Span::raw(" Results "),
+        Span::styled(
+            format!("({}/{}) ", scroll_offset + 1, total_lines.max(1)),
+            Style::default().fg(DIM_COLOR),
+        ),
+        Span::styled(format!("│ {} ", list_hint), Style::default().fg(DIM_COLOR)),
+        Span::styled("│ Press 'x' to execute ", Style::default().fg(DIM_COLOR)),
+    ]);
+
+    let results = Paragraph::new(result_lines)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .title(results_title))
+        .wrap(Wrap { trim: false });
+
+    f.render_widget(results, chunks[1]);
+
+    if total_lines > visible_height {
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
+        let mut scrollbar_state = ScrollbarState::new(total_lines).position(scroll_offset);
+        f.render_stateful_widget(scrollbar, chunks[1], &mut scrollbar_state);
     }
 }
 

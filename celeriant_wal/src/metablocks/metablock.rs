@@ -17,6 +17,10 @@ pub struct Metablock {
     pub lease_index: u64,
     /// ID of the node that wrote this batch
     pub node_id: u128,
+    /// Size of the uncompressed event batch data in bytes
+    pub uncompressed_size: u64,
+    /// Length of the compressed event batch data
+    pub compressed_size: u64,
     /// Different types of fixed 512 byte metablocks
     pub wal_metablock_type: MetablockKind,
     /// Type of datablock linked to this metablock, if any
@@ -31,6 +35,8 @@ impl Metablock {
     const WIRE_SIZE_SERVER_TIMESTAMP: usize = 8;
     const WIRE_SIZE_LEASE_INDEX: usize = 8;
     const WIRE_SIZE_NODE_ID: usize = 16;
+    const WIRE_SIZE_UNCOMPRESSED_SIZE: usize = 8;
+    const WIRE_SIZE_COMPRESSED_SIZE: usize = 8;
 
     pub const OFFSET_WAL_INDEX: usize = 0;
 
@@ -43,8 +49,14 @@ impl Metablock {
     pub const OFFSET_NODE_ID: usize = 
         Self::OFFSET_LEASE_INDEX + Self::WIRE_SIZE_LEASE_INDEX;
 
-    pub const OFFSET_WAL_METABLOCK_TYPE: usize = 
+    pub const OFFSET_UNCOMPRESSED_SIZE: usize = 
         Self::OFFSET_NODE_ID + Self::WIRE_SIZE_NODE_ID;
+
+    pub const OFFSET_COMPRESSED_SIZE: usize = 
+        Self::OFFSET_UNCOMPRESSED_SIZE + Self::WIRE_SIZE_UNCOMPRESSED_SIZE;
+
+    pub const OFFSET_WAL_METABLOCK_TYPE: usize = 
+        Self::OFFSET_COMPRESSED_SIZE + Self::WIRE_SIZE_COMPRESSED_SIZE;
 
     pub fn default_inline_event_batch_metadata(aggregate_key: AggregateKey) -> Self {
         Self { 
@@ -52,6 +64,8 @@ impl Metablock {
             server_timestamp: 0, 
             lease_index: 0, 
             node_id: 0, 
+            compressed_size: 0,
+            uncompressed_size: 0,
             wal_metablock_type: MetablockKind::EventBatchMetadata(MetablockEventBatch { 
                 aggregate_key, 
                 event_batch_index: 0, 

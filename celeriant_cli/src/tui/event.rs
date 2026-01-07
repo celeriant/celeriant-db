@@ -50,9 +50,47 @@ async fn handle_normal_mode(app: &mut App, key: KeyEvent) -> anyhow::Result<()> 
                 Screen::TrimStart => handle_trim_start_keys(app, key).await?,
                 Screen::Watch => handle_watch_keys(app, key).await?,
                 Screen::OrgWatch => handle_org_watch_keys(app, key).await?,
+                Screen::List => handle_list_keys(app, key).await?,
                 Screen::Help => handle_help_keys(app, key),
             }
         }
+    }
+    Ok(())
+}
+
+async fn handle_list_keys(app: &mut App, key: KeyEvent) -> anyhow::Result<()> {
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.list_scroll > 0 {
+                app.list_scroll -= 1;
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.list_scroll < app.list_results.len().saturating_sub(10) {
+                app.list_scroll += 1;
+            }
+        }
+        KeyCode::PageUp => {
+            app.list_scroll = app.list_scroll.saturating_sub(10);
+        }
+        KeyCode::PageDown => {
+            app.list_scroll = (app.list_scroll + 10).min(app.list_results.len().saturating_sub(10));
+        }
+        KeyCode::Home | KeyCode::Char('g') => {
+            app.list_scroll = 0;
+        }
+        KeyCode::End | KeyCode::Char('G') => {
+            app.list_scroll = app.list_results.len().saturating_sub(10);
+        }
+        KeyCode::Enter | KeyCode::Char('e') | KeyCode::Char('i') => {
+            app.input_mode = InputMode::Editing;
+        }
+        KeyCode::Char('x') => {
+            if let Err(e) = app.execute_list().await {
+                app.set_error(&e);
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -181,6 +219,13 @@ async fn handle_editing_mode(app: &mut App, key: KeyEvent) -> anyhow::Result<()>
                         _ => {}
                     }
                 }
+                Screen::List => {
+                    match app.input_field_index {
+                        0 => app.list_org_id.push(c),
+                        1 => app.list_aggregate_type.push(c),
+                        _ => {}
+                    }
+                }
                 _ => {}
             }
         }
@@ -227,6 +272,13 @@ async fn handle_editing_mode(app: &mut App, key: KeyEvent) -> anyhow::Result<()>
                         _ => {}
                     }
                 }
+                Screen::List => {
+                    match app.input_field_index {
+                        0 => { app.list_org_id.pop(); }
+                        1 => { app.list_aggregate_type.pop(); }
+                        _ => {}
+                    }
+                }
                 _ => {}
             }
         }
@@ -258,17 +310,22 @@ async fn handle_home_keys(app: &mut App, key: KeyEvent) -> anyhow::Result<()> {
                         app.go_to_screen(Screen::EnterAggregate);
                     }
                     1 => {
+                        // List
+                        app.setup_list_fields();
+                        app.go_to_screen(Screen::List);
+                    }
+                    2 => {
                         // Organisation Watch
                         app.setup_org_watch_fields();
                         app.go_to_screen(Screen::OrgWatch);
                     }
-                    2 => {
+                    3 => {
                         app.disconnect().await;
                     }
-                    3 => {
+                    4 => {
                         app.go_to_screen(Screen::Help);
                     }
-                    4 => {
+                    5 => {
                         app.should_quit = true;
                     }
                     _ => {}

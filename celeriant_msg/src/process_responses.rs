@@ -4,7 +4,7 @@ use celeriant_wal::compression_type::CompressionType;
 use celeriant_wire::{constants::WIRE_FIXED_BODY_SIZE, wire_error::WireError, wire_header::WireHeader};
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
 
-use crate::response::responses::{ErrorResponse, ExistsResponse, ProtocolErrorResponse, ReadResponse, SuccessResponse, WatchResponse};
+use crate::response::responses::{ErrorResponse, ExistsResponse, ListAggregateTypesResponse, ListAggregatesResponse, ListOrgsResponse, ProtocolErrorResponse, ReadResponse, SuccessResponse, WatchResponse};
 
 // Response type discriminants
 #[repr(u32)]
@@ -18,6 +18,9 @@ pub enum ResponseType {
     ProtocolError = 6,
     GenericError = 7,
     Watch = 8,
+    ListOrgs = 9,
+    ListAggregateTypes = 10,
+    ListAggregates = 11,
 }
 
 impl ResponseType {
@@ -31,6 +34,9 @@ impl ResponseType {
             6 => Ok(ResponseType::ProtocolError),
             7 => Ok(ResponseType::GenericError),
             8 => Ok(ResponseType::Watch),
+            9 => Ok(ResponseType::ListOrgs),
+            10 => Ok(ResponseType::ListAggregateTypes),
+            11 => Ok(ResponseType::ListAggregates),
             _ => Err(WireError::UnknownResponseType(value)),
         }
     }
@@ -58,7 +64,10 @@ pub enum Response {
     Delete(SuccessResponse),
     ProtocolError(ProtocolErrorResponse),
     GenericError(ErrorResponse),
-    Watch(WatchResponse)
+    Watch(WatchResponse),
+    ListOrgs(ListOrgsResponse),
+    ListAggregateTypes(ListAggregateTypesResponse),
+    ListAggregates(ListAggregatesResponse),
 }
 
 impl Response {
@@ -72,6 +81,9 @@ impl Response {
             Response::ProtocolError(_) => ResponseType::ProtocolError,
             Response::GenericError(_) => ResponseType::GenericError,
             Response::Watch(_) => ResponseType::Watch,
+            Response::ListOrgs(_) => ResponseType::ListOrgs,
+            Response::ListAggregateTypes(_) => ResponseType::ListAggregateTypes,
+            Response::ListAggregates(_) => ResponseType::ListAggregates,
         }
     }
 
@@ -116,6 +128,15 @@ impl Response {
                 ResponseType::Watch => {
                     Response::Watch(wire_header.read_variable_size(reader, u64::MAX).await?)
                 }
+                ResponseType::ListOrgs => {
+                    Response::ListOrgs(wire_header.read_variable_size(reader, u64::MAX).await?)
+                }
+                ResponseType::ListAggregateTypes => {
+                    Response::ListAggregateTypes(wire_header.read_variable_size(reader, u64::MAX).await?)
+                }
+                ResponseType::ListAggregates => {
+                    Response::ListAggregates(wire_header.read_variable_size(reader, u64::MAX).await?)
+                }
                 _ => unreachable!(),
             }
         };
@@ -133,6 +154,9 @@ impl Response {
             Response::ProtocolError(_) => CompressionType::None,
             Response::GenericError(_) => CompressionType::None,
             Response::Watch(_) => CompressionType::Snappy,
+            Response::ListOrgs(_) => CompressionType::Snappy,
+            Response::ListAggregateTypes(_) => CompressionType::Snappy,
+            Response::ListAggregates(_) => CompressionType::Snappy,
         }
     }
 
@@ -168,6 +192,15 @@ impl Response {
                 Response::Watch(res) => {
                     WireHeader::write_variable_size(writer, res, response_type_id, compression_type, u64::MAX, version).await
                 }
+                Response::ListOrgs(res) => {
+                    WireHeader::write_variable_size(writer, res, response_type_id, compression_type, u64::MAX, version).await
+                }
+                Response::ListAggregateTypes(res) => {
+                    WireHeader::write_variable_size(writer, res, response_type_id, compression_type, u64::MAX, version).await
+                }
+                Response::ListAggregates(res) => {
+                    WireHeader::write_variable_size(writer, res, response_type_id, compression_type, u64::MAX, version).await
+                }
                 _ => unreachable!(),
             }
         }
@@ -181,8 +214,8 @@ mod tests {
     use futures_lite::{future::block_on, io::Cursor};
 
     // UPDATE THIS when adding new ResponseTypes - tests will fail if mismatched
-    const RESPONSE_TYPE_COUNT: usize = 8;
-    const RESPONSE_TYPE_MAX_ID: u32 = 8;
+    const RESPONSE_TYPE_COUNT: usize = 11;
+    const RESPONSE_TYPE_MAX_ID: u32 = 11;
 
     impl ResponseType {
         /// Returns all ResponseType variants. Adding a new variant without updating
@@ -197,6 +230,9 @@ mod tests {
                 ResponseType::ProtocolError,
                 ResponseType::GenericError,
                 ResponseType::Watch,
+                ResponseType::ListOrgs,
+                ResponseType::ListAggregateTypes,
+                ResponseType::ListAggregates,
             ]
         }
     }
@@ -231,6 +267,21 @@ mod tests {
                 correlation_id: Some(109), 
                 error_code: 99, 
                 error_message: "Got an error, sorry!".to_string()
+            }),
+            ResponseType::ListOrgs => Response::ListOrgs(ListOrgsResponse {
+                correlation_id: Some(110),
+                orgs: vec![],
+                next_cursor: None,
+            }),
+            ResponseType::ListAggregateTypes => Response::ListAggregateTypes(ListAggregateTypesResponse {
+                correlation_id: Some(111),
+                aggregate_types: vec![],
+                next_cursor: None,
+            }),
+            ResponseType::ListAggregates => Response::ListAggregates(ListAggregatesResponse {
+                correlation_id: Some(112),
+                aggregates: vec![],
+                next_cursor: None,
             }),
         }
     }

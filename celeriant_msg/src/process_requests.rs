@@ -2,7 +2,7 @@ use celeriant_wal::compression_type::CompressionType;
 use celeriant_wire::{constants::WIRE_FIXED_BODY_SIZE, wire_error::WireError, wire_header::WireHeader};
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
 
-use crate::request::requests::{DeleteRequest, ExistsRequest, ReadRequest, TrimStartRequest, WatchRequest, WriteRequest};
+use crate::request::requests::{DeleteRequest, ExistsRequest, ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest, ReadRequest, TrimStartRequest, WatchRequest, WriteRequest};
 
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,6 +13,9 @@ pub enum RequestType {
     TrimStart = 4,
     Delete = 5,
     Watch = 6,
+    ListOrgs = 7,
+    ListAggregateTypes = 8,
+    ListAggregates = 9,
 }
 
 impl RequestType {
@@ -24,6 +27,9 @@ impl RequestType {
             4 => Ok(RequestType::TrimStart),
             5 => Ok(RequestType::Delete),
             6 => Ok(RequestType::Watch),
+            7 => Ok(RequestType::ListOrgs),
+            8 => Ok(RequestType::ListAggregateTypes),
+            9 => Ok(RequestType::ListAggregates),
             _ => Err(WireError::UnknownRequestType(value)),
         }
     }
@@ -36,6 +42,9 @@ impl RequestType {
                 | RequestType::TrimStart
                 | RequestType::Delete
                 | RequestType::Watch
+                | RequestType::ListOrgs
+                | RequestType::ListAggregateTypes
+                | RequestType::ListAggregates
         )
     }
 }
@@ -49,6 +58,9 @@ pub enum Request {
     TrimStart(TrimStartRequest),
     Delete(DeleteRequest),
     Watch(WatchRequest),
+    ListOrgs(ListOrgsRequest),
+    ListAggregateTypes(ListAggregateTypesRequest),
+    ListAggregates(ListAggregatesRequest),
 }
 
 impl Request {
@@ -60,6 +72,9 @@ impl Request {
             Request::TrimStart(_) => RequestType::TrimStart,
             Request::Delete(_) => RequestType::Delete,
             Request::Watch(_) => RequestType::Watch,
+            Request::ListOrgs(_) => RequestType::ListOrgs,
+            Request::ListAggregateTypes(_) => RequestType::ListAggregateTypes,
+            Request::ListAggregates(_) => RequestType::ListAggregates,
         }
     }
 
@@ -71,6 +86,9 @@ impl Request {
             Request::TrimStart(req) => req.correlation_id,
             Request::Delete(req) => req.correlation_id,
             Request::Watch(req) => req.correlation_id,
+            Request::ListOrgs(req) => req.correlation_id,
+            Request::ListAggregateTypes(req) => req.correlation_id,
+            Request::ListAggregates(req) => req.correlation_id,
         }
     }
 
@@ -84,6 +102,9 @@ impl Request {
             Request::TrimStart(req) => req.aggregate_key.aggregate_id,
             Request::Delete(_req) => 0,
             Request::Watch(_req) => 0,
+            Request::ListOrgs(_req) => 0,
+            Request::ListAggregateTypes(_req) => 0,
+            Request::ListAggregates(_req) => 0,
         }
     }
 
@@ -97,6 +118,9 @@ impl Request {
             Request::TrimStart(req) => req.aggregate_key.org_id,
             Request::Delete(_req) => 0,
             Request::Watch(_req) => 0,
+            Request::ListOrgs(_req) => 0,
+            Request::ListAggregateTypes(_req) => 0,
+            Request::ListAggregates(_req) => 0,
         }
     }
 
@@ -110,6 +134,9 @@ impl Request {
             Request::TrimStart(req) => req.aggregate_key.aggregate_type_id,
             Request::Delete(_req) => 0,
             Request::Watch(_req) => 0,
+            Request::ListOrgs(_req) => 0,
+            Request::ListAggregateTypes(_req) => 0,
+            Request::ListAggregates(_req) => 0,
         }
     }
 
@@ -143,6 +170,15 @@ impl Request {
                 }
                 RequestType::Watch => {
                     Request::Watch(wire_header.read_fixed_size(reader, &mut buffer).await?)
+                }
+                RequestType::ListOrgs => {
+                    Request::ListOrgs(wire_header.read_fixed_size(reader, &mut buffer).await?)
+                }
+                RequestType::ListAggregateTypes => {
+                    Request::ListAggregateTypes(wire_header.read_fixed_size(reader, &mut buffer).await?)
+                }
+                RequestType::ListAggregates => {
+                    Request::ListAggregates(wire_header.read_fixed_size(reader, &mut buffer).await?)
                 }
                 _ => unreachable!(),
             }
@@ -181,6 +217,9 @@ impl Request {
                 Request::TrimStart(req) => WireHeader::write_fixed_size(writer, req, request_type_id, version).await,
                 Request::Delete(req) => WireHeader::write_fixed_size(writer, req, request_type_id, version).await,
                 Request::Watch(req) => WireHeader::write_fixed_size(writer, req, request_type_id, version).await,
+                Request::ListOrgs(req) => WireHeader::write_fixed_size(writer, req, request_type_id, version).await,
+                Request::ListAggregateTypes(req) => WireHeader::write_fixed_size(writer, req, request_type_id, version).await,
+                Request::ListAggregates(req) => WireHeader::write_fixed_size(writer, req, request_type_id, version).await,
                 _ => unreachable!(),
             }
         } else {
@@ -210,11 +249,11 @@ mod tests {
     use celeriant_wal::aggregate_key::AggregateKey;
     use celeriant_wire::constants::{PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3};
     use futures_lite::{future::block_on, io::Cursor};
-    use crate::request::{read_filters::ReadFilters, requests::{SingleAggregateDelete, SingleAggregateWrite}};
+    use crate::request::{read_filters::ReadFilters, requests::{ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest, SingleAggregateDelete, SingleAggregateWrite}};
 
     // UPDATE THIS when adding new RequestTypes - tests will fail if mismatched
-    const REQUEST_TYPE_COUNT: usize = 6;
-    const REQUEST_TYPE_MAX_ID: u32 = 6;
+    const REQUEST_TYPE_COUNT: usize = 9;
+    const REQUEST_TYPE_MAX_ID: u32 = 9;
 
     impl RequestType {
         /// Returns all RequestType variants. Adding a new variant without updating
@@ -227,6 +266,9 @@ mod tests {
                 RequestType::TrimStart,
                 RequestType::Delete,
                 RequestType::Watch,
+                RequestType::ListOrgs,
+                RequestType::ListAggregateTypes,
+                RequestType::ListAggregates,
             ]
         }
     }
@@ -272,6 +314,8 @@ mod tests {
                 correlation_id: Some(106),
                 aggregate_key: key,
                 keep_from_event_batch_index: 10,
+                client_id: 999,
+                user_id: None,
             }),
             RequestType::Delete => {
                 let deletes = std::collections::HashMap::from([(
@@ -297,6 +341,24 @@ mod tests {
                 aggregate_types: None,
                 aggregates: None,
                 operation_types: None, 
+            }),
+            RequestType::ListOrgs => Request::ListOrgs(ListOrgsRequest {
+                correlation_id: Some(110),
+                shard_id: 0,
+                cursor: None,
+            }),
+            RequestType::ListAggregateTypes => Request::ListAggregateTypes(ListAggregateTypesRequest {
+                correlation_id: Some(111),
+                shard_id: 0,
+                org_id: Some(1),
+                cursor: None,
+            }),
+            RequestType::ListAggregates => Request::ListAggregates(ListAggregatesRequest {
+                correlation_id: Some(112),
+                shard_id: 0,
+                org_id: Some(1),
+                aggregate_type_id: Some(2),
+                cursor: None,
             }),
         }
     }

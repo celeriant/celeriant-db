@@ -1,9 +1,8 @@
 use crate::mem_snapshot_aggregate::AggregateStatus;
 use crate::metablock_position::MetablockPosition;
 use crate::{
-    aggregate_recent_write::AggregateRecentWrites, mem_snapshot_aggregate::MemSnapshotAggregate,
-    queue_aggregate_positions::QueueAggregatePositions, recent_write::RecentWrite, shard_log_queue_item::ShardLogQueueItem,
-    sync_positions_snapshot::SyncPositionsSnapshot,
+    aggregate_recent_write::AggregateRecentWrites, mem_snapshot_aggregate::MemSnapshotAggregate, queue_aggregate_positions::QueueAggregatePositions,
+    recent_write::RecentWrite, shard_log_queue_item::ShardLogQueueItem, sync_positions_snapshot::SyncPositionsSnapshot,
 };
 use celeriant_wal::{
     aggregate_client_key::AggregateClientKey, aggregate_key::AggregateKey, constants::FIXED_BLOCK_SIZE_BYTES, datablocks::datablock::Datablock,
@@ -17,7 +16,7 @@ use std::{
 };
 
 pub struct ShardMemCache {
-    recent_write_cache_bytes: u64, 
+    recent_write_cache_bytes: u64,
 
     /// Cache of recent writes indexed by aggregate key.
     /// Only populated after successful durable write.
@@ -44,10 +43,13 @@ pub struct ShardMemCache {
     /// Writes from clients that are pending write to disk
     /// This is unbounded as we expect quick flush to disk
     pending_append_queue: Vec<ShardLogQueueItem>,
+
+    /// LRU cache mapping wal_index -> position in log files
+    /// Used to optimize list pagination by avoiding full scans
+    wal_index_positions: LruCache<u64, WalIndexPosition>,
 }
 
 impl ShardMemCache {
-
     /// Returns (is_loaded, last_client_event_index)
     /// - is_loaded: true if we've already checked disk for this aggregate+client
     /// - last_client_event_index: Some(idx) if client has written, None if not found
@@ -172,11 +174,7 @@ impl ShardMemCache {
     }
 
     /// Update min_event_batch_index in the aggregate snapshot cache
-    pub fn update_aggregate_min_event_batch_index(
-        &mut self,
-        aggregate_key: &AggregateKey,
-        min_event_batch_index: u64,
-    ) {
+    pub fn update_aggregate_min_event_batch_index(&mut self, aggregate_key: &AggregateKey, min_event_batch_index: u64) {
         if let Some(snapshot) = self.aggregate_snapshots.get_mut(aggregate_key) {
             if min_event_batch_index > snapshot.min_event_batch_index {
                 snapshot.min_event_batch_index = min_event_batch_index;
@@ -197,11 +195,10 @@ impl ShardMemCache {
         }
 
         // Clean up eviction queue for trimmed entries
-        self.cache_eviction_queue.retain(|(k, batch_idx, _)| {
-            k != aggregate_key || *batch_idx >= min_event_batch_index
-        });
+        self.cache_eviction_queue
+            .retain(|(k, batch_idx, _)| k != aggregate_key || *batch_idx >= min_event_batch_index);
     }
-    
+
     /// Get cached writes for an aggregate from a starting batch index.
     /// Returns writes in batch order as (batch_index, &RecentWrite).
     /// Returns None if aggregate not in cache.
@@ -350,20 +347,15 @@ impl ShardMemCache {
         allow_recreate: bool,
         allow_index_continuation: bool,
     ) {
-        let snapshot = MemSnapshotAggregate::deleted(
-            event_index,
-            event_batch_index,
-            allow_recreate,
-            allow_index_continuation,
-        );
+        let snapshot = MemSnapshotAggregate::deleted(event_index, event_batch_index, allow_recreate, allow_index_continuation);
         put_with_priority(&mut self.aggregate_snapshots, aggregate_key.clone(), snapshot, false);
-        
+
         // Also clear any recent writes for this aggregate
         if let Some(writes) = self.aggregate_recent_writes.remove(&aggregate_key) {
             let bytes_removed: u64 = writes.writes.iter().map(|w| w.size_bytes).sum();
             self.cache_current_bytes = self.cache_current_bytes.saturating_sub(bytes_removed);
         }
-        
+
         // Remove from eviction queue (will be cleaned up lazily, but mark for skip)
         self.cache_eviction_queue.retain(|(k, _, _)| k != &aggregate_key);
     }
@@ -384,7 +376,6 @@ impl ShardMemCache {
     /// Provide the aggregate_queue_positions snapshotted before disk write begun
     /// and this will update the aggregate_file_positions with the committed data
     pub fn commit_sync_positions_snapshot(&mut self, sync_positions_snapshot: SyncPositionsSnapshot) {
-
         for (key, queue_positions) in sync_positions_snapshot.aggregate_queue_positions {
             // Update aggregate positions LRU
             if let Some(existing) = self.aggregate_snapshots.get_mut(&key) {
@@ -511,12 +502,52 @@ impl ShardMemCache {
         }
     }
 
+    /// Cache a WAL index position for list pagination optimization
+    pub fn cache_wal_index_position(&mut self, wal_index: u64, log_id: u64, metablock_absolute_pos: u64) {
+        self.wal_index_positions.put(
+            wal_index,
+            WalIndexPosition {
+                log_id,
+                metablock_absolute_pos,
+            },
+        );
+    }
+
+    /// Get cached position for a WAL index, if available
+    pub fn get_wal_index_position(&mut self, wal_index: u64) -> Option<WalIndexPosition> {
+        self.wal_index_positions.get(&wal_index).cloned()
+    }
+
+    /// Find the nearest cached position at or before the given WAL index
+    pub fn find_nearest_wal_index_position(&mut self, target_wal_index: u64) -> Option<(u64, WalIndexPosition)> {
+        // Peek through cache to find nearest position <= target
+        // This is O(n) but cache is bounded and small
+        let mut best: Option<(u64, WalIndexPosition)> = None;
+
+        for (&wal_index, pos) in self.wal_index_positions.iter() {
+            if wal_index <= target_wal_index {
+                match &best {
+                    None => best = Some((wal_index, pos.clone())),
+                    Some((best_idx, _)) if wal_index > *best_idx => {
+                        best = Some((wal_index, pos.clone()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        best
+    }
+
     pub fn new(
-        recent_write_cache_bytes: u64, aggregate_snapshots_cache_bytes: u64, aggregate_client_snapshots_cache_bytes: u64,
+        recent_write_cache_bytes: u64,
+        aggregate_snapshots_cache_bytes: u64,
+        aggregate_client_snapshots_cache_bytes: u64,
+        list_wal_index_cache_bytes: u64,
     ) -> Self {
         let aggregate_cap = NonZeroUsize::new((aggregate_snapshots_cache_bytes / 112) as usize).unwrap_or(NonZeroUsize::new(10_000).unwrap());
-        let client_cap =
-            NonZeroUsize::new((aggregate_client_snapshots_cache_bytes / 128) as usize).unwrap_or(NonZeroUsize::new(100_000).unwrap());
+        let client_cap = NonZeroUsize::new((aggregate_client_snapshots_cache_bytes / 128) as usize).unwrap_or(NonZeroUsize::new(100_000).unwrap());
+        let wal_index_cap = NonZeroUsize::new((list_wal_index_cache_bytes / 24) as usize).unwrap_or(NonZeroUsize::new(1_000).unwrap());
 
         Self {
             recent_write_cache_bytes,
@@ -527,6 +558,7 @@ impl ShardMemCache {
             pending_append_queue: vec![],
             aggregate_snapshots: LruCache::new(aggregate_cap),
             aggregate_client_snapshots: LruCache::new(client_cap),
+            wal_index_positions: LruCache::new(wal_index_cap),
         }
     }
 }
@@ -538,6 +570,13 @@ pub struct EventIndexes {
     pub event_batch_index: u64,
     pub min_event_batch_index: u64,
     pub event_index: u64,
+}
+
+/// Cached position for a WAL index, used to optimize list pagination
+#[derive(Clone, Debug)]
+pub struct WalIndexPosition {
+    pub log_id: u64,
+    pub metablock_absolute_pos: u64,
 }
 
 /// Inserts into the cache. If `low_priority` is true, only inserts when there's

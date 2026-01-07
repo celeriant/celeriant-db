@@ -1,5 +1,5 @@
 use celeriant_msg::request::read_filters::ReadFilters;
-use celeriant_wal::{constants::{BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED, MINIBATCH_SIZE_BYTES}, datablocks::datablock_aggregate_event_batch::DatablockAggregateEventBatch, metablocks::{datablock_storage_kind::DatablockStorageKind, metablock::Metablock, metablock_event_batch::EventTypesKind, metablock_kind::MetablockKind}};
+use celeriant_wal::{constants::{BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED}, datablocks::datablock_aggregate_event_batch::DatablockAggregateEventBatch, metablocks::{datablock_storage_kind::DatablockStorageKind, metablock::Metablock, metablock_event_batch::EventTypesKind, metablock_kind::MetablockKind}};
 use fastbloom::BloomFilter;
 
 pub fn apply_event_filters(event_batch: &mut DatablockAggregateEventBatch, read_filters: &ReadFilters) {
@@ -195,14 +195,6 @@ fn bloom_filter_from_bytes(bloom_bytes: &[u64; BLOOM_BYTES / 8]) -> BloomFilter 
         .hashes(BLOOM_HASH_COUNT)
 }
 
-pub fn get_uncompressed_size(datablock: &DatablockStorageKind) -> u64 {
-    match datablock {
-        DatablockStorageKind::None => 0,
-        DatablockStorageKind::Inline(_) => MINIBATCH_SIZE_BYTES as u64,
-        DatablockStorageKind::Block(block_ref) => block_ref.uncompressed_size,
-    }
-}
-
 pub fn trim_end_if_exceeds_max_bytes(
     metablocks: &mut Vec<Metablock>,
     read_filters: &ReadFilters,
@@ -229,7 +221,7 @@ pub fn trim_end_if_exceeds_max_bytes(
 
     // Batches are sorted by event_batch_index (ascending)
     for (index, batch) in metablocks.iter().enumerate() {
-        cumulative_size += get_uncompressed_size(&batch.datablock);
+        cumulative_size += batch.uncompressed_size;
 
         // If we exceed the max_bytes limit, store this index as the cut point
         if cumulative_size > max_bytes {
@@ -285,12 +277,12 @@ mod tests {
             server_timestamp,
             lease_index: 0,
             node_id: 0,
+            uncompressed_size,
+            compressed_size: 0,
             datablock: DatablockStorageKind::Block(DatablockBlockRef {
                 crc32c: 0,
                 datablock_position: 0,
                 version: 1,
-                uncompressed_size,
-                compressed_size: 0,
                 compression_type: 0,
             }),
             wal_metablock_type: MetablockKind::EventBatchMetadata(MetablockEventBatch {
@@ -339,12 +331,12 @@ mod tests {
             server_timestamp,
             lease_index: 0,
             node_id: 0,
+            uncompressed_size,
+            compressed_size: 0,
             datablock: DatablockStorageKind::Block(DatablockBlockRef {
                 crc32c: 0,
                 datablock_position: 0,
                 version: 1,
-                uncompressed_size,
-                compressed_size: 0,
                 compression_type: 0,
             }),
             wal_metablock_type: MetablockKind::EventBatchMetadata(MetablockEventBatch {

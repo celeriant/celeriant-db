@@ -27,5 +27,8 @@ pub fn format_response(response: &Response) -> String {
         Response::GenericError(r) => format!("Error {}: {}", r.error_code, r.error_message),
         Response::Watch(watch_response) => format!("Watch: {}-{:?}", 
             watch_response.events.is_none(), watch_response.events.as_ref().map(|f| f.len())),
+        Response::ListOrgs(r) => format!("ListOrgs: {} orgs", r.orgs.len()),
+        Response::ListAggregateTypes(r) => format!("ListAggregateTypes: {} types", r.aggregate_types.len()),
+        Response::ListAggregates(r) => format!("ListAggregates: {} aggregates", r.aggregates.len()),
     }
 }

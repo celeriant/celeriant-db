@@ -56,8 +56,6 @@ impl MetablockEventBatch {
     const WIRE_SIZE_CLIENT_ID: usize = 16;
     // Option<u128>: 1 byte discriminant + 16 bytes value
     const WIRE_SIZE_USER_ID: usize = 1 + 16;
-    // EventTypesKind: 4 byte discriminant + [u64; BLOOM_BYTES / 8]
-    const WIRE_SIZE_EVENT_TYPES_DATA: usize = WIRE_SIZE_ENUM_DISCRIMINANT + BLOOM_BYTES;
 
     pub const OFFSET_AGGREGATE_KEY: usize = 0;
 
@@ -94,9 +92,6 @@ impl MetablockEventBatch {
     pub const OFFSET_EVENT_TYPES_DATA: usize = 
         Self::OFFSET_USER_ID + Self::WIRE_SIZE_USER_ID;
 
-    /// Total wire size of MetablockEventBatch
-    pub const WIRE_SIZE_TOTAL: usize = 
-        Self::OFFSET_EVENT_TYPES_DATA + Self::WIRE_SIZE_EVENT_TYPES_DATA;
 }
 
 impl MetablockEventBatch {

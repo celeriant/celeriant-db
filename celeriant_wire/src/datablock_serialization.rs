@@ -1,6 +1,6 @@
 use celeriant_wal::{
     compression_type::CompressionType,
-    constants::{MINIBATCH_SIZE_BYTES, WIRE_VERSION_WAL_DATABLOCK},
+    constants::{FIXED_BLOCK_SIZE_BYTES, MINIBATCH_SIZE_BYTES, WIRE_VERSION_WAL_DATABLOCK},
     datablocks::datablock::Datablock,
     metablocks::{
         datablock_block_ref::DatablockBlockRef,
@@ -17,6 +17,8 @@ use crate::{
 /// Result of serializing a datablock, containing the storage kind for the metablock
 /// and optionally the external data to write to the datablock area
 pub struct SerializedDatablock {
+    pub uncompressed_size: u64,
+    pub compressed_size: u64,
     /// Storage kind to store in the metablock
     pub storage_kind: DatablockStorageKind,
     /// External data to write to datablock area (only present for Block storage)
@@ -51,6 +53,8 @@ pub fn serialize_datablock(
         minibatch[..uncompressed_size].copy_from_slice(&uncompressed);
 
         return Ok(SerializedDatablock {
+            uncompressed_size: FIXED_BLOCK_SIZE_BYTES as u64,
+            compressed_size: FIXED_BLOCK_SIZE_BYTES as u64,
             storage_kind: DatablockStorageKind::Inline(DatablockInlineData { minibatch }),
             external_data: None,
         });
@@ -72,12 +76,12 @@ pub fn serialize_datablock(
         crc32c,
         datablock_position,
         version: WIRE_VERSION_WAL_DATABLOCK,
-        uncompressed_size: uncompressed_size as u64,
-        compressed_size: compressed_size as u64,
         compression_type: compression_type_id,
     };
 
     Ok(SerializedDatablock {
+        uncompressed_size: uncompressed_size as u64,
+        compressed_size: compressed_size as u64,
         storage_kind: DatablockStorageKind::Block(block_ref),
         external_data: Some(compressed),
     })
@@ -96,6 +100,7 @@ pub fn serialize_datablock(
 /// * `WireFormatError::ChecksumMismatch` if CRC verification fails for block storage
 /// * `WireFormatError::Deserialization` if external_data is missing for Block storage
 pub fn deserialize_datablock(
+    uncompressed_size: u64,
     storage_kind: &DatablockStorageKind,
     external_data: Option<&[u8]>,
 ) -> Result<Datablock, WireFormatError> {
@@ -134,7 +139,7 @@ pub fn deserialize_datablock(
             let decompressed = decompress_variable(
                 data,
                 compression_type,
-                block_ref.uncompressed_size as usize,
+                uncompressed_size as usize,
             )?;
 
             bincode_variable_deserialise(&decompressed, CompressionType::None, decompressed.len())
@@ -216,7 +221,7 @@ mod tests {
 
         let serialized = serialize_datablock(&original, CompressionType::None, 10000).unwrap();
 
-        let deserialized = deserialize_datablock(&serialized.storage_kind, None).unwrap();
+        let deserialized = deserialize_datablock(serialized.uncompressed_size, &serialized.storage_kind, None).unwrap();
 
         // Compare the event batch contents
         match (&original.datablock_kind, &deserialized.datablock_kind) {
@@ -248,6 +253,7 @@ mod tests {
         }
 
         let deserialized = deserialize_datablock(
+            serialized.uncompressed_size, 
             &serialized.storage_kind,
             serialized.external_data.as_deref(),
         )
@@ -277,6 +283,7 @@ mod tests {
         }
 
         let deserialized = deserialize_datablock(
+            serialized.uncompressed_size, 
             &serialized.storage_kind,
             serialized.external_data.as_deref(),
         )
@@ -300,6 +307,7 @@ mod tests {
         let serialized = serialize_datablock(&original, CompressionType::Snappy, 10000).unwrap();
 
         let deserialized = deserialize_datablock(
+            serialized.uncompressed_size, 
             &serialized.storage_kind,
             serialized.external_data.as_deref(),
         )
@@ -326,7 +334,7 @@ mod tests {
         let mut corrupted = serialized.external_data.unwrap();
         corrupted[10] ^= 0xFF;
 
-        let result = deserialize_datablock(&serialized.storage_kind, Some(&corrupted));
+        let result = deserialize_datablock(serialized.uncompressed_size, &serialized.storage_kind, Some(&corrupted));
 
         assert!(matches!(result, Err(WireFormatError::ChecksumMismatch { .. })));
     }
@@ -338,14 +346,14 @@ mod tests {
         let serialized = serialize_datablock(&original, CompressionType::None, 10000).unwrap();
 
         // Try to deserialize block without external data
-        let result = deserialize_datablock(&serialized.storage_kind, None);
+        let result = deserialize_datablock(serialized.uncompressed_size, &serialized.storage_kind, None);
 
         assert!(matches!(result, Err(WireFormatError::Deserialization(_))));
     }
 
     #[test]
     fn none_storage_fails() {
-        let result = deserialize_datablock(&DatablockStorageKind::None, None);
+        let result = deserialize_datablock(0, &DatablockStorageKind::None, None);
 
         assert!(matches!(result, Err(WireFormatError::Deserialization(_))));
     }
@@ -362,6 +370,7 @@ mod tests {
         }
 
         let result = deserialize_datablock(
+            serialized.uncompressed_size, 
             &serialized.storage_kind,
             serialized.external_data.as_deref(),
         );
@@ -375,13 +384,13 @@ mod tests {
 
         let serialized = serialize_datablock(&original, CompressionType::Zstd { level: 3 }, 10000).unwrap();
 
-        if let DatablockStorageKind::Block(ref block_ref) = serialized.storage_kind {
+        if let DatablockStorageKind::Block(ref _block_ref) = serialized.storage_kind {
             let external = serialized.external_data.as_ref().unwrap();
 
-            assert_eq!(block_ref.compressed_size, external.len() as u64);
-            assert!(block_ref.uncompressed_size > 0);
+            assert_eq!(serialized.compressed_size, external.len() as u64);
+            assert!(serialized.uncompressed_size > 0);
             // With compression, compressed should typically be smaller or equal
-            assert!(block_ref.compressed_size <= block_ref.uncompressed_size);
+            assert!(serialized.compressed_size <= serialized.uncompressed_size);
         } else {
             panic!("Expected Block storage");
         }

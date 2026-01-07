@@ -4,7 +4,9 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::num::NonZeroUsize;
 use std::rc::Rc;
+use std::time::Instant;
 
 use celeriant_disk::files::read_objects_absolute;
 use celeriant_memcache::mem_snapshot_aggregate::{AggregateStatus, MemSnapshotAggregate};
@@ -15,9 +17,9 @@ use celeriant_memcache::sync_positions_snapshot::SyncPositionsSnapshot;
 use celeriant_msg::process_requests::Request;
 use celeriant_msg::process_responses::Response;
 use celeriant_msg::request::read_filters::ReadFilters;
-use celeriant_msg::request::requests::{DeleteRequest, ExistsRequest, ReadRequest, SingleAggregateWrite, TrimStartRequest, WriteRequest};
+use celeriant_msg::request::requests::{DeleteRequest, ExistsRequest, ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest, ReadRequest, SingleAggregateWrite, TrimStartRequest, WriteRequest};
 use celeriant_msg::response::aggregate_event_batch::AggregateEventBatch;
-use celeriant_msg::response::responses::{ExistsResponse, ReadResponse, SuccessResponse};
+use celeriant_msg::response::responses::{AggregateListItem, AggregateTypeListItem, ExistsResponse, ListAggregateTypesResponse, ListAggregatesResponse, ListOrgsResponse, OrgListItem, ReadResponse, SuccessResponse};
 use celeriant_rotating_log::log_segment_file::LogSegmentFile;
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
 use celeriant_rotating_log::reverse_metablock_scanner::ReverseMetablockScanner;
@@ -25,6 +27,7 @@ use celeriant_rotating_log::rotating_log_error::RotatingLogError;
 use celeriant_rotating_log::rwlock_timeout::write_with_timeout;
 use celeriant_wal::aggregate_client_key::AggregateClientKey;
 use celeriant_wal::aggregate_key::AggregateKey;
+use celeriant_wal::aggregate_type_key::AggregateTypeKey;
 use celeriant_wal::constants::{FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_METABLOCK};
 use celeriant_wal::datablocks::datablock::Datablock;
 use celeriant_wal::datablocks::datablock_aggregate_event_batch::DatablockAggregateEventBatch;
@@ -42,6 +45,7 @@ use celeriant_wire::datablock_serialization::{deserialize_datablock, serialize_d
 use celeriant_wire::metablock_bytes;
 use celeriant_wire::version_aware_wire_format::serialize_versioned_message;
 use deepsize::DeepSizeOf;
+use lru::LruCache;
 
 use crate::amortisation::coordinator::Coordinator;
 use crate::bloom::bloom_filter_cache::BloomFilterCache;
@@ -126,6 +130,21 @@ impl ShardWal {
             Request::Watch(_) => Err(ShardError::Read(ShardReadError::IoError(
                 "Watch unprocessable via request/response model".to_string(),
             ))),
+            Request::ListOrgs(list_request) => {
+                self.list_orgs(list_request).await.map(Response::ListOrgs).map_err(ShardError::Read)
+            }
+            Request::ListAggregateTypes(list_request) => {
+                self.list_aggregate_types(list_request)
+                    .await
+                    .map(Response::ListAggregateTypes)
+                    .map_err(ShardError::Read)
+            }
+            Request::ListAggregates(list_request) => {
+                self.list_aggregates(list_request)
+                    .await
+                    .map(Response::ListAggregates)
+                    .map_err(ShardError::Read)
+            }
         }
     }
 
@@ -138,6 +157,7 @@ impl ShardWal {
             config.recent_write_cache_bytes,
             config.aggregate_snapshots_cache_bytes,
             config.aggregate_client_snapshots_cache_bytes,
+            config.list_wal_index_cache_bytes,
         );
 
         let log_segments_cache = LogSegmentsCache::ready_up(
@@ -159,6 +179,422 @@ impl ShardWal {
         })
     }
 
+    /// List all unique organizations that have data in this shard.
+    /// 
+    /// Scans WAL in reverse order, returning orgs with most recent activity first.
+    /// Uses bounded LRU for deduplication within a page.
+    pub async fn list_orgs(&self, request: ListOrgsRequest) -> Result<ListOrgsResponse, ShardReadError> {
+        let start_time = Instant::now();
+        let max_duration = self.config.list_max_duration;
+        let page_size = self.config.list_page_size;
+        let start_wal_index = request.cursor.unwrap_or(u64::MAX);
+
+        // Bounded deduplication: org_id -> ()
+        let mut seen: LruCache<u128, ()> = LruCache::new(
+            NonZeroUsize::new(page_size.saturating_mul(4).max(100)).unwrap()
+        );
+        let mut results: Vec<OrgListItem> = Vec::with_capacity(page_size);
+        let mut last_wal_index: Option<u64> = None;
+        let mut reached_end = false;
+
+        // Try to find a cached starting position
+        let (start_log_id, start_pos) = self.find_list_scan_start(start_wal_index).await;
+
+        let mut scanner = ReverseMetablockScanner::new(
+            &self.log_segments_cache,
+            start_log_id,
+            start_pos,
+            self.config.read_max_chunk_size,
+        );
+
+        let scan_result = scanner
+            .scan::<bool, ShardReadError>(|log_id, pos, bytes| {
+                // Check time limit
+                if start_time.elapsed() >= max_duration {
+                    return Ok(Some(false)); // Stop due to timeout, not end of WAL
+                }
+
+                let wal_index = metablock_bytes::read_wal_index(bytes);
+
+                // Skip entries newer than our cursor
+                if wal_index > start_wal_index {
+                    return Ok(None);
+                }
+
+                // Cache this position for future lookups (sample every ~100 entries)
+                if wal_index % 100 == 0 {
+                    self.shard_mem_cache.borrow_mut().cache_wal_index_position(wal_index, log_id, pos);
+                }
+
+                // Only process EventBatch metablocks for org discovery
+                if !metablock_bytes::is_metablock_kind_event_batch_metadata(bytes) {
+                    return Ok(None);
+                }
+
+                let org_id = metablock_bytes::read_event_batch_org_id(bytes);
+
+                if !seen.contains(&org_id) {
+                    seen.put(org_id, ());
+                    results.push(OrgListItem { org_id });
+                    last_wal_index = Some(wal_index);
+
+                    if results.len() >= page_size {
+                        return Ok(Some(false)); // Page full
+                    }
+                }
+
+                Ok(None)
+            })
+            .await?;
+
+        // If scan completed without early exit, we reached the end
+        if scan_result.is_none() {
+            reached_end = true;
+        }
+
+        let next_cursor = if reached_end || results.is_empty() {
+            None
+        } else {
+            last_wal_index.map(|i| i.saturating_sub(1))
+        };
+
+        Ok(ListOrgsResponse {
+            correlation_id: request.correlation_id,
+            orgs: results,
+            next_cursor,
+        })
+    }
+
+    /// List aggregate types, optionally filtered by org_id.
+    ///
+    /// Scans WAL in reverse order, returning types with most recent activity first.
+    pub async fn list_aggregate_types(&self, request: ListAggregateTypesRequest) -> Result<ListAggregateTypesResponse, ShardReadError> {
+        let start_time = Instant::now();
+        let max_duration = self.config.list_max_duration;
+        let page_size = self.config.list_page_size;
+        let start_wal_index = request.cursor.unwrap_or(u64::MAX);
+        let filter_org_id = request.org_id;
+
+        // Bounded deduplication: (org_id, aggregate_type_id) -> ()
+        let mut seen: LruCache<AggregateTypeKey, ()> = LruCache::new(
+            NonZeroUsize::new(page_size.saturating_mul(4).max(100)).unwrap()
+        );
+        let mut results: Vec<AggregateTypeListItem> = Vec::with_capacity(page_size);
+        let mut last_wal_index: Option<u64> = None;
+        let mut reached_end = false;
+
+        let (start_log_id, start_pos) = self.find_list_scan_start(start_wal_index).await;
+
+        let mut scanner = ReverseMetablockScanner::new(
+            &self.log_segments_cache,
+            start_log_id,
+            start_pos,
+            self.config.read_max_chunk_size,
+        );
+
+        let scan_result = scanner
+            .scan::<bool, ShardReadError>(|log_id, pos, bytes| {
+                if start_time.elapsed() >= max_duration {
+                    return Ok(Some(false));
+                }
+
+                let wal_index = metablock_bytes::read_wal_index(bytes);
+
+                if wal_index > start_wal_index {
+                    return Ok(None);
+                }
+
+                if wal_index % 100 == 0 {
+                    self.shard_mem_cache.borrow_mut().cache_wal_index_position(wal_index, log_id, pos);
+                }
+
+                if !metablock_bytes::is_metablock_kind_event_batch_metadata(bytes) {
+                    return Ok(None);
+                }
+
+                let org_id = metablock_bytes::read_event_batch_org_id(bytes);
+
+                // Apply org filter if specified
+                if let Some(filter) = filter_org_id {
+                    if org_id != filter {
+                        return Ok(None);
+                    }
+                }
+
+                let aggregate_type_id = metablock_bytes::read_event_batch_aggregate_type_id(bytes);
+                let type_key = AggregateTypeKey::new(org_id, aggregate_type_id);
+
+                if !seen.contains(&type_key) {
+                    seen.put(type_key, ());
+                    results.push(AggregateTypeListItem { org_id, aggregate_type_id });
+                    last_wal_index = Some(wal_index);
+
+                    if results.len() >= page_size {
+                        return Ok(Some(false));
+                    }
+                }
+
+                Ok(None)
+            })
+            .await?;
+
+        if scan_result.is_none() {
+            reached_end = true;
+        }
+
+        let next_cursor = if reached_end || results.is_empty() {
+            None
+        } else {
+            last_wal_index.map(|i| i.saturating_sub(1))
+        };
+
+        Ok(ListAggregateTypesResponse {
+            correlation_id: request.correlation_id,
+            aggregate_types: results,
+            next_cursor,
+        })
+    }
+
+    /// List aggregates, optionally filtered by org_id and/or aggregate_type_id.
+    ///
+    /// Scans WAL in reverse order. Returns aggregates with accumulated statistics
+    /// from batches seen within this page. Client must merge stats across pages.
+    pub async fn list_aggregates(&self, request: ListAggregatesRequest) -> Result<ListAggregatesResponse, ShardReadError> {
+        let start_time = Instant::now();
+        let max_duration = self.config.list_max_duration;
+        let page_size = self.config.list_page_size;
+        let start_wal_index = request.cursor.unwrap_or(u64::MAX);
+        let filter_org_id = request.org_id;
+        let filter_aggregate_type_id = request.aggregate_type_id;
+
+        // Track aggregate stats with insertion order preserved
+        // Key -> accumulated stats for this page
+        struct AggregatePageStats {
+            is_deleted: bool,
+            event_batch_count: u64,
+            min_event_timestamp: u64,
+            max_event_timestamp: u64,
+            min_server_timestamp: u64,
+            max_server_timestamp: u64,
+            min_event_batch_index: u64,
+            max_event_batch_index: u64,
+            min_event_index: u64,
+            max_event_index: u64,
+            compressed_size: u64,
+            uncompressed_size: u64,
+        }
+
+        let mut seen: LruCache<AggregateKey, AggregatePageStats> = LruCache::new(
+            NonZeroUsize::new(page_size.saturating_mul(4).max(100)).unwrap()
+        );
+        let mut result_order: Vec<AggregateKey> = Vec::with_capacity(page_size);
+        let mut last_wal_index: Option<u64> = None;
+        let mut reached_end = false;
+        let mut unique_count = 0usize;
+
+        let (start_log_id, start_pos) = self.find_list_scan_start(start_wal_index).await;
+
+        let mut scanner = ReverseMetablockScanner::new(
+            &self.log_segments_cache,
+            start_log_id,
+            start_pos,
+            self.config.read_max_chunk_size,
+        );
+
+        let scan_result = scanner
+            .scan::<bool, ShardReadError>(|log_id, pos, bytes| {
+                if start_time.elapsed() >= max_duration {
+                    return Ok(Some(false));
+                }
+
+                let wal_index = metablock_bytes::read_wal_index(bytes);
+
+                if wal_index > start_wal_index {
+                    return Ok(None);
+                }
+
+                if wal_index % 100 == 0 {
+                    self.shard_mem_cache.borrow_mut().cache_wal_index_position(wal_index, log_id, pos);
+                }
+
+                // Handle SoftDelete - mark aggregate as deleted
+                if metablock_bytes::is_metablock_kind_soft_delete(bytes) {
+                    let aggregate_key = metablock_bytes::read_soft_delete_aggregate_key(bytes);
+                    
+                    if let Some(filter) = filter_org_id {
+                        if aggregate_key.org_id != filter {
+                            return Ok(None);
+                        }
+                    }
+                    if let Some(filter) = filter_aggregate_type_id {
+                        if aggregate_key.aggregate_type_id != filter {
+                            return Ok(None);
+                        }
+                    }
+
+                    if !seen.contains(&aggregate_key) {
+                        // First time seeing this aggregate (as deleted)
+                        if unique_count >= page_size {
+                            return Ok(Some(false)); // Page full
+                        }
+                        
+                        result_order.push(aggregate_key.clone());
+                        seen.put(aggregate_key, AggregatePageStats {
+                            is_deleted: true,
+                            event_batch_count: 0,
+                            min_event_timestamp: u64::MAX,
+                            max_event_timestamp: 0,
+                            min_server_timestamp: u64::MAX,
+                            max_server_timestamp: 0,
+                            min_event_batch_index: u64::MAX,
+                            max_event_batch_index: 0,
+                            min_event_index: u64::MAX,
+                            max_event_index: 0,
+                            uncompressed_size: 0,
+                            compressed_size: 0,
+                        });
+                        unique_count += 1;
+                        last_wal_index = Some(wal_index);
+                    }
+                    return Ok(None);
+                }
+
+                // Handle EventBatch
+                if !metablock_bytes::is_metablock_kind_event_batch_metadata(bytes) {
+                    return Ok(None);
+                }
+
+                let aggregate_key = metablock_bytes::read_event_batch_aggregate_key(bytes);
+
+                if let Some(filter) = filter_org_id {
+                    if aggregate_key.org_id != filter {
+                        return Ok(None);
+                    }
+                }
+                if let Some(filter) = filter_aggregate_type_id {
+                    if aggregate_key.aggregate_type_id != filter {
+                        return Ok(None);
+                    }
+                }
+
+                // Read stats from this metablock
+                let event_batch_index = metablock_bytes::read_event_batch_event_batch_index(bytes);
+                let min_event_ts = metablock_bytes::read_event_batch_min_event_timestamp(bytes);
+                let max_event_ts = metablock_bytes::read_event_batch_max_event_timestamp(bytes);
+                let server_ts = metablock_bytes::read_server_timestamp(bytes);
+                let min_event_idx = metablock_bytes::read_event_batch_min_event_index(bytes);
+                let max_event_idx = metablock_bytes::read_event_batch_max_event_index(bytes);
+                let compressed_size = metablock_bytes::read_compressed_size(bytes);
+                let uncompressed_size = metablock_bytes::read_uncompressed_size(bytes);
+
+                if let Some(stats) = seen.get_mut(&aggregate_key) {
+                    // Already seen this aggregate, accumulate stats
+                    stats.event_batch_count += 1;
+                    stats.min_event_timestamp = stats.min_event_timestamp.min(min_event_ts);
+                    stats.max_event_timestamp = stats.max_event_timestamp.max(max_event_ts);
+                    stats.min_server_timestamp = stats.min_server_timestamp.min(server_ts);
+                    stats.max_server_timestamp = stats.max_server_timestamp.max(server_ts);
+                    stats.min_event_batch_index = stats.min_event_batch_index.min(event_batch_index);
+                    stats.max_event_batch_index = stats.max_event_batch_index.max(event_batch_index);
+                    stats.min_event_index = stats.min_event_index.min(min_event_idx);
+                    stats.max_event_index = stats.max_event_index.max(max_event_idx);
+                    stats.compressed_size += compressed_size;
+                    stats.uncompressed_size += uncompressed_size;
+                } else {
+                    // First time seeing this aggregate
+                    if unique_count >= page_size {
+                        return Ok(Some(false)); // Page full
+                    }
+
+                    result_order.push(aggregate_key.clone());
+                    seen.put(aggregate_key, AggregatePageStats {
+                        is_deleted: false,
+                        event_batch_count: 1,
+                        min_event_timestamp: min_event_ts,
+                        max_event_timestamp: max_event_ts,
+                        min_server_timestamp: server_ts,
+                        max_server_timestamp: server_ts,
+                        min_event_batch_index: event_batch_index,
+                        max_event_batch_index: event_batch_index,
+                        min_event_index: min_event_idx,
+                        max_event_index: max_event_idx,
+                        compressed_size,
+                        uncompressed_size,
+                    });
+                    unique_count += 1;
+                    last_wal_index = Some(wal_index);
+                }
+
+                Ok(None)
+            })
+            .await?;
+
+        if scan_result.is_none() {
+            reached_end = true;
+        }
+
+        // Convert to results, preserving insertion order
+        let results: Vec<AggregateListItem> = result_order
+            .into_iter()
+            .filter_map(|key| {
+                seen.get(&key).map(|stats| AggregateListItem {
+                    org_id: key.org_id,
+                    aggregate_type_id: key.aggregate_type_id,
+                    aggregate_id: key.aggregate_id,
+                    is_deleted: stats.is_deleted,
+                    event_batch_count: stats.event_batch_count,
+                    min_event_timestamp: if stats.min_event_timestamp == u64::MAX { 0 } else { stats.min_event_timestamp },
+                    max_event_timestamp: stats.max_event_timestamp,
+                    min_event_batch_index: if stats.min_event_batch_index == u64::MAX { 0 } else { stats.min_event_batch_index },
+                    max_event_batch_index: stats.max_event_batch_index,
+                    min_event_index: if stats.min_event_index == u64::MAX { 0 } else { stats.min_event_index },
+                    max_event_index: stats.max_event_index,
+                    min_server_timestamp: if stats.min_server_timestamp == u64::MAX { 0 } else { stats.min_server_timestamp },
+                    max_server_timestamp: stats.max_server_timestamp,
+                    uncompressed_size: stats.uncompressed_size,
+                    compressed_size: stats.compressed_size,
+                })
+            })
+            .collect();
+
+        let next_cursor = if reached_end || results.is_empty() {
+            None
+        } else {
+            last_wal_index.map(|i| i.saturating_sub(1))
+        };
+
+        Ok(ListAggregatesResponse {
+            correlation_id: request.correlation_id,
+            aggregates: results,
+            next_cursor,
+        })
+    }
+
+    /// Find the starting position for a list scan.
+    /// 
+    /// Tries to use cached position if available, otherwise starts from active log.
+    async fn find_list_scan_start(&self, target_wal_index: u64) -> (u64, Option<u64>) {
+        // If no cursor (starting from latest), just use active log
+        if target_wal_index == u64::MAX {
+            return (self.log_segments_cache.active_log_id(), None);
+        }
+
+        // Try to find cached position at or near target
+        let cached = self.shard_mem_cache.borrow_mut().find_nearest_wal_index_position(target_wal_index);
+        
+        if let Some((cached_wal_index, pos)) = cached {
+            // Only use cache if it's reasonably close (within ~1000 entries)
+            // and not too far ahead of target
+            if cached_wal_index <= target_wal_index && target_wal_index - cached_wal_index < 1000 {
+                // Start just after the cached position to include it in scan
+                return (pos.log_id, Some(pos.metablock_absolute_pos.saturating_add(FIXED_BLOCK_SIZE_BYTES as u64)));
+            }
+        }
+
+        // No useful cache hit, start from active log
+        (self.log_segments_cache.active_log_id(), None)
+    }
+    
     pub async fn exists(&self, exists_request: &ExistsRequest) -> Result<ExistsResponse, ShardReadError> {
         let exists = self.aggregate_exists_and_cache(&exists_request.aggregate_key).await?;
         if !exists {
@@ -218,6 +654,8 @@ impl ShardWal {
             server_timestamp,
             lease_index,
             node_id: self.config.node_id,
+            compressed_size: 0,
+            uncompressed_size: 0,
             datablock: DatablockStorageKind::None,
             wal_metablock_type: MetablockKind::SoftTrim(metablock_soft_trim),
         };
@@ -283,6 +721,8 @@ impl ShardWal {
                 server_timestamp,
                 lease_index,
                 node_id: self.config.node_id,
+                compressed_size: 0,
+                uncompressed_size: 0,
                 datablock: DatablockStorageKind::None,
                 wal_metablock_type: MetablockKind::SoftDelete(metablock_soft_delete.clone()),
             };
@@ -752,6 +1192,8 @@ impl ShardWal {
             server_timestamp,
             lease_index,
             node_id: self.config.node_id,
+            uncompressed_size: serialized_datablock.uncompressed_size,
+            compressed_size: serialized_datablock.compressed_size,
             datablock: serialized_datablock.storage_kind,
             wal_metablock_type: MetablockKind::EventBatchMetadata(metablock_event_batch),
         };
@@ -1205,7 +1647,7 @@ impl ShardWal {
                 continue;
             }
 
-            let batch_size = in_memory_filtering::get_uncompressed_size(&write.metablock.datablock);
+            let batch_size = write.metablock.uncompressed_size;
 
             // Check if adding this batch would exceed budget
             // (allow at least one batch even if over budget)
@@ -1276,7 +1718,7 @@ impl ShardWal {
                     return Ok(None); // Continue - filtered out
                 }
 
-                let batch_size = in_memory_filtering::get_uncompressed_size(&metablock.datablock);
+                let batch_size = metablock.uncompressed_size;
 
                 // Add to back (we're scanning backwards, newest seen first)
                 disk_cumulative += batch_size;
@@ -1335,7 +1777,7 @@ impl ShardWal {
                 }
                 DatablockStorageKind::Inline(_) => {
                     // Can deserialize immediately - no disk I/O needed
-                    let datablock = deserialize_datablock(&kept.metablock.datablock, None)?;
+                    let datablock = deserialize_datablock(kept.metablock.uncompressed_size, &kept.metablock.datablock, None)?;
                     results.push((kept.metablock.clone(), Some(datablock)));
                 }
                 DatablockStorageKind::Block(_) => {
@@ -1366,7 +1808,7 @@ impl ShardWal {
                             *idx,
                             read_objects_absolute::AbsoluteObjectPosition {
                                 start_pos: r.datablock_position,
-                                end_pos: r.datablock_position + r.compressed_size,
+                                end_pos: r.datablock_position + meta.compressed_size,
                             },
                         ))
                     } else {
@@ -1400,7 +1842,7 @@ impl ShardWal {
             // Deserialize and update results
             for (result_idx, blob) in indices.into_iter().zip(blobs) {
                 let metablock = &results[result_idx].0;
-                let datablock = deserialize_datablock(&metablock.datablock, Some(&blob))?;
+                let datablock = deserialize_datablock(metablock.uncompressed_size, &metablock.datablock, Some(&blob))?;
                 results[result_idx].1 = Some(datablock);
             }
         }

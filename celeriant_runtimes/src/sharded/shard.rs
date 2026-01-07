@@ -107,13 +107,18 @@ struct ShardData {
     shard_wal: Rc<ShardWal>,
 }
 
+enum ShardRedirectResult {
+    ProcessLocally(celeriant_msg::process_requests::Request, TcpStream),
+    Redirected,
+    ErrorSentContinue(TcpStream), // Connection still usable for pipelining
+}
 
 async fn check_for_shard_redirect(
     mut tcp_stream: TcpStream,
     request: celeriant_msg::process_requests::Request,
     message_version: u32,
     shard_data: &ShardData,
-) -> Option<(celeriant_msg::process_requests::Request, TcpStream)> {
+) -> ShardRedirectResult {
 
     let idx = match determine_shard_route(&request, Rc::clone(&shard_data.config)) {
         Ok(shard_idx) => shard_idx,
@@ -132,7 +137,7 @@ async fn check_for_shard_redirect(
                 message_version,
                 shard_data.config.slow_client_timeout,
             ).await;
-            return None;
+            return ShardRedirectResult::ErrorSentContinue(tcp_stream);
         }
     };
 
@@ -145,10 +150,10 @@ async fn check_for_shard_redirect(
         if let Err(e) = shard_data.intrashard_sender.send_to(idx, msg).await {
             warn!("Failed to redirect connection to shard {idx}: {e:?}");
         }
-        return None;
+        return ShardRedirectResult::Redirected;
     }
 
-    Some((request, tcp_stream))
+    ShardRedirectResult::ProcessLocally(request, tcp_stream)
 }
 
 #[derive(Debug)]
@@ -190,6 +195,15 @@ fn determine_shard_route(
         celeriant_msg::process_requests::Request::Delete(delete_request) => {
             determine_shard_route_delete_request(delete_request, config)
         },
+        celeriant_msg::process_requests::Request::ListOrgs(list_request) => {
+            validate_client_shard_id(list_request.shard_id, num_shards)
+        },
+        celeriant_msg::process_requests::Request::ListAggregateTypes(list_request) => {
+            validate_client_shard_id(list_request.shard_id, num_shards)
+        },
+        celeriant_msg::process_requests::Request::ListAggregates(list_request) => {
+            validate_client_shard_id(list_request.shard_id, num_shards)
+        },
         the_rest => {
             let shard_id = match config.routing_rule {
                 crate::RoutingRule::OrgId => the_rest.org_id() % num_shards,
@@ -199,6 +213,18 @@ fn determine_shard_route(
             Ok(shard_id as usize)
         },
     }
+}
+
+fn validate_client_shard_id(shard_id: u64, num_shards: u128) -> Result<usize, ShardRoutingError> {
+    if (shard_id as u128) >= num_shards {
+        return Err(ShardRoutingError::IncompatibleFilters(
+            format!(
+                "Invalid shard_id {}. Must be less than {} (total number of shards).",
+                shard_id, num_shards
+            ),
+        ));
+    }
+    Ok(shard_id as usize)
 }
 
 fn determine_shard_route_write_request(
@@ -711,49 +737,40 @@ async fn handle_watch_request(
 
 async fn handle_request_and_further_pipelining(
     mut tcp_stream: TcpStream,
-    mut request: celeriant_msg::process_requests::Request,
+    request: celeriant_msg::process_requests::Request,
     mut message_version: u32,
     shard_data: ShardData,
 ) {
+    let mut optional_request = Some(request);
     loop {
         if shard_data.shutdown_requested.get() {
             break;
         }
 
-        // if request is Watch type process seprately
-        if let celeriant_msg::process_requests::Request::Watch(watch_request) = request {
-            handle_watch_request(
-                tcp_stream,
-                watch_request,
-                message_version,
-                shard_data.shard_wal.clone(),
-                shard_data.config.max_requested_latency,
-                shard_data.config.slow_client_timeout,
-            )
-            .await;
-            return;
-        } else {
-            process_client_request(
-                &mut tcp_stream,
-                shard_data.shard_wal.clone(),
-                request,
-                message_version,
-                shard_data.config.slow_client_timeout,
-            )
-            .await;
-
-            // TESTING - ZERO WORK
-            // let response = celeriant_msg::process_responses::Response::Write(SuccessResponse{ correlation_id: None });
-            // let _ = write_response_with_timeout(
-            //     &mut tcp_stream,
-            //     &response,
-            //     celeriant_wal::compression_type::CompressionType::None,
-            //     2,
-            //     Duration::from_secs(100),
-            // )
-            // .await;
+        if let Some(request) = optional_request.take() {
+            // if request is Watch type process seprately
+            if let celeriant_msg::process_requests::Request::Watch(watch_request) = request {
+                handle_watch_request(
+                    tcp_stream,
+                    watch_request,
+                    message_version,
+                    shard_data.shard_wal.clone(),
+                    shard_data.config.max_requested_latency,
+                    shard_data.config.slow_client_timeout,
+                )
+                .await;
+                return;
+            } else {
+                process_client_request(
+                    &mut tcp_stream,
+                    shard_data.shard_wal.clone(),
+                    request,
+                    message_version,
+                    shard_data.config.slow_client_timeout,
+                )
+                .await;
+            }
         }
-
 
         if shard_data.shutdown_requested.get() {
             break;
@@ -762,7 +779,7 @@ async fn handle_request_and_further_pipelining(
         // Support pipelining of another request on the same connection
         match read_client_request(&mut tcp_stream, &shard_data, shard_data.config.slow_client_timeout).await {
             Some((next_request, next_message_version)) => {
-                request = next_request;
+                optional_request = Some(next_request);
                 message_version = next_message_version;
             }
             None => return,
@@ -772,13 +789,20 @@ async fn handle_request_and_further_pipelining(
             break;
         }
 
-        // The next request might need to be forwarded to another shard
-        match check_for_shard_redirect(tcp_stream, request, message_version, &shard_data).await {
-            Some((returned_request, returned_tcp_stream)) => {
-                request = returned_request;
-                tcp_stream = returned_tcp_stream;
+        if let Some(request) = optional_request.take() {
+            // The next request might need to be forwarded to another shard
+            match check_for_shard_redirect(tcp_stream, request, message_version, &shard_data).await {
+                ShardRedirectResult::ProcessLocally(returned_request, returned_tcp_stream) => {
+                    optional_request = Some(returned_request);
+                    tcp_stream = returned_tcp_stream;
+                }
+                ShardRedirectResult::Redirected => return,
+                ShardRedirectResult::ErrorSentContinue(returned_tcp_stream) => {
+                    // Error was sent, but keep connection alive for next request
+                    tcp_stream = returned_tcp_stream;
+                    continue; // Skip processing, go to next iteration to read another request
+                }
             }
-            None => return,
         }
     }
 }
@@ -801,11 +825,17 @@ fn handle_new_client_connection(mut tcp_stream: TcpStream, shard_data: ShardData
 
         // The request might need to be forwarded to another shard
         match check_for_shard_redirect(tcp_stream, request, message_version, &shard_data).await {
-            Some((returned_request, returned_tcp_stream)) => {
+            ShardRedirectResult::ProcessLocally(returned_request, returned_tcp_stream) => {
                 request = returned_request;
                 tcp_stream = returned_tcp_stream;
             }
-            None => return,
+            ShardRedirectResult::Redirected => return,
+            ShardRedirectResult::ErrorSentContinue(_returned_tcp_stream) => {
+                // Fall through to handle_request_and_further_pipelining with a dummy loop
+                // Or read next request here - simplest is to just return and let client reconnect
+                // for initial connection errors. The pipelining case is more important.
+                return;
+            }
         }
 
         handle_request_and_further_pipelining(tcp_stream, request, message_version, shard_data)

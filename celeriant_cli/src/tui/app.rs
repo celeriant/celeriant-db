@@ -28,6 +28,7 @@ pub enum Screen {
     TrimStart,
     Watch, 
     OrgWatch,
+    List,
     Help,
 }
 
@@ -103,6 +104,12 @@ pub struct App {
     pub org_watch_aggregate_types: String,
     pub org_watch_event_types: String,
     pub org_watch_latency_ms: String,
+
+    // List state
+    pub list_org_id: String,
+    pub list_aggregate_type: String,
+    pub list_results: Vec<String>,
+    pub list_scroll: usize,
 }
 
 #[derive(Debug)]
@@ -197,6 +204,12 @@ impl App {
             org_watch_aggregate_types: String::new(),
             org_watch_event_types: "1".to_string(),
             org_watch_latency_ms: "100".to_string(),
+
+            // List state
+            list_org_id: String::new(),
+            list_aggregate_type: String::new(),
+            list_results: Vec::new(),
+            list_scroll: 0,
         }
     }
     
@@ -551,6 +564,7 @@ impl App {
         if self.is_connected() {
             vec![
                 ("Enter Aggregate", "Go directly to an aggregate by ID"),
+                ("List", "List orgs, types, or aggregates"),
                 ("Organisation Watch", "Watch events across an organisation"),
                 ("Disconnect", "Disconnect from server"),
                 ("Help", "Show keyboard shortcuts"),
@@ -564,6 +578,131 @@ impl App {
                 ("Quit", "Exit the application"),
             ]
         }
+    }
+
+    pub fn setup_list_fields(&mut self) {
+        self.input_fields = vec![
+            InputField::with_value("Organisation ID (empty=list orgs)", &self.list_org_id),
+            InputField::with_value("Aggregate Type (empty=list types)", &self.list_aggregate_type),
+        ];
+        self.input_field_index = 0;
+        self.list_results.clear();
+        self.list_scroll = 0;
+    }
+
+    pub async fn execute_list(&mut self) -> Result<(), String> {
+        use celeriant_client_tokio::list_operations::{
+            ListOptions, ListOrgsIterator, ListAggregateTypesIterator, ListAggregatesIterator
+        };
+
+        let mut client = CeleriantClient::connect(&self.server_address)
+            .await
+            .map_err(|e| format!("Connection failed: {}", e))?;
+
+        let options = ListOptions::default();
+        self.list_results.clear();
+
+        let org_id: Option<u128> = if self.list_org_id.trim().is_empty() {
+            None
+        } else {
+            Some(self.list_org_id.trim().parse().map_err(|_| "Invalid Organisation ID")?)
+        };
+
+        let agg_type: Option<u128> = if self.list_aggregate_type.trim().is_empty() {
+            None
+        } else {
+            Some(self.list_aggregate_type.trim().parse().map_err(|_| "Invalid Aggregate Type")?)
+        };
+
+        match (org_id, agg_type) {
+            (None, _) => {
+                // List organisations
+                self.list_results.push("━━━ Organisations ━━━".to_string());
+                self.list_results.push(String::new());
+                
+                let mut iter = ListOrgsIterator::new(&mut client, options);
+                let mut count = 0;
+                while let Some(result) = iter.next().await {
+                    match result {
+                        Ok(org) => {
+                            self.list_results.push(format!("  Org: {}", org.org_id));
+                            count += 1;
+                        }
+                        Err(e) => {
+                            self.list_results.push(format!("  Error: {}", e));
+                            break;
+                        }
+                    }
+                }
+                self.list_results.push(String::new());
+                self.list_results.push(format!("Total: {} organisations", count));
+                self.set_status(&format!("Listed {} organisations", count));
+            }
+            (Some(org), None) => {
+                // List aggregate types for org
+                self.list_results.push(format!("━━━ Aggregate Types for Org {} ━━━", org));
+                self.list_results.push(String::new());
+                
+                let mut iter = ListAggregateTypesIterator::new(&mut client, Some(org), options);
+                let mut count = 0;
+                while let Some(result) = iter.next().await {
+                    match result {
+                        Ok(agg_type) => {
+                            self.list_results.push(format!(
+                                "  Type: {} (Org: {})", 
+                                agg_type.aggregate_type_id,
+                                agg_type.org_id
+                            ));
+                            count += 1;
+                        }
+                        Err(e) => {
+                            self.list_results.push(format!("  Error: {}", e));
+                            break;
+                        }
+                    }
+                }
+                self.list_results.push(String::new());
+                self.list_results.push(format!("Total: {} aggregate types", count));
+                self.set_status(&format!("Listed {} aggregate types", count));
+            }
+            (Some(org), Some(agg_type)) => {
+                // List aggregates for org/type
+                self.list_results.push(format!("━━━ Aggregates for Org {} Type {} ━━━", org, agg_type));
+                self.list_results.push(String::new());
+                
+                let mut iter = ListAggregatesIterator::new(&mut client, Some(org), Some(agg_type), options);
+                let mut count = 0;
+                while let Some(result) = iter.next().await {
+                    match result {
+                        Ok(agg) => {
+                            let deleted_marker = if agg.is_deleted { " [DELETED]" } else { "" };
+                            let last_updated = crate::utils::format_timestamp(agg.max_server_timestamp);
+                            let events = agg.max_event_index.saturating_add(1);
+                            self.list_results.push(format!(
+                                "  [{}] - size {} | {} batches, {} events | updated {}{}",
+                                agg.aggregate_id,
+                                humansize::format_size(agg.compressed_size, humansize::BINARY),
+                                agg.event_batch_count,
+                                events,
+                                last_updated,
+                                deleted_marker
+                            ));
+                            count += 1;
+                        }
+                        Err(e) => {
+                            self.list_results.push(format!("  Error: {}", e));
+                            break;
+                        }
+                    }
+                }
+                self.list_results.push(String::new());
+                self.list_results.push(format!("Total: {} aggregates", count));
+                self.set_status(&format!("Listed {} aggregates", count));
+            }
+        }
+
+        self.list_scroll = 0;
+        Ok(())
     }
 
     pub fn setup_watch_fields(&mut self) {

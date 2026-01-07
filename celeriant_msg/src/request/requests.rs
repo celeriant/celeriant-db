@@ -7,6 +7,36 @@ use serde::{Deserialize, Serialize};
 use crate::request::{read_filters::ReadFilters};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub struct ListOrgsRequest {
+    pub correlation_id: Option<u128>,
+    pub shard_id: u64,
+    /// WAL index to continue scanning from (exclusive). None starts from latest.
+    pub cursor: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub struct ListAggregateTypesRequest {
+    pub correlation_id: Option<u128>,
+    pub shard_id: u64,
+    /// Optional filter by org_id
+    pub org_id: Option<u128>,
+    /// WAL index to continue scanning from (exclusive). None starts from latest.
+    pub cursor: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub struct ListAggregatesRequest {
+    pub correlation_id: Option<u128>,
+    pub shard_id: u64,
+    /// Optional filter by org_id
+    pub org_id: Option<u128>,
+    /// Optional filter by aggregate_type_id (requires org_id if specified)
+    pub aggregate_type_id: Option<u128>,
+    /// WAL index to continue scanning from (exclusive). None starts from latest.
+    pub cursor: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct ExistsRequest {
     pub correlation_id: Option<u128>,
     pub aggregate_key: AggregateKey,
