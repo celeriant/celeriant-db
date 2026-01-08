@@ -1,216 +1,228 @@
 # celeriant_rotating_log
 
-Rotating log file management for the Celeriant write-ahead log (WAL). This crate handles log file lifecycle, rotation, caching, and crash recovery using direct I/O.
-
-**README WAS LLM GENERATED AND HUMAN REVIEWED 2025-12-20**
+Manages rotating WAL log segments with LRU caching, DMA I/O, and bloom filter optimization. Handles file lifecycle, crash recovery, and efficient reverse scanning.
 
 ## Overview
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    RotatingLogCache                         │
-├─────────────────────────────────────────────────────────────┤
-│  active_file: Rc<RwLock<ShardLogDmaFile>>  ← writers here   │
-│  active_log_id: Cell<u64>                  ← lock-free read │
-│  lru_cache: LruCache<log_id, ShardLogDmaFile>  ← readers    │
-└─────────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    ShardLogDmaFile                          │
-├─────────────────────────────────────────────────────────────┤
-│  dma_file: Option<DmaFile>     ← direct I/O handle          │
-│  log_id: u64                   ← monotonic file identifier  │
-│  file_len: u64                 ← preallocated size          │
-│  shard_log_header: ShardLogHeader  ← write positions        │
-└─────────────────────────────────────────────────────────────┘
+Shard Directory
+├── log_1.wal (oldest, cached on-demand)
+├── log_2.wal (cached on-demand)
+├── ...
+└── log_N.wal (active, always open for writes)
+
+LogSegmentsCache
+├── active_file     → Current log being written (Rc<LogSegmentFile>)
+├── lru_cache       → Older logs opened on-demand (LRU<log_id, Rc<LogSegmentFile>>)
+└── shard_dir       → Path for lazy-loading
+
+LogSegmentFile
+├── writer          → RwLock<DmaFile> for appends
+├── reader          → RwLock<DmaFile> for concurrent reads (dup'd fd)
+└── metadata        → Positions, bloom filter, wal_index
 ```
 
-## File Layout
-
-Each log file is preallocated to a fixed size with dual headers for crash recovery:
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│ Header (512 bytes) - metablocks_position, datablocks_position│
-├──────────────────────────────────────────────────────────────┤
-│ Metablocks (512 bytes each, growing forward →)               │
-│                                                              │
-├ ─ ─ ─ ─ ─ ─ ─ ─ ─ Free Space ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┤
-│                                                              │
-│              Datablocks (variable, growing ← backward)       │
-├──────────────────────────────────────────────────────────────┤
-│ Header (512 bytes) - duplicate for torn write recovery       │
-└──────────────────────────────────────────────────────────────┘
-
-File: log_1.wal, log_2.wal, log_3.wal, ...
-```
-
-When metablocks and datablocks meet in the middle, the file is full and rotation occurs.
+**Active file**: Always open, receives all writes, rotates when full.  
+**Cached files**: Opened lazily, evicted via LRU when cache is full.  
+**Dual file handles**: Separate reader/writer DmaFiles allow concurrent read/write without blocking.
 
 ## Key Types
 
-### RotatingLogCache
+| Type | Purpose |
+|------|---------|
+| `LogSegmentsCache` | Manages active + cached log files with LRU eviction |
+| `LogSegmentFile` | Single log file with reader/writer handles and metadata |
+| `LogSegmentFileMetadata` | In-memory state: positions, bloom filter, wal_index |
+| `AggregateKeyBloom` | Per-segment bloom filter for aggregate key filtering |
+| `ReverseMetablockScanner` | Scans metablocks backwards across log files |
+| `RotatingLogError` | Error types (IO, corruption, validation) |
 
-Manages the active log file and LRU cache of older log files.
+## Key Functions
+
+| Function | Purpose |
+|----------|---------|
+| `LogSegmentsCache::ready_up` | Initialize shard, open/create active log file |
+| `LogSegmentsCache::active` | Get active log segment for writing |
+| `LogSegmentsCache::get` | Get log segment by ID (from cache or disk) |
+| `LogSegmentsCache::rotate_to_next_log` | Create new active log when space exhausted |
+| `LogSegmentsCache::close` | Close all file handles |
+| `LogSegmentFile::open_or_create` | Open existing or create new log file |
+| `LogSegmentFile::open_existing` | Open existing log file (errors if missing) |
+| `ReverseMetablockScanner::scan` | Scan metablocks in reverse with visitor |
+| `write_dual_shard_log_header` | Write header to both start and end of file |
+
+## Usage
 
 ```rust
-let cache = RotatingLogCache::new(
-    shard_dir,           // Directory for log files
-    preallocate_bytes,   // Size of each log file (must be block-aligned)
-    max_cached_files,    // LRU cache capacity for reader access
+// Initialize shard
+let cache = LogSegmentsCache::ready_up(
+    shard_dir,
+    1 << 30,        // 1GB preallocate
+    8,              // max cached files
 ).await?;
 
-// Writers: get the active file with write lock
+// Write path: get active log
 let active = cache.active();
-let mut guard = active.write().await?;
+let mut guard = active.lock_writer("append").await?;
+// ... write metablocks/datablocks ...
 
-// Readers: get any log file by ID (from cache or disk)
+// Rotate when needed
+cache.rotate_to_next_log(required_space).await?;
+
+// Read path: get any log by ID
 let log_file = cache.get(log_id).await?;
-let guard = log_file.read().await?;
+let guard = log_file.lock_reader("read").await?;
+// ... read data ...
+
+// Reverse scan with bloom filter optimization
+let mut scanner = ReverseMetablockScanner::new(
+    &cache,
+    cache.active_log_id(),
+    None,           // start from end
+    64 * 1024,      // chunk size
+).with_bloom_filter(&aggregate_key);
+
+let result = scanner.scan(|log_id, pos, block| {
+    // Process 512-byte metablock
+    if found_what_we_need(block) {
+        Ok(Some(result))  // Stop scanning
+    } else {
+        Ok(None)          // Continue
+    }
+}).await?;
+
+// Cleanup
+cache.close().await?;
 ```
 
-**Design decisions:**
+## Design Decisions
 
-| Feature | Rationale |
-|---------|-----------|
-| Separate active file | Writers don't contend with readers on old files |
-| `Cell<u64>` for active_log_id | Avoid blocking readers when write lock is present |
-| LRU cache | Respect linux fd limits while keeping hot files open |
-| `Rc<RwLock<_>>` handles | Uniform access pattern for both active and cached files |
+### Dual headers for crash recovery
 
-### ShardLogDmaFile
-
-Represents a single physical log file with direct I/O support.
-
-```rust
-// Open or create (for active file on startup)
-let mut dma_file = ShardLogDmaFile::open_or_create(&shard_dir, preallocate_bytes, log_id).await?;
-
-// Open existing (for reader cache)
-let dma_file = ShardLogDmaFile::open_existing(&shard_dir, log_id).await?;
-
-// Rotate to next file (returns previous file for caching)
-let previous = dma_file.rotate_to_next_log(&shard_dir, preallocate_bytes).await?;
-cache.rotate_to_next_log(dma_file.log_id, previous);
-
-// Update headers after writes
-dma_file.write_new_headers_and_fsync(new_datablocks_pos, new_metablocks_pos).await?;
+```
+Log File Layout:
+[Header @ 0]           ← Primary header
+[Metablocks →]
+[Free space]
+[← Datablocks]
+[Header @ EOF-512]     ← Backup header
 ```
 
-### ShardLogHeader
+Both headers are written on every fsync. On open, if primary is corrupted, backup is used. If both are corrupted, the file requires repair.
 
-Tracks write positions within a log file:
-
-```rust
-pub struct ShardLogHeader {
-    pub metablocks_position: u64,  // End of last written metablock
-    pub datablocks_position: u64,  // Start of last written datablock
-}
-
-// Available space for new writes
-let space = header.available_space(); // datablocks_position - metablocks_position
-```
-
-## Usage Patterns
-
-### Writer Path
+### Separate reader/writer file handles
 
 ```rust
-// Acquire exclusive access to active file
-let lockable_active = rotating_log_cache.active();
-let mut shard_log_dma_file = lockable_active.write().await?;
-
-// Check if rotation needed
-if !has_enough_free_space {
-    let previous = shard_log_dma_file
-        .rotate_to_next_log(&shard_dir, preallocate_bytes)
-        .await?;
-    rotating_log_cache.rotate_to_next_log(shard_log_dma_file.log_id, previous);
-}
-
-// Write data...
-let dma_file = shard_log_dma_file.dma_file.as_mut().unwrap();
-dma_file.write_at(buffer, position).await?;
-
-// Commit with fsync
-shard_log_dma_file
-    .write_new_headers_and_fsync(new_datablocks_pos, new_metablocks_pos)
-    .await?;
-```
-
-### Reader Path
-
-```rust
-// Get file by log_id (cache hit or disk open)
-let log_file = cache.get(log_id).await?;
-let guard = log_file.read().await?;
-
-// Read data
-let dma_file = guard.dma_file.as_ref().unwrap();
-let data = dma_file.read_at(position, size).await?;
-```
-
-### Startup Recovery
-
-```rust
-// Automatically finds latest log file and opens it
-let cache = RotatingLogCache::new(shard_dir, preallocate_bytes, max_cached).await?;
-
-// If front header is corrupted, recovers from back header
-// If both headers corrupted, returns HeaderCorrupted error
-```
-
-## Crash Recovery
-
-Dual headers enable recovery from torn writes:
-
-1. **Normal state**: Front and back headers match
-2. **Torn write during header update**: Back header has last-known-good state
-3. **Recovery**: If front header CRC fails, use back header
-
-## Error Handling
-
-```rust
-pub enum RotatingLogError {
-    InvalidPreallocatedBytes(u64),  // Size validation failed
-    IoError(String),                 // Disk I/O failure
-    WireFormat(WireFormatError),     // Serialization failure
-    HeaderCorrupted { log_id: Option<u64> },  // Both headers invalid
-    LogFileNotFound { log_id: u64 }, // Requested log doesn't exist
+pub struct LogSegmentFile {
+    writer: RwLock<Option<Rc<DmaFile>>>,  // For appends
+    reader: RwLock<Option<Rc<DmaFile>>>,  // For concurrent reads
 }
 ```
 
-## File Naming
+Using `DmaFile::dup()` creates independent file descriptors. Readers never block writers and vice versa. The RwLock protects the Option (for close semantics), not concurrent I/O.
 
-Log files follow a strict naming convention:
+### Metadata in separate RefCell
 
+```rust
+pub struct LogSegmentFile {
+    writer: RwLock<Option<Rc<DmaFile>>>,
+    reader: RwLock<Option<Rc<DmaFile>>>,
+    pub metadata: RefCell<LogSegmentFileMetadata>,  // Not inside the RwLock!
+}
 ```
-log_{id}.wal
 
-Examples:
-  log_1.wal   ← First log file
-  log_2.wal   ← After first rotation
-  log_999.wal ← After 998 rotations
+Metadata (positions, bloom filter, wal_index) is stored in a separate `RefCell`, not inside the `RwLock` with the file handles. This enables a critical optimization:
+
+```rust
+// After fsync completes, update metadata without blocking readers:
+let mut metadata = log_segment_file.metadata.borrow_mut();
+metadata.metablocks_position = new_metablocks_position;
+metadata.datablocks_position = new_datablocks_position;
+metadata.wal_index = new_wal_index;
+// Readers can immediately see new data boundaries
 ```
 
-The cache scans for `log_*.wal` files on startup and opens the highest ID as active.
+**Why this matters:**
+- After a write is fsynced, readers need to know the new `metablocks_position` to read freshly written data
+- If metadata lived inside the writer's `RwLock`, updating it would require a write lock
+- That write lock would block all concurrent readers until the update completes
+- With separate `RefCell`, metadata updates are instant and readers see new positions immediately
+
+**Single-threaded safety:** Celeriant uses glommio's thread-per-core model. Each shard runs on exactly one thread, so `RefCell` is safe—no cross-thread access occurs. The `RwLock` on file handles exists for async coordination (multiple tasks on same thread), not thread safety.
+
+### Bloom filter per log segment
+
+Each log segment maintains a bloom filter of all aggregate keys written to it. When scanning backwards for an aggregate:
+
+```rust
+scanner.with_bloom_filter(&aggregate_key)
+```
+
+Entire log segments where the bloom filter says "definitely not present" are skipped, potentially avoiding many disk reads.
+
+### LRU cache with active file bypass
+
+```rust
+pub async fn get(&self, log_id: u64) -> Result<Rc<LogSegmentFile>> {
+    if log_id == self.active_log_id() {
+        return Ok(self.active());  // Direct return, no cache
+    }
+    // Check LRU cache, open from disk if needed
+}
+```
+
+The active file is always accessible without cache lookup. Older files go through LRU with configurable capacity.
+
+### Rotation triggers
+
+```rust
+pub async fn rotate_to_next_log(&self, required_disk_space: u64) -> Result<bool> {
+    if available_space.saturating_sub(required_disk_space) > 0 {
+        return Ok(false);  // No rotation needed
+    }
+    // Create log_{N+1}.wal, move current to cache
+}
+```
+
+Rotation is caller-driven based on required space. The old active file moves to the LRU cache; the new file becomes active.
+
+### Deadlock detection
+
+```rust
+pub async fn read_with_timeout<T>(lock: &RwLock<T>, location: &'static str) 
+    -> Result<RwLockReadGuard<T>, LockTimeoutError>
+```
+
+All lock acquisitions use 1-second timeouts. If exceeded, returns `PotentialDeadlock` error with the location string for debugging. Essential for diagnosing async deadlocks in production.
+
+### Preallocated files
+
+```rust
+LogSegmentsCache::ready_up(shard_dir, preallocate_bytes, max_cached)
+```
+
+Files are preallocated to `preallocate_bytes` (typically 1GB) on creation. This:
+- Reduces fragmentation
+- Enables efficient DMA alignment
+- Makes available space calculation simple
+
+Size must be multiple of 512 bytes and large enough for dual headers.
+
+### Datablocks carry-over
+
+When `datablocks_position` is not aligned to DMA boundaries, the bytes between position and next alignment boundary are read on open:
+
+```rust
+pub datablocks_carry_over: Option<Vec<u8>>
+```
+
+This allows writers to continue appending at unaligned positions without losing data.
 
 ## Dependencies
 
-- `glommio` - Async direct I/O runtime (DmaFile, RwLock)
+- `glommio` - Thread-per-core async runtime with DMA support
 - `lru` - LRU cache implementation
-- `celeriant_wal` - Header structures and constants
+- `celeriant_wal` - WAL data structures (Metablock, ShardLogHeader)
 - `celeriant_wire` - Serialization for headers
-- `celeriant_disk` - DmaFile open helpers
-
-## Thread Model
-
-This crate is designed for single-threaded async executors (glommio):
-
-- `Rc` instead of `Arc` for reference counting
-- `RefCell` instead of `Mutex` for interior mutability
-- `Cell` for lock-free primitive updates
-- `glommio::sync::RwLock` for async reader-writer locking
-
-Not `Send` or `Sync` - each shard runs on a dedicated CPU core.
+- `celeriant_disk` - Low-level DMA read utilities
+- `fastbloom` - Bloom filter implementation

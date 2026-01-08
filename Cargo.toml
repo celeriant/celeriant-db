@@ -24,6 +24,7 @@ edition = "2024"
 license = "Apache-2.0"
 
 [workspace.dependencies]
+object_store = { version = "0.13.0", features = ["aws"] }
 deepsize = "0.2.0"
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 base64 = "0.22.1"
@@ -33,6 +34,7 @@ rmp-serde = "1.3.0"
 zstd = "0.13.3"
 brotli = "8.0.2"
 flate2 = "1.1.7"
+futures = "0.3"
 futures-lite = "2.6.1"
 criterion = "0.8.0"
 tokio = { version = "1.48.0", features = ["full"] }
@@ -51,7 +53,7 @@ libc = "0.2.178"
 dotenvy = "0.15.7"
 tracing = "0.1.43"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
-thiserror = "2.0.12"
+thiserror = "2.0.2"
 rsa = { version = "0.9.9", features = ["sha2", "pem"] }
 sha2 = "0.10.9"
 rand = "0.8.5"

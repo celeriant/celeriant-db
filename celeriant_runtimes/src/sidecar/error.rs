@@ -31,7 +31,7 @@ impl SidecarError {
 
 impl From<StoreError> for SidecarError {
     fn from(value: StoreError) -> Self {
-        SidecarError { kind: ErrorKind::StoreError, message: value.message }
+        SidecarError { kind: ErrorKind::StoreError, message: value.to_string() }
     }
 }
 

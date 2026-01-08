@@ -379,6 +379,9 @@ impl ShardMemCache {
         for (key, queue_positions) in sync_positions_snapshot.aggregate_queue_positions {
             // Update aggregate positions LRU
             if let Some(existing) = self.aggregate_snapshots.get_mut(&key) {
+                if queue_positions.pending_delete {
+                    continue; // Will be handled by put_aggregate_into_cache_as_deleted
+                }
                 existing.status = AggregateStatus::Found;
                 if queue_positions.event_batch_index > existing.event_batch_index {
                     existing.event_batch_index = queue_positions.event_batch_index;

@@ -2,8 +2,6 @@
 
 Watch/subscription system for real-time aggregate change notifications. Handles client subscriptions, event filtering, batching, and delivery.
 
-**README WAS LLM GENERATED AND HUMAN REVIEWED [2025-12-20]**
-
 ## Architecture
 
 ```

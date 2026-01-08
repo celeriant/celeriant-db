@@ -2,16 +2,14 @@
 
 Shard-level write-ahead log orchestrator. Coordinates validation, queue management, durability, caching, and read filtering for a single shard.
 
-**README WAS LLM GENERATED AND HUMAN REVIEWED [2025-12-30]**
-
-## Overview
+## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                              ShardWal                                   │
 ├─────────────────────────────────────────────────────────────────────────┤
 │  ┌──────────────────┐  ┌──────────────────┐  ┌───────────────────────┐  │
-│  │  ShardMemCache   │  │ RotatingLogCache │  │  AggregateWatchers    │  │
+│  │  ShardMemCache   │  │ LogSegmentsCache │  │  AggregateWatchers    │  │
 │  │  (positions,     │  │  (DMA file I/O)  │  │  (watch subscribers)  │  │
 │  │   queues, cache) │  │                  │  │                       │  │
 │  └────────┬─────────┘  └────────┬─────────┘  └───────────┬───────────┘  │
@@ -22,10 +20,10 @@ Shard-level write-ahead log orchestrator. Coordinates validation, queue manageme
 │  │            leader/follower coalescing with delay                 │   │
 │  └──────────────────────────────────────────────────────────────────┘   │
 │                                                                         │
-│  ┌─────────────────────┐  ┌─────────────────────┐                       │
-│  │ LoadingCoordinator  │  │  BloomFilterCache   │                       │
-│  │ (thundering herd)   │  │  (reusable filter)  │                       │
-│  └─────────────────────┘  └─────────────────────┘                       │
+│  ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────┐  │
+│  │ LoadingCoordinator  │  │  BloomFilterCache   │  │ TimestampConfig │  │
+│  │ (thundering herd)   │  │  (reusable filter)  │  │ (precision/epoch│  │
+│  └─────────────────────┘  └─────────────────────┘  └─────────────────┘  │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -38,9 +36,26 @@ Shard-level write-ahead log orchestrator. Coordinates validation, queue manageme
 | `LocalEvent` | Single-threaded async event for result broadcasting |
 | `BloomFilterCache` | Reusable bloom filter to avoid allocations |
 | `LoadingCoordinator` | Serializes concurrent loads per key |
+| `TimestampConfig` | Configurable precision (ms/μs/ns) and epoch offset |
+| `InternalShardConfig` | All shard configuration parameters |
 | `ShardWriteError` | Validation failures (idempotency, OCC, empty events) |
 | `ShardReadError` | Read failures (not found, size limits, I/O) |
 | `ShardFsyncError` | Durability failures (I/O, space, corruption) |
+
+## Key Functions
+
+| Function | Purpose |
+|----------|---------|
+| `ShardWal::open` | Open or create shard WAL from config |
+| `ShardWal::process_request` | Route request to appropriate handler |
+| `ShardWal::read` | Read event batches with filtering |
+| `ShardWal::write` | Append events to aggregates |
+| `ShardWal::delete` | Soft-delete aggregates |
+| `ShardWal::trim_start` | Remove old event batches |
+| `ShardWal::exists` | Check aggregate existence |
+| `ShardWal::list_orgs/aggregate_types/aggregates` | Discovery with pagination |
+| `ShardWal::close` | Flush and close shard |
+| `Coordinator::request_sync` | Batched fsync with delay |
 
 ## Write Flow
 
@@ -78,7 +93,7 @@ Client Write Request
              Client ACK
 ```
 
-### Validation Details
+### Validation Errors
 
 | Check | Error | Purpose |
 |-------|-------|---------|
@@ -87,6 +102,7 @@ Client Write Request
 | Aggregate missing | `AggregateNotExists` | Unless `allow_create = true` |
 | Client idempotency | `ClientIdempotencyViolation` | Reject duplicate client_event_index |
 | OCC | `OptimisticConcurrencyViolation` | Expected batch index mismatch |
+| Deleted aggregate | `AggregateRecreateNotAllowed` | Unless `allow_recreate = true` |
 
 ## Read Flow
 
@@ -145,15 +161,7 @@ Writer 3 ─┘                                     │
 |------|----------|
 | Durable | Wait for fsync, batched by delay (typically 5-10ms) |
 | Non-durable | Spawn fsync task, return immediately to client |
-| Force immediate | Skip delay (after previous fsync failure in non-durable mode) |
-
-### FSync Leader Election
-
-1. First writer acquires write lock → becomes leader
-2. Subsequent writers acquire read lock → become followers
-3. Leader sleeps for configured delay
-4. Leader clears orchestrator, calls sync function
-5. All waiters receive cloned result via `LocalEvent`
+| Force immediate | Skip delay (after previous fsync failure) |
 
 ## In-Memory Filtering
 
@@ -161,8 +169,7 @@ Writer 3 ─┘                                     │
 
 | Filter | Check Against |
 |--------|---------------|
-| `from_event_batch_index` | `event_batch_index >= from` |
-| `to_event_batch_index` | `event_batch_index <= to` |
+| `from/to_event_batch_index` | `event_batch_index` bounds |
 | `min/max_server_timestamp` | `server_timestamp` range |
 | `include/exclude_client_id` | `client_id` match |
 | `include/exclude_user_id` | `user_id` match |
@@ -173,7 +180,44 @@ Writer 3 ─┘                                     │
 
 ### Event-Level (after deserialize)
 
-Batches are filtered, but some filters are also applied to individual events within kept batches.
+Applied to individual events within kept batches for final filtering.
+
+## List Operations
+
+Reverse WAL scanning with pagination for discovery:
+
+```rust
+// List all orgs in shard
+list_orgs(ListOrgsRequest { cursor: None, .. })
+
+// List aggregate types filtered by org
+list_aggregate_types(ListAggregateTypesRequest { org_id: Some(123), .. })
+
+// List aggregates with full metadata
+list_aggregates(ListAggregatesRequest { org_id: Some(123), aggregate_type_id: Some(456), .. })
+```
+
+Features:
+- Time-bounded scans (`list_max_duration`)
+- LRU deduplication within page
+- WAL index position caching for fast cursor resumption
+- Returns metadata: batch counts, index ranges, timestamps, sizes
+
+## Timestamp Configuration
+
+```rust
+pub struct TimestampConfig {
+    pub precision: TimestampPrecision,  // Milliseconds, Microseconds, Nanoseconds
+    pub epoch_offset_secs: i64,         // Custom epoch offset from Unix epoch
+}
+
+// Usage
+let config = TimestampConfig {
+    precision: TimestampPrecision::Microseconds,
+    epoch_offset_secs: 1704067200,  // Custom epoch: 2024-01-01
+};
+let timestamp = config.now();  // Microseconds since custom epoch
+```
 
 ## Loading Coordinators
 
@@ -191,28 +235,19 @@ if already_loaded { return Ok(()); }
 ```
 
 Two coordinators:
-- `aggregate_loading` - Aggregate snapshot loading
+- `aggregate_loading` - Aggregate snapshot loading from disk
 - `aggregate_client_loading` - Client idempotency index loading
 
 ## Watch Integration
 
 After successful fsync, watch events are broadcast:
 
-```rust
-// Accumulate events during commit
-let mut write_events: HashMap<AggregateKey, AggregateWatchEventOperation> = HashMap::new();
-let mut create_events: HashMap<AggregateKey, AggregateWatchEventOperation> = HashMap::new();
-
-// Broadcast after commit
-for (aggregate_key, operation) in create_events {
-    watched_aggregates.broadcast(AggregateWatchEvent { aggregate_key, operation });
-}
-for (aggregate_key, operation) in write_events {
-    watched_aggregates.broadcast(AggregateWatchEvent { aggregate_key, operation });
-}
-```
-
-Multiple batches to same aggregate in one sync are merged into range `(from_event_batch_index, to_event_batch_index)`. This keeps our memory usage reasonable when working with low latency watchers.
+| Event Type | Trigger |
+|------------|---------|
+| `Create` | First event batch for aggregate |
+| `Write` | Event batch appended (merged to range) |
+| `Delete` | Soft delete committed |
+| `TrimStart` | Trim operation committed |
 
 ## Error Recovery
 
@@ -222,25 +257,13 @@ Multiple batches to same aggregate in one sync are merged into range `(from_even
 sync() fails
     │
     ▼
-rollback_queue_positions()
+rollback_queue_positions()  → Clear uncommitted state
     │
-    ├── Clears aggregate_queue_positions
-    ├── Sets had_fsync_failure flag
-    └── Next write forces a durable write to surface errors to clients
+    ├── force_immediate = true  → Next sync skips delay
+    └── Error propagated to all waiting writers
 ```
 
-### Log Rotation
-
-When log file is full:
-
-```rust
-if !shard_mem_cache.has_enough_free_space() {
-    rotating_log_cache.rotate_to_next_log(...).await?;
-    shard_mem_cache.rotate_to_next_log(new_log_id, meta_pos, data_pos, file_len);
-}
-```
-
-## Configuration via InternalShardConfig
+## Configuration
 
 | Field | Purpose |
 |-------|---------|
@@ -249,24 +272,32 @@ if !shard_mem_cache.has_enough_free_space() {
 | `max_response_size` | Size bound for read responses |
 | `read_max_chunk_size` | Disk read chunk size |
 | `shard_log_preallocate_bytes` | Log file size |
-| `max_open_files` | LRU cache capacity |
+| `max_open_files` | LRU cache for log files |
+| `recent_write_cache_bytes` | Hot write cache size |
+| `aggregate_snapshots_cache_bytes` | Position cache size |
+| `list_page_size` | Results per list page |
+| `list_max_duration` | Max time for list scan |
+| `timestamp_config` | Precision and epoch settings |
 
 ## Thread Safety
 
 `ShardWal` is **not thread-safe**. Designed for single-threaded async execution per shard (thread-per-core architecture). Uses:
 
 - `Rc<RefCell<_>>` for interior mutability
-- `glommio::sync::RwLock` for async coordination
-- `Cell` for lock-free primitives
+- `glommio::sync::RwLock` for async coordination within single thread
+- `Cell` for lock-free flags
 
 ## Dependencies
 
-- `celeriant_memcache` - In-memory state (queues, positions, cache)
-- `celeriant_rotating_log` - Direct I/O log file management
-- `celeriant_wal` - Metablock/datablock types
-- `celeriant_wire` - Serialization
-- `celeriant_watch` - Watch subscription system
-- `celeriant_msg` - Request/response types
-- `celeriant_disk` - DMA read utilities
-- `glommio` - Async runtime
-- `fastbloom` - Bloom filter implementation
+| Crate | Purpose |
+|-------|---------|
+| `celeriant_memcache` | In-memory state (queues, positions, cache) |
+| `celeriant_rotating_log` | Direct I/O log file management |
+| `celeriant_wal` | Metablock/datablock types |
+| `celeriant_wire` | Serialization |
+| `celeriant_watch` | Watch subscription system |
+| `celeriant_msg` | Request/response types |
+| `celeriant_disk` | DMA read utilities |
+| `glommio` | Async runtime |
+| `fastbloom` | Bloom filter implementation |
+| `lru` | LRU cache for bounded collections |

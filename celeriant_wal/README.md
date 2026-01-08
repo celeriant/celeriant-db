@@ -2,8 +2,6 @@
 
 Data structures for the Celeriant write-ahead log. No I/O logic—just types and serialization.
 
-**README WAS LLM GENERATED AND HUMAN REVIEWED 2025-12-20**
-
 ## Architecture
 
 ```
@@ -36,7 +34,8 @@ When they meet, file rotates. Files could be less than 1GB if they get trimmed a
 |------|-------|---------|
 | `Metablock` | Meta | Container with wal_index, timestamps, lease_index, node_id |
 | `MetablockEventBatch` | Meta | Filtering metadata (min/max ranges, bloom filter, aggregate key) |
-| `MetablockSnapshotAggregate` | Meta | Aggregate discovery + index tracking |
+| `MetablockSoftDelete` | Meta | Marking an aggregate as deleted including its last indexes and if it can be recreated |
+| `MetablockSoftTrim` | Meta | Marking the minimum available event batch index of an aggregate |
 | `Datablock` | Data | Container for variable-length payloads |
 | `DatablockAggregateEventBatch` | Data | Batch of events from one client |
 | `DatablockAggregateEvent` | Data | Single event with payload |
@@ -72,6 +71,8 @@ Avoids copying payload bytes when moving events across thread boundaries.
 - `event_timestamp`: Client-assigned, when event occurred
 - `server_timestamp`: Server-assigned, when persisted
 
+Timestamps are by default Unix epoch ms. But the server could be configured to be us, ns or have a different offset.
+
 ### Minibatch optimization
 
 If encoded, uncompressed batch ≤256 bytes, it's stored inline in the metablock via `DatablockInlineData`, avoiding an extra disk read.
@@ -87,14 +88,6 @@ If encoded, uncompressed batch ≤256 bytes, it's stored inline in the metablock
 ### Event type filtering
 
 `EventTypesKind::Direct` for ≤4 unique types (exact match), `EventTypesKind::Bloom` for more (bloom filter).
-
-## Snapshot Types
-
-Snapshots avoid replaying entire WAL on startup:
-
-- `SnapshotAggregate`: Idempotency tracking (`client_id → last_event_batch_index`)
-- `SnapshotAggregateType`: Schema registry per event type
-- `SnapshotOrg`: Reserved for org-level state
 
 ## Dependencies
 

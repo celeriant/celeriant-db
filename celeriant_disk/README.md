@@ -2,8 +2,6 @@
 
 Low-level disk I/O primitives for Celeriant using Direct Memory Access (DMA). This crate provides alignment-aware file reading optimized for the glommio async runtime.
 
-**README WAS LLM GENERATED AND HUMAN REVIEWED 2025-12-27**
-
 ## Overview
 
 This crate handles the complexities of DMA I/O—alignment requirements, chunked reads, gap skipping—so higher layers can work with simple byte ranges and records.

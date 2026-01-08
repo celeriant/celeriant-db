@@ -1,42 +1,32 @@
 # celeriant_runtimes
 
-Runtime orchestration for sharded executors and sidecar I/O. Manages thread-per-core glommio executors, inter-shard routing, and bridges to tokio for external operations (S3, object storage).
-
-**README WAS LLM GENERATED AND HUMAN REVIEWED [2025-12-30]**
+Runtime orchestration for sharded executors and sidecar I/O. Manages thread-per-core glommio executors, inter-shard routing, and bridges to tokio for external operations.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           Glommio Executor Pool                             │
-│  ┌───────────────┐  ┌───────────────┐       ┌───────────────┐               │
-│  │   Shard 0     │  │   Shard 1     │  ...  │   Shard N     │               │
-│  │  TcpListener  │  │  TcpListener  │       │  TcpListener  │               │
-│  │  ShardWal     │  │  ShardWal     │       │  ShardWal     │               │
-│  │  SignalHandler│  │               │       │               │               │
-│  └───────┬───────┘  └───────┬───────┘       └───────┬───────┘               │
-│          │                  │                       │                       │
-│          └──────────────────┼───────────────────────┘                       │
-│                             │ Channel Mesh (Full)                           │
-│                    IntrashardMessages                                       │
-└─────────────────────────────┼───────────────────────────────────────────────┘
-                              │
-                    flume channels (bounded)
-                              │
-┌─────────────────────────────┼───────────────────────────────────────────────┐
-│                    Tokio Sidecar Runtime                                    │
-│  ┌─────────────────────────┴─────────────────────────┐                      │
-│  │              SidecarRuntime                       │                      │
-│  │  ┌─────────────────┐  ┌─────────────────┐         │                      │
-│  │  │  Control Lane   │  │   Data Lane     │         │                      │
-│  │  │ (leases, member)│  │ (batch uploads) │         │                      │
-│  │  └────────┬────────┘  └────────┬────────┘         │                      │
-│  │           └────────────────────┘                  │                      │
-│  │                    │                              │                      │
-│  │           SidecarStoreTrait                       │                      │
-│  │           (S3, local, etc.)                       │                      │
-│  └───────────────────────────────────────────────────┘                      │
-└─────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                    Glommio Executor Pool                        │
+│  ┌─────────────┐  ┌─────────────┐       ┌─────────────┐         │
+│  │  Shard 0    │  │  Shard 1    │  ...  │  Shard N    │         │
+│  │ TcpListener │  │ TcpListener │       │ TcpListener │         │
+│  │  ShardWal   │  │  ShardWal   │       │  ShardWal   │         │
+│  │SignalHandler│  │             │       │             │         │
+│  └──────┬──────┘  └──────┬──────┘       └──────┬──────┘         │
+│         └────────────────┼─────────────────────┘                │
+│                   Channel Mesh (Full)                           │
+│                  IntrashardMessages                             │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │ flume channels
+┌──────────────────────────┴──────────────────────────────────────┐
+│                    Tokio Sidecar Runtime                        │
+│  ┌────────────────┐  ┌────────────────┐                         │
+│  │  Control Lane  │  │   Data Lane    │                         │
+│  │(leases, member)│  │(batch uploads) │                         │
+│  └───────┬────────┘  └───────┬────────┘                         │
+│          └───────────────────┘                                  │
+│                 SidecarStoreTrait                               │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ## Key Types
@@ -45,275 +35,154 @@ Runtime orchestration for sharded executors and sidecar I/O. Manages thread-per-
 |------|---------|
 | `Shard` | Per-core executor: TCP accept, routing, request processing |
 | `ShardConfig` | Node-level configuration (paths, timeouts, routing) |
-| `RoutingRule` | Aggregate-to-shard mapping strategy |
-| `IntrashardMessages` | Inter-shard communication (shutdown, redirect) |
-| `SignalHandler` | SIGINT/SIGTERM handling for graceful shutdown |
-| `SidecarRuntime` | Tokio runtime for external I/O operations |
-| `SidecarSenders` | glommio → tokio channel handles |
-| `SidecarConfig` | Sidecar thread pool and queue configuration |
+| `RoutingRule` | Aggregate-to-shard mapping strategy (OrgId, AggregateTypeId, AggregateId) |
+| `IntrashardMessages` | Inter-shard communication (Shutdown, ConnectionRedirect) |
+| `SignalHandler` | SIGINT/SIGTERM handling via atomic flags |
+| `SidecarRuntime` | Tokio runtime for external I/O (S3, object storage) |
+| `SidecarSenders` | glommio → tokio channel handles with QoS lanes |
+| `SidecarConfig` | Thread pool and queue capacity configuration |
+| `ShardRoutingError` | Routing failures (no key, multiple shards, incompatible filters) |
 
-## Shard Routing
+## Key Functions
 
-Routing determines which shard owns an aggregate based on `RoutingRule`:
+| Function | Purpose |
+|----------|---------|
+| `run_executors_and_sidecar` | Main entry: spawn mesh, sidecar, and executor pool |
+| `new_sidecar` | Create sidecar runtime with store implementation |
+| `Shard::new` | Initialize shard with config, channels, WAL |
+| `Shard::run` | Main loop: accept connections, handle messages |
+| `check_for_shard_redirect` | Route request to correct shard or process locally |
+| `determine_shard_route` | Compute target shard from request and routing rule |
+| `handle_request_and_further_pipelining` | Process request, support HTTP/1.1-style pipelining |
+| `SidecarSenders::send_async` | Send request to sidecar, await response |
+
+## Design Decisions
+
+### Thread-per-core model
+
+One glommio executor per CPU core. Each shard owns a subset of aggregates. No locks on hot path. `Rc<Cell<_>>` for flags, `Rc<RefCell<_>>` for state.
+
+### Shard routing
 
 | Rule | Routes By | Use Case |
 |------|-----------|----------|
-| `OrgId` | `aggregate_key.org_id % num_shards` | Multi-tenant isolation |
-| `AggregateTypeId` | `aggregate_key.aggregate_type_id % num_shards` | Type locality |
-| `AggregateId` | `aggregate_key.aggregate_id % num_shards` | Even distribution (default) |
+| `OrgId` | `org_id % num_shards` | Multi-tenant isolation |
+| `AggregateTypeId` | `aggregate_type_id % num_shards` | Type locality |
+| `AggregateId` | `aggregate_id % num_shards` | Even distribution (default) |
 
-### Routing Flow
+### Connection redirect
 
-```
-Client connects to any shard
-         │
-         ▼
-┌─────────────────────────┐
-│  Read first request     │
-│  Extract routing key    │
-└───────────┬─────────────┘
-            │
-            ▼
-┌─────────────────────────┐     Yes    ┌─────────────────────────┐
-│ routing_id % num_shards │───────────►│   Process locally       │
-│ == current_shard_id?    │            └─────────────────────────┘
-└───────────┬─────────────┘
-            │ No
-            ▼
-┌─────────────────────────┐
-│  Send ConnectionRedirect│
-│  via channel mesh       │
-└───────────┬─────────────┘
-            │
-            ▼
-┌─────────────────────────┐
-│  Target shard receives  │
-│  AcceptedTcpStream +    │
-│  first request          │
-└─────────────────────────┘
-```
-
-### Multi-Aggregate Write Routing
-
-To perform multi-aggregate atomic writes with OCC, aggregates that are part of a write must all be on the same shard:
+Clients connect to any shard. First request is read, routing computed. If wrong shard, `AcceptedTcpStream` + request sent via channel mesh. Target shard binds stream and continues processing.
 
 ```rust
-// All aggregates must hash to same shard
-for aggregate_key in write_request.writes.keys() {
-    let routing_id = config.routing_rule.routing_id_for_rule(aggregate_key);
-    let shard_id = (routing_id % num_shards) as usize;
-    shard_ids.insert(shard_id);
-}
-
-if shard_ids.len() > 1 {
-    return Err(ShardRoutingError::MultipleShardRoutes);
+IntrashardMessages::ConnectionRedirect {
+    accepted_tcp_stream,  // Transferable socket
+    request,              // Already-parsed first request
+    message_version,
 }
 ```
 
-### Watch Request Routing
+### Multi-aggregate write routing
 
-Watch requests must specify filters compatible with the routing rule:
-
-| Routing Rule | Required Watch Filter |
-|--------------|----------------------|
-| `OrgId` | `orgs` must be specified |
-| `AggregateTypeId` | `aggregate_types` must be specified |
-| `AggregateId` | `aggregates` must be specified |
-
-## Connection Lifecycle
-
-```
-TcpListener::shared_accept()
-         │
-         ▼
-┌─────────────────────────┐
-│  set_nodelay(true)      │  ← Disable Nagle for latency
-└───────────┬─────────────┘
-            │
-            ▼
-┌─────────────────────────┐
-│  read_client_request()  │  ← With slow_client_timeout
-└───────────┬─────────────┘
-            │
-            ▼
-┌───────────────────────────┐
-│  check_for_shard_redirect │
-└───────────┬───────────────┘
-            │
-            ▼
-┌─────────────────────────────────────────┐
-│  handle_request_and_further_pipelining  │
-│  ┌─────────────────────────────────────┐│
-│  │  Watch? → handle_watch_request      ││
-│  │  Other? → process_client_request    ││
-│  │  Read next request (pipelining)     ││
-│  │  Check redirect again               ││
-│  │  Loop until disconnect/shutdown     ││
-│  └─────────────────────────────────────┘│
-└─────────────────────────────────────────┘
-```
-
-## Inter-Shard Communication
-
-Full mesh topology via `glommio::channels::channel_mesh`:
+All aggregates in a write must hash to the same shard:
 
 ```rust
-pub enum IntrashardMessages {
-    /// Broadcast from shard 0 on SIGINT/SIGTERM
-    Shutdown,
-    
-    /// Redirect client connection to correct shard
-    ConnectionRedirect {
-        accepted_tcp_stream: AcceptedTcpStream,
-        request: Request,
-        message_version: u32,
-    }
+for key in write_request.writes.keys() {
+    shard_ids.insert(routing_rule.routing_id_for_rule(key) % num_shards);
 }
+if shard_ids.len() > 1 { return Err(MultipleShardRoutes); }
 ```
 
-## Graceful Shutdown
+### Watch request routing
 
-```
-SIGINT/SIGTERM received
-         │
-         ▼ (shard 0 only)
-┌─────────────────────────┐
-│  SignalHandler detects  │
-│  signal via atomic flag │
-└───────────┬─────────────┘
-            │
-            ▼
-┌─────────────────────────┐
-│  Set shutdown_requested │
-│  Broadcast to all shards│
-└───────────┬─────────────┘
-            │
-            ▼
-┌─────────────────────────┐
-│  Each shard:            │
-│  • Stop accepting new   │
-│  • Finish active reqs   │
-│  • Close ShardWal       │
-└─────────────────────────┘
-```
+Watch filters must match routing rule. If routing by `OrgId`, `orgs` filter required. Ensures watch request routes to exactly one shard.
 
-## Sidecar Architecture
+### Sidecar bridge
 
-Bridges glommio (io_uring) to tokio for external I/O that can't use direct I/O:
+Tokio runtime for operations incompatible with io_uring (S3, HTTP clients). Two QoS lanes:
 
-### QoS Lanes
+| Lane | Operations | Capacity |
+|------|------------|----------|
+| Control | Leases, membership | Lower capacity, higher priority |
+| Data | Batch uploads/downloads | Higher capacity |
 
-| Lane | Operations | Purpose |
-|------|------------|---------|
-| Control | Leases, membership | Low-latency, high-priority |
-| Data | Batch uploads/downloads | Higher throughput, can queue |
-
-### Channel Bridge
+Flume bounded channels with oneshot response pattern:
 
 ```rust
-// From glommio shard
-let response = sidecar_senders.send_async(
-    SidecarTarget::ControlPlaneLease,
-    store_request,
-).await?;
-
-// Inside sidecar (tokio)
-while let Ok(request) = rx.recv_async().await {
-    tokio::spawn(async move {
-        let response = sidecar_store.process_request(request.store_request).await;
-        let _ = request.response_tx.send(response);
-    });
-}
+let (response_tx, response_rx) = flume::bounded(1);
+tx.send_async(SidecarRequest { response_tx, .. }).await?;
+response_rx.recv_async().await?
 ```
 
-## Configuration
+### Graceful shutdown
 
-### ShardConfig
+Shard 0 polls `SignalHandler` for SIGINT/SIGTERM. On signal:
+1. Set local `shutdown_requested` flag
+2. Broadcast `Shutdown` to all shards via mesh
+3. Each shard stops accepting, finishes active requests, closes WAL
 
-| Field | Purpose |
-|-------|---------|
-| `node_id` | Unique node identifier |
-| `num_shards` | Number of shards (typically = CPU cores) |
-| `data_root` | Base directory for shard data |
-| `listen_address` | TCP bind address (shared across shards) |
-| `routing_rule` | Aggregate-to-shard mapping |
-| `slow_client_timeout` | Max time for client read/write ops |
-| `max_requested_latency` | Max watch latency clients can request |
-| `fsync_delay` | Amortisation window for durability |
-| `non_durable_writes` | Ack before fsync (higher throughput) |
+### Pipelining support
 
-### SidecarConfig
+After processing a request, connection reads next request with timeout. Subsequent requests may route to different shards—redirect check runs again.
 
-| Field | Purpose |
-|-------|---------|
-| `worker_threads` | Tokio thread pool size |
-| `control_lane_capacity` | Bounded queue for control ops |
-| `data_lane_capacity` | Bounded queue for data ops |
+### Nagle disabled
+
+`set_nodelay(true)` on all TCP streams for lower latency.
+
+## Usage
+
+```rust
+use celeriant_runtimes::{run_executors_and_sidecar, ShardConfig, SidecarConfig, RoutingRule};
+
+let shard_config = ShardConfig {
+    node_id: 1,
+    num_shards: 16,
+    data_root: "/data".into(),
+    listen_address: "0.0.0.0:10000".into(),
+    routing_rule: RoutingRule::AggregateId,
+    slow_client_timeout: Duration::from_secs(30),
+    fsync_delay: Duration::from_millis(5),
+    // ... other fields
+};
+
+let sidecar_config = SidecarConfig {
+    worker_threads: 4,
+    control_lane_capacity: 1000,
+    data_lane_capacity: 10000,
+};
+
+run_executors_and_sidecar(
+    shard_config,
+    sidecar_config,
+    1024,  // mesh channel size
+    node_id,
+    my_store,  // impl SidecarStoreTrait
+);
+```
 
 ## Error Handling
 
-### ShardRoutingError
-
-| Error | Cause |
-|-------|-------|
-| `NoRoutingKeyProvided` | Watch request missing required filter |
-| `MultipleShardRoutes` | Write spans multiple shards |
-| `IncompatibleFilters` | Filter doesn't match routing rule |
-
-### Error Response Mapping
-
-| ShardError | HTTP-like Code | Meaning |
-|------------|----------------|---------|
+| Error | Code | Cause |
+|-------|------|-------|
+| `NoRoutingKeyProvided` | 400 | Watch missing required filter for routing rule |
+| `MultipleShardRoutes` | 400 | Write/delete spans multiple shards |
+| `IncompatibleFilters` | 400 | Filter doesn't match routing rule |
 | `AggregateNotExists` | 404 | Aggregate not found |
-| `OptimisticConcurrencyViolation` | 409 | OCC conflict |
+| `OptimisticConcurrencyViolation` | 409 | OCC check failed |
 | `ClientIdempotencyViolation` | 409 | Duplicate client_event_index |
-| `EmptyEventsList` | 400 | Write with no events |
 | `IoError` | 500 | Disk/network failure |
-
-## Entry Point
-
-```rust
-pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(
-    shard_config: ShardConfig,
-    sidecar_config: SidecarConfig,
-    mesh_channel_size: usize,
-    node_id: u128,
-    sidecar_store: S,
-) {
-    // 1. Create full mesh for inter-shard messages
-    let mesh = MeshBuilder::<IntrashardMessages, Full>::full(num_shards, mesh_channel_size);
-    
-    // 2. Start sidecar on tokio runtime
-    let (sidecar_senders, _sidecar_runtime) = new_sidecar(sidecar_config, sidecar_store)?;
-    
-    // 3. Spawn glommio executors, one per shard
-    LocalExecutorPoolBuilder::new(PoolPlacement::MaxSpread(num_shards, CpuSet::online()))
-        .on_all_shards(|| async {
-            // Join mesh, bind TCP, open ShardWal, run shard loop
-        })
-        .join_all();
-}
-```
-
-## Thread Model
-
-| Component | Runtime | Threading |
-|-----------|---------|-----------|
-| Shards | glommio | One executor per CPU core |
-| TCP accept | glommio | `shared_accept()` across all shards |
-| ShardWal | glommio | Single-threaded per shard |
-| Sidecar | tokio | Multi-threaded pool |
-| Channels | flume | MPMC bounded queues |
 
 ## Dependencies
 
-- `celeriant_shard` - ShardWal and error types
-- `celeriant_memcache` - InternalShardConfig
-- `celeriant_sidecar` - Store trait and requests
-- `celeriant_msg` - Request/response types
-- `celeriant_wire` - Wire errors
-- `celeriant_watch` - Watch session types
-- `glommio` - io_uring async runtime
-- `tokio` - Sidecar async runtime
-- `flume` - Cross-runtime channels
-- `signal-hook` - SIGINT/SIGTERM handling
+| Crate | Purpose |
+|-------|---------|
+| `celeriant_shard` | ShardWal, error types |
+| `celeriant_sidecar` | Store trait, requests |
+| `celeriant_msg` | Request/response types |
+| `celeriant_wire` | Wire errors |
+| `celeriant_watch` | Watch session types |
+| `celeriant_wal` | AggregateKey, compression |
+| `glommio` | io_uring async runtime, channel mesh |
+| `tokio` | Sidecar async runtime |
+| `flume` | Cross-runtime bounded channels |
+| `signal-hook` | SIGINT/SIGTERM via atomic flags |

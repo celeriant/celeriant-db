@@ -212,6 +212,30 @@ pub struct ServerConfig {
         help = "Single-level subfolder to isolate cluster data inside the bucket"
     )]
     pub s3_subfolder: Option<String>,
+
+    #[arg(
+        long,
+        requires = "s3_enabled",
+        env = "CELERIANT_S3_ENDPOINT_OVERRIDE",
+        help = "Override the default AWS S3 endpoint URL."
+    )]
+    pub s3_endpoint_override: Option<String>,
+
+    #[arg(
+        long,
+        requires = "s3_enabled",
+        env = "CELERIANT_S3_SKIP_SIGNATURE",
+        help = "Skip AWS Signature Version 4 authentication on requests."
+    )]
+    pub s3_skip_signature: bool,
+
+    #[arg(
+        long,
+        requires = "s3_enabled",
+        env = "CELERIANT_S3_ALLOW_HTTP",
+        help = "Allow data transmitted in plaintext using http instead of https."
+    )]
+    pub s3_allow_http: bool,
 }
 
 impl ServerConfig {
@@ -237,6 +261,9 @@ impl ServerConfig {
                 access_key_id: self.s3_access_key_id.clone(),
                 secret_access_key: self.s3_secret_access_key.clone(),
                 subfolder,
+                endpoint: self.s3_endpoint_override.clone(),
+                skip_signature: self.s3_skip_signature,
+                allow_http: self.s3_allow_http,
             })
         } else {
             None
@@ -372,6 +399,9 @@ impl Default for ServerConfig {
             list_max_duration_ms: 2000,
             list_page_size: 20000,
             list_wal_index_cache_bytes: 12 * 1024 * 1024,
+            s3_endpoint_override: None,
+            s3_skip_signature: false,
+            s3_allow_http: false,
         }
     }
 }

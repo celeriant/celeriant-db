@@ -59,6 +59,8 @@ use crate::in_memory_filtering;
 use crate::internal_shard_config::InternalShardConfig;
 use crate::loading_coordinator::LoadingCoordinator;
 
+const STRUCT_TO_MEMORY_REAL_SIZE: usize = 3;
+
 /// Write-ahead log for a single shard.
 ///
 /// Handles the complete lifecycle of reads and writes:
@@ -1335,7 +1337,7 @@ async fn sync_with_rollback(
                             add_create_event(&mut create_events, event_batch_metadata.aggregate_key.clone());
                         }
 
-                        let size_bytes = ((queue_item.metablock.deep_size_of() + queue_item.datablock.deep_size_of()) * 3) as u64;
+                        let size_bytes = ((queue_item.metablock.deep_size_of() + queue_item.datablock.deep_size_of()) * STRUCT_TO_MEMORY_REAL_SIZE) as u64;
 
                         // Cache the write (only happens after durable write confirmed)
                         shard_mem_cache.cache_recent_write(

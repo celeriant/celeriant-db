@@ -2,8 +2,6 @@
 
 Serialization, compression, and wire protocol framing for Celeriant. Handles encoding/decoding for both network messages and WAL persistence.
 
-**README WAS LLM GENERATED AND HUMAN REVIEWED 2025-12-20**
-
 ## Architecture
 
 ```
@@ -16,7 +14,7 @@ Wire Frame (network messages)
 
 Versioned Block (WAL persistence)
 ┌──────────┬─────────┬───────────────────────────┐
-│ CRC (4B) │ Ver(4B) │  bincode payload + zero   │
+│ CRC (4B) │ Ver(4B) │  bincode payload + zeros  │
 └──────────┴─────────┴───────────────────────────┘
 ```
 
@@ -91,18 +89,6 @@ CRC covers version + payload. Verified before deserialization to detect corrupti
 ### Why return uncompressed_size?
 
 Variable serialization returns `(uncompressed_size, compressed_bytes)`. The uncompressed size is required for decompression (zstd/brotli need allocation hint) and stored in wire headers for validation.
-
-## Performance Summary
-
-From benchmarks (bincode, 100 events × 1KB):
-
-| Compression | Roundtrip | Throughput |
-|-------------|-----------|------------|
-| none | 12µs | 8 GB/s |
-| zstd_3 | 27µs | 3.5 GB/s |
-| snappy | 21µs | 4.6 GB/s |
-
-msgpack is ~7x slower than bincode uncompressed; gap narrows with compression.
 
 ## Dependencies
 

@@ -1,90 +1,80 @@
 # celeriant_memcache
 
-In-memory state management for Celeriant shards. Tracks write positions, pending queues, and recent write caches. No I/O—just state coordination for the durability layer.
-
-**README WAS LLM GENERATED AND HUMAN REVIEWED 2025-12-21**
-
-## Purpose
-
-Manages the gap between "client sent write" and "write durably on disk". Provides:
-
-1. **Position tracking** - Where to write next, what's committed
-2. **Idempotency** - Client deduplication before hitting disk
-3. **Recent write cache** - Serve reads from memory when possible
-4. **Atomic commit/rollback** - Snapshot state before disk write, restore on failure
+In-memory caching layer for the Celeriant WAL. Manages recent writes, aggregate positions, client idempotency tracking, and pending write queues.
 
 ## Architecture
 
 ```
-Client Write
-    │
-    ▼
-┌─────────────────────────────────────────────────────┐
-│  ShardMemCache                                      │
-│  ┌───────────────────┐  ┌────────────────────────┐  │
-│  │ Queue Positions   │  │ Pending Append Queue   │  │
-│  │ (uncommitted)     │  │ (waiting for disk)     │  │
-│  └─────────┬─────────┘  └───────────┬────────────┘  │
-│            │                        │               │
-│            ▼ take_sync_snapshot()   ▼               │
-│  ┌─────────────────────────────────────────────┐    │
-│  │         SyncPositionsSnapshot               │    │
-│  │         (frozen state for disk write)       │    │
-│  └─────────────────────────────────────────────┘    │
-│            │                                        │
-│            ├── success ──► commit_sync_snapshot()   │
-│            │                      │                 │
-│            │                      ▼                 │
-│            │              ┌───────────────────┐     │
-│            │              │ File Positions    │     │
-│            │              │ (committed)       │     │
-│            │              └───────────────────┘     │
-│            │                      │                 │
-│            │                      ▼                 │
-│            │              ┌───────────────────┐     │
-│            │              │ Recent Write Cache│     │
-│            │              │ (LRU eviction)    │     │
-│            │              └───────────────────┘     │
-│            │                                        │
-│            └── failure ──► rollback_queue_positions │
-└─────────────────────────────────────────────────────┘
+Write Path:
+┌─────────────────────┐     ┌──────────────────────┐     ┌─────────────┐
+│ add_to_pending_     │────>│ take_sync_positions_ │────>│   fsync     │
+│ append_queue        │     │ snapshot             │     │   (disk)    │
+└─────────────────────┘     └──────────────────────┘     └──────┬──────┘
+                                                                │
+┌─────────────────────┐     ┌──────────────────────┐            │
+│ cache_recent_write  │<────│ commit_sync_         │<───────────┘
+│ (hot data)          │     │ positions_snapshot   │
+└─────────────────────┘     └──────────────────────┘
+
+Read Path:
+┌───────────────────────┐
+│ aggregate_load_status │─── Check queue, then LRU cache
+└───────────────────────┘
+           │
+           ▼
+┌───────────────────────┐
+│ get_cached_writes_from│─── Recent writes (size-bounded)
+└───────────────────────┘
+           │
+           ▼
+┌───────────────────────┐
+│ get_event_indexes     │─── Queue positions or LRU snapshot
+└───────────────────────┘
 ```
 
 ## Key Types
 
 | Type | Purpose |
 |------|---------|
-| `ShardMemCache` | Main coordinator for shard memory state |
-| `AggregatePositions` | Tracks event_index, event_batch_index, client indexes per aggregate |
-| `SyncPositionsSnapshot` | Frozen state taken before disk write begins |
-| `ShardLogQueueItem` | Single write waiting in pending queue |
-| `RecentWrite` | Cached metablock + datablock after durable write |
-| `InternalShardConfig` | Shard configuration (cache size, fsync delay, etc.) |
+| `ShardMemCache` | Main cache coordinating all sub-caches |
+| `AggregateRecentWrites` | VecDeque of recent writes for one aggregate |
+| `MemSnapshotAggregate` | Cached aggregate position, status, and metadata |
+| `QueueAggregatePositions` | In-flight write positions before disk commit |
+| `RecentWrite` | Cached metablock + datablock + size |
+| `ShardLogQueueItem` | Pending write awaiting fsync |
+| `SyncPositionsSnapshot` | Atomic snapshot for two-phase commit |
+| `MetablockPosition` | Log file position for an aggregate |
+| `AggregateStatus` | Found / NotFound / Deleted |
 
-## Two-Position Design
+## Key Functions
 
-Each aggregate has two position stores:
+| Function | Purpose |
+|----------|---------|
+| `ShardMemCache::new` | Create cache with size limits |
+| `add_to_pending_append_queue` | Queue write, update in-memory indexes |
+| `add_pending_delete_to_queue` | Queue soft delete |
+| `add_pending_trim_to_queue` | Queue trim operation |
+| `take_sync_positions_snapshot` | Clone queue state for fsync |
+| `commit_sync_positions_snapshot` | Merge synced positions into LRU |
+| `rollback_queue_positions` | Clear queue on fsync failure |
+| `cache_recent_write` | Add to hot cache after durable write |
+| `get_cached_writes_from` | Iterate cached writes from batch index |
+| `aggregate_load_status` | Check if aggregate is in memory |
+| `get_event_indexes` | Get latest indexes (queue → LRU) |
+| `get_client_event_index` | Get client's last event index |
 
-| Store | Updated When | Purpose |
-|-------|--------------|---------|
-| `aggregate_queue_positions` | On `add_to_pending_append_queue()` | Idempotency checks before disk write |
-| `aggregate_file_positions` | On `commit_sync_snapshot()` | Confirmed durable state |
-
-Lookups check queue first, fall back to file. This allows immediate idempotency rejection without waiting for disk.
+## Usage
 
 ```rust
-// Idempotency check flow
-fn get_client_event_index(&self, aggregate_key, client_id) -> Option<u64> {
-    self.aggregate_queue_positions.get(...)  // Check pending first
-        .or_else(|| self.aggregate_file_positions.get(...))  // Fall back to committed
-}
-```
+// Initialize cache with size limits
+let cache = ShardMemCache::new(
+    64 * 1024 * 1024,  // 64MB recent write cache
+    16 * 1024 * 1024,  // 16MB aggregate snapshots
+    8 * 1024 * 1024,   // 8MB client snapshots  
+    1024 * 1024,       // 1MB WAL index cache
+);
 
-## Write Flow
-
-### 1. Add to Queue
-
-```rust
+// Write path: queue → snapshot → fsync → commit
 cache.add_to_pending_append_queue(
     &aggregate_key,
     event_index,
@@ -93,105 +83,115 @@ cache.add_to_pending_append_queue(
     client_event_index,
     queue_item,
 );
-```
 
-Updates `aggregate_queue_positions` immediately for idempotency. Appends to `pending_append_queue`.
-
-### 2. Take Snapshot
-
-```rust
 let snapshot = cache.take_sync_positions_snapshot();
-// Queue is now empty, positions moved to snapshot
-// New writes can arrive while disk I/O happens
-```
-
-### 3. Commit or Rollback
-
-```rust
-// Success: merge snapshot into file positions
+// ... fsync to disk ...
 cache.commit_sync_positions_snapshot(snapshot);
 
-// Failure: discard queue positions, set fsync failure flag
-cache.rollback_queue_positions();
-```
+// Cache hot data after durable write
+cache.cache_recent_write(aggregate_key, batch_index, metablock, datablock, size);
 
-## Recent Write Cache
-
-LRU-style cache for serving reads from memory:
-
-```rust
-// After durable write
-cache.cache_recent_write(
-    aggregate_key,
-    batch_index,
-    metablock,
-    datablock,
-    size_bytes,
-);
-
-// On read
-if let Some(writes) = cache.get_cached_writes_from(&key, from_batch_index) {
-    // Serve from memory, skip disk
+// Read path: check cache before disk
+let (is_loaded, status) = cache.aggregate_load_status(&key);
+if is_loaded && status == AggregateStatus::Found {
+    for (batch_idx, write) in cache.get_cached_writes_from(&key, from_batch) {
+        // Use cached data
+    }
 }
 ```
 
-**Eviction**: Size-based. When `cache_current_bytes + new_size > max_bytes`, oldest entries evicted via `cache_eviction_queue`.
+## Design Decisions
 
-**Configuration**: Set via `InternalShardConfig::recent_write_cache_bytes`. Zero disables caching.
-
-## Position Tracking
-
-Shard log file has metablocks growing forward, datablocks growing backward:
-
-```
-┌──────────────────────────────────────────────┐
-│ [metablocks →]  [free space]  [← datablocks] │
-│        ↑                            ↑        │
-│  metablocks_position      datablocks_position│
-└──────────────────────────────────────────────┘
-```
-
-When the file is full, a new log is created and the old one is rotated.
+### Two-phase commit with queue visibility
 
 ```rust
-// Check if pending writes will fit
-cache.has_enough_free_space()  // datablocks_position - metablocks_position > required
-
-// After log rotation
-cache.rotate_to_next_log(new_log_id, meta_pos, data_pos, file_len);
+// Queue positions cloned, not moved - new writes can continue
+let snapshot = cache.take_sync_positions_snapshot();
+// Pending queue cleared, ready for next batch
 ```
 
-## Fsync Failure Handling
+During fsync, the queue snapshot is cloned so new writes see correct indexes. The pending queue is cleared immediately, allowing new writes to accumulate for the next sync.
 
-If fsync fails:
-
-1. `had_fsync_failure` flag set
-2. `aggregate_queue_positions` cleared (fall back to file positions)
-3. In durable mode, clients are notified of the failure
-3. Next write checks `force_durable_on_next_write()` to notify clients not using durable mode
+### Size-bounded recent write cache
 
 ```rust
-if cache.force_durable_on_next_write() {
-    // Force sync even in async mode, client needs to know about failure
+pub struct ShardMemCache {
+    recent_write_cache_bytes: u64,      // Max size
+    cache_current_bytes: u64,           // Current size
+    cache_eviction_queue: VecDeque<_>,  // FIFO eviction order
 }
 ```
 
-## InternalShardConfig Fields
+Recent writes are evicted FIFO when size limit exceeded. Each entry tracks its byte size for accurate accounting. Eviction happens before insertion to ensure space.
 
-| Field | Purpose |
-|-------|---------|
-| `node_id` | Unique identifier for this node |
-| `max_open_files` | File descriptor limit |
-| `shard_log_preallocate_bytes` | Preallocate log file size |
-| `fsync_delay` | Amortised fsync batch time (typically 5-10ms) |
-| `recent_write_cache_bytes` | Max cache size (0 = disabled) |
-| `non_durable_writes` | Ack back to clients after in-memory queuing, dont wait for fsync |
-| `shard_dir` | Directory for shard log files |
+### LRU with priority insertion
 
-## Thread Safety
+```rust
+fn put_with_priority<K, V>(cache: &mut LruCache<K, V>, key: K, value: V, low_priority: bool)
+```
 
-`ShardMemCache` is **not thread-safe**. Designed for single-threaded access per shard in a thread-per-core architecture. Each CPU core owns its shards exclusively.
+Low-priority inserts (eager caching during scans) only happen when there's spare capacity and immediately demote to LRU position. Prevents scan pollution of the cache.
+
+### Queue vs snapshot separation
+
+| Layer | Mutability | Purpose |
+|-------|------------|---------|
+| `aggregate_queue_positions` | Unbounded HashMap | In-flight writes, always latest |
+| `aggregate_snapshots` | Bounded LRU | Committed positions from disk |
+
+Queue is checked first for reads—it has the most recent uncommitted state. After fsync, positions move to LRU.
+
+### Rollback on failure
+
+```rust
+pub fn rollback_queue_positions(&mut self) {
+    self.aggregate_queue_positions.clear();
+}
+```
+
+On fsync failure, queue is cleared. Next reads will reload from disk. Prevents serving uncommitted data.
+
+### Client idempotency tracking
+
+```rust
+// 0 is sentinel for "checked disk, client never wrote"
+if client_event_index == 0 { None } else { Some(client_event_index) }
+```
+
+Client event indexes cached with sentinel value to distinguish "never wrote" from "not in cache". Enables idempotency checks without repeated disk scans.
+
+### Aggregate status enum
+
+```rust
+pub enum AggregateStatus {
+    Found,      // Exists with data
+    NotFound,   // Never created
+    Deleted,    // Soft deleted (may allow recreate)
+}
+```
+
+Explicit status prevents conflating "not in cache" with "doesn't exist". Deleted aggregates track `allow_recreate` and `allow_index_continuation` flags.
+
+### Contiguous batch index optimization
+
+```rust
+pub struct AggregateRecentWrites {
+    pub first_batch_index: u64,
+    pub writes: VecDeque<RecentWrite>,
+}
+```
+
+Batch indexes are monotonic with no gaps. VecDeque with tracked starting index enables O(1) lookup by batch index instead of HashMap overhead.
+
+### WAL index position cache
+
+```rust
+wal_index_positions: LruCache<u64, WalIndexPosition>
+```
+
+Caches WAL index → file position mappings for list pagination. `find_nearest_wal_index_position` finds closest cached position to avoid full scans.
 
 ## Dependencies
 
-- `celeriant_wal` - Types for metablocks, datablocks, aggregate keys
+- `celeriant_wal` - WAL data structures (Metablock, Datablock, keys)
+- `lru` - LRU cache implementation
