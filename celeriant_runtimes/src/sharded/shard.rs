@@ -26,7 +26,8 @@ use crate::{
 
 pub struct Shard {
     intrashard_receivers: Receivers<IntrashardMessages>,
-    tcp_listener: Rc<TcpListener>,
+    client_tcp_listener: Rc<TcpListener>,
+    replication_tcp_listener: Rc<TcpListener>,
     shard_data: ShardData,
 }
 
@@ -37,7 +38,8 @@ impl Shard {
         sender: Senders<IntrashardMessages>,
         receivers: Receivers<IntrashardMessages>,
         sidecar_senders: SidecarSenders,
-        tcp_listener: TcpListener,
+        client_tcp_listener: TcpListener,
+        replication_tcp_listener: TcpListener,
         shard_wal: ShardWal,
     ) -> Self {
         info!("Initializing shard {current_shard_id}");
@@ -53,7 +55,8 @@ impl Shard {
 
         Self {
             intrashard_receivers: receivers,
-            tcp_listener: Rc::new(tcp_listener),
+            client_tcp_listener: Rc::new(client_tcp_listener),
+            replication_tcp_listener: Rc::new(replication_tcp_listener),
             shard_data,
         }
     }
@@ -75,24 +78,43 @@ impl Shard {
     }
 
     async fn enter_main_loop_until_shutdown(&self) {
+        // Spawn client port handler
+        let client_listener = self.client_tcp_listener.clone();
+        let client_shard_data = self.shard_data.clone();
+        glommio::spawn_local(async move {
+            loop {
+                if client_shard_data.shutdown_requested.get() {
+                    break;
+                }
+                match glommio::timer::timeout(Duration::from_secs(1), client_listener.shared_accept()).await {
+                    Ok(stream) => handle_new_client_connection(stream.bind_to_executor(), client_shard_data.clone()),
+                    Err(_) => {}
+                }
+            }
+        }).detach();
+
+        // Spawn replication port handler
+        let repl_listener = self.replication_tcp_listener.clone();
+        let repl_shard_data = self.shard_data.clone();
+        glommio::spawn_local(async move {
+            loop {
+                if repl_shard_data.shutdown_requested.get() {
+                    break;
+                }
+                match glommio::timer::timeout(Duration::from_secs(1), repl_listener.shared_accept()).await {
+                    Ok(stream) => handle_new_replication_connection(stream.bind_to_executor(), repl_shard_data.clone()),
+                    Err(_) => {}
+                }
+            }
+        }).detach();
+
+        // Wait for shutdown
         loop {
             if self.shard_data.shutdown_requested.get() {
                 let _ = self.shard_data.shard_wal.close().await;
                 break;
             }
-
-            // Don't hang the main loop forever otherwise we won't be able to shutdown gracefully
-            match glommio::timer::timeout(Duration::from_secs(1), self.tcp_listener.shared_accept())
-                .await
-            {
-                Ok(accepted_tcp_stream) => {
-                    handle_new_client_connection(
-                        accepted_tcp_stream.bind_to_executor(),
-                        self.shard_data.clone(),
-                    );
-                }
-                Err(_) => {}
-            }
+            glommio::timer::sleep(Duration::from_secs(1)).await;
         }
     }
 }
@@ -808,7 +830,7 @@ async fn handle_request_and_further_pipelining(
 }
 
 fn handle_new_client_connection(mut tcp_stream: TcpStream, shard_data: ShardData) {
-    
+
     // Disable Nagle's algorithm if possible
     let _ = tcp_stream.set_nodelay(true);
 
@@ -840,6 +862,18 @@ fn handle_new_client_connection(mut tcp_stream: TcpStream, shard_data: ShardData
 
         handle_request_and_further_pipelining(tcp_stream, request, message_version, shard_data)
             .await;
+    })
+    .detach();
+}
+
+fn handle_new_replication_connection(tcp_stream: TcpStream, _shard_data: ShardData) {
+    // Disable Nagle's algorithm if possible
+    let _ = tcp_stream.set_nodelay(true);
+
+    glommio::spawn_local(async move {
+        // Replication operations not yet implemented
+        // Future: read replication request, process, respond
+        drop(tcp_stream);
     })
     .detach();
 }

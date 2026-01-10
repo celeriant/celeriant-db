@@ -34,8 +34,13 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
             let (sender, receivers) = mesh.join().await
                 .expect("Failed to join mesh - cannot initialize shard");
             
-            let tcp_listener = TcpListener::bind(&shard_config.listen_address)
-                .expect(&format!("Failed to bind TCP listener to {} - cannot initialize shard", shard_config.listen_address));
+            let client_bind_address = format!("{}:{}", shard_config.listen_address, shard_config.client_port);
+            let client_tcp_listener = TcpListener::bind(&client_bind_address)
+                .expect(&format!("Failed to bind client TCP listener to {} - cannot initialize shard", client_bind_address));
+
+            let replication_bind_address = format!("{}:{}", shard_config.listen_address, shard_config.replication_port);
+            let replication_tcp_listener = TcpListener::bind(&replication_bind_address)
+                .expect(&format!("Failed to bind replication TCP listener to {} - cannot initialize shard", replication_bind_address));
             
             let current_shard_id = sender.peer_id();
 
@@ -60,7 +65,7 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
             let filesystem = ShardWal::open(internal_shard_config).await
                 .expect(&format!("Failed to initialize filesystem at {:?} - cannot initialize shard", shard_config.data_root));
 
-            Shard::new(shard_config, current_shard_id, sender, receivers, sidecar_senders, tcp_listener, filesystem).run().await;
+            Shard::new(shard_config, current_shard_id, sender, receivers, sidecar_senders, client_tcp_listener, replication_tcp_listener, filesystem).run().await;
 
         }))
         .unwrap()

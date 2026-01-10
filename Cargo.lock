@@ -402,6 +402,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "celeriant_distributed"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+]
+
+[[package]]
 name = "celeriant_memcache"
 version = "0.1.0"
 dependencies = [

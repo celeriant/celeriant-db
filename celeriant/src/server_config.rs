@@ -45,11 +45,27 @@ pub struct ServerConfig {
 
     #[arg(
         long,
-        default_value = "0.0.0.0:10000",
+        default_value = "0.0.0.0",
         env = "CELERIANT_LISTEN_ADDRESS",
         help = "Server listen address"
     )]
     pub listen_address: String,
+
+    #[arg(
+        long,
+        default_value_t = 10000,
+        env = "CELERIANT_CLIENT_PORT",
+        help = "Port for client connections"
+    )]
+    pub client_port: u16,
+
+    #[arg(
+        long,
+        default_value_t = 10001,
+        env = "CELERIANT_REPLICATION_PORT",
+        help = "Port for leader-to-follower replication"
+    )]
+    pub replication_port: u16,
 
     #[arg(
         long,
@@ -278,6 +294,8 @@ impl ServerConfig {
             num_shards,
             data_root: self.data_root.clone(),
             listen_address: self.listen_address.clone(),
+            client_port: self.client_port,
+            replication_port: self.replication_port,
             max_open_files: self.max_open_files,
             read_max_chunk_size: self.read_max_chunk_size,
             write_max_chunk_size: self.write_max_chunk_size,
@@ -326,6 +344,8 @@ impl ServerConfig {
 
         check_field!(data_root);
         check_field!(listen_address);
+        check_field!(client_port);
+        check_field!(replication_port);
         check_field!(mesh_channel_size);
         check_field!(num_shards);
         check_field!(max_open_files);
@@ -370,7 +390,9 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             data_root: PathBuf::from("data"),
-            listen_address: "0.0.0.0:10000".to_string(),
+            listen_address: "0.0.0.0".to_string(),
+            client_port: 10000,
+            replication_port: 10001,
             mesh_channel_size: 1024,
             num_shards: None,
             read_max_chunk_size: 32 * 1024,

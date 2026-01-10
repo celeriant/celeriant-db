@@ -12,6 +12,8 @@ pub struct ShardConfig {
     pub num_shards: u32,
     pub data_root: PathBuf,
     pub listen_address: String,
+    pub client_port: u16,
+    pub replication_port: u16,
     pub max_open_files: u64,
     pub read_max_chunk_size: u64,
     pub write_max_chunk_size: u64,

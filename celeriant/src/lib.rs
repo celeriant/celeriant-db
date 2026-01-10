@@ -42,7 +42,7 @@ pub fn startup(args: Vec<String>) -> Result<(), std::io::Error> {
         }
     };
 
-    info!("node_id={}, data_root={:?}, listen_address={}", node_id, server_config.data_root, server_config.listen_address);
+    info!("node_id={}, data_root={:?}, listen_address={}, client_port={}, replication_port={}", node_id, server_config.data_root, server_config.listen_address, server_config.client_port, server_config.replication_port);
     
     let nbr_shards = server_config.num_shards.unwrap_or_else(num_cpus::get) as u32;
     let shard_config = server_config.to_shard_config(node_id, nbr_shards);
