@@ -8,3 +8,4 @@ license.workspace = true
 [dependencies]
 celeriant_wal = { path = "../celeriant_wal" }
 lru.workspace = true
+deepsize.workspace = true

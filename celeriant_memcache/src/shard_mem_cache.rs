@@ -294,6 +294,10 @@ impl ShardMemCache {
         }
     }
 
+    pub fn buffer_size_total(&self) -> u64 {
+        self.buffer_size_datablocks().saturating_add(self.buffer_size_metablocks())
+    }
+
     pub fn buffer_size_datablocks(&self) -> u64 {
         self.pending_append_queue
             .iter()
