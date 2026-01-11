@@ -1,5 +1,5 @@
 use celeriant_msg::request::read_filters::ReadFilters;
-use celeriant_wal::{constants::{BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED}, datablocks::datablock_aggregate_event_batch::DatablockAggregateEventBatch, metablocks::{datablock_storage_kind::DatablockStorageKind, metablock::Metablock, metablock_event_batch::EventTypesKind, metablock_kind::MetablockKind}};
+use celeriant_wal::{constants::{BLOOM_BYTES, BLOOM_HASH_COUNT, BLOOM_HASH_SEED}, datablocks::datablock_aggregate_event_batch::DatablockAggregateEventBatch, metablocks::{metablock::Metablock, metablock_event_batch::EventTypesKind, metablock_kind::MetablockKind}};
 use fastbloom::BloomFilter;
 
 pub fn apply_event_filters(event_batch: &mut DatablockAggregateEventBatch, read_filters: &ReadFilters) {
@@ -254,7 +254,7 @@ pub fn trim_end_if_exceeds_max_bytes(
 
 #[cfg(test)]
 mod tests {
-    use celeriant_wal::{aggregate_key::AggregateKey, datablocks::datablock_aggregate_event::DatablockAggregateEvent, metablocks::{datablock_block_ref::DatablockBlockRef, metablock::Metablock, metablock_event_batch::MetablockEventBatch}};
+    use celeriant_wal::{aggregate_key::AggregateKey, datablocks::datablock_aggregate_event::DatablockAggregateEvent, metablocks::{datablock_block_ref::DatablockBlockRef, datablock_storage_kind::DatablockStorageKind, metablock::Metablock, metablock_event_batch::MetablockEventBatch}};
 
     use super::*;
 

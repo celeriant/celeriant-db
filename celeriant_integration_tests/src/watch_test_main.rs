@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use celeriant_client_demo::TestServer;
+use celeriant_integration_tests::TestServer;
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_msg::{
     process_requests::Request,

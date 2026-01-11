@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use celeriant_client_demo::TestServer;
+use celeriant_integration_tests::TestServer;
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::list_operations::{
     ListAggregateTypesIterator, ListAggregatesIterator, ListOptions, ListOrgsIterator,
@@ -151,7 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // === List Operations ===
     println!("\n=== Listing Organizations ===");
     let options = ListOptions::default();
-    let mut orgs_iter = ListOrgsIterator::new(&mut client, options);
+    let orgs_iter = ListOrgsIterator::new(&mut client, options);
     let orgs = orgs_iter.collect().await?;
     println!("Found {} organizations:", orgs.len());
     for org in &orgs {
@@ -166,7 +166,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\n=== Listing Aggregate Types ===");
     let options = ListOptions::default();
-    let mut types_iter = ListAggregateTypesIterator::new(&mut client, Some(1), options);
+    let types_iter = ListAggregateTypesIterator::new(&mut client, Some(1), options);
     let agg_types = types_iter.collect().await?;
     println!("Found {} aggregate types for org 1:", agg_types.len());
     for agg_type in &agg_types {
@@ -188,7 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\n=== Listing Aggregates (before delete) ===");
     let options = ListOptions::default();
-    let mut aggs_iter = ListAggregatesIterator::new(&mut client, Some(1), None, options);
+    let aggs_iter = ListAggregatesIterator::new(&mut client, Some(1), None, options);
     let aggregates = aggs_iter.collect().await?;
     println!("Found {} aggregates for org 1:", aggregates.len());
     for agg in &aggregates {
@@ -240,7 +240,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // === List Aggregates again to verify delete ===
     println!("\n=== Listing Aggregates (after delete, excluding deleted) ===");
     let options = ListOptions::default();
-    let mut aggs_iter = ListAggregatesIterator::new(&mut client, Some(1), None, options);
+    let aggs_iter = ListAggregatesIterator::new(&mut client, Some(1), None, options);
     let aggregates = aggs_iter.collect().await?;
     println!("Found {} non-deleted aggregates for org 1:", aggregates.len());
     for agg in &aggregates {
@@ -267,7 +267,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         include_deleted: true,
         ..Default::default()
     };
-    let mut aggs_iter = ListAggregatesIterator::new(&mut client, Some(1), None, options);
+    let aggs_iter = ListAggregatesIterator::new(&mut client, Some(1), None, options);
     let aggregates = aggs_iter.collect().await?;
     println!(
         "Found {} total aggregates for org 1 (including deleted):",

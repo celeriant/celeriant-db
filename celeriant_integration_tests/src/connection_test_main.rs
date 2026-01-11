@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use celeriant_client_demo::{ServerConfig, TestServer};
+use celeriant_integration_tests::{ServerConfig, TestServer};
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_msg::{
     process_requests::Request,

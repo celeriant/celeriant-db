@@ -2,6 +2,11 @@
 //!
 //! Coordinates validation, building, caching, and durability for a single shard.
 
+#[path = "shard_wal_sync.rs"]
+mod sync;
+
+use self::sync::sync_with_rollback;
+
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroUsize;
@@ -13,14 +18,12 @@ use celeriant_memcache::mem_snapshot_aggregate::{AggregateStatus, MemSnapshotAgg
 use celeriant_memcache::metablock_position::MetablockPosition;
 use celeriant_memcache::shard_log_queue_item::ShardLogQueueItem;
 use celeriant_memcache::shard_mem_cache::ShardMemCache;
-use celeriant_memcache::sync_positions_snapshot::SyncPositionsSnapshot;
 use celeriant_msg::process_requests::Request;
 use celeriant_msg::process_responses::Response;
 use celeriant_msg::request::read_filters::ReadFilters;
 use celeriant_msg::request::requests::{DeleteRequest, ExistsRequest, ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest, ReadRequest, SingleAggregateWrite, TrimStartRequest, WriteRequest};
 use celeriant_msg::response::aggregate_event_batch::AggregateEventBatch;
 use celeriant_msg::response::responses::{AggregateListItem, AggregateTypeListItem, ExistsResponse, ListAggregateTypesResponse, ListAggregatesResponse, ListOrgsResponse, OrgListItem, ReadResponse, SuccessResponse};
-use celeriant_rotating_log::log_segment_file::LogSegmentFile;
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
 use celeriant_rotating_log::reverse_metablock_scanner::ReverseMetablockScanner;
 use celeriant_rotating_log::rotating_log_error::RotatingLogError;
@@ -28,7 +31,7 @@ use celeriant_rotating_log::rwlock_timeout::write_with_timeout;
 use celeriant_wal::aggregate_client_key::AggregateClientKey;
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::aggregate_type_key::AggregateTypeKey;
-use celeriant_wal::constants::{FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_METABLOCK};
+use celeriant_wal::constants::{FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES};
 use celeriant_wal::datablocks::datablock::Datablock;
 use celeriant_wal::datablocks::datablock_aggregate_event_batch::DatablockAggregateEventBatch;
 use celeriant_wal::datablocks::datablock_kind::DatablockKind;
@@ -39,12 +42,9 @@ use celeriant_wal::metablocks::metablock_kind::MetablockKind;
 use celeriant_wal::metablocks::metablock_soft_delete::MetablockSoftDelete;
 use celeriant_wal::metablocks::metablock_soft_trim::MetablockSoftTrim;
 use celeriant_watch::aggregate_reader::AggregateReader;
-use celeriant_watch::aggregate_watch_event::{AggregateWatchEvent, AggregateWatchEventOperation};
 use celeriant_watch::aggregate_watchers::AggregateWatchers;
 use celeriant_wire::datablock_serialization::{deserialize_datablock, serialize_datablock};
 use celeriant_wire::metablock_bytes;
-use celeriant_wire::version_aware_wire_format::serialize_versioned_message;
-use deepsize::DeepSizeOf;
 use lru::LruCache;
 
 use crate::amortisation::coordinator::Coordinator;
@@ -58,8 +58,6 @@ use crate::error::shard_write_error::ShardWriteError;
 use crate::in_memory_filtering;
 use crate::internal_shard_config::InternalShardConfig;
 use crate::loading_coordinator::LoadingCoordinator;
-
-const STRUCT_TO_MEMORY_REAL_SIZE: usize = 3;
 
 /// Write-ahead log for a single shard.
 ///
@@ -1259,287 +1257,6 @@ impl ShardWal {
             Ok(())
         }
     }
-}
-
-/// Extends the write batch index bounds in an AggregateWatchEventOperation when writing mulitple batches for the same aggregate.
-fn add_write_event(write_events: &mut HashMap<AggregateKey, AggregateWatchEventOperation>, metablock_event_batch: &MetablockEventBatch) {
-    write_events
-        .entry(metablock_event_batch.aggregate_key.clone())
-        .and_modify(|event| {
-            if let AggregateWatchEventOperation::Write {
-                from_event_batch_index,
-                to_event_batch_index,
-            } = event
-            {
-                if metablock_event_batch.event_batch_index < *from_event_batch_index {
-                    *from_event_batch_index = metablock_event_batch.event_batch_index;
-                }
-                if metablock_event_batch.event_batch_index > *to_event_batch_index {
-                    *to_event_batch_index = metablock_event_batch.event_batch_index;
-                }
-            }
-        })
-        .or_insert(AggregateWatchEventOperation::Write {
-            from_event_batch_index: metablock_event_batch.event_batch_index,
-            to_event_batch_index: metablock_event_batch.event_batch_index,
-        });
-}
-
-/// Records a create event for an aggregate.
-fn add_create_event(create_events: &mut HashMap<AggregateKey, AggregateWatchEventOperation>, aggregate_key: AggregateKey) {
-    create_events.entry(aggregate_key).or_insert(AggregateWatchEventOperation::Create {});
-}
-
-async fn sync_with_rollback(
-    log_segments_cache: Rc<LogSegmentsCache>,
-    shard_mem_cache: Rc<RefCell<ShardMemCache>>,
-    watched_aggregates: Rc<AggregateWatchers>,
-) -> Result<(), ShardFsyncError> {
-    let (required_disk_space, mut sync_positions_snapshot) = {
-        let mut shard_mem_cache = shard_mem_cache.borrow_mut();
-
-        if shard_mem_cache.pending_append_queue_is_empty() {
-            return Ok(());
-        }
-
-        let required_disk_space = shard_mem_cache
-            .buffer_size_datablocks()
-            .saturating_add(shard_mem_cache.buffer_size_metablocks());
-        let sync_positions_snapshot = shard_mem_cache.take_sync_positions_snapshot();
-
-        (required_disk_space, sync_positions_snapshot)
-    };
-
-    //TODO: Under rare scenarios (eg. embedded and small log size) this is not enough
-    //It should really be partitioning the pending queue into chunks < log size and looping
-    log_segments_cache.rotate_to_next_log(required_disk_space).await?;
-    let active_log_segment = log_segments_cache.active();
-
-    match sync(active_log_segment, &mut sync_positions_snapshot).await {
-        Ok(_) => {
-            let mut shard_mem_cache = shard_mem_cache.borrow_mut();
-
-            // Commit moves the carry over bytes back into memcache, so take queue first
-            let pending_append_queue = std::mem::take(&mut sync_positions_snapshot.pending_append_queue);
-            shard_mem_cache.commit_sync_positions_snapshot(sync_positions_snapshot);
-
-            // Transform the queue into recent writes and broadcast events
-            let mut write_events: HashMap<AggregateKey, AggregateWatchEventOperation> = HashMap::new();
-            let mut create_events: HashMap<AggregateKey, AggregateWatchEventOperation> = HashMap::new();
-            let mut delete_events: HashMap<AggregateKey, AggregateWatchEventOperation> = HashMap::new();
-            let mut trim_events: HashMap<AggregateKey, AggregateWatchEventOperation> = HashMap::new();
-
-            for queue_item in pending_append_queue {
-                match &queue_item.metablock.wal_metablock_type {
-                    MetablockKind::EventBatchMetadata(event_batch_metadata) => {
-                        // Build watched_aggregates events
-                        add_write_event(&mut write_events, event_batch_metadata);
-
-                        // If first event batch for aggregate, add create event
-                        if event_batch_metadata.event_batch_index == FIRST_EVENT_BATCH_INDEX {
-                            add_create_event(&mut create_events, event_batch_metadata.aggregate_key.clone());
-                        }
-
-                        let size_bytes = ((queue_item.metablock.deep_size_of() + queue_item.datablock.deep_size_of()) * STRUCT_TO_MEMORY_REAL_SIZE) as u64;
-
-                        // Cache the write (only happens after durable write confirmed)
-                        shard_mem_cache.cache_recent_write(
-                            event_batch_metadata.aggregate_key.clone(),
-                            event_batch_metadata.event_batch_index,
-                            queue_item.metablock,
-                            queue_item.datablock,
-                            size_bytes,
-                        );
-                    }
-                    MetablockKind::SoftTrim(soft_trim) => {
-                        // Update aggregate min_event_batch_index in cache
-                        shard_mem_cache.update_aggregate_min_event_batch_index(
-                            &soft_trim.aggregate_key,
-                            soft_trim.keep_from_event_batch_index,
-                        );
-                        
-                        // Track trim event for watchers
-                        trim_events.entry(soft_trim.aggregate_key.clone())
-                            .or_insert(AggregateWatchEventOperation::TrimStart {
-                                keep_from_event_batch_index: soft_trim.keep_from_event_batch_index,
-                            });
-                    }
-                    MetablockKind::SoftDelete(soft_delete) => {
-                        // Mark aggregate as deleted in cache
-                        shard_mem_cache.put_aggregate_into_cache_as_deleted(
-                            soft_delete.aggregate_key.clone(),
-                            soft_delete.event_index,
-                            soft_delete.event_batch_index,
-                            soft_delete.allow_recreate,
-                            soft_delete.allow_index_continuation,
-                        );
-                        
-                        // Track delete event for watchers
-                        delete_events.entry(soft_delete.aggregate_key.clone())
-                            .or_insert(AggregateWatchEventOperation::Delete {});
-                    }
-                    _ => {}
-                }
-            }
-
-            for (aggregate_key, operation) in create_events {
-                watched_aggregates.broadcast(AggregateWatchEvent { aggregate_key, operation });
-            }
-
-            for (aggregate_key, operation) in write_events {
-                watched_aggregates.broadcast(AggregateWatchEvent {
-                    aggregate_key: aggregate_key.clone(),
-                    operation,
-                });
-            }
-
-            for (aggregate_key, operation) in delete_events {
-                watched_aggregates.broadcast(AggregateWatchEvent { aggregate_key, operation });
-            }
-
-            for (aggregate_key, operation) in trim_events {
-                watched_aggregates.broadcast(AggregateWatchEvent { aggregate_key, operation });
-            }
-
-            return Ok(());
-        }
-        Err(e) => {
-            let mut shard_mem_cache = shard_mem_cache.borrow_mut();
-            shard_mem_cache.rollback_queue_positions();
-            log_segments_cache.force_immediate.set(true);
-            return Err(e);
-        }
-    }
-}
-
-async fn sync(log_segment_file: Rc<LogSegmentFile>, sync_positions_snapshot: &mut SyncPositionsSnapshot) -> Result<(), ShardFsyncError> {
-    let mut log_segment_file_metadata = log_segment_file.metadata.borrow().clone();
-
-    let dma_file_writer = log_segment_file.lock_writer("sync").await?;
-    let dma_file_writer = dma_file_writer
-        .as_ref()
-        .ok_or_else(|| RotatingLogError::IoError("No file handle".to_string()))?;
-
-    // Write datablocks first so we can get the positions to include into metablocks
-    let buffer_size_datablocks: u64 = sync_positions_snapshot.buffer_size_datablocks();
-
-    let mut datablocks_absolute_write_positions: Vec<u64> = Vec::with_capacity(sync_positions_snapshot.pending_append_queue.len());
-    let mut new_datablocks_position = log_segment_file_metadata.datablocks_position;
-    let mut datablocks_carry_over: Option<Vec<u8>> = log_segment_file_metadata.datablocks_carry_over.take();
-
-    if buffer_size_datablocks > 0 {
-        let write_to_pos = dma_file_writer.align_up(log_segment_file_metadata.datablocks_position);
-        new_datablocks_position = log_segment_file_metadata.datablocks_position.saturating_sub(buffer_size_datablocks);
-        let write_from_pos = dma_file_writer.align_down(new_datablocks_position);
-        let aligned_buffer_size_datablocks = write_to_pos.saturating_sub(write_from_pos);
-
-        let front_carry_over = new_datablocks_position.saturating_sub(write_from_pos) as usize;
-        let end_carry_over = write_to_pos.saturating_sub(log_segment_file_metadata.datablocks_position) as usize;
-
-        let mut buffer_datablocks = dma_file_writer.alloc_dma_buffer(front_carry_over + buffer_size_datablocks as usize + end_carry_over);
-        let buffer_datablocks_slice = buffer_datablocks.as_bytes_mut();
-
-        buffer_datablocks_slice.fill(0);
-
-        if end_carry_over > 0 {
-            if datablocks_carry_over.is_none() || datablocks_carry_over.as_ref().unwrap().len() != end_carry_over as usize {
-                return Err(ShardFsyncError::DatablocksCarryOverBufferNotPresent);
-            }
-            buffer_datablocks_slice[(aligned_buffer_size_datablocks.saturating_sub(end_carry_over as u64)) as usize..]
-                .copy_from_slice(&datablocks_carry_over.as_ref().unwrap());
-        }
-
-        let mut position = 0usize;
-        for item in &sync_positions_snapshot.pending_append_queue {
-            if let Some(datablock_bytes) = &item.datablock_bytes {
-                let len = datablock_bytes.len();
-                let start_idx = front_carry_over + position;
-                let end_idx = front_carry_over + position + len;
-
-                datablocks_absolute_write_positions.push(new_datablocks_position + position as u64);
-                buffer_datablocks_slice[start_idx..end_idx].copy_from_slice(datablock_bytes);
-                position += len;
-            }
-        }
-
-        let datablocks_carry_over_size = dma_file_writer.align_up(new_datablocks_position).saturating_sub(new_datablocks_position);
-        if datablocks_carry_over_size > 0 {
-            datablocks_carry_over =
-                Some(buffer_datablocks_slice[front_carry_over..(front_carry_over + datablocks_carry_over_size as usize)].to_vec());
-        }
-
-        dma_file_writer
-            .write_at(buffer_datablocks, new_datablocks_position.saturating_sub(front_carry_over as u64))
-            .await?;
-    }
-
-    let buffer_size_metablocks: u64 = sync_positions_snapshot.buffer_size_metablocks();
-    let mut buffer_metablocks = dma_file_writer.alloc_dma_buffer(buffer_size_metablocks as usize);
-    let buffer_metablocks_slice = buffer_metablocks.as_bytes_mut();
-    let mut position = 0usize;
-    let mut index = 0;
-    for item in &mut sync_positions_snapshot.pending_append_queue {
-        if item.datablock_bytes.is_some() && item.datablock.is_some() {
-            match &mut item.metablock.datablock {
-                DatablockStorageKind::Block(datablock_block_ref) => {
-                    datablock_block_ref.datablock_position = datablocks_absolute_write_positions[index];
-                }
-                _ => {}
-            }
-            index += 1;
-        }
-
-        log_segment_file_metadata.wal_index = log_segment_file_metadata.wal_index.saturating_add(1);
-        item.metablock.wal_index = log_segment_file_metadata.wal_index;
-
-        // Track the absolute position where this metablock is written
-        let metablock_absolute_pos = log_segment_file_metadata.metablocks_position + position as u64;
-
-        // Update aggregate positions tracking for event batches (only if entry exists)
-        if let MetablockKind::EventBatchMetadata(event_batch) = &item.metablock.wal_metablock_type {
-            if let Some(aggregate_positions) = sync_positions_snapshot.aggregate_queue_positions.get_mut(&event_batch.aggregate_key) {
-                aggregate_positions.log_id = log_segment_file_metadata.log_id;
-                aggregate_positions.metablock_absolute_pos = metablock_absolute_pos;
-            }
-        }
-
-        let mut metablock_bytes = [0u8; FIXED_BLOCK_SIZE_BYTES];
-        serialize_versioned_message(&item.metablock, WIRE_VERSION_WAL_METABLOCK, &mut metablock_bytes)?;
-
-        //let metablock_bytes: [u8; FIXED_BLOCK_SIZE_BYTES]
-        buffer_metablocks_slice[position..position + FIXED_BLOCK_SIZE_BYTES].copy_from_slice(&metablock_bytes);
-        position += FIXED_BLOCK_SIZE_BYTES;
-    }
-
-    //Write metablocks
-    let new_metablocks_position = log_segment_file_metadata.metablocks_position + buffer_metablocks.len() as u64;
-    dma_file_writer
-        .write_at(buffer_metablocks, log_segment_file_metadata.metablocks_position)
-        .await?;
-
-    // Update bloom filter with aggregate keys from this batch
-    for item in &sync_positions_snapshot.pending_append_queue {
-        if let MetablockKind::EventBatchMetadata(event_batch) = &item.metablock.wal_metablock_type {
-            log_segment_file_metadata.aggregate_key_bloom.insert(&event_batch.aggregate_key);
-        }
-    }
-
-    // Update positions and carry over
-    log_segment_file_metadata.metablocks_position = new_metablocks_position;
-    log_segment_file_metadata.datablocks_carry_over = datablocks_carry_over;
-    log_segment_file_metadata.datablocks_position = new_datablocks_position;
-
-    // Write header
-    let header_end_start_pos = log_segment_file_metadata.file_len.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64);
-    let header = log_segment_file_metadata.to_shard_log_header();
-    celeriant_rotating_log::log_segment_file::write_dual_shard_log_header(&dma_file_writer, header_end_start_pos, &header).await?;
-
-    dma_file_writer.fdatasync().await?;
-
-    let mut updated_log_segment_file_metadata = log_segment_file.metadata.borrow_mut();
-    *updated_log_segment_file_metadata = log_segment_file_metadata;
-
-    Ok(())
 }
 
 /// Intermediate struct for validated and prepared write data

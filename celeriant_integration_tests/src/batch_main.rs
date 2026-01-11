@@ -9,7 +9,7 @@
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use celeriant_client_demo::{ServerConfig, TestServer};
+use celeriant_integration_tests::{ServerConfig, TestServer};
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
 use celeriant_msg::request::requests::WriteRequest;
@@ -21,7 +21,7 @@ use celeriant_wal::{
 use tokio::sync::Barrier;
 use tokio::time::Instant;
 
-const DEFAULT_NUM_CONNECTIONS: usize = 12 * 1024; // 28k max source port limit ~25000;
+const DEFAULT_NUM_CONNECTIONS: usize = 24000; // 28k max source port limit ~25000;
 const TEST_DURATION_SECS: u64 = 15;
 const NUM_AGGREGATES: usize = 1024;
 const USE_MICRO_PAYLOAD: bool = true;

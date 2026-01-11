@@ -1,4 +1,4 @@
-//! Shared test utilities for celeriant_client_demo integration tests.
+//! Shared test utilities for celeriant_integration_tests integration tests.
 
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -16,7 +16,7 @@ use tokio::time::sleep;
 /// # Example
 ///
 /// ```no_run
-/// use celeriant_client_demo::{TestServer, ServerConfig};
+/// use celeriant_integration_tests::{TestServer, ServerConfig};
 ///
 /// #[tokio::main]
 /// async fn main() {

@@ -79,13 +79,14 @@ mod tests {
         let mut bloom = AggregateKeyBloom::new();
         let key1 = AggregateKey::new(1, 2, 3);
         let key2 = AggregateKey::new(4, 5, 6);
-        let key3 = AggregateKey::new(7, 8, 9);
+        let _key3 = AggregateKey::new(7, 8, 9);
 
         bloom.insert(&key1);
         bloom.insert(&key2);
 
         assert!(bloom.may_contain(&key1));
         assert!(bloom.may_contain(&key2));
+        // assert!(!bloom.may_contain(&key3));
         // key3 was not inserted - might still return true (false positive) but unlikely
     }
 

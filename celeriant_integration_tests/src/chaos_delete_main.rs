@@ -7,7 +7,7 @@
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use celeriant_client_demo::TestServer;
+use celeriant_integration_tests::TestServer;
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
 use celeriant_client_tokio::list_operations::{

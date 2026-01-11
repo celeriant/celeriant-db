@@ -263,8 +263,6 @@ pub fn read_event_batch_aggregate_key(bytes: &[u8]) -> AggregateKey {
 mod tests {
     use super::*;
     use celeriant_wal::constants::{FIXED_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_METABLOCK};
-    use celeriant_wal::metablocks::datablock_block_ref::DatablockBlockRef;
-    use celeriant_wal::metablocks::datablock_inline_data::DatablockInlineData;
     use celeriant_wal::metablocks::datablock_storage_kind::DatablockStorageKind;
     use celeriant_wal::metablocks::metablock::Metablock;
     use celeriant_wal::metablocks::metablock_event_batch::{EventTypesKind, MetablockEventBatch};
@@ -284,7 +282,7 @@ mod tests {
     fn make_event_batch_metablock(
         wal_index: u64,
         server_timestamp: u64,
-        aggregate_key: AggregateKey,
+        _aggregate_key: AggregateKey,
         event_batch: MetablockEventBatch,
         datablock: DatablockStorageKind,
         compressed_size: u64,
@@ -1045,15 +1043,15 @@ mod tests {
             user_id: None,
             event_types_data: EventTypesKind::Direct([0; 4]),
         };
-        let mut event_batch_metablock = make_event_batch_metablock(wal_index, server_timestamp, key.clone(), batch, DatablockStorageKind::None, 0, 0);
+        let event_batch_metablock = make_event_batch_metablock(wal_index, server_timestamp, key.clone(), batch, DatablockStorageKind::None, 0, 0);
         let event_batch_bytes = serialize_metablock(&event_batch_metablock);
 
         // SoftDelete
-        let mut soft_delete_metablock = make_soft_delete_metablock(wal_index, server_timestamp, key.clone(), 0, 0);
+        let soft_delete_metablock = make_soft_delete_metablock(wal_index, server_timestamp, key.clone(), 0, 0);
         let soft_delete_bytes = serialize_metablock(&soft_delete_metablock);
 
         // SoftTrim
-        let mut soft_trim_metablock = make_soft_trim_metablock(wal_index, server_timestamp, key.clone(), 50, 0, 0);
+        let soft_trim_metablock = make_soft_trim_metablock(wal_index, server_timestamp, key.clone(), 50, 0, 0);
         let soft_trim_bytes = serialize_metablock(&soft_trim_metablock);
 
         // Verify wal_index is read correctly from all types

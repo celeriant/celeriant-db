@@ -1,4 +1,4 @@
-use crate::{aggregate_key::AggregateKey, constants::WIRE_SIZE_ENUM_DISCRIMINANT};
+use crate::aggregate_key::AggregateKey;
 use crate::constants::BLOOM_BYTES;
 use crate::datablocks::datablock_aggregate_event_batch::DatablockAggregateEventBatch;
 use bincode::{Decode, Encode};

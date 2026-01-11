@@ -61,7 +61,7 @@
                     "--bin",
                     "batch_main",
                     "-p",
-                    "celeriant_client_demo",
+                    "celeriant_integration_tests",
                 ],
                 "filter": {
                     "name": "batch_main",

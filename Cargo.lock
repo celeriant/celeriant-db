@@ -355,21 +355,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "celeriant_client_demo"
-version = "0.1.0"
-dependencies = [
- "celeriant",
- "celeriant_client_tokio",
- "celeriant_msg",
- "celeriant_wal",
- "celeriant_wire",
- "rand 0.8.5",
- "tempfile",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
 name = "celeriant_client_tokio"
 version = "0.1.0"
 dependencies = [
@@ -409,6 +394,21 @@ name = "celeriant_distributed"
 version = "0.1.0"
 dependencies = [
  "bincode",
+]
+
+[[package]]
+name = "celeriant_integration_tests"
+version = "0.1.0"
+dependencies = [
+ "celeriant",
+ "celeriant_client_tokio",
+ "celeriant_msg",
+ "celeriant_wal",
+ "celeriant_wire",
+ "rand 0.8.5",
+ "tempfile",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]

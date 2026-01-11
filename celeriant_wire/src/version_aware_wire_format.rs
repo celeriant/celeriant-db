@@ -101,7 +101,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use celeriant_wal::{aggregate_key::AggregateKey, buffer_read::{read_option_u128_le, read_u64_le, read_u128_le}, constants::{AGGREGATE_BLOOM_BYTES, FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, WIRE_SIZE_ENUM_DISCRIMINANT}, metablocks::{metablock_event_batch::MetablockEventBatch, metablock_snapshot_aggregate::MetablockSnapshotAggregate, metablock_snapshot_org::MetablockSnapshotOrg}, shard_log_header::ShardLogHeader};
+    use celeriant_wal::{aggregate_key::AggregateKey, buffer_read::{read_option_u128_le, read_u64_le, read_u128_le}, constants::{FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, WIRE_SIZE_ENUM_DISCRIMINANT}, metablocks::{metablock_event_batch::MetablockEventBatch, metablock_snapshot_aggregate::MetablockSnapshotAggregate, metablock_snapshot_org::MetablockSnapshotOrg}, shard_log_header::ShardLogHeader};
 
     fn indexing_metablock_event_batch() -> Metablock {
         Metablock {
