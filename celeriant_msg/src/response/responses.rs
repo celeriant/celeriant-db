@@ -94,3 +94,8 @@ pub struct ErrorResponse {
     pub error_message: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub struct ReplicationBatchResponse {
+    pub correlation_id: Option<u128>,
+}
+

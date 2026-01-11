@@ -358,12 +358,15 @@ dependencies = [
 name = "celeriant_client_demo"
 version = "0.1.0"
 dependencies = [
+ "celeriant",
  "celeriant_client_tokio",
  "celeriant_msg",
  "celeriant_wal",
  "celeriant_wire",
  "rand 0.8.5",
+ "tempfile",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

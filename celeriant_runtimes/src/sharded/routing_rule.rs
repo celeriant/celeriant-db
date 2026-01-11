@@ -5,11 +5,8 @@ use celeriant_wal::aggregate_key::AggregateKey;
 /// Determines which field of the aggregate key is used for shard routing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RoutingRule {
-    /// Route by org_id - all aggregates for an org go to the same shard
     OrgId,
-    /// Route by aggregate_type_id - all aggregates of a type go to the same shard
     AggregateTypeId,
-    /// Route by aggregate_id (default) - individual aggregates are distributed
     #[default]
     AggregateId,
 }
@@ -41,12 +38,19 @@ impl std::fmt::Display for RoutingRule {
 }
 
 impl RoutingRule {
-    /// Returns the routing ID based on the specified routing rule.
     pub fn routing_id_for_rule(&self, aggregate_key: &AggregateKey) -> u128 {
         match self {
             RoutingRule::OrgId => aggregate_key.org_id,
             RoutingRule::AggregateTypeId => aggregate_key.aggregate_type_id,
             RoutingRule::AggregateId => aggregate_key.aggregate_id,
+        }
+    }
+
+    pub fn routing_id_for_request(&self, request: &celeriant_msg::process_requests::Request) -> u128 {
+        match self {
+            RoutingRule::OrgId => request.org_id(),
+            RoutingRule::AggregateTypeId => request.aggregate_type_id(),
+            RoutingRule::AggregateId => request.aggregate_id(),
         }
     }
 }

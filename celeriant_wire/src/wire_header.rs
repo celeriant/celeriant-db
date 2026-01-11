@@ -84,10 +84,19 @@ impl WireHeader {
         R: AsyncReadExt + Unpin,
         T: Decode<()> + serde::de::DeserializeOwned,
     {
-        if self.uncompressed_length as u64 > max_size_bytes
-        {
+        // Validate BOTH compressed and uncompressed lengths to prevent:
+        // 1. Memory exhaustion from large compressed payloads
+        // 2. Decompression bombs (small compressed, huge uncompressed)
+        if self.compressed_length as u64 > max_size_bytes {
             return Err(WireError::MessageTooLarge {
                 message_length: self.compressed_length as u64,
+                max_size_bytes,
+            });
+        }
+
+        if self.uncompressed_length as u64 > max_size_bytes {
+            return Err(WireError::MessageTooLarge {
+                message_length: self.uncompressed_length as u64,
                 max_size_bytes,
             });
         }
@@ -363,6 +372,52 @@ mod tests {
             let result: Result<u64, _> = header.read_fixed_size(&mut reader, &mut tiny_buf).await;
 
             assert!(matches!(result, Err(WireError::BufferTooSmall { .. })));
+        });
+    }
+
+    #[test]
+    fn test_compressed_length_exceeds_max_size_rejected() {
+        block_on(async {
+            // Craft a malicious header with large compressed_length but small uncompressed_length
+            // This simulates a DoS attack where a client claims a huge compressed payload
+            let mut malicious_header = Vec::new();
+            malicious_header.extend_from_slice(&PROTOCOL_VERSION_V2.to_le_bytes()); // version
+            malicious_header.extend_from_slice(&1u32.to_le_bytes()); // message_type
+            malicious_header.extend_from_slice(&1_000_000u32.to_le_bytes()); // compressed_length (1MB - malicious)
+            malicious_header.extend_from_slice(&100u32.to_le_bytes()); // uncompressed_length (small)
+            malicious_header.push(0); // no compression
+
+            let mut reader = Cursor::new(malicious_header);
+            let header = WireHeader::from_reader(&mut reader).await.unwrap();
+
+            // Should reject because compressed_length exceeds max_size
+            let max_size = 1000u64;
+            let result: Result<Vec<u8>, _> = header.read_variable_size(&mut reader, max_size).await;
+
+            assert!(matches!(result, Err(WireError::MessageTooLarge { .. })));
+        });
+    }
+
+    #[test]
+    fn test_uncompressed_length_exceeds_max_size_rejected() {
+        block_on(async {
+            // Craft a header with small compressed_length but large uncompressed_length
+            // This simulates a decompression bomb attack
+            let mut malicious_header = Vec::new();
+            malicious_header.extend_from_slice(&PROTOCOL_VERSION_V2.to_le_bytes()); // version
+            malicious_header.extend_from_slice(&1u32.to_le_bytes()); // message_type
+            malicious_header.extend_from_slice(&100u32.to_le_bytes()); // compressed_length (small)
+            malicious_header.extend_from_slice(&1_000_000u32.to_le_bytes()); // uncompressed_length (1MB - malicious)
+            malicious_header.push(1); // zstd compression
+
+            let mut reader = Cursor::new(malicious_header);
+            let header = WireHeader::from_reader(&mut reader).await.unwrap();
+
+            // Should reject because uncompressed_length exceeds max_size
+            let max_size = 1000u64;
+            let result: Result<Vec<u8>, _> = header.read_variable_size(&mut reader, max_size).await;
+
+            assert!(matches!(result, Err(WireError::MessageTooLarge { .. })));
         });
     }
 }

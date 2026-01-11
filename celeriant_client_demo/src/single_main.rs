@@ -1,24 +1,45 @@
+//! Single-Aggregate Integration Tests
+//!
+//! Tests basic CRUD operations, idempotency, and listing functionality.
+//! Creates a temporary data directory and spawns the server automatically.
+//!
+//! Run with: cargo run --bin single_main
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use celeriant_client_demo::TestServer;
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_client_tokio::list_operations::{ListOptions, ListOrgsIterator, ListAggregateTypesIterator, ListAggregatesIterator};
+use celeriant_client_tokio::list_operations::{
+    ListAggregateTypesIterator, ListAggregatesIterator, ListOptions, ListOrgsIterator,
+};
 use celeriant_msg::{
     process_requests::Request,
-    request::{read_filters::ReadFilters, requests::{DeleteRequest, ExistsRequest, ReadRequest, SingleAggregateDelete, SingleAggregateWrite, WriteRequest}},
+    request::{
+        read_filters::ReadFilters,
+        requests::{
+            DeleteRequest, ExistsRequest, ReadRequest, SingleAggregateDelete, SingleAggregateWrite,
+            WriteRequest,
+        },
+    },
 };
 use celeriant_wal::{
-    aggregate_key::AggregateKey,
-    compression_type::CompressionType,
+    aggregate_key::AggregateKey, compression_type::CompressionType,
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
 };
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = CeleriantClient::connect("0.0.0.0:10000").await?;
+    println!("=== Single-Aggregate Integration Tests ===\n");
+
+    println!("Starting test server...");
+    let server = TestServer::start().await?;
+    println!("Server started at {}\n", server.address());
+
+    let mut client = CeleriantClient::connect(server.address()).await?;
 
     let aggregate_1 = AggregateKey::new(1, 2, 101);
-    let aggregate_2 = AggregateKey::new(1, 2+32, 201);
+    let aggregate_2 = AggregateKey::new(1, 2 + 32, 201);
     let client_id: u128 = 999;
 
     // Check if aggregates exist
@@ -95,14 +116,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         user_id: Some(42),
         writes,
     });
-    match client.send_request(&atomic_request, CompressionType::None).await {
+    match client
+        .send_request(&atomic_request, CompressionType::None)
+        .await
+    {
         Ok(response) => println!("Atomic multi-aggregate write: {:?}", response),
         Err(e) => println!("Atomic multi-aggregate write failed: {:?}", e),
     }
 
     // Test idempotency - retry same write
     println!("\n=== Testing idempotency (retry same write) ===");
-    match client.send_request(&atomic_request, CompressionType::None).await {
+    match client
+        .send_request(&atomic_request, CompressionType::None)
+        .await
+    {
         Ok(response) => println!("Idempotent retry succeeded: {:?}", response),
         Err(e) => println!("Idempotent retry result: {:?}", e),
     }
@@ -131,8 +158,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  - Org ID: {}", org.org_id);
     }
     // Verify org_id 1 exists (both aggregates use org_id 1)
-    assert!(orgs.iter().any(|o| o.org_id == 1), "Expected org_id 1 to exist");
-    println!("✓ Verified org_id 1 exists");
+    assert!(
+        orgs.iter().any(|o| o.org_id == 1),
+        "Expected org_id 1 to exist"
+    );
+    println!("  Verified org_id 1 exists");
 
     println!("\n=== Listing Aggregate Types ===");
     let options = ListOptions::default();
@@ -140,12 +170,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let agg_types = types_iter.collect().await?;
     println!("Found {} aggregate types for org 1:", agg_types.len());
     for agg_type in &agg_types {
-        println!("  - Org: {}, Type ID: {}", agg_type.org_id, agg_type.aggregate_type_id);
+        println!(
+            "  - Org: {}, Type ID: {}",
+            agg_type.org_id, agg_type.aggregate_type_id
+        );
     }
     // Verify both aggregate types exist (2 and 34)
-    assert!(agg_types.iter().any(|t| t.aggregate_type_id == 2), "Expected aggregate_type_id 2 to exist");
-    assert!(agg_types.iter().any(|t| t.aggregate_type_id == 34), "Expected aggregate_type_id 34 to exist");
-    println!("✓ Verified aggregate types 2 and 34 exist");
+    assert!(
+        agg_types.iter().any(|t| t.aggregate_type_id == 2),
+        "Expected aggregate_type_id 2 to exist"
+    );
+    assert!(
+        agg_types.iter().any(|t| t.aggregate_type_id == 34),
+        "Expected aggregate_type_id 34 to exist"
+    );
+    println!("  Verified aggregate types 2 and 34 exist");
 
     println!("\n=== Listing Aggregates (before delete) ===");
     let options = ListOptions::default();
@@ -153,15 +192,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let aggregates = aggs_iter.collect().await?;
     println!("Found {} aggregates for org 1:", aggregates.len());
     for agg in &aggregates {
-        println!("  - Org: {}, Type: {}, ID: {}, Deleted: {}", 
-            agg.org_id, agg.aggregate_type_id, agg.aggregate_id, agg.is_deleted);
+        println!(
+            "  - Org: {}, Type: {}, ID: {}, Deleted: {}",
+            agg.org_id, agg.aggregate_type_id, agg.aggregate_id, agg.is_deleted
+        );
     }
     // Verify both aggregates exist and are not deleted
-    assert!(aggregates.iter().any(|a| a.aggregate_id == 101 && !a.is_deleted), 
-        "Expected aggregate 101 to exist and not be deleted");
-    assert!(aggregates.iter().any(|a| a.aggregate_id == 201 && !a.is_deleted), 
-        "Expected aggregate 201 to exist and not be deleted");
-    println!("✓ Verified aggregates 101 and 201 exist and are not deleted");
+    assert!(
+        aggregates
+            .iter()
+            .any(|a| a.aggregate_id == 101 && !a.is_deleted),
+        "Expected aggregate 101 to exist and not be deleted"
+    );
+    assert!(
+        aggregates
+            .iter()
+            .any(|a| a.aggregate_id == 201 && !a.is_deleted),
+        "Expected aggregate 201 to exist and not be deleted"
+    );
+    println!("  Verified aggregates 101 and 201 exist and are not deleted");
 
     // === Delete aggregate_1 ===
     println!("\n=== Deleting aggregate 1 ===");
@@ -180,7 +229,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         user_id: Some(42),
         deletes,
     });
-    match client.send_request(&delete_request, CompressionType::None).await {
+    match client
+        .send_request(&delete_request, CompressionType::None)
+        .await
+    {
         Ok(response) => println!("Delete aggregate 1: {:?}", response),
         Err(e) => println!("Delete aggregate 1 failed: {:?}", e),
     }
@@ -192,15 +244,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let aggregates = aggs_iter.collect().await?;
     println!("Found {} non-deleted aggregates for org 1:", aggregates.len());
     for agg in &aggregates {
-        println!("  - Org: {}, Type: {}, ID: {}, Deleted: {}", 
-            agg.org_id, agg.aggregate_type_id, agg.aggregate_id, agg.is_deleted);
+        println!(
+            "  - Org: {}, Type: {}, ID: {}, Deleted: {}",
+            agg.org_id, agg.aggregate_type_id, agg.aggregate_id, agg.is_deleted
+        );
     }
     // Verify aggregate 101 is no longer in the list (filtered out as deleted)
-    assert!(!aggregates.iter().any(|a| a.aggregate_id == 101), 
-        "Expected aggregate 101 to be filtered out (deleted)");
-    assert!(aggregates.iter().any(|a| a.aggregate_id == 201 && !a.is_deleted), 
-        "Expected aggregate 201 to still exist and not be deleted");
-    println!("✓ Verified aggregate 101 is filtered out, aggregate 201 still exists");
+    assert!(
+        !aggregates.iter().any(|a| a.aggregate_id == 101),
+        "Expected aggregate 101 to be filtered out (deleted)"
+    );
+    assert!(
+        aggregates
+            .iter()
+            .any(|a| a.aggregate_id == 201 && !a.is_deleted),
+        "Expected aggregate 201 to still exist and not be deleted"
+    );
+    println!("  Verified aggregate 101 is filtered out, aggregate 201 still exists");
 
     println!("\n=== Listing Aggregates (after delete, including deleted) ===");
     let options = ListOptions {
@@ -209,17 +269,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut aggs_iter = ListAggregatesIterator::new(&mut client, Some(1), None, options);
     let aggregates = aggs_iter.collect().await?;
-    println!("Found {} total aggregates for org 1 (including deleted):", aggregates.len());
+    println!(
+        "Found {} total aggregates for org 1 (including deleted):",
+        aggregates.len()
+    );
     for agg in &aggregates {
-        println!("  - Org: {}, Type: {}, ID: {}, Deleted: {}", 
-            agg.org_id, agg.aggregate_type_id, agg.aggregate_id, agg.is_deleted);
+        println!(
+            "  - Org: {}, Type: {}, ID: {}, Deleted: {}",
+            agg.org_id, agg.aggregate_type_id, agg.aggregate_id, agg.is_deleted
+        );
     }
     // Verify aggregate 101 shows as deleted
-    assert!(aggregates.iter().any(|a| a.aggregate_id == 101 && a.is_deleted), 
-        "Expected aggregate 101 to be marked as deleted");
-    assert!(aggregates.iter().any(|a| a.aggregate_id == 201 && !a.is_deleted), 
-        "Expected aggregate 201 to still exist and not be deleted");
-    println!("✓ Verified aggregate 101 is marked as deleted, aggregate 201 is not deleted");
+    assert!(
+        aggregates
+            .iter()
+            .any(|a| a.aggregate_id == 101 && a.is_deleted),
+        "Expected aggregate 101 to be marked as deleted"
+    );
+    assert!(
+        aggregates
+            .iter()
+            .any(|a| a.aggregate_id == 201 && !a.is_deleted),
+        "Expected aggregate 201 to still exist and not be deleted"
+    );
+    println!("  Verified aggregate 101 is marked as deleted, aggregate 201 is not deleted");
 
     // Test expected_event_batch_index conflict
     println!("\n=== Testing expected_event_batch_index conflict ===");
@@ -251,7 +324,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
-
 
 fn create_event(client_event_index: u64, message: String) -> DatablockAggregateEvent {
     DatablockAggregateEvent {

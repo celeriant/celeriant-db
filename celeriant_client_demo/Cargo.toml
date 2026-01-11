@@ -10,10 +10,6 @@ name = "batch_main"
 path = "src/batch_main.rs"
 
 [[bin]]
-name = "exists_batch_main"
-path = "src/exists_batch_main.rs"
-
-[[bin]]
 name = "single_main"
 path = "src/single_main.rs"
 
@@ -25,10 +21,21 @@ path = "src/chaos_main.rs"
 name = "chaos_delete_main"
 path = "src/chaos_delete_main.rs"
 
+[[bin]]
+name = "connection_test_main"
+path = "src/connection_test_main.rs"
+
+[[bin]]
+name = "watch_test_main"
+path = "src/watch_test_main.rs"
+
 [dependencies]
+celeriant_lib = { package = "celeriant", path = "../celeriant" }
 celeriant_client_tokio = { path = "../celeriant_client_tokio" }
 celeriant_msg = { path = "../celeriant_msg" }
 celeriant_wire = { path = "../celeriant_wire" }
 celeriant_wal = { path = "../celeriant_wal" }
 tokio.workspace = true
+tokio-util.workspace = true
 rand.workspace = true
+tempfile.workspace = true

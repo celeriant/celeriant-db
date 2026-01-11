@@ -1,44 +1,185 @@
+//! Batch Write Performance Test
+//!
+//! Stress tests write throughput with many concurrent connections.
+//! Creates a temporary data directory and spawns the server automatically.
+//!
+//! Run with: cargo run --bin batch_main
+//!
+//! Set SWEEP_MODE=1 to run connection count sweep for optimal throughput discovery.
+
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use celeriant_client_demo::{ServerConfig, TestServer};
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
-use celeriant_msg::{process_requests::Request, request::requests::SingleAggregateWrite};
 use celeriant_msg::request::requests::WriteRequest;
+use celeriant_msg::{process_requests::Request, request::requests::SingleAggregateWrite};
 use celeriant_wal::{
-    aggregate_key::AggregateKey,
-    compression_type::CompressionType,
+    aggregate_key::AggregateKey, compression_type::CompressionType,
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
 };
 use tokio::sync::Barrier;
 use tokio::time::Instant;
 
-const NUM_CONNECTIONS: usize = 12*1024; // 28k max source port limit ~25000;
-const TEST_DURATION_SECS: u64 = 30;
-const NUM_AGGREGATES: usize = 32;
-const USE_MICRO_PAYLOAD: bool = false;
-const SERVER_ADDR: &str = "0.0.0.0:10000";
+const DEFAULT_NUM_CONNECTIONS: usize = 12 * 1024; // 28k max source port limit ~25000;
+const TEST_DURATION_SECS: u64 = 15;
+const NUM_AGGREGATES: usize = 1024;
+const USE_MICRO_PAYLOAD: bool = true;
 const CLIENTSIDE_TIMEOUT_S: u64 = 5;
+
+// Connection counts to sweep through when SWEEP_MODE is enabled
+const CONNECTION_SWEEP: &[usize] = &[512, 1024, 2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384];
 
 struct TaskStats {
     request_count: u64,
     latencies_us: Vec<u64>,
 }
 
+#[derive(Debug, Clone)]
+struct BenchmarkResult {
+    num_connections: usize,
+    total_requests: u64,
+    throughput: f64,
+    avg_latency_ms: f64,
+    p50_ms: u64,
+    p95_ms: u64,
+    p99_ms: u64,
+    p999_ms: u64,
+    min_ms: u64,
+    max_ms: u64,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!(
-        "Establishing {} connections...",
-        NUM_CONNECTIONS
-    );
+    let sweep_mode = std::env::var("SWEEP_MODE").is_ok();
 
+    if sweep_mode {
+        run_sweep_benchmark().await
+    } else {
+        let num_connections = std::env::var("NUM_CONNECTIONS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_NUM_CONNECTIONS);
+        run_single_benchmark(num_connections, true).await.map(|_| ())
+    }
+}
+
+async fn run_sweep_benchmark() -> Result<(), Box<dyn std::error::Error>> {
+    println!("=== Batch Write Performance Sweep Test ===\n");
+    println!("Testing connection counts: {:?}\n", CONNECTION_SWEEP);
+
+    // Start server with all shards
+    println!("Starting test server with all shards...");
+    let config = ServerConfig {
+        log_level: "warn".to_string(),
+        ..Default::default()
+    };
+    let port = 10100 + (std::process::id() % 100) as u16;
+    let server = TestServer::start_with_config(port, config).await?;
+    let server_address = server.address().to_string();
+    println!("Server started at {}\n", server_address);
+
+    let mut results: Vec<BenchmarkResult> = Vec::new();
+
+    for &num_connections in CONNECTION_SWEEP {
+        println!("\n{}", "=".repeat(60));
+        println!("Testing {} connections...", num_connections);
+        println!("{}", "=".repeat(60));
+
+        match run_benchmark_iteration(&server_address, num_connections).await {
+            Ok(result) => {
+                println!(
+                    "  Throughput: {:.2} req/s | Avg latency: {:.2}ms | P99: {}ms",
+                    result.throughput, result.avg_latency_ms, result.p99_ms
+                );
+                results.push(result);
+            }
+            Err(e) => {
+                eprintln!("  Benchmark failed: {}", e);
+            }
+        }
+
+        // Brief pause between tests to let things settle
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    // Print summary report
+    print_summary_report(&results);
+
+    Ok(())
+}
+
+fn print_summary_report(results: &[BenchmarkResult]) {
+    println!("\n");
+    println!("╔══════════════════════════════════════════════════════════════════════════════════════════════════════╗");
+    println!("║                              BATCH WRITE PERFORMANCE SWEEP REPORT                                    ║");
+    println!("╠══════════════════════════════════════════════════════════════════════════════════════════════════════╣");
+    println!("║ Connections │  Throughput   │ Total Reqs │ Avg (ms) │ P50 │ P95 │ P99 │ P99.9 │ Min │  Max  ║");
+    println!("╠══════════════════════════════════════════════════════════════════════════════════════════════════════╣");
+
+    for r in results {
+        println!(
+            "║ {:>10}  │ {:>12.2} │ {:>10} │ {:>8.2} │ {:>3} │ {:>3} │ {:>3} │ {:>5} │ {:>3} │ {:>5} ║",
+            r.num_connections,
+            r.throughput,
+            r.total_requests,
+            r.avg_latency_ms,
+            r.p50_ms,
+            r.p95_ms,
+            r.p99_ms,
+            r.p999_ms,
+            r.min_ms,
+            r.max_ms
+        );
+    }
+
+    println!("╚══════════════════════════════════════════════════════════════════════════════════════════════════════╝");
+
+    // Find optimal configuration
+    if let Some(best) = results.iter().max_by(|a, b| {
+        a.throughput.partial_cmp(&b.throughput).unwrap()
+    }) {
+        println!("\n=== OPTIMAL CONFIGURATION ===");
+        println!("Best throughput: {:.2} req/s with {} connections", best.throughput, best.num_connections);
+        println!("Latency at optimal: avg={:.2}ms, P99={}ms", best.avg_latency_ms, best.p99_ms);
+
+        let target = 400_000.0;
+        if best.throughput >= target {
+            println!("\n✓ Target of {} req/s ACHIEVED!", target as u64);
+        } else {
+            let gap = target - best.throughput;
+            let percentage = (best.throughput / target) * 100.0;
+            println!("\n✗ Target of {} req/s NOT achieved", target as u64);
+            println!("  Current: {:.2} req/s ({:.1}% of target)", best.throughput, percentage);
+            println!("  Gap: {:.2} req/s", gap);
+        }
+    }
+
+    // Throughput trend analysis
+    println!("\n=== THROUGHPUT TREND ===");
+    for (i, r) in results.iter().enumerate() {
+        let bar_length = ((r.throughput / 500_000.0) * 50.0) as usize;
+        let bar: String = "█".repeat(bar_length.min(50));
+        let marker = if i > 0 && results[i-1].throughput < r.throughput { "↑" }
+                     else if i > 0 && results[i-1].throughput > r.throughput { "↓" }
+                     else { " " };
+        println!("{:>6} conn: {:50} {:>12.0} {}", r.num_connections, bar, r.throughput, marker);
+    }
+}
+
+async fn run_benchmark_iteration(
+    server_address: &str,
+    num_connections: usize,
+) -> Result<BenchmarkResult, Box<dyn std::error::Error>> {
     let connect_start = Instant::now();
 
-    // Establish all connections first
-    let mut connection_tasks = Vec::with_capacity(NUM_CONNECTIONS);
-    for connection_id in 0..NUM_CONNECTIONS {
+    // Establish all connections
+    let mut connection_tasks = Vec::with_capacity(num_connections);
+    for connection_id in 0..num_connections {
+        let addr = server_address.to_string();
         let task = tokio::spawn(async move {
             let client = CeleriantClient::connect_with_timeout(
-                SERVER_ADDR,
+                &addr,
                 Some(Duration::from_secs(CLIENTSIDE_TIMEOUT_S)),
             )
             .await
@@ -50,27 +191,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Collect all established connections
-    let mut clients = Vec::with_capacity(NUM_CONNECTIONS);
+    let mut clients = Vec::with_capacity(num_connections);
     let mut failed_connections = 0;
     for task in connection_tasks {
         match task.await {
             Ok(Ok((connection_id, client))) => {
                 clients.push((connection_id, client));
             }
-            Ok(Err(e)) => {
-                eprintln!("{}", e);
-                failed_connections += 1;
-            }
-            Err(e) => {
-                eprintln!("Join error: {}", e);
-                failed_connections += 1;
-            }
+            Ok(Err(_)) => failed_connections += 1,
+            Err(_) => failed_connections += 1,
         }
     }
 
     let connect_duration = connect_start.elapsed();
     println!(
-        "Established {} connections in {:.2}s ({} failed)",
+        "  Established {} connections in {:.2}s ({} failed)",
         clients.len(),
         connect_duration.as_secs_f64(),
         failed_connections
@@ -80,19 +215,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("No connections established".into());
     }
 
-    // Create a barrier to synchronize all tasks to start at the same time
-    let barrier = Arc::new(Barrier::new(clients.len()));
-
-    println!(
-        "Starting benchmark with {} concurrent connections for {} seconds...",
-        clients.len(),
-        TEST_DURATION_SECS
-    );
+    let actual_connections = clients.len();
+    let barrier = Arc::new(Barrier::new(actual_connections));
 
     let start_time = Instant::now();
 
-    // Spawn benchmark tasks with pre-established connections
-    let mut tasks = Vec::with_capacity(clients.len());
+    // Spawn benchmark tasks
+    let mut tasks = Vec::with_capacity(actual_connections);
     for (connection_id, client) in clients {
         let barrier = Arc::clone(&barrier);
         let task = tokio::spawn(async move {
@@ -102,12 +231,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Wait for all tasks to complete
-    let mut all_stats = Vec::with_capacity(NUM_CONNECTIONS);
+    let mut all_stats = Vec::with_capacity(actual_connections);
     for task in tasks {
         match task.await {
             Ok(Ok(stats)) => all_stats.push(stats),
-            Ok(Err(e)) => eprintln!("Task error: {}", e),
-            Err(e) => eprintln!("Join error: {}", e),
+            _ => {}
         }
     }
 
@@ -115,21 +243,172 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Aggregate results
     let total_requests: u64 = all_stats.iter().map(|s| s.request_count).sum();
-    let mut all_latencies: Vec<u64> = all_stats.into_iter().flat_map(|s| s.latencies_us).collect();
+    let mut all_latencies: Vec<u64> = all_stats
+        .into_iter()
+        .flat_map(|s| s.latencies_us)
+        .collect();
+
+    all_latencies.sort_unstable();
+
+    let throughput = total_requests as f64 / total_duration.as_secs_f64();
+
+    let (avg_latency_ms, p50_ms, p95_ms, p99_ms, p999_ms, min_ms, max_ms) = if !all_latencies.is_empty() {
+        let avg = all_latencies.iter().sum::<u64>() as f64 / all_latencies.len() as f64;
+        let p50 = all_latencies[all_latencies.len() * 50 / 100];
+        let p95 = all_latencies[all_latencies.len() * 95 / 100];
+        let p99 = all_latencies[all_latencies.len() * 99 / 100];
+        let p999 = all_latencies[all_latencies.len() * 999 / 1000];
+        let max = all_latencies[all_latencies.len() - 1];
+        let min = all_latencies[0];
+        (avg, p50, p95, p99, p999, min, max)
+    } else {
+        (0.0, 0, 0, 0, 0, 0, 0)
+    };
+
+    Ok(BenchmarkResult {
+        num_connections: actual_connections,
+        total_requests,
+        throughput,
+        avg_latency_ms,
+        p50_ms,
+        p95_ms,
+        p99_ms,
+        p999_ms,
+        min_ms,
+        max_ms,
+    })
+}
+
+async fn run_single_benchmark(num_connections: usize, verbose: bool) -> Result<Option<BenchmarkResult>, Box<dyn std::error::Error>> {
+    if verbose {
+        println!("=== Batch Write Performance Test ===\n");
+    }
+
+    // Start server with all shards
+    if verbose {
+        println!("Starting test server with all shards...");
+    }
+    let config = ServerConfig {
+        log_level: "warn".to_string(),
+        ..Default::default()
+    };
+    let port = 10100 + (std::process::id() % 100) as u16;
+    let server = TestServer::start_with_config(port, config).await?;
+    let server_address = server.address();
+    if verbose {
+        println!("Server started at {}\n", server_address);
+        println!("Establishing {} connections...", num_connections);
+    }
+
+    let connect_start = Instant::now();
+
+    // Establish all connections first
+    let mut connection_tasks = Vec::with_capacity(num_connections);
+    for connection_id in 0..num_connections {
+        let addr = server_address.to_string();
+        let task = tokio::spawn(async move {
+            let client = CeleriantClient::connect_with_timeout(
+                &addr,
+                Some(Duration::from_secs(CLIENTSIDE_TIMEOUT_S)),
+            )
+            .await
+            .map_err(|e| format!("Connection {} error: {}", connection_id, e))?
+            .with_timeout(Duration::from_secs(CLIENTSIDE_TIMEOUT_S));
+            Ok::<_, String>((connection_id, client))
+        });
+        connection_tasks.push(task);
+    }
+
+    // Collect all established connections
+    let mut clients = Vec::with_capacity(num_connections);
+    let mut failed_connections = 0;
+    for task in connection_tasks {
+        match task.await {
+            Ok(Ok((connection_id, client))) => {
+                clients.push((connection_id, client));
+            }
+            Ok(Err(e)) => {
+                if verbose { eprintln!("{}", e); }
+                failed_connections += 1;
+            }
+            Err(e) => {
+                if verbose { eprintln!("Join error: {}", e); }
+                failed_connections += 1;
+            }
+        }
+    }
+
+    let connect_duration = connect_start.elapsed();
+    if verbose {
+        println!(
+            "Established {} connections in {:.2}s ({} failed)",
+            clients.len(),
+            connect_duration.as_secs_f64(),
+            failed_connections
+        );
+    }
+
+    if clients.is_empty() {
+        return Err("No connections established".into());
+    }
+
+    // Create a barrier to synchronize all tasks to start at the same time
+    let barrier = Arc::new(Barrier::new(clients.len()));
+
+    if verbose {
+        println!(
+            "Starting benchmark with {} concurrent connections for {} seconds...",
+            clients.len(),
+            TEST_DURATION_SECS
+        );
+    }
+
+    let start_time = Instant::now();
+
+    // Spawn benchmark tasks with pre-established connections
+    let mut tasks = Vec::with_capacity(clients.len());
+    for (connection_id, client) in clients {
+        let barrier = Arc::clone(&barrier);
+        let task =
+            tokio::spawn(
+                async move { run_connection_benchmark(connection_id, client, barrier).await },
+            );
+        tasks.push(task);
+    }
+
+    // Wait for all tasks to complete
+    let mut all_stats = Vec::with_capacity(num_connections);
+    for task in tasks {
+        match task.await {
+            Ok(Ok(stats)) => all_stats.push(stats),
+            Ok(Err(e)) => { if verbose { eprintln!("Task error: {}", e); } }
+            Err(e) => { if verbose { eprintln!("Join error: {}", e); } }
+        }
+    }
+
+    let total_duration = start_time.elapsed();
+
+    // Aggregate results
+    let total_requests: u64 = all_stats.iter().map(|s| s.request_count).sum();
+    let mut all_latencies: Vec<u64> = all_stats
+        .into_iter()
+        .flat_map(|s| s.latencies_us)
+        .collect();
 
     all_latencies.sort_unstable();
 
     // Calculate statistics
     let throughput = total_requests as f64 / total_duration.as_secs_f64();
 
-    println!("\n=== Benchmark Results ===");
-    println!("Total Duration: {:.2}s", total_duration.as_secs_f64());
-    println!("Total Requests: {}", total_requests);
-    println!("Throughput: {:.2} req/s", throughput);
+    if verbose {
+        println!("\n=== Benchmark Results ===");
+        println!("Total Duration: {:.2}s", total_duration.as_secs_f64());
+        println!("Total Requests: {}", total_requests);
+        println!("Throughput: {:.2} req/s", throughput);
+    }
 
-    if !all_latencies.is_empty() {
-        let avg_latency =
-            all_latencies.iter().sum::<u64>() as f64 / all_latencies.len() as f64;
+    if !all_latencies.is_empty() && verbose {
+        let avg_latency = all_latencies.iter().sum::<u64>() as f64 / all_latencies.len() as f64;
         let p50 = all_latencies[all_latencies.len() * 50 / 100];
         let p95 = all_latencies[all_latencies.len() * 95 / 100];
         let p99 = all_latencies[all_latencies.len() * 99 / 100];
@@ -147,7 +426,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Min: {}ms", min_latency);
     }
 
-    Ok(())
+    Ok(None)
 }
 
 async fn run_connection_benchmark(
@@ -185,7 +464,9 @@ async fn run_connection_benchmark(
             event_timestamp: 0,
             event_type_major: 2,
             event_type_minor: 3,
-            event_value: std::sync::Arc::new(format!("{}She should have died hereafter;
+            event_value: std::sync::Arc::new(
+                format!(
+                    "{}She should have died hereafter;
             There would have been a time for such a word.
             Tomorrow, and tomorrow, and tomorrow,
             Creeps in this petty pace from day to day
@@ -195,7 +476,11 @@ async fn run_connection_benchmark(
             Life's but a walking shadow, a poor player
             That struts and frets his hour upon the stage
             And then is heard no more. It is a tale
-            Told by an idiot, full of sound and fury, Signifying nothing. ", prefix).into_bytes()),
+            Told by an idiot, full of sound and fury, Signifying nothing. ",
+                    prefix
+                )
+                .into_bytes(),
+            ),
             iv: None,
         };
 
@@ -203,11 +488,7 @@ async fn run_connection_benchmark(
 
         let mut writes = HashMap::new();
         writes.insert(
-            AggregateKey::new(
-                1,
-                1,
-                aggregate_id as u128,
-            ),
+            AggregateKey::new(1, 1, aggregate_id as u128),
             SingleAggregateWrite {
                 events: if USE_MICRO_PAYLOAD {
                     vec![event_1]
@@ -230,7 +511,10 @@ async fn run_connection_benchmark(
 
         let req_start = Instant::now();
 
-        match client.send_request(&request, CompressionType::None).await {
+        match client
+            .send_request(&request, CompressionType::None)
+            .await
+        {
             Ok(_) => {
                 let latency_us = req_start.elapsed().as_millis() as u64;
                 latencies.push(latency_us);
@@ -242,15 +526,15 @@ async fn run_connection_benchmark(
                     connection_id, err_resp.error_message, err_resp.error_code
                 );
             }
-            Err(e) => {
-                match e {
-                    ClientError::RequestTimeout => eprintln!("Connection {} Timeout: {}", connection_id, e),
-                    _ => {
-                        eprintln!("Connection {} Error: {}", connection_id, e);
-                        break; // Exit on connection errors
-                    },
+            Err(e) => match e {
+                ClientError::RequestTimeout => {
+                    eprintln!("Connection {} Timeout: {}", connection_id, e)
                 }
-            }
+                _ => {
+                    eprintln!("Connection {} Error: {}", connection_id, e);
+                    break; // Exit on connection errors
+                }
+            },
         }
     }
 

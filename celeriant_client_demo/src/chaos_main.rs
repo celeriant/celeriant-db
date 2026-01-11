@@ -1,5 +1,13 @@
-use std::{sync::Arc, time::Duration};
+//! Chaos Testing with Large Payloads
+//!
+//! Concurrent read/write testing with variable payload sizes.
+//! Creates a temporary data directory and spawns the server automatically.
+//!
+//! Run with: cargo run --bin chaos_main
 
+use std::{collections::HashMap, sync::Arc, time::Duration};
+
+use celeriant_client_demo::TestServer;
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
 use celeriant_msg::{
@@ -10,19 +18,16 @@ use celeriant_msg::{
     },
 };
 use celeriant_wal::{
-    aggregate_key::AggregateKey,
-    compression_type::CompressionType,
+    aggregate_key::AggregateKey, compression_type::CompressionType,
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
 };
-use rand::{Rng, SeedableRng, rngs::StdRng};
-use std::collections::HashMap;
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Barrier;
 use tokio::time::Instant;
 
 const NUM_AGGREGATES: usize = 10;
 const TEST_DURATION_SECS: u64 = 120;
-const SERVER_ADDR: &str = "0.0.0.0:10000";
 const CLIENTSIDE_TIMEOUT_S: u64 = 30; // Longer timeout for large payloads
 
 const MIN_PAYLOAD_SIZE: usize = 1;
@@ -60,7 +65,13 @@ struct ChaosStats {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== Chaos Testing Mode ===");
+    println!("=== Chaos Testing Mode ===\n");
+
+    println!("Starting test server...");
+    let server = TestServer::start().await?;
+    let server_addr = server.address();
+    println!("Server started at {}\n", server_addr);
+
     println!(
         "Aggregates: {}, Duration: {}s, Payload range: {} bytes - {} bytes",
         NUM_AGGREGATES, TEST_DURATION_SECS, MIN_PAYLOAD_SIZE, MAX_PAYLOAD_SIZE
@@ -82,7 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for aggregate_id in 0..NUM_AGGREGATES {
         // Writer connection
         let writer = CeleriantClient::connect_with_timeout(
-            SERVER_ADDR,
+            server_addr,
             Some(Duration::from_secs(CLIENTSIDE_TIMEOUT_S)),
         )
         .await
@@ -91,7 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Reader connection
         let reader = CeleriantClient::connect_with_timeout(
-            SERVER_ADDR,
+            server_addr,
             Some(Duration::from_secs(CLIENTSIDE_TIMEOUT_S)),
         )
         .await
@@ -122,9 +133,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (aggregate_id, client) in writer_clients {
         let barrier = Arc::clone(&barrier);
         let state = Arc::clone(&aggregate_states[aggregate_id]);
-        let task = tokio::spawn(async move {
-            run_writer_task(aggregate_id, client, barrier, state).await
-        });
+        let task =
+            tokio::spawn(async move { run_writer_task(aggregate_id, client, barrier, state).await });
         writer_tasks.push((aggregate_id, task));
     }
 
@@ -132,9 +142,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (aggregate_id, client) in reader_clients {
         let barrier = Arc::clone(&barrier);
         let state = Arc::clone(&aggregate_states[aggregate_id]);
-        let task = tokio::spawn(async move {
-            run_reader_task(aggregate_id, client, barrier, state).await
-        });
+        let task =
+            tokio::spawn(async move { run_reader_task(aggregate_id, client, barrier, state).await });
         reader_tasks.push((aggregate_id, task));
     }
 
@@ -169,8 +178,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut total_read_errors = 0u64;
     let mut total_bytes = 0u64;
 
-    println!("{:<12} {:>12} {:>12} {:>12} {:>12} {:>15}", 
-        "Aggregate", "Writes", "Reads", "Write Errs", "Read Errs", "Bytes Written");
+    println!(
+        "{:<12} {:>12} {:>12} {:>12} {:>12} {:>15}",
+        "Aggregate", "Writes", "Reads", "Write Errs", "Read Errs", "Bytes Written"
+    );
     println!("{}", "-".repeat(75));
 
     for stats in &all_stats {
@@ -216,9 +227,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     if total_write_errors > 0 || total_read_errors > 0 {
-        println!("\n⚠️  ERRORS DETECTED - Check logs above for details");
+        println!("\n  ERRORS DETECTED - Check logs above for details");
     } else {
-        println!("\n✓ No errors detected");
+        println!("\n  No errors detected");
     }
 
     Ok(())
@@ -279,7 +290,10 @@ async fn run_writer_task(
             writes,
         });
 
-        match client.send_request(&request, CompressionType::None).await {
+        match client
+            .send_request(&request, CompressionType::None)
+            .await
+        {
             Ok(_) => {
                 state.write_count.fetch_add(1, Ordering::Relaxed);
                 event_index += 1;
@@ -351,17 +365,16 @@ async fn run_reader_task(
             filters: ReadFilters::new(from_batch).to_event_batch_index(latest_batch),
         });
 
-        match client.send_request(&request, CompressionType::None).await {
+        match client
+            .send_request(&request, CompressionType::None)
+            .await
+        {
             Ok(_response) => {
                 state.read_count.fetch_add(1, Ordering::Relaxed);
             }
             Err(ClientError::CeleriantError(err_resp)) => {
                 // Some errors are expected (e.g., batch not found yet)
                 if !err_resp.error_message.contains("not found") {
-                    // eprintln!(
-                    //     "[Reader {}] Server error: {} ({})",
-                    //     aggregate_id, err_resp.error_message, err_resp.error_code
-                    // );
                     state.read_errors.fetch_add(1, Ordering::Relaxed);
                 }
             }

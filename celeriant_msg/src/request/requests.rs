@@ -100,3 +100,18 @@ pub struct WatchRequest {
     pub aggregates: Option<HashSet<u128>>,
     pub operation_types: Option<HashSet<u8>>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub struct ReplicationBatchRequest {
+    pub correlation_id: Option<u128>,
+    pub lease_index: u64,
+    pub shard_id: u64,
+    pub batches: Vec<ReplicationBatchItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub struct ReplicationBatchItem {
+    pub wal_index: u64,
+    pub metablock_bytes: Vec<u8>,
+    pub datablock_bytes: Option<Vec<u8>>,
+}

@@ -147,6 +147,9 @@ impl ShardWal {
                     .map(Response::ListAggregates)
                     .map_err(ShardError::Read)
             }
+            Request::ReplicationBatch(_) => Err(ShardError::Read(ShardReadError::IoError(
+                "ReplicationBatch requests not implemented yet".to_string(),
+            ))),
         }
     }
 

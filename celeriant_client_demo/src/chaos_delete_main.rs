@@ -1,5 +1,13 @@
+//! Chaos Delete Testing
+//!
+//! Concurrent write/delete/read testing with verification.
+//! Creates a temporary data directory and spawns the server automatically.
+//!
+//! Run with: cargo run --bin chaos_delete_main
+
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use celeriant_client_demo::TestServer;
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
 use celeriant_client_tokio::list_operations::{
@@ -14,11 +22,10 @@ use celeriant_msg::{
     },
 };
 use celeriant_wal::{
-    aggregate_key::AggregateKey,
-    compression_type::CompressionType,
+    aggregate_key::AggregateKey, compression_type::CompressionType,
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
 };
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::{Barrier, Mutex};
@@ -34,7 +41,6 @@ const TOTAL_AGGREGATES: usize = NUM_ORGS * NUM_AGGREGATE_TYPES_PER_ORG * NUM_AGG
 const NUM_WRITERS: usize = 10;
 const NUM_READERS: usize = 5;
 const TEST_DURATION_SECS: u64 = 60;
-const SERVER_ADDR: &str = "0.0.0.0:10000";
 const CLIENTSIDE_TIMEOUT_S: u64 = 30;
 
 // Payload configuration
@@ -51,7 +57,11 @@ fn index_to_aggregate_key(index: usize) -> AggregateKey {
     let aggregate_type_id = type_index + 1;
     let aggregate_id = (index % NUM_AGGREGATES_PER_TYPE) + 1;
 
-    AggregateKey::new(org_id as u128, aggregate_type_id as u128, aggregate_id as u128)
+    AggregateKey::new(
+        org_id as u128,
+        aggregate_type_id as u128,
+        aggregate_id as u128,
+    )
 }
 
 /// Tracking state for each aggregate
@@ -64,6 +74,7 @@ struct AggregateTrackingState {
     /// Whether this aggregate currently exists (not deleted)
     exists: AtomicBool,
     /// Last event batch index written
+    #[allow(dead_code)]
     last_event_batch_index: AtomicU64,
 }
 
@@ -107,7 +118,9 @@ impl GlobalTrackingState {
 
     async fn record_write(&self, index: usize, key: &AggregateKey, bytes: u64) {
         if index < self.aggregates.len() {
-            self.aggregates[index].write_count.fetch_add(1, Ordering::Relaxed);
+            self.aggregates[index]
+                .write_count
+                .fetch_add(1, Ordering::Relaxed);
             self.aggregates[index].exists.store(true, Ordering::Release);
         }
         self.total_writes.fetch_add(1, Ordering::Relaxed);
@@ -126,7 +139,9 @@ impl GlobalTrackingState {
 
     fn record_delete(&self, index: usize) {
         if index < self.aggregates.len() {
-            self.aggregates[index].delete_count.fetch_add(1, Ordering::Relaxed);
+            self.aggregates[index]
+                .delete_count
+                .fetch_add(1, Ordering::Relaxed);
             self.aggregates[index].exists.store(false, Ordering::Release);
         }
         self.total_deletes.fetch_add(1, Ordering::Relaxed);
@@ -154,7 +169,13 @@ impl GlobalTrackingState {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== Chaos Delete Testing Mode ===");
+    println!("=== Chaos Delete Testing Mode ===\n");
+
+    println!("Starting test server...");
+    let server = TestServer::start().await?;
+    let server_addr = server.address();
+    println!("Server started at {}\n", server_addr);
+
     println!(
         "Orgs: {}, Types/Org: {}, Aggregates/Type: {} (Total: {})",
         NUM_ORGS, NUM_AGGREGATE_TYPES_PER_ORG, NUM_AGGREGATES_PER_TYPE, TOTAL_AGGREGATES
@@ -177,7 +198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for i in 0..NUM_WRITERS {
         let client = CeleriantClient::connect_with_timeout(
-            SERVER_ADDR,
+            server_addr,
             Some(Duration::from_secs(CLIENTSIDE_TIMEOUT_S)),
         )
         .await
@@ -188,7 +209,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for i in 0..NUM_READERS {
         let client = CeleriantClient::connect_with_timeout(
-            SERVER_ADDR,
+            server_addr,
             Some(Duration::from_secs(CLIENTSIDE_TIMEOUT_S)),
         )
         .await
@@ -216,9 +237,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (worker_id, client) in writer_clients {
         let barrier = Arc::clone(&barrier);
         let state = Arc::clone(&state);
-        let task = tokio::spawn(async move {
-            run_writer_task(worker_id, client, barrier, state).await
-        });
+        let task =
+            tokio::spawn(async move { run_writer_task(worker_id, client, barrier, state).await });
         tasks.push(("writer", worker_id, task));
     }
 
@@ -226,9 +246,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (worker_id, client) in reader_clients {
         let barrier = Arc::clone(&barrier);
         let state = Arc::clone(&state);
-        let task = tokio::spawn(async move {
-            run_reader_task(worker_id, client, barrier, state).await
-        });
+        let task =
+            tokio::spawn(async move { run_reader_task(worker_id, client, barrier, state).await });
         tasks.push(("reader", worker_id, task));
     }
 
@@ -258,7 +277,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{:<15} {:>12} {:>12}", "Operation", "Success", "Errors");
     println!("{}", "-".repeat(41));
     println!("{:<15} {:>12} {:>12}", "Writes", total_writes, write_errors);
-    println!("{:<15} {:>12} {:>12}", "Deletes", total_deletes, delete_errors);
+    println!(
+        "{:<15} {:>12} {:>12}",
+        "Deletes", total_deletes, delete_errors
+    );
     println!("{:<15} {:>12} {:>12}", "Reads", total_reads, read_errors);
     println!("{}", "-".repeat(41));
     println!("Total bytes written: {}\n", format_bytes(total_bytes));
@@ -282,7 +304,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let verify_start = Instant::now();
 
     let mut verify_client = CeleriantClient::connect_with_timeout(
-        SERVER_ADDR,
+        server_addr,
         Some(Duration::from_secs(CLIENTSIDE_TIMEOUT_S)),
     )
     .await
@@ -313,14 +335,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let extra_orgs: Vec<_> = listed_org_ids.difference(&expected_orgs).collect();
 
     if missing_orgs.is_empty() && extra_orgs.is_empty() {
-        println!("  ✓ Organizations verified: {} found", listed_org_ids.len());
+        println!("  Organizations verified: {} found", listed_org_ids.len());
     } else {
-        println!("  ✗ Organization mismatch!");
+        println!("  Organization mismatch!");
         if !missing_orgs.is_empty() {
             println!("    Missing: {:?}", missing_orgs);
         }
         if !extra_orgs.is_empty() {
-            println!("    Extra (may be from other tests): {} found", extra_orgs.len());
+            println!(
+                "    Extra (may be from other tests): {} found",
+                extra_orgs.len()
+            );
         }
     }
 
@@ -338,14 +363,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let extra_types: Vec<_> = listed_type_keys.difference(&expected_types).collect();
 
     if missing_types.is_empty() && extra_types.is_empty() {
-        println!("  ✓ Aggregate types verified: {} found", listed_type_keys.len());
+        println!(
+            "  Aggregate types verified: {} found",
+            listed_type_keys.len()
+        );
     } else {
-        println!("  ✗ Aggregate type mismatch!");
+        println!("  Aggregate type mismatch!");
         if !missing_types.is_empty() {
             println!("    Missing: {:?}", missing_types);
         }
         if !extra_types.is_empty() {
-            println!("    Extra (may be from other tests): {} found", extra_types.len());
+            println!(
+                "    Extra (may be from other tests): {} found",
+                extra_types.len()
+            );
         }
     }
 
@@ -372,26 +403,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Check existing aggregates
     let missing_existing: Vec<_> = expected_existing.difference(&listed_existing).collect();
-    let wrongly_deleted: Vec<_> = expected_existing
-        .intersection(&listed_deleted)
-        .collect();
+    let wrongly_deleted: Vec<_> = expected_existing.intersection(&listed_deleted).collect();
 
     // Check deleted aggregates
     let missing_deleted: Vec<_> = expected_deleted.difference(&listed_deleted).collect();
-    let wrongly_existing: Vec<_> = expected_deleted
-        .intersection(&listed_existing)
-        .collect();
+    let wrongly_existing: Vec<_> = expected_deleted.intersection(&listed_existing).collect();
 
     let mut aggregate_errors = false;
 
     if missing_existing.is_empty() && wrongly_deleted.is_empty() {
         println!(
-            "  ✓ Existing aggregates verified: {} found",
+            "  Existing aggregates verified: {} found",
             expected_existing.len()
         );
     } else {
         aggregate_errors = true;
-        println!("  ✗ Existing aggregate mismatch!");
+        println!("  Existing aggregate mismatch!");
         if !missing_existing.is_empty() {
             println!("    Missing existing: {} aggregates", missing_existing.len());
         }
@@ -405,12 +432,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if missing_deleted.is_empty() && wrongly_existing.is_empty() {
         println!(
-            "  ✓ Deleted aggregates verified: {} found",
+            "  Deleted aggregates verified: {} found",
             expected_deleted.len()
         );
     } else {
         aggregate_errors = true;
-        println!("  ✗ Deleted aggregate mismatch!");
+        println!("  Deleted aggregate mismatch!");
         if !missing_deleted.is_empty() {
             println!("    Missing deleted: {} aggregates", missing_deleted.len());
         }
@@ -423,7 +450,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let verify_duration = verify_start.elapsed();
-    println!("\nVerification completed in {:.2}s", verify_duration.as_secs_f64());
+    println!(
+        "\nVerification completed in {:.2}s",
+        verify_duration.as_secs_f64()
+    );
 
     // Final summary
     println!("\n=== Final Summary ===");
@@ -435,9 +465,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         || aggregate_errors;
 
     if has_errors {
-        println!("⚠️  ISSUES DETECTED - Review output above");
+        println!("  ISSUES DETECTED - Review output above");
     } else {
-        println!("✓ All verifications passed!");
+        println!("  All verifications passed!");
     }
 
     Ok(())
@@ -482,7 +512,10 @@ async fn run_writer_task(
                 user_id: None,
             });
 
-            match client.send_request(&request, CompressionType::None).await {
+            match client
+                .send_request(&request, CompressionType::None)
+                .await
+            {
                 Ok(_) => {
                     state.record_delete(aggregate_index);
                 }
@@ -542,9 +575,14 @@ async fn run_writer_task(
                 writes,
             });
 
-            match client.send_request(&request, CompressionType::None).await {
+            match client
+                .send_request(&request, CompressionType::None)
+                .await
+            {
                 Ok(_) => {
-                    state.record_write(aggregate_index, &aggregate_key, payload_size as u64).await;
+                    state
+                        .record_write(aggregate_index, &aggregate_key, payload_size as u64)
+                        .await;
                     event_index += 1;
                 }
                 Err(ClientError::CeleriantError(err_resp)) => {
@@ -594,7 +632,10 @@ async fn run_reader_task(
             filters: ReadFilters::new(1),
         });
 
-        match client.send_request(&request, CompressionType::None).await {
+        match client
+            .send_request(&request, CompressionType::None)
+            .await
+        {
             Ok(_) => {
                 state.total_reads.fetch_add(1, Ordering::Relaxed);
             }

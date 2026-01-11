@@ -2,7 +2,7 @@ use celeriant_wal::compression_type::CompressionType;
 use celeriant_wire::{constants::WIRE_FIXED_BODY_SIZE, wire_error::WireError, wire_header::WireHeader};
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
 
-use crate::request::requests::{DeleteRequest, ExistsRequest, ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest, ReadRequest, TrimStartRequest, WatchRequest, WriteRequest};
+use crate::request::requests::{DeleteRequest, ExistsRequest, ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest, ReadRequest, ReplicationBatchRequest, TrimStartRequest, WatchRequest, WriteRequest};
 
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,6 +16,7 @@ pub enum RequestType {
     ListOrgs = 7,
     ListAggregateTypes = 8,
     ListAggregates = 9,
+    ReplicationBatch = 10,
 }
 
 impl RequestType {
@@ -30,6 +31,7 @@ impl RequestType {
             7 => Ok(RequestType::ListOrgs),
             8 => Ok(RequestType::ListAggregateTypes),
             9 => Ok(RequestType::ListAggregates),
+            10 => Ok(RequestType::ReplicationBatch),
             _ => Err(WireError::UnknownRequestType(value)),
         }
     }
@@ -61,6 +63,7 @@ pub enum Request {
     ListOrgs(ListOrgsRequest),
     ListAggregateTypes(ListAggregateTypesRequest),
     ListAggregates(ListAggregatesRequest),
+    ReplicationBatch(ReplicationBatchRequest),
 }
 
 impl Request {
@@ -75,6 +78,7 @@ impl Request {
             Request::ListOrgs(_) => RequestType::ListOrgs,
             Request::ListAggregateTypes(_) => RequestType::ListAggregateTypes,
             Request::ListAggregates(_) => RequestType::ListAggregates,
+            Request::ReplicationBatch(_) => RequestType::ReplicationBatch,
         }
     }
 
@@ -89,6 +93,7 @@ impl Request {
             Request::ListOrgs(req) => req.correlation_id,
             Request::ListAggregateTypes(req) => req.correlation_id,
             Request::ListAggregates(req) => req.correlation_id,
+            Request::ReplicationBatch(req) => req.correlation_id,
         }
     }
 
@@ -105,6 +110,7 @@ impl Request {
             Request::ListOrgs(_req) => 0,
             Request::ListAggregateTypes(_req) => 0,
             Request::ListAggregates(_req) => 0,
+            Request::ReplicationBatch(_req) => 0,
         }
     }
 
@@ -121,6 +127,7 @@ impl Request {
             Request::ListOrgs(_req) => 0,
             Request::ListAggregateTypes(_req) => 0,
             Request::ListAggregates(_req) => 0,
+            Request::ReplicationBatch(_req) => 0,
         }
     }
 
@@ -137,6 +144,7 @@ impl Request {
             Request::ListOrgs(_req) => 0,
             Request::ListAggregateTypes(_req) => 0,
             Request::ListAggregates(_req) => 0,
+            Request::ReplicationBatch(_req) => 0,
         }
     }
 
@@ -189,6 +197,11 @@ impl Request {
                         .read_variable_size(reader, max_request_size)
                         .await?,
                 ),
+                RequestType::ReplicationBatch => Request::ReplicationBatch(
+                    wire_header
+                        .read_variable_size(reader, max_request_size)
+                        .await?,
+                ),
                 _ => unreachable!(),
             }
         };
@@ -236,9 +249,28 @@ impl Request {
                     )
                     .await
                 }
+                Request::ReplicationBatch(req) => {
+                    WireHeader::write_variable_size(
+                        writer,
+                        req,
+                        request_type_id,
+                        compression_type,
+                        max_message_size,
+                        version,
+                    )
+                    .await
+                }
                 _ => unreachable!(),
             }
         }
+    }
+
+    pub fn is_client_port_request(&self) -> bool {
+        !matches!(self, Request::ReplicationBatch(_))
+    }
+
+    pub fn is_replication_port_request(&self) -> bool {
+        matches!(self, Request::ReplicationBatch(_))
     }
 
 }
@@ -249,11 +281,11 @@ mod tests {
     use celeriant_wal::aggregate_key::AggregateKey;
     use celeriant_wire::constants::{PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3};
     use futures_lite::{future::block_on, io::Cursor};
-    use crate::request::{read_filters::ReadFilters, requests::{ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest, SingleAggregateDelete, SingleAggregateWrite}};
+    use crate::request::{read_filters::ReadFilters, requests::{ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest, ReplicationBatchRequest, SingleAggregateDelete, SingleAggregateWrite}};
 
     // UPDATE THIS when adding new RequestTypes - tests will fail if mismatched
-    const REQUEST_TYPE_COUNT: usize = 9;
-    const REQUEST_TYPE_MAX_ID: u32 = 9;
+    const REQUEST_TYPE_COUNT: usize = 10;
+    const REQUEST_TYPE_MAX_ID: u32 = 10;
 
     impl RequestType {
         /// Returns all RequestType variants. Adding a new variant without updating
@@ -269,6 +301,7 @@ mod tests {
                 RequestType::ListOrgs,
                 RequestType::ListAggregateTypes,
                 RequestType::ListAggregates,
+                RequestType::ReplicationBatch,
             ]
         }
     }
@@ -359,6 +392,12 @@ mod tests {
                 org_id: Some(1),
                 aggregate_type_id: Some(2),
                 cursor: None,
+            }),
+            RequestType::ReplicationBatch => Request::ReplicationBatch(ReplicationBatchRequest {
+                correlation_id: Some(113),
+                lease_index: 1,
+                shard_id: 0,
+                batches: vec![],
             }),
         }
     }

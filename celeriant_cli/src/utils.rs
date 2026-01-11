@@ -30,5 +30,6 @@ pub fn format_response(response: &Response) -> String {
         Response::ListOrgs(r) => format!("ListOrgs: {} orgs", r.orgs.len()),
         Response::ListAggregateTypes(r) => format!("ListAggregateTypes: {} types", r.aggregate_types.len()),
         Response::ListAggregates(r) => format!("ListAggregates: {} aggregates", r.aggregates.len()),
+        Response::ReplicationBatch(_) => "ReplicationBatch: success".to_string(),
     }
 }

@@ -7,7 +7,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::server_config::ServerConfig;
 
-mod server_config;
+pub mod server_config;
 mod dio_check;
 
 pub fn startup(args: Vec<String>) -> Result<(), std::io::Error> {

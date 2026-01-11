@@ -4,7 +4,7 @@ use celeriant_wal::compression_type::CompressionType;
 use celeriant_wire::{constants::WIRE_FIXED_BODY_SIZE, wire_error::WireError, wire_header::WireHeader};
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
 
-use crate::response::responses::{ErrorResponse, ExistsResponse, ListAggregateTypesResponse, ListAggregatesResponse, ListOrgsResponse, ProtocolErrorResponse, ReadResponse, SuccessResponse, WatchResponse};
+use crate::response::responses::{ErrorResponse, ExistsResponse, ListAggregateTypesResponse, ListAggregatesResponse, ListOrgsResponse, ProtocolErrorResponse, ReadResponse, ReplicationBatchResponse, SuccessResponse, WatchResponse};
 
 // Response type discriminants
 #[repr(u32)]
@@ -21,6 +21,7 @@ pub enum ResponseType {
     ListOrgs = 9,
     ListAggregateTypes = 10,
     ListAggregates = 11,
+    ReplicationBatch = 12,
 }
 
 impl ResponseType {
@@ -37,6 +38,7 @@ impl ResponseType {
             9 => Ok(ResponseType::ListOrgs),
             10 => Ok(ResponseType::ListAggregateTypes),
             11 => Ok(ResponseType::ListAggregates),
+            12 => Ok(ResponseType::ReplicationBatch),
             _ => Err(WireError::UnknownResponseType(value)),
         }
     }
@@ -50,6 +52,7 @@ impl ResponseType {
                 | ResponseType::ProtocolError
                 | ResponseType::Write
                 | ResponseType::GenericError
+                | ResponseType::ReplicationBatch
         )
     }
 }
@@ -68,6 +71,7 @@ pub enum Response {
     ListOrgs(ListOrgsResponse),
     ListAggregateTypes(ListAggregateTypesResponse),
     ListAggregates(ListAggregatesResponse),
+    ReplicationBatch(ReplicationBatchResponse),
 }
 
 impl Response {
@@ -84,6 +88,7 @@ impl Response {
             Response::ListOrgs(_) => ResponseType::ListOrgs,
             Response::ListAggregateTypes(_) => ResponseType::ListAggregateTypes,
             Response::ListAggregates(_) => ResponseType::ListAggregates,
+            Response::ReplicationBatch(_) => ResponseType::ReplicationBatch,
         }
     }
 
@@ -117,6 +122,9 @@ impl Response {
                 }
                 ResponseType::GenericError => {
                     Response::GenericError(wire_header.read_fixed_size(reader, &mut buffer).await?)
+                }
+                ResponseType::ReplicationBatch => {
+                    Response::ReplicationBatch(wire_header.read_fixed_size(reader, &mut buffer).await?)
                 }
                 _ => unreachable!(),
             }
@@ -157,6 +165,7 @@ impl Response {
             Response::ListOrgs(_) => CompressionType::Snappy,
             Response::ListAggregateTypes(_) => CompressionType::Snappy,
             Response::ListAggregates(_) => CompressionType::Snappy,
+            Response::ReplicationBatch(_) => CompressionType::None,
         }
     }
 
@@ -181,6 +190,7 @@ impl Response {
                 Response::ProtocolError(res) => WireHeader::write_fixed_size(writer, res, response_type_id, version).await,
                 Response::Write(res) => WireHeader::write_fixed_size(writer, res, response_type_id, version).await,
                 Response::GenericError(res) => WireHeader::write_fixed_size(writer, res, response_type_id, version).await,
+                Response::ReplicationBatch(res) => WireHeader::write_fixed_size(writer, res, response_type_id, version).await,
                 _ => unreachable!(),
             }
         } else {
@@ -214,8 +224,8 @@ mod tests {
     use futures_lite::{future::block_on, io::Cursor};
 
     // UPDATE THIS when adding new ResponseTypes - tests will fail if mismatched
-    const RESPONSE_TYPE_COUNT: usize = 11;
-    const RESPONSE_TYPE_MAX_ID: u32 = 11;
+    const RESPONSE_TYPE_COUNT: usize = 12;
+    const RESPONSE_TYPE_MAX_ID: u32 = 12;
 
     impl ResponseType {
         /// Returns all ResponseType variants. Adding a new variant without updating
@@ -233,6 +243,7 @@ mod tests {
                 ResponseType::ListOrgs,
                 ResponseType::ListAggregateTypes,
                 ResponseType::ListAggregates,
+                ResponseType::ReplicationBatch,
             ]
         }
     }
@@ -282,6 +293,9 @@ mod tests {
                 correlation_id: Some(112),
                 aggregates: vec![],
                 next_cursor: None,
+            }),
+            ResponseType::ReplicationBatch => Response::ReplicationBatch(ReplicationBatchResponse {
+                correlation_id: Some(113),
             }),
         }
     }
