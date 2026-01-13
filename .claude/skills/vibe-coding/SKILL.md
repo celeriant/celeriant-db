@@ -3,89 +3,365 @@ name: vibe-coding
 description: Enables autonomous exploration mode. Use when working in a scratch/sandbox codebase that will be thrown away and replayed manually. Claude should work freely, make assumptions, and iterate without asking permission.
 ---
 
-# Vibe Coding Mode
+# Vibe Coding Mode - Orchestrator Protocol
 
-**This skill is activated explicitly.** When active, you're working in a disposable sandbox—a scratch copy of the codebase that will be deleted after the session.
+**This skill is activated explicitly.** When active, you become an **orchestrator** - you coordinate work, not do it directly. Implementation happens in sub-agents with isolated contexts.
 
 Your code will never be merged directly. The human will study your output and replay the solution themselves in the real codebase. See `vibe-manifesto.md` for the philosophy.
 
-## Behavior Changes
+## Architecture: Orchestrator + Implementer
 
-### Work Autonomously
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    ORCHESTRATOR (you)                       │
+│  - Lightweight coordination context                         │
+│  - Reads/updates SESSION_STATE.md                           │
+│  - Plans phases from spec                                   │
+│  - Spawns implementer for each phase                        │
+│  - Runs validation agents after each phase                  │
+│  - Commits after each phase                                 │
+│  - Updates progress log                                     │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+         ┌─────────────────┼─────────────────┐
+         ▼                 ▼                 ▼
+┌─────────────┐   ┌─────────────┐   ┌─────────────┐
+│ vibe-       │   │ design-     │   │ integration │
+│ implementer │   │ conformance │   │ -validator  │
+│             │   │             │   │             │
+│ Does work   │   │ Checks spec │   │ Runs tests  │
+│ in isolated │   │ alignment   │   │             │
+│ context     │   │             │   │             │
+└─────────────┘   └─────────────┘   └─────────────┘
+```
 
-- **Don't ask permission.** Make decisions and move forward.
-- **Don't seek approval.** Implement your best judgment.
-- **Don't list options.** Pick one and build it.
-- **Don't wait for confirmation.** Iterate until it works.
-- **Make logical, local git commits** Commit to git at logical breaks in the implementation. Don't commit to main. Don't push to remote.
+**Why this architecture:**
+- Implementer context is isolated - doesn't fill up your orchestrator context
+- Each phase starts with fresh implementer context
+- You stay lightweight and focused on coordination
+- Guardrails (commits, updates, checks) are YOUR responsibility - can't be forgotten
 
-### Progress Tracking
+---
 
-- You will be given a spec. Put together a todo list, grouped by epics/milestones. Present this to the user before continuing.
-- On approval of the to-do list, you can begin.  Keep another separate document in the same folder as the spec and the to-do list,  which will be your progress document.  It is an append-only log documenting the decisions that you made,  the steps that you've performed,  and any interesting information that you found along the way.  It's designed to be read later by humans,  to see what happened during the vibe-curding session,  and also it can be provided to other agents to review or continue from the position that you finished.
+## Orchestrator Responsibilities
 
-### Make Assumptions
+### 1. Session Management
 
-When requirements are ambiguous:
-- Choose the most reasonable interpretation
-- Document your assumption briefly in the log, or in the code
-- Keep moving
+You maintain TWO separate files:
 
-### Be Proactive
+#### SESSION_STATE.md (mutable current state)
+- Location: `docs/SESSION_STATE.md`
+- Purpose: Context recovery, phase tracking
+- Update: **After EVERY phase completes**
 
-- Fix adjacent issues you notice
-- Refactor if it helps solve the problem
-- Add what's needed, remove what's not
-- Explore alternative approaches if the first doesn't work
+```markdown
+## Current Phase
+Phase 3: Wire protocol implementation
 
-### Iterate Freely
+## Completed Phases
+- Phase 1: Core data structures ✓
+- Phase 2: Storage layer ✓
 
-- Try things that might not work
-- Leave TODO comments for edge cases you're deferring
-- Stub out complex parts to prove the core concept first
-- Break things, then fix them
+## Next Actions
+1. Implement batch serialization
+2. Add connection handling
 
-### Prioritize Working Over Perfect
+## Active Stubs
+| Location | Category | Description |
+|----------|----------|-------------|
+| file.rs:42 | wire | TCP connect |
 
-The goal is a **working proof-of-concept**, not production code. Optimize for:
-1. Does it work? Don't just run unit tests, test it with the integration tests. If they fail, prioritise fixing them. 
-2. Does it demonstrate the solution?
-3. Can the human understand the approach?
+## Design Anchors
+- Spec section 4.2 covers this phase
+- Key invariant: X must hold
+```
 
-Don't optimize for:
-- Perfect style
-- Complete error handling
-- Comprehensive tests
-- Documentation
+#### Progress Log (append-only history)
+- Location: `docs/[feature]-progress.md`
+- Purpose: Human replay reference
+- Update: **After EVERY phase completes**
 
-## What You're Producing
+```markdown
+## Phase 3 Summary
+**Completed**: [date/time or session marker]
 
-Your output is a **research artifact**. The human will extract:
-- The approach (how you decomposed the problem)
-- The edge cases (what you handled)
-- The integration points (where features connect)
-- The failure modes (what errors you anticipated)
+### What was done
+- Implemented X
+- Refactored Y
+- Created Z
 
-They will NOT copy your code directly. Write for comprehension, not reuse.
+### Key decisions
+- Chose approach A over B because...
 
-## Communication Style
+### Stubs created
+- file.rs:42 - description
 
-- Brief status updates, not detailed explanations
-- "I'm trying X because Y" not "Would you like me to try X?"
-- "This approach didn't work, switching to Z" not "Should I try Z instead?"
-- Results over process
+### Stubs resolved
+- other.rs:89 - was blocking, now works
 
-## When This Skill is Active
+### Integration status
+- Build: ✓
+- Tests: ✓ (3 passing, 1 skipped)
+```
 
-You'll know vibe coding mode is active when:
-- The user explicitly invokes this skill
-- The user says "vibe", "explore freely", "sandbox mode", or similar
-- You're working in a `vibing/` directory or explicitly disposable copy
+### 2. Phase Planning
 
-## When to Exit This Mode
+Before spawning implementers, plan the work:
+
+1. Read SESSION_STATE.md to know current position
+2. Read relevant spec section
+3. Break remaining work into phases (2-4 hours of work each)
+4. Each phase should be independently committable
+
+### 3. Phase Execution Loop
+
+For each phase, execute this loop **exactly**:
+
+```
+┌─────────────────────────────────────────────────┐
+│ PHASE LOOP - DO NOT SKIP STEPS                  │
+├─────────────────────────────────────────────────┤
+│                                                 │
+│  1. SPAWN IMPLEMENTER                           │
+│     Task(subagent_type="vibe-implementer",      │
+│          prompt="Phase context...")             │
+│                                                 │
+│  2. RUN ALL THREE VALIDATORS (parallel)         │
+│     Task(subagent_type="integration-validator") │
+│     Task(subagent_type="design-conformance")    │
+│     Task(subagent_type="code-architecture-     │
+│                         review")                │
+│                                                 │
+│  3. FIX IF NEEDED                               │
+│     If validation fails → spawn implementer     │
+│     to fix, then re-validate                    │
+│                                                 │
+│  4. COMMIT                                      │
+│     git add . && git commit                     │
+│     Branch: vibing/[feature-name]               │
+│                                                 │
+│  5. UPDATE DOCUMENTS                            │
+│     - SESSION_STATE.md (current state)          │
+│     - Progress log (append summary)             │
+│                                                 │
+│  6. NEXT PHASE OR COMPLETE                      │
+│                                                 │
+└─────────────────────────────────────────────────┘
+```
+
+**CRITICAL: Steps 4 and 5 are YOUR responsibility.** The implementer doesn't commit or update docs. You do.
+
+---
+
+## Spawning the Implementer
+
+Use the Task tool with `subagent_type="vibe-implementer"`:
+
+```
+Task(
+    subagent_type="vibe-implementer",
+    prompt="""
+    ## Phase: [Name]
+
+    ## Objective
+    [Clear, specific goal for this phase]
+
+    ## Context
+    - Design spec: docs/[spec].md, section X
+    - Prior work: [summary of what exists]
+    - Key files: [list relevant files]
+
+    ## Scope
+    DO:
+    - [specific task 1]
+    - [specific task 2]
+
+    DO NOT:
+    - [out of scope item]
+    - [thing to defer]
+
+    ## Constraints
+    - [Any specific patterns to follow]
+    - [Any files NOT to modify]
+
+    ## Success Criteria
+    - [How to know it's done]
+    - [What tests should pass]
+    """
+)
+```
+
+### Good Prompts vs Bad Prompts
+
+**BAD** (too vague):
+```
+Implement the replication system.
+```
+
+**GOOD** (specific and bounded):
+```
+## Phase: ReplicationBatch wire format
+
+## Objective
+Implement serialization/deserialization for ReplicationBatch messages.
+
+## Context
+- Design spec: docs/s3-design.md, section 3.2 "Wire Protocol"
+- Prior work: Batch struct exists in celeriant_shard/src/batch.rs
+- Key files: celeriant_wire/src/messages.rs, celeriant_wire/src/codec.rs
+
+## Scope
+DO:
+- Add ReplicationBatch to wire message enum
+- Implement encode/decode
+- Add round-trip test
+
+DO NOT:
+- Implement actual replication logic (next phase)
+- Modify the TCP server (separate phase)
+
+## Constraints
+- Follow existing message patterns in messages.rs
+- Use the existing codec infrastructure
+
+## Success Criteria
+- cargo test in celeriant_wire passes
+- New test: replication_batch_roundtrip
+```
+
+---
+
+## Running Validation Agents
+
+After each phase, run **all three validators in parallel** in a single message:
+
+```
+Task(
+    subagent_type="integration-validator",
+    prompt="Run full validation: stub scan, cargo check, cargo build --release, cargo test."
+)
+
+Task(
+    subagent_type="design-conformance",
+    prompt="Check implementation against docs/[spec].md focusing on [current phase area]. Progress log at docs/[feature]-progress.md."
+)
+
+Task(
+    subagent_type="code-architecture-review",
+    prompt="Review [crate/path] for pattern violations, missed reuse, and abstraction issues."
+)
+```
+
+**All three in every phase.** This catches issues early when they're cheap to fix.
+
+### Acting on Validation Results
+
+| Result | Action |
+|--------|--------|
+| Build fails | Spawn implementer to fix, re-validate |
+| Tests fail | Spawn implementer to fix, re-validate |
+| Design drift detected | Spawn implementer to fix, re-validate |
+| Warnings only | Note in progress log, continue |
+| All green | Proceed to commit |
+
+---
+
+## Committing
+
+After validation passes:
+
+```bash
+git checkout -b vibing/[feature-name] 2>/dev/null || git checkout vibing/[feature-name]
+git add .
+git commit -m "Phase N: [description]
+
+[Brief summary of changes]
+
+Contains STUB: [list any stubs if present]"
+```
+
+You can push to remote: `git push -u origin vibing/[feature-name]`
+
+---
+
+## Session Continuity
+
+When `/vibe-coding continue` is invoked (or after context compaction):
+
+1. **Read SESSION_STATE.md** - This tells you exactly where you are
+2. **Read the spec section** noted in "Current Focus"
+3. **Resume the phase loop** from where it stopped
+
+The session state file is your persistent memory. Trust it.
+
+### If SESSION_STATE.md doesn't exist
+
+Ask the user for:
+1. The design spec location
+2. What they want to build
+3. Any existing progress
+
+Then create SESSION_STATE.md and begin phase planning.
+
+---
+
+## Behavior Rules
+
+### You Are the Orchestrator
+
+- **Don't implement directly** - Spawn implementers
+- **Don't read lots of code** - Implementers do that
+- **Don't debug deeply** - Spawn implementers to investigate
+- **Do track state** - SESSION_STATE.md is your responsibility
+- **Do run validations** - After every phase
+- **Do commit** - After every successful phase
+- **Do update docs** - After every phase
+
+### Implementer Handles
+
+- Code reading and exploration
+- Writing new code
+- Debugging and fixing
+- Following stub management
+- Making implementation decisions
+
+### You Handle
+
+- Phase planning
+- Spawning implementers with clear prompts
+- Running validation agents
+- Committing changes
+- Updating SESSION_STATE.md
+- Appending to progress log
+- Deciding when a phase is complete
+- Deciding when to stop/continue
+
+---
+
+## When to Exit Vibe Mode
 
 Return to normal careful mode when:
 - The user asks you to stop vibing
 - You're asked to work in the main/production codebase
 - The exploration is complete and integration is starting
 
+---
+
+## Quick Reference
+
+### Phase Loop Checklist
+- [ ] Spawn implementer with specific prompt
+- [ ] Run ALL THREE validation agents (parallel, single message)
+- [ ] Fix any failures (spawn implementer again)
+- [ ] Commit to vibing/[feature] branch
+- [ ] Update SESSION_STATE.md
+- [ ] Append to progress log
+- [ ] Plan next phase or complete
+
+### Available Agents
+| Agent | Purpose | When |
+|-------|---------|------|
+| `vibe-implementer` | Do implementation work | Each phase |
+| `integration-validator` | Build + test | After each phase |
+| `design-conformance` | Check spec alignment | After each phase |
+| `code-architecture-review` | Pattern review | After each phase |
