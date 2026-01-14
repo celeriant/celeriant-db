@@ -1,11 +1,12 @@
 use bincode::{Decode, Encode};
 use deepsize::DeepSizeOf;
 use crate::aggregate_key::{AggregateKey};
+use serde::{Deserialize, Serialize};
 
 /// Quick metadata about an aggregate. Used for aggregate discovery,
 /// the write path to track next indexes and read path to determine 
 /// available data
-#[derive(Debug, Clone, Encode, Decode, DeepSizeOf)]
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode, DeepSizeOf)]
 pub struct MetablockSnapshotAggregate {
     pub aggregate_key: AggregateKey,
 

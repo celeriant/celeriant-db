@@ -1,9 +1,10 @@
 use bincode::{Decode, Encode};
 use deepsize::DeepSizeOf;
+use serde::{Deserialize, Serialize};
 
 use crate::aggregate_key::AggregateKey;
 
-#[derive(Debug, Clone, Encode, Decode, DeepSizeOf)]
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode, DeepSizeOf)]
 pub struct MetablockSoftDelete {
     pub aggregate_key: AggregateKey,
     pub allow_recreate: bool,

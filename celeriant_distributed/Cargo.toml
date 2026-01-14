@@ -6,4 +6,6 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+celeriant_wal = { path = "../celeriant_wal" }
 bincode.workspace = true
+blake3.workspace = true

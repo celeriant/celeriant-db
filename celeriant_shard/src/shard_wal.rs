@@ -148,6 +148,9 @@ impl ShardWal {
             Request::ReplicationBatch(_) => Err(ShardError::Read(ShardReadError::IoError(
                 "ReplicationBatch requests not implemented yet".to_string(),
             ))),
+            Request::CatchUp(_) => Err(ShardError::Read(ShardReadError::IoError(
+                "CatchUp requests not implemented yet".to_string(),
+            ))),
         }
     }
 

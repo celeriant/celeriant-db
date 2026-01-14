@@ -4,7 +4,7 @@ use celeriant_wal::compression_type::CompressionType;
 use celeriant_wire::{constants::WIRE_FIXED_BODY_SIZE, wire_error::WireError, wire_header::WireHeader};
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
 
-use crate::response::responses::{ErrorResponse, ExistsResponse, ListAggregateTypesResponse, ListAggregatesResponse, ListOrgsResponse, ProtocolErrorResponse, ReadResponse, ReplicationBatchResponse, SuccessResponse, WatchResponse};
+use crate::response::responses::{CatchUpResponse, ErrorResponse, ExistsResponse, ListAggregateTypesResponse, ListAggregatesResponse, ListOrgsResponse, ProtocolErrorResponse, ReadResponse, ReplicationBatchResponse, SuccessResponse, WatchResponse};
 
 // Response type discriminants
 #[repr(u32)]
@@ -22,6 +22,7 @@ pub enum ResponseType {
     ListAggregateTypes = 10,
     ListAggregates = 11,
     ReplicationBatch = 12,
+    CatchUp = 13,
 }
 
 impl ResponseType {
@@ -39,6 +40,7 @@ impl ResponseType {
             10 => Ok(ResponseType::ListAggregateTypes),
             11 => Ok(ResponseType::ListAggregates),
             12 => Ok(ResponseType::ReplicationBatch),
+            13 => Ok(ResponseType::CatchUp),
             _ => Err(WireError::UnknownResponseType(value)),
         }
     }
@@ -72,6 +74,7 @@ pub enum Response {
     ListAggregateTypes(ListAggregateTypesResponse),
     ListAggregates(ListAggregatesResponse),
     ReplicationBatch(ReplicationBatchResponse),
+    CatchUp(CatchUpResponse),
 }
 
 impl Response {
@@ -89,6 +92,7 @@ impl Response {
             Response::ListAggregateTypes(_) => ResponseType::ListAggregateTypes,
             Response::ListAggregates(_) => ResponseType::ListAggregates,
             Response::ReplicationBatch(_) => ResponseType::ReplicationBatch,
+            Response::CatchUp(_) => ResponseType::CatchUp,
         }
     }
 
@@ -145,6 +149,9 @@ impl Response {
                 ResponseType::ListAggregates => {
                     Response::ListAggregates(wire_header.read_variable_size(reader, u64::MAX).await?)
                 }
+                ResponseType::CatchUp => {
+                    Response::CatchUp(wire_header.read_variable_size(reader, u64::MAX).await?)
+                }
                 _ => unreachable!(),
             }
         };
@@ -166,6 +173,7 @@ impl Response {
             Response::ListAggregateTypes(_) => CompressionType::Snappy,
             Response::ListAggregates(_) => CompressionType::Snappy,
             Response::ReplicationBatch(_) => CompressionType::None,
+            Response::CatchUp(_) => CompressionType::Snappy,
         }
     }
 
@@ -211,6 +219,9 @@ impl Response {
                 Response::ListAggregates(res) => {
                     WireHeader::write_variable_size(writer, res, response_type_id, compression_type, u64::MAX, version).await
                 }
+                Response::CatchUp(res) => {
+                    WireHeader::write_variable_size(writer, res, response_type_id, compression_type, u64::MAX, version).await
+                }
                 _ => unreachable!(),
             }
         }
@@ -224,8 +235,8 @@ mod tests {
     use futures_lite::{future::block_on, io::Cursor};
 
     // UPDATE THIS when adding new ResponseTypes - tests will fail if mismatched
-    const RESPONSE_TYPE_COUNT: usize = 12;
-    const RESPONSE_TYPE_MAX_ID: u32 = 12;
+    const RESPONSE_TYPE_COUNT: usize = 13;
+    const RESPONSE_TYPE_MAX_ID: u32 = 13;
 
     impl ResponseType {
         /// Returns all ResponseType variants. Adding a new variant without updating
@@ -244,6 +255,7 @@ mod tests {
                 ResponseType::ListAggregateTypes,
                 ResponseType::ListAggregates,
                 ResponseType::ReplicationBatch,
+                ResponseType::CatchUp,
             ]
         }
     }
@@ -296,6 +308,13 @@ mod tests {
             }),
             ResponseType::ReplicationBatch => Response::ReplicationBatch(ReplicationBatchResponse {
                 correlation_id: Some(113),
+                last_follower_metablock: None,
+                follower_timestamp_ms: 0,
+            }),
+            ResponseType::CatchUp => Response::CatchUp(CatchUpResponse {
+                correlation_id: Some(114),
+                batches: vec![],
+                continue_catching_up: false,
             }),
         }
     }

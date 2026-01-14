@@ -3,9 +3,10 @@ use crate::constants::BLOOM_BYTES;
 use crate::datablocks::datablock_aggregate_event_batch::DatablockAggregateEventBatch;
 use bincode::{Decode, Encode};
 use deepsize::DeepSizeOf;
+use serde::{Deserialize, Serialize};
 
 /// Per-aggregate metadata for each event batch, stored in metablocks
-#[derive(Debug, Clone, Encode, Decode, DeepSizeOf)]
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode, DeepSizeOf)]
 pub struct MetablockEventBatch {
     pub aggregate_key: AggregateKey,
     /// Server-assigned ID for this batch within the aggregate
@@ -31,7 +32,7 @@ pub struct MetablockEventBatch {
     pub event_types_data: EventTypesKind,
 }
 
-#[derive(Debug, Clone, Encode, Decode, DeepSizeOf)]
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode, DeepSizeOf)]
 pub enum EventTypesKind {
     /// Bloom filter bytes (when more than 4 unique event types)
     Bloom([u64; BLOOM_BYTES / 8]),

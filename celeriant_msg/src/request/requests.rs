@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use bincode::{Decode, Encode};
-use celeriant_wal::{aggregate_key::AggregateKey, compression_type::CompressionType, datablocks::datablock_aggregate_event::DatablockAggregateEvent};
+use celeriant_wal::{aggregate_key::AggregateKey, compression_type::CompressionType, datablocks::{datablock::Datablock, datablock_aggregate_event::DatablockAggregateEvent}, metablocks::metablock::Metablock};
 use serde::{Deserialize, Serialize};
 
 use crate::request::{read_filters::ReadFilters};
@@ -104,14 +104,32 @@ pub struct WatchRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct ReplicationBatchRequest {
     pub correlation_id: Option<u128>,
-    pub lease_index: u64,
     pub shard_id: u64,
+    /// Leader provides its current time to follower to catch clock drift
+    pub leader_timestamp_ms: u64,
+    /// Leader has decided to kick the follower
+    /// Follower won't rejoin until it's caught back up
+    pub follower_too_far_behind: bool,
+    /// If there are batches to replicate, they are provided to the follower
+    /// Otherwise it's just a heartbeat message
     pub batches: Vec<ReplicationBatchItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct ReplicationBatchItem {
-    pub wal_index: u64,
-    pub metablock_bytes: Vec<u8>,
-    pub datablock_bytes: Option<Vec<u8>>,
+    pub metablock: Metablock,
+    pub datablock: Option<Datablock>,
+}
+
+/// Follower-initiated protocol for pulling WAL entries during initial sync
+/// or after falling behind. Follower sends its current position and leader
+/// responds with entries up to max_entries.
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub struct CatchUpRequest {
+    pub correlation_id: Option<u128>,
+    pub shard_id: u64,
+    /// Follower current position in the WAL
+    /// Leader checks this with its WAL - is the hash chain for the wal index correct?
+    /// Is the follower caught up enough?
+    pub last_follower_metablock: Option<Metablock>,
 }

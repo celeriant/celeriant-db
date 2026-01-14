@@ -31,5 +31,6 @@ pub fn format_response(response: &Response) -> String {
         Response::ListAggregateTypes(r) => format!("ListAggregateTypes: {} types", r.aggregate_types.len()),
         Response::ListAggregates(r) => format!("ListAggregates: {} aggregates", r.aggregates.len()),
         Response::ReplicationBatch(_) => "ReplicationBatch: success".to_string(),
+        Response::CatchUp(_) => "CatchUp: success".to_string(),
     }
 }

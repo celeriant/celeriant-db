@@ -1,5 +1,6 @@
 use bincode::{Decode, Encode};
 use deepsize::DeepSizeOf;
+use serde::{Deserialize, Serialize};
 
 use crate::metablocks::{
     metablock_event_batch::MetablockEventBatch, metablock_snapshot_aggregate::MetablockSnapshotAggregate,
@@ -9,7 +10,7 @@ use crate::metablocks::{
 
 /// Different kinds of WAL metablocks, snapshots and event batch metadata
 /// All metablocks are fixed size 512 byte blocks
-#[derive(Debug, Clone, Encode, Decode, DeepSizeOf)]
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode, DeepSizeOf)]
 #[repr(u32)]
 pub enum MetablockKind {
     EventBatchMetadata(MetablockEventBatch) = 0,

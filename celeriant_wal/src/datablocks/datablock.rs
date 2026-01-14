@@ -1,5 +1,6 @@
 use bincode::{Decode, Encode};
 use deepsize::DeepSizeOf;
+use serde::{Deserialize, Serialize};
 
 use crate::datablocks::datablock_kind::DatablockKind;
 
@@ -7,7 +8,7 @@ use crate::datablocks::datablock_kind::DatablockKind;
 /// the middle of the file, eventually meeting with metablocks, then continuing to a new wal file
 /// Each datablock relies on the linked metablock for version + crc at the front 
 /// and for upgradability and protect against corruption/bitrot
-#[derive(Debug, Clone, Encode, Decode, DeepSizeOf)]
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode, DeepSizeOf)]
 pub struct Datablock {
     pub datablock_kind: DatablockKind,
 }

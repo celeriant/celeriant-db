@@ -2,12 +2,13 @@ use std::u128;
 
 use bincode::{Decode, Encode};
 use deepsize::DeepSizeOf;
+use serde::{Deserialize, Serialize};
 
 use crate::{aggregate_key::AggregateKey, constants::MINIBATCH_SIZE_BYTES, metablocks::{datablock_inline_data::DatablockInlineData, datablock_storage_kind::DatablockStorageKind, metablock_event_batch::{EventTypesKind, MetablockEventBatch}, metablock_kind::MetablockKind}};
 
 /// Metablocks are fixed size 512 byte blocks. They read fast and allow
 /// us to avoid pulling in large message payloads (stored in datablocks)
-#[derive(Debug, Clone, Encode, Decode, DeepSizeOf)]
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode, DeepSizeOf)]
 pub struct Metablock {
     /// WAL global index of this metablock
     pub wal_index: u64,

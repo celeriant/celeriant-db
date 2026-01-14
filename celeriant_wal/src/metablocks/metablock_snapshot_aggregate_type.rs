@@ -1,11 +1,12 @@
 use bincode::{Decode, Encode};
 use deepsize::DeepSizeOf;
+use serde::{Deserialize, Serialize};
 
 use crate::aggregate_type_key::AggregateTypeKey;
 
 /// TODO: Snapshot of an aggregate type definition at a point in time
 /// Could include things like schema definitions, settings, list of aggregates
-#[derive(Debug, Clone, Encode, Decode, DeepSizeOf)]
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode, DeepSizeOf)]
 pub struct MetablockSnapshotAggregateType {
     pub aggregate_type_key: AggregateTypeKey,
     pub has_schemas: bool,

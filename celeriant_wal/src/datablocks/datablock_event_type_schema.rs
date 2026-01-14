@@ -1,8 +1,9 @@
 use bincode::{Decode, Encode};
 use deepsize::DeepSizeOf;
+use serde::{Deserialize, Serialize};
 
 ///TODO: Track the schemas for each event type.
-#[derive(Debug, Clone, Encode, Decode, DeepSizeOf)]
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode, DeepSizeOf)]
 pub struct DatablockEventTypeSchema {
     /// Could be json, avro, protobuf, msgpack, etc.
     pub schema_type: u8,

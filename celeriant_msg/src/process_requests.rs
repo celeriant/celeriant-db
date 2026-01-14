@@ -2,7 +2,7 @@ use celeriant_wal::compression_type::CompressionType;
 use celeriant_wire::{constants::WIRE_FIXED_BODY_SIZE, wire_error::WireError, wire_header::WireHeader};
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
 
-use crate::request::requests::{DeleteRequest, ExistsRequest, ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest, ReadRequest, ReplicationBatchRequest, TrimStartRequest, WatchRequest, WriteRequest};
+use crate::request::requests::{CatchUpRequest, DeleteRequest, ExistsRequest, ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest, ReadRequest, ReplicationBatchRequest, TrimStartRequest, WatchRequest, WriteRequest};
 
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,6 +17,7 @@ pub enum RequestType {
     ListAggregateTypes = 8,
     ListAggregates = 9,
     ReplicationBatch = 10,
+    CatchUp = 11,
 }
 
 impl RequestType {
@@ -32,6 +33,7 @@ impl RequestType {
             8 => Ok(RequestType::ListAggregateTypes),
             9 => Ok(RequestType::ListAggregates),
             10 => Ok(RequestType::ReplicationBatch),
+            11 => Ok(RequestType::CatchUp),
             _ => Err(WireError::UnknownRequestType(value)),
         }
     }
@@ -64,6 +66,7 @@ pub enum Request {
     ListAggregateTypes(ListAggregateTypesRequest),
     ListAggregates(ListAggregatesRequest),
     ReplicationBatch(ReplicationBatchRequest),
+    CatchUp(CatchUpRequest),
 }
 
 impl Request {
@@ -79,6 +82,7 @@ impl Request {
             Request::ListAggregateTypes(_) => RequestType::ListAggregateTypes,
             Request::ListAggregates(_) => RequestType::ListAggregates,
             Request::ReplicationBatch(_) => RequestType::ReplicationBatch,
+            Request::CatchUp(_) => RequestType::CatchUp,
         }
     }
 
@@ -94,6 +98,7 @@ impl Request {
             Request::ListAggregateTypes(req) => req.correlation_id,
             Request::ListAggregates(req) => req.correlation_id,
             Request::ReplicationBatch(req) => req.correlation_id,
+            Request::CatchUp(req) => req.correlation_id,
         }
     }
 
@@ -111,6 +116,7 @@ impl Request {
             Request::ListAggregateTypes(_req) => 0,
             Request::ListAggregates(_req) => 0,
             Request::ReplicationBatch(_req) => 0,
+            Request::CatchUp(_req) => 0,
         }
     }
 
@@ -128,6 +134,7 @@ impl Request {
             Request::ListAggregateTypes(_req) => 0,
             Request::ListAggregates(_req) => 0,
             Request::ReplicationBatch(_req) => 0,
+            Request::CatchUp(_req) => 0,
         }
     }
 
@@ -145,6 +152,7 @@ impl Request {
             Request::ListAggregateTypes(_req) => 0,
             Request::ListAggregates(_req) => 0,
             Request::ReplicationBatch(_req) => 0,
+            Request::CatchUp(_req) => 0,
         }
     }
 
@@ -198,6 +206,11 @@ impl Request {
                         .await?,
                 ),
                 RequestType::ReplicationBatch => Request::ReplicationBatch(
+                    wire_header
+                        .read_variable_size(reader, max_request_size)
+                        .await?,
+                ),
+                RequestType::CatchUp => Request::CatchUp(
                     wire_header
                         .read_variable_size(reader, max_request_size)
                         .await?,
@@ -260,17 +273,28 @@ impl Request {
                     )
                     .await
                 }
+                Request::CatchUp(req) => {
+                    WireHeader::write_variable_size(
+                        writer,
+                        req,
+                        request_type_id,
+                        compression_type,
+                        max_message_size,
+                        version,
+                    )
+                    .await
+                }
                 _ => unreachable!(),
             }
         }
     }
 
     pub fn is_client_port_request(&self) -> bool {
-        !matches!(self, Request::ReplicationBatch(_))
+        !matches!(self, Request::ReplicationBatch(_) | Request::CatchUp(_))
     }
 
     pub fn is_replication_port_request(&self) -> bool {
-        matches!(self, Request::ReplicationBatch(_))
+        matches!(self, Request::ReplicationBatch(_) | Request::CatchUp(_))
     }
 
 }
@@ -281,11 +305,11 @@ mod tests {
     use celeriant_wal::aggregate_key::AggregateKey;
     use celeriant_wire::constants::{PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3};
     use futures_lite::{future::block_on, io::Cursor};
-    use crate::request::{read_filters::ReadFilters, requests::{ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest, ReplicationBatchRequest, SingleAggregateDelete, SingleAggregateWrite}};
+    use crate::request::{read_filters::ReadFilters, requests::{CatchUpRequest, ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest, ReplicationBatchRequest, SingleAggregateDelete, SingleAggregateWrite}};
 
     // UPDATE THIS when adding new RequestTypes - tests will fail if mismatched
-    const REQUEST_TYPE_COUNT: usize = 10;
-    const REQUEST_TYPE_MAX_ID: u32 = 10;
+    const REQUEST_TYPE_COUNT: usize = 11;
+    const REQUEST_TYPE_MAX_ID: u32 = 11;
 
     impl RequestType {
         /// Returns all RequestType variants. Adding a new variant without updating
@@ -302,6 +326,7 @@ mod tests {
                 RequestType::ListAggregateTypes,
                 RequestType::ListAggregates,
                 RequestType::ReplicationBatch,
+                RequestType::CatchUp,
             ]
         }
     }
@@ -395,9 +420,15 @@ mod tests {
             }),
             RequestType::ReplicationBatch => Request::ReplicationBatch(ReplicationBatchRequest {
                 correlation_id: Some(113),
-                lease_index: 1,
                 shard_id: 0,
+                leader_timestamp_ms: 0,
+                follower_too_far_behind: false,
                 batches: vec![],
+            }),
+            RequestType::CatchUp => Request::CatchUp(CatchUpRequest {
+                correlation_id: Some(114),
+                shard_id: 0,
+                last_follower_metablock: None,
             }),
         }
     }
