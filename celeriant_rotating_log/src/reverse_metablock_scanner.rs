@@ -76,15 +76,24 @@ impl<'a> ReverseMetablockScanner<'a> {
         E: std::fmt::Debug,
     {
         let log_segment_file = self.log_cache.get(self.current_log_id).await?;
-        
-        // Check bloom filter - skip entire log segment if aggregate definitely not present
-        if let Some(key) = self.bloom_filter_key {
-            if !log_segment_file.metadata.borrow().aggregate_key_bloom.may_contain(key) {
-                return Ok(None);
-            }
-        }
 
-        let metablock_position = log_segment_file.metadata.borrow().metablocks_position;
+        let metablock_position = {
+            let metadata = log_segment_file.metadata.borrow();
+            let read = match &metadata.read {
+                Some(r) => r,
+                None => return Ok(None),
+            };
+
+            // Check bloom filter - skip entire log segment if aggregate definitely not present
+            if let Some(key) = self.bloom_filter_key {
+                if !read.aggregate_key_bloom.may_contain(key) {
+                    return Ok(None);
+                }
+            }
+
+            read.metablocks_position
+        };
+
         let guard = log_segment_file.lock_reader("scan_single_log").await?;
         let dma_file = guard.as_ref().ok_or_else(|| RotatingLogError::IoError("No file handle".to_string()))?;
         let metablocks_start = HEADER_BLOCK_SIZE_BYTES as u64;

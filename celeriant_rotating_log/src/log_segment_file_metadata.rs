@@ -1,61 +1,49 @@
-use celeriant_wal::shard_log_header::ShardLogHeader;
+use celeriant_wal::{shard_log_header::ShardLogHeader};
 
-use crate::aggregate_key_bloom::AggregateKeyBloom;
-
+use crate::log_segment_cursor::LogSegmentCursor;
 
 #[derive(Clone)]
 pub struct LogSegmentFileMetadata {
     /// One based incremented log id
     pub log_id: u64,
-
     /// Size of log file, typically fixed but could be smaller if log is being truncated
     pub file_len: u64,
-
-    /// A metablock is 512 byte fixed size, written from the start of the file
-    /// This position indicates the end of the last written metablock entry
-    pub metablocks_position: u64,
-
-    /// The position where new variable length payloads can be written to
-    /// Note that event batches are written to end of the file
-    /// so this position indicates the start of the most recently written batches
-    pub datablocks_position: u64,
-
-    /// Shard-global WAL index representing the last written metablock
-    pub wal_index: u64,
-
+    /// Writer's view - most recent writes (not yet replicated)
+    pub write: LogSegmentCursor,
+    /// Reader's view - replicated and visible to readers
+    /// May be none if the read position is still on the previous log segment file
+    pub read: Option<LogSegmentCursor>,
+    /// Used in write path as datablock file writes are not Direct I/O aligned
     pub datablocks_carry_over: Option<Vec<u8>>,
-
-    pub aggregate_key_bloom: AggregateKeyBloom,
 }
 
 impl LogSegmentFileMetadata {
-
     pub fn available_space(&self) -> u64 {
-        self.datablocks_position.saturating_sub(self.metablocks_position)
+        self.write.datablocks_position.saturating_sub(self.write.metablocks_position)
     }
 
-    pub fn new(log_id: u64, file_len: u64, datablocks_carry_over: Option<Vec<u8>>, shard_log_header: &ShardLogHeader) -> Self {
-        let aggregate_key_bloom = AggregateKeyBloom::from_bytes(&shard_log_header.aggregate_bloom);
-
+    pub fn new(log_id: u64, file_len: u64, datablocks_carry_over: Option<Vec<u8>>, shard_log_header: &ShardLogHeader, advance_read: bool) -> Self {
         LogSegmentFileMetadata {
             log_id,
             file_len,
-            metablocks_position: shard_log_header.metablocks_position,
-            datablocks_position: shard_log_header.datablocks_position,
-            wal_index: shard_log_header.datablocks_position,
-            aggregate_key_bloom,
+            write: LogSegmentCursor::from_shard_log_header(log_id, shard_log_header),
+            read: if advance_read { Some(LogSegmentCursor::from_shard_log_header(log_id, shard_log_header)) } else { None },
             datablocks_carry_over,
         }
     }
 
-    /// Convert this metadata into a WAL `ShardLogHeader` suitable for writing to disk.
     #[must_use]
     pub fn to_shard_log_header(&self) -> ShardLogHeader {
-        ShardLogHeader {
-            metablocks_position: self.metablocks_position,
-            datablocks_position: self.datablocks_position,
-            wal_index: self.wal_index,
-            aggregate_bloom: self.aggregate_key_bloom.to_bytes(),
-        }
+        self.write.to_shard_log_header()
+    }
+
+    /// Advance visible position after successful replication (write -> read)
+    pub fn advance_visible_position(&mut self) {
+        self.read = Some(self.write.clone());
+    }
+
+    /// Returns true if write cursor is ahead of read cursor (pending replication)
+    pub fn is_pending_advance(&self) -> bool {
+        self.read.is_none() || self.write.wal_index > self.read.as_ref().unwrap().wal_index
     }
 }

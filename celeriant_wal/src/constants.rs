@@ -13,3 +13,5 @@ pub const FIRST_EVENT_BATCH_INDEX: u64 = 1;
 pub const AGGREGATE_BLOOM_BYTES: usize = 256 * 1024; // 2^18 (256KB) gives <1% chance for 200k entries per shard log segment
 pub const AGGREGATE_BLOOM_HASH_COUNT: u32 = 10;
 pub const AGGREGATE_BLOOM_HASH_SEED: u128 = 987654321098765432109876543210987u128;
+pub type EntryHashBytes = [u8; 32];
+pub const GENESIS_HASH: EntryHashBytes = [0u8; 32];

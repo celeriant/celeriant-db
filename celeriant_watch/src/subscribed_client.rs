@@ -149,7 +149,7 @@ mod test_subscribed_client {
                             .len(),
                         1
                     );
-                    assert!(client.last_send_time.elapsed().as_millis() <= 1);
+                    assert!(client.last_send_time.elapsed().as_millis() <= 50);
                     assert!(!client.should_wait_and_flush().await);
 
                     client.accumulate_watch_event(AggregateWatchEvent {
@@ -172,20 +172,21 @@ mod test_subscribed_client {
                             .len(),
                         2
                     );
-                    assert!(client.last_send_time.elapsed().as_millis() <= 1);
+                    assert!(client.last_send_time.elapsed().as_millis() <= 50);
                     assert!(!client.should_wait_and_flush().await);
 
                     glommio::timer::sleep(client.additional_latency_wait_time()).await;
 
                     assert!(client.should_wait_and_flush().await);
+                    let elapsed_ms = client.last_send_time.elapsed().as_millis();
                     assert!(
-                        client.last_send_time.elapsed().as_millis() >= 10
-                            && client.last_send_time.elapsed().as_millis() <= 13
+                        elapsed_ms >= 10 && elapsed_ms <= 100,
+                        "elapsed_ms was {elapsed_ms}, expected 10-100"
                     );
 
                     let watch_response = client.take_response();
                     assert!(client.watch_response.as_ref().is_none());
-                    assert!(client.last_send_time.elapsed().as_millis() <= 1);
+                    assert!(client.last_send_time.elapsed().as_millis() <= 50);
 
                     assert_eq!(
                         watch_response

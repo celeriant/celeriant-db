@@ -7,35 +7,43 @@ description: Enables autonomous exploration mode. Use when working in a scratch/
 
 **This skill is activated explicitly.** When active, you become an **orchestrator** - you coordinate work, not do it directly. Implementation happens in sub-agents with isolated contexts.
 
-Your code will never be merged directly. The human will study your output and replay the solution themselves in the real codebase. See `vibe-manifesto.md` for the philosophy.
+Your code will never be merged directly. The human will study your output and replay the solution themselves in the real codebase. See `human-replay-manifesto.md` for the philosophy.
 
-## Architecture: Orchestrator + Implementer
+## Architecture: Orchestrator + Workers
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                    ORCHESTRATOR (you)                       │
 │  - Lightweight coordination context                         │
 │  - Reads/updates SESSION_STATE.md                           │
-│  - Plans phases from spec                                   │
+│  - Spawns researcher for upfront exploration                │
+│  - Plans phases from spec + research findings               │
 │  - Spawns implementer for each phase                        │
 │  - Runs validation agents after each phase                  │
 │  - Commits after each phase                                 │
 │  - Updates progress log                                     │
 └──────────────────────────┬──────────────────────────────────┘
                            │
-         ┌─────────────────┼─────────────────┐
-         ▼                 ▼                 ▼
-┌─────────────┐   ┌─────────────┐   ┌─────────────┐
-│ vibe-       │   │ design-     │   │ integration │
-│ implementer │   │ conformance │   │ -validator  │
-│             │   │             │   │             │
-│ Does work   │   │ Checks spec │   │ Runs tests  │
-│ in isolated │   │ alignment   │   │             │
-│ context     │   │             │   │             │
-└─────────────┘   └─────────────┘   └─────────────┘
+    ┌──────────────────────┼──────────────────────┐
+    │                      │                      │
+    ▼                      ▼                      ▼
+┌─────────────┐   ┌─────────────────┐   ┌─────────────────┐
+│ vibe-       │   │ vibe-           │   │ validation      │
+│ researcher  │   │ implementer     │   │ agents          │
+│             │   │                 │   │                 │
+│ Explores    │   │ Does work       │   │ design-         │
+│ codebase,   │   │ in isolated     │   │ conformance,    │
+│ gathers     │   │ context         │   │ integration-    │
+│ context     │   │                 │   │ validator,      │
+│             │   │                 │   │ code-arch       │
+└─────────────┘   └─────────────────┘   └─────────────────┘
+     ↓                    ↓                      ↓
+  Research           Each phase            After each
+  phase (once)       of work               phase
 ```
 
 **Why this architecture:**
+- Researcher explores first - you get context without filling your orchestrator context
 - Implementer context is isolated - doesn't fill up your orchestrator context
 - Each phase starts with fresh implementer context
 - You stay lightweight and focused on coordination
@@ -104,16 +112,58 @@ Phase 3: Wire protocol implementation
 - Tests: ✓ (3 passing, 1 skipped)
 ```
 
-### 2. Phase Planning
+### 2. Research Phase (Before Implementation)
 
-Before spawning implementers, plan the work:
+Before planning implementation phases, spawn the researcher to explore the codebase:
+
+```
+Task(
+    subagent_type="vibe-researcher",
+    prompt="""
+    ## Research Objective
+    [What you need to understand before implementing]
+
+    ## Design Spec
+    - Location: docs/[spec].md
+    - Relevant sections: [list sections]
+
+    ## Questions to Answer
+    - Where should this functionality live?
+    - What existing patterns should we follow?
+    - What interfaces/modules will we integrate with?
+    - Are there similar features to reference?
+
+    ## Focus Areas
+    - [specific area 1]
+    - [specific area 2]
+    """
+)
+```
+
+**When to use the researcher:**
+- Starting a new feature (always)
+- Unfamiliar with the codebase area
+- Need to understand existing patterns
+- Integration points are unclear
+
+**Skip research when:**
+- Continuing a well-understood session (SESSION_STATE.md has full context)
+- Simple bug fix with known location
+- Adding to code you just wrote
+
+The researcher returns structured findings that inform your phase planning.
+
+### 3. Phase Planning
+
+After research (or reading SESSION_STATE.md for continuations), plan the work:
 
 1. Read SESSION_STATE.md to know current position
 2. Read relevant spec section
-3. Break remaining work into phases (2-4 hours of work each)
-4. Each phase should be independently committable
+3. Review researcher findings (if research was done)
+4. Break remaining work into phases (2-4 hours of work each)
+5. Each phase should be independently committable
 
-### 3. Phase Execution Loop
+### 4. Phase Execution Loop
 
 For each phase, execute this loop **exactly**:
 
@@ -207,8 +257,8 @@ Implement serialization/deserialization for ReplicationBatch messages.
 
 ## Context
 - Design spec: docs/s3-design.md, section 3.2 "Wire Protocol"
-- Prior work: Batch struct exists in celeriant_shard/src/batch.rs
-- Key files: celeriant_wire/src/messages.rs, celeriant_wire/src/codec.rs
+- Prior work: Batch struct exists in src/batch.rs
+- Key files: src/messages.rs, src/codec.rs
 
 ## Scope
 DO:
@@ -225,7 +275,7 @@ DO NOT:
 - Use the existing codec infrastructure
 
 ## Success Criteria
-- cargo test in celeriant_wire passes
+- unit tests in wire passes
 - New test: replication_batch_roundtrip
 ```
 
@@ -310,16 +360,25 @@ Then create SESSION_STATE.md and begin phase planning.
 ### You Are the Orchestrator
 
 - **Don't implement directly** - Spawn implementers
-- **Don't read lots of code** - Implementers do that
+- **Don't read lots of code** - Researcher and implementers do that
 - **Don't debug deeply** - Spawn implementers to investigate
+- **Do spawn researcher** - Before planning new features
 - **Do track state** - SESSION_STATE.md is your responsibility
 - **Do run validations** - After every phase
 - **Do commit** - After every successful phase
 - **Do update docs** - After every phase
 
+### Researcher Handles
+
+- Codebase exploration
+- Pattern discovery
+- Finding integration points
+- External documentation lookup
+- Providing context for planning
+
 ### Implementer Handles
 
-- Code reading and exploration
+- Reading code relevant to current phase
 - Writing new code
 - Debugging and fixing
 - Following stub management
@@ -327,8 +386,9 @@ Then create SESSION_STATE.md and begin phase planning.
 
 ### You Handle
 
-- Phase planning
-- Spawning implementers with clear prompts
+- Deciding when research is needed
+- Phase planning (informed by research)
+- Spawning researcher and implementers with clear prompts
 - Running validation agents
 - Committing changes
 - Updating SESSION_STATE.md
@@ -349,6 +409,12 @@ Return to normal careful mode when:
 
 ## Quick Reference
 
+### Session Start Checklist
+- [ ] Read SESSION_STATE.md (if exists) or gather requirements
+- [ ] Spawn researcher (if new feature or unfamiliar area)
+- [ ] Plan phases based on spec + research findings
+- [ ] Create/update SESSION_STATE.md with plan
+
 ### Phase Loop Checklist
 - [ ] Spawn implementer with specific prompt
 - [ ] Run ALL THREE validation agents (parallel, single message)
@@ -361,6 +427,7 @@ Return to normal careful mode when:
 ### Available Agents
 | Agent | Purpose | When |
 |-------|---------|------|
+| `vibe-researcher` | Explore codebase, gather context | Before planning (new features) |
 | `vibe-implementer` | Do implementation work | Each phase |
 | `integration-validator` | Build + test | After each phase |
 | `design-conformance` | Check spec alignment | After each phase |

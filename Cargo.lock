@@ -500,6 +500,7 @@ name = "celeriant_shard"
 version = "0.1.0"
 dependencies = [
  "celeriant_disk",
+ "celeriant_distributed",
  "celeriant_memcache",
  "celeriant_msg",
  "celeriant_rotating_log",

@@ -218,9 +218,8 @@ pub fn determine_shard(
     let num_shards = config.num_shards as u128;
 
     match request {
-        Request::ReplicationBatch(req) => {
-            validate_shard_id(req.shard_id, num_shards)
-        }
+        Request::ReplicationBatch(req) => validate_shard_id(req.shard_id, num_shards),
+        Request::CatchUp(req) => validate_shard_id(req.shard_id, num_shards),
         Request::Watch(req) if port_type == PortType::Client => {
             determine_shard_watch(req, config)
         }
@@ -522,9 +521,9 @@ mod tests {
     use celeriant_msg::request::{
         read_filters::ReadFilters,
         requests::{
-            DeleteRequest, ExistsRequest, ListAggregateTypesRequest, ListAggregatesRequest,
-            ListOrgsRequest, ReadRequest, ReplicationBatchRequest, SingleAggregateDelete,
-            SingleAggregateWrite, TrimStartRequest, WriteRequest,
+            CatchUpRequest, DeleteRequest, ExistsRequest, ListAggregateTypesRequest,
+            ListAggregatesRequest, ListOrgsRequest, ReadRequest, ReplicationBatchRequest,
+            SingleAggregateDelete, SingleAggregateWrite, TrimStartRequest, WriteRequest,
         },
     };
     use celeriant_shard::timestamp_config::TimestampPrecision;
@@ -585,9 +584,11 @@ mod tests {
     fn port_validation_replication_requests() {
         let repl = Request::ReplicationBatch(ReplicationBatchRequest {
             correlation_id: None,
-            lease_index: 0,
             shard_id: 0,
             batches: vec![],
+            leader_timestamp_ms: 0,
+            follower_too_far_behind: false,
+            expected_follower_tip_hash: None,
         });
         assert!(!is_valid_for_port(&repl, PortType::Client));
         assert!(is_valid_for_port(&repl, PortType::Replication));
@@ -632,9 +633,11 @@ mod tests {
         let config = test_config(4, crate::RoutingRule::AggregateId);
         let request = Request::ReplicationBatch(ReplicationBatchRequest {
             correlation_id: None,
-            lease_index: 0,
             shard_id: 2,
+            leader_timestamp_ms: 0,
+            follower_too_far_behind: false,
             batches: vec![],
+            expected_follower_tip_hash: None,
         });
         let shard = determine_shard(&request, &config, PortType::Replication).unwrap();
         assert_eq!(shard, 2);
@@ -645,9 +648,37 @@ mod tests {
         let config = test_config(4, crate::RoutingRule::AggregateId);
         let request = Request::ReplicationBatch(ReplicationBatchRequest {
             correlation_id: None,
-            lease_index: 0,
             shard_id: 10,
+            leader_timestamp_ms: 0,
+            follower_too_far_behind: false,
             batches: vec![],
+            expected_follower_tip_hash: None,
+        });
+        let result = determine_shard(&request, &config, PortType::Replication);
+        assert!(matches!(result, Err(ShardRoutingError::IncompatibleFilters(_))));
+    }
+
+    #[test]
+    fn routing_catchup_uses_explicit_shard_id() {
+        let config = test_config(4, crate::RoutingRule::AggregateId);
+        let request = Request::CatchUp(CatchUpRequest {
+            correlation_id: None,
+            shard_id: 2,
+            last_follower_metablock: None,
+            follower_tip_hash: None,
+        });
+        let shard = determine_shard(&request, &config, PortType::Replication).unwrap();
+        assert_eq!(shard, 2);
+    }
+
+    #[test]
+    fn routing_catchup_invalid_shard_id() {
+        let config = test_config(4, crate::RoutingRule::AggregateId);
+        let request = Request::CatchUp(CatchUpRequest {
+            correlation_id: None,
+            shard_id: 10,
+            last_follower_metablock: None,
+            follower_tip_hash: None,
         });
         let result = determine_shard(&request, &config, PortType::Replication);
         assert!(matches!(result, Err(ShardRoutingError::IncompatibleFilters(_))));

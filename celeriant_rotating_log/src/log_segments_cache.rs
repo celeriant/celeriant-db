@@ -2,7 +2,7 @@ use celeriant_wal::constants::HEADER_BLOCK_SIZE_BYTES;
 use lru::LruCache;
 use std::{cell::{Cell, RefCell}, num::NonZeroUsize, path::PathBuf, rc::Rc};
 
-use crate::{log_segment_file::LogSegmentFile, rotating_log_error::RotatingLogError};
+use crate::{log_segment_cursor::LogSegmentCursor, log_segment_file::LogSegmentFile, rotating_log_error::RotatingLogError};
 
 /// Manages DmaFile handles for a shard with LRU caching.
 /// "Active File" file is the current log being written to
@@ -25,6 +25,83 @@ pub struct LogSegmentsCache {
 
 impl LogSegmentsCache {
 
+    /// Rollback write position after failed replication (read -> write)
+    /// This is done here because it's possible the write is on a new rotated log file
+    /// and read is still at the previous log file.
+    pub fn rollback_write_position(&mut self) {
+        let active_log_id = self.active_log_id();
+        let prev_log_id = active_log_id.saturating_sub(1);
+
+        // Check if read position is on active file
+        let read_on_active = {
+            let active_file = self.active_file.borrow();
+            active_file.metadata.borrow().read.is_some()
+        };
+
+        if read_on_active {
+            let active_file = self.active_file.borrow();
+            let mut metadata = active_file.metadata.borrow_mut();
+            metadata.write = metadata.read.clone().unwrap();
+            return;
+        }
+
+        // Read position is still on a previous log file
+        // Get cursor from previous file: prefer read, fallback to write
+        let prev_cursor = {
+            self.lru_cache.borrow_mut()
+                .get(&prev_log_id)
+                .map(|prev_file| {
+                    let metadata = prev_file.metadata.borrow();
+                    metadata.read.clone().unwrap_or_else(|| metadata.write.clone())
+                })
+        };
+
+        // Reset active file - use previous cursor state if available, otherwise fresh
+        {
+            let active_file = self.active_file.borrow();
+            let mut metadata = active_file.metadata.borrow_mut();
+            
+            metadata.write = LogSegmentCursor {
+                log_id: metadata.log_id,
+                metablocks_position: HEADER_BLOCK_SIZE_BYTES as u64,
+                datablocks_position: metadata.file_len.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64),
+                wal_index: prev_cursor.as_ref().map_or(0, |c| c.wal_index),
+                aggregate_key_bloom: prev_cursor.as_ref().map_or_else(Default::default, |c| c.aggregate_key_bloom.clone()),
+                tip_hash: prev_cursor.as_ref().map_or(Default::default(), |c| c.tip_hash),
+            };
+        }
+
+        // Reset the previous log file's write position
+        if let Some(prev_cursor) = prev_cursor {
+            if let Some(prev_file) = self.lru_cache.borrow_mut().get(&prev_log_id) {
+                prev_file.metadata.borrow_mut().write = prev_cursor;
+            }
+        }
+    }
+
+    /// Gets the read position metadata - from active file, or if we just rotated and
+    /// the read positions are still in the previous log segment file, returns that instead
+    pub fn get_latest_read_cursor(&self) -> LogSegmentCursor {
+        let (read_cursor, write_cursor, prev_log_id) = {
+            let active_file = self.active_file.borrow();
+            let metadata = active_file.metadata.borrow();
+            (metadata.read.clone(), metadata.write.clone(), metadata.log_id.saturating_sub(1))
+        };
+
+        if let Some(read) = read_cursor {
+            return read;
+        }
+
+        // Read is still on previous log file, fallback to write if not found
+        self.lru_cache.borrow_mut()
+            .get(&prev_log_id)
+            .map(|prev_file| {
+                let metadata = prev_file.metadata.borrow();
+                metadata.read.clone().unwrap_or_else(|| metadata.write.clone())
+            })
+            .unwrap_or(write_cursor)
+    }
+
     pub async fn rotate_to_next_log(&self, required_disk_space: u64) -> Result<bool, RotatingLogError> {
 
         let (current_log_id, available_space) = {
@@ -44,7 +121,7 @@ impl LogSegmentsCache {
 
         let active_log_id = current_log_id.saturating_add(1);
 
-        let new_log_segment_file = Rc::new(LogSegmentFile::open_or_create(&self.shard_dir, self.preallocate_bytes, active_log_id).await?);
+        let new_log_segment_file = Rc::new(LogSegmentFile::open_or_create(&self.shard_dir, self.preallocate_bytes, active_log_id, false).await?);
 
         let mut current_log_segment_cache = self.active_file.borrow_mut();
         let old = std::mem::replace(&mut *current_log_segment_cache, new_log_segment_file);
@@ -66,7 +143,7 @@ impl LogSegmentsCache {
             .map_err(|e| RotatingLogError::IoError(e.to_string()))?
             .unwrap_or(FIRST_LOG_ID);
 
-        let active_file = LogSegmentFile::open_or_create(&shard_dir, preallocate_bytes, active_log_id).await?;
+        let active_file = LogSegmentFile::open_or_create(&shard_dir, preallocate_bytes, active_log_id, true).await?;
 
         let cache_cap = NonZeroUsize::new(max_cached_files.max(1)).unwrap();
         Ok(Self {

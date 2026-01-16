@@ -14,6 +14,7 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use celeriant_disk::files::read_objects_absolute;
+use celeriant_memcache::cache_path::CachePath;
 use celeriant_memcache::mem_snapshot_aggregate::{AggregateStatus, MemSnapshotAggregate};
 use celeriant_memcache::metablock_position::MetablockPosition;
 use celeriant_memcache::shard_log_queue_item::ShardLogQueueItem;
@@ -579,11 +580,15 @@ impl ShardWal {
     /// Find the starting position for a list scan.
     /// 
     /// Tries to use cached position if available, otherwise starts from active log.
-    async fn find_list_scan_start(&self, target_wal_index: u64) -> (u64, Option<u64>) {
+    async fn find_list_scan_start(&self, mut target_wal_index: u64) -> (u64, Option<u64>) {
         // If no cursor (starting from latest), just use active log
         if target_wal_index == u64::MAX {
             return (self.log_segments_cache.active_log_id(), None);
         }
+
+        // Make sure we can't read the write tip, only from committed read positions
+        let read_cursor = self.log_segments_cache.get_latest_read_cursor();
+        target_wal_index = target_wal_index.min(read_cursor.wal_index);
 
         // Try to find cached position at or near target
         let cached = self.shard_mem_cache.borrow_mut().find_nearest_wal_index_position(target_wal_index);
@@ -598,11 +603,11 @@ impl ShardWal {
         }
 
         // No useful cache hit, start from active log
-        (self.log_segments_cache.active_log_id(), None)
+        (read_cursor.log_id, None)
     }
     
     pub async fn exists(&self, exists_request: &ExistsRequest) -> Result<ExistsResponse, ShardReadError> {
-        let exists = self.aggregate_exists_and_cache(&exists_request.aggregate_key).await?;
+        let exists = self.aggregate_exists_and_cache(&exists_request.aggregate_key, CachePath::Read).await?;
         if !exists {
             return Ok(ExistsResponse {
                 correlation_id: exists_request.correlation_id,
@@ -613,7 +618,7 @@ impl ShardWal {
         let last_known_metablock = self
             .shard_mem_cache
             .borrow_mut()
-            .get_aggregate_last_metablock_pos(&exists_request.aggregate_key);
+            .get_aggregate_last_metablock_pos(&exists_request.aggregate_key, CachePath::Read);
 
         Ok(ExistsResponse {
             correlation_id: exists_request.correlation_id,
@@ -625,11 +630,11 @@ impl ShardWal {
         let aggregate_key = &trim_request.aggregate_key;
 
         // Ensure aggregate exists
-        if !self.aggregate_exists_and_cache(aggregate_key).await? {
+        if !self.aggregate_exists_and_cache(aggregate_key, CachePath::Write).await? {
             return Err(ShardWriteError::AggregateNotExists);
         }
 
-        let current_indexes = self.shard_mem_cache.borrow_mut().get_event_indexes(aggregate_key);
+        let current_indexes = self.shard_mem_cache.borrow_mut().get_write_event_indexes(aggregate_key);
 
         // Validate trim index is within valid range
         if trim_request.keep_from_event_batch_index <= current_indexes.min_event_batch_index {
@@ -695,11 +700,11 @@ impl ShardWal {
         let mut prepared_deletes = Vec::with_capacity(delete_request.deletes.len());
         for (aggregate_key, single_delete) in &delete_request.deletes {
             // Ensure aggregate snapshot is in memcache, loading from disk if necessary
-            if !self.aggregate_exists_and_cache(aggregate_key).await? {
+            if !self.aggregate_exists_and_cache(aggregate_key, CachePath::Write).await? {
                 return Err(ShardWriteError::AggregateNotExists);
             }
 
-            let aggregate_current_indexes = self.shard_mem_cache.borrow_mut().get_event_indexes(aggregate_key);
+            let aggregate_current_indexes = self.shard_mem_cache.borrow_mut().get_write_event_indexes(aggregate_key);
 
             // Validate optimistic concurrency
             if let Some(expected) = single_delete.expected_event_batch_index {
@@ -797,13 +802,13 @@ impl ShardWal {
 
             // Ensure aggregate snapshot is in memcache, loading from disk if necessary
             // Returns true for Found, false for NotFound/Deleted
-            let aggregate_exists = self.aggregate_exists_and_cache(aggregate_key).await?;
+            let aggregate_exists = self.aggregate_exists_and_cache(aggregate_key, CachePath::Write).await?;
             
             if !aggregate_exists {
                 // Check if it was deleted with allow_recreate = false
-                let (is_loaded, status) = self.shard_mem_cache.borrow_mut().aggregate_load_status(aggregate_key);
+                let (is_loaded, status) = self.shard_mem_cache.borrow_mut().aggregate_load_status(aggregate_key, CachePath::Write);
                 if is_loaded && status == AggregateStatus::Deleted {
-                    let indexes = self.shard_mem_cache.borrow_mut().get_event_indexes(aggregate_key);
+                    let indexes = self.shard_mem_cache.borrow_mut().get_write_event_indexes(aggregate_key);
                     if !indexes.allow_recreate {
                         return Err(ShardWriteError::AggregateRecreateNotAllowed);
                     }
@@ -851,11 +856,11 @@ impl ShardWal {
         let max_bytes = self.config.max_response_size as u64;
 
         // 1. Ensure aggregate exists and is cached
-        if !self.aggregate_exists_and_cache(aggregate_key).await? {
+        if !self.aggregate_exists_and_cache(aggregate_key, CachePath::Read).await? {
             return Err(ShardReadError::AggregateNotExists);
         }
 
-        let last_known = self.shard_mem_cache.borrow_mut().get_aggregate_last_metablock_pos(aggregate_key);
+        let last_known = self.shard_mem_cache.borrow_mut().get_aggregate_last_metablock_pos(aggregate_key, CachePath::Read);
 
         // 2. Validate requested range is available (not trimmed)
         if filters.from_event_batch_index < last_known.min_event_batch_index {
@@ -914,7 +919,7 @@ impl ShardWal {
             return Ok(());
         }
 
-        let last_known_metablock = self.shard_mem_cache.borrow_mut().get_aggregate_last_metablock_pos(aggregate_key);
+        let last_known_metablock = self.shard_mem_cache.borrow_mut().get_aggregate_last_metablock_pos(aggregate_key, CachePath::Write);
 
         // Begin the search from the last_known_metablock, moving backwards
         let mut scanner = ReverseMetablockScanner::new(
@@ -957,15 +962,15 @@ impl ShardWal {
         let found = find_result.unwrap_or(false);
         if !found {
             let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
-            shard_mem_cache.put_aggregate_into_cache_as_not_found(aggregate_key.clone());
+            shard_mem_cache.put_aggregate_into_cache_as_not_found(aggregate_key.clone(), CachePath::Write);
         }
 
         Ok(())
     }
 
-    async fn aggregate_exists_and_cache(&self, searching_for_aggregate_key: &AggregateKey) -> Result<bool, ShardCacheError> {
+    async fn aggregate_exists_and_cache(&self, searching_for_aggregate_key: &AggregateKey, cache_path: CachePath) -> Result<bool, ShardCacheError> {
         // If we are cached already
-        if let (true, status) = self.shard_mem_cache.borrow_mut().aggregate_load_status(searching_for_aggregate_key) {
+        if let (true, status) = self.shard_mem_cache.borrow_mut().aggregate_load_status(searching_for_aggregate_key, cache_path) {
             return Ok(status == AggregateStatus::Found);
         }
 
@@ -974,9 +979,17 @@ impl ShardWal {
         let _ = write_with_timeout(&aggregate_lock, "move_aggregate_to_memcache").await?;
 
         // We have exclusive access now, check if another concurrent task has already done the work
-        if let (true, status) = self.shard_mem_cache.borrow_mut().aggregate_load_status(searching_for_aggregate_key) {
+        if let (true, status) = self.shard_mem_cache.borrow_mut().aggregate_load_status(searching_for_aggregate_key, cache_path) {
             return Ok(status == AggregateStatus::Found);
         }
+
+        let (starting_log_id, start_from_postion) = match cache_path {
+            CachePath::Read => {
+                let read_cursor = self.log_segments_cache.get_latest_read_cursor();
+                (read_cursor.log_id, Some(read_cursor.metablocks_position))
+            },
+            CachePath::Write => (self.log_segments_cache.active_log_id(), None),
+        };
 
         // Track if we've seen a more recent trim
         let mut seen_trim_min: Option<u64> = None;
@@ -984,8 +997,8 @@ impl ShardWal {
         // Begin the search from the active log, moving backwards
         let mut scanner = ReverseMetablockScanner::new(
             &self.log_segments_cache,
-            self.log_segments_cache.active_log_id(),
-            None,
+            starting_log_id,
+            start_from_postion,
             self.config.read_max_chunk_size,
         )
         .with_bloom_filter(searching_for_aggregate_key);
@@ -1006,6 +1019,7 @@ impl ShardWal {
                             soft_delete.event_batch_index,
                             soft_delete.allow_recreate,
                             soft_delete.allow_index_continuation,
+                            cache_path,
                         );
                     }
                     return Ok(Some(false)); // Found but deleted
@@ -1032,7 +1046,7 @@ impl ShardWal {
                 let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
 
                 // Not the aggregate we are searching for. Can we eager cache it? If not, skip it.
-                if low_priority && shard_mem_cache.is_aggregate_snapshot_full_or_contains(&current_aggregate_key) {
+                if low_priority && shard_mem_cache.is_aggregate_snapshot_full_or_contains(&current_aggregate_key, cache_path) {
                     return Ok(None);
                 }
 
@@ -1058,7 +1072,7 @@ impl ShardWal {
                 let client_id = metablock_bytes::read_event_batch_client_id(metablock_bytes);
                 let last_client_event_index = metablock_bytes::read_event_batch_max_client_event_index(metablock_bytes);
 
-                shard_mem_cache.put_aggregate_into_cache(current_aggregate_key, snapshot, client_id, last_client_event_index, low_priority);
+                shard_mem_cache.put_aggregate_into_cache(current_aggregate_key, snapshot, client_id, last_client_event_index, low_priority, cache_path);
 
                 if low_priority {
                     Ok(None) //Haven't found aggregate yet
@@ -1072,7 +1086,7 @@ impl ShardWal {
         if find_result.is_none() {
             // Never found any metablock for this aggregate
             let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
-            shard_mem_cache.put_aggregate_into_cache_as_not_found(searching_for_aggregate_key.clone());
+            shard_mem_cache.put_aggregate_into_cache_as_not_found(searching_for_aggregate_key.clone(), cache_path);
         }
 
         Ok(found)
@@ -1103,7 +1117,7 @@ impl ShardWal {
             }
         }
 
-        let aggregate_current_indexes = shard_mem_cache.get_event_indexes(aggregate_key);
+        let aggregate_current_indexes = shard_mem_cache.get_write_event_indexes(aggregate_key);
 
         // There is a soft delete entry in the queue that hasn't been committed yet
         if aggregate_current_indexes.pending_delete {
@@ -1359,9 +1373,10 @@ impl ShardWal {
         evicted_batch_index: &mut Option<u64>,
     ) {
         let shard_mem_cache = self.shard_mem_cache.borrow();
+        let log_segments_cache = self.log_segments_cache.get_latest_read_cursor();
 
         // Cache iterates forward (ascending batch index) from from_event_batch_index
-        for (batch_idx, write) in shard_mem_cache.get_cached_writes_from(aggregate_key, filters.from_event_batch_index) {
+        for (batch_idx, write) in shard_mem_cache.get_cached_writes_from(aggregate_key, filters.from_event_batch_index, log_segments_cache.wal_index) {
             // Stop if past upper bound
             if filters.to_event_batch_index.map_or(false, |to| batch_idx > to) {
                 break;

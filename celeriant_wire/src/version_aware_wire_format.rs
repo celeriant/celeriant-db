@@ -101,7 +101,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use celeriant_wal::{aggregate_key::AggregateKey, buffer_read::{read_option_u128_le, read_u64_le, read_u128_le}, constants::{FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, WIRE_SIZE_ENUM_DISCRIMINANT}, metablocks::{metablock_event_batch::MetablockEventBatch, metablock_snapshot_aggregate::MetablockSnapshotAggregate, metablock_snapshot_org::MetablockSnapshotOrg}, shard_log_header::ShardLogHeader};
+    use celeriant_wal::{aggregate_key::AggregateKey, buffer_read::{read_option_u128_le, read_u64_le, read_u128_le}, constants::{FIXED_BLOCK_SIZE_BYTES, GENESIS_HASH, HEADER_BLOCK_SIZE_BYTES, WIRE_SIZE_ENUM_DISCRIMINANT}, metablocks::{metablock_event_batch::MetablockEventBatch, metablock_snapshot_aggregate::MetablockSnapshotAggregate, metablock_snapshot_org::MetablockSnapshotOrg}, shard_log_header::ShardLogHeader};
 
     fn indexing_metablock_event_batch() -> Metablock {
         Metablock {
@@ -298,6 +298,7 @@ mod tests {
             datablocks_position: 0xFEDC_BA98_7654_3210,
             wal_index: 0x0FED_CBA9_8765_4321,
             aggregate_bloom: vec![],
+            tip_hash: GENESIS_HASH,
         };
 
         let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
@@ -321,11 +322,18 @@ mod tests {
 
     #[test]
     fn shard_log_header_roundtrip() {
+        let tip_hash = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
+            0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10,
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+            0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00,
+        ];
         let header = ShardLogHeader {
             metablocks_position: 11,
             datablocks_position: 12,
             wal_index: 13,
             aggregate_bloom: vec![],
+            tip_hash,
         };
 
         let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
@@ -337,6 +345,7 @@ mod tests {
         assert_eq!(deserialized.metablocks_position, header.metablocks_position);
         assert_eq!(deserialized.datablocks_position, header.datablocks_position);
         assert_eq!(deserialized.wal_index, header.wal_index);
+        assert_eq!(deserialized.tip_hash, header.tip_hash);
     }
 
     #[test]
@@ -346,6 +355,7 @@ mod tests {
             datablocks_position: 12,
             wal_index: 13,
             aggregate_bloom: vec![],
+            tip_hash: GENESIS_HASH,
         };
 
         let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
@@ -365,6 +375,7 @@ mod tests {
             datablocks_position: 0x2222_2222_2222_2222,
             wal_index: 0x3333_3333_3333_3333,
             aggregate_bloom: vec![],
+            tip_hash: GENESIS_HASH,
         };
 
         let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
@@ -387,6 +398,7 @@ mod tests {
             datablocks_position: 12,
             wal_index: 13,
             aggregate_bloom: vec![],
+            tip_hash: GENESIS_HASH,
         };
 
         let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
@@ -409,6 +421,7 @@ mod tests {
             datablocks_position: 12,
             wal_index: 13,
             aggregate_bloom: vec![],
+            tip_hash: GENESIS_HASH,
         };
 
         let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
@@ -431,6 +444,7 @@ mod tests {
             datablocks_position: 12,
             wal_index: 13,
             aggregate_bloom: vec![],
+            tip_hash: GENESIS_HASH,
         };
 
         let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
@@ -455,6 +469,7 @@ mod tests {
             datablocks_position: 12,
             wal_index: 13,
             aggregate_bloom: vec![],
+            tip_hash: GENESIS_HASH,
         };
 
         let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use bincode::{Decode, Encode};
-use celeriant_wal::{aggregate_key::AggregateKey, compression_type::CompressionType, datablocks::{datablock::Datablock, datablock_aggregate_event::DatablockAggregateEvent}, metablocks::metablock::Metablock};
+use celeriant_wal::{aggregate_key::AggregateKey, compression_type::CompressionType, constants::EntryHashBytes, datablocks::{datablock::Datablock, datablock_aggregate_event::DatablockAggregateEvent}, metablocks::metablock::Metablock};
 use serde::{Deserialize, Serialize};
 
 use crate::request::{read_filters::ReadFilters};
@@ -110,6 +110,9 @@ pub struct ReplicationBatchRequest {
     /// Leader has decided to kick the follower
     /// Follower won't rejoin until it's caught back up
     pub follower_too_far_behind: bool,
+    /// Leader's expected tip_hash at follower's current position.
+    /// Follower rejects batch if its tip_hash doesn't match.
+    pub expected_follower_tip_hash: Option<EntryHashBytes>,
     /// If there are batches to replicate, they are provided to the follower
     /// Otherwise it's just a heartbeat message
     pub batches: Vec<ReplicationBatchItem>,
@@ -132,4 +135,6 @@ pub struct CatchUpRequest {
     /// Leader checks this with its WAL - is the hash chain for the wal index correct?
     /// Is the follower caught up enough?
     pub last_follower_metablock: Option<Metablock>,
+    /// Either all 0's or the hash up and including the follower's last metablock
+    pub follower_tip_hash: Option<EntryHashBytes>,
 }

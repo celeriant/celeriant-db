@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use bincode::{Decode, Encode};
-use celeriant_wal::{aggregate_key::AggregateKey, metablocks::metablock::Metablock};
+use celeriant_wal::{aggregate_key::AggregateKey, constants::EntryHashBytes, metablocks::metablock::Metablock};
 use serde::{Deserialize, Serialize};
 
 use crate::{request::requests::ReplicationBatchItem, response::{aggregate_event_batch::AggregateEventBatch, watch_event::WatchEvent}};
@@ -100,6 +100,8 @@ pub struct ReplicationBatchResponse {
     /// Leader can use last follower metablock to check for replication 
     /// success, position, fall behind, or to decide to kick follower
     pub last_follower_metablock: Option<Metablock>,
+    /// Either all 0's or the hash up and including the follower's last metablock
+    pub follower_tip_hash: Option<EntryHashBytes>,
     /// Leader will also check the follower's current time for clock drift
     pub follower_timestamp_ms: u64,
 }
@@ -107,6 +109,9 @@ pub struct ReplicationBatchResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct CatchUpResponse {
     pub correlation_id: Option<u128>,
+    /// Leader's expected tip_hash at follower's current position.
+    /// Follower rejects batch if its tip_hash doesn't match.
+    pub expected_follower_tip_hash: Option<EntryHashBytes>,
     /// Batches for the follower to append to its WAL for the requested shard
     /// May not contain everything (paginated)
     pub batches: Vec<ReplicationBatchItem>,

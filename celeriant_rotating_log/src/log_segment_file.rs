@@ -2,7 +2,7 @@ use std::{cell::RefCell, path::PathBuf, rc::Rc};
 
 use celeriant_disk::files::open_dma_files::{existing_file_dma, open_or_create_file_dma};
 use celeriant_wal::{
-    constants::{AGGREGATE_BLOOM_BYTES, HEADER_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_SHARD_LOG_HEADER},
+    constants::{AGGREGATE_BLOOM_BYTES, GENESIS_HASH, HEADER_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_SHARD_LOG_HEADER},
     shard_log_header::ShardLogHeader,
 };
 use celeriant_wire::version_aware_wire_format::{deserialize_versioned_shard_log_header, serialize_versioned_message};
@@ -42,7 +42,7 @@ impl LogSegmentFile {
     /// Open a log file, if it doesn't exist, create it.
     /// Used for opening the active writing last log file.
     /// Errors if the file is corrupt and needs repair.
-    pub async fn open_or_create(shard_dir: &PathBuf, preallocate_bytes: u64, log_id: u64) -> Result<Self, RotatingLogError> {
+    pub async fn open_or_create(shard_dir: &PathBuf, preallocate_bytes: u64, log_id: u64, advance_read: bool) -> Result<Self, RotatingLogError> {
         let log_path = shard_dir.join(log_file_name(log_id));
         let (mut writer, file_len, exists) = open_or_create_file_dma(&log_path, Some(preallocate_bytes)).await?;
         let reader = writer.dup()?;
@@ -53,7 +53,7 @@ impl LogSegmentFile {
         Ok(Self {
             writer: RwLock::new(Some(Rc::new(writer))),
             reader: RwLock::new(Some(Rc::new(reader))),
-            metadata: RefCell::new(LogSegmentFileMetadata::new(log_id, file_len, datablocks_carry_over, &shard_log_header)),
+            metadata: RefCell::new(LogSegmentFileMetadata::new(log_id, file_len, datablocks_carry_over, &shard_log_header, advance_read)),
         })
     }
 
@@ -70,7 +70,7 @@ impl LogSegmentFile {
         Ok(Self {
             writer: RwLock::new(Some(Rc::new(writer))),
             reader: RwLock::new(Some(Rc::new(reader))),
-            metadata: RefCell::new(LogSegmentFileMetadata::new(log_id, file_len, datablocks_carry_over, &shard_log_header)),
+            metadata: RefCell::new(LogSegmentFileMetadata::new(log_id, file_len, datablocks_carry_over, &shard_log_header, true)),
         })
     }
 }
@@ -116,6 +116,7 @@ async fn setup_new_file(dma_file: &mut DmaFile, file_len: u64) -> Result<ShardLo
         datablocks_position: file_len.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64),
         wal_index: 0,
         aggregate_bloom: vec![0u64; AGGREGATE_BLOOM_BYTES / 8],
+        tip_hash: GENESIS_HASH,
     };
 
     write_dual_shard_log_header(dma_file, header.datablocks_position, &header).await?;

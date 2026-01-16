@@ -1,7 +1,7 @@
 use bincode::{Decode, Encode};
 use deepsize::DeepSizeOf;
 
-use crate::constants::{AGGREGATE_BLOOM_BYTES, HEADER_BLOCK_SIZE_BYTES};
+use crate::constants::{AGGREGATE_BLOOM_BYTES, EntryHashBytes, GENESIS_HASH, HEADER_BLOCK_SIZE_BYTES};
 
 /// The header is written at the start and end of the fixed size log segment file.
 /// Writing both, protected by crc checks, allows recovery on torn writes.
@@ -20,6 +20,9 @@ pub struct ShardLogHeader {
     /// Shard-global WAL index representing the last written metablock
     pub wal_index: u64,
 
+    /// Blake3 hash of last metablock entry
+    pub tip_hash: EntryHashBytes,
+
     /// Bloom filter for aggregate keys written to this log segment.
     /// Used to quickly skip log segments during aggregate existence checks.
     /// A "definitely not in set" result means no metablocks for that aggregate exist.
@@ -33,6 +36,7 @@ impl ShardLogHeader {
     const WIRE_SIZE_METABLOCKS_POSITION: usize = 8;
     const WIRE_SIZE_DATABLOCKS_POSITION: usize = 8;
     const WIRE_SIZE_WAL_INDEX: usize = 8;
+    const WIRE_SIZE_TIP_HASH: usize = 32;
     const WIRE_SIZE_AGGREGATE_BLOOM: usize = AGGREGATE_BLOOM_BYTES;
 
     pub const OFFSET_METABLOCKS_POSITION: usize = 0;
@@ -40,11 +44,14 @@ impl ShardLogHeader {
     pub const OFFSET_DATABLOCKS_POSITION: usize = 
         Self::OFFSET_METABLOCKS_POSITION + Self::WIRE_SIZE_METABLOCKS_POSITION;
 
-    pub const OFFSET_WAL_INDEX: usize = 
+    pub const OFFSET_WAL_INDEX: usize =
         Self::OFFSET_DATABLOCKS_POSITION + Self::WIRE_SIZE_DATABLOCKS_POSITION;
 
-    pub const OFFSET_AGGREGATE_BLOOM: usize =
+    pub const OFFSET_TIP_HASH: usize =
         Self::OFFSET_WAL_INDEX + Self::WIRE_SIZE_WAL_INDEX;
+
+    pub const OFFSET_AGGREGATE_BLOOM: usize =
+        Self::OFFSET_TIP_HASH + Self::WIRE_SIZE_TIP_HASH;
 
     /// Total wire size of ShardLogHeader
     pub const WIRE_SIZE_TOTAL: usize = 
@@ -55,6 +62,7 @@ impl ShardLogHeader {
             metablocks_position: HEADER_BLOCK_SIZE_BYTES as u64,
             datablocks_position: file_len.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64),
             wal_index: 0,
+            tip_hash: GENESIS_HASH,
             aggregate_bloom: vec![],
         }
     }
@@ -84,6 +92,7 @@ impl ShardLogHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::GENESIS_HASH;
 
     const TEST_FILE_LEN: u64 = 1024 * 1024 * 1024; // 1GB
 
@@ -121,6 +130,7 @@ mod tests {
             metablocks_position: 1000,
             datablocks_position: 500,
             wal_index: 0,
+            tip_hash: GENESIS_HASH,
             aggregate_bloom: vec![],
         };
 

@@ -5,17 +5,11 @@
 //! hash at index N != leader hash -> truncate and resync.
 
 use bincode::{Decode, Encode};
+use celeriant_wal::constants::{EntryHashBytes, GENESIS_HASH};
 
-/// Hash of a WAL entry in the chain.
-pub type EntryHashBytes = [u8; 32];
-
-/// Genesis hash (all zeros) for the start of the chain.
-pub const GENESIS_HASH: EntryHashBytes = [0u8; 32];
-
-pub fn compute_entry_hash(previous_hash: &EntryHashBytes, wal_index: u64, content: &[u8]) -> EntryHashBytes {
+pub fn compute_entry_hash(previous_hash: &EntryHashBytes, content: &[u8]) -> EntryHashBytes {
     let mut hasher = blake3::Hasher::new();
     hasher.update(previous_hash);
-    hasher.update(&wal_index.to_le_bytes());
     hasher.update(content);
     *hasher.finalize().as_bytes()
 }
@@ -47,7 +41,7 @@ impl HashChainState {
     /// Advance the chain with a new entry.
     pub fn advance(&mut self, wal_index: u64, content: &[u8]) {
         debug_assert!(wal_index > self.tip_wal_index || self.tip_wal_index == 0);
-        self.current_hash = compute_entry_hash(&self.current_hash, wal_index, content);
+        self.current_hash = compute_entry_hash(&self.current_hash, content);
         self.tip_wal_index = wal_index;
     }
 
@@ -133,8 +127,7 @@ mod tests {
 
         // Compute expected hash manually to verify chain construction
         let direct_hash = compute_entry_hash(
-            &compute_entry_hash(&GENESIS_HASH, 1, b"first"),
-            2,
+            &compute_entry_hash(&GENESIS_HASH, b"first"),
             b"second",
         );
 

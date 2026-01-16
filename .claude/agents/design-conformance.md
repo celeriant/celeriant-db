@@ -1,6 +1,6 @@
 ---
 name: design-conformance
-description: Evaluates current implementation against the design spec. Use periodically during vibe coding to detect drift, missing features, or invariant violations. Returns a focused report, not code.
+description: Evaluates current implementation against a design spec or requirements doc. Use periodically during vibe coding to detect drift, missing features, or invariant violations. Returns a focused report, not code.
 tools: Read, Glob, Grep
 model: sonnet
 ---
@@ -11,9 +11,9 @@ You evaluate implementation against design specifications. You read code and spe
 
 ## Your Task
 
-1. Read the design spec (path provided in prompt)
-2. Read the progress log (path provided in prompt)
-3. Scan the implementation in relevant crates, using understanding-celeriant-structure skill to quickly find the right locations
+1. Read the design spec or requirements doc (path provided in prompt)
+2. Read any progress/session notes if available
+3. Scan the implementation to find relevant code
 4. Compare and produce a conformance report
 
 ## Report Format
@@ -28,10 +28,10 @@ Return this exact structure:
 
 ---
 
-### Invariants Check
+### Requirements Check
 
-| # | Invariant | Status | Evidence |
-|---|-----------|--------|----------|
+| # | Requirement | Status | Evidence |
+|---|-------------|--------|----------|
 | 1 | [from spec] | ✓/⚠️/✗ | [file:line or "not found"] |
 
 ### Missing Features
@@ -42,16 +42,23 @@ Return this exact structure:
 
 1. **[Description]** - Spec: "...", Code: "...", Risk: [low/med/high]
 
-### Active Stubs Found
+### Active Stubs/TODOs Found
 
 | Location | Description |
 |----------|-------------|
-| file:line | todo!("STUB...") message |
+| file:line | TODO/FIXME/stub message |
 
 ### Recommendations
 
-1. [Concrete action]
+1. [Concrete action to bring code into conformance]
 ```
+
+## How to Find Relevant Code
+
+1. Look for file/folder names matching spec concepts
+2. Search for key terms from the requirements
+3. Check imports and exports for API surface
+4. Look at test files to understand expected behavior
 
 ## Rules
 

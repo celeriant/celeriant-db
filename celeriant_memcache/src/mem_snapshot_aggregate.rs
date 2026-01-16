@@ -14,6 +14,7 @@ pub enum AggregateStatus {
 /// the last batch for this aggregate!
 /// We also store the current event and batch indexes for writes,
 /// used when adding writes to the in-memory queue
+#[derive(Clone)]
 pub struct MemSnapshotAggregate {
     pub status: AggregateStatus,
     pub log_id: u64,

@@ -6,6 +6,8 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use celeriant_distributed::hash_chain::compute_entry_hash;
+use celeriant_memcache::cache_path::CachePath;
 use celeriant_memcache::shard_mem_cache::ShardMemCache;
 use celeriant_memcache::sync_positions_snapshot::SyncPositionsSnapshot;
 use celeriant_rotating_log::log_segment_file::LogSegmentFile;
@@ -50,7 +52,10 @@ pub(crate) async fn sync_with_rollback(
     log_segments_cache.rotate_to_next_log(required_disk_space).await?;
     let active_log_segment = log_segments_cache.active();
 
-    match sync(active_log_segment, &mut sync_positions_snapshot).await {
+    // TODO: replicated_mode for sync
+    let replicated_mode = false;
+
+    match sync(active_log_segment, &mut sync_positions_snapshot, replicated_mode).await {
         Ok(_) => {
             commit_sync(shard_mem_cache, watched_aggregates, sync_positions_snapshot);
             Ok(())
@@ -72,6 +77,7 @@ fn commit_sync(
 
     // Take the queue before committing the snapshot since commit consumes it
     let pending_append_queue = std::mem::take(&mut sync_positions_snapshot.pending_append_queue);
+
     shard_mem_cache.commit_sync_positions_snapshot(sync_positions_snapshot);
 
     // Collect watch events and update caches
@@ -96,7 +102,8 @@ fn commit_sync(
                 );
             }
             MetablockKind::SoftTrim(soft_trim) => {
-                shard_mem_cache.update_aggregate_min_event_batch_index(&soft_trim.aggregate_key, soft_trim.keep_from_event_batch_index);
+                shard_mem_cache.update_aggregate_min_event_batch_index(&soft_trim.aggregate_key, soft_trim.keep_from_event_batch_index, CachePath::Write);
+                shard_mem_cache.update_aggregate_min_event_batch_index(&soft_trim.aggregate_key, soft_trim.keep_from_event_batch_index, CachePath::Read);
                 event_collector.add_trim_event(soft_trim.aggregate_key.clone(), soft_trim.keep_from_event_batch_index);
             }
             MetablockKind::SoftDelete(soft_delete) => {
@@ -106,6 +113,15 @@ fn commit_sync(
                     soft_delete.event_batch_index,
                     soft_delete.allow_recreate,
                     soft_delete.allow_index_continuation,
+                    CachePath::Write,
+                );
+                shard_mem_cache.put_aggregate_into_cache_as_deleted(
+                    soft_delete.aggregate_key.clone(),
+                    soft_delete.event_index,
+                    soft_delete.event_batch_index,
+                    soft_delete.allow_recreate,
+                    soft_delete.allow_index_continuation,
+                    CachePath::Read,
                 );
                 event_collector.add_delete_event(soft_delete.aggregate_key.clone());
             }
@@ -132,7 +148,7 @@ fn rollback_sync(shard_mem_cache: Rc<RefCell<ShardMemCache>>, log_segments_cache
 /// 4. Updates bloom filter
 /// 5. Writes dual headers
 /// 6. Calls fdatasync for durability
-pub(crate) async fn sync(log_segment_file: Rc<LogSegmentFile>, sync_positions_snapshot: &mut SyncPositionsSnapshot) -> Result<(), ShardFsyncError> {
+pub(crate) async fn sync(log_segment_file: Rc<LogSegmentFile>, sync_positions_snapshot: &mut SyncPositionsSnapshot, replicated_mode: bool) -> Result<(), ShardFsyncError> {
     let mut log_segment_file_metadata = log_segment_file.metadata.borrow().clone();
 
     let dma_file_writer = log_segment_file.lock_writer("sync").await?;
@@ -144,17 +160,17 @@ pub(crate) async fn sync(log_segment_file: Rc<LogSegmentFile>, sync_positions_sn
     let buffer_size_datablocks: u64 = sync_positions_snapshot.buffer_size_datablocks();
 
     let mut datablocks_absolute_write_positions: Vec<u64> = Vec::with_capacity(sync_positions_snapshot.pending_append_queue.len());
-    let mut new_datablocks_position = log_segment_file_metadata.datablocks_position;
+    let mut new_datablocks_position = log_segment_file_metadata.write.datablocks_position;
     let mut datablocks_carry_over: Option<Vec<u8>> = log_segment_file_metadata.datablocks_carry_over.take();
 
     if buffer_size_datablocks > 0 {
-        let write_to_pos = dma_file_writer.align_up(log_segment_file_metadata.datablocks_position);
-        new_datablocks_position = log_segment_file_metadata.datablocks_position.saturating_sub(buffer_size_datablocks);
+        let write_to_pos = dma_file_writer.align_up(log_segment_file_metadata.write.datablocks_position);
+        new_datablocks_position = log_segment_file_metadata.write.datablocks_position.saturating_sub(buffer_size_datablocks);
         let write_from_pos = dma_file_writer.align_down(new_datablocks_position);
         let aligned_buffer_size_datablocks = write_to_pos.saturating_sub(write_from_pos);
 
         let front_carry_over = new_datablocks_position.saturating_sub(write_from_pos) as usize;
-        let end_carry_over = write_to_pos.saturating_sub(log_segment_file_metadata.datablocks_position) as usize;
+        let end_carry_over = write_to_pos.saturating_sub(log_segment_file_metadata.write.datablocks_position) as usize;
 
         let mut buffer_datablocks = dma_file_writer.alloc_dma_buffer(front_carry_over + buffer_size_datablocks as usize + end_carry_over);
         let buffer_datablocks_slice = buffer_datablocks.as_bytes_mut();
@@ -209,11 +225,11 @@ pub(crate) async fn sync(log_segment_file: Rc<LogSegmentFile>, sync_positions_sn
             index += 1;
         }
 
-        log_segment_file_metadata.wal_index = log_segment_file_metadata.wal_index.saturating_add(1);
-        item.metablock.wal_index = log_segment_file_metadata.wal_index;
+        log_segment_file_metadata.write.wal_index = log_segment_file_metadata.write.wal_index.saturating_add(1);
+        item.metablock.wal_index = log_segment_file_metadata.write.wal_index;
 
         // Track the absolute position where this metablock is written
-        let metablock_absolute_pos = log_segment_file_metadata.metablocks_position + position as u64;
+        let metablock_absolute_pos = log_segment_file_metadata.write.metablocks_position + position as u64;
 
         // Update aggregate positions tracking for event batches (only if entry exists)
         if let MetablockKind::EventBatchMetadata(event_batch) = &item.metablock.wal_metablock_type {
@@ -226,28 +242,41 @@ pub(crate) async fn sync(log_segment_file: Rc<LogSegmentFile>, sync_positions_sn
         let mut metablock_bytes = [0u8; FIXED_BLOCK_SIZE_BYTES];
         serialize_versioned_message(&item.metablock, WIRE_VERSION_WAL_METABLOCK, &mut metablock_bytes)?;
 
+        // Compute hash chain: hash = blake3(previous_hash || metablock_bytes)
+        log_segment_file_metadata.write.tip_hash = compute_entry_hash(
+            &log_segment_file_metadata.write.tip_hash,
+            &metablock_bytes,
+        );
+
         //let metablock_bytes: [u8; FIXED_BLOCK_SIZE_BYTES]
         buffer_metablocks_slice[position..position + FIXED_BLOCK_SIZE_BYTES].copy_from_slice(&metablock_bytes);
         position += FIXED_BLOCK_SIZE_BYTES;
     }
 
     //Write metablocks
-    let new_metablocks_position = log_segment_file_metadata.metablocks_position + buffer_metablocks.len() as u64;
+    let new_metablocks_position = log_segment_file_metadata.write.metablocks_position + buffer_metablocks.len() as u64;
     dma_file_writer
-        .write_at(buffer_metablocks, log_segment_file_metadata.metablocks_position)
+        .write_at(buffer_metablocks, log_segment_file_metadata.write.metablocks_position)
         .await?;
 
     // Update bloom filter with aggregate keys from this batch
     for item in &sync_positions_snapshot.pending_append_queue {
         if let MetablockKind::EventBatchMetadata(event_batch) = &item.metablock.wal_metablock_type {
-            log_segment_file_metadata.aggregate_key_bloom.insert(&event_batch.aggregate_key);
+            log_segment_file_metadata.write.aggregate_key_bloom.insert(&event_batch.aggregate_key);
         }
     }
 
     // Update positions and carry over
-    log_segment_file_metadata.metablocks_position = new_metablocks_position;
+    log_segment_file_metadata.write.metablocks_position = new_metablocks_position;
     log_segment_file_metadata.datablocks_carry_over = datablocks_carry_over;
-    log_segment_file_metadata.datablocks_position = new_datablocks_position;
+    log_segment_file_metadata.write.datablocks_position = new_datablocks_position;
+
+    // In single-node mode, data is immediately visible after fsync.
+    // In replicated mode, the replication layer calls advance_visible_position
+    // after successful replication to follower (or S3 fallback).
+    if !replicated_mode {
+        log_segment_file_metadata.advance_visible_position();
+    }
 
     // Write header
     let header_end_start_pos = log_segment_file_metadata.file_len.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64);

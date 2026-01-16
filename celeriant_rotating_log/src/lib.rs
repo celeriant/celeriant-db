@@ -5,6 +5,7 @@ pub mod reverse_metablock_scanner;
 pub mod rwlock_timeout;
 pub mod aggregate_key_bloom;
 pub mod log_segment_file_metadata;
+pub mod log_segment_cursor;
 
 #[cfg(test)]
 mod rotating_log_tests;

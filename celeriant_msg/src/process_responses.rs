@@ -310,11 +310,13 @@ mod tests {
                 correlation_id: Some(113),
                 last_follower_metablock: None,
                 follower_timestamp_ms: 0,
+                follower_tip_hash: None,
             }),
             ResponseType::CatchUp => Response::CatchUp(CatchUpResponse {
                 correlation_id: Some(114),
                 batches: vec![],
                 continue_catching_up: false,
+                expected_follower_tip_hash: None,
             }),
         }
     }
