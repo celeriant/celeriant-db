@@ -97,6 +97,14 @@ When complete, return a structured summary:
 - [Interface/module that new code should use]
 - [Existing code that handles related functionality]
 
+### Architectural Constraints Discovered
+Look for these in design docs, code comments, or inferred from patterns:
+- Where code MUST live (module boundaries)
+- Where code MUST NOT live (anti-patterns)
+- Call stack requirements (e.g., "X must be called outside Y")
+- Nesting prohibitions (e.g., "don't nest coordinators/locks")
+(or "None found")
+
 ### Suggested Approach
 - [Based on research, how implementation might proceed]
 - [Key decisions the orchestrator should consider]

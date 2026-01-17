@@ -42,6 +42,20 @@ Return this exact structure:
 
 1. **[Description]** - Spec: "...", Code: "...", Risk: [low/med/high]
 
+### Architectural Constraint Violations
+
+Check for "Architectural Constraints", "Anti-Patterns", or "DO NOT" sections in the spec.
+
+| Constraint | Status | Evidence |
+|------------|--------|----------|
+| [from spec] | ✓/✗ | [file:line or explanation] |
+
+Common architectural issues to check:
+- Code placed in wrong module/layer (spec says "not in X", code is in X)
+- Nested patterns that should be sequential (e.g., nested coordinators, nested locks)
+- Blocking operations in non-blocking contexts
+- Integration points in wrong location
+
 ### Active Stubs/TODOs Found
 
 | Location | Description |
