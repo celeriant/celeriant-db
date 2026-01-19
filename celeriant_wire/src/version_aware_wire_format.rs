@@ -128,6 +128,7 @@ mod tests {
                 },
             ),
             datablock: celeriant_wal::metablocks::datablock_storage_kind::DatablockStorageKind::None,
+            previous_tip_hash: GENESIS_HASH,
         }
     }
 
@@ -155,6 +156,7 @@ mod tests {
                 },
             ),
             datablock: celeriant_wal::metablocks::datablock_storage_kind::DatablockStorageKind::None,
+            previous_tip_hash: GENESIS_HASH,
         }
     }
 

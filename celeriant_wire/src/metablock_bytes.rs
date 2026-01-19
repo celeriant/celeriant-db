@@ -262,7 +262,7 @@ pub fn read_event_batch_aggregate_key(bytes: &[u8]) -> AggregateKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use celeriant_wal::constants::{FIXED_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_METABLOCK};
+    use celeriant_wal::constants::{FIXED_BLOCK_SIZE_BYTES, GENESIS_HASH, WIRE_VERSION_WAL_METABLOCK};
     use celeriant_wal::metablocks::datablock_storage_kind::DatablockStorageKind;
     use celeriant_wal::metablocks::metablock::Metablock;
     use celeriant_wal::metablocks::metablock_event_batch::{EventTypesKind, MetablockEventBatch};
@@ -297,6 +297,7 @@ mod tests {
             uncompressed_size,
             wal_metablock_type: MetablockKind::EventBatchMetadata(event_batch),
             datablock,
+            previous_tip_hash: GENESIS_HASH,
         }
     }
 
@@ -324,6 +325,7 @@ mod tests {
                 user_id: Some(666),
             }),
             datablock: DatablockStorageKind::None,
+            previous_tip_hash: GENESIS_HASH,
         }
     }
 
@@ -349,6 +351,7 @@ mod tests {
                 user_id: None,
             }),
             datablock: DatablockStorageKind::None,
+            previous_tip_hash: GENESIS_HASH,
         }
     }
 
@@ -364,6 +367,7 @@ mod tests {
             uncompressed_size,
             wal_metablock_type: MetablockKind::SnapshotOrg(MetablockSnapshotOrg { org_id }),
             datablock: DatablockStorageKind::None,
+            previous_tip_hash: GENESIS_HASH,
         }
     }
 
@@ -391,6 +395,7 @@ mod tests {
                 created_by_user_id: Some(3000),
             }),
             datablock: DatablockStorageKind::None,
+            previous_tip_hash: GENESIS_HASH,
         }
     }
 

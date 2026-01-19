@@ -82,9 +82,6 @@ impl From<ShardFsyncError> for ShardWriteError {
             ShardFsyncError::LogFileNotFound { log_id } => {
                 Self::IoError(format!("Log file not found: log_id={}", log_id))
             }
-            ShardFsyncError::SyncFailurePending => {
-                Self::IoError("Previous sync failure pending".to_string())
-            }
             ShardFsyncError::DatablocksCarryOverBufferNotPresent => {
                 Self::IoError("Datablocks carry-over buffer not present".to_string())
             }

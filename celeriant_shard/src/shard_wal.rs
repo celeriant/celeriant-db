@@ -32,7 +32,7 @@ use celeriant_rotating_log::rwlock_timeout::write_with_timeout;
 use celeriant_wal::aggregate_client_key::AggregateClientKey;
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::aggregate_type_key::AggregateTypeKey;
-use celeriant_wal::constants::{FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES};
+use celeriant_wal::constants::{FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, GENESIS_HASH};
 use celeriant_wal::datablocks::datablock::Datablock;
 use celeriant_wal::datablocks::datablock_aggregate_event_batch::DatablockAggregateEventBatch;
 use celeriant_wal::datablocks::datablock_kind::DatablockKind;
@@ -669,6 +669,7 @@ impl ShardWal {
             uncompressed_size: 0,
             datablock: DatablockStorageKind::None,
             wal_metablock_type: MetablockKind::SoftTrim(metablock_soft_trim),
+            previous_tip_hash: GENESIS_HASH,
         };
 
         let shard_log_queue_item = ShardLogQueueItem::new(None, None, metablock);
@@ -736,6 +737,7 @@ impl ShardWal {
                 uncompressed_size: 0,
                 datablock: DatablockStorageKind::None,
                 wal_metablock_type: MetablockKind::SoftDelete(metablock_soft_delete.clone()),
+                previous_tip_hash: GENESIS_HASH,
             };
 
             let shard_log_queue_item = ShardLogQueueItem::new(None, None, metablock);
@@ -1216,6 +1218,7 @@ impl ShardWal {
             compressed_size: serialized_datablock.compressed_size,
             datablock: serialized_datablock.storage_kind,
             wal_metablock_type: MetablockKind::EventBatchMetadata(metablock_event_batch),
+            previous_tip_hash: GENESIS_HASH,
         };
 
         let shard_log_queue_item = ShardLogQueueItem::new(Some(datablock), serialized_datablock.external_data, metablock);

@@ -11,6 +11,7 @@ use celeriant_memcache::cache_path::CachePath;
 use celeriant_memcache::shard_mem_cache::ShardMemCache;
 use celeriant_memcache::sync_positions_snapshot::SyncPositionsSnapshot;
 use celeriant_rotating_log::log_segment_file::LogSegmentFile;
+use celeriant_rotating_log::log_segment_file_metadata::LogSegmentFileMetadata;
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
 use celeriant_rotating_log::rotating_log_error::RotatingLogError;
 use celeriant_wal::constants::{FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_METABLOCK};
@@ -19,20 +20,25 @@ use celeriant_wal::metablocks::metablock_kind::MetablockKind;
 use celeriant_watch::aggregate_watchers::AggregateWatchers;
 use celeriant_wire::version_aware_wire_format::serialize_versioned_message;
 
+use crate::cluster_role::ClusterRole;
 use crate::error::shard_fsync_error::ShardFsyncError;
 use crate::watch_event_collector::WatchEventCollector;
 
-fn take_sync_snapshot(shard_mem_cache: &Rc<RefCell<ShardMemCache>>) -> Option<(u64, SyncPositionsSnapshot)> {
+fn take_sync_snapshot(shard_mem_cache: &Rc<RefCell<ShardMemCache>>) -> Result<Option<(u64, SyncPositionsSnapshot)>, ShardFsyncError> {
     let mut cache = shard_mem_cache.borrow_mut();
 
+    if cache.take_pending_append_queue_invalidated() {
+        return Err(ShardFsyncError::IoError("Previous fsync batch failure, pending writes invalidated".to_string()));
+    }
+
     if cache.pending_append_queue_is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let required_disk_space = cache.buffer_size_total();
     let snapshot = cache.take_sync_positions_snapshot();
 
-    Some((required_disk_space, snapshot))
+    Ok(Some((required_disk_space, snapshot)))
 }
 
 /// Orchestrates the sync process with rollback on failure.
@@ -45,7 +51,7 @@ pub(crate) async fn sync_with_rollback(
     shard_mem_cache: Rc<RefCell<ShardMemCache>>,
     watched_aggregates: Rc<AggregateWatchers>,
 ) -> Result<(), ShardFsyncError> {
-    let Some((required_disk_space, mut sync_positions_snapshot)) = take_sync_snapshot(&shard_mem_cache) else {
+    let Some((required_disk_space, mut sync_positions_snapshot)) = take_sync_snapshot(&shard_mem_cache)? else {
         return Ok(());
     };
 
@@ -53,11 +59,14 @@ pub(crate) async fn sync_with_rollback(
     let active_log_segment = log_segments_cache.active();
 
     // TODO: replicated_mode for sync
-    let replicated_mode = false;
+    let _cluster_role = ClusterRole::Leader;
 
-    match sync(active_log_segment, &mut sync_positions_snapshot, replicated_mode).await {
-        Ok(_) => {
-            commit_sync(shard_mem_cache, watched_aggregates, sync_positions_snapshot);
+    match sync(active_log_segment.clone(), &mut sync_positions_snapshot).await {
+        Ok(updated_log_segment_file_metadata) => {
+            //TODO: This is where replication logic comes in
+            //follower/single node? advance read immediately, update memcache
+            //leader? need to batch up what we just wrote and defer read pos and memcache updates but still maintain updated write path
+            commit_sync(shard_mem_cache, watched_aggregates, sync_positions_snapshot, active_log_segment, updated_log_segment_file_metadata);
             Ok(())
         }
         Err(e) => {
@@ -72,7 +81,13 @@ fn commit_sync(
     shard_mem_cache: Rc<RefCell<ShardMemCache>>,
     watched_aggregates: Rc<AggregateWatchers>,
     mut sync_positions_snapshot: SyncPositionsSnapshot,
+    log_segment_file: Rc<LogSegmentFile>,
+    mut new_metadata: LogSegmentFileMetadata,
 ) {
+    // Currently single node mode
+    new_metadata.advance_visible_position();
+    *log_segment_file.metadata.borrow_mut() = new_metadata;
+
     let mut shard_mem_cache = shard_mem_cache.borrow_mut();
 
     // Take the queue before committing the snapshot since commit consumes it
@@ -134,8 +149,7 @@ fn commit_sync(
 
 /// Rolls back a failed sync by restoring queue positions and forcing immediate rotation.
 fn rollback_sync(shard_mem_cache: Rc<RefCell<ShardMemCache>>, log_segments_cache: &Rc<LogSegmentsCache>) {
-    let mut shard_mem_cache = shard_mem_cache.borrow_mut();
-    shard_mem_cache.rollback_queue_positions();
+    shard_mem_cache.borrow_mut().rollback_queue_positions();
     log_segments_cache.force_immediate.set(true);
 }
 
@@ -148,7 +162,8 @@ fn rollback_sync(shard_mem_cache: Rc<RefCell<ShardMemCache>>, log_segments_cache
 /// 4. Updates bloom filter
 /// 5. Writes dual headers
 /// 6. Calls fdatasync for durability
-pub(crate) async fn sync(log_segment_file: Rc<LogSegmentFile>, sync_positions_snapshot: &mut SyncPositionsSnapshot, replicated_mode: bool) -> Result<(), ShardFsyncError> {
+/// sync_positions_snapshot is mutable because we need to set the datablocks absolute position as we write (only known at write time)
+pub(crate) async fn sync(log_segment_file: Rc<LogSegmentFile>, sync_positions_snapshot: &mut SyncPositionsSnapshot) -> Result<LogSegmentFileMetadata, ShardFsyncError> {
     let mut log_segment_file_metadata = log_segment_file.metadata.borrow().clone();
 
     let dma_file_writer = log_segment_file.lock_writer("sync").await?;
@@ -239,6 +254,9 @@ pub(crate) async fn sync(log_segment_file: Rc<LogSegmentFile>, sync_positions_sn
             }
         }
 
+        // Keep the chain - store the previous hash in the next metablock. Done before serialisation!
+        item.metablock.previous_tip_hash = log_segment_file_metadata.write.tip_hash;
+
         let mut metablock_bytes = [0u8; FIXED_BLOCK_SIZE_BYTES];
         serialize_versioned_message(&item.metablock, WIRE_VERSION_WAL_METABLOCK, &mut metablock_bytes)?;
 
@@ -271,13 +289,6 @@ pub(crate) async fn sync(log_segment_file: Rc<LogSegmentFile>, sync_positions_sn
     log_segment_file_metadata.datablocks_carry_over = datablocks_carry_over;
     log_segment_file_metadata.write.datablocks_position = new_datablocks_position;
 
-    // In single-node mode, data is immediately visible after fsync.
-    // In replicated mode, the replication layer calls advance_visible_position
-    // after successful replication to follower (or S3 fallback).
-    if !replicated_mode {
-        log_segment_file_metadata.advance_visible_position();
-    }
-
     // Write header
     let header_end_start_pos = log_segment_file_metadata.file_len.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64);
     let header = log_segment_file_metadata.to_shard_log_header();
@@ -285,8 +296,5 @@ pub(crate) async fn sync(log_segment_file: Rc<LogSegmentFile>, sync_positions_sn
 
     dma_file_writer.fdatasync().await?;
 
-    let mut updated_log_segment_file_metadata = log_segment_file.metadata.borrow_mut();
-    *updated_log_segment_file_metadata = log_segment_file_metadata;
-
-    Ok(())
+    Ok(log_segment_file_metadata)
 }

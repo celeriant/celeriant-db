@@ -50,6 +50,11 @@ pub struct ShardMemCache {
     /// This is unbounded as we expect quick flush to disk
     pending_append_queue: Vec<ShardLogQueueItem>,
 
+    /// Happens during a rollback when fsync fails. Anything in the pending_append_queue
+    /// is cleared, as its batch index and event index positions are fucked - the previous
+    /// batch didn't write and was rolled back, so we can't write the next batch either.
+    pending_append_queue_invalidated: bool,
+
     /// LRU cache mapping wal_index -> position in log files
     /// Used to optimize list pagination by avoiding full scans
     wal_index_positions: LruCache<u64, WalIndexPosition>,
@@ -229,6 +234,12 @@ impl ShardMemCache {
             .filter(move |(_batch_idx, write)| write.metablock.wal_index <= visible_wal_index)
     }
 
+    pub fn take_pending_append_queue_invalidated(&mut self) -> bool {
+        let state = self.pending_append_queue_invalidated;
+        self.pending_append_queue_invalidated = false;
+        state
+    }
+
     pub fn pending_append_queue_is_empty(&self) -> bool {
         self.pending_append_queue.is_empty()
     }
@@ -331,8 +342,15 @@ impl ShardMemCache {
 
     /// If we have any failure to write to disk, set had_fsync_failure and clear
     /// out all our aggregate_queue_positions, falling back to the aggregate_file_positions store
+    /// This also invalidates our pending_append_queue for our next fsync batch, as it'll have entries
+    /// with the wrong indexes. Technically it could still be valid if we are writing different aggregates,
+    /// but we would have to implement an 'aggregate aware' coordinator to error back to pending client tasks
+    /// on a per-aggregate basis. And since the fsync failure mode is rare and generally a 'server ending' 
+    /// situation, it's not worth the extra logic... just go scorched earth
     pub fn rollback_queue_positions(&mut self) {
         self.aggregate_queue_positions.clear();
+        self.pending_append_queue.clear();
+        self.pending_append_queue_invalidated = true;
     }
 
     pub fn is_aggregate_snapshot_full_or_contains(&self, aggregate_key: &AggregateKey, cache_path: CachePath) -> bool {
@@ -633,6 +651,7 @@ impl ShardMemCache {
             cache_eviction_queue: VecDeque::new(),
             aggregate_queue_positions: HashMap::new(),
             pending_append_queue: vec![],
+            pending_append_queue_invalidated: false,
             aggregate_write_snapshots: LruCache::new(aggregate_cap),
             aggregate_read_snapshots: LruCache::new(aggregate_cap),
             aggregate_write_client_snapshots: LruCache::new(client_cap),

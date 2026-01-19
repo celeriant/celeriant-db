@@ -254,7 +254,7 @@ pub fn trim_end_if_exceeds_max_bytes(
 
 #[cfg(test)]
 mod tests {
-    use celeriant_wal::{aggregate_key::AggregateKey, datablocks::datablock_aggregate_event::DatablockAggregateEvent, metablocks::{datablock_block_ref::DatablockBlockRef, datablock_storage_kind::DatablockStorageKind, metablock::Metablock, metablock_event_batch::MetablockEventBatch}};
+    use celeriant_wal::{aggregate_key::AggregateKey, constants::GENESIS_HASH, datablocks::datablock_aggregate_event::DatablockAggregateEvent, metablocks::{datablock_block_ref::DatablockBlockRef, datablock_storage_kind::DatablockStorageKind, metablock::Metablock, metablock_event_batch::MetablockEventBatch}};
 
     use super::*;
 
@@ -299,6 +299,7 @@ mod tests {
                 min_event_index: min_eidx,
                 max_event_index: max_eidx,
             }),
+            previous_tip_hash: GENESIS_HASH,
         }
     }
 
@@ -353,6 +354,7 @@ mod tests {
                 min_event_index: min_eidx,
                 max_event_index: max_eidx,
             }),
+            previous_tip_hash: GENESIS_HASH,
         }
     }
 

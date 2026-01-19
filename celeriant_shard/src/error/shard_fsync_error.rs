@@ -19,9 +19,6 @@ pub enum ShardFsyncError {
     
     /// Requested log file doesn't exist.
     LogFileNotFound { log_id: u64 },
-    
-    /// Previous sync failed, forcing durable mode.
-    SyncFailurePending,
 
     DatablocksCarryOverBufferNotPresent,
 
