@@ -59,14 +59,14 @@ pub(crate) async fn sync_with_rollback(
     let active_log_segment = log_segments_cache.active();
 
     // TODO: replicated_mode for sync
-    let _cluster_role = ClusterRole::Leader;
+    let cluster_role = ClusterRole::Leader;
 
     match sync(active_log_segment.clone(), &mut sync_positions_snapshot).await {
         Ok(updated_log_segment_file_metadata) => {
             //TODO: This is where replication logic comes in
             //follower/single node? advance read immediately, update memcache
             //leader? need to batch up what we just wrote and defer read pos and memcache updates but still maintain updated write path
-            commit_sync(shard_mem_cache, watched_aggregates, sync_positions_snapshot, active_log_segment, updated_log_segment_file_metadata);
+            commit_sync(cluster_role, shard_mem_cache, watched_aggregates, sync_positions_snapshot, active_log_segment, updated_log_segment_file_metadata);
             Ok(())
         }
         Err(e) => {
@@ -78,6 +78,7 @@ pub(crate) async fn sync_with_rollback(
 
 /// Commits a successful sync by updating caches and broadcasting watch events.
 fn commit_sync(
+    cluster_role: ClusterRole,
     shard_mem_cache: Rc<RefCell<ShardMemCache>>,
     watched_aggregates: Rc<AggregateWatchers>,
     mut sync_positions_snapshot: SyncPositionsSnapshot,
