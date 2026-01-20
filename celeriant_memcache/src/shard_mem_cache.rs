@@ -5,6 +5,7 @@ use crate::{
     aggregate_recent_write::AggregateRecentWrites, mem_snapshot_aggregate::MemSnapshotAggregate, queue_aggregate_positions::QueueAggregatePositions,
     recent_write::RecentWrite, shard_log_queue_item::ShardLogQueueItem, sync_positions_snapshot::{SyncPositionsSnapshot},
 };
+use celeriant_wal::cluster_role::ClusterRole;
 use celeriant_wal::{
     aggregate_client_key::AggregateClientKey, aggregate_key::AggregateKey, constants::FIXED_BLOCK_SIZE_BYTES, datablocks::datablock::Datablock,
     metablocks::metablock::Metablock,
@@ -440,7 +441,7 @@ impl ShardMemCache {
 
     /// Provide the aggregate_queue_positions snapshotted before disk write begun
     /// and this will update the aggregate_file_positions with the committed data.
-    pub fn commit_sync_positions_snapshot(&mut self, sync_positions_snapshot: SyncPositionsSnapshot) {
+    pub fn commit_sync_positions_snapshot(&mut self, cluster_role: ClusterRole, sync_positions_snapshot: SyncPositionsSnapshot) {
         for (key, queue_positions) in sync_positions_snapshot.aggregate_queue_positions {
             if queue_positions.pending_delete {
                 continue; // Will be handled by put_aggregate_into_cache_as_deleted
@@ -470,27 +471,28 @@ impl ShardMemCache {
                 self.aggregate_write_snapshots.put(key.clone(), snapshot);
             }
 
-            // Single-node: update read cache immediately.
-            // TODO: Handle replication mode
-            if let Some(existing) = self.aggregate_read_snapshots.get_mut(&key) {
-                existing.status = AggregateStatus::Found;
-                if queue_positions.event_batch_index > existing.event_batch_index {
-                    existing.event_batch_index = queue_positions.event_batch_index;
+            if cluster_role != ClusterRole::Leader {
+                // Single-node or follower: update read cache immediately.
+                if let Some(existing) = self.aggregate_read_snapshots.get_mut(&key) {
+                    existing.status = AggregateStatus::Found;
+                    if queue_positions.event_batch_index > existing.event_batch_index {
+                        existing.event_batch_index = queue_positions.event_batch_index;
+                    }
+                    if queue_positions.event_index > existing.event_index {
+                        existing.event_index = queue_positions.event_index;
+                    }
+                } else {
+                    self.aggregate_read_snapshots.put(key.clone(), MemSnapshotAggregate {
+                        log_id: queue_positions.log_id,
+                        metablock_absolute_pos: queue_positions.metablock_absolute_pos,
+                        event_index: queue_positions.event_index,
+                        event_batch_index: queue_positions.event_batch_index,
+                        min_event_batch_index: queue_positions.min_event_batch_index,
+                        status: AggregateStatus::Found,
+                        allow_index_continuation: false,
+                        allow_recreate: false,
+                    });
                 }
-                if queue_positions.event_index > existing.event_index {
-                    existing.event_index = queue_positions.event_index;
-                }
-            } else {
-                self.aggregate_read_snapshots.put(key.clone(), MemSnapshotAggregate {
-                    log_id: queue_positions.log_id,
-                    metablock_absolute_pos: queue_positions.metablock_absolute_pos,
-                    event_index: queue_positions.event_index,
-                    event_batch_index: queue_positions.event_batch_index,
-                    min_event_batch_index: queue_positions.min_event_batch_index,
-                    status: AggregateStatus::Found,
-                    allow_index_continuation: false,
-                    allow_recreate: false,
-                });
             }
 
             // Update client event indexes LRU

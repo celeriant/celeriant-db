@@ -8,3 +8,4 @@ pub mod shard_log_header;
 pub mod aggregate_type_key;
 pub mod aggregate_client_key;
 pub mod buffer_read;
+pub mod cluster_role;

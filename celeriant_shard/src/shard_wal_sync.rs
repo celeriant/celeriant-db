@@ -14,13 +14,13 @@ use celeriant_rotating_log::log_segment_file::LogSegmentFile;
 use celeriant_rotating_log::log_segment_file_metadata::LogSegmentFileMetadata;
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
 use celeriant_rotating_log::rotating_log_error::RotatingLogError;
+use celeriant_wal::cluster_role::ClusterRole;
 use celeriant_wal::constants::{FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_METABLOCK};
 use celeriant_wal::metablocks::datablock_storage_kind::DatablockStorageKind;
 use celeriant_wal::metablocks::metablock_kind::MetablockKind;
 use celeriant_watch::aggregate_watchers::AggregateWatchers;
 use celeriant_wire::version_aware_wire_format::serialize_versioned_message;
 
-use crate::cluster_role::ClusterRole;
 use crate::error::shard_fsync_error::ShardFsyncError;
 use crate::watch_event_collector::WatchEventCollector;
 
@@ -85,16 +85,19 @@ fn commit_sync(
     log_segment_file: Rc<LogSegmentFile>,
     mut new_metadata: LogSegmentFileMetadata,
 ) {
-    // Currently single node mode
-    new_metadata.advance_visible_position();
-    *log_segment_file.metadata.borrow_mut() = new_metadata;
+    if cluster_role != ClusterRole::Leader {
+        // Currently single node mode or is follower
+        // Data is durable, so we can advance visible position
+        new_metadata.advance_visible_position();
+        *log_segment_file.metadata.borrow_mut() = new_metadata;
+    }
 
     let mut shard_mem_cache = shard_mem_cache.borrow_mut();
 
     // Take the queue before committing the snapshot since commit consumes it
     let pending_append_queue = std::mem::take(&mut sync_positions_snapshot.pending_append_queue);
 
-    shard_mem_cache.commit_sync_positions_snapshot(sync_positions_snapshot);
+    shard_mem_cache.commit_sync_positions_snapshot(cluster_role, sync_positions_snapshot);
 
     // Collect watch events and update caches
     let mut event_collector = WatchEventCollector::new();
@@ -108,14 +111,16 @@ fn commit_sync(
                     event_collector.add_create_event(event_batch_metadata.aggregate_key.clone());
                 }
 
-                let size_bytes = queue_item.size_bytes();
-                shard_mem_cache.cache_recent_write(
-                    event_batch_metadata.aggregate_key.clone(),
-                    event_batch_metadata.event_batch_index,
-                    queue_item.metablock,
-                    queue_item.datablock,
-                    size_bytes,
-                );
+                if cluster_role != ClusterRole::Leader {
+                    let size_bytes = queue_item.size_bytes();
+                    shard_mem_cache.cache_recent_write(
+                        event_batch_metadata.aggregate_key.clone(),
+                        event_batch_metadata.event_batch_index,
+                        queue_item.metablock,
+                        queue_item.datablock,
+                        size_bytes,
+                    );
+                }
             }
             MetablockKind::SoftTrim(soft_trim) => {
                 shard_mem_cache.update_aggregate_min_event_batch_index(&soft_trim.aggregate_key, soft_trim.keep_from_event_batch_index, CachePath::Write);
@@ -145,7 +150,9 @@ fn commit_sync(
         }
     }
 
-    event_collector.broadcast_all(&watched_aggregates);
+    if cluster_role != ClusterRole::Leader {
+        event_collector.broadcast_all(&watched_aggregates);
+    }
 }
 
 /// Rolls back a failed sync by restoring queue positions and forcing immediate rotation.
