@@ -165,6 +165,7 @@ impl ShardWal {
             config.aggregate_snapshots_cache_bytes,
             config.aggregate_client_snapshots_cache_bytes,
             config.list_wal_index_cache_bytes,
+            config.pending_replication_high_water_bytes,
         );
 
         let log_segments_cache = LogSegmentsCache::ready_up(

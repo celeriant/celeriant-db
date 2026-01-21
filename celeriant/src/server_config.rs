@@ -162,6 +162,9 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 64 * 1024 * 1024, env = "CELERIANT_AGGREGATE_SNAPSHOTS_CACHE_BYTES", help = "Amount of recent aggregate metadata to keep in memory for each shard (64MB)")]
     pub aggregate_snapshots_cache_bytes: u64,
 
+    #[arg(long, default_value_t = 64 * 1024 * 1024, env = "CELERIANT_PENDING_REPLICATION_HIGH_WATER_BYTES", help = "High water mark for pending replication queue before triggering S3 fallback (64MB)")]
+    pub pending_replication_high_water_bytes: u64,
+
     #[arg(
         long,
         default_value_t = 17000,
@@ -321,6 +324,7 @@ impl ServerConfig {
             list_max_duration: Duration::from_millis(self.list_max_duration_ms),
             list_page_size: self.list_page_size as usize,
             list_wal_index_cache_bytes: self.list_wal_index_cache_bytes,
+            pending_replication_high_water_bytes: self.pending_replication_high_water_bytes,
         }
     }
 
@@ -416,6 +420,7 @@ impl Default for ServerConfig {
             routing_rule: RoutingRule::AggregateId,
             aggregate_client_snapshots_cache_bytes: 64 * 1024 * 1024,
             aggregate_snapshots_cache_bytes: 64 * 1024 * 1024,
+            pending_replication_high_water_bytes: 64 * 1024 * 1024,
             timestamp_precision: ConfigTimestampPrecision::Milliseconds,
             timestamp_epoch_offset_secs: 0,
             list_max_duration_ms: 2000,

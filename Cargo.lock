@@ -443,6 +443,7 @@ dependencies = [
 name = "celeriant_memcache"
 version = "0.1.0"
 dependencies = [
+ "celeriant_rotating_log",
  "celeriant_wal",
  "deepsize",
  "lru 0.16.2",

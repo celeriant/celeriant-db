@@ -7,5 +7,6 @@ license.workspace = true
 
 [dependencies]
 celeriant_wal = { path = "../celeriant_wal" }
+celeriant_rotating_log = { path = "../celeriant_rotating_log" }
 lru.workspace = true
 deepsize.workspace = true

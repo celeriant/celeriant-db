@@ -19,4 +19,5 @@ pub struct InternalShardConfig {
     pub list_page_size: usize,
     pub list_max_duration: Duration,
     pub list_wal_index_cache_bytes: u64,
+    pub pending_replication_high_water_bytes: u64,
 }

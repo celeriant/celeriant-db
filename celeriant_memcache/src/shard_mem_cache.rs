@@ -1,6 +1,7 @@
 use crate::cache_path::CachePath;
 use crate::mem_snapshot_aggregate::AggregateStatus;
 use crate::metablock_position::MetablockPosition;
+use crate::pending_commit_data::PendingCommitData;
 use crate::{
     aggregate_recent_write::AggregateRecentWrites, mem_snapshot_aggregate::MemSnapshotAggregate, queue_aggregate_positions::QueueAggregatePositions,
     recent_write::RecentWrite, shard_log_queue_item::ShardLogQueueItem, sync_positions_snapshot::{SyncPositionsSnapshot},
@@ -59,6 +60,22 @@ pub struct ShardMemCache {
     /// LRU cache mapping wal_index -> position in log files
     /// Used to optimize list pagination by avoiding full scans
     wal_index_positions: LruCache<u64, WalIndexPosition>,
+
+    /// Batches awaiting replication (post-fsync, pre-commit)
+    /// Intentionally unbounded (like pending_append_queue) - high water mark triggers
+    /// S3 fallback at ReplicationCoordinator level rather than eviction here.
+    /// Queue pressure is detected via pending_replication_high_water_bytes.
+    pending_replication_batches: Vec<PendingCommitData>,
+
+    /// Total bytes in pending replication queue
+    pending_replication_bytes: u64,
+
+    /// High water mark - when exceeded, trigger S3 fallback
+    pending_replication_high_water_bytes: u64,
+
+    /// Happens during rollback when replication fails. Pending replication queue
+    /// is cleared and this flag signals the coordinator to handle the invalidation.
+    pending_replication_queue_invalidated: bool,
 }
 
 impl ShardMemCache {
@@ -636,11 +653,80 @@ impl ShardMemCache {
         best
     }
 
+    /// Add a batch to the pending replication queue
+    /// Returns true if high water mark exceeded
+    pub fn push_pending_replication(&mut self, batch: PendingCommitData) -> bool {
+        self.pending_replication_bytes = self.pending_replication_bytes.saturating_add(batch.size_bytes());
+        self.pending_replication_batches.push(batch);
+        self.is_replication_queue_pressured()
+    }
+
+    /// Take all pending batches for replication
+    pub fn take_pending_replication(&mut self) -> Vec<PendingCommitData> {
+        self.pending_replication_bytes = 0;
+        std::mem::take(&mut self.pending_replication_batches)
+    }
+
+    /// Peek at oldest batch (for timeout checking)
+    pub fn peek_pending_replication(&self) -> Option<&PendingCommitData> {
+        self.pending_replication_batches.first()
+    }
+
+    /// Check if high water mark exceeded
+    pub fn is_replication_queue_pressured(&self) -> bool {
+        self.pending_replication_bytes > self.pending_replication_high_water_bytes
+    }
+
+    /// Clear all pending replication batches (on rollback)
+    pub fn clear_pending_replication(&mut self) {
+        self.pending_replication_batches.clear();
+        self.pending_replication_bytes = 0;
+    }
+
+    /// Clear caches that may contain un-replicated data (used during rollback).
+    ///
+    /// Does NOT clear recent_write_cache since it only contains successfully replicated data.
+    /// The recent write cache is only populated in complete_commit() AFTER successful replication,
+    /// so it never contains un-replicated writes that would need clearing on rollback.
+    pub fn clear_rollback_caches(&mut self) {
+        self.aggregate_write_snapshots.clear();
+        self.aggregate_read_snapshots.clear();
+        self.aggregate_write_client_snapshots.clear();
+        self.wal_index_positions.clear();
+        self.aggregate_queue_positions.clear();
+        self.pending_append_queue.clear();
+        self.pending_append_queue_invalidated = true;
+        self.clear_pending_replication();
+        self.pending_replication_queue_invalidated = true;
+    }
+
+    /// Invalidate the pending replication queue (on rollback)
+    pub fn invalidate_pending_replication(&mut self) {
+        self.clear_pending_replication();
+        self.pending_replication_queue_invalidated = true;
+    }
+
+    /// Take the pending replication invalidated flag and reset it
+    pub fn take_pending_replication_invalidated(&mut self) -> bool {
+        let state = self.pending_replication_queue_invalidated;
+        self.pending_replication_queue_invalidated = false;
+        state
+    }
+
+    /// Copy a single aggregate's write snapshot to read snapshot.
+    /// Used during commit completion to make writes visible to readers.
+    pub fn copy_write_to_read_snapshot(&mut self, key: &AggregateKey) {
+        if let Some(write_snapshot) = self.aggregate_write_snapshots.get(key) {
+            self.aggregate_read_snapshots.put(key.clone(), write_snapshot.clone());
+        }
+    }
+
     pub fn new(
         recent_write_cache_bytes: u64,
         aggregate_write_snapshots_cache_bytes: u64,
         aggregate_client_snapshots_cache_bytes: u64,
         list_wal_index_cache_bytes: u64,
+        pending_replication_high_water_bytes: u64,
     ) -> Self {
         let aggregate_cap = NonZeroUsize::new((aggregate_write_snapshots_cache_bytes / 112) as usize).unwrap_or(NonZeroUsize::new(10_000).unwrap());
         let client_cap = NonZeroUsize::new((aggregate_client_snapshots_cache_bytes / 128) as usize).unwrap_or(NonZeroUsize::new(100_000).unwrap());
@@ -658,6 +744,10 @@ impl ShardMemCache {
             aggregate_read_snapshots: LruCache::new(aggregate_cap),
             aggregate_write_client_snapshots: LruCache::new(client_cap),
             wal_index_positions: LruCache::new(wal_index_cap),
+            pending_replication_batches: Vec::new(),
+            pending_replication_bytes: 0,
+            pending_replication_high_water_bytes,
+            pending_replication_queue_invalidated: false,
         }
     }
 }
