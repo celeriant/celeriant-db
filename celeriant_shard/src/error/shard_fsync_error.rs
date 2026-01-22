@@ -2,6 +2,8 @@ use celeriant_rotating_log::{rotating_log_error::RotatingLogError, rwlock_timeou
 use celeriant_wire::wire_format_error::WireFormatError;
 use glommio::GlommioError;
 
+use crate::error::replication_error::ReplicationError;
+
 /// Storage/infrastructure errors—may be transient.
 #[derive(Debug, Clone)]
 pub enum ShardFsyncError {
@@ -65,6 +67,18 @@ impl From<RotatingLogError> for ShardFsyncError {
             RotatingLogError::WireFormat(e) => Self::WireFormat(e),
             RotatingLogError::HeaderCorrupted { log_id } => Self::HeaderCorrupted { log_id },
             RotatingLogError::LogFileNotFound { log_id } => Self::LogFileNotFound { log_id },
+        }
+    }
+}
+
+impl From<ReplicationError> for ShardFsyncError {
+    fn from(e: ReplicationError) -> Self {
+        match e {
+            ReplicationError::RollbackInProgress => Self::IoError("Rollback in progress".into()),
+            ReplicationError::NetworkFailure(msg) => Self::IoError(msg),
+            ReplicationError::FollowerDiverged => Self::IoError("Follower log diverged from leader".into()),
+            ReplicationError::S3Unavailable => Self::IoError("S3 sidecar unavailable".into()),
+            ReplicationError::RollbackFailed(rb_err) => Self::IoError(format!("Rollback failed: {:?}", rb_err)),
         }
     }
 }

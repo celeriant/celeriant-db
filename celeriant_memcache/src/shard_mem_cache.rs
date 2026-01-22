@@ -7,6 +7,7 @@ use crate::{
     recent_write::RecentWrite, shard_log_queue_item::ShardLogQueueItem, sync_positions_snapshot::{SyncPositionsSnapshot},
 };
 use celeriant_wal::cluster_role::ClusterRole;
+use celeriant_wal::metablocks::metablock_event_batch::MetablockEventBatch;
 use celeriant_wal::{
     aggregate_client_key::AggregateClientKey, aggregate_key::AggregateKey, constants::FIXED_BLOCK_SIZE_BYTES, datablocks::datablock::Datablock,
     metablocks::metablock::Metablock,
@@ -52,11 +53,6 @@ pub struct ShardMemCache {
     /// This is unbounded as we expect quick flush to disk
     pending_append_queue: Vec<ShardLogQueueItem>,
 
-    /// Happens during a rollback when fsync fails. Anything in the pending_append_queue
-    /// is cleared, as its batch index and event index positions are fucked - the previous
-    /// batch didn't write and was rolled back, so we can't write the next batch either.
-    pending_append_queue_invalidated: bool,
-
     /// LRU cache mapping wal_index -> position in log files
     /// Used to optimize list pagination by avoiding full scans
     wal_index_positions: LruCache<u64, WalIndexPosition>,
@@ -72,10 +68,6 @@ pub struct ShardMemCache {
 
     /// High water mark - when exceeded, trigger S3 fallback
     pending_replication_high_water_bytes: u64,
-
-    /// Happens during rollback when replication fails. Pending replication queue
-    /// is cleared and this flag signals the coordinator to handle the invalidation.
-    pending_replication_queue_invalidated: bool,
 }
 
 impl ShardMemCache {
@@ -252,12 +244,6 @@ impl ShardMemCache {
             .filter(move |(_batch_idx, write)| write.metablock.wal_index <= visible_wal_index)
     }
 
-    pub fn take_pending_append_queue_invalidated(&mut self) -> bool {
-        let state = self.pending_append_queue_invalidated;
-        self.pending_append_queue_invalidated = false;
-        state
-    }
-
     pub fn pending_append_queue_is_empty(&self) -> bool {
         self.pending_append_queue.is_empty()
     }
@@ -365,10 +351,9 @@ impl ShardMemCache {
     /// but we would have to implement an 'aggregate aware' coordinator to error back to pending client tasks
     /// on a per-aggregate basis. And since the fsync failure mode is rare and generally a 'server ending' 
     /// situation, it's not worth the extra logic... just go scorched earth
-    pub fn rollback_queue_positions(&mut self) {
+    pub fn execute_fsync_rollback(&mut self) {
         self.aggregate_queue_positions.clear();
         self.pending_append_queue.clear();
-        self.pending_append_queue_invalidated = true;
     }
 
     pub fn is_aggregate_snapshot_full_or_contains(&self, aggregate_key: &AggregateKey, cache_path: CachePath) -> bool {
@@ -456,6 +441,30 @@ impl ShardMemCache {
         }
     }
 
+    pub fn commit_read_position_snapshot(&mut self, event_batch: &MetablockEventBatch, log_id: u64, metablock_absolute_pos: u64) {
+        if let Some(existing) = self.aggregate_read_snapshots.get_mut(&event_batch.aggregate_key)
+            && existing.status != AggregateStatus::NotFound {
+            existing.status = AggregateStatus::Found;
+            if event_batch.event_batch_index > existing.event_batch_index {
+                existing.event_batch_index = event_batch.event_batch_index;
+            }
+            if event_batch.max_event_index > existing.event_index {
+                existing.event_index = event_batch.max_event_index;
+            }
+        } else {
+            self.aggregate_read_snapshots.put(event_batch.aggregate_key.clone(), MemSnapshotAggregate {
+                log_id: log_id,
+                metablock_absolute_pos: metablock_absolute_pos,
+                event_index: event_batch.max_event_index,
+                event_batch_index: event_batch.event_batch_index,
+                min_event_batch_index: 0,
+                status: AggregateStatus::Found,
+                allow_index_continuation: false,
+                allow_recreate: false,
+            });
+        }
+    }
+
     /// Provide the aggregate_queue_positions snapshotted before disk write begun
     /// and this will update the aggregate_file_positions with the committed data.
     pub fn commit_sync_positions_snapshot(&mut self, cluster_role: ClusterRole, sync_positions_snapshot: SyncPositionsSnapshot) {
@@ -465,7 +474,8 @@ impl ShardMemCache {
             }
 
             // Always update write cache
-            if let Some(existing) = self.aggregate_write_snapshots.get_mut(&key) {
+            if let Some(existing) = self.aggregate_write_snapshots.get_mut(&key) 
+            && existing.status != AggregateStatus::NotFound {
                 existing.status = AggregateStatus::Found;
                 if queue_positions.event_batch_index > existing.event_batch_index {
                     existing.event_batch_index = queue_positions.event_batch_index;
@@ -474,7 +484,6 @@ impl ShardMemCache {
                     existing.event_index = queue_positions.event_index;
                 }
             } else {
-
                 let snapshot = MemSnapshotAggregate {
                     log_id: queue_positions.log_id,
                     metablock_absolute_pos: queue_positions.metablock_absolute_pos,
@@ -490,7 +499,8 @@ impl ShardMemCache {
 
             if cluster_role != ClusterRole::Leader {
                 // Single-node or follower: update read cache immediately.
-                if let Some(existing) = self.aggregate_read_snapshots.get_mut(&key) {
+                if let Some(existing) = self.aggregate_read_snapshots.get_mut(&key)
+                && existing.status != AggregateStatus::NotFound {
                     existing.status = AggregateStatus::Found;
                     if queue_positions.event_batch_index > existing.event_batch_index {
                         existing.event_batch_index = queue_positions.event_batch_index;
@@ -677,40 +687,18 @@ impl ShardMemCache {
         self.pending_replication_bytes > self.pending_replication_high_water_bytes
     }
 
-    /// Clear all pending replication batches (on rollback)
-    pub fn clear_pending_replication(&mut self) {
+    /// Clear caches that may contain un-replicated data (used during rollback).
+    pub fn execute_replication_rollback(&mut self) {
+
+        self.execute_fsync_rollback();
+
+        // Written to disk but not replicated
+        self.aggregate_write_snapshots.clear();
+        self.aggregate_write_client_snapshots.clear();
+
+        // Pending replication, now cannot proceed
         self.pending_replication_batches.clear();
         self.pending_replication_bytes = 0;
-    }
-
-    /// Clear caches that may contain un-replicated data (used during rollback).
-    ///
-    /// Does NOT clear recent_write_cache since it only contains successfully replicated data.
-    /// The recent write cache is only populated in complete_commit() AFTER successful replication,
-    /// so it never contains un-replicated writes that would need clearing on rollback.
-    pub fn clear_rollback_caches(&mut self) {
-        self.aggregate_write_snapshots.clear();
-        self.aggregate_read_snapshots.clear();
-        self.aggregate_write_client_snapshots.clear();
-        self.wal_index_positions.clear();
-        self.aggregate_queue_positions.clear();
-        self.pending_append_queue.clear();
-        self.pending_append_queue_invalidated = true;
-        self.clear_pending_replication();
-        self.pending_replication_queue_invalidated = true;
-    }
-
-    /// Invalidate the pending replication queue (on rollback)
-    pub fn invalidate_pending_replication(&mut self) {
-        self.clear_pending_replication();
-        self.pending_replication_queue_invalidated = true;
-    }
-
-    /// Take the pending replication invalidated flag and reset it
-    pub fn take_pending_replication_invalidated(&mut self) -> bool {
-        let state = self.pending_replication_queue_invalidated;
-        self.pending_replication_queue_invalidated = false;
-        state
     }
 
     /// Copy a single aggregate's write snapshot to read snapshot.
@@ -739,7 +727,6 @@ impl ShardMemCache {
             cache_eviction_queue: VecDeque::new(),
             aggregate_queue_positions: HashMap::new(),
             pending_append_queue: vec![],
-            pending_append_queue_invalidated: false,
             aggregate_write_snapshots: LruCache::new(aggregate_cap),
             aggregate_read_snapshots: LruCache::new(aggregate_cap),
             aggregate_write_client_snapshots: LruCache::new(client_cap),
@@ -747,7 +734,6 @@ impl ShardMemCache {
             pending_replication_batches: Vec::new(),
             pending_replication_bytes: 0,
             pending_replication_high_water_bytes,
-            pending_replication_queue_invalidated: false,
         }
     }
 }

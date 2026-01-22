@@ -23,6 +23,7 @@ pub struct ShardConfig {
     pub max_requested_latency: Duration,
     pub shard_log_preallocate_bytes: u64,
     pub fsync_delay: Duration,
+    pub replication_delay: Duration,
     pub recent_write_cache_bytes: u64,
     pub routing_rule: RoutingRule,
     pub non_durable_writes: bool,

@@ -28,7 +28,7 @@ impl LogSegmentsCache {
     /// Rollback write position after failed replication (read -> write)
     /// This is done here because it's possible the write is on a new rotated log file
     /// and read is still at the previous log file.
-    pub fn rollback_write_position(&mut self) {
+    pub fn rollback_write_position(&self) {
         let active_log_id = self.active_log_id();
         let prev_log_id = active_log_id.saturating_sub(1);
 
@@ -210,6 +210,14 @@ impl LogSegmentsCache {
         self.lru_cache.borrow_mut().put(log_id, rc_file.clone());
 
         Ok(rc_file)
+    }
+
+    /// Get file by log_id only if already cached (active or in LRU). No I/O.
+    pub fn get_if_cached(&self, log_id: u64) -> Option<Rc<LogSegmentFile>> {
+        if log_id == self.active_log_id() {
+            return Some(self.active());
+        }
+        self.lru_cache.borrow_mut().get(&log_id).cloned()
     }
 }
 

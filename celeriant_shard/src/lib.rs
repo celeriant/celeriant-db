@@ -7,4 +7,5 @@ pub mod loading_coordinator;
 pub mod internal_shard_config;
 pub mod timestamp_config;
 pub mod watch_event_collector;
-pub mod replication_coordinator;
+pub mod replication_client;
+pub mod shard_wal_replicate;

@@ -1,6 +1,6 @@
 use std::{cell::Cell, rc::Rc, time::Duration};
 
-use celeriant_shard::shard_wal::ShardWal;
+use celeriant_shard::{replication_client::ReplicationClient, shard_wal::ShardWal};
 use glommio::{
     channels::{
         channel_mesh::{Receivers, Senders},
@@ -20,16 +20,16 @@ use crate::{
     sidecar::sidecar_channels::SidecarSenders,
 };
 
-pub struct Shard {
+pub struct Shard<R: ReplicationClient + 'static> {
     intrashard_receivers: Receivers<IntrashardMessages>,
     client_tcp_listener: Rc<TcpListener>,
     replication_tcp_listener: Rc<TcpListener>,
-    ctx: ConnectionContext,
+    ctx: ConnectionContext<R>,
     shutdown_requested: Rc<Cell<bool>>,
-    shard_wal: Rc<ShardWal>,
+    shard_wal: Rc<ShardWal<R>>,
 }
 
-impl Shard {
+impl<R: ReplicationClient + 'static> Shard<R> {
     pub fn new(
         config: ShardConfig,
         current_shard_id: usize,
@@ -38,7 +38,7 @@ impl Shard {
         _sidecar_senders: SidecarSenders,
         client_tcp_listener: TcpListener,
         replication_tcp_listener: TcpListener,
-        shard_wal: ShardWal,
+        shard_wal: ShardWal<R>,
     ) -> Self {
         info!("Initializing shard {current_shard_id}");
 
@@ -129,7 +129,7 @@ async fn broadcast_message_to_other_shards(
     }
 }
 
-fn spawn_shard_zero_shutdown_handler(ctx: ConnectionContext) {
+fn spawn_shard_zero_shutdown_handler<R: ReplicationClient + 'static>(ctx: ConnectionContext<R>) {
     if ctx.current_shard_id != 0 {
         return;
     }
@@ -160,7 +160,7 @@ fn spawn_shard_zero_shutdown_handler(ctx: ConnectionContext) {
     }).detach();
 }
 
-fn spawn_intrashard_message_handler(stream: ConnectedReceiver<IntrashardMessages>, ctx: ConnectionContext) {
+fn spawn_intrashard_message_handler<R: ReplicationClient + 'static>(stream: ConnectedReceiver<IntrashardMessages>, ctx: ConnectionContext<R>) {
     glommio::spawn_local(async move {
         while let Some(msg) = stream.recv().await {
             handle_intrashard_message(msg, &ctx);
@@ -168,7 +168,7 @@ fn spawn_intrashard_message_handler(stream: ConnectedReceiver<IntrashardMessages
     }).detach();
 }
 
-fn handle_intrashard_message(msg: IntrashardMessages, ctx: &ConnectionContext) {
+fn handle_intrashard_message<R: ReplicationClient + 'static>(msg: IntrashardMessages, ctx: &ConnectionContext<R>) {
     match msg {
         IntrashardMessages::Shutdown => {
             ctx.shutdown_requested.set(true);

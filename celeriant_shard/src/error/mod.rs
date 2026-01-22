@@ -4,3 +4,5 @@ pub mod shard_write_error;
 pub mod shard_error;
 pub mod shard_cache_load_error;
 pub mod watch_session_error;
+pub mod rollback_error;
+pub mod replication_error;

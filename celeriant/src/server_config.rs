@@ -175,6 +175,14 @@ pub struct ServerConfig {
 
     #[arg(
         long,
+        default_value_t = 17000,
+        env = "CELERIANT_REPLICATION_DELAY_US",
+        help = "Amortised replication send duration block (17ms)"
+    )]
+    pub replication_delay_us: u64,
+
+    #[arg(
+        long,
         action = clap::ArgAction::SetTrue,
         env = "CELERIANT_NON_DURABLE_WRITES",
         help = "Acknowledge writes to client before persisting to disk",
@@ -309,6 +317,7 @@ impl ServerConfig {
             slow_client_timeout: Duration::from_millis(self.client_connection_timeout_ms),
             max_requested_latency: Duration::from_millis(self.max_requested_latency_ms),
             fsync_delay: Duration::from_micros(self.fsync_delay_us),
+            replication_delay: Duration::from_micros(self.replication_delay_us),
             routing_rule: self.routing_rule,
             non_durable_writes: self.non_durable_writes,
             aggregate_client_snapshots_cache_bytes: self.aggregate_client_snapshots_cache_bytes,
@@ -363,6 +372,7 @@ impl ServerConfig {
         check_field!(max_requested_latency_ms);
         check_field!(shard_log_preallocate_bytes);
         check_field!(fsync_delay_us);
+        check_field!(replication_delay_us);
         check_field!(non_durable_writes);
         check_field!(log_level);
         check_field!(s3_enabled);
@@ -414,6 +424,7 @@ impl Default for ServerConfig {
             s3_subfolder: None,
             shard_log_preallocate_bytes: 1024 * 1024 * 1024,
             fsync_delay_us: 17000,
+            replication_delay_us: 17000,
             non_durable_writes: false,
             recent_write_cache_bytes: 512 * 1024 * 1024,
             client_connection_timeout_ms: 30000,

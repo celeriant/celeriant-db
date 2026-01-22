@@ -8,6 +8,7 @@ pub struct ShardLogQueueItem {
     pub datablock_bytes: Option<Vec<u8>>,
     pub datablock: Option<Datablock>,
     pub metablock: Metablock,
+    pub metablock_absolute_pos: u64,
 }
 
 impl ShardLogQueueItem {
@@ -20,6 +21,7 @@ impl ShardLogQueueItem {
             datablock_bytes,
             datablock,
             metablock,
+            metablock_absolute_pos: 0,
         }
     }
     

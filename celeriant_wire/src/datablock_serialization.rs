@@ -27,7 +27,7 @@ pub struct SerializedDatablock {
 
 /// Serializes a datablock, automatically choosing inline or block storage based on size.
 ///
-/// If the serialized data fits within MINIBATCH_SIZE_BYTES (256 bytes), it will be
+/// If the serialized data fits within MINIBATCH_SIZE_BYTES (512 bytes), it will be
 /// stored inline. Otherwise, it will be compressed (if compression_type != None)
 /// and stored as a block reference.
 ///
@@ -176,8 +176,9 @@ mod tests {
     }
 
     fn create_large_datablock() -> Datablock {
-        // Create a datablock with enough data to exceed MINIBATCH_SIZE_BYTES
-        let large_payload = vec![0u8; 300];
+        // Create a datablock with enough data to exceed MINIBATCH_SIZE_BYTES (512 bytes)
+        // Need 600+ bytes to ensure serialized size exceeds threshold after bincode overhead
+        let large_payload = vec![0u8; 600];
         Datablock {
             datablock_kind: DatablockKind::EventBatchItem(DatablockAggregateEventBatch {
                 event_batch_index: 1,

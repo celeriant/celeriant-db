@@ -1,5 +1,6 @@
-use celeriant_shard::{internal_shard_config::InternalShardConfig, shard_wal::ShardWal};
+use celeriant_shard::{internal_shard_config::InternalShardConfig, replication_client::StubReplicationClient, shard_wal::ShardWal};
 use celeriant_sidecar::store::SidecarStoreTrait;
+use celeriant_wal::cluster_role::ClusterRole;
 use glommio::{
     CpuSet, LocalExecutorPoolBuilder, PoolPlacement,
     channels::channel_mesh::{Full, MeshBuilder},
@@ -48,7 +49,8 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
             let internal_shard_config = InternalShardConfig { 
                 shard_log_preallocate_bytes: shard_config.shard_log_preallocate_bytes, 
                 node_id, 
-                fsync_delay: shard_config.fsync_delay, 
+                fsync_delay: shard_config.fsync_delay,
+                replication_delay: shard_config.replication_delay,
                 non_durable_writes: shard_config.non_durable_writes, 
                 shard_dir,
                 max_open_files: shard_config.max_open_files,
@@ -63,7 +65,8 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                 list_wal_index_cache_bytes: shard_config.list_wal_index_cache_bytes,
                 pending_replication_high_water_bytes: shard_config.pending_replication_high_water_bytes,
             };
-            let filesystem = ShardWal::open(internal_shard_config).await
+            //TODO: Cluster role handling in shard init
+            let filesystem = ShardWal::open(internal_shard_config, ClusterRole::Leader, StubReplicationClient).await
                 .expect(&format!("Failed to initialize filesystem at {:?} - cannot initialize shard", shard_config.data_root));
 
             Shard::new(shard_config, current_shard_id, sender, receivers, sidecar_senders, client_tcp_listener, replication_tcp_listener, filesystem).run().await;

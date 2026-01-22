@@ -6,10 +6,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use celeriant_shard::internal_shard_config::InternalShardConfig;
+use celeriant_shard::replication_client::StubReplicationClient;
 use celeriant_shard::timestamp_config::TimestampConfig;
 use celeriant_msg::request::requests::{SingleAggregateWrite, WriteRequest};
 use celeriant_shard::shard_wal::ShardWal;
 use celeriant_wal::aggregate_key::AggregateKey;
+use celeriant_wal::cluster_role::ClusterRole;
 use celeriant_wal::compression_type::CompressionType;
 use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
@@ -60,6 +62,7 @@ fn create_config(shard_dir: PathBuf) -> InternalShardConfig {
         max_open_files: 256,
         shard_log_preallocate_bytes: SEGMENT_SIZE_BYTES,
         fsync_delay: FSYNC_DELAY,
+        replication_delay: Duration::from_millis(17),
         recent_write_cache_bytes: 64 * 1024 * 1024,
         non_durable_writes: false,
         shard_dir,
@@ -71,6 +74,7 @@ fn create_config(shard_dir: PathBuf) -> InternalShardConfig {
         list_max_duration: Duration::from_millis(2000),
         list_page_size: 20000,
         list_wal_index_cache_bytes: 12 * 1024 * 1024,
+        pending_replication_high_water_bytes: 67_108_864, // 64MB
     }
 }
 
@@ -151,7 +155,7 @@ fn bench_aggregate_count_impact(c: &mut Criterion) {
                         let iteration_duration = LocalExecutorBuilder::new(Placement::Fixed(0))
                             .spawn(move || async move {
                                 let config = create_config(shard_dir);
-                                let shard_wal = Rc::new(ShardWal::open(config).await.unwrap());
+                                let shard_wal = Rc::new(ShardWal::open(config, ClusterRole::Standalone, StubReplicationClient).await.unwrap());
 
                                 let mut all_handles = Vec::with_capacity(TOTAL_WRITES);
                                 let num_waves = TOTAL_WRITES / WRITES_PER_WAVE;

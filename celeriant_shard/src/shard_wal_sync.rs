@@ -8,6 +8,8 @@ use std::rc::Rc;
 
 use celeriant_distributed::hash_chain::compute_entry_hash;
 use celeriant_memcache::cache_path::CachePath;
+use celeriant_memcache::pending_cache_item::PendingCacheItem;
+use celeriant_memcache::pending_commit_data::PendingCommitData;
 use celeriant_memcache::shard_mem_cache::ShardMemCache;
 use celeriant_memcache::sync_positions_snapshot::SyncPositionsSnapshot;
 use celeriant_rotating_log::log_segment_file::LogSegmentFile;
@@ -24,21 +26,17 @@ use celeriant_wire::version_aware_wire_format::serialize_versioned_message;
 use crate::error::shard_fsync_error::ShardFsyncError;
 use crate::watch_event_collector::WatchEventCollector;
 
-fn take_sync_snapshot(shard_mem_cache: &Rc<RefCell<ShardMemCache>>) -> Result<Option<(u64, SyncPositionsSnapshot)>, ShardFsyncError> {
+fn take_sync_snapshot(shard_mem_cache: &Rc<RefCell<ShardMemCache>>) -> Result<(u64, SyncPositionsSnapshot), ShardFsyncError> {
     let mut cache = shard_mem_cache.borrow_mut();
 
-    if cache.take_pending_append_queue_invalidated() {
-        return Err(ShardFsyncError::IoError("Previous fsync batch failure, pending writes invalidated".to_string()));
-    }
-
     if cache.pending_append_queue_is_empty() {
-        return Ok(None);
+        return Err(ShardFsyncError::IoError("Fsync batch failure, pending queue emptied by fsync or replication rollback, pending writes invalidated".to_string()));
     }
 
     let required_disk_space = cache.buffer_size_total();
     let snapshot = cache.take_sync_positions_snapshot();
 
-    Ok(Some((required_disk_space, snapshot)))
+    Ok((required_disk_space, snapshot))
 }
 
 /// Orchestrates the sync process with rollback on failure.
@@ -47,19 +45,15 @@ fn take_sync_snapshot(shard_mem_cache: &Rc<RefCell<ShardMemCache>>) -> Result<Op
 /// and either commits the changes (updating caches and broadcasting events)
 /// or rolls back on failure.
 pub(crate) async fn sync_with_rollback(
+    cluster_role: ClusterRole,
     log_segments_cache: Rc<LogSegmentsCache>,
     shard_mem_cache: Rc<RefCell<ShardMemCache>>,
     watched_aggregates: Rc<AggregateWatchers>,
 ) -> Result<(), ShardFsyncError> {
-    let Some((required_disk_space, mut sync_positions_snapshot)) = take_sync_snapshot(&shard_mem_cache)? else {
-        return Ok(());
-    };
+    let (required_disk_space, mut sync_positions_snapshot) = take_sync_snapshot(&shard_mem_cache)?;
 
     log_segments_cache.rotate_to_next_log(required_disk_space).await?;
     let active_log_segment = log_segments_cache.active();
-
-    // TODO: replicated_mode for sync
-    let cluster_role = ClusterRole::Leader;
 
     match sync(active_log_segment.clone(), &mut sync_positions_snapshot).await {
         Ok(updated_log_segment_file_metadata) => {
@@ -89,8 +83,9 @@ fn commit_sync(
         // Currently single node mode or is follower
         // Data is durable, so we can advance visible position
         new_metadata.advance_visible_position();
-        *log_segment_file.metadata.borrow_mut() = new_metadata;
     }
+    
+    *log_segment_file.metadata.borrow_mut() = new_metadata;
 
     let mut shard_mem_cache = shard_mem_cache.borrow_mut();
 
@@ -99,19 +94,24 @@ fn commit_sync(
 
     shard_mem_cache.commit_sync_positions_snapshot(cluster_role, sync_positions_snapshot);
 
+    let mut pending_commit_data = PendingCommitData {
+        log_metadata: log_segment_file.metadata.borrow().clone(),
+        pending_queue: Vec::with_capacity(pending_append_queue.len()),
+    };
+
     // Collect watch events and update caches
     let mut event_collector = WatchEventCollector::new();
 
     for queue_item in pending_append_queue {
         match &queue_item.metablock.wal_metablock_type {
             MetablockKind::EventBatchMetadata(event_batch_metadata) => {
-                event_collector.add_write_event(event_batch_metadata);
-
-                if event_batch_metadata.event_batch_index == FIRST_EVENT_BATCH_INDEX {
-                    event_collector.add_create_event(event_batch_metadata.aggregate_key.clone());
-                }
 
                 if cluster_role != ClusterRole::Leader {
+                    event_collector.add_write_event(event_batch_metadata);
+
+                    if event_batch_metadata.event_batch_index == FIRST_EVENT_BATCH_INDEX {
+                        event_collector.add_create_event(event_batch_metadata.aggregate_key.clone());
+                    }
                     let size_bytes = queue_item.size_bytes();
                     shard_mem_cache.cache_recent_write(
                         event_batch_metadata.aggregate_key.clone(),
@@ -120,12 +120,19 @@ fn commit_sync(
                         queue_item.datablock,
                         size_bytes,
                     );
+                } else {
+                    pending_commit_data.pending_queue.push(PendingCacheItem::new(queue_item));
                 }
             }
             MetablockKind::SoftTrim(soft_trim) => {
                 shard_mem_cache.update_aggregate_min_event_batch_index(&soft_trim.aggregate_key, soft_trim.keep_from_event_batch_index, CachePath::Write);
-                shard_mem_cache.update_aggregate_min_event_batch_index(&soft_trim.aggregate_key, soft_trim.keep_from_event_batch_index, CachePath::Read);
-                event_collector.add_trim_event(soft_trim.aggregate_key.clone(), soft_trim.keep_from_event_batch_index);
+                
+                if cluster_role != ClusterRole::Leader {
+                    shard_mem_cache.update_aggregate_min_event_batch_index(&soft_trim.aggregate_key, soft_trim.keep_from_event_batch_index, CachePath::Read);
+                    event_collector.add_trim_event(soft_trim.aggregate_key.clone(), soft_trim.keep_from_event_batch_index);
+                } else {
+                    pending_commit_data.pending_queue.push(PendingCacheItem::new(queue_item));
+                }
             }
             MetablockKind::SoftDelete(soft_delete) => {
                 shard_mem_cache.put_aggregate_into_cache_as_deleted(
@@ -136,15 +143,20 @@ fn commit_sync(
                     soft_delete.allow_index_continuation,
                     CachePath::Write,
                 );
-                shard_mem_cache.put_aggregate_into_cache_as_deleted(
-                    soft_delete.aggregate_key.clone(),
-                    soft_delete.event_index,
-                    soft_delete.event_batch_index,
-                    soft_delete.allow_recreate,
-                    soft_delete.allow_index_continuation,
-                    CachePath::Read,
-                );
-                event_collector.add_delete_event(soft_delete.aggregate_key.clone());
+
+                if cluster_role != ClusterRole::Leader {
+                    shard_mem_cache.put_aggregate_into_cache_as_deleted(
+                        soft_delete.aggregate_key.clone(),
+                        soft_delete.event_index,
+                        soft_delete.event_batch_index,
+                        soft_delete.allow_recreate,
+                        soft_delete.allow_index_continuation,
+                        CachePath::Read,
+                    );
+                    event_collector.add_delete_event(soft_delete.aggregate_key.clone());
+                } else {
+                    pending_commit_data.pending_queue.push(PendingCacheItem::new(queue_item));
+                }
             }
             _ => {}
         }
@@ -152,12 +164,15 @@ fn commit_sync(
 
     if cluster_role != ClusterRole::Leader {
         event_collector.broadcast_all(&watched_aggregates);
+    } else {
+        // As leader, after fsync we can now allow replication to proceed
+        shard_mem_cache.push_pending_replication(pending_commit_data);
     }
 }
 
 /// Rolls back a failed sync by restoring queue positions and forcing immediate rotation.
 fn rollback_sync(shard_mem_cache: Rc<RefCell<ShardMemCache>>, log_segments_cache: &Rc<LogSegmentsCache>) {
-    shard_mem_cache.borrow_mut().rollback_queue_positions();
+    shard_mem_cache.borrow_mut().execute_fsync_rollback();
     log_segments_cache.force_immediate.set(true);
 }
 
@@ -253,6 +268,7 @@ pub(crate) async fn sync(log_segment_file: Rc<LogSegmentFile>, sync_positions_sn
 
         // Track the absolute position where this metablock is written
         let metablock_absolute_pos = log_segment_file_metadata.write.metablocks_position + position as u64;
+        item.metablock_absolute_pos = metablock_absolute_pos;
 
         // Update aggregate positions tracking for event batches (only if entry exists)
         if let MetablockKind::EventBatchMetadata(event_batch) = &item.metablock.wal_metablock_type {

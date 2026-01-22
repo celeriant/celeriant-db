@@ -27,15 +27,24 @@ pub type SyncResult<E> = Result<(), E>;
 /// ```
 pub struct Coordinator<E: Clone> {
     lock_orchestrator: RwLock<Option<Rc<LocalEvent<SyncResult<E>>>>>,
-    sync_serializer: RwLock<()>, // Ensures one sync at a time
+
+    /// Sync gate: serializes sync execution and supports rollback drain/gate.
+    /// Fsync and rollback both acquire write lock - ensures one-at-a-time execution.
+    sync_gate: RwLock<()>,
 }
 
 impl<E: Clone> Coordinator<E> {
     pub fn new() -> Self {
         Self {
             lock_orchestrator: RwLock::new(None),
-            sync_serializer: RwLock::new(()),
+            sync_gate: RwLock::new(()),
         }
+    }
+
+    /// Acquire rollback lock. Waits for any in-flight fsync to complete,
+    /// then blocks new fsyncs until the guard is dropped.
+    pub async fn acquire_rollback_lock(&self) -> Option<glommio::sync::RwLockWriteGuard<'_, ()>> {
+        write_with_timeout(&self.sync_gate, "acquire_rollback_lock").await.ok()
     }
 
     pub async fn request_sync<F, Fut>(&self, delay: Option<Duration>, sync_fn: F) -> SyncResult<E>
@@ -83,8 +92,7 @@ impl<E: Clone> Coordinator<E> {
                         guard.take();
                     }
 
-                    // Serialize sync operations - wait for previous sync to complete
-                    let _sync_guard = self.sync_serializer.write().await.ok();
+                    let _sync_guard = write_with_timeout(&self.sync_gate, "fsync_sync_gate").await.ok();
                     let result = sync_fn().await;
                     drop(_sync_guard);
 
@@ -795,6 +803,79 @@ mod tests {
 
             // All waiters should have completed, not hung
             assert_eq!(completed_count.get(), 10);
+        });
+    }
+
+    // ==================== Rollback Gate Tests ====================
+
+    #[test]
+    fn rollback_gate_blocks_new_syncs() {
+        run_with_glommio(|| async {
+            let coordinator: Rc<Coordinator<String>> = Rc::new(Coordinator::new());
+            let sync_count = Rc::new(Cell::new(0));
+
+            let gate = coordinator.acquire_rollback_lock().await;
+
+            let mut handles = vec![];
+            for _ in 0..5 {
+                let coord = coordinator.clone();
+                let sc = sync_count.clone();
+                handles.push(spawn_local(async move {
+                    coord
+                        .request_sync(Some(Duration::from_millis(1)), || async move {
+                            sc.set(sc.get() + 1);
+                            Ok(())
+                        })
+                        .await
+                }));
+            }
+
+            glommio::timer::sleep(Duration::from_millis(20)).await;
+            assert_eq!(sync_count.get(), 0);
+
+            drop(gate);
+
+            for h in handles {
+                h.await.unwrap();
+            }
+            assert_eq!(sync_count.get(), 1); // All batched
+        });
+    }
+
+    #[test]
+    fn rollback_gate_drains_inflight_sync() {
+        run_with_glommio(|| async {
+            let coordinator: Rc<Coordinator<String>> = Rc::new(Coordinator::new());
+            let sync_started = Rc::new(Cell::new(false));
+            let sync_done = Rc::new(Cell::new(false));
+
+            let coord = coordinator.clone();
+            let started = sync_started.clone();
+            let done = sync_done.clone();
+            let sync_handle = spawn_local(async move {
+                coord
+                    .request_sync(Some(Duration::from_millis(1)), || async move {
+                        started.set(true);
+                        glommio::timer::sleep(Duration::from_millis(50)).await;
+                        done.set(true);
+                        Ok(())
+                    })
+                    .await
+            });
+
+            while !sync_started.get() {
+                yield_now().await;
+            }
+
+            let coord = coordinator.clone();
+            let done_check = sync_done.clone();
+            let drain_handle = spawn_local(async move {
+                let _guard = coord.acquire_rollback_lock().await;
+                assert!(done_check.get()); // Sync must finish before we acquire
+            });
+
+            sync_handle.await.unwrap();
+            drain_handle.await;
         });
     }
 }

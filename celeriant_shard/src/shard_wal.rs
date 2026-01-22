@@ -7,7 +7,7 @@ mod sync;
 
 use self::sync::sync_with_rollback;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroUsize;
 use std::rc::Rc;
@@ -32,6 +32,7 @@ use celeriant_rotating_log::rwlock_timeout::write_with_timeout;
 use celeriant_wal::aggregate_client_key::AggregateClientKey;
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::aggregate_type_key::AggregateTypeKey;
+use celeriant_wal::cluster_role::ClusterRole;
 use celeriant_wal::constants::{FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, GENESIS_HASH};
 use celeriant_wal::datablocks::datablock::Datablock;
 use celeriant_wal::datablocks::datablock_aggregate_event_batch::DatablockAggregateEventBatch;
@@ -51,6 +52,7 @@ use lru::LruCache;
 use crate::amortisation::coordinator::Coordinator;
 use crate::bloom::bloom_filter_cache::BloomFilterCache;
 use crate::bloom::event_type_filter::extract_unique_event_types;
+use crate::error::replication_error::ReplicationError;
 use crate::error::shard_cache_load_error::ShardCacheError;
 use crate::error::shard_error::ShardError;
 use crate::error::shard_fsync_error::ShardFsyncError;
@@ -59,6 +61,8 @@ use crate::error::shard_write_error::ShardWriteError;
 use crate::in_memory_filtering;
 use crate::internal_shard_config::InternalShardConfig;
 use crate::loading_coordinator::LoadingCoordinator;
+use crate::replication_client::ReplicationClient;
+use crate::shard_wal_replicate::replicate_with_rollback;
 
 /// Write-ahead log for a single shard.
 ///
@@ -71,7 +75,7 @@ use crate::loading_coordinator::LoadingCoordinator;
 /// - Watch notifications
 ///
 /// Not thread-safe—designed for single-threaded per-core access.
-pub struct ShardWal {
+pub struct ShardWal<R: ReplicationClient + 'static> {
     /// No async in shard_mem_cache and no interior mutability
     shard_mem_cache: Rc<RefCell<ShardMemCache>>,
 
@@ -81,11 +85,17 @@ pub struct ShardWal {
     /// Uses interior mutability with glommio RwLocks to select an fsync leader
     fsync_coordinator: Rc<Coordinator<ShardFsyncError>>,
 
+    /// Same pattern as fsync_coordinator, single leader, batched replication over tcp
+    replication_coordinator: Rc<Coordinator<ReplicationError>>,
+
     /// Registry of watchers for aggregates in this shard, uses local channel broadcasting
     pub watched_aggregates: Rc<AggregateWatchers>,
 
     /// Cache for bloom filter construction to avoid repeated allocations, uses interior mutability
     bloom_filter_cache: Rc<BloomFilterCache>,
+
+    // Are we the leader? Follower? Single node mode? Note this can change at runtime.
+    cluster_role: Rc<Cell<ClusterRole>>,
 
     config: InternalShardConfig,
 
@@ -94,15 +104,18 @@ pub struct ShardWal {
 
     /// Serializes concurrent client event index loading from disk
     aggregate_client_loading: LoadingCoordinator<AggregateClientKey>,
+
+    /// Client for replicating data to followers or S3
+    replication_client: Rc<R>,
 }
 
-impl AggregateReader for ShardWal {
+impl<R: ReplicationClient + 'static> AggregateReader for ShardWal<R> {
     fn watched_aggregates(&self) -> Rc<AggregateWatchers> {
         Rc::clone(&self.watched_aggregates)
     }
 }
 
-impl ShardWal {
+impl<R: ReplicationClient + 'static> ShardWal<R> {
     pub async fn process_request(&self, lease_index: Option<u64>, request: Request) -> Result<Response, ShardError> {
         match request {
             Request::Exists(exists_request) => self.exists(&exists_request).await.map(Response::Exists).map_err(ShardError::Read),
@@ -159,7 +172,7 @@ impl ShardWal {
     ///
     /// If the shard directory exists with log files, reopens from the latest.
     /// Otherwise creates a new shard with an empty log file.
-    pub async fn open(config: InternalShardConfig) -> Result<Self, RotatingLogError> {
+    pub async fn open(config: InternalShardConfig, cluster_role: ClusterRole, replication_client: R) -> Result<Self, RotatingLogError> {
         let shard_mem_cache = ShardMemCache::new(
             config.recent_write_cache_bytes,
             config.aggregate_snapshots_cache_bytes,
@@ -179,11 +192,14 @@ impl ShardWal {
             shard_mem_cache: Rc::new(RefCell::new(shard_mem_cache)),
             log_segments_cache: Rc::new(log_segments_cache),
             fsync_coordinator: Rc::new(Coordinator::new()),
+            replication_coordinator: Rc::new(Coordinator::new()),
             watched_aggregates: Rc::new(AggregateWatchers::new()),
             bloom_filter_cache: Rc::new(BloomFilterCache::new()),
+            cluster_role: Rc::new(Cell::new(cluster_role)),
             config,
             aggregate_loading: LoadingCoordinator::new(),
             aggregate_client_loading: LoadingCoordinator::new(),
+            replication_client: Rc::new(replication_client),
         })
     }
 
@@ -688,6 +704,10 @@ impl ShardWal {
         // Wait for durable write
         self.sync_durable().await?;
 
+        // Same deal for replication, if we are the leader, 
+        // wait on durable replication, also batched
+        self.replicate_durable().await?;
+
         Ok(SuccessResponse {
             correlation_id: trim_request.correlation_id,
         })
@@ -762,6 +782,10 @@ impl ShardWal {
 
         // Now we wait on disk write before ack to client
         self.sync_durable().await?;
+
+        // Same deal for replication, if we are the leader, 
+        // wait on durable replication, also batched
+        self.replicate_durable().await?;
 
         Ok(SuccessResponse {
             correlation_id: delete_request.correlation_id,
@@ -843,8 +867,12 @@ impl ShardWal {
         // Phase 2: Append all prepared writes to queue - cannot fail
         self.append_prepared_writes_to_queue(prepared_writes);
 
-        // Now we wait on disk write before ack to client
+        // Wait on disk write, it's batched for performance
         self.sync_durable().await?;
+
+        // Same deal for replication, if we are the leader, 
+        // wait on durable replication, also batched
+        self.replicate_durable().await?;
 
         Ok(SuccessResponse {
             correlation_id: write_request.correlation_id,
@@ -1257,21 +1285,58 @@ impl ShardWal {
         let shard_mem_cache = self.shard_mem_cache.clone();
         let watched_aggregates = self.watched_aggregates.clone();
 
+        // Note we don't decide on the current cluster role right now, only just before sync
+        let cluster_role = self.cluster_role.clone();
+
         if rotating_log_cache.force_immediate.get() {
             self.fsync_coordinator
-                .request_sync(None, move || sync_with_rollback(rotating_log_cache, shard_mem_cache, watched_aggregates))
+                .request_sync(None, move || sync_with_rollback(cluster_role.get(), rotating_log_cache, shard_mem_cache, watched_aggregates))
                 .await
         } else if !self.config.non_durable_writes {
             self.fsync_coordinator
                 .request_sync(Some(self.config.fsync_delay), move || {
-                    sync_with_rollback(rotating_log_cache, shard_mem_cache, watched_aggregates)
+                    sync_with_rollback(cluster_role.get(), rotating_log_cache, shard_mem_cache, watched_aggregates)
                 })
                 .await
         } else {
             let fsync_coordinator = self.fsync_coordinator.clone();
             glommio::spawn_local(async move {
                 let _ = fsync_coordinator
-                    .request_sync(None, move || sync_with_rollback(rotating_log_cache, shard_mem_cache, watched_aggregates))
+                    .request_sync(None, move || sync_with_rollback(cluster_role.get(), rotating_log_cache, shard_mem_cache, watched_aggregates))
+                    .await;
+            })
+            .detach();
+            Ok(())
+        }
+    }
+
+    async fn replicate_durable(&self) -> Result<(), ReplicationError> {
+        // Only leaders need to replicate
+        if self.cluster_role.get() != ClusterRole::Leader {
+            return Ok(());
+        }
+
+        let replication_client = self.replication_client.clone();
+        let fsync_coordinator = self.fsync_coordinator.clone();
+        let rotating_log_cache = self.log_segments_cache.clone();
+        let shard_mem_cache = self.shard_mem_cache.clone();
+        let watched_aggregates = self.watched_aggregates.clone();
+
+        if rotating_log_cache.force_immediate.get() {
+            self.replication_coordinator
+                .request_sync(None, move || replicate_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates))
+                .await
+        } else if !self.config.non_durable_writes {
+            self.replication_coordinator
+                .request_sync(Some(self.config.fsync_delay), move || {
+                    replicate_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates)
+                })
+                .await
+        } else {
+            let replication_coordinator = self.replication_coordinator.clone();
+            glommio::spawn_local(async move {
+                let _ = replication_coordinator
+                    .request_sync(None, move || replicate_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates))
                     .await;
             })
             .detach();
@@ -1308,7 +1373,7 @@ struct MetablockCollection {
     next_event_batch_index: Option<u64>,
 }
 
-impl ShardWal {
+impl<R: ReplicationClient + 'static> ShardWal<R> {
     fn get_batch_index(metablock: &Metablock) -> u64 {
         match &metablock.wal_metablock_type {
             MetablockKind::EventBatchMetadata(m) => m.event_batch_index,

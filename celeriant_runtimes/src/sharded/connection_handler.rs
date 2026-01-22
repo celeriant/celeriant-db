@@ -8,6 +8,7 @@ use celeriant_msg::{
 };
 use celeriant_shard::{
     error::{shard_error::ShardError, shard_read_error::ShardReadError, shard_write_error::ShardWriteError, watch_session_error::WatchSessionError},
+    replication_client::ReplicationClient,
     shard_wal::ShardWal,
 };
 use celeriant_watch::{watch_output_type::WatchOutputType, watch_session::WatchSession};
@@ -23,13 +24,24 @@ pub enum PortType {
     Replication,
 }
 
-#[derive(Clone)]
-pub struct ConnectionContext {
+pub struct ConnectionContext<R: ReplicationClient + 'static> {
     pub config: Rc<ShardConfig>,
     pub current_shard_id: usize,
     pub intrashard_sender: Rc<Senders<IntrashardMessages>>,
     pub shutdown_requested: Rc<Cell<bool>>,
-    pub shard_wal: Rc<ShardWal>,
+    pub shard_wal: Rc<ShardWal<R>>,
+}
+
+impl<R: ReplicationClient + 'static> Clone for ConnectionContext<R> {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            current_shard_id: self.current_shard_id,
+            intrashard_sender: self.intrashard_sender.clone(),
+            shutdown_requested: self.shutdown_requested.clone(),
+            shard_wal: self.shard_wal.clone(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -55,7 +67,7 @@ enum RedirectResult {
     ErrorSentContinue(TcpStream),
 }
 
-pub fn handle_new_connection(mut tcp_stream: TcpStream, ctx: ConnectionContext, port_type: PortType) {
+pub fn handle_new_connection<R: ReplicationClient + 'static>(mut tcp_stream: TcpStream, ctx: ConnectionContext<R>, port_type: PortType) {
     let _ = tcp_stream.set_nodelay(true);
 
     glommio::spawn_local(async move {
@@ -79,11 +91,11 @@ pub fn handle_new_connection(mut tcp_stream: TcpStream, ctx: ConnectionContext, 
     .detach();
 }
 
-pub fn handle_redirected_connection(
+pub fn handle_redirected_connection<R: ReplicationClient + 'static>(
     tcp_stream: TcpStream,
     request: Request,
     message_version: u32,
-    ctx: ConnectionContext,
+    ctx: ConnectionContext<R>,
     port_type: PortType,
 ) {
     let _ = tcp_stream.set_nodelay(true);
@@ -94,11 +106,11 @@ pub fn handle_redirected_connection(
     .detach();
 }
 
-async fn handle_pipelining(
+async fn handle_pipelining<R: ReplicationClient + 'static>(
     mut tcp_stream: TcpStream,
     request: Request,
     mut message_version: u32,
-    ctx: ConnectionContext,
+    ctx: ConnectionContext<R>,
     port_type: PortType,
 ) {
     let mut optional_request = Some(request);
@@ -175,11 +187,11 @@ fn is_valid_for_port(request: &Request, port_type: PortType) -> bool {
     }
 }
 
-async fn check_redirect(
+async fn check_redirect<R: ReplicationClient + 'static>(
     mut tcp_stream: TcpStream,
     request: Request,
     message_version: u32,
-    ctx: &ConnectionContext,
+    ctx: &ConnectionContext<R>,
     port_type: PortType,
 ) -> RedirectResult {
     let target_shard = match determine_shard(&request, &ctx.config, port_type) {
@@ -356,9 +368,9 @@ fn collect_unique_shard_id(
     shard_id.ok_or(ShardRoutingError::NoRoutingKeyProvided)
 }
 
-async fn read_request(
+async fn read_request<R: ReplicationClient + 'static>(
     tcp_stream: &mut TcpStream,
-    ctx: &ConnectionContext,
+    ctx: &ConnectionContext<R>,
 ) -> Option<(Request, u32)> {
     match glommio::timer::timeout(ctx.config.slow_client_timeout, async {
         let result = Request::read_request(tcp_stream, ctx.config.max_request_size).await;
@@ -393,9 +405,9 @@ async fn write_response(
     }
 }
 
-async fn process_request(
+async fn process_request<R: ReplicationClient + 'static>(
     tcp_stream: &mut TcpStream,
-    ctx: &ConnectionContext,
+    ctx: &ConnectionContext<R>,
     request: Request,
     message_version: u32,
 ) {
@@ -407,11 +419,11 @@ async fn process_request(
     let _ = write_response(tcp_stream, &response, message_version, ctx.config.slow_client_timeout).await;
 }
 
-async fn handle_watch(
+async fn handle_watch<R: ReplicationClient + 'static>(
     mut tcp_stream: TcpStream,
     watch_request: WatchRequest,
     message_version: u32,
-    ctx: &ConnectionContext,
+    ctx: &ConnectionContext<R>,
 ) {
     let correlation_id = watch_request.correlation_id;
 
@@ -449,11 +461,11 @@ async fn handle_watch(
     }
 }
 
-fn create_watch_session(
-    shard_wal: &Rc<ShardWal>,
+fn create_watch_session<R: ReplicationClient + 'static>(
+    shard_wal: &Rc<ShardWal<R>>,
     request: WatchRequest,
     max_requested_latency: Duration,
-) -> Result<WatchSession<ShardWal>, WatchSessionError> {
+) -> Result<WatchSession<ShardWal<R>>, WatchSessionError> {
     if let Some(latency_ms) = request.requested_latency_ms
         && Duration::from_millis(latency_ms) > max_requested_latency
     {
@@ -559,6 +571,8 @@ mod tests {
             list_max_duration: Duration::from_secs(10),
             list_page_size: 100,
             list_wal_index_cache_bytes: 1024,
+            pending_replication_high_water_bytes: 67_108_864, // 64MB
+            replication_delay: Duration::from_millis(20),
         }
     }
 

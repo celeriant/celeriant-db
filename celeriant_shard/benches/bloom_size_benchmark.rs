@@ -6,10 +6,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use celeriant_shard::internal_shard_config::InternalShardConfig;
+use celeriant_shard::replication_client::StubReplicationClient;
 use celeriant_shard::timestamp_config::TimestampConfig;
 use celeriant_msg::request::requests::{ExistsRequest, SingleAggregateWrite, WriteRequest};
 use celeriant_shard::shard_wal::ShardWal;
 use celeriant_wal::aggregate_key::AggregateKey;
+use celeriant_wal::cluster_role::ClusterRole;
 use celeriant_wal::compression_type::CompressionType;
 use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
@@ -58,6 +60,7 @@ fn create_config(shard_dir: PathBuf) -> InternalShardConfig {
         max_open_files: 256,
         shard_log_preallocate_bytes: SEGMENT_SIZE_BYTES,
         fsync_delay: FSYNC_DELAY,
+        replication_delay: Duration::from_millis(17),
         recent_write_cache_bytes: 64 * 1024 * 1024,
         non_durable_writes: false,
         shard_dir,
@@ -69,6 +72,7 @@ fn create_config(shard_dir: PathBuf) -> InternalShardConfig {
         list_max_duration: Duration::from_millis(2000),
         list_page_size: 20000,
         list_wal_index_cache_bytes: 12 * 1024 * 1024,
+        pending_replication_high_water_bytes: 67_108_864, // 64MB
     }
 }
 
@@ -113,7 +117,7 @@ fn create_write_request(
 }
 
 /// Populate WAL with specified number of unique aggregates
-async fn populate_wal(shard_wal: Rc<ShardWal>, num_aggregates: usize, total_writes: usize) {
+async fn populate_wal(shard_wal: Rc<ShardWal<StubReplicationClient>>, num_aggregates: usize, total_writes: usize) {
     let num_waves = total_writes / WRITES_PER_WAVE;
     let mut all_handles = Vec::with_capacity(total_writes);
 
@@ -177,7 +181,7 @@ fn bench_bloom_effectiveness(c: &mut Criterion) {
             LocalExecutorBuilder::new(Placement::Fixed(0))
                 .spawn(move || async move {
                     let config = create_config(shard_dir);
-                    let shard_wal = Rc::new(ShardWal::open(config).await.unwrap());
+                    let shard_wal = Rc::new(ShardWal::open(config, ClusterRole::Standalone, StubReplicationClient).await.unwrap());
                     populate_wal(shard_wal.clone(), num_aggregates, total_writes).await;
                     shard_wal.close().await.unwrap();
                 })
@@ -209,7 +213,7 @@ fn bench_bloom_effectiveness(c: &mut Criterion) {
                     let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
                         .spawn(move || async move {
                             let config = create_config(shard_dir);
-                            let shard_wal = ShardWal::open(config).await.unwrap();
+                            let shard_wal = ShardWal::open(config, ClusterRole::Standalone, StubReplicationClient).await.unwrap();
 
                             let mut total_duration = Duration::ZERO;
 
@@ -253,7 +257,7 @@ fn bench_bloom_effectiveness(c: &mut Criterion) {
                     let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
                         .spawn(move || async move {
                             let config = create_config(shard_dir);
-                            let shard_wal = ShardWal::open(config).await.unwrap();
+                            let shard_wal = ShardWal::open(config, ClusterRole::Standalone, StubReplicationClient).await.unwrap();
 
                             let mut total_duration = Duration::ZERO;
                             // Use IDs way outside the written range

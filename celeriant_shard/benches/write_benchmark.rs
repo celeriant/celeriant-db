@@ -6,10 +6,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use celeriant_shard::internal_shard_config::InternalShardConfig;
+use celeriant_shard::replication_client::StubReplicationClient;
 use celeriant_shard::timestamp_config::TimestampConfig;
 use celeriant_msg::request::requests::{SingleAggregateWrite, WriteRequest};
 use celeriant_shard::shard_wal::ShardWal;
 use celeriant_wal::aggregate_key::AggregateKey;
+use celeriant_wal::cluster_role::ClusterRole;
 use celeriant_wal::compression_type::CompressionType;
 use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
@@ -79,6 +81,7 @@ fn create_config(
         max_open_files: 256,
         shard_log_preallocate_bytes: SEGMENT_SIZE_BYTES,
         fsync_delay,
+        replication_delay: Duration::from_millis(17),
         recent_write_cache_bytes,
         non_durable_writes: false,
         shard_dir,
@@ -90,6 +93,7 @@ fn create_config(
         list_max_duration: Duration::from_millis(2000),
         list_page_size: 20000,
         list_wal_index_cache_bytes: 12 * 1024 * 1024,
+        pending_replication_high_water_bytes: 67_108_864, // 64MB
     }
 }
 
@@ -180,7 +184,7 @@ fn bench_write_fsync_delays(c: &mut Criterion) {
                             .spawn(move || async move {
                                 let config =
                                     create_config(shard_dir, fsync_delay, 64 * 1024 * 1024);
-                                let shard_wal = Rc::new(ShardWal::open(config).await.unwrap());
+                                let shard_wal = Rc::new(ShardWal::open(config, ClusterRole::Standalone, StubReplicationClient).await.unwrap());
 
                                 let mut all_handles = Vec::with_capacity(TOTAL_WRITES);
                                 let num_waves = TOTAL_WRITES / WRITES_PER_WAVE;
@@ -257,7 +261,7 @@ fn bench_write_fsync_delays(c: &mut Criterion) {
                             .spawn(move || async move {
                                 let config =
                                     create_config(shard_dir, fsync_delay, 64 * 1024 * 1024);
-                                let shard_wal = Rc::new(ShardWal::open(config).await.unwrap());
+                                let shard_wal = Rc::new(ShardWal::open(config, ClusterRole::Standalone, StubReplicationClient).await.unwrap());
 
                                 let aggregate_key = AggregateKey::new(1, 1, 1);
                                 let mut all_handles = Vec::with_capacity(TOTAL_WRITES);
@@ -352,7 +356,7 @@ fn bench_write_cache_impact(c: &mut Criterion) {
                         let iteration_duration = LocalExecutorBuilder::new(Placement::Fixed(0))
                             .spawn(move || async move {
                                 let config = create_config(shard_dir, fsync_delay, cache_bytes);
-                                let shard_wal = Rc::new(ShardWal::open(config).await.unwrap());
+                                let shard_wal = Rc::new(ShardWal::open(config, ClusterRole::Standalone, StubReplicationClient).await.unwrap());
 
                                 let mut all_handles = Vec::with_capacity(TOTAL_WRITES);
                                 let num_waves = TOTAL_WRITES / WRITES_PER_WAVE;
@@ -424,7 +428,7 @@ fn bench_write_cache_impact(c: &mut Criterion) {
                         let iteration_duration = LocalExecutorBuilder::new(Placement::Fixed(0))
                             .spawn(move || async move {
                                 let config = create_config(shard_dir, fsync_delay, cache_bytes);
-                                let shard_wal = Rc::new(ShardWal::open(config).await.unwrap());
+                                let shard_wal = Rc::new(ShardWal::open(config, ClusterRole::Standalone, StubReplicationClient).await.unwrap());
 
                                 let aggregate_key = AggregateKey::new(1, 1, 1);
                                 let mut all_handles = Vec::with_capacity(TOTAL_WRITES);
