@@ -6,6 +6,15 @@ use std::{rc::Rc, time::Duration};
 /// Result of a sync operation.
 pub type SyncResult<E> = Result<(), E>;
 
+/// Result of a capture operation in two-phase sync.
+pub enum CaptureResult<T, E: Clone> {
+    /// Data was captured, proceed with sync.
+    Captured(T),
+    /// Capture failed (e.g., rollback occurred, queue was emptied).
+    Failed(E),
+    NoCaptureRaceButOk,
+}
+
 /// Coordinates delayed sync with writer coalescing.
 ///
 /// Designed for the fsync batching pattern:
@@ -96,6 +105,91 @@ impl<E: Clone> Coordinator<E> {
                     let result = sync_fn().await;
                     drop(_sync_guard);
 
+                    event.notify(result.clone());
+                    return result;
+                }
+                Acquired::Follower(event) => return event.listen().await,
+                Acquired::Retry => continue,
+            }
+        }
+    }
+
+    /// Two-phase sync: capture snapshot first, then commit.
+    ///
+    /// This fixes a race condition in the single-phase API where clearing the orchestrator
+    /// before taking the snapshot can cause a subsequent leader to find an empty queue
+    /// (because the previous leader's snapshot captured their items).
+    ///
+    /// The fix: take snapshot FIRST (while orchestrator still has event), THEN clear orchestrator.
+    /// This ensures followers are correctly associated with the batch that captures their items.
+    pub async fn request_sync_two_phase<C, S, T, Fut1, Fut2>(
+        &self,
+        delay: Option<Duration>,
+        capture_fn: C,
+        sync_fn: S,
+    ) -> SyncResult<E>
+    where
+        C: FnOnce() -> Fut1,
+        Fut1: std::future::Future<Output = CaptureResult<T, E>>,
+        S: FnOnce(T) -> Fut2,
+        Fut2: std::future::Future<Output = SyncResult<E>>,
+    {
+        let delay = match delay {
+            Some(d) if d.as_micros() > 0 => d,
+            _ => Duration::from_millis(0),
+        };
+
+        enum Acquired<E: Clone> {
+            Leader(Rc<LocalEvent<SyncResult<E>>>),
+            Follower(Rc<LocalEvent<SyncResult<E>>>),
+            Retry,
+        }
+
+        loop {
+            let acquired = {
+                match self.lock_orchestrator.try_write() {
+                    Ok(mut guard) => match guard.as_ref() {
+                        Some(event) => Acquired::Follower(event.clone()),
+                        None => {
+                            let event = Rc::new(LocalEvent::new());
+                            *guard = Some(event.clone());
+                            Acquired::Leader(event)
+                        }
+                    },
+                    Err(_) => match read_with_timeout(&self.lock_orchestrator, "request_sync_two_phase_read").await {
+                        Ok(guard) => match guard.as_ref() {
+                            Some(event) => Acquired::Follower(event.clone()),
+                            None => Acquired::Retry,
+                        },
+                        Err(_) => Acquired::Retry,
+                    },
+                }
+            };
+
+            match acquired {
+                Acquired::Leader(event) => {
+                    glommio::timer::sleep(delay).await;
+
+                    // Acquire sync gate BEFORE capture - serializes sync execution
+                    let _sync_guard = write_with_timeout(&self.sync_gate, "two_phase_sync_gate").await.ok();
+
+                    // Phase 1: Capture snapshot FIRST (while orchestrator still has our event)
+                    // Any writer that arrives now sees our event and becomes a follower
+                    let captured = capture_fn().await;
+
+                    // NOW clear orchestrator - new leaders can only start for items added AFTER capture
+                    if let Ok(mut guard) = write_with_timeout(&self.lock_orchestrator, "two_phase_clear_orchestrator").await {
+                        guard.take();
+                    }
+
+                    // Phase 2: Process captured data
+                    let result = match captured {
+                        CaptureResult::Captured(data) => sync_fn(data).await,
+                        CaptureResult::Failed(e) => Err(e),
+                        CaptureResult::NoCaptureRaceButOk => Ok(()),
+                    };
+
+                    drop(_sync_guard);
                     event.notify(result.clone());
                     return result;
                 }

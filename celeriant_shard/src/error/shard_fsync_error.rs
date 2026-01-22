@@ -9,16 +9,16 @@ use crate::error::replication_error::ReplicationError;
 pub enum ShardFsyncError {
     /// Disk I/O failure.
     IoError(String),
-    
+
     /// Serialization or deserialization failure.
     WireFormat(WireFormatError),
-    
+
     /// DMA file handle not initialized (startup issue).
     DmaFileNotInitialized,
-    
+
     /// Log file header corrupted beyond recovery.
     HeaderCorrupted { log_id: Option<u64> },
-    
+
     /// Requested log file doesn't exist.
     LogFileNotFound { log_id: u64 },
 
@@ -27,7 +27,11 @@ pub enum ShardFsyncError {
     NotEnoughLogFreeSpace {
         required: u64,
         available: u64,
-    }
+    },
+
+    /// A rollback occurred and invalidated pending writes.
+    /// Writers should retry their operation.
+    RollbackInvalidatedWrites,
 }
 
 impl From<LockTimeoutError> for ShardFsyncError {

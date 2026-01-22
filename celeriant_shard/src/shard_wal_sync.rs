@@ -23,44 +23,52 @@ use celeriant_wal::metablocks::metablock_kind::MetablockKind;
 use celeriant_watch::aggregate_watchers::AggregateWatchers;
 use celeriant_wire::version_aware_wire_format::serialize_versioned_message;
 
+use crate::amortisation::coordinator::CaptureResult;
 use crate::error::shard_fsync_error::ShardFsyncError;
 use crate::watch_event_collector::WatchEventCollector;
 
-fn take_sync_snapshot(shard_mem_cache: &Rc<RefCell<ShardMemCache>>) -> Result<(u64, SyncPositionsSnapshot), ShardFsyncError> {
+/// Captured data from the fsync snapshot phase.
+pub(crate) struct FsyncCapturedData {
+    pub required_disk_space: u64,
+    pub sync_positions_snapshot: SyncPositionsSnapshot,
+}
+
+/// Capture phase: take snapshot from memcache.
+/// Must be called while the coordinator still holds the orchestrator event.
+pub(crate) fn capture_fsync_snapshot(shard_mem_cache: &Rc<RefCell<ShardMemCache>>) -> CaptureResult<FsyncCapturedData, ShardFsyncError> {
     let mut cache = shard_mem_cache.borrow_mut();
 
+    if cache.take_fsync_rollback_flag() && cache.pending_append_queue_is_empty() {
+        return CaptureResult::Failed(ShardFsyncError::RollbackInvalidatedWrites);
+    }
+
     if cache.pending_append_queue_is_empty() {
-        return Err(ShardFsyncError::IoError("Fsync batch failure, pending queue emptied by fsync or replication rollback, pending writes invalidated".to_string()));
+        return CaptureResult::NoCaptureRaceButOk;
     }
 
     let required_disk_space = cache.buffer_size_total();
-    let snapshot = cache.take_sync_positions_snapshot();
+    let sync_positions_snapshot = cache.take_sync_positions_snapshot();
 
-    Ok((required_disk_space, snapshot))
+    CaptureResult::Captured(FsyncCapturedData {
+        required_disk_space,
+        sync_positions_snapshot,
+    })
 }
 
-/// Orchestrates the sync process with rollback on failure.
-///
-/// Takes a snapshot of pending writes, attempts to write them to disk,
-/// and either commits the changes (updating caches and broadcasting events)
-/// or rolls back on failure.
-pub(crate) async fn sync_with_rollback(
+/// Commit phase: write captured data to disk and update caches.
+pub(crate) async fn commit_fsync_with_rollback(
     cluster_role: ClusterRole,
     log_segments_cache: Rc<LogSegmentsCache>,
     shard_mem_cache: Rc<RefCell<ShardMemCache>>,
     watched_aggregates: Rc<AggregateWatchers>,
+    mut captured: FsyncCapturedData,
 ) -> Result<(), ShardFsyncError> {
-    let (required_disk_space, mut sync_positions_snapshot) = take_sync_snapshot(&shard_mem_cache)?;
-
-    log_segments_cache.rotate_to_next_log(required_disk_space).await?;
+    log_segments_cache.rotate_to_next_log(captured.required_disk_space).await?;
     let active_log_segment = log_segments_cache.active();
 
-    match sync(active_log_segment.clone(), &mut sync_positions_snapshot).await {
+    match sync(active_log_segment.clone(), &mut captured.sync_positions_snapshot).await {
         Ok(updated_log_segment_file_metadata) => {
-            //TODO: This is where replication logic comes in
-            //follower/single node? advance read immediately, update memcache
-            //leader? need to batch up what we just wrote and defer read pos and memcache updates but still maintain updated write path
-            commit_sync(cluster_role, shard_mem_cache, watched_aggregates, sync_positions_snapshot, active_log_segment, updated_log_segment_file_metadata);
+            commit_sync(cluster_role, shard_mem_cache, watched_aggregates, captured.sync_positions_snapshot, active_log_segment, updated_log_segment_file_metadata);
             Ok(())
         }
         Err(e) => {

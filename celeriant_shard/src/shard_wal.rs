@@ -5,7 +5,7 @@
 #[path = "shard_wal_sync.rs"]
 mod sync;
 
-use self::sync::sync_with_rollback;
+use self::sync::{capture_fsync_snapshot, commit_fsync_with_rollback};
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
@@ -62,7 +62,7 @@ use crate::in_memory_filtering;
 use crate::internal_shard_config::InternalShardConfig;
 use crate::loading_coordinator::LoadingCoordinator;
 use crate::replication_client::ReplicationClient;
-use crate::shard_wal_replicate::replicate_with_rollback;
+use crate::shard_wal_replicate::{capture_replication_snapshot, commit_replication_with_rollback};
 
 /// Write-ahead log for a single shard.
 ///
@@ -1280,29 +1280,42 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
     }
 
     /// Perform sync with potential delay for amortisation.
+    /// Uses two-phase sync to fix the race condition where clearing the orchestrator
+    /// before taking the snapshot can cause a subsequent leader to find an empty queue.
     async fn sync_durable(&self) -> Result<(), ShardFsyncError> {
         let rotating_log_cache = self.log_segments_cache.clone();
         let shard_mem_cache = self.shard_mem_cache.clone();
         let watched_aggregates = self.watched_aggregates.clone();
-
-        // Note we don't decide on the current cluster role right now, only just before sync
         let cluster_role = self.cluster_role.clone();
 
         if rotating_log_cache.force_immediate.get() {
+            let mc_capture = shard_mem_cache.clone();
             self.fsync_coordinator
-                .request_sync(None, move || sync_with_rollback(cluster_role.get(), rotating_log_cache, shard_mem_cache, watched_aggregates))
+                .request_sync_two_phase(
+                    None,
+                    move || async move { capture_fsync_snapshot(&mc_capture) },
+                    move |captured| commit_fsync_with_rollback(cluster_role.get(), rotating_log_cache, shard_mem_cache, watched_aggregates, captured),
+                )
                 .await
         } else if !self.config.non_durable_writes {
+            let mc_capture = shard_mem_cache.clone();
             self.fsync_coordinator
-                .request_sync(Some(self.config.fsync_delay), move || {
-                    sync_with_rollback(cluster_role.get(), rotating_log_cache, shard_mem_cache, watched_aggregates)
-                })
+                .request_sync_two_phase(
+                    Some(self.config.fsync_delay),
+                    move || async move { capture_fsync_snapshot(&mc_capture) },
+                    move |captured| commit_fsync_with_rollback(cluster_role.get(), rotating_log_cache, shard_mem_cache, watched_aggregates, captured),
+                )
                 .await
         } else {
             let fsync_coordinator = self.fsync_coordinator.clone();
             glommio::spawn_local(async move {
+                let mc_capture = shard_mem_cache.clone();
                 let _ = fsync_coordinator
-                    .request_sync(None, move || sync_with_rollback(cluster_role.get(), rotating_log_cache, shard_mem_cache, watched_aggregates))
+                    .request_sync_two_phase(
+                        None,
+                        move || async move { capture_fsync_snapshot(&mc_capture) },
+                        move |captured| commit_fsync_with_rollback(cluster_role.get(), rotating_log_cache, shard_mem_cache, watched_aggregates, captured),
+                    )
                     .await;
             })
             .detach();
@@ -1323,20 +1336,33 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
         let watched_aggregates = self.watched_aggregates.clone();
 
         if rotating_log_cache.force_immediate.get() {
+            let mc_capture = shard_mem_cache.clone();
             self.replication_coordinator
-                .request_sync(None, move || replicate_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates))
+                .request_sync_two_phase(
+                    None,
+                    move || async move { capture_replication_snapshot(&mc_capture) },
+                    move |captured| commit_replication_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates, captured),
+                )
                 .await
         } else if !self.config.non_durable_writes {
+            let mc_capture = shard_mem_cache.clone();
             self.replication_coordinator
-                .request_sync(Some(self.config.fsync_delay), move || {
-                    replicate_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates)
-                })
+                .request_sync_two_phase(
+                    Some(self.config.replication_delay),
+                    move || async move { capture_replication_snapshot(&mc_capture) },
+                    move |captured| commit_replication_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates, captured),
+                )
                 .await
         } else {
             let replication_coordinator = self.replication_coordinator.clone();
             glommio::spawn_local(async move {
+                let mc_capture = shard_mem_cache.clone();
                 let _ = replication_coordinator
-                    .request_sync(None, move || replicate_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates))
+                    .request_sync_two_phase(
+                        None,
+                        move || async move { capture_replication_snapshot(&mc_capture) },
+                        move |captured| commit_replication_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates, captured),
+                    )
                     .await;
             })
             .detach();

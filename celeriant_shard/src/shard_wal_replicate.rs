@@ -3,7 +3,6 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use celeriant_memcache::cache_path::CachePath;
-use celeriant_memcache::mem_snapshot_aggregate::MemSnapshotAggregate;
 use celeriant_memcache::pending_commit_data::PendingCommitData;
 use celeriant_memcache::shard_mem_cache::ShardMemCache;
 use celeriant_rotating_log::log_segment_file::write_dual_shard_log_header;
@@ -12,51 +11,57 @@ use celeriant_wal::constants::{FIRST_EVENT_BATCH_INDEX, HEADER_BLOCK_SIZE_BYTES}
 use celeriant_wal::metablocks::metablock_kind::MetablockKind;
 use celeriant_watch::aggregate_watchers::AggregateWatchers;
 
-use crate::amortisation::coordinator::Coordinator;
+use crate::amortisation::coordinator::{CaptureResult, Coordinator};
 use crate::error::replication_error::ReplicationError;
 use crate::error::rollback_error::RollbackError;
 use crate::error::shard_fsync_error::ShardFsyncError;
 use crate::replication_client::ReplicationClient;
 use crate::watch_event_collector::WatchEventCollector;
 
-fn take_replication_snapshot(shard_mem_cache: &Rc<RefCell<ShardMemCache>>) -> Result<Vec<PendingCommitData>, ReplicationError> {
-    let mut cache = shard_mem_cache.borrow_mut();
-
-    let snapshot = cache.take_pending_replication();
-
-    if snapshot.is_empty() {
-        return Err(ReplicationError::RollbackInProgress);
-    }
-
-    Ok(snapshot)
+/// Captured data from the replication snapshot phase.
+pub(crate) struct ReplicationCapturedData {
+    pub use_s3: bool,
+    pub replication_snapshot: Vec<PendingCommitData>,
 }
 
-/// Orchestrates the replication commit process with rollback on failure.
-///
-/// Takes a snapshot of pending replication data, attempts to replicate,
-/// and either commits the changes (updating caches and broadcasting events)
-/// or rolls back on failure.
-///
-/// Uses queue pressure to decide replication target:
-/// - Normal: replicate to follower
-/// - High water mark exceeded OR follower fails: replicate to S3
-pub(crate) async fn replicate_with_rollback<R: ReplicationClient>(
+/// Capture phase: take replication snapshot from memcache.
+/// Must be called while the coordinator still holds the orchestrator event.
+pub(crate) fn capture_replication_snapshot(shard_mem_cache: &Rc<RefCell<ShardMemCache>>) -> CaptureResult<ReplicationCapturedData, ReplicationError> {
+    let mut cache = shard_mem_cache.borrow_mut();
+
+    let use_s3 = cache.is_replication_queue_pressured();
+    let replication_snapshot = cache.take_pending_replication();
+
+    if cache.take_replication_rollback_flag() && replication_snapshot.is_empty() {
+        return CaptureResult::Failed(ReplicationError::RollbackInProgress);
+    }
+
+    if replication_snapshot.is_empty() {
+        return CaptureResult::NoCaptureRaceButOk;
+    }
+
+    CaptureResult::Captured(ReplicationCapturedData {
+        use_s3,
+        replication_snapshot,
+    })
+}
+
+/// Commit phase: replicate captured data and update caches.
+pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
     replication_client: Rc<R>,
     fsync_coordinator: Rc<Coordinator<ShardFsyncError>>,
     log_segments_cache: Rc<LogSegmentsCache>,
     shard_mem_cache: Rc<RefCell<ShardMemCache>>,
     watched_aggregates: Rc<AggregateWatchers>,
+    captured: ReplicationCapturedData,
 ) -> Result<(), ReplicationError> {
-    let use_s3 = shard_mem_cache.borrow().is_replication_queue_pressured();
-    let replication_snapshot = take_replication_snapshot(&shard_mem_cache)?;
-
-    match replicate(&*replication_client, &replication_snapshot, use_s3).await {
+    match replicate(&*replication_client, &captured.replication_snapshot, captured.use_s3).await {
         Ok(()) => {
-            commit_replication(log_segments_cache, shard_mem_cache, watched_aggregates, replication_snapshot);
+            commit_replication(log_segments_cache, shard_mem_cache, watched_aggregates, captured.replication_snapshot);
             Ok(())
         }
         Err(replication_err) => {
-            match rollback_replicate(&fsync_coordinator, &log_segments_cache, &shard_mem_cache, replication_snapshot).await {
+            match rollback_replicate(&fsync_coordinator, &log_segments_cache, &shard_mem_cache, captured.replication_snapshot).await {
                 Ok(()) => Err(replication_err),
                 Err(rollback_err) => Err(ReplicationError::RollbackFailed(rollback_err)),
             }

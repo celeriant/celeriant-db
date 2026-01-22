@@ -68,6 +68,14 @@ pub struct ShardMemCache {
 
     /// High water mark - when exceeded, trigger S3 fallback
     pending_replication_high_water_bytes: u64,
+
+    /// Flag set when fsync rollback occurs, cleared by following leader
+    /// Used to distinguish "empty queue due to rollback" from "empty queue due to race".
+    fsync_rollback_occurred: bool,
+
+    /// Flag set when replication rollback occurs, cleared by following leader
+    /// Used to distinguish "empty queue due to rollback" from "empty queue due to race".
+    replication_rollback_occurred: bool,
 }
 
 impl ShardMemCache {
@@ -354,6 +362,7 @@ impl ShardMemCache {
     pub fn execute_fsync_rollback(&mut self) {
         self.aggregate_queue_positions.clear();
         self.pending_append_queue.clear();
+        self.fsync_rollback_occurred = true;
     }
 
     pub fn is_aggregate_snapshot_full_or_contains(&self, aggregate_key: &AggregateKey, cache_path: CachePath) -> bool {
@@ -692,6 +701,8 @@ impl ShardMemCache {
 
         self.execute_fsync_rollback();
 
+        self.replication_rollback_occurred = true;
+
         // Written to disk but not replicated
         self.aggregate_write_snapshots.clear();
         self.aggregate_write_client_snapshots.clear();
@@ -734,7 +745,25 @@ impl ShardMemCache {
             pending_replication_batches: Vec::new(),
             pending_replication_bytes: 0,
             pending_replication_high_water_bytes,
+            fsync_rollback_occurred: false,
+            replication_rollback_occurred: false,
         }
+    }
+
+    /// Check if a rollback has occurred since items were last added.
+    /// Used to distinguish "empty queue due to rollback" from "empty queue due to race".
+    pub fn take_fsync_rollback_flag(&mut self) -> bool {
+        let state = self.fsync_rollback_occurred;
+        self.fsync_rollback_occurred = false;
+        state
+    }
+
+    /// Check if a rollback has occurred since items were last added.
+    /// Used to distinguish "empty queue due to rollback" from "empty queue due to race".
+    pub fn take_replication_rollback_flag(&mut self) -> bool {
+        let state = self.replication_rollback_occurred;
+        self.replication_rollback_occurred = false;
+        state
     }
 }
 

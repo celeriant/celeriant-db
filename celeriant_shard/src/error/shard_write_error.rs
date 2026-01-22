@@ -88,6 +88,7 @@ impl From<ShardFsyncError> for ShardWriteError {
             ShardFsyncError::NotEnoughLogFreeSpace { required, available } => {
                 Self::IoError(format!("Not enough free log space, required: {required} but available: {available}"))
             }
+            ShardFsyncError::RollbackInvalidatedWrites => Self::IoError("Rollback invalidated writes".to_string()),
         }
     }
 }
