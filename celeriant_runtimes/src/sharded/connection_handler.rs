@@ -516,21 +516,7 @@ fn error_to_response(correlation_id: Option<u128>, error: ShardError) -> Respons
                 400,
                 format!("Trim index {} out of range, max event batch index is {}", requested, max_event_batch_index),
             ),
-            ShardWriteError::NotAFollower => (500, "Node is not a follower".to_string()),
-            ShardWriteError::EmptyReplicationBatch => (500, "Empty replication batch".to_string()),
-            ShardWriteError::ReplicationTimeDriftTooHigh { leader_timestamp_ms, follower_timestamp_ms, max_allowed_drift_ms } => (
-                500,
-                format!("Replication time drift too high: leader={}ms, follower={}ms, max_allowed={}ms", leader_timestamp_ms, follower_timestamp_ms, max_allowed_drift_ms),
-            ),
-            ShardWriteError::ReplicationTipHashMismatch { follower_tip_hash, leader_tip_hash } => (
-                500,
-                format!("Replication tip hash mismatch: follower={:?}, leader={:?}", follower_tip_hash, leader_tip_hash),
-            ),
-            ShardWriteError::ReplicationWalIndexMismatch { follower_wal_index, leader_wal_index } => (
-                500,
-                format!("Replication WAL index mismatch: follower={}, leader={}", follower_wal_index, leader_wal_index),
-            ),
-            ShardWriteError::MissingDatablockInReplicationBatch => (500, "Missing datablock in replication batch".to_string()),
+            ShardWriteError::Replication(replication_error) => (500, format!("Replication error: {:?}", replication_error)),
         },
         ShardError::WatchSession(watch_session_error) => match watch_session_error {
             WatchSessionError::WatchLatencyTooHigh { latency_ms, max_latency_ms } => (
@@ -562,6 +548,8 @@ mod tests {
         ShardConfig {
             node_id: 1,
             num_shards,
+            cluster_role: celeriant_wal::cluster_role::ClusterRole::Standalone,
+            follower_address: None,
             data_root: "/tmp".into(),
             listen_address: "127.0.0.1".into(),
             client_port: 8080,

@@ -6,12 +6,11 @@ use celeriant_msg::{
     process_requests::Request,
     process_responses::Response,
     request::requests::{ReplicationBatchItem, ReplicationBatchRequest},
+    response::responses::ReplicationResult,
 };
 use celeriant_wal::compression_type::CompressionType;
 
-use crate::error::replication_error::ReplicationError;
-
-pub type ReplicationResult = Result<(), ReplicationError>;
+use crate::error::replication_error::{NetworkError, ReplicationError};
 
 /// Trait for network replication operations.
 ///
@@ -77,9 +76,16 @@ impl ReplicationClient for GlommioReplicationClient {
             .await?;
 
         match response {
-            Response::ReplicationBatch(_) => Ok(()),
-            Response::GenericError(err) => Err(ReplicationError::NetworkFailure(err.error_message)),
-            _ => Err(ReplicationError::NetworkFailure("Unexpected response type".to_string())),
+            Response::ReplicationBatch(resp) => match resp.result {
+                ReplicationResult::Success { .. } => Ok(()),
+                ReplicationResult::Rejected(rejection) => Err(ReplicationError::FollowerRejected(rejection)),
+            },
+            Response::GenericError(err) => {
+                Err(ReplicationError::Network(NetworkError::SendFailed(err.error_message)))
+            }
+            _ => Err(ReplicationError::Network(NetworkError::SendFailed(
+                "Unexpected response type".to_string(),
+            ))),
         }
     }
 

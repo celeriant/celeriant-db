@@ -78,10 +78,10 @@ impl From<RotatingLogError> for ShardFsyncError {
 impl From<ReplicationError> for ShardFsyncError {
     fn from(e: ReplicationError) -> Self {
         match e {
+            ReplicationError::Network(net_err) => Self::IoError(format!("{:?}", net_err)),
+            ReplicationError::FollowerRejected(rejection) => Self::IoError(format!("Follower rejected: {:?}", rejection)),
             ReplicationError::LockTimeout(msg) => Self::IoError(msg),
             ReplicationError::RollbackInProgress => Self::IoError("Rollback in progress".into()),
-            ReplicationError::NetworkFailure(msg) => Self::IoError(msg),
-            ReplicationError::FollowerDiverged => Self::IoError("Follower log diverged from leader".into()),
             ReplicationError::S3Unavailable => Self::IoError("S3 sidecar unavailable".into()),
             ReplicationError::RollbackFailed(rb_err) => Self::IoError(format!("Rollback failed: {:?}", rb_err)),
         }

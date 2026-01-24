@@ -28,7 +28,7 @@ const USE_MICRO_PAYLOAD: bool = true;
 const CLIENTSIDE_TIMEOUT_S: u64 = 5;
 
 /// Enable replicated mode: spins up a leader and follower, benchmarks writes to leader
-const REPLICATED_MODE: bool = false;
+const REPLICATED_MODE: bool = true;
 
 // Connection counts to sweep through when SWEEP_MODE is enabled
 const CONNECTION_SWEEP: &[usize] = &[512, 1024, 2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384];

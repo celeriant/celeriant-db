@@ -231,6 +231,7 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::response::responses::ReplicationResult;
     use celeriant_wire::constants::{PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3};
     use futures_lite::{future::block_on, io::Cursor};
 
@@ -308,8 +309,8 @@ mod tests {
             }),
             ResponseType::ReplicationBatch => Response::ReplicationBatch(ReplicationBatchResponse {
                 correlation_id: Some(113),
-                last_follower_metablock: None,
                 follower_timestamp_ms: 0,
+                result: ReplicationResult::Success { last_follower_metablock: None },
             }),
             ResponseType::CatchUp => Response::CatchUp(CatchUpResponse {
                 correlation_id: Some(114),

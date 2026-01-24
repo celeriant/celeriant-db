@@ -27,7 +27,7 @@ use celeriant_msg::process_responses::Response;
 use celeriant_msg::request::read_filters::ReadFilters;
 use celeriant_msg::request::requests::{DeleteRequest, ExistsRequest, ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest, ReadRequest, ReplicationBatchItem, SingleAggregateWrite, TrimStartRequest, WriteRequest};
 use celeriant_msg::response::aggregate_event_batch::AggregateEventBatch;
-use celeriant_msg::response::responses::{AggregateListItem, AggregateTypeListItem, ExistsResponse, ListAggregateTypesResponse, ListAggregatesResponse, ListOrgsResponse, OrgListItem, ReadResponse, ReplicationBatchResponse, SuccessResponse};
+use celeriant_msg::response::responses::{AggregateListItem, AggregateTypeListItem, ExistsResponse, FollowerRejection, ListAggregateTypesResponse, ListAggregatesResponse, ListOrgsResponse, OrgListItem, ReadResponse, ReplicationBatchResponse, ReplicationResult, SuccessResponse};
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
 use celeriant_rotating_log::reverse_metablock_scanner::ReverseMetablockScanner;
 use celeriant_rotating_log::rotating_log_error::RotatingLogError;
@@ -1379,23 +1379,31 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
     async fn handle_replication_batch(
         &self, request: celeriant_msg::request::requests::ReplicationBatchRequest
     ) -> Result<ReplicationBatchResponse, ShardWriteError> {
+        let follower_timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("System time before Unix epoch")
+            .as_millis() as u64;
 
-        let follower_timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH).expect("System time before Unix epoch").as_millis() as u64;
-        
+        let response = |result| ReplicationBatchResponse {
+            correlation_id: request.correlation_id,
+            follower_timestamp_ms,
+            result,
+        };
+
         if self.cluster_role.get() != ClusterRole::Follower {
-            return Err(ShardWriteError::NotAFollower);
+            return Ok(response(ReplicationResult::Rejected(FollowerRejection::NotAFollower)));
         }
 
         if follower_timestamp_ms.saturating_sub(request.leader_timestamp_ms) > self.config.max_cluster_time_drift_ms {
-            return Err(ShardWriteError::ReplicationTimeDriftTooHigh {
-                leader_timestamp_ms: request.leader_timestamp_ms,
-                follower_timestamp_ms,
-                max_allowed_drift_ms: self.config.max_cluster_time_drift_ms,
-            });
+            return Ok(response(ReplicationResult::Rejected(FollowerRejection::TimeDriftTooHigh {
+                leader_ms: request.leader_timestamp_ms,
+                follower_ms: follower_timestamp_ms,
+                max_allowed_ms: self.config.max_cluster_time_drift_ms,
+            })));
         }
 
         if request.batches.is_empty() {
-            return Err(ShardWriteError::EmptyReplicationBatch);
+            return Ok(response(ReplicationResult::Rejected(FollowerRejection::EmptyBatch)));
         }
 
         let (follower_tip_hash, follower_wal_index) = {
@@ -1403,42 +1411,46 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
             let metadata = active_log_segment_file.metadata.borrow();
             (metadata.write.tip_hash, metadata.write.wal_index)
         };
-        let (leader_tip_hash, leader_wal_index) = {
-            request.batches.first().map(|b| (b.metablock.previous_tip_hash, b.metablock.wal_index.saturating_sub(1))).unwrap_or((GENESIS_HASH, 0))
-        };
+        let (leader_tip_hash, leader_wal_index) = request
+            .batches
+            .first()
+            .map(|b| (b.metablock.previous_tip_hash, b.metablock.wal_index.saturating_sub(1)))
+            .unwrap_or((GENESIS_HASH, 0));
 
         if follower_wal_index != leader_wal_index {
-            return Err(ShardWriteError::ReplicationWalIndexMismatch {
-                follower_wal_index,
-                leader_wal_index,
-            });
+            return Ok(response(ReplicationResult::Rejected(FollowerRejection::WalIndexMismatch {
+                follower: follower_wal_index,
+                leader: leader_wal_index,
+            })));
         }
 
         if follower_tip_hash != leader_tip_hash {
-            return Err(ShardWriteError::ReplicationTipHashMismatch {
-                follower_tip_hash,
-                leader_tip_hash,
-            });
+            return Ok(response(ReplicationResult::Rejected(FollowerRejection::TipHashMismatch {
+                follower: follower_tip_hash,
+                leader: leader_tip_hash,
+            })));
         }
 
         // Add all entries to pending queue synchronously (no fsync yet)
-        self.add_replicated_entries_to_queue(request.batches)?;
+        if let Some(rejection) = self.add_replicated_entries_to_queue(request.batches)? {
+            return Ok(response(ReplicationResult::Rejected(rejection)));
+        }
 
         // Single fsync for entire batch
         self.sync_durable().await?;
 
-        Ok(celeriant_msg::response::responses::ReplicationBatchResponse {
-            correlation_id: request.correlation_id,
+        Ok(response(ReplicationResult::Success {
             last_follower_metablock: None,
-            follower_timestamp_ms,
-        })
+        }))
     }
 
+    /// Prepares and queues replicated entries.
+    /// Returns Ok(None) on success, Ok(Some(rejection)) for validation failures,
+    /// or Err for I/O errors.
     fn add_replicated_entries_to_queue(
         &self,
         items: Vec<ReplicationBatchItem>,
-    ) -> Result<(), ShardWriteError> {
-        // Validate and prepare all items first (all-or-nothing)
+    ) -> Result<Option<FollowerRejection>, ShardWriteError> {
         let mut prepared = Vec::with_capacity(items.len());
 
         for item in items {
@@ -1451,17 +1463,15 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
                         let serialized_datablock = serialize_datablock(&datablock, compression_type, 0)?;
                         (serialized_datablock.external_data, Some(datablock))
                     } else {
-                        return Err(ShardWriteError::MissingDatablockInReplicationBatch);
+                        return Ok(Some(FollowerRejection::MissingDatablock));
                     }
-                },
+                }
             };
             prepared.push(ShardLogQueueItem::new(datablock, datablock_bytes, item.metablock));
         }
 
-        // All validation passed - add to queue
         self.shard_mem_cache.borrow_mut().add_to_pending_queue(prepared);
-
-        Ok(())
+        Ok(None)
     }
 }
 

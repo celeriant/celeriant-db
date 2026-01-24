@@ -1,5 +1,4 @@
 use celeriant_rotating_log::{rotating_log_error::RotatingLogError, rwlock_timeout::LockTimeoutError};
-use celeriant_wal::constants::EntryHashBytes;
 use celeriant_wire::wire_format_error::WireFormatError;
 use glommio::GlommioError;
 
@@ -10,28 +9,28 @@ use crate::error::{replication_error::ReplicationError, shard_cache_load_error::
 pub enum ShardWriteError {
     /// Disk I/O failure.
     IoError(String),
-    
+
     /// Serialization or deserialization failure.
     WireFormat(WireFormatError),
 
     /// Write request contained no events.
     EmptyEventsList,
-    
+
     /// Event type 0 is reserved as a sentinel value.
     ZeroEventType { client_event_index: u64 },
-    
+
     /// Client already wrote an event with this or higher client_event_index.
     ClientIdempotencyViolation {
         last_client_event_index: u64,
         attempted_client_event_index: u64,
     },
-    
+
     /// Expected event_batch_index doesn't match current aggregate state.
     OptimisticConcurrencyViolation {
         expected_event_batch_index: u64,
         current_event_batch_index: u64,
     },
-    
+
     /// Write request requires a valid lease index.
     InvalidLeaseIndex,
 
@@ -48,27 +47,8 @@ pub enum ShardWriteError {
         max_event_batch_index: u64,
     },
 
-    NotAFollower,
-
-    EmptyReplicationBatch,
-
-    ReplicationTimeDriftTooHigh {
-        leader_timestamp_ms: u64,
-        follower_timestamp_ms: u64,
-        max_allowed_drift_ms: u64,
-    },
-
-    ReplicationWalIndexMismatch {
-        follower_wal_index: u64,
-        leader_wal_index: u64,
-    },
-
-    ReplicationTipHashMismatch {
-        follower_tip_hash: EntryHashBytes,
-        leader_tip_hash: EntryHashBytes,
-    },
-
-    MissingDatablockInReplicationBatch,
+    /// Replication error (network or follower rejection).
+    Replication(ReplicationError),
 }
 
 impl From<ShardCacheError> for ShardWriteError {
@@ -136,13 +116,6 @@ impl From<std::io::Error> for ShardWriteError {
 
 impl From<ReplicationError> for ShardWriteError {
     fn from(e: ReplicationError) -> Self {
-        match e {
-            ReplicationError::LockTimeout(msg) => Self::IoError(msg),
-            ReplicationError::RollbackInProgress => Self::IoError("Rollback in progress".into()),
-            ReplicationError::NetworkFailure(msg) => Self::IoError(msg),
-            ReplicationError::FollowerDiverged => Self::IoError("Follower log diverged from leader".into()),
-            ReplicationError::S3Unavailable => Self::IoError("S3 sidecar unavailable".into()),
-            ReplicationError::RollbackFailed(rb_err) => Self::IoError(format!("Rollback failed: {:?}", rb_err)),
-        }
+        Self::Replication(e)
     }
 }

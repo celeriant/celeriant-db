@@ -94,14 +94,48 @@ pub struct ErrorResponse {
     pub error_message: String,
 }
 
+/// Rejection reasons when follower refuses a replication batch.
+/// These are logical errors indicating state mismatch, not network failures.
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode, PartialEq, Eq)]
+pub enum FollowerRejection {
+    /// Node is not configured as a follower.
+    NotAFollower,
+    /// Clock skew between leader and follower exceeds threshold.
+    TimeDriftTooHigh {
+        leader_ms: u64,
+        follower_ms: u64,
+        max_allowed_ms: u64,
+    },
+    /// Follower's WAL index doesn't match leader's expected position.
+    WalIndexMismatch {
+        follower: u64,
+        leader: u64,
+    },
+    /// Follower's tip hash doesn't match leader's expected hash.
+    TipHashMismatch {
+        follower: EntryHashBytes,
+        leader: EntryHashBytes,
+    },
+    /// Leader sent empty batch.
+    EmptyBatch,
+    /// Batch item references external datablock but none provided.
+    MissingDatablock,
+}
+
+/// Result of a replication batch - either success or explicit rejection.
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub enum ReplicationResult {
+    Success {
+        last_follower_metablock: Option<Metablock>,
+    },
+    Rejected(FollowerRejection),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct ReplicationBatchResponse {
     pub correlation_id: Option<u128>,
-    /// Leader can use last follower metablock to check for replication 
-    /// success, position, fall behind, or to decide to kick follower
-    pub last_follower_metablock: Option<Metablock>,
-    /// Leader will also check the follower's current time for clock drift
     pub follower_timestamp_ms: u64,
+    pub result: ReplicationResult,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
