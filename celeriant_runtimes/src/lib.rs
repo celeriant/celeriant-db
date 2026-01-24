@@ -1,6 +1,5 @@
-use celeriant_shard::{internal_shard_config::InternalShardConfig, replication_client::StubReplicationClient, shard_wal::ShardWal};
+use celeriant_shard::{internal_shard_config::InternalShardConfig, replication_client::GlommioReplicationClient, shard_wal::ShardWal};
 use celeriant_sidecar::store::SidecarStoreTrait;
-use celeriant_wal::cluster_role::ClusterRole;
 use glommio::{
     CpuSet, LocalExecutorPoolBuilder, PoolPlacement,
     channels::channel_mesh::{Full, MeshBuilder},
@@ -13,7 +12,7 @@ use crate::{sharded::{intrashard_messages::IntrashardMessages, shard::Shard}, si
 mod sharded;
 mod sidecar;
 
-pub use {sharded::shard_config::ShardConfig, sidecar::sidecar_config::SidecarConfig, sharded::routing_rule::RoutingRule};
+pub use {sharded::shard_config::ShardConfig, sidecar::sidecar_config::SidecarConfig, sharded::routing_rule::RoutingRule, celeriant_wal::cluster_role::ClusterRole};
 
 pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig, sidecar_config: SidecarConfig, mesh_channel_size: usize, node_id: u128, sidecar_store: S) {
     info!("Starting {} shard executors on node {}", shard_config.num_shards, node_id);
@@ -64,9 +63,11 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                 list_page_size: shard_config.list_page_size,
                 list_wal_index_cache_bytes: shard_config.list_wal_index_cache_bytes,
                 pending_replication_high_water_bytes: shard_config.pending_replication_high_water_bytes,
+                max_cluster_time_drift_ms: shard_config.max_cluster_time_drift_ms,
             };
-            //TODO: Cluster role handling in shard init
-            let filesystem = ShardWal::open(internal_shard_config, ClusterRole::Leader, StubReplicationClient).await
+            let follower_address = shard_config.follower_address.clone().unwrap_or_default();
+            let replication_client = GlommioReplicationClient::new(follower_address, current_shard_id as u64);
+            let filesystem = ShardWal::open(internal_shard_config, shard_config.cluster_role, replication_client).await
                 .expect(&format!("Failed to initialize filesystem at {:?} - cannot initialize shard", shard_config.data_root));
 
             Shard::new(shard_config, current_shard_id, sender, receivers, sidecar_senders, client_tcp_listener, replication_tcp_listener, filesystem).run().await;

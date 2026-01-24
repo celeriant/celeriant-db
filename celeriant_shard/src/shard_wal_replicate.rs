@@ -2,11 +2,14 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
 
+use glommio::sync::RwLock;
+
 use celeriant_memcache::cache_path::CachePath;
 use celeriant_memcache::pending_commit_data::PendingCommitData;
 use celeriant_memcache::shard_mem_cache::ShardMemCache;
 use celeriant_rotating_log::log_segment_file::write_dual_shard_log_header;
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
+use celeriant_rotating_log::rwlock_timeout::write_with_timeout;
 use celeriant_wal::constants::{FIRST_EVENT_BATCH_INDEX, HEADER_BLOCK_SIZE_BYTES};
 use celeriant_wal::metablocks::metablock_kind::MetablockKind;
 use celeriant_watch::aggregate_watchers::AggregateWatchers;
@@ -48,14 +51,15 @@ pub(crate) fn capture_replication_snapshot(shard_mem_cache: &Rc<RefCell<ShardMem
 
 /// Commit phase: replicate captured data and update caches.
 pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
-    replication_client: Rc<R>,
+    replication_client: Rc<RwLock<R>>,
     fsync_coordinator: Rc<Coordinator<ShardFsyncError>>,
     log_segments_cache: Rc<LogSegmentsCache>,
     shard_mem_cache: Rc<RefCell<ShardMemCache>>,
     watched_aggregates: Rc<AggregateWatchers>,
     captured: ReplicationCapturedData,
 ) -> Result<(), ReplicationError> {
-    match replicate(&*replication_client, &captured.replication_snapshot, captured.use_s3).await {
+    let mut client_guard = write_with_timeout(&replication_client, "replicate_to_follower").await?;
+    match replicate(&mut *client_guard, &captured.replication_snapshot, captured.use_s3).await {
         Ok(()) => {
             commit_replication(log_segments_cache, shard_mem_cache, watched_aggregates, captured.replication_snapshot);
             Ok(())
@@ -185,7 +189,7 @@ async fn rollback_replicate(
 }
 
 async fn replicate<R: ReplicationClient>(
-    client: &R,
+    client: &mut R,
     batches: &[PendingCommitData],
     use_s3: bool,
 ) -> Result<(), ReplicationError> {
@@ -196,6 +200,7 @@ async fn replicate<R: ReplicationClient>(
     // Try follower first, fall back to S3 on failure
     match client.replicate_to_follower(batches).await {
         Ok(()) => Ok(()),
-        Err(_) => client.replicate_to_s3(batches).await,
+        Err(e) => Err(e),
+        //TODO: Err(_) => client.replicate_to_s3(batches).await,
     }
 }

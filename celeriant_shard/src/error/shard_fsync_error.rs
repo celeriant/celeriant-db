@@ -78,6 +78,7 @@ impl From<RotatingLogError> for ShardFsyncError {
 impl From<ReplicationError> for ShardFsyncError {
     fn from(e: ReplicationError) -> Self {
         match e {
+            ReplicationError::LockTimeout(msg) => Self::IoError(msg),
             ReplicationError::RollbackInProgress => Self::IoError("Rollback in progress".into()),
             ReplicationError::NetworkFailure(msg) => Self::IoError(msg),
             ReplicationError::FollowerDiverged => Self::IoError("Follower log diverged from leader".into()),

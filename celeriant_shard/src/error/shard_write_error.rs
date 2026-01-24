@@ -1,4 +1,5 @@
 use celeriant_rotating_log::{rotating_log_error::RotatingLogError, rwlock_timeout::LockTimeoutError};
+use celeriant_wal::constants::EntryHashBytes;
 use celeriant_wire::wire_format_error::WireFormatError;
 use glommio::GlommioError;
 
@@ -46,6 +47,28 @@ pub enum ShardWriteError {
         requested: u64,
         max_event_batch_index: u64,
     },
+
+    NotAFollower,
+
+    EmptyReplicationBatch,
+
+    ReplicationTimeDriftTooHigh {
+        leader_timestamp_ms: u64,
+        follower_timestamp_ms: u64,
+        max_allowed_drift_ms: u64,
+    },
+
+    ReplicationWalIndexMismatch {
+        follower_wal_index: u64,
+        leader_wal_index: u64,
+    },
+
+    ReplicationTipHashMismatch {
+        follower_tip_hash: EntryHashBytes,
+        leader_tip_hash: EntryHashBytes,
+    },
+
+    MissingDatablockInReplicationBatch,
 }
 
 impl From<ShardCacheError> for ShardWriteError {
@@ -114,6 +137,7 @@ impl From<std::io::Error> for ShardWriteError {
 impl From<ReplicationError> for ShardWriteError {
     fn from(e: ReplicationError) -> Self {
         match e {
+            ReplicationError::LockTimeout(msg) => Self::IoError(msg),
             ReplicationError::RollbackInProgress => Self::IoError("Rollback in progress".into()),
             ReplicationError::NetworkFailure(msg) => Self::IoError(msg),
             ReplicationError::FollowerDiverged => Self::IoError("Follower log diverged from leader".into()),

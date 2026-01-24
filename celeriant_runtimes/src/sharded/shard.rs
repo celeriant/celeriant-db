@@ -173,13 +173,13 @@ fn handle_intrashard_message<R: ReplicationClient + 'static>(msg: IntrashardMess
         IntrashardMessages::Shutdown => {
             ctx.shutdown_requested.set(true);
         }
-        IntrashardMessages::ConnectionRedirect { accepted_tcp_stream, request, message_version } => {
+        IntrashardMessages::ConnectionRedirect { accepted_tcp_stream, request, message_version, port_type } => {
             handle_redirected_connection(
                 accepted_tcp_stream.bind_to_executor(),
                 request,
                 message_version,
                 ctx.clone(),
-                PortType::Client,
+                port_type,
             );
         }
     }

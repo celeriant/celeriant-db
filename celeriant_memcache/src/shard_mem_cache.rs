@@ -256,6 +256,12 @@ impl ShardMemCache {
         self.pending_append_queue.is_empty()
     }
 
+    /// Add prepared items directly to the pending queue (used for replication).
+    /// Does not update aggregate/client tracking - those are handled on commit.
+    pub fn add_to_pending_queue(&mut self, items: Vec<ShardLogQueueItem>) {
+        self.pending_append_queue.extend(items);
+    }
+
     /// Add a pending delete to the queue
     pub fn add_pending_delete_to_queue(
         &mut self,

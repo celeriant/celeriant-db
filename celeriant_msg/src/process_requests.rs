@@ -424,7 +424,6 @@ mod tests {
                 leader_timestamp_ms: 0,
                 follower_too_far_behind: false,
                 batches: vec![],
-                expected_follower_tip_hash: None,
             }),
             RequestType::CatchUp => Request::CatchUp(CatchUpRequest {
                 correlation_id: Some(114),

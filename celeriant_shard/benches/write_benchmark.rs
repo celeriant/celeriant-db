@@ -94,6 +94,7 @@ fn create_config(
         list_page_size: 20000,
         list_wal_index_cache_bytes: 12 * 1024 * 1024,
         pending_replication_high_water_bytes: 67_108_864, // 64MB
+        max_cluster_time_drift_ms: 5000,
     }
 }
 

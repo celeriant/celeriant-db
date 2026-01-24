@@ -33,6 +33,7 @@ path = "src/watch_test_main.rs"
 celeriant_lib = { package = "celeriant", path = "../celeriant" }
 celeriant_client_tokio = { path = "../celeriant_client_tokio" }
 celeriant_msg = { path = "../celeriant_msg" }
+celeriant_runtimes = { path = "../celeriant_runtimes" }
 celeriant_wire = { path = "../celeriant_wire" }
 celeriant_wal = { path = "../celeriant_wal" }
 tokio.workspace = true

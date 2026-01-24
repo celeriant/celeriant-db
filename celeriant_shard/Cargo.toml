@@ -14,6 +14,7 @@ celeriant_disk = { path = "../celeriant_disk" }
 celeriant_watch = { path = "../celeriant_watch" }
 celeriant_memcache = { path = "../celeriant_memcache" }
 celeriant_rotating_log = { path = "../celeriant_rotating_log" }
+celeriant_client_glommio = { path = "../celeriant_client_glommio" }
 glommio.workspace = true
 futures-lite.workspace = true
 fastbloom.workspace = true

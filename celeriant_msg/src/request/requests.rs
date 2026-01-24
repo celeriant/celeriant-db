@@ -110,9 +110,6 @@ pub struct ReplicationBatchRequest {
     /// Leader has decided to kick the follower
     /// Follower won't rejoin until it's caught back up
     pub follower_too_far_behind: bool,
-    /// Leader's expected tip_hash at follower's current position.
-    /// Follower rejects batch if its tip_hash doesn't match.
-    pub expected_follower_tip_hash: Option<EntryHashBytes>,
     /// If there are batches to replicate, they are provided to the follower
     /// Otherwise it's just a heartbeat message
     pub batches: Vec<ReplicationBatchItem>,

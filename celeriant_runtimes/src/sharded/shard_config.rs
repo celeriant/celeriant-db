@@ -1,6 +1,7 @@
 use std::{path::PathBuf, time::Duration};
 
 use celeriant_shard::timestamp_config::TimestampConfig;
+use celeriant_wal::cluster_role::ClusterRole;
 
 use crate::sharded::routing_rule::RoutingRule;
 
@@ -10,6 +11,8 @@ use crate::sharded::routing_rule::RoutingRule;
 pub struct ShardConfig {
     pub node_id: u128,
     pub num_shards: u32,
+    pub cluster_role: ClusterRole,
+    pub follower_address: Option<String>,
     pub data_root: PathBuf,
     pub listen_address: String,
     pub client_port: u16,
@@ -34,4 +37,5 @@ pub struct ShardConfig {
     pub list_page_size: usize,
     pub list_wal_index_cache_bytes: u64,
     pub pending_replication_high_water_bytes: u64,
+    pub max_cluster_time_drift_ms: u64,
 }

@@ -9,7 +9,7 @@
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use celeriant_integration_tests::{ServerConfig, TestServer};
+use celeriant_integration_tests::{ConfigClusterRole, ServerConfig, TestServer};
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
 use celeriant_msg::request::requests::WriteRequest;
@@ -27,12 +27,58 @@ const NUM_AGGREGATES: usize = 1024;
 const USE_MICRO_PAYLOAD: bool = true;
 const CLIENTSIDE_TIMEOUT_S: u64 = 5;
 
+/// Enable replicated mode: spins up a leader and follower, benchmarks writes to leader
+const REPLICATED_MODE: bool = false;
+
 // Connection counts to sweep through when SWEEP_MODE is enabled
 const CONNECTION_SWEEP: &[usize] = &[512, 1024, 2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384];
 
 struct TaskStats {
     request_count: u64,
     latencies_us: Vec<u64>,
+}
+
+/// Holds both leader and follower servers for replicated mode
+struct ReplicatedServers {
+    leader: TestServer,
+    _follower: TestServer,
+}
+
+impl ReplicatedServers {
+    async fn start(base_port: u16, log_level: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        // Start follower first (it needs to be listening before leader connects)
+        let follower_port = base_port + 100;
+        let follower_config = ServerConfig {
+            log_level: log_level.to_string(),
+            cluster_role: ConfigClusterRole::Follower,
+            ..Default::default()
+        };
+        println!("Starting follower on port {}...", follower_port);
+        let follower = TestServer::start_with_config(follower_port, follower_config).await?;
+
+        // Small delay to ensure follower is fully ready
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Start leader with follower address
+        let follower_replication_port = follower_port + 1;
+        let leader_config = ServerConfig {
+            log_level: log_level.to_string(),
+            cluster_role: ConfigClusterRole::Leader,
+            follower_address: Some(format!("127.0.0.1:{}", follower_replication_port)),
+            ..Default::default()
+        };
+        println!("Starting leader on port {} (replicating to 127.0.0.1:{})...", base_port, follower_replication_port);
+        let leader = TestServer::start_with_config(base_port, leader_config).await?;
+
+        Ok(Self {
+            leader,
+            _follower: follower,
+        })
+    }
+
+    fn address(&self) -> &str {
+        self.leader.address()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -65,19 +111,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_sweep_benchmark() -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== Batch Write Performance Sweep Test ===\n");
+    let mode_str = if REPLICATED_MODE { "Replicated (Leader+Follower)" } else { "Standalone" };
+    println!("=== Batch Write Performance Sweep Test ({}) ===\n", mode_str);
     println!("Testing connection counts: {:?}\n", CONNECTION_SWEEP);
 
-    // Start server with all shards
-    println!("Starting test server with all shards...");
-    let config = ServerConfig {
-        log_level: "warn".to_string(),
-        ..Default::default()
-    };
     let port = 10100 + (std::process::id() % 100) as u16;
-    let server = TestServer::start_with_config(port, config).await?;
-    let server_address = server.address().to_string();
-    println!("Server started at {}\n", server_address);
+
+    // Start server(s)
+    let (server_address, _standalone, _replicated) = if REPLICATED_MODE {
+        println!("Starting replicated cluster...");
+        let replicated = ReplicatedServers::start(port, "warn").await?;
+        let addr = replicated.address().to_string();
+        println!("Cluster started, leader at {}\n", addr);
+        (addr, None, Some(replicated))
+    } else {
+        println!("Starting standalone test server...");
+        let config = ServerConfig {
+            log_level: "warn".to_string(),
+            ..Default::default()
+        };
+        let server = TestServer::start_with_config(port, config).await?;
+        let addr = server.address().to_string();
+        println!("Server started at {}\n", addr);
+        (addr, Some(server), None)
+    };
 
     let mut results: Vec<BenchmarkResult> = Vec::new();
 
@@ -280,23 +337,41 @@ async fn run_benchmark_iteration(
 }
 
 async fn run_single_benchmark(num_connections: usize, verbose: bool) -> Result<Option<BenchmarkResult>, Box<dyn std::error::Error>> {
+    let mode_str = if REPLICATED_MODE { "Replicated" } else { "Standalone" };
     if verbose {
-        println!("=== Batch Write Performance Test ===\n");
+        println!("=== Batch Write Performance Test ({}) ===\n", mode_str);
     }
 
-    // Start server with all shards
-    if verbose {
-        println!("Starting test server with all shards...");
-    }
-    let config = ServerConfig {
-        log_level: "warn".to_string(),
-        ..Default::default()
-    };
     let port = 10100 + (std::process::id() % 100) as u16;
-    let server = TestServer::start_with_config(port, config).await?;
-    let server_address = server.address();
+
+    // Start server(s)
+    let (server_address, _standalone, _replicated) = if REPLICATED_MODE {
+        if verbose {
+            println!("Starting replicated cluster...");
+        }
+        let replicated = ReplicatedServers::start(port, "warn").await?;
+        let addr = replicated.address().to_string();
+        if verbose {
+            println!("Cluster started, leader at {}\n", addr);
+        }
+        (addr, None, Some(replicated))
+    } else {
+        if verbose {
+            println!("Starting standalone test server...");
+        }
+        let config = ServerConfig {
+            log_level: "warn".to_string(),
+            ..Default::default()
+        };
+        let server = TestServer::start_with_config(port, config).await?;
+        let addr = server.address().to_string();
+        if verbose {
+            println!("Server started at {}\n", addr);
+        }
+        (addr, Some(server), None)
+    };
+
     if verbose {
-        println!("Server started at {}\n", server_address);
         println!("Establishing {} connections...", num_connections);
     }
 

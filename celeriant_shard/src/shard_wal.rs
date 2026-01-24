@@ -11,7 +11,10 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroUsize;
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use celeriant_wal::compression_type::CompressionType;
+use glommio::sync::RwLock;
 
 use celeriant_disk::files::read_objects_absolute;
 use celeriant_memcache::cache_path::CachePath;
@@ -22,9 +25,9 @@ use celeriant_memcache::shard_mem_cache::ShardMemCache;
 use celeriant_msg::process_requests::Request;
 use celeriant_msg::process_responses::Response;
 use celeriant_msg::request::read_filters::ReadFilters;
-use celeriant_msg::request::requests::{DeleteRequest, ExistsRequest, ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest, ReadRequest, SingleAggregateWrite, TrimStartRequest, WriteRequest};
+use celeriant_msg::request::requests::{DeleteRequest, ExistsRequest, ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest, ReadRequest, ReplicationBatchItem, SingleAggregateWrite, TrimStartRequest, WriteRequest};
 use celeriant_msg::response::aggregate_event_batch::AggregateEventBatch;
-use celeriant_msg::response::responses::{AggregateListItem, AggregateTypeListItem, ExistsResponse, ListAggregateTypesResponse, ListAggregatesResponse, ListOrgsResponse, OrgListItem, ReadResponse, SuccessResponse};
+use celeriant_msg::response::responses::{AggregateListItem, AggregateTypeListItem, ExistsResponse, ListAggregateTypesResponse, ListAggregatesResponse, ListOrgsResponse, OrgListItem, ReadResponse, ReplicationBatchResponse, SuccessResponse};
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
 use celeriant_rotating_log::reverse_metablock_scanner::ReverseMetablockScanner;
 use celeriant_rotating_log::rotating_log_error::RotatingLogError;
@@ -106,7 +109,7 @@ pub struct ShardWal<R: ReplicationClient + 'static> {
     aggregate_client_loading: LoadingCoordinator<AggregateClientKey>,
 
     /// Client for replicating data to followers or S3
-    replication_client: Rc<R>,
+    replication_client: Rc<RwLock<R>>,
 }
 
 impl<R: ReplicationClient + 'static> AggregateReader for ShardWal<R> {
@@ -159,9 +162,12 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
                     .map(Response::ListAggregates)
                     .map_err(ShardError::Read)
             }
-            Request::ReplicationBatch(_) => Err(ShardError::Read(ShardReadError::IoError(
-                "ReplicationBatch requests not implemented yet".to_string(),
-            ))),
+            Request::ReplicationBatch(replication_request) => {
+                self.handle_replication_batch(replication_request)
+                    .await
+                    .map(Response::ReplicationBatch)
+                    .map_err(ShardError::Write)
+            }
             Request::CatchUp(_) => Err(ShardError::Read(ShardReadError::IoError(
                 "CatchUp requests not implemented yet".to_string(),
             ))),
@@ -199,7 +205,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
             config,
             aggregate_loading: LoadingCoordinator::new(),
             aggregate_client_loading: LoadingCoordinator::new(),
-            replication_client: Rc::new(replication_client),
+            replication_client: Rc::new(RwLock::new(replication_client)),
         })
     }
 
@@ -1368,6 +1374,94 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
             .detach();
             Ok(())
         }
+    }
+    
+    async fn handle_replication_batch(
+        &self, request: celeriant_msg::request::requests::ReplicationBatchRequest
+    ) -> Result<ReplicationBatchResponse, ShardWriteError> {
+
+        let follower_timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH).expect("System time before Unix epoch").as_millis() as u64;
+        
+        if self.cluster_role.get() != ClusterRole::Follower {
+            return Err(ShardWriteError::NotAFollower);
+        }
+
+        if follower_timestamp_ms.saturating_sub(request.leader_timestamp_ms) > self.config.max_cluster_time_drift_ms {
+            return Err(ShardWriteError::ReplicationTimeDriftTooHigh {
+                leader_timestamp_ms: request.leader_timestamp_ms,
+                follower_timestamp_ms,
+                max_allowed_drift_ms: self.config.max_cluster_time_drift_ms,
+            });
+        }
+
+        if request.batches.is_empty() {
+            return Err(ShardWriteError::EmptyReplicationBatch);
+        }
+
+        let (follower_tip_hash, follower_wal_index) = {
+            let active_log_segment_file = self.log_segments_cache.active();
+            let metadata = active_log_segment_file.metadata.borrow();
+            (metadata.write.tip_hash, metadata.write.wal_index)
+        };
+        let (leader_tip_hash, leader_wal_index) = {
+            request.batches.first().map(|b| (b.metablock.previous_tip_hash, b.metablock.wal_index.saturating_sub(1))).unwrap_or((GENESIS_HASH, 0))
+        };
+
+        if follower_wal_index != leader_wal_index {
+            return Err(ShardWriteError::ReplicationWalIndexMismatch {
+                follower_wal_index,
+                leader_wal_index,
+            });
+        }
+
+        if follower_tip_hash != leader_tip_hash {
+            return Err(ShardWriteError::ReplicationTipHashMismatch {
+                follower_tip_hash,
+                leader_tip_hash,
+            });
+        }
+
+        // Add all entries to pending queue synchronously (no fsync yet)
+        self.add_replicated_entries_to_queue(request.batches)?;
+
+        // Single fsync for entire batch
+        self.sync_durable().await?;
+
+        Ok(celeriant_msg::response::responses::ReplicationBatchResponse {
+            correlation_id: request.correlation_id,
+            last_follower_metablock: None,
+            follower_timestamp_ms,
+        })
+    }
+
+    fn add_replicated_entries_to_queue(
+        &self,
+        items: Vec<ReplicationBatchItem>,
+    ) -> Result<(), ShardWriteError> {
+        // Validate and prepare all items first (all-or-nothing)
+        let mut prepared = Vec::with_capacity(items.len());
+
+        for item in items {
+            let (datablock_bytes, datablock) = match item.metablock.datablock {
+                DatablockStorageKind::None => (None, None),
+                DatablockStorageKind::Inline(_) => (None, None),
+                DatablockStorageKind::Block(ref datablock_block_ref) => {
+                    if let Some(datablock) = item.datablock {
+                        let compression_type = CompressionType::from_tuple(datablock_block_ref.compression_type, None);
+                        let serialized_datablock = serialize_datablock(&datablock, compression_type, 0)?;
+                        (serialized_datablock.external_data, Some(datablock))
+                    } else {
+                        return Err(ShardWriteError::MissingDatablockInReplicationBatch);
+                    }
+                },
+            };
+            prepared.push(ShardLogQueueItem::new(datablock, datablock_bytes, item.metablock));
+        }
+
+        // All validation passed - add to queue
+        self.shard_mem_cache.borrow_mut().add_to_pending_queue(prepared);
+
+        Ok(())
     }
 }
 

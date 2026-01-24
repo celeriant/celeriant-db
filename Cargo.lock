@@ -381,6 +381,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "celeriant_client_glommio"
+version = "0.1.0"
+dependencies = [
+ "celeriant_msg",
+ "celeriant_wal",
+ "celeriant_wire",
+ "futures-lite",
+ "glommio",
+]
+
+[[package]]
 name = "celeriant_client_tokio"
 version = "0.1.0"
 dependencies = [
@@ -431,6 +442,7 @@ dependencies = [
  "celeriant",
  "celeriant_client_tokio",
  "celeriant_msg",
+ "celeriant_runtimes",
  "celeriant_wal",
  "celeriant_wire",
  "rand 0.8.5",
@@ -500,6 +512,7 @@ dependencies = [
 name = "celeriant_shard"
 version = "0.1.0"
 dependencies = [
+ "celeriant_client_glommio",
  "celeriant_disk",
  "celeriant_distributed",
  "celeriant_memcache",

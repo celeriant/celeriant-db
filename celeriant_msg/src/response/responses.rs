@@ -100,8 +100,6 @@ pub struct ReplicationBatchResponse {
     /// Leader can use last follower metablock to check for replication 
     /// success, position, fall behind, or to decide to kick follower
     pub last_follower_metablock: Option<Metablock>,
-    /// Either all 0's or the hash up and including the follower's last metablock
-    pub follower_tip_hash: Option<EntryHashBytes>,
     /// Leader will also check the follower's current time for clock drift
     pub follower_timestamp_ms: u64,
 }

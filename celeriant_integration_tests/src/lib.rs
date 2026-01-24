@@ -3,7 +3,7 @@
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-pub use celeriant_lib::server_config::ServerConfig;
+pub use celeriant_lib::server_config::{ConfigClusterRole, ServerConfig};
 use tempfile::TempDir;
 use tokio::net::TcpStream;
 use tokio::time::sleep;
@@ -224,6 +224,20 @@ impl ServerConfigExt for ServerConfig {
 
         args.push("--list-wal-index-cache-bytes".to_string());
         args.push(self.list_wal_index_cache_bytes.to_string());
+
+        // Cluster role configuration
+        let role_str = match self.cluster_role {
+            ConfigClusterRole::Standalone => "standalone",
+            ConfigClusterRole::Leader => "leader",
+            ConfigClusterRole::Follower => "follower",
+        };
+        args.push("--cluster-role".to_string());
+        args.push(role_str.to_string());
+
+        if let Some(follower_addr) = &self.follower_address {
+            args.push("--follower-address".to_string());
+            args.push(follower_addr.clone());
+        }
 
         // S3 configuration (only if enabled)
         if self.s3_enabled {

@@ -14,6 +14,14 @@ pub enum ConfigTimestampPrecision {
     Nanoseconds,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, ValueEnum)]
+pub enum ConfigClusterRole {
+    #[default]
+    Standalone,
+    Leader,
+    Follower,
+}
+
 #[derive(Clone, Debug, Parser)]
 #[command(name = "celeriant")]
 #[command(about = "Celeriant TCP Server", long_about = None)]
@@ -66,6 +74,21 @@ pub struct ServerConfig {
         help = "Port for leader-to-follower replication"
     )]
     pub replication_port: u16,
+
+    #[arg(
+        long,
+        default_value = "standalone",
+        env = "CELERIANT_CLUSTER_ROLE",
+        help = "Cluster role: standalone, leader, or follower"
+    )]
+    pub cluster_role: ConfigClusterRole,
+
+    #[arg(
+        long,
+        env = "CELERIANT_FOLLOWER_ADDRESS",
+        help = "Address of follower node for replication (required when cluster_role=leader)"
+    )]
+    pub follower_address: Option<String>,
 
     #[arg(
         long,
@@ -164,6 +187,9 @@ pub struct ServerConfig {
 
     #[arg(long, default_value_t = 64 * 1024 * 1024, env = "CELERIANT_PENDING_REPLICATION_HIGH_WATER_BYTES", help = "High water mark for pending replication queue before triggering S3 fallback (64MB)")]
     pub pending_replication_high_water_bytes: u64,
+
+    #[arg(long, default_value_t = 5000, env = "CELERIANT_MAX_CLUSTER_TIME_DRIFT_MS", help = "Maximum allowed clock drift between leader and follower nodes (5s)")]
+    pub max_cluster_time_drift_ms: u64,
 
     #[arg(
         long,
@@ -300,9 +326,16 @@ impl ServerConfig {
     }
 
     pub fn to_shard_config(&self, node_id: u128, num_shards: u32) -> ShardConfig {
+        use celeriant_runtimes::ClusterRole;
         ShardConfig {
             node_id,
             num_shards,
+            cluster_role: match self.cluster_role {
+                ConfigClusterRole::Standalone => ClusterRole::Standalone,
+                ConfigClusterRole::Leader => ClusterRole::Leader,
+                ConfigClusterRole::Follower => ClusterRole::Follower,
+            },
+            follower_address: self.follower_address.clone(),
             data_root: self.data_root.clone(),
             listen_address: self.listen_address.clone(),
             client_port: self.client_port,
@@ -334,6 +367,7 @@ impl ServerConfig {
             list_page_size: self.list_page_size as usize,
             list_wal_index_cache_bytes: self.list_wal_index_cache_bytes,
             pending_replication_high_water_bytes: self.pending_replication_high_water_bytes,
+            max_cluster_time_drift_ms: self.max_cluster_time_drift_ms,
         }
     }
 
@@ -407,6 +441,8 @@ impl Default for ServerConfig {
             listen_address: "0.0.0.0".to_string(),
             client_port: 10000,
             replication_port: 10001,
+            cluster_role: ConfigClusterRole::Standalone,
+            follower_address: None,
             mesh_channel_size: 1024,
             num_shards: None,
             read_max_chunk_size: 32 * 1024,
@@ -432,6 +468,7 @@ impl Default for ServerConfig {
             aggregate_client_snapshots_cache_bytes: 64 * 1024 * 1024,
             aggregate_snapshots_cache_bytes: 64 * 1024 * 1024,
             pending_replication_high_water_bytes: 64 * 1024 * 1024,
+            max_cluster_time_drift_ms: 5000,
             timestamp_precision: ConfigTimestampPrecision::Milliseconds,
             timestamp_epoch_offset_secs: 0,
             list_max_duration_ms: 2000,

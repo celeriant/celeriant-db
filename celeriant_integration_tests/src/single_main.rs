@@ -7,8 +7,10 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
+use celeriant_runtimes::RoutingRule;
 
-use celeriant_integration_tests::TestServer;
+use celeriant_integration_tests::{ConfigClusterRole, ServerConfig, TestServer};
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::list_operations::{
     ListAggregateTypesIterator, ListAggregatesIterator, ListOptions, ListOrgsIterator,
@@ -28,28 +30,97 @@ use celeriant_wal::{
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
 };
 
+/// Enable replicated mode: writes to leader, reads from follower
+const REPLICATED_MODE: bool = true;
+
+struct ReplicatedServers {
+    leader: TestServer,
+    follower: TestServer,
+}
+
+impl ReplicatedServers {
+    async fn start(base_port: u16) -> Result<Self, Box<dyn std::error::Error>> {
+        // Start follower first
+        let follower_port = base_port + 100;
+        let follower_config = ServerConfig {
+            log_level: "warn".to_string(),
+            cluster_role: ConfigClusterRole::Follower,
+            routing_rule: RoutingRule::AggregateTypeId,
+            ..Default::default()
+        };
+        println!("Starting follower on port {}...", follower_port);
+        let follower = TestServer::start_with_config(follower_port, follower_config).await?;
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Start leader with follower address
+        let follower_replication_port = follower_port + 1;
+        let leader_config = ServerConfig {
+            log_level: "warn".to_string(),
+            cluster_role: ConfigClusterRole::Leader,
+            follower_address: Some(format!("127.0.0.1:{}", follower_replication_port)),
+            routing_rule: RoutingRule::AggregateTypeId,
+            ..Default::default()
+        };
+        println!(
+            "Starting leader on port {} (replicating to 127.0.0.1:{})...",
+            base_port, follower_replication_port
+        );
+        let leader = TestServer::start_with_config(base_port, leader_config).await?;
+
+        Ok(Self { leader, follower })
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== Single-Aggregate Integration Tests ===\n");
+    let mode_str = if REPLICATED_MODE {
+        "Replicated (writes→leader, reads→follower)"
+    } else {
+        "Standalone"
+    };
+    println!("=== Single-Aggregate Integration Tests ({}) ===\n", mode_str);
 
-    println!("Starting test server...");
-    let server = TestServer::start().await?;
-    println!("Server started at {}\n", server.address());
+    let port = 10100 + (std::process::id() % 100) as u16;
 
-    let mut client = CeleriantClient::connect(server.address()).await?;
+    // Start server(s) and create clients
+    let (mut write_client, mut read_client, _standalone, _replicated) = if REPLICATED_MODE {
+        println!("Starting replicated cluster...");
+        let servers = ReplicatedServers::start(port).await?;
+        println!(
+            "Cluster started: leader at {}, follower at {}\n",
+            servers.leader.address(),
+            servers.follower.address()
+        );
+
+        let write_client = CeleriantClient::connect(servers.leader.address()).await?;
+        let read_client = CeleriantClient::connect(servers.follower.address()).await?;
+        (write_client, read_client, None, Some(servers))
+    } else {
+        println!("Starting test server...");
+        let server = TestServer::start_with_port(port).await?;
+        println!("Server started at {}\n", server.address());
+
+        let client = CeleriantClient::connect(server.address()).await?;
+        let read_client = CeleriantClient::connect(server.address()).await?;
+        (client, read_client, Some(server), None)
+    };
 
     let aggregate_1 = AggregateKey::new(1, 2, 101);
     let aggregate_2 = AggregateKey::new(1, 2 + 32, 201);
     let client_id: u128 = 999;
 
-    // Check if aggregates exist
+    // Check if aggregates exist (use read_client)
     println!("=== Checking if aggregates exist ===");
     for agg in [&aggregate_1, &aggregate_2] {
         let request = Request::Exists(ExistsRequest {
             aggregate_key: agg.clone(),
             correlation_id: None,
         });
-        match client.send_request(&request, CompressionType::None).await {
+        match read_client
+            .send_request(&request, CompressionType::None)
+            .await
+        {
             Ok(response) => println!("Aggregate {:?}: {:?}", agg, response),
             Err(e) => println!("Aggregate {:?}: Error - {:?}", agg, e),
         }
@@ -77,7 +148,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             user_id: None,
             writes,
         });
-        match client.send_request(&request, CompressionType::None).await {
+        match write_client
+            .send_request(&request, CompressionType::None)
+            .await
+        {
             Ok(response) => println!("Initial write to aggregate {}: {:?}", i + 1, response),
             Err(e) => println!("Initial write to aggregate {} failed: {:?}", i + 1, e),
         }
@@ -116,7 +190,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         user_id: Some(42),
         writes,
     });
-    match client
+    match write_client
         .send_request(&atomic_request, CompressionType::None)
         .await
     {
@@ -126,7 +200,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Test idempotency - retry same write
     println!("\n=== Testing idempotency (retry same write) ===");
-    match client
+    match write_client
         .send_request(&atomic_request, CompressionType::None)
         .await
     {
@@ -134,24 +208,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => println!("Idempotent retry result: {:?}", e),
     }
 
-    // Read back events from both aggregates
+    // Read back events from both aggregates (use read_client - follower in replicated mode)
     println!("\n=== Reading events from both aggregates ===");
+    if REPLICATED_MODE {
+        println!("(Reading from FOLLOWER)");
+    }
     for (i, agg) in [&aggregate_1, &aggregate_2].iter().enumerate() {
         let request = Request::Read(ReadRequest {
             correlation_id: None,
             aggregate_key: (*agg).clone(),
             filters: ReadFilters::new(1),
         });
-        match client.send_request(&request, CompressionType::None).await {
+        match read_client
+            .send_request(&request, CompressionType::None)
+            .await
+        {
             Ok(response) => println!("Aggregate {} events: {:?}", i + 1, response),
             Err(e) => println!("Aggregate {} read failed: {:?}", i + 1, e),
         }
     }
 
-    // === List Operations ===
+    // === List Operations (use read_client - follower in replicated mode) ===
     println!("\n=== Listing Organizations ===");
+    if REPLICATED_MODE {
+        println!("(Reading from FOLLOWER)");
+    }
     let options = ListOptions::default();
-    let orgs_iter = ListOrgsIterator::new(&mut client, options);
+    let orgs_iter = ListOrgsIterator::new(&mut read_client, options);
     let orgs = orgs_iter.collect().await?;
     println!("Found {} organizations:", orgs.len());
     for org in &orgs {
@@ -166,7 +249,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\n=== Listing Aggregate Types ===");
     let options = ListOptions::default();
-    let types_iter = ListAggregateTypesIterator::new(&mut client, Some(1), options);
+    let types_iter = ListAggregateTypesIterator::new(&mut read_client, Some(1), options);
     let agg_types = types_iter.collect().await?;
     println!("Found {} aggregate types for org 1:", agg_types.len());
     for agg_type in &agg_types {
@@ -188,7 +271,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\n=== Listing Aggregates (before delete) ===");
     let options = ListOptions::default();
-    let aggs_iter = ListAggregatesIterator::new(&mut client, Some(1), None, options);
+    let aggs_iter = ListAggregatesIterator::new(&mut read_client, Some(1), None, options);
     let aggregates = aggs_iter.collect().await?;
     println!("Found {} aggregates for org 1:", aggregates.len());
     for agg in &aggregates {
@@ -229,7 +312,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         user_id: Some(42),
         deletes,
     });
-    match client
+    match write_client
         .send_request(&delete_request, CompressionType::None)
         .await
     {
@@ -240,7 +323,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // === List Aggregates again to verify delete ===
     println!("\n=== Listing Aggregates (after delete, excluding deleted) ===");
     let options = ListOptions::default();
-    let aggs_iter = ListAggregatesIterator::new(&mut client, Some(1), None, options);
+    let aggs_iter = ListAggregatesIterator::new(&mut read_client, Some(1), None, options);
     let aggregates = aggs_iter.collect().await?;
     println!("Found {} non-deleted aggregates for org 1:", aggregates.len());
     for agg in &aggregates {
@@ -267,7 +350,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         include_deleted: true,
         ..Default::default()
     };
-    let aggs_iter = ListAggregatesIterator::new(&mut client, Some(1), None, options);
+    let aggs_iter = ListAggregatesIterator::new(&mut read_client, Some(1), None, options);
     let aggregates = aggs_iter.collect().await?;
     println!(
         "Found {} total aggregates for org 1 (including deleted):",
@@ -315,7 +398,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         user_id: None,
         writes,
     });
-    match client.send_request(&request, CompressionType::None).await {
+    match write_client
+        .send_request(&request, CompressionType::None)
+        .await
+    {
         Ok(response) => println!("Unexpected success: {:?}", response),
         Err(e) => println!("Expected conflict error: {:?}", e),
     }

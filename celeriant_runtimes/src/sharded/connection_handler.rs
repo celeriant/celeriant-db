@@ -212,6 +212,7 @@ async fn check_redirect<R: ReplicationClient + 'static>(
             accepted_tcp_stream: tcp_stream.into_accepted(),
             request,
             message_version,
+            port_type,
         };
         if let Err(e) = ctx.intrashard_sender.send_to(target_shard, msg).await {
             warn!("Failed to redirect connection to shard {target_shard}: {e:?}");
@@ -515,6 +516,21 @@ fn error_to_response(correlation_id: Option<u128>, error: ShardError) -> Respons
                 400,
                 format!("Trim index {} out of range, max event batch index is {}", requested, max_event_batch_index),
             ),
+            ShardWriteError::NotAFollower => (500, "Node is not a follower".to_string()),
+            ShardWriteError::EmptyReplicationBatch => (500, "Empty replication batch".to_string()),
+            ShardWriteError::ReplicationTimeDriftTooHigh { leader_timestamp_ms, follower_timestamp_ms, max_allowed_drift_ms } => (
+                500,
+                format!("Replication time drift too high: leader={}ms, follower={}ms, max_allowed={}ms", leader_timestamp_ms, follower_timestamp_ms, max_allowed_drift_ms),
+            ),
+            ShardWriteError::ReplicationTipHashMismatch { follower_tip_hash, leader_tip_hash } => (
+                500,
+                format!("Replication tip hash mismatch: follower={:?}, leader={:?}", follower_tip_hash, leader_tip_hash),
+            ),
+            ShardWriteError::ReplicationWalIndexMismatch { follower_wal_index, leader_wal_index } => (
+                500,
+                format!("Replication WAL index mismatch: follower={}, leader={}", follower_wal_index, leader_wal_index),
+            ),
+            ShardWriteError::MissingDatablockInReplicationBatch => (500, "Missing datablock in replication batch".to_string()),
         },
         ShardError::WatchSession(watch_session_error) => match watch_session_error {
             WatchSessionError::WatchLatencyTooHigh { latency_ms, max_latency_ms } => (
@@ -573,6 +589,7 @@ mod tests {
             list_wal_index_cache_bytes: 1024,
             pending_replication_high_water_bytes: 67_108_864, // 64MB
             replication_delay: Duration::from_millis(20),
+            max_cluster_time_drift_ms: 5000,
         }
     }
 
@@ -602,7 +619,6 @@ mod tests {
             batches: vec![],
             leader_timestamp_ms: 0,
             follower_too_far_behind: false,
-            expected_follower_tip_hash: None,
         });
         assert!(!is_valid_for_port(&repl, PortType::Client));
         assert!(is_valid_for_port(&repl, PortType::Replication));
@@ -651,7 +667,6 @@ mod tests {
             leader_timestamp_ms: 0,
             follower_too_far_behind: false,
             batches: vec![],
-            expected_follower_tip_hash: None,
         });
         let shard = determine_shard(&request, &config, PortType::Replication).unwrap();
         assert_eq!(shard, 2);
@@ -666,7 +681,6 @@ mod tests {
             leader_timestamp_ms: 0,
             follower_too_far_behind: false,
             batches: vec![],
-            expected_follower_tip_hash: None,
         });
         let result = determine_shard(&request, &config, PortType::Replication);
         assert!(matches!(result, Err(ShardRoutingError::IncompatibleFilters(_))));
