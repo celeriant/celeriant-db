@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use celeriant_msg::response::responses::ErrorResponse;
 use celeriant_wire::wire_error::WireError;
 use glommio::GlommioError;
@@ -7,22 +5,24 @@ use glommio::GlommioError;
 #[derive(Debug)]
 pub enum ClientError {
     ConnectionFailed(glommio::GlommioError<()>),
+    ConnectionTimeout,
     WireError(WireError),
     ProtocolError,
     CeleriantError(ErrorResponse),
-    Timeout(Duration),
+    RequestTimeout,
 }
 
 impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ClientError::ConnectionFailed(e) => write!(f, "Connection failed: {}", e),
+            ClientError::ConnectionTimeout => write!(f, "Connection timeout"),
             ClientError::WireError(e) => write!(f, "Wire error: {:?}", e),
             ClientError::ProtocolError => write!(f, "Protocol error"),
             ClientError::CeleriantError(e) => {
                 write!(f, "Celeriant server error: {}", e.error_message)
             }
-            ClientError::Timeout(duration) => write!(f, "Request timeout at {}ms", duration.as_millis()),
+            ClientError::RequestTimeout => write!(f, "Request timeout"),
         }
     }
 }

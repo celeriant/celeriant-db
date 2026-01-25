@@ -129,6 +129,43 @@ impl TestServer {
     pub fn config(&self) -> &ServerConfig {
         &self.config
     }
+
+    /// Stop the server process (can be restarted later).
+    pub fn stop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        println!("  Server stopped on port {}", self.config.client_port);
+    }
+
+    /// Restart the server process after stopping.
+    pub async fn restart(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let args = self.config.to_cli_args();
+
+        self.child = Command::new("cargo")
+            .args(["run", "-p", "celeriant", "--release", "--"])
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+
+        // Wait for server to start
+        let start = std::time::Instant::now();
+        let max_wait = Duration::from_secs(30);
+
+        while start.elapsed() < max_wait {
+            match TcpStream::connect(&self.address).await {
+                Ok(_) => {
+                    println!("  Server restarted on port {} (took {:?})", self.config.client_port, start.elapsed());
+                    return Ok(());
+                }
+                Err(_) => {
+                    sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+
+        Err("Server failed to restart within timeout".into())
+    }
 }
 
 impl Drop for TestServer {

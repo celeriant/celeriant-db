@@ -11,3 +11,4 @@ celeriant_wire = { path = "../celeriant_wire" }
 bincode.workspace = true
 futures-lite.workspace = true
 serde.workspace = true
+deepsize.workspace = true

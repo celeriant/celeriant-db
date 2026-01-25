@@ -108,8 +108,7 @@ pub enum FollowerRejection {
     },
     /// Follower's WAL index doesn't match leader's expected position.
     WalIndexMismatch {
-        follower: u64,
-        leader: u64,
+        max_follower_wal_index: u64,
     },
     /// Follower's tip hash doesn't match leader's expected hash.
     TipHashMismatch {

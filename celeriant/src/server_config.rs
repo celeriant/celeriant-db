@@ -193,6 +193,14 @@ pub struct ServerConfig {
 
     #[arg(
         long,
+        default_value_t = 104_857_600,
+        env = "CELERIANT_MAX_CATCHUP_GAP_BYTES",
+        help = "Maximum gap between leader and follower before triggering catchup (100MB)"
+    )]
+    pub max_catchup_gap_bytes: u64,
+
+    #[arg(
+        long,
         default_value_t = 17000,
         env = "CELERIANT_FSYNC_DELAY_US",
         help = "Amortised fsync duration block (17ms)"
@@ -368,6 +376,7 @@ impl ServerConfig {
             list_wal_index_cache_bytes: self.list_wal_index_cache_bytes,
             pending_replication_high_water_bytes: self.pending_replication_high_water_bytes,
             max_cluster_time_drift_ms: self.max_cluster_time_drift_ms,
+            max_catchup_gap_bytes: self.max_catchup_gap_bytes,
         }
     }
 
@@ -469,6 +478,7 @@ impl Default for ServerConfig {
             aggregate_snapshots_cache_bytes: 64 * 1024 * 1024,
             pending_replication_high_water_bytes: 64 * 1024 * 1024,
             max_cluster_time_drift_ms: 5000,
+            max_catchup_gap_bytes: 104_857_600,
             timestamp_precision: ConfigTimestampPrecision::Milliseconds,
             timestamp_epoch_offset_secs: 0,
             list_max_duration_ms: 2000,

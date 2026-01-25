@@ -3,9 +3,8 @@ use celeriant_msg::process_responses::Response;
 use celeriant_wal::compression_type::CompressionType;
 use celeriant_wire::constants::PROTOCOL_VERSION_V2;
 use futures_lite::future::or;
-use glommio::GlommioError;
 use glommio::net::TcpStream;
-use glommio::timer::{Timer};
+use glommio::timer::Timer;
 use std::time::Duration;
 
 use crate::client_error::ClientError;
@@ -27,34 +26,40 @@ pub struct CeleriantClient {
 impl CeleriantClient {
     /// Connect to Celeriant server at the given address (e.g., "127.0.0.1:10000")
     pub async fn connect(address: &str) -> Result<Self, ClientError> {
+        Self::connect_with_timeout(address, None).await
+    }
 
-        //TODO: Apply timeout to connection attempt
-        let stream = TcpStream::connect(address)
-            .await
-            .map_err(|e| ClientError::ConnectionFailed(e))?;
+    /// Connect to Celeriant server with an optional connection timeout
+    pub async fn connect_with_timeout(
+        address: &str,
+        connection_timeout: Option<Duration>,
+    ) -> Result<Self, ClientError> {
+        let stream = if let Some(duration) = connection_timeout {
+            TcpStream::connect_timeout(address, duration)
+                .await
+                .map_err(|e| {
+                    use std::io::ErrorKind;
+                    if let glommio::GlommioError::IoError(ref io_err) = e {
+                        if io_err.kind() == ErrorKind::TimedOut {
+                            return ClientError::ConnectionTimeout;
+                        }
+                    }
+                    ClientError::ConnectionFailed(e)
+                })?
+        } else {
+            TcpStream::connect(address)
+                .await
+                .map_err(ClientError::ConnectionFailed)?
+        };
+
+        // Set TCP_NODELAY to disable Nagle's algorithm
+        stream
+            .set_nodelay(true)
+            .map_err(ClientError::ConnectionFailed)?;
 
         Ok(Self {
             stream,
             max_request_size: 10_000_000, // 10MB default
-            timeout_duration: None,
-        })
-    }
-
-    /// Connect to Celeriant server with a connection timeout
-    pub async fn connect_with_timeout(
-        address: &str,
-        connect_timeout: Duration,
-    ) -> Result<Self, ClientError> {
-        let stream = TcpStream::connect_timeout(address, connect_timeout)
-            .await
-            .map_err(|e| match e {
-                GlommioError::TimedOut(dur) => ClientError::Timeout(dur),
-                other => ClientError::ConnectionFailed(other),
-            })?;
-
-        Ok(Self {
-            stream,
-            max_request_size: 10_000_000,
             timeout_duration: None,
         })
     }
@@ -94,7 +99,7 @@ impl CeleriantClient {
 
             match result {
                 Some(response) => response,
-                None => Err(ClientError::Timeout(duration)),
+                None => Err(ClientError::RequestTimeout),
             }
         } else {
             self.send_request_inner(request, compression_type).await
@@ -145,5 +150,17 @@ impl CeleriantClient {
         self.stream
             .peer_addr()
             .map_err(|e| ClientError::ConnectionFailed(e))
+    }
+    
+    /// Close the connection explicitly
+    ///
+    /// Consumes the client, ensuring it cannot be used after closing.
+    /// The connection is also closed automatically when dropped.
+    pub async fn close(self) -> Result<(), ClientError> {
+        use std::net::Shutdown;
+        self.stream
+            .shutdown(Shutdown::Both)
+            .await
+            .map_err(ClientError::ConnectionFailed)
     }
 }

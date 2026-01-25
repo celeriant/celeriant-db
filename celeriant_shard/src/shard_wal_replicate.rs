@@ -2,6 +2,9 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
 
+use celeriant_msg::request::requests::ReplicationBatchItem;
+use celeriant_rotating_log::reverse_metablock_scanner::ReverseMetablockScanner;
+use celeriant_wire::{metablock_bytes, version_aware_wire_format};
 use glommio::sync::RwLock;
 
 use celeriant_memcache::cache_path::CachePath;
@@ -10,7 +13,7 @@ use celeriant_memcache::shard_mem_cache::ShardMemCache;
 use celeriant_rotating_log::log_segment_file::write_dual_shard_log_header;
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
 use celeriant_rotating_log::rwlock_timeout::write_with_timeout;
-use celeriant_wal::constants::{FIRST_EVENT_BATCH_INDEX, HEADER_BLOCK_SIZE_BYTES};
+use celeriant_wal::constants::{FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES};
 use celeriant_wal::metablocks::metablock_kind::MetablockKind;
 use celeriant_watch::aggregate_watchers::AggregateWatchers;
 
@@ -18,12 +21,28 @@ use crate::amortisation::coordinator::{CaptureResult, Coordinator};
 use crate::error::replication_error::ReplicationError;
 use crate::error::rollback_error::RollbackError;
 use crate::error::shard_fsync_error::ShardFsyncError;
+use crate::error::shard_read_error::ShardReadError;
 use crate::replication_client::ReplicationClient;
+use crate::shard_wal::{KeptMetablock, fetch_datablocks_for_metablocks};
 use crate::watch_event_collector::WatchEventCollector;
+
+/// Returns the number of items from the start that fit within `max_size_bytes`.
+/// Always returns at least 1 to ensure progress even with oversized items.
+fn batch_end_index(items: &[ReplicationBatchItem], max_size_bytes: u64) -> usize {
+    let mut cumulative = 0u64;
+    for (i, item) in items.iter().enumerate() {
+        let size = item.size_bytes();
+        if cumulative + size > max_size_bytes && i > 0 {
+            return i;
+        }
+        cumulative += size;
+    }
+    items.len()
+}
 
 /// Captured data from the replication snapshot phase.
 pub(crate) struct ReplicationCapturedData {
-    pub use_s3: bool,
+    pub follower_falling_behind_or_offline: bool,
     pub replication_snapshot: Vec<PendingCommitData>,
 }
 
@@ -32,10 +51,10 @@ pub(crate) struct ReplicationCapturedData {
 pub(crate) fn capture_replication_snapshot(shard_mem_cache: &Rc<RefCell<ShardMemCache>>) -> CaptureResult<ReplicationCapturedData, ReplicationError> {
     let mut cache = shard_mem_cache.borrow_mut();
 
-    let use_s3 = cache.is_replication_queue_pressured();
+    let follower_falling_behind = cache.is_replication_queue_pressured();
     let replication_snapshot = cache.take_pending_replication();
 
-    if cache.take_replication_rollback_flag() && replication_snapshot.is_empty() {
+    if cache.take_replication_rollback_flag() {
         return CaptureResult::Failed(ReplicationError::RollbackInProgress);
     }
 
@@ -44,7 +63,7 @@ pub(crate) fn capture_replication_snapshot(shard_mem_cache: &Rc<RefCell<ShardMem
     }
 
     CaptureResult::Captured(ReplicationCapturedData {
-        use_s3,
+        follower_falling_behind_or_offline: follower_falling_behind,
         replication_snapshot,
     })
 }
@@ -56,28 +75,118 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
     log_segments_cache: Rc<LogSegmentsCache>,
     shard_mem_cache: Rc<RefCell<ShardMemCache>>,
     watched_aggregates: Rc<AggregateWatchers>,
-    captured: ReplicationCapturedData,
+    replication_captured_data: ReplicationCapturedData,
+    max_catchup_gap_bytes: u64,
+    max_request_size: u64,
+    read_max_chunk_size: u64,
 ) -> Result<(), ReplicationError> {
     let mut client_guard = write_with_timeout(&replication_client, "replicate_to_follower").await?;
-    match replicate(&mut *client_guard, &captured.replication_snapshot, captured.use_s3).await {
-        Ok(()) => {
-            commit_replication(log_segments_cache, shard_mem_cache, watched_aggregates, captured.replication_snapshot);
-            Ok(())
+
+    let mut follower_falling_behind_or_offline = replication_captured_data.follower_falling_behind_or_offline;
+    let mut added_additional_entries = false;
+
+    // Move replication batches into a flat list of items for replication
+    let mut batches: Vec<ReplicationBatchItem> = replication_captured_data.replication_snapshot.iter()
+        .flat_map(|batch| batch.pending_queue.iter())
+        .map(|item| ReplicationBatchItem {
+            metablock: item.metablock.clone(), //Don't consume captured data as its needed for commit
+            datablock: item.datablock.clone(),
+        })
+        .collect();
+
+    // Loop until we run out of captured.replication_snapshot to replicate, or an unrecoverable error occurs.
+    // We must split captured.replication_snapshot into batches that are less than max_request_size (bytes)
+    // If captured.replication_snapshot at any point grows > max_catchup_gap_bytes, we must fallback so S3
+
+    let mut workset_size_bytes = batches.iter().map(|c| c.size_bytes()).sum::<u64>();
+    while !batches.is_empty() {
+
+        // If at any point the amount of data that we have to replicate to the 
+        // follower becomes too large,  we skip the follower and send the data to S3 instead.
+        if workset_size_bytes > max_catchup_gap_bytes {
+            follower_falling_behind_or_offline = true;
         }
-        Err(replication_err) => {
-            match rollback_replicate(&fsync_coordinator, &log_segments_cache, &shard_mem_cache, captured.replication_snapshot).await {
-                Ok(()) => Err(replication_err),
-                Err(rollback_err) => Err(ReplicationError::RollbackFailed(rollback_err)),
+
+        // Either the follower is too slow to keep up, or it has been offline for a while
+        // and needs to catch up itself first, or the follower is completely offline
+        if follower_falling_behind_or_offline {
+            match client_guard.replicate_to_s3(batches).await {
+                Ok(()) => {
+                    break;
+                },
+                Err(replication_err) => {
+                    return match rollback_replicate(&fsync_coordinator, &log_segments_cache, &shard_mem_cache, replication_captured_data.replication_snapshot).await {
+                        Ok(()) => Err(replication_err),
+                        Err(rollback_err) => Err(ReplicationError::RollbackFailed(rollback_err)),
+                    }
+                },
+            }
+        }
+
+        let end_idx = batch_end_index(&batches, max_request_size);
+        
+        match client_guard.replicate_to_follower(batches[..end_idx].to_vec()).await {
+            Ok(()) => {
+                batches.drain(..end_idx);
+            }
+            Err(replication_err) => {
+
+                if added_additional_entries {
+                    follower_falling_behind_or_offline = true;
+                    continue;
+                }
+
+                match replication_err {
+                    ReplicationError::FollowerRejected(follower_rejection) => {
+                        match follower_rejection {
+                            celeriant_msg::response::responses::FollowerRejection::WalIndexMismatch { max_follower_wal_index } => {
+                                //We need to provide older wal entries to follower as they are behind
+                                //If we are unable to provide older wal entries, we need to fallback to S3
+                                let fetch_catchup_entries_result = fetch_catchup_entries(
+                                    &log_segments_cache,
+                                    max_follower_wal_index,
+                                    batches[0].metablock.wal_index,
+                                    max_catchup_gap_bytes,
+                                    read_max_chunk_size,
+                                ).await;
+
+                                let (additional_entries_for_follower, too_far_behind) = match fetch_catchup_entries_result {
+                                    Ok((entries, too_far_behind)) => (entries, too_far_behind),
+                                    Err(shard_read_err) => {
+                                        return match rollback_replicate(&fsync_coordinator, &log_segments_cache, &shard_mem_cache, replication_captured_data.replication_snapshot).await {
+                                            Ok(()) => Err(ReplicationError::ExtendedCatchupFailure(shard_read_err)),
+                                            Err(rollback_err) => Err(ReplicationError::RollbackFailed(rollback_err)),
+                                        }
+                                    },
+                                };
+
+                                if too_far_behind {
+                                    follower_falling_behind_or_offline = true;
+                                }
+                                
+                                workset_size_bytes += additional_entries_for_follower.iter().map(|c| c.size_bytes()).sum::<u64>();
+                                batches.splice(0..0, additional_entries_for_follower);
+                                added_additional_entries = true;
+                            },
+                            _ => follower_falling_behind_or_offline = true,
+                        }
+                    },
+                    _ => follower_falling_behind_or_offline = true,
+                }
             }
         }
     }
+
+    commit_replication(&log_segments_cache, &shard_mem_cache, &watched_aggregates, replication_captured_data.replication_snapshot);
+
+    Ok(())
 }
 
 /// Commits successful replication by updating read path, recent write cache, and broadcasting events.
 fn commit_replication(
-    log_segments_cache: Rc<LogSegmentsCache>,
-    shard_mem_cache: Rc<RefCell<ShardMemCache>>,
-    watched_aggregates: Rc<AggregateWatchers>,
+    log_segments_cache: &Rc<LogSegmentsCache>,
+    shard_mem_cache: &Rc<RefCell<ShardMemCache>>,
+    watched_aggregates: &Rc<AggregateWatchers>,
     replication_snapshot: Vec<PendingCommitData>,
 ) {
     let mut event_collector = WatchEventCollector::new();
@@ -188,19 +297,77 @@ async fn rollback_replicate(
     Ok(())
 }
 
-async fn replicate<R: ReplicationClient>(
-    client: &mut R,
-    batches: &[PendingCommitData],
-    use_s3: bool,
-) -> Result<(), ReplicationError> {
-    if use_s3 {
-        return client.replicate_to_s3(batches).await;
+async fn fetch_catchup_entries(
+    log_segments_cache: &Rc<LogSegmentsCache>,
+    follower_wal_index: u64,
+    leader_wal_index: u64,
+    max_size_bytes: u64,
+    read_max_chunk_size: u64,
+) -> Result<(Vec<ReplicationBatchItem>, bool), ShardReadError> {
+
+    let current_log_id = log_segments_cache.active_log_id();
+    let mut scanner = ReverseMetablockScanner::new(log_segments_cache, current_log_id, None, read_max_chunk_size);
+
+    let mut collected: Vec<KeptMetablock> = vec![];
+    let mut accumulated_size = 0u64;
+
+    let _scan_result = scanner.scan(|log_id, _pos, bytes| {
+        let wal_index = metablock_bytes::read_wal_index(bytes);
+
+        // Stop if we've gone too far back
+        if wal_index <= follower_wal_index {
+            return Ok(Some(()));
+        }
+
+        // Include if in range
+        if wal_index < leader_wal_index {
+            let (metablock, _version) = version_aware_wire_format::deserialize_versioned_metablock(bytes)
+                .map_err(|_e| "Failed to deserialize metablock")?;
+
+            // Estimate size (metablock + potential datablock)
+            let size_estimate = metablock.uncompressed_size.saturating_add(FIXED_BLOCK_SIZE_BYTES as u64);
+            accumulated_size += size_estimate;
+
+            let batch_size = metablock.uncompressed_size;
+
+            collected.push(KeptMetablock {
+                log_id,
+                metablock,
+                uncompressed_size: batch_size,
+                datablock: None,
+            });
+
+            // Stop if size limit exceeded
+            if accumulated_size > max_size_bytes {
+                return Ok(Some(()));
+            }
+        }
+
+        Ok::<Option<()>, &str>(None)
+    }).await?;
+
+    // If nothing collected, return empty
+    // This is still valid because the leader no longer has the entries
+    // So the follower doesn't need them either (hard deleted)
+    if collected.is_empty() {
+        return Ok((vec![], false));
     }
 
-    // Try follower first, fall back to S3 on failure
-    match client.replicate_to_follower(batches).await {
-        Ok(()) => Ok(()),
-        Err(e) => Err(e),
-        //TODO: Err(_) => client.replicate_to_s3(batches).await,
+    if accumulated_size > max_size_bytes {
+        return Ok((vec![], true));
     }
+
+    // Reverse to get chronological order
+    collected.reverse();
+
+    let batches_with_data = fetch_datablocks_for_metablocks(&collected, read_max_chunk_size, log_segments_cache).await?;
+
+    let replication_items: Vec<ReplicationBatchItem> = batches_with_data.into_iter()
+        .map(|kept| ReplicationBatchItem {
+            metablock: kept.0,
+            datablock: kept.1,
+        })
+        .collect();
+
+    Ok((replication_items, false))
 }

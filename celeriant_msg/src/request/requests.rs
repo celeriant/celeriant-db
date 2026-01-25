@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use bincode::{Decode, Encode};
-use celeriant_wal::{aggregate_key::AggregateKey, compression_type::CompressionType, constants::EntryHashBytes, datablocks::{datablock::Datablock, datablock_aggregate_event::DatablockAggregateEvent}, metablocks::metablock::Metablock};
+use celeriant_wal::{aggregate_key::AggregateKey, compression_type::CompressionType, constants::{EntryHashBytes, STRUCT_TO_MEMORY_REAL_SIZE}, datablocks::{datablock::Datablock, datablock_aggregate_event::DatablockAggregateEvent}, metablocks::metablock::Metablock};
 use serde::{Deserialize, Serialize};
+use deepsize::DeepSizeOf;
 
 use crate::request::{read_filters::ReadFilters};
 
@@ -119,6 +120,12 @@ pub struct ReplicationBatchRequest {
 pub struct ReplicationBatchItem {
     pub metablock: Metablock,
     pub datablock: Option<Datablock>,
+}
+
+impl ReplicationBatchItem {
+    pub fn size_bytes(&self) -> u64 {
+        ((self.metablock.deep_size_of() + self.datablock.deep_size_of()) * STRUCT_TO_MEMORY_REAL_SIZE) as u64
+    }    
 }
 
 /// Follower-initiated protocol for pulling WAL entries during initial sync

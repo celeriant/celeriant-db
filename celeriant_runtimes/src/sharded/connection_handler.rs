@@ -578,6 +578,7 @@ mod tests {
             pending_replication_high_water_bytes: 67_108_864, // 64MB
             replication_delay: Duration::from_millis(20),
             max_cluster_time_drift_ms: 5000,
+            max_catchup_gap_bytes: 104_857_600,
         }
     }
 

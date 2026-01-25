@@ -1,7 +1,7 @@
 use celeriant_msg::response::responses::FollowerRejection;
 use celeriant_rotating_log::rwlock_timeout::LockTimeoutError;
 
-use crate::error::rollback_error::RollbackError;
+use crate::error::{rollback_error::RollbackError, shard_read_error::ShardReadError};
 
 /// Network/transport errors - may be transient, retry or S3 fallback makes sense.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,7 +12,7 @@ pub enum NetworkError {
 }
 
 /// Errors that can occur during replication operations.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum ReplicationError {
     /// Network/transport errors - transient, may retry or failover to S3.
     Network(NetworkError),
@@ -31,6 +31,14 @@ pub enum ReplicationError {
 
     /// Replication failed AND subsequent rollback failed (CRITICAL).
     RollbackFailed(RollbackError),
+
+    /// Gap between follower and leader exceeds maximum catchup threshold.
+    GapTooLarge { gap_bytes: u64, threshold_bytes: u64 },
+
+    /// Requested WAL entries are no longer available (compacted).
+    WalEntriesUnavailable { requested_index: u64 },
+
+    ExtendedCatchupFailure(ShardReadError),
 }
 
 impl ReplicationError {

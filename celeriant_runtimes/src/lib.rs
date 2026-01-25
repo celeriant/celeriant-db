@@ -55,6 +55,7 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                 max_open_files: shard_config.max_open_files,
                 recent_write_cache_bytes: shard_config.recent_write_cache_bytes,
                 max_response_size: shard_config.max_response_size,
+                max_request_size: shard_config.max_request_size,
                 aggregate_client_snapshots_cache_bytes: shard_config.aggregate_client_snapshots_cache_bytes,
                 aggregate_snapshots_cache_bytes: shard_config.aggregate_snapshots_cache_bytes,
                 read_max_chunk_size: shard_config.read_max_chunk_size,
@@ -64,6 +65,7 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                 list_wal_index_cache_bytes: shard_config.list_wal_index_cache_bytes,
                 pending_replication_high_water_bytes: shard_config.pending_replication_high_water_bytes,
                 max_cluster_time_drift_ms: shard_config.max_cluster_time_drift_ms,
+                max_catchup_gap_bytes: shard_config.max_catchup_gap_bytes,
             };
             let follower_address = shard_config.follower_address.clone().unwrap_or_default();
             let replication_client = GlommioReplicationClient::new(follower_address, current_shard_id as u64);

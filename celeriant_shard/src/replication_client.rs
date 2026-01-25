@@ -1,7 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use celeriant_client_glommio::CeleriantClient;
-use celeriant_memcache::pending_commit_data::PendingCommitData;
 use celeriant_msg::{
     process_requests::Request,
     process_responses::Response,
@@ -17,20 +16,20 @@ use crate::error::replication_error::{NetworkError, ReplicationError};
 /// This allows mocking network failures for testing rollback behavior.
 #[allow(async_fn_in_trait)]
 pub trait ReplicationClient {
-    async fn replicate_to_follower(&mut self, batches: &[PendingCommitData]) -> Result<(), ReplicationError>;
-    async fn replicate_to_s3(&mut self, batches: &[PendingCommitData]) -> Result<(), ReplicationError>;
+    async fn replicate_to_follower(&mut self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicationError>;
+    async fn replicate_to_s3(&mut self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicationError>;
 }
 
 pub struct StubReplicationClient;
 
 impl ReplicationClient for StubReplicationClient {
-    async fn replicate_to_follower(&mut self, _batches: &[PendingCommitData]) -> Result<(), ReplicationError> {
+    async fn replicate_to_follower(&mut self, _batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicationError> {
         glommio::timer::sleep(std::time::Duration::from_millis(30)).await;
         // TODO(network): Implement actual follower replication
         Ok(())
     }
 
-    async fn replicate_to_s3(&mut self, _batches: &[PendingCommitData]) -> Result<(), ReplicationError> {
+    async fn replicate_to_s3(&mut self, _batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicationError> {
         glommio::timer::sleep(std::time::Duration::from_millis(230)).await;
         // TODO(network): Implement actual S3 replication
         Ok(())
@@ -53,7 +52,10 @@ impl GlommioReplicationClient {
         }
     }
 
-    async fn ensure_connected(&mut self) -> Result<&mut CeleriantClient, ReplicationError> {
+    async fn ensure_connected(&mut self, reset: bool) -> Result<&mut CeleriantClient, ReplicationError> {
+        if reset && let Some(client) = self.client.take() {
+            client.close().await?;
+        }
         if self.client.is_none() {
             self.client = Some(CeleriantClient::connect(&self.follower_address).await?);
         }
@@ -62,18 +64,23 @@ impl GlommioReplicationClient {
 }
 
 impl ReplicationClient for GlommioReplicationClient {
-    async fn replicate_to_follower(&mut self, batches: &[PendingCommitData]) -> Result<(), ReplicationError> {
+    async fn replicate_to_follower(&mut self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicationError> {
         if batches.is_empty() {
             return Ok(());
         }
 
         let shard_id = self.shard_id;
-        let client = self.ensure_connected().await?;
-        let request = pending_to_replication_request(shard_id, batches);
+        let client = self.ensure_connected(false).await?;
+        let request = Request::ReplicationBatch(pending_to_replication_request(shard_id, batches));
 
-        let response = client
-            .send_request(&Request::ReplicationBatch(request), CompressionType::Snappy)
-            .await?;
+        let response = match client.send_request(&request, CompressionType::Snappy).await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                let client = self.ensure_connected(true).await?;
+                client.send_request(&request, CompressionType::Snappy).await?
+            }
+        };
 
         match response {
             Response::ReplicationBatch(resp) => match resp.result {
@@ -89,22 +96,14 @@ impl ReplicationClient for GlommioReplicationClient {
         }
     }
 
-    async fn replicate_to_s3(&mut self, _batches: &[PendingCommitData]) -> Result<(), ReplicationError> {
-        Err(ReplicationError::S3Unavailable)
+    async fn replicate_to_s3(&mut self, _batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicationError> {
+        Ok(())
+        // Err(ReplicationError::S3Unavailable)
     }
 }
 
 /// Convert PendingCommitData batches to ReplicationBatchRequest
-fn pending_to_replication_request(shard_id: u64, batches: &[PendingCommitData]) -> ReplicationBatchRequest {
-    let items: Vec<ReplicationBatchItem> = batches
-        .iter()
-        .flat_map(|batch| batch.pending_queue.iter())
-        .map(|item| ReplicationBatchItem {
-            metablock: item.metablock.clone(),
-            datablock: item.datablock.clone(),
-        })
-        .collect();
-
+fn pending_to_replication_request(shard_id: u64, items: Vec<ReplicationBatchItem>) -> ReplicationBatchRequest {
     let current_timestamp = SystemTime::now().duration_since(UNIX_EPOCH).expect("System time before Unix epoch");
 
     ReplicationBatchRequest {

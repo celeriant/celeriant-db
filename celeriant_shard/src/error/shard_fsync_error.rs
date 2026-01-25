@@ -84,6 +84,9 @@ impl From<ReplicationError> for ShardFsyncError {
             ReplicationError::RollbackInProgress => Self::IoError("Rollback in progress".into()),
             ReplicationError::S3Unavailable => Self::IoError("S3 sidecar unavailable".into()),
             ReplicationError::RollbackFailed(rb_err) => Self::IoError(format!("Rollback failed: {:?}", rb_err)),
+            ReplicationError::GapTooLarge { gap_bytes, threshold_bytes } => Self::IoError(format!("Gap too large: {} bytes exceeds threshold {} bytes", gap_bytes, threshold_bytes)),
+            ReplicationError::WalEntriesUnavailable { requested_index } => Self::IoError(format!("WAL entries unavailable for index {}", requested_index)),
+            ReplicationError::ExtendedCatchupFailure(_shard_read_error) => Self::IoError("Extended catchup failed".into()),
         }
     }
 }

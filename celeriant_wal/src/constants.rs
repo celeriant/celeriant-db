@@ -15,3 +15,4 @@ pub const AGGREGATE_BLOOM_HASH_COUNT: u32 = 10;
 pub const AGGREGATE_BLOOM_HASH_SEED: u128 = 987654321098765432109876543210987u128;
 pub type EntryHashBytes = [u8; 32];
 pub const GENESIS_HASH: EntryHashBytes = [0u8; 32];
+pub const STRUCT_TO_MEMORY_REAL_SIZE: usize = 3;

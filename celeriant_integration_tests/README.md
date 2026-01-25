@@ -57,3 +57,7 @@ Connection handling tests. Covers pipelining, cross-shard routing, connection ch
 ```bash
 cargo run --bin connection_test_main -p celeriant_integration_tests --release
 ```
+
+### Spinning up leader/follower manually
+cargo run --release -p celeriant -- --data-root data_follower --client-port 10002 --replication-port 10003 --cluster-role follower --num-shards 1
+cargo run --release -p celeriant -- --data-root data_leader --client-port 10000 --replication-port 10001   --cluster-role leader --follower-address 127.0.0.1:10003 --num-shards 1

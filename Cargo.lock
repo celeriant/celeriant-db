@@ -468,6 +468,7 @@ dependencies = [
  "bincode",
  "celeriant_wal",
  "celeriant_wire",
+ "deepsize",
  "futures-lite",
  "serde",
 ]

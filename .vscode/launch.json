@@ -54,6 +54,38 @@
         {
             "type": "lldb",
             "request": "launch",
+            "name": "Debug celeriant as leader (debug build)",
+            "cargo": {
+                "args": [
+                    "build",
+                    "-p",
+                    "celeriant"
+                ],
+                "filter": {
+                    "name": "celeriant",
+                    "kind": "bin"
+                }
+            },
+            "args": [
+                "--data-root",
+                "data_leader",
+                "--num-shards",
+                "1",
+                "--client-port",
+                "10000",
+                "--replication-port",
+                "10001",
+                "--cluster-role",
+                "leader",
+                "--follower-address",
+                "127.0.0.1:10003"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {}
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
             "name": "Debug batch_main",
             "cargo": {
                 "args": [

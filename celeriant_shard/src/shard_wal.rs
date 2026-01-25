@@ -911,7 +911,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
         let collection = self.collect_metablocks_bounded(aggregate_key, filters, max_bytes, last_known).await?;
 
         // 4. Fetch datablocks only for kept metablocks
-        let batches_with_data = self.fetch_datablocks_for_metablocks(&collection.kept_metablocks).await?;
+        let batches_with_data = fetch_datablocks_for_metablocks(&collection.kept_metablocks, self.config.read_max_chunk_size, &self.log_segments_cache).await?;
 
         // 5. Deserialize and apply event-level filters
         let event_batches = self.build_filtered_response(batches_with_data, filters)?;
@@ -1340,6 +1340,9 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
         let rotating_log_cache = self.log_segments_cache.clone();
         let shard_mem_cache = self.shard_mem_cache.clone();
         let watched_aggregates = self.watched_aggregates.clone();
+        let max_catchup_gap_bytes = self.config.max_catchup_gap_bytes;
+        let max_request_size = self.config.max_request_size;
+        let read_max_chunk_size = self.config.read_max_chunk_size;
 
         if rotating_log_cache.force_immediate.get() {
             let mc_capture = shard_mem_cache.clone();
@@ -1347,7 +1350,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
                 .request_sync_two_phase(
                     None,
                     move || async move { capture_replication_snapshot(&mc_capture) },
-                    move |captured| commit_replication_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates, captured),
+                    move |captured| commit_replication_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates, captured, max_catchup_gap_bytes, max_request_size, read_max_chunk_size),
                 )
                 .await
         } else if !self.config.non_durable_writes {
@@ -1356,7 +1359,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
                 .request_sync_two_phase(
                     Some(self.config.replication_delay),
                     move || async move { capture_replication_snapshot(&mc_capture) },
-                    move |captured| commit_replication_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates, captured),
+                    move |captured| commit_replication_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates, captured, max_catchup_gap_bytes, max_request_size, read_max_chunk_size),
                 )
                 .await
         } else {
@@ -1367,7 +1370,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
                     .request_sync_two_phase(
                         None,
                         move || async move { capture_replication_snapshot(&mc_capture) },
-                        move |captured| commit_replication_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates, captured),
+                        move |captured| commit_replication_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates, captured, max_catchup_gap_bytes, max_request_size, read_max_chunk_size),
                     )
                     .await;
             })
@@ -1414,13 +1417,12 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
         let (leader_tip_hash, leader_wal_index) = request
             .batches
             .first()
-            .map(|b| (b.metablock.previous_tip_hash, b.metablock.wal_index.saturating_sub(1)))
+            .map(|b| (b.metablock.previous_tip_hash, b.metablock.wal_index))
             .unwrap_or((GENESIS_HASH, 0));
 
-        if follower_wal_index != leader_wal_index {
+        if follower_wal_index.saturating_add(1) != leader_wal_index {
             return Ok(response(ReplicationResult::Rejected(FollowerRejection::WalIndexMismatch {
-                follower: follower_wal_index,
-                leader: leader_wal_index,
+                max_follower_wal_index: follower_wal_index,
             })));
         }
 
@@ -1486,13 +1488,13 @@ struct PreparedWrite {
 }
 
 /// Metablock kept after size-bounded collection
-struct KeptMetablock {
-    log_id: u64,
-    metablock: Metablock,
+pub struct KeptMetablock {
+    pub log_id: u64,
+    pub metablock: Metablock,
     /// If from recent write cache, we already have the datablock
-    datablock: Option<Datablock>,
+    pub datablock: Option<Datablock>,
     /// Cached size from DatablockStorageKind for running total
-    uncompressed_size: u64,
+    pub uncompressed_size: u64,
 }
 
 /// Result of size-bounded metablock collection
@@ -1696,99 +1698,6 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
         Ok(())
     }
 
-    async fn fetch_datablocks_for_metablocks(
-        &self,
-        kept_metablocks: &[KeptMetablock],
-    ) -> Result<Vec<(Metablock, Option<Datablock>)>, ShardReadError> {
-        let mut results: Vec<(Metablock, Option<Datablock>)> = Vec::with_capacity(kept_metablocks.len());
-        let mut disk_fetches: Vec<(usize, u64, &Metablock)> = Vec::new();
-
-        for (idx, kept) in kept_metablocks.iter().enumerate() {
-            // If we have datablock from cache, use it directly
-            if kept.datablock.is_some() {
-                results.push((kept.metablock.clone(), kept.datablock.clone()));
-                continue;
-            }
-
-            match &kept.metablock.datablock {
-                DatablockStorageKind::None => {
-                    results.push((kept.metablock.clone(), None));
-                }
-                DatablockStorageKind::Inline(_) => {
-                    // Can deserialize immediately - no disk I/O needed
-                    let datablock = deserialize_datablock(kept.metablock.uncompressed_size, &kept.metablock.datablock, None)?;
-                    results.push((kept.metablock.clone(), Some(datablock)));
-                }
-                DatablockStorageKind::Block(_) => {
-                    // Need to fetch from disk
-                    results.push((kept.metablock.clone(), None)); // Placeholder
-                    disk_fetches.push((idx, kept.log_id, &kept.metablock));
-                }
-            }
-        }
-
-        if disk_fetches.is_empty() {
-            return Ok(results);
-        }
-
-        // Group fetches by log_id for batch I/O
-        let mut by_log: HashMap<u64, Vec<(usize, &Metablock)>> = HashMap::new();
-        for (idx, log_id, meta) in disk_fetches {
-            by_log.entry(log_id).or_default().push((idx, meta));
-        }
-
-        // Batch fetch per log file
-        for (log_id, log_fetches) in by_log {
-            let positions: Vec<(usize, read_objects_absolute::AbsoluteObjectPosition)> = log_fetches
-                .iter()
-                .filter_map(|(idx, meta)| {
-                    if let DatablockStorageKind::Block(r) = &meta.datablock {
-                        Some((
-                            *idx,
-                            read_objects_absolute::AbsoluteObjectPosition {
-                                start_pos: r.datablock_position,
-                                end_pos: r.datablock_position + meta.compressed_size,
-                            },
-                        ))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            if positions.is_empty() {
-                continue;
-            }
-
-            // Sort positions AND indices together by start_pos
-            let mut indexed_positions = positions;
-            indexed_positions.sort_by_key(|(_, p)| p.start_pos);
-
-            let indices: Vec<usize> = indexed_positions.iter().map(|(i, _)| *i).collect();
-            let pos_only: Vec<read_objects_absolute::AbsoluteObjectPosition> = indexed_positions.into_iter().map(|(_, p)| p).collect();
-
-            let blobs = {
-                let log_segment_file = self.log_segments_cache.get(log_id).await?;
-                let file_len = log_segment_file.metadata.borrow().file_len;
-                let guard = log_segment_file.lock_reader("fetch_datablocks").await?;
-                let dma = guard
-                    .as_ref()
-                    .ok_or_else(|| ShardReadError::IoError(format!("No file handle for log {}", log_id)))?;
-
-                read_objects_absolute::read_objects_absolute(dma, file_len, &pos_only, self.config.read_max_chunk_size).await?
-            };
-
-            // Deserialize and update results
-            for (result_idx, blob) in indices.into_iter().zip(blobs) {
-                let metablock = &results[result_idx].0;
-                let datablock = deserialize_datablock(metablock.uncompressed_size, &metablock.datablock, Some(&blob))?;
-                results[result_idx].1 = Some(datablock);
-            }
-        }
-
-        Ok(results)
-    }
-
     fn build_filtered_response(
         &self,
         batches_with_data: Vec<(Metablock, Option<Datablock>)>,
@@ -1818,4 +1727,99 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
 
         Ok(event_batches)
     }
+}
+
+
+pub async fn fetch_datablocks_for_metablocks(
+    kept_metablocks: &[KeptMetablock],
+    read_max_chunk_size: u64,
+    log_segments_cache: &LogSegmentsCache,
+) -> Result<Vec<(Metablock, Option<Datablock>)>, ShardReadError> {
+    let mut results: Vec<(Metablock, Option<Datablock>)> = Vec::with_capacity(kept_metablocks.len());
+    let mut disk_fetches: Vec<(usize, u64, &Metablock)> = Vec::new();
+
+    for (idx, kept) in kept_metablocks.iter().enumerate() {
+        // If we have datablock from cache, use it directly
+        if kept.datablock.is_some() {
+            results.push((kept.metablock.clone(), kept.datablock.clone()));
+            continue;
+        }
+
+        match &kept.metablock.datablock {
+            DatablockStorageKind::None => {
+                results.push((kept.metablock.clone(), None));
+            }
+            DatablockStorageKind::Inline(_) => {
+                // Can deserialize immediately - no disk I/O needed
+                let datablock = deserialize_datablock(kept.metablock.uncompressed_size, &kept.metablock.datablock, None)?;
+                results.push((kept.metablock.clone(), Some(datablock)));
+            }
+            DatablockStorageKind::Block(_) => {
+                // Need to fetch from disk
+                results.push((kept.metablock.clone(), None)); // Placeholder
+                disk_fetches.push((idx, kept.log_id, &kept.metablock));
+            }
+        }
+    }
+
+    if disk_fetches.is_empty() {
+        return Ok(results);
+    }
+
+    // Group fetches by log_id for batch I/O
+    let mut by_log: HashMap<u64, Vec<(usize, &Metablock)>> = HashMap::new();
+    for (idx, log_id, meta) in disk_fetches {
+        by_log.entry(log_id).or_default().push((idx, meta));
+    }
+
+    // Batch fetch per log file
+    for (log_id, log_fetches) in by_log {
+        let positions: Vec<(usize, read_objects_absolute::AbsoluteObjectPosition)> = log_fetches
+            .iter()
+            .filter_map(|(idx, meta)| {
+                if let DatablockStorageKind::Block(r) = &meta.datablock {
+                    Some((
+                        *idx,
+                        read_objects_absolute::AbsoluteObjectPosition {
+                            start_pos: r.datablock_position,
+                            end_pos: r.datablock_position + meta.compressed_size,
+                        },
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if positions.is_empty() {
+            continue;
+        }
+
+        // Sort positions AND indices together by start_pos
+        let mut indexed_positions = positions;
+        indexed_positions.sort_by_key(|(_, p)| p.start_pos);
+
+        let indices: Vec<usize> = indexed_positions.iter().map(|(i, _)| *i).collect();
+        let pos_only: Vec<read_objects_absolute::AbsoluteObjectPosition> = indexed_positions.into_iter().map(|(_, p)| p).collect();
+
+        let blobs = {
+            let log_segment_file = log_segments_cache.get(log_id).await?;
+            let file_len = log_segment_file.metadata.borrow().file_len;
+            let guard = log_segment_file.lock_reader("fetch_datablocks").await?;
+            let dma = guard
+                .as_ref()
+                .ok_or_else(|| ShardReadError::IoError(format!("No file handle for log {}", log_id)))?;
+
+            read_objects_absolute::read_objects_absolute(dma, file_len, &pos_only, read_max_chunk_size).await?
+        };
+
+        // Deserialize and update results
+        for (result_idx, blob) in indices.into_iter().zip(blobs) {
+            let metablock = &results[result_idx].0;
+            let datablock = deserialize_datablock(metablock.uncompressed_size, &metablock.datablock, Some(&blob))?;
+            results[result_idx].1 = Some(datablock);
+        }
+    }
+
+    Ok(results)
 }

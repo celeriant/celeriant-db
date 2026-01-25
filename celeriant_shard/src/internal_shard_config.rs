@@ -13,6 +13,7 @@ pub struct InternalShardConfig {
     pub non_durable_writes: bool,
     pub shard_dir: PathBuf,
     pub max_response_size: u64,
+    pub max_request_size: u64,
     pub aggregate_snapshots_cache_bytes: u64,
     pub aggregate_client_snapshots_cache_bytes: u64,
     pub read_max_chunk_size: u64,
@@ -22,4 +23,5 @@ pub struct InternalShardConfig {
     pub list_wal_index_cache_bytes: u64,
     pub pending_replication_high_water_bytes: u64,
     pub max_cluster_time_drift_ms: u64,
+    pub max_catchup_gap_bytes: u64,
 }

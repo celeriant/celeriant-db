@@ -65,6 +65,7 @@ fn create_config(shard_dir: PathBuf) -> InternalShardConfig {
         non_durable_writes: false,
         shard_dir,
         max_response_size: 16 * 1024 * 1024,
+        max_request_size: 16 * 1024 * 1024,
         aggregate_snapshots_cache_bytes: 64 * 1024 * 1024,
         aggregate_client_snapshots_cache_bytes: 32 * 1024 * 1024,
         read_max_chunk_size: 32 * 1024,
@@ -74,6 +75,7 @@ fn create_config(shard_dir: PathBuf) -> InternalShardConfig {
         list_wal_index_cache_bytes: 12 * 1024 * 1024,
         pending_replication_high_water_bytes: 67_108_864, // 64MB
         max_cluster_time_drift_ms: 5000,
+        max_catchup_gap_bytes: 104_857_600,
     }
 }
 

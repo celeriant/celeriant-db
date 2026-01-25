@@ -1,9 +1,7 @@
-use celeriant_wal::{datablocks::datablock::Datablock, metablocks::metablock::Metablock};
+use celeriant_wal::{constants::STRUCT_TO_MEMORY_REAL_SIZE, datablocks::datablock::Datablock, metablocks::metablock::Metablock};
 use deepsize::DeepSizeOf;
 
 use crate::shard_log_queue_item::ShardLogQueueItem;
-
-const STRUCT_TO_MEMORY_REAL_SIZE: usize = 3;
 
 /// Metablock/datablock pair for caching after replication completes.
 /// Unlike ShardLogQueueItem, this excludes datablock_bytes since

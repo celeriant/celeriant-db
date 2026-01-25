@@ -38,4 +38,5 @@ pub struct ShardConfig {
     pub list_wal_index_cache_bytes: u64,
     pub pending_replication_high_water_bytes: u64,
     pub max_cluster_time_drift_ms: u64,
+    pub max_catchup_gap_bytes: u64,
 }
