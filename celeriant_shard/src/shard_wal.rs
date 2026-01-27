@@ -1465,9 +1465,9 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
             let (datablock_bytes, datablock) = match item.metablock.datablock {
                 DatablockStorageKind::None => (None, None),
                 DatablockStorageKind::Inline(_) => (None, None),
-                DatablockStorageKind::Block(ref datablock_block_ref) => {
+                DatablockStorageKind::Block(_) => {
                     if let Some(datablock) = item.datablock {
-                        let compression_type = CompressionType::from_tuple(datablock_block_ref.compression_type, None);
+                        let compression_type = CompressionType::from_tuple(item.metablock.datablock_compression_type, None);
                         let serialized_datablock = serialize_datablock(&datablock, compression_type, 0)?;
                         (serialized_datablock.external_data, Some(datablock))
                     } else {

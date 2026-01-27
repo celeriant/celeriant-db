@@ -55,8 +55,6 @@ impl SerialisedDatablock {
         let block_ref = DatablockBlockRef {
             crc32c,
             datablock_position: 0, // To be filled in by the fsync write process
-            version: WIRE_VERSION_WAL_DATABLOCK,
-            compression_type: compression_type_id,
         };
 
         Ok(Self {
@@ -116,11 +114,11 @@ pub fn deserialise_datablock(
             }
 
             // Check version
-            if block_ref.version != WIRE_VERSION_WAL_DATABLOCK {
-                return Err(DiskFormatError::UnsupportedVersion(block_ref.version));
+            if datablock_version != WIRE_VERSION_WAL_DATABLOCK {
+                return Err(DiskFormatError::UnsupportedVersion(datablock_version));
             }
 
-            let compression_type = CompressionType::from_tuple(block_ref.compression_type, None);
+            let compression_type = CompressionType::from_tuple(compression_type_id, None);
 
             // Save the extra heap allocation if no compression
             if compression_type == CompressionType::None {
@@ -331,9 +329,8 @@ mod tests {
         let serialized = SerialisedDatablock::new(&original, CompressionType::Zstd { level: 3 }).unwrap();
 
         // Verify compression was applied
-        if let DatablockStorageKind::Block(ref block_ref) = serialized.storage_kind {
-            assert_eq!(block_ref.compression_type, 1); // Zstd
-        }
+        assert!(matches!(serialized.storage_kind, DatablockStorageKind::Block(_)));
+        assert_eq!(serialized.compression_type, 1); // Zstd
 
         let deserialized = roundtrip_deserialise(&serialized).unwrap();
 
@@ -421,10 +418,8 @@ mod tests {
 
         let mut serialized = SerialisedDatablock::new(&original, CompressionType::None).unwrap();
 
-        // Modify the version in the block ref
-        if let DatablockStorageKind::Block(ref mut block_ref) = serialized.storage_kind {
-            block_ref.version = 9999;
-        }
+        // Modify the version
+        serialized.datablock_version = 9999;
 
         let result = roundtrip_deserialise(&serialized);
 

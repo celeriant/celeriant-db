@@ -284,8 +284,6 @@ mod tests {
             datablock: DatablockStorageKind::Block(DatablockBlockRef {
                 crc32c: 0,
                 datablock_position: 0,
-                version: 1,
-                compression_type: 0,
             }),
             wal_metablock_type: MetablockKind::EventBatchMetadata(MetablockEventBatch {
                 aggregate_key: AggregateKey::new(1, 1, 1),
@@ -341,8 +339,6 @@ mod tests {
             datablock: DatablockStorageKind::Block(DatablockBlockRef {
                 crc32c: 0,
                 datablock_position: 0,
-                version: 1,
-                compression_type: 0,
             }),
             wal_metablock_type: MetablockKind::EventBatchMetadata(MetablockEventBatch {
                 aggregate_key: AggregateKey::new(1, 1, 1),
