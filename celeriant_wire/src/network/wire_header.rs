@@ -193,7 +193,10 @@ where
     buffer[12..16].copy_from_slice(&(body_size as u32).to_le_bytes());
     buffer[16] = 0;
 
-    writer.write_all(&buffer).await?;
+    // Write only the used portion (header + actual encoded length)
+    writer
+        .write_all(&buffer[..WIRE_HEADER_SIZE + body_size])
+        .await?;
 
     Ok(())
 }
