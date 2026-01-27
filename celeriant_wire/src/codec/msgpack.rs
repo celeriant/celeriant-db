@@ -1,11 +1,14 @@
 use serde::{Serialize, de::DeserializeOwned};
+use std::io::Cursor;
 
 #[inline]
-pub fn serialise_stack<T>(message: &T, mut buffer: &mut [u8]) -> Result<(), rmp_serde::encode::Error>
+pub fn serialise_stack<T>(message: &T, buffer: &mut [u8]) -> Result<usize, rmp_serde::encode::Error>
 where
     T: Serialize,
 {
-    rmp_serde::encode::write(&mut buffer, message)
+    let mut cursor = Cursor::new(buffer);
+    rmp_serde::encode::write(&mut cursor, message)?;
+    Ok(cursor.position() as usize)
 }
 
 #[inline]

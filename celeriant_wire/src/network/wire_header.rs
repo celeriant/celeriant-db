@@ -94,7 +94,7 @@ impl WireHeader {
 
                 // Save the extra heap allocation if no compression
                 if self.compression_type == CompressionType::None {
-                    codec::bincode::variable_deserialise(&payload)?
+                    codec::bincode::fixed_deserialise(&payload)?
                 }
 
                 // Decompress and deserialize
@@ -104,7 +104,7 @@ impl WireHeader {
                     uncompressed_length,
                 )?;
 
-                codec::bincode::variable_deserialise(&decompressed)?
+                codec::bincode::fixed_deserialise(&decompressed)?
             }
             PROTOCOL_VERSION_V3 => {
 
@@ -151,7 +151,7 @@ impl WireHeader {
             .await?;
 
         let obj: T = match self.version {
-            PROTOCOL_VERSION_V2 => codec::bincode::variable_deserialise(&buffer)?,
+            PROTOCOL_VERSION_V2 => codec::bincode::fixed_deserialise(&buffer)?,
             PROTOCOL_VERSION_V3 => codec::msgpack::deserialise(&buffer)?,
             _ => return Err(WireError::UnsupportedProtocol(self.version)),
         };
@@ -177,13 +177,12 @@ where
 {
     let mut buffer = [0u8; WIRE_HEADER_SIZE + WIRE_FIXED_BODY_SIZE];
 
-    let mut body_size = WIRE_FIXED_BODY_SIZE;
-    match protocol_version {
+    let body_size = match protocol_version {
         PROTOCOL_VERSION_V2 => {
-            body_size = codec::bincode::variable_serialise_stack(message, &mut buffer[WIRE_HEADER_SIZE..])?;
+            codec::bincode::fixed_serialise_stack(message, &mut buffer[WIRE_HEADER_SIZE..])?
         }
         PROTOCOL_VERSION_V3 => {
-            codec::msgpack::serialise_stack(message, &mut buffer[WIRE_HEADER_SIZE..])?;
+            codec::msgpack::serialise_stack(message, &mut buffer[WIRE_HEADER_SIZE..])?
         }
         _ => return Err(WireError::UnsupportedProtocol(protocol_version)),
     };
@@ -218,7 +217,7 @@ where
 {
     // Encode and compress based on version
     let uncompressed_data = match protocol_version {
-        PROTOCOL_VERSION_V2 => codec::bincode::variable_serialise_heap(message)?,
+        PROTOCOL_VERSION_V2 => codec::bincode::fixed_serialise_heap(message)?,
         PROTOCOL_VERSION_V3 => codec::msgpack::serialise_heap(message)?,
         _ => return Err(WireError::UnsupportedProtocol(protocol_version)),
     };

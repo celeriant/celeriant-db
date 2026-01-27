@@ -4,9 +4,6 @@ pub static CONFIG_FIXED: bincode::config::Configuration<bincode::config::LittleE
     .with_fixed_int_encoding() // Force fixed-length integers
     .with_little_endian();
 
-pub static CONFIG_VARIABLE: bincode::config::Configuration<bincode::config::LittleEndian, bincode::config::Varint> =
-    bincode::config::standard().with_variable_int_encoding().with_little_endian();
-
 #[inline]
 pub fn fixed_serialise_stack<T>(message: &T, buffer: &mut [u8]) -> Result<usize, error::EncodeError>
 where
@@ -25,28 +22,11 @@ where
 }
 
 #[inline]
-pub fn variable_serialise_heap<T>(message: &T) -> Result<Vec<u8>, error::EncodeError>
+pub fn fixed_serialise_heap<T>(message: &T) -> Result<Vec<u8>, error::EncodeError>
 where
     T: Encode,
 {
-    bincode::encode_to_vec(message, CONFIG_VARIABLE)
-}
-
-#[inline]
-pub fn variable_deserialise<T>(data: &[u8]) -> Result<T, error::DecodeError>
-where
-    T: Decode<()>,
-{
-    let (result, _len) = bincode::decode_from_slice(data, CONFIG_VARIABLE)?;
-    Ok(result)
-}
-
-#[inline]
-pub fn variable_serialise_stack<T>(message: &T, buffer: &mut [u8]) -> Result<usize, error::EncodeError>
-where
-    T: Encode,
-{
-    bincode::encode_into_slice(message, buffer, CONFIG_VARIABLE)
+    bincode::encode_to_vec(message, CONFIG_FIXED)
 }
 
 #[cfg(test)]
@@ -77,15 +57,15 @@ mod tests {
     }
 
     #[test]
-    fn variable_roundtrip() {
+    fn heap_roundtrip() {
         let original = TestMessage {
             id: 42,
             name: "test".into(),
             values: vec![1, 2, 3],
         };
 
-        let encoded = variable_serialise_heap(&original).unwrap();
-        let decoded: TestMessage = variable_deserialise(&encoded).unwrap();
+        let encoded = fixed_serialise_heap(&original).unwrap();
+        let decoded: TestMessage = fixed_deserialise(&encoded).unwrap();
 
         assert_eq!(original, decoded);
     }
@@ -98,15 +78,13 @@ mod tests {
             values: vec![1, 2, 3],
         };
 
-        let encoded = variable_serialise_heap(&original).unwrap();
+        let encoded = fixed_serialise_heap(&original).unwrap();
         let msg_len = encoded.len();
 
-        // Copy into over-allocated buffer with garbage trailing bytes
         let mut buffer = [0xFFu8; 1024];
         buffer[..msg_len].copy_from_slice(&encoded);
 
-        // Deserialize from full buffer - bincode finds message boundary
-        let decoded: TestMessage = variable_deserialise(&buffer).unwrap();
+        let decoded: TestMessage = fixed_deserialise(&buffer).unwrap();
         assert_eq!(original, decoded);
     }
 

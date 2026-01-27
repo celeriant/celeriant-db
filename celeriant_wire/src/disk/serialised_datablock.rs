@@ -14,7 +14,7 @@ impl SerialisedDatablock {
         compression_type: CompressionType,
     ) -> Result<Self, CodecError> {
         // First serialize without compression to check size
-        let uncompressed = codec::bincode::variable_serialise_heap(datablock)?;
+        let uncompressed = codec::bincode::fixed_serialise_heap(datablock)?;
         let uncompressed_size = uncompressed.len();
 
         // If it fits in a minibatch, store inline
@@ -63,7 +63,7 @@ pub fn deserialise_datablock(
         }
 
         DatablockStorageKind::Inline(inline) => {
-            Ok(codec::bincode::variable_deserialise(&inline.minibatch)?)
+            Ok(codec::bincode::fixed_deserialise(&inline.minibatch)?)
         }
 
         DatablockStorageKind::Block(block_ref) => {
@@ -87,7 +87,7 @@ pub fn deserialise_datablock(
 
             // Save the extra heap allocation if no compression
             if compression_type == CompressionType::None {
-                return Ok(codec::bincode::variable_deserialise(&data)?);
+                return Ok(codec::bincode::fixed_deserialise(&data)?);
             }
 
             // Decompress and deserialize
@@ -97,7 +97,7 @@ pub fn deserialise_datablock(
                 uncompressed_size as usize,
             )?;
 
-            Ok(codec::bincode::variable_deserialise(&decompressed)?)
+            Ok(codec::bincode::fixed_deserialise(&decompressed)?)
         }
     }
 }
@@ -202,10 +202,9 @@ mod tests {
 
         let serialized = SerialisedDatablock::new(&original, CompressionType::None).unwrap();
 
-        // Verify position was calculated correctly
+        // Position is filled in later by fsync write process
         if let DatablockStorageKind::Block(ref block_ref) = serialized.storage_kind {
-            let expected_position = 10000 - serialized.external_data.as_ref().unwrap().len() as u64;
-            assert_eq!(block_ref.datablock_position, expected_position);
+            assert_eq!(block_ref.datablock_position, 0);
         }
 
         let deserialized = deserialise_datablock(
@@ -304,14 +303,14 @@ mod tests {
         // Try to deserialize block without external data
         let result = deserialise_datablock(serialized.uncompressed_size, &serialized.storage_kind, None);
 
-        assert!(matches!(result, Err(DiskFormatError::Codec(_))));
+        assert!(matches!(result, Err(DiskFormatError::ExternalDataMissing)));
     }
 
     #[test]
     fn none_storage_fails() {
         let result = deserialise_datablock(0, &DatablockStorageKind::None, None);
 
-        assert!(matches!(result, Err(DiskFormatError::Codec(_))));
+        assert!(matches!(result, Err(DiskFormatError::DatablockExpected)));
     }
 
     #[test]
