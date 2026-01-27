@@ -22,6 +22,10 @@ pub struct Metablock {
     pub uncompressed_size: u64,
     /// Length of the compressed event batch data
     pub compressed_size: u64,
+    /// Datablock wire format version for deserialization
+    pub datablock_version: u32,
+    /// Compression algorithm used for the datablock
+    pub datablock_compression_type: u8,
     /// Hash of the previous WAL entry's tip, forming a hash chain
     pub previous_tip_hash: EntryHashBytes,
     /// Different types of fixed 512 byte metablocks
@@ -40,6 +44,8 @@ impl Metablock {
     const WIRE_SIZE_NODE_ID: usize = 16;
     const WIRE_SIZE_UNCOMPRESSED_SIZE: usize = 8;
     const WIRE_SIZE_COMPRESSED_SIZE: usize = 8;
+    const WIRE_SIZE_DATABLOCK_VERSION: usize = 4;
+    const WIRE_SIZE_DATABLOCK_COMPRESSION_TYPE: usize = 1;
     const WIRE_SIZE_PREVIOUS_TIP_HASH: usize = 32;
 
     pub const OFFSET_WAL_INDEX: usize = 0;
@@ -59,8 +65,14 @@ impl Metablock {
     pub const OFFSET_COMPRESSED_SIZE: usize =
         Self::OFFSET_UNCOMPRESSED_SIZE + Self::WIRE_SIZE_UNCOMPRESSED_SIZE;
 
-    pub const OFFSET_PREVIOUS_TIP_HASH: usize =
+    pub const OFFSET_DATABLOCK_VERSION: usize =
         Self::OFFSET_COMPRESSED_SIZE + Self::WIRE_SIZE_COMPRESSED_SIZE;
+
+    pub const OFFSET_DATABLOCK_COMPRESSION_TYPE: usize =
+        Self::OFFSET_DATABLOCK_VERSION + Self::WIRE_SIZE_DATABLOCK_VERSION;
+
+    pub const OFFSET_PREVIOUS_TIP_HASH: usize =
+        Self::OFFSET_DATABLOCK_COMPRESSION_TYPE + Self::WIRE_SIZE_DATABLOCK_COMPRESSION_TYPE;
 
     pub const OFFSET_WAL_METABLOCK_TYPE: usize =
         Self::OFFSET_PREVIOUS_TIP_HASH + Self::WIRE_SIZE_PREVIOUS_TIP_HASH;
@@ -73,6 +85,8 @@ impl Metablock {
             node_id: 0,
             uncompressed_size: 0,
             compressed_size: 0,
+            datablock_version: 0,
+            datablock_compression_type: 0,
             previous_tip_hash: [0u8; 32],
             wal_metablock_type: MetablockKind::EventBatchMetadata(MetablockEventBatch {
                 aggregate_key,

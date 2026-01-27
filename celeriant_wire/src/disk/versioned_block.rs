@@ -108,6 +108,8 @@ mod tests {
             node_id: 12345678901234567890u128,
             compressed_size: 0,
             uncompressed_size: 0,
+            datablock_version: 0,
+            datablock_compression_type: 0,
             wal_metablock_type: celeriant_wal::metablocks::metablock_kind::MetablockKind::EventBatchMetadata(
                 celeriant_wal::metablocks::metablock_event_batch::MetablockEventBatch {
                     aggregate_key: AggregateKey::new(23423423423, 33420324432, 230234323),
@@ -137,6 +139,8 @@ mod tests {
             node_id: 12345678901234567890u128,
             compressed_size: 0,
             uncompressed_size: 0,
+            datablock_version: 0,
+            datablock_compression_type: 0,
             wal_metablock_type: celeriant_wal::metablocks::metablock_kind::MetablockKind::SnapshotAggregate(
                 MetablockSnapshotAggregate {
                     aggregate_key: AggregateKey::new(23423423423, 33420324432, 230234323),

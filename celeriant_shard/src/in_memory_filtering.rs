@@ -279,6 +279,8 @@ mod tests {
             node_id: 0,
             uncompressed_size,
             compressed_size: 0,
+            datablock_version: 0,
+            datablock_compression_type: 0,
             datablock: DatablockStorageKind::Block(DatablockBlockRef {
                 crc32c: 0,
                 datablock_position: 0,
@@ -334,6 +336,8 @@ mod tests {
             node_id: 0,
             uncompressed_size,
             compressed_size: 0,
+            datablock_version: 0,
+            datablock_compression_type: 0,
             datablock: DatablockStorageKind::Block(DatablockBlockRef {
                 crc32c: 0,
                 datablock_position: 0,
