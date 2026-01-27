@@ -6,55 +6,38 @@ use celeriant_wal::constants::{WIRE_SIZE_ENUM_DISCRIMINANT};
 use celeriant_wal::metablocks::{metablock::Metablock, metablock_event_batch::MetablockEventBatch};
 use celeriant_wal::aggregate_key::AggregateKey;
 
-use crate::version_aware_wire_format::HEADER_SIZE;
+use crate::disk::versioned_block::HEADER_SIZE;
 
-/// Discriminant value for MetablockKind::EventBatchMetadata
 const DISCRIMINANT_EVENT_BATCH_METADATA: u8 = 0;
-
-/// Discriminant value for MetablockKind::SoftDelete
 const DISCRIMINANT_SOFT_DELETE: u8 = 4;
-
-/// Discriminant value for MetablockKind::SoftTrim
 const DISCRIMINANT_SOFT_TRIM: u8 = 5;
 
-/// Base offset where MetablockEventBatch payload starts
-const EVENT_BATCH_PAYLOAD_OFFSET: usize = 
+const METABLOCK_TYPE_PAYLOAD_OFFSET: usize = 
     HEADER_SIZE + Metablock::OFFSET_WAL_METABLOCK_TYPE + WIRE_SIZE_ENUM_DISCRIMINANT;
 
-const SOFT_DELETE_PAYLOAD_OFFSET: usize = 
-    HEADER_SIZE + Metablock::OFFSET_WAL_METABLOCK_TYPE + WIRE_SIZE_ENUM_DISCRIMINANT;
-
-const SOFT_TRIM_PAYLOAD_OFFSET: usize = 
-    HEADER_SIZE + Metablock::OFFSET_WAL_METABLOCK_TYPE + WIRE_SIZE_ENUM_DISCRIMINANT;
-
-/// Read the MetablockKind discriminant from raw bytes
 #[inline]
 pub fn read_metablock_kind_discriminant(bytes: &[u8]) -> u8 {
     bytes[HEADER_SIZE + Metablock::OFFSET_WAL_METABLOCK_TYPE]
 }
 
-/// Read wal_index from metablock bytes
 #[inline]
 pub fn read_wal_index(bytes: &[u8]) -> u64 {
     let offset = HEADER_SIZE + Metablock::OFFSET_WAL_INDEX;
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }
 
-/// Read wal_index from metablock bytes
 #[inline]
 pub fn read_server_timestamp(bytes: &[u8]) -> u64 {
     let offset = HEADER_SIZE + Metablock::OFFSET_SERVER_TIMESTAMP;
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }
 
-/// Read wal_index from metablock bytes
 #[inline]
 pub fn read_compressed_size(bytes: &[u8]) -> u64 {
     let offset = HEADER_SIZE + Metablock::OFFSET_COMPRESSED_SIZE;
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }
 
-/// Read wal_index from metablock bytes
 #[inline]
 pub fn read_uncompressed_size(bytes: &[u8]) -> u64 {
     let offset = HEADER_SIZE + Metablock::OFFSET_UNCOMPRESSED_SIZE;
@@ -76,7 +59,6 @@ pub fn is_metablock_kind_event_batch_metadata(bytes: &[u8]) -> bool {
     read_metablock_kind_discriminant(bytes) == DISCRIMINANT_EVENT_BATCH_METADATA
 }
 
-/// Check if this metablock is an EventBatchMetadata for the given aggregate
 #[inline]
 pub fn is_matches_aggregate_key(bytes: &[u8], target: &AggregateKey) -> bool {
     if read_metablock_kind_discriminant(bytes) != DISCRIMINANT_EVENT_BATCH_METADATA {
@@ -92,7 +74,6 @@ pub fn is_matches_aggregate_key(bytes: &[u8], target: &AggregateKey) -> bool {
         && agg_id == target.aggregate_id
 }
 
-/// Check if this metablock is a SoftDelete for the given aggregate
 #[inline]
 pub fn is_soft_delete_for_aggregate(bytes: &[u8], target: &AggregateKey) -> bool {
     if read_metablock_kind_discriminant(bytes) != DISCRIMINANT_SOFT_DELETE {
@@ -109,7 +90,7 @@ pub fn is_soft_delete_for_aggregate(bytes: &[u8], target: &AggregateKey) -> bool
         && agg_id == target.aggregate_id
 }
 
-/// Read aggregate_key from SoftDelete metablock
+#[inline]
 pub fn read_soft_delete_aggregate_key(bytes: &[u8]) -> AggregateKey {    
     let org_id = read_soft_delete_org_id(bytes);
     let type_id = read_soft_delete_aggregate_type_id(bytes);
@@ -118,7 +99,6 @@ pub fn read_soft_delete_aggregate_key(bytes: &[u8]) -> AggregateKey {
     AggregateKey::new(org_id, type_id, agg_id)
 }
 
-/// Check if this metablock is a SoftTrim for the given aggregate
 #[inline]
 pub fn is_soft_trim_for_aggregate(bytes: &[u8], target: &AggregateKey) -> bool {
     if read_metablock_kind_discriminant(bytes) != DISCRIMINANT_SOFT_TRIM {
@@ -134,30 +114,28 @@ pub fn is_soft_trim_for_aggregate(bytes: &[u8], target: &AggregateKey) -> bool {
         && agg_id == target.aggregate_id
 }
 
-// --- SoftTrim field readers ---
-
 #[inline]
 pub fn read_soft_trim_org_id(bytes: &[u8]) -> u128 {
-    let offset = SOFT_TRIM_PAYLOAD_OFFSET + AggregateKey::OFFSET_ORG_ID;
+    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + AggregateKey::OFFSET_ORG_ID;
     read_u128_le(bytes, offset)
 }
 
 #[inline]
 pub fn read_soft_trim_aggregate_type_id(bytes: &[u8]) -> u128 {
-    let offset = SOFT_TRIM_PAYLOAD_OFFSET + AggregateKey::OFFSET_AGGREGATE_TYPE_ID;
+    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + AggregateKey::OFFSET_AGGREGATE_TYPE_ID;
     read_u128_le(bytes, offset)
 }
 
 #[inline]
 pub fn read_soft_trim_aggregate_id(bytes: &[u8]) -> u128 {
-    let offset = SOFT_TRIM_PAYLOAD_OFFSET + AggregateKey::OFFSET_AGGREGATE_ID;
+    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + AggregateKey::OFFSET_AGGREGATE_ID;
     read_u128_le(bytes, offset)
 }
 
 #[inline]
 pub fn read_soft_trim_keep_from_event_batch_index(bytes: &[u8]) -> u64 {
     // AggregateKey is 3 x u128 = 48 bytes
-    let offset = SOFT_TRIM_PAYLOAD_OFFSET + AggregateKey::WIRE_SIZE_TOTAL;
+    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + AggregateKey::WIRE_SIZE_TOTAL;
     read_u64_le(bytes, offset)
 }
 
@@ -165,19 +143,19 @@ pub fn read_soft_trim_keep_from_event_batch_index(bytes: &[u8]) -> u64 {
 
 #[inline]
 pub fn read_soft_delete_org_id(bytes: &[u8]) -> u128 {
-    let offset = SOFT_DELETE_PAYLOAD_OFFSET + AggregateKey::OFFSET_ORG_ID;
+    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + AggregateKey::OFFSET_ORG_ID;
     read_u128_le(bytes, offset)
 }
 
 #[inline]
 pub fn read_soft_delete_aggregate_type_id(bytes: &[u8]) -> u128 {
-    let offset = SOFT_DELETE_PAYLOAD_OFFSET + AggregateKey::OFFSET_AGGREGATE_TYPE_ID;
+    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + AggregateKey::OFFSET_AGGREGATE_TYPE_ID;
     read_u128_le(bytes, offset)
 }
 
 #[inline]
 pub fn read_soft_delete_aggregate_id(bytes: &[u8]) -> u128 {
-    let offset = SOFT_DELETE_PAYLOAD_OFFSET + AggregateKey::OFFSET_AGGREGATE_ID;
+    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + AggregateKey::OFFSET_AGGREGATE_ID;
     read_u128_le(bytes, offset)
 }
 
@@ -185,25 +163,25 @@ pub fn read_soft_delete_aggregate_id(bytes: &[u8]) -> u128 {
 
 #[inline]
 pub fn read_event_batch_min_event_timestamp(bytes: &[u8]) -> u64 {
-    let offset = EVENT_BATCH_PAYLOAD_OFFSET + MetablockEventBatch::OFFSET_MIN_EVENT_TIMESTAMP;
+    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + MetablockEventBatch::OFFSET_MIN_EVENT_TIMESTAMP;
     read_u64_le(bytes, offset)
 }
 
 #[inline]
 pub fn read_event_batch_max_event_timestamp(bytes: &[u8]) -> u64 {
-    let offset = EVENT_BATCH_PAYLOAD_OFFSET + MetablockEventBatch::OFFSET_MAX_EVENT_TIMESTAMP;
+    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + MetablockEventBatch::OFFSET_MAX_EVENT_TIMESTAMP;
     read_u64_le(bytes, offset)
 }
 
 #[inline]
 pub fn read_event_batch_min_event_index(bytes: &[u8]) -> u64 {
-    let offset = EVENT_BATCH_PAYLOAD_OFFSET + MetablockEventBatch::OFFSET_MIN_EVENT_INDEX;
+    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + MetablockEventBatch::OFFSET_MIN_EVENT_INDEX;
     read_u64_le(bytes, offset)
 }
 
 #[inline]
 pub fn read_event_batch_org_id(bytes: &[u8]) -> u128 {
-    let offset = EVENT_BATCH_PAYLOAD_OFFSET 
+    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET 
         + MetablockEventBatch::OFFSET_AGGREGATE_KEY 
         + AggregateKey::OFFSET_ORG_ID;
     read_u128_le(bytes, offset)
@@ -211,7 +189,7 @@ pub fn read_event_batch_org_id(bytes: &[u8]) -> u128 {
 
 #[inline]
 pub fn read_event_batch_aggregate_type_id(bytes: &[u8]) -> u128 {
-    let offset = EVENT_BATCH_PAYLOAD_OFFSET 
+    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET 
         + MetablockEventBatch::OFFSET_AGGREGATE_KEY 
         + AggregateKey::OFFSET_AGGREGATE_TYPE_ID;
     read_u128_le(bytes, offset)
@@ -219,7 +197,7 @@ pub fn read_event_batch_aggregate_type_id(bytes: &[u8]) -> u128 {
 
 #[inline]
 pub fn read_event_batch_aggregate_id(bytes: &[u8]) -> u128 {
-    let offset = EVENT_BATCH_PAYLOAD_OFFSET 
+    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET 
         + MetablockEventBatch::OFFSET_AGGREGATE_KEY 
         + AggregateKey::OFFSET_AGGREGATE_ID;
     read_u128_le(bytes, offset)
@@ -227,31 +205,31 @@ pub fn read_event_batch_aggregate_id(bytes: &[u8]) -> u128 {
 
 #[inline]
 pub fn read_event_batch_min_event_batch_index(bytes: &[u8]) -> u64 {
-    let offset = EVENT_BATCH_PAYLOAD_OFFSET + MetablockEventBatch::OFFSET_MIN_EVENT_BATCH_INDEX;
+    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + MetablockEventBatch::OFFSET_MIN_EVENT_BATCH_INDEX;
     read_u64_le(bytes, offset)
 }
 
 #[inline]
 pub fn read_event_batch_event_batch_index(bytes: &[u8]) -> u64 {
-    let offset = EVENT_BATCH_PAYLOAD_OFFSET + MetablockEventBatch::OFFSET_EVENT_BATCH_INDEX;
+    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + MetablockEventBatch::OFFSET_EVENT_BATCH_INDEX;
     read_u64_le(bytes, offset)
 }
 
 #[inline]
 pub fn read_event_batch_max_event_index(bytes: &[u8]) -> u64 {
-    let offset = EVENT_BATCH_PAYLOAD_OFFSET + MetablockEventBatch::OFFSET_MAX_EVENT_INDEX;
+    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + MetablockEventBatch::OFFSET_MAX_EVENT_INDEX;
     read_u64_le(bytes, offset)
 }
 
 #[inline]
 pub fn read_event_batch_client_id(bytes: &[u8]) -> u128 {
-    let offset = EVENT_BATCH_PAYLOAD_OFFSET + MetablockEventBatch::OFFSET_CLIENT_ID;
+    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + MetablockEventBatch::OFFSET_CLIENT_ID;
     read_u128_le(bytes, offset)
 }
 
 #[inline]
 pub fn read_event_batch_max_client_event_index(bytes: &[u8]) -> u64 {
-    let offset = EVENT_BATCH_PAYLOAD_OFFSET + MetablockEventBatch::OFFSET_MAX_CLIENT_EVENT_INDEX;
+    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + MetablockEventBatch::OFFSET_MAX_CLIENT_EVENT_INDEX;
     read_u64_le(bytes, offset)
 }
 
@@ -261,6 +239,8 @@ pub fn read_event_batch_aggregate_key(bytes: &[u8]) -> AggregateKey {
 
 #[cfg(test)]
 mod tests {
+    use crate::disk::versioned_block::serialize_versioned_message;
+
     use super::*;
     use celeriant_wal::constants::{FIXED_BLOCK_SIZE_BYTES, GENESIS_HASH, WIRE_VERSION_WAL_METABLOCK};
     use celeriant_wal::metablocks::datablock_storage_kind::DatablockStorageKind;
@@ -271,8 +251,7 @@ mod tests {
     use celeriant_wal::metablocks::metablock_snapshot_aggregate::MetablockSnapshotAggregate;
     use celeriant_wal::metablocks::metablock_soft_delete::MetablockSoftDelete;
     use celeriant_wal::metablocks::metablock_soft_trim::MetablockSoftTrim;
-    use crate::version_aware_wire_format::serialize_versioned_message;
-
+    
     fn serialize_metablock(metablock: &Metablock) -> [u8; FIXED_BLOCK_SIZE_BYTES] {
         let mut buffer = [0u8; FIXED_BLOCK_SIZE_BYTES];
         serialize_versioned_message(metablock, WIRE_VERSION_WAL_METABLOCK, &mut buffer).unwrap();

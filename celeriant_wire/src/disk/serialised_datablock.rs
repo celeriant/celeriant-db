@@ -1,128 +1,78 @@
-use celeriant_wal::{
-    compression_type::CompressionType,
-    constants::{FIXED_BLOCK_SIZE_BYTES, MINIBATCH_SIZE_BYTES, WIRE_VERSION_WAL_DATABLOCK},
-    datablocks::datablock::Datablock,
-    metablocks::{
-        datablock_block_ref::DatablockBlockRef,
-        datablock_inline_data::DatablockInlineData,
-        datablock_storage_kind::DatablockStorageKind,
-    },
-};
+use celeriant_wal::{compression_type::CompressionType, constants::{MINIBATCH_SIZE_BYTES, WIRE_VERSION_WAL_DATABLOCK}, datablocks::datablock::Datablock, metablocks::{datablock_block_ref::DatablockBlockRef, datablock_inline_data::DatablockInlineData, datablock_storage_kind::DatablockStorageKind}};
 
-use crate::{
-    wire_format::{bincode_variable_serialise_no_compression, compress_variable, decompress_variable, bincode_variable_deserialise},
-    wire_format_error::WireFormatError,
-};
+use crate::{codec::{self, codec_error::CodecError, compression}, disk::disk_format_error::DiskFormatError};
 
-/// Result of serializing a datablock, containing the storage kind for the metablock
-/// and optionally the external data to write to the datablock area
-pub struct SerializedDatablock {
+pub struct SerialisedDatablock {
     pub uncompressed_size: u64,
-    pub compressed_size: u64,
-    /// Storage kind to store in the metablock
     pub storage_kind: DatablockStorageKind,
-    /// External data to write to datablock area (only present for Block storage)
     pub external_data: Option<Vec<u8>>,
 }
 
-/// Serializes a datablock, automatically choosing inline or block storage based on size.
-///
-/// If the serialized data fits within MINIBATCH_SIZE_BYTES (512 bytes), it will be
-/// stored inline. Otherwise, it will be compressed (if compression_type != None)
-/// and stored as a block reference.
-///
-/// # Arguments
-/// * `datablock` - The datablock to serialize
-/// * `compression_type` - Compression to apply for block storage
-/// * `current_datablock_wal_position` - Points to the position of the previously written datablock
-///
-/// # Returns
-/// * `SerializedDatablock` containing the storage kind and optional external data
-pub fn serialize_datablock(
-    datablock: &Datablock,
-    compression_type: CompressionType,
-    current_datablock_wal_position: u64,
-) -> Result<SerializedDatablock, WireFormatError> {
-    // First serialize without compression to check size
-    let uncompressed = bincode_variable_serialise_no_compression(datablock)?;
-    let uncompressed_size = uncompressed.len();
+impl SerialisedDatablock {
+    pub fn new(
+        datablock: &Datablock,
+        compression_type: CompressionType,
+    ) -> Result<Self, CodecError> {
+        // First serialize without compression to check size
+        let uncompressed = codec::bincode::variable_serialise_heap(datablock)?;
+        let uncompressed_size = uncompressed.len();
 
-    // If it fits in a minibatch, store inline
-    if uncompressed_size <= MINIBATCH_SIZE_BYTES {
-        let mut minibatch = [0u8; MINIBATCH_SIZE_BYTES];
-        minibatch[..uncompressed_size].copy_from_slice(&uncompressed);
+        // If it fits in a minibatch, store inline
+        if uncompressed_size <= MINIBATCH_SIZE_BYTES {
+            let mut minibatch = [0u8; MINIBATCH_SIZE_BYTES];
+            minibatch[..uncompressed_size].copy_from_slice(&uncompressed);
 
-        return Ok(SerializedDatablock {
-            uncompressed_size: FIXED_BLOCK_SIZE_BYTES as u64,
-            compressed_size: FIXED_BLOCK_SIZE_BYTES as u64,
-            storage_kind: DatablockStorageKind::Inline(DatablockInlineData { minibatch }),
-            external_data: None,
-        });
+            return Ok(Self {
+                uncompressed_size: MINIBATCH_SIZE_BYTES as u64,
+                storage_kind: DatablockStorageKind::Inline(DatablockInlineData { minibatch }),
+                external_data: None,
+            });
+        }
+
+        // Otherwise, compress and create a block reference
+        let compressed = compression::compress(&uncompressed, compression_type)?;
+
+        // Calculate CRC over the compressed data
+        let crc32c = crc32c::crc32c(&compressed);
+
+        let (compression_type_id, _) = compression_type.to_tuple();
+
+        let block_ref = DatablockBlockRef {
+            crc32c,
+            datablock_position: 0, // To be filled in by the fsync write process
+            version: WIRE_VERSION_WAL_DATABLOCK,
+            compression_type: compression_type_id,
+        };
+
+        Ok(Self {
+            uncompressed_size: uncompressed_size as u64,
+            storage_kind: DatablockStorageKind::Block(block_ref),
+            external_data: Some(compressed),
+        })
     }
-
-    // Otherwise, compress and create a block reference
-    let (_, compressed) = compress_variable(uncompressed, compression_type)?;
-    let compressed_size = compressed.len();
-
-    // Calculate position (datablocks grow backward from end)
-    let datablock_position = current_datablock_wal_position.saturating_sub(compressed_size as u64);
-
-    // Calculate CRC over the compressed data
-    let crc32c = crc32c::crc32c(&compressed);
-
-    let (compression_type_id, _) = compression_type.to_tuple();
-
-    let block_ref = DatablockBlockRef {
-        crc32c,
-        datablock_position,
-        version: WIRE_VERSION_WAL_DATABLOCK,
-        compression_type: compression_type_id,
-    };
-
-    Ok(SerializedDatablock {
-        uncompressed_size: uncompressed_size as u64,
-        compressed_size: compressed_size as u64,
-        storage_kind: DatablockStorageKind::Block(block_ref),
-        external_data: Some(compressed),
-    })
 }
 
-/// Deserializes a datablock from the given storage kind.
-///
-/// # Arguments
-/// * `storage_kind` - The storage kind from the metablock
-/// * `external_data` - The external block data (required for Block storage)
-///
-/// # Returns
-/// * The deserialized Datablock
-///
-/// # Errors
-/// * `WireFormatError::ChecksumMismatch` if CRC verification fails for block storage
-/// * `WireFormatError::Deserialization` if external_data is missing for Block storage
-pub fn deserialize_datablock(
+pub fn deserialise_datablock(
     uncompressed_size: u64,
     storage_kind: &DatablockStorageKind,
     external_data: Option<&[u8]>,
-) -> Result<Datablock, WireFormatError> {
+) -> Result<Datablock, DiskFormatError> {
     match storage_kind {
         DatablockStorageKind::None => {
-            Err(WireFormatError::Deserialization("No datablock storage".to_string()))
+            Err(DiskFormatError::DatablockExpected)
         }
 
         DatablockStorageKind::Inline(inline) => {
-            // Deserialize directly from minibatch
-            bincode_variable_deserialise(&inline.minibatch, CompressionType::None, MINIBATCH_SIZE_BYTES)
+            Ok(codec::bincode::variable_deserialise(&inline.minibatch)?)
         }
 
         DatablockStorageKind::Block(block_ref) => {
-            let data = external_data.ok_or_else(|| {
-                WireFormatError::Deserialization("Missing external data for block storage".to_string())
-            })?;
+            let data = external_data.ok_or(DiskFormatError::ExternalDataMissing)?;
 
             // Verify CRC
             let actual_crc = crc32c::crc32c(data);
             if actual_crc != block_ref.crc32c {
-                return Err(WireFormatError::ChecksumMismatch {
+                return Err(DiskFormatError::ChecksumMismatch {
                     expected: block_ref.crc32c,
                     actual: actual_crc,
                 });
@@ -130,19 +80,24 @@ pub fn deserialize_datablock(
 
             // Check version
             if block_ref.version != WIRE_VERSION_WAL_DATABLOCK {
-                return Err(WireFormatError::UnsupportedVersion(block_ref.version));
+                return Err(DiskFormatError::UnsupportedVersion(block_ref.version));
             }
 
             let compression_type = CompressionType::from_tuple(block_ref.compression_type, None);
 
+            // Save the extra heap allocation if no compression
+            if compression_type == CompressionType::None {
+                return Ok(codec::bincode::variable_deserialise(&data)?);
+            }
+
             // Decompress and deserialize
-            let decompressed = decompress_variable(
+            let decompressed = codec::compression::decompress(
                 data,
                 compression_type,
                 uncompressed_size as usize,
             )?;
 
-            bincode_variable_deserialise(&decompressed, CompressionType::None, decompressed.len())
+            Ok(codec::bincode::variable_deserialise(&decompressed)?)
         }
     }
 }
@@ -200,7 +155,7 @@ mod tests {
     fn small_datablock_serializes_inline() {
         let datablock = create_small_datablock();
 
-        let result = serialize_datablock(&datablock, CompressionType::None, 10000).unwrap();
+        let result = SerialisedDatablock::new(&datablock, CompressionType::None).unwrap();
 
         assert!(matches!(result.storage_kind, DatablockStorageKind::Inline(_)));
         assert!(result.external_data.is_none());
@@ -210,7 +165,7 @@ mod tests {
     fn large_datablock_serializes_as_block() {
         let datablock = create_large_datablock();
 
-        let result = serialize_datablock(&datablock, CompressionType::None, 10000).unwrap();
+        let result = SerialisedDatablock::new(&datablock, CompressionType::None).unwrap();
 
         assert!(matches!(result.storage_kind, DatablockStorageKind::Block(_)));
         assert!(result.external_data.is_some());
@@ -220,9 +175,9 @@ mod tests {
     fn inline_roundtrip() {
         let original = create_small_datablock();
 
-        let serialized = serialize_datablock(&original, CompressionType::None, 10000).unwrap();
+        let serialized = SerialisedDatablock::new(&original, CompressionType::None).unwrap();
 
-        let deserialized = deserialize_datablock(serialized.uncompressed_size, &serialized.storage_kind, None).unwrap();
+        let deserialized = deserialise_datablock(serialized.uncompressed_size, &serialized.storage_kind, None).unwrap();
 
         // Compare the event batch contents
         match (&original.datablock_kind, &deserialized.datablock_kind) {
@@ -245,7 +200,7 @@ mod tests {
     fn block_roundtrip_no_compression() {
         let original = create_large_datablock();
 
-        let serialized = serialize_datablock(&original, CompressionType::None, 10000).unwrap();
+        let serialized = SerialisedDatablock::new(&original, CompressionType::None).unwrap();
 
         // Verify position was calculated correctly
         if let DatablockStorageKind::Block(ref block_ref) = serialized.storage_kind {
@@ -253,7 +208,7 @@ mod tests {
             assert_eq!(block_ref.datablock_position, expected_position);
         }
 
-        let deserialized = deserialize_datablock(
+        let deserialized = deserialise_datablock(
             serialized.uncompressed_size, 
             &serialized.storage_kind,
             serialized.external_data.as_deref(),
@@ -276,14 +231,14 @@ mod tests {
     fn block_roundtrip_with_zstd_compression() {
         let original = create_large_datablock();
 
-        let serialized = serialize_datablock(&original, CompressionType::Zstd { level: 3 }, 10000).unwrap();
+        let serialized = SerialisedDatablock::new(&original, CompressionType::Zstd { level: 3 }).unwrap();
 
         // Verify compression was applied
         if let DatablockStorageKind::Block(ref block_ref) = serialized.storage_kind {
             assert_eq!(block_ref.compression_type, 1); // Zstd
         }
 
-        let deserialized = deserialize_datablock(
+        let deserialized = deserialise_datablock(
             serialized.uncompressed_size, 
             &serialized.storage_kind,
             serialized.external_data.as_deref(),
@@ -305,9 +260,9 @@ mod tests {
     fn block_roundtrip_with_snappy_compression() {
         let original = create_large_datablock();
 
-        let serialized = serialize_datablock(&original, CompressionType::Snappy, 10000).unwrap();
+        let serialized = SerialisedDatablock::new(&original, CompressionType::Snappy).unwrap();
 
-        let deserialized = deserialize_datablock(
+        let deserialized = deserialise_datablock(
             serialized.uncompressed_size, 
             &serialized.storage_kind,
             serialized.external_data.as_deref(),
@@ -329,69 +284,66 @@ mod tests {
     fn crc_mismatch_detected() {
         let original = create_large_datablock();
 
-        let serialized = serialize_datablock(&original, CompressionType::None, 10000).unwrap();
+        let serialized = SerialisedDatablock::new(&original, CompressionType::None).unwrap();
 
         // Corrupt the external data
         let mut corrupted = serialized.external_data.unwrap();
         corrupted[10] ^= 0xFF;
 
-        let result = deserialize_datablock(serialized.uncompressed_size, &serialized.storage_kind, Some(&corrupted));
+        let result = deserialise_datablock(serialized.uncompressed_size, &serialized.storage_kind, Some(&corrupted));
 
-        assert!(matches!(result, Err(WireFormatError::ChecksumMismatch { .. })));
+        assert!(matches!(result, Err(DiskFormatError::ChecksumMismatch { .. })));
     }
 
     #[test]
     fn block_missing_external_data_fails() {
         let original = create_large_datablock();
 
-        let serialized = serialize_datablock(&original, CompressionType::None, 10000).unwrap();
+        let serialized = SerialisedDatablock::new(&original, CompressionType::None).unwrap();
 
         // Try to deserialize block without external data
-        let result = deserialize_datablock(serialized.uncompressed_size, &serialized.storage_kind, None);
+        let result = deserialise_datablock(serialized.uncompressed_size, &serialized.storage_kind, None);
 
-        assert!(matches!(result, Err(WireFormatError::Deserialization(_))));
+        assert!(matches!(result, Err(DiskFormatError::Codec(_))));
     }
 
     #[test]
     fn none_storage_fails() {
-        let result = deserialize_datablock(0, &DatablockStorageKind::None, None);
+        let result = deserialise_datablock(0, &DatablockStorageKind::None, None);
 
-        assert!(matches!(result, Err(WireFormatError::Deserialization(_))));
+        assert!(matches!(result, Err(DiskFormatError::Codec(_))));
     }
 
     #[test]
     fn unsupported_version_detected() {
         let original = create_large_datablock();
 
-        let mut serialized = serialize_datablock(&original, CompressionType::None, 10000).unwrap();
+        let mut serialized = SerialisedDatablock::new(&original, CompressionType::None).unwrap();
 
         // Modify the version in the block ref
         if let DatablockStorageKind::Block(ref mut block_ref) = serialized.storage_kind {
             block_ref.version = 9999;
         }
 
-        let result = deserialize_datablock(
+        let result = deserialise_datablock(
             serialized.uncompressed_size, 
             &serialized.storage_kind,
             serialized.external_data.as_deref(),
         );
 
-        assert!(matches!(result, Err(WireFormatError::UnsupportedVersion(9999))));
+        assert!(matches!(result, Err(DiskFormatError::UnsupportedVersion(9999))));
     }
 
     #[test]
     fn block_ref_contains_correct_sizes() {
         let original = create_large_datablock();
 
-        let serialized = serialize_datablock(&original, CompressionType::Zstd { level: 3 }, 10000).unwrap();
+        let serialized = SerialisedDatablock::new(&original, CompressionType::Zstd { level: 3 }).unwrap();
 
         if let DatablockStorageKind::Block(ref _block_ref) = serialized.storage_kind {
-            let external = serialized.external_data.as_ref().unwrap();
-
-            assert_eq!(serialized.compressed_size, external.len() as u64);
             assert!(serialized.uncompressed_size > 0);
             // With compression, compressed should typically be smaller or equal
-            assert!(serialized.compressed_size <= serialized.uncompressed_size);
+            assert!(serialized.external_data.as_ref().unwrap().len() <= serialized.uncompressed_size as usize);
         } else {
             panic!("Expected Block storage");
         }
@@ -401,7 +353,7 @@ mod tests {
     fn crc_is_calculated_over_compressed_data() {
         let original = create_large_datablock();
 
-        let serialized = serialize_datablock(&original, CompressionType::None, 10000).unwrap();
+        let serialized = SerialisedDatablock::new(&original, CompressionType::None).unwrap();
 
         if let DatablockStorageKind::Block(ref block_ref) = serialized.storage_kind {
             let external = serialized.external_data.as_ref().unwrap();

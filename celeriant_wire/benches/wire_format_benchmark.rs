@@ -5,11 +5,11 @@ use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::datablocks::datablock_aggregate_event_batch::DatablockAggregateEventBatch;
 use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
 use celeriant_wal::metablocks::metablock_event_batch::{MetablockEventBatch, EventTypesKind};
-use celeriant_wal::{
-    compression_type::CompressionType,
-};
-use celeriant_wire::wire_format::{
-    bincode_variable_deserialise, bincode_variable_serialise, msgpack_variable_deserialise, msgpack_variable_serialise
+use celeriant_wal::compression_type::CompressionType;
+use celeriant_wire::codec::{
+    bincode::{variable_serialise_heap as bincode_serialise, variable_deserialise as bincode_deserialise},
+    msgpack::{serialise_heap as msgpack_serialise, deserialise as msgpack_deserialise},
+    compression::{compress, decompress},
 };
 use criterion::{
     criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
@@ -104,10 +104,11 @@ fn bench_event_batch_serialization(c: &mut Criterion) {
                 &(&batch, compression),
                 |b, (batch, comp)| {
                     b.iter(|| {
-                        let (uncompressed_size, encoded) =
-                            bincode_variable_serialise(black_box(*batch), *comp).unwrap();
-                        let _decoded: DatablockAggregateEventBatch =
-                            bincode_variable_deserialise(&encoded, *comp, uncompressed_size).unwrap();
+                        let serialised = bincode_serialise(black_box(*batch)).unwrap();
+                        let uncompressed_size = serialised.len();
+                        let compressed = compress(&serialised, *comp).unwrap();
+                        let decompressed = decompress(&compressed, *comp, uncompressed_size).unwrap();
+                        let _decoded: DatablockAggregateEventBatch = bincode_deserialise(&decompressed).unwrap();
                     });
                 },
             );
@@ -122,11 +123,11 @@ fn bench_event_batch_serialization(c: &mut Criterion) {
                 &(&batch, compression),
                 |b, (batch, comp)| {
                     b.iter(|| {
-                        let (uncompressed_size, encoded) =
-                            msgpack_variable_serialise(black_box(*batch), *comp).unwrap();
-                        let _decoded: DatablockAggregateEventBatch =
-                            msgpack_variable_deserialise(&encoded, *comp, uncompressed_size)
-                                .unwrap();
+                        let serialised = msgpack_serialise(black_box(*batch)).unwrap();
+                        let uncompressed_size = serialised.len();
+                        let compressed = compress(&serialised, *comp).unwrap();
+                        let decompressed = decompress(&compressed, *comp, uncompressed_size).unwrap();
+                        let _decoded: DatablockAggregateEventBatch = msgpack_deserialise(&decompressed).unwrap();
                     });
                 },
             );
@@ -151,10 +152,11 @@ fn bench_metadata_serialization(c: &mut Criterion) {
             &(&metadata, compression),
             |b, (meta, comp)| {
                 b.iter(|| {
-                    let (uncompressed_size, encoded) =
-                        bincode_variable_serialise(black_box(*meta), *comp).unwrap();
-                    let _decoded: MetablockEventBatch =
-                        bincode_variable_deserialise(&encoded, *comp, uncompressed_size).unwrap();
+                    let serialised = bincode_serialise(black_box(*meta)).unwrap();
+                    let uncompressed_size = serialised.len();
+                    let compressed = compress(&serialised, *comp).unwrap();
+                    let decompressed = decompress(&compressed, *comp, uncompressed_size).unwrap();
+                    let _decoded: MetablockEventBatch = bincode_deserialise(&decompressed).unwrap();
                 });
             },
         );

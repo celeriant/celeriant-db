@@ -3,13 +3,15 @@ use std::time::Duration;
 
 use bincode::{Decode, Encode};
 use celeriant_wal::compression_type::CompressionType;
-use celeriant_wire::{
-    constants::{PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3, WIRE_FIXED_BODY_SIZE},
-    wire_header::WireHeader,
+use celeriant_wire::network::wire_header::{
+    WireHeader, wire_header_write_fixed_size, wire_header_write_variable_size,
 };
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use futures_lite::{future::block_on, io::Cursor};
 use serde::{Deserialize, Serialize};
+
+const PROTOCOL_VERSION_V2: u32 = 2;
+const PROTOCOL_VERSION_V3: u32 = 3;
 
 criterion_group!(benches, bench_fixed_vs_variable);
 criterion_main!(benches);
@@ -60,7 +62,7 @@ fn bench_fixed_vs_variable(c: &mut Criterion) {
                 b.iter(|| {
                     block_on(async {
                         let mut buffer = Vec::with_capacity(128);
-                        WireHeader::write_fixed_size(
+                        wire_header_write_fixed_size(
                             &mut buffer,
                             black_box(*msg),
                             request_type,
@@ -82,7 +84,7 @@ fn bench_fixed_vs_variable(c: &mut Criterion) {
                 b.iter(|| {
                     block_on(async {
                         let mut buffer = Vec::with_capacity(128);
-                        WireHeader::write_variable_size(
+                        wire_header_write_variable_size(
                             &mut buffer,
                             black_box(*msg),
                             request_type,
@@ -103,14 +105,14 @@ fn bench_fixed_vs_variable(c: &mut Criterion) {
         // Pre-serialize for read benchmarks
         let mut fixed_buffer = Vec::new();
         block_on(async {
-            WireHeader::write_fixed_size(&mut fixed_buffer, &message, request_type, version)
+            wire_header_write_fixed_size(&mut fixed_buffer, &message, request_type, version)
                 .await
                 .unwrap();
         });
 
         let mut variable_buffer = Vec::new();
         block_on(async {
-            WireHeader::write_variable_size(
+            wire_header_write_variable_size(
                 &mut variable_buffer,
                 &message,
                 request_type,
@@ -130,10 +132,9 @@ fn bench_fixed_vs_variable(c: &mut Criterion) {
                 b.iter(|| {
                     block_on(async {
                         let mut reader = Cursor::new(black_box(data.as_slice()));
-                        let header = WireHeader::from_reader(&mut reader).await.unwrap();
-                        let mut read_buf = [0u8; WIRE_FIXED_BODY_SIZE];
+                        let header = WireHeader::from_reader(&mut reader, u64::MAX).await.unwrap();
                         let decoded: SmallMessage = header
-                            .read_fixed_size(&mut reader, &mut read_buf)
+                            .read_fixed_size(&mut reader)
                             .await
                             .unwrap();
                         decoded
@@ -150,9 +151,9 @@ fn bench_fixed_vs_variable(c: &mut Criterion) {
                 b.iter(|| {
                     block_on(async {
                         let mut reader = Cursor::new(black_box(data.as_slice()));
-                        let header = WireHeader::from_reader(&mut reader).await.unwrap();
+                        let header = WireHeader::from_reader(&mut reader, u64::MAX).await.unwrap();
                         let decoded: SmallMessage =
-                            header.read_variable_size(&mut reader, u64::MAX).await.unwrap();
+                            header.read_variable_size(&mut reader).await.unwrap();
                         decoded
                     })
                 });
@@ -169,7 +170,7 @@ fn bench_fixed_vs_variable(c: &mut Criterion) {
                 b.iter(|| {
                     block_on(async {
                         let mut buffer = Vec::with_capacity(128);
-                        WireHeader::write_fixed_size(
+                        wire_header_write_fixed_size(
                             &mut buffer,
                             black_box(*msg),
                             request_type,
@@ -179,10 +180,9 @@ fn bench_fixed_vs_variable(c: &mut Criterion) {
                         .unwrap();
 
                         let mut reader = Cursor::new(buffer.as_slice());
-                        let header = WireHeader::from_reader(&mut reader).await.unwrap();
-                        let mut read_buf = [0u8; WIRE_FIXED_BODY_SIZE];
+                        let header = WireHeader::from_reader(&mut reader, u64::MAX).await.unwrap();
                         let decoded: SmallMessage = header
-                            .read_fixed_size(&mut reader, &mut read_buf)
+                            .read_fixed_size(&mut reader)
                             .await
                             .unwrap();
                         decoded
@@ -199,7 +199,7 @@ fn bench_fixed_vs_variable(c: &mut Criterion) {
                 b.iter(|| {
                     block_on(async {
                         let mut buffer = Vec::with_capacity(128);
-                        WireHeader::write_variable_size(
+                        wire_header_write_variable_size(
                             &mut buffer,
                             black_box(*msg),
                             request_type,
@@ -211,9 +211,9 @@ fn bench_fixed_vs_variable(c: &mut Criterion) {
                         .unwrap();
 
                         let mut reader = Cursor::new(buffer.as_slice());
-                        let header = WireHeader::from_reader(&mut reader).await.unwrap();
+                        let header = WireHeader::from_reader(&mut reader, u64::MAX).await.unwrap();
                         let decoded: SmallMessage =
-                            header.read_variable_size(&mut reader, u64::MAX).await.unwrap();
+                            header.read_variable_size(&mut reader).await.unwrap();
                         decoded
                     })
                 });

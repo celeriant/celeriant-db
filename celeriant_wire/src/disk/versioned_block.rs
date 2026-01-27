@@ -1,90 +1,24 @@
-use bincode::{Encode};
-use celeriant_wal::{ constants::{WIRE_VERSION_WAL_METABLOCK, WIRE_VERSION_WAL_SHARD_LOG_HEADER}, metablocks::metablock::Metablock, shard_log_header::ShardLogHeader};
-
-use crate::{wire_format::{bincode_fixed_deserialise, bincode_fixed_serialise}, wire_format_error::WireFormatError};
+use crate::codec::bincode::fixed_serialise_stack;
+use celeriant_wal::{constants::{FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_METABLOCK, WIRE_VERSION_WAL_SHARD_LOG_HEADER}, metablocks::metablock::Metablock, shard_log_header::ShardLogHeader};
+use crate::{codec, disk::{disk_format_error::DiskFormatError}};
 
 const VERSION_SIZE: usize = 4;
 const CRC_SIZE: usize = 4;
-pub const HEADER_SIZE: usize = VERSION_SIZE + CRC_SIZE;
-
-fn verify_crc32c(data: &[u8], expected_crc: u32) -> Result<(), WireFormatError> {
-    let actual_crc = crc32c::crc32c(data);
-    if actual_crc != expected_crc {
-        return Err(WireFormatError::ChecksumMismatch {
-            expected: expected_crc,
-            actual: actual_crc,
-        });
-    }
-    Ok(())
-}
-
-pub fn deserialize_versioned_metablock(
-    buffer: &[u8],
-) -> Result<(Metablock, u32), WireFormatError>
-{
-    let stored_crc = u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
-
-    // Verify CRC before attempting to deserialize
-    verify_crc32c(&buffer[CRC_SIZE..], stored_crc)?;
-
-    let version = u32::from_le_bytes([
-        buffer[CRC_SIZE],
-        buffer[CRC_SIZE + 1],
-        buffer[CRC_SIZE + 2],
-        buffer[CRC_SIZE + 3],
-    ]);
-
-
-    match version {
-        WIRE_VERSION_WAL_METABLOCK => {
-            let (meta, _data_len): (Metablock, usize) =
-                bincode_fixed_deserialise(&buffer[HEADER_SIZE..])?;
-            Ok((meta, version))
-        }
-        _ => Err(WireFormatError::UnsupportedVersion(version)),
-    }
-}
-
-pub fn deserialize_versioned_shard_log_header(
-    buffer: &[u8],
-) -> Result<(ShardLogHeader, u32), WireFormatError>
-{
-    let stored_crc = u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
-
-    // Verify CRC before attempting to deserialize
-    verify_crc32c(&buffer[CRC_SIZE..], stored_crc)?;
-
-    let version = u32::from_le_bytes([
-        buffer[CRC_SIZE],
-        buffer[CRC_SIZE + 1],
-        buffer[CRC_SIZE + 2],
-        buffer[CRC_SIZE + 3],
-    ]);
-
-
-    match version {
-        WIRE_VERSION_WAL_SHARD_LOG_HEADER => {
-            let (meta, _data_len): (ShardLogHeader, usize) =
-                bincode_fixed_deserialise(&buffer[HEADER_SIZE..])?;
-            Ok((meta, version))
-        }
-        _ => Err(WireFormatError::UnsupportedVersion(version)),
-    }
-}
+pub(crate) const HEADER_SIZE: usize = VERSION_SIZE + CRC_SIZE;
 
 pub fn serialize_versioned_message<T>(
     message: &T,
     version: u32,
     buffer: &mut [u8],
-) -> Result<(), WireFormatError>
+) -> Result<(), bincode::error::EncodeError>
 where
-    T: Encode,
+    T: bincode::Encode,
 {
     // Write version of what we are serializing
     buffer[CRC_SIZE..HEADER_SIZE].copy_from_slice(&version.to_le_bytes());
 
     // serialize the message after the header
-    let len = bincode_fixed_serialise(message, &mut buffer[HEADER_SIZE..])?;
+    let len = fixed_serialise_stack(message, &mut buffer[HEADER_SIZE..])?;
     
     //Ensure we always entirely fill the provided fixed length buffer
     buffer[HEADER_SIZE + len..].fill(0);
@@ -96,6 +30,69 @@ where
     buffer[0..CRC_SIZE].copy_from_slice(&crc.to_le_bytes());
 
     Ok(())
+}
+
+pub fn deserialise_metablock(
+    data: &[u8; FIXED_BLOCK_SIZE_BYTES],
+) -> Result<Metablock, DiskFormatError> {
+
+    let stored_crc = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    let actual_crc = crc32c::crc32c(&data[CRC_SIZE..]);
+
+    if stored_crc != actual_crc {
+        return Err(DiskFormatError::ChecksumMismatch {
+            expected: stored_crc,
+            actual: actual_crc,
+        });
+    }
+
+    let version = u32::from_le_bytes([
+        data[CRC_SIZE],
+        data[CRC_SIZE + 1],
+        data[CRC_SIZE + 2],
+        data[CRC_SIZE + 3],
+    ]);
+
+    if version != WIRE_VERSION_WAL_METABLOCK {
+        return Err(DiskFormatError::UnsupportedVersion(version));
+    }
+
+    return Ok(codec::bincode::fixed_deserialise(&data[HEADER_SIZE..])?);
+}
+
+pub fn deserialise_shard_log_header(
+    data: &[u8],
+) -> Result<ShardLogHeader, DiskFormatError> {
+
+    if data.len() != HEADER_BLOCK_SIZE_BYTES {
+        return Err(DiskFormatError::HeaderSizeMismatch {
+            expected: HEADER_BLOCK_SIZE_BYTES,
+            actual: data.len(),
+        });
+    }
+
+    let stored_crc = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    let actual_crc = crc32c::crc32c(&data[CRC_SIZE..]);
+
+    if stored_crc != actual_crc {
+        return Err(DiskFormatError::ChecksumMismatch {
+            expected: stored_crc,
+            actual: actual_crc,
+        });
+    }
+
+    let version = u32::from_le_bytes([
+        data[CRC_SIZE],
+        data[CRC_SIZE + 1],
+        data[CRC_SIZE + 2],
+        data[CRC_SIZE + 3],
+    ]);
+
+    if version != WIRE_VERSION_WAL_SHARD_LOG_HEADER {
+        return Err(DiskFormatError::UnsupportedVersion(version));
+    }
+
+    return Ok(codec::bincode::fixed_deserialise(&data[HEADER_SIZE..])?);
 }
 
 #[cfg(test)]
@@ -306,7 +303,7 @@ mod tests {
         let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
         serialize_versioned_message(&header, WIRE_VERSION_WAL_SHARD_LOG_HEADER, &mut buffer).unwrap();
 
-        let (deserialized, _) = deserialize_versioned_shard_log_header(&buffer).unwrap();
+        let deserialized = deserialise_shard_log_header(&buffer).unwrap();
 
         // The bug `buffer[len+1..].fill(0)` zeros bytes starting at the wrong offset,
         // corrupting the latter portion of the serialized data (datablocks_position)
@@ -341,9 +338,8 @@ mod tests {
         let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
         serialize_versioned_message(&header, 1, &mut buffer).unwrap();
 
-        let (deserialized, version) = deserialize_versioned_shard_log_header(&buffer).unwrap();
+        let deserialized = deserialise_shard_log_header(&buffer).unwrap();
 
-        assert_eq!(version, WIRE_VERSION_WAL_SHARD_LOG_HEADER);
         assert_eq!(deserialized.metablocks_position, header.metablocks_position);
         assert_eq!(deserialized.datablocks_position, header.datablocks_position);
         assert_eq!(deserialized.wal_index, header.wal_index);
@@ -366,8 +362,8 @@ mod tests {
         // Corrupt a byte in the version field (not payload - see crc_covers_payload_data test)
         buffer[VERSION_SIZE + 2] ^= 0xFF;
 
-        let result = deserialize_versioned_shard_log_header(&buffer);
-        assert!(matches!(result, Err(WireFormatError::ChecksumMismatch { .. })));
+        let result = deserialise_shard_log_header(&buffer);
+        assert!(matches!(result, Err(DiskFormatError::ChecksumMismatch { .. })));
     }
 
     #[test]
@@ -386,9 +382,9 @@ mod tests {
         // Corrupt a byte in the actual payload area (after HEADER_SIZE)
         buffer[HEADER_SIZE + 4] ^= 0xFF;
 
-        let result = deserialize_versioned_shard_log_header(&buffer);
+        let result = deserialise_shard_log_header(&buffer);
         assert!(
-            matches!(result, Err(WireFormatError::ChecksumMismatch { .. })),
+            matches!(result, Err(DiskFormatError::ChecksumMismatch { .. })),
             "CRC should detect corruption in payload data"
         );
     }
@@ -409,9 +405,9 @@ mod tests {
         // Corrupt a byte in the version field (bytes CRC_SIZE..HEADER_SIZE)
         buffer[CRC_SIZE + 1] ^= 0xFF;
 
-        let result = deserialize_versioned_shard_log_header(&buffer);
+        let result = deserialise_shard_log_header(&buffer);
         assert!(
-            matches!(result, Err(WireFormatError::ChecksumMismatch { .. })),
+            matches!(result, Err(DiskFormatError::ChecksumMismatch { .. })),
             "CRC should detect corruption in version field"
         );
     }
@@ -432,9 +428,9 @@ mod tests {
         // Corrupting the CRC field itself should cause mismatch (not pass silently)
         buffer[1] ^= 0xFF;
 
-        let result = deserialize_versioned_shard_log_header(&buffer);
+        let result = deserialise_shard_log_header(&buffer);
         assert!(
-            matches!(result, Err(WireFormatError::ChecksumMismatch { .. })),
+            matches!(result, Err(DiskFormatError::ChecksumMismatch { .. })),
             "Corrupted CRC should not accidentally match"
         );
     }
@@ -460,8 +456,8 @@ mod tests {
         let new_crc = crc32c::crc32c(&buffer[CRC_SIZE..]);
         buffer[..CRC_SIZE].copy_from_slice(&new_crc.to_le_bytes());
 
-        let result = deserialize_versioned_shard_log_header(&buffer);
-        assert!(matches!(result, Err(WireFormatError::UnsupportedVersion(9999))));
+        let result = deserialise_shard_log_header(&buffer);
+        assert!(matches!(result, Err(DiskFormatError::UnsupportedVersion(9999))));
     }
 
     #[test]
