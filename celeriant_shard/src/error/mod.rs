@@ -6,3 +6,5 @@ pub mod shard_cache_load_error;
 pub mod watch_session_error;
 pub mod rollback_error;
 pub mod replication_error;
+pub mod replication_to_follower_error;
+pub mod replication_to_s3_error;

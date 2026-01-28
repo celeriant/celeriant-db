@@ -2,26 +2,23 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
 
+use celeriant_disk::files::rwlock_timeout::write_with_timeout;
 use celeriant_msg::request::requests::ReplicationBatchItem;
+use celeriant_rotating_log::log_segment_file::log_segment_file::write_dual_shard_log_header;
 use celeriant_rotating_log::reverse_metablock_scanner::ReverseMetablockScanner;
-use celeriant_wire::{metablock_bytes, version_aware_wire_format};
+use celeriant_wire::disk::metablock_bytes;
+use celeriant_wire::disk::versioned_block::deserialise_metablock;
 use glommio::sync::RwLock;
 
 use celeriant_memcache::cache_path::CachePath;
 use celeriant_memcache::pending_commit_data::PendingCommitData;
 use celeriant_memcache::shard_mem_cache::ShardMemCache;
-use celeriant_rotating_log::log_segment_file::write_dual_shard_log_header;
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
-use celeriant_rotating_log::rwlock_timeout::write_with_timeout;
 use celeriant_wal::constants::{FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES};
 use celeriant_wal::metablocks::metablock_kind::MetablockKind;
 use celeriant_watch::aggregate_watchers::AggregateWatchers;
 
 use crate::amortisation::coordinator::{CaptureResult, Coordinator};
-use crate::error::replication_error::ReplicationError;
-use crate::error::rollback_error::RollbackError;
-use crate::error::shard_fsync_error::ShardFsyncError;
-use crate::error::shard_read_error::ShardReadError;
 use crate::replication_client::ReplicationClient;
 use crate::shard_wal::{KeptMetablock, fetch_datablocks_for_metablocks};
 use crate::watch_event_collector::WatchEventCollector;
@@ -321,7 +318,7 @@ async fn fetch_catchup_entries(
 
         // Include if in range
         if wal_index < leader_wal_index {
-            let (metablock, _version) = version_aware_wire_format::deserialize_versioned_metablock(bytes)
+            let metablock = deserialise_metablock(bytes)
                 .map_err(|_e| "Failed to deserialize metablock")?;
 
             // Estimate size (metablock + potential datablock)

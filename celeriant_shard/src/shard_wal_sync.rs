@@ -1,8 +1,3 @@
-//! Sync and durability functions for the shard WAL.
-//!
-//! Handles writing pending queue items to disk, updating metadata,
-//! and broadcasting watch events after successful fsync.
-
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -12,19 +7,17 @@ use celeriant_memcache::pending_cache_item::PendingCacheItem;
 use celeriant_memcache::pending_commit_data::PendingCommitData;
 use celeriant_memcache::shard_mem_cache::ShardMemCache;
 use celeriant_memcache::sync_positions_snapshot::SyncPositionsSnapshot;
-use celeriant_rotating_log::log_segment_file::LogSegmentFile;
-use celeriant_rotating_log::log_segment_file_metadata::LogSegmentFileMetadata;
+use celeriant_rotating_log::log_segment_file::log_segment_file::{LogSegmentFile, write_dual_shard_log_header};
+use celeriant_rotating_log::log_segment_file::log_segment_file_metadata::LogSegmentFileMetadata;
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
-use celeriant_rotating_log::rotating_log_error::RotatingLogError;
 use celeriant_wal::cluster_role::ClusterRole;
 use celeriant_wal::constants::{FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_METABLOCK};
 use celeriant_wal::metablocks::datablock_storage_kind::DatablockStorageKind;
 use celeriant_wal::metablocks::metablock_kind::MetablockKind;
 use celeriant_watch::aggregate_watchers::AggregateWatchers;
-use celeriant_wire::version_aware_wire_format::serialize_versioned_message;
+use celeriant_wire::disk::versioned_block::serialize_versioned_message;
 
 use crate::amortisation::coordinator::CaptureResult;
-use crate::error::shard_fsync_error::ShardFsyncError;
 use crate::watch_event_collector::WatchEventCollector;
 
 /// Captured data from the fsync snapshot phase.
@@ -66,9 +59,10 @@ pub(crate) async fn commit_fsync_with_rollback(
     let available_space = log_segments_cache.active_log_available_space();
     if available_space < captured.required_disk_space {
 
-        if self.preallocate_bytes.saturating_sub(required_disk_space).saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64 * 2) == 0 {
-            return Err(RotatingLogError::BatchesTooLarge(self.preallocate_bytes));
-        }
+        // TODO: batch too large for single log segment handling
+        // if self.preallocate_bytes.saturating_sub(required_disk_space).saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64 * 2) == 0 {
+        //     return Err(RotatingLogError::BatchesTooLarge(self.preallocate_bytes));
+        // }
         
         log_segments_cache.rotate_to_next_log().await?;
     }
@@ -333,7 +327,7 @@ pub(crate) async fn sync(log_segment_file: Rc<LogSegmentFile>, sync_positions_sn
     // Write header
     let header_end_start_pos = log_segment_file_metadata.file_len.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64);
     let header = log_segment_file_metadata.to_shard_log_header();
-    celeriant_rotating_log::log_segment_file::write_dual_shard_log_header(&dma_file_writer, header_end_start_pos, &header).await?;
+    write_dual_shard_log_header(&dma_file_writer, header_end_start_pos, &header).await?;
 
     dma_file_writer.fdatasync().await?;
 

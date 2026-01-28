@@ -1,7 +1,7 @@
 use celeriant_msg::process_requests::Request;
 use celeriant_msg::process_responses::Response;
 use celeriant_wal::compression_type::CompressionType;
-use celeriant_wire::constants::PROTOCOL_VERSION_V2;
+use celeriant_wire::network::wire_header::PROTOCOL_VERSION_V2;
 use futures_lite::future::or;
 use glommio::net::TcpStream;
 use glommio::timer::Timer;
@@ -20,19 +20,16 @@ use crate::client_error::ClientError;
 pub struct CeleriantClient {
     stream: TcpStream,
     max_request_size: u64,
+    max_response_size: u64,
     timeout_duration: Option<Duration>,
 }
 
 impl CeleriantClient {
-    /// Connect to Celeriant server at the given address (e.g., "127.0.0.1:10000")
-    pub async fn connect(address: &str) -> Result<Self, ClientError> {
-        Self::connect_with_timeout(address, None).await
-    }
-
-    /// Connect to Celeriant server with an optional connection timeout
     pub async fn connect_with_timeout(
         address: &str,
         connection_timeout: Option<Duration>,
+        max_request_size: u64,
+        max_response_size: u64,
     ) -> Result<Self, ClientError> {
         let stream = if let Some(duration) = connection_timeout {
             TcpStream::connect_timeout(address, duration)
@@ -55,11 +52,12 @@ impl CeleriantClient {
         // Set TCP_NODELAY to disable Nagle's algorithm
         stream
             .set_nodelay(true)
-            .map_err(ClientError::ConnectionFailed)?;
+            .map_err(ClientError::SetNoDelayError)?;
 
         Ok(Self {
             stream,
-            max_request_size: 10_000_000, // 10MB default
+            max_request_size,
+            max_response_size,
             timeout_duration: None,
         })
     }
@@ -119,13 +117,15 @@ impl CeleriantClient {
             self.max_request_size,
             PROTOCOL_VERSION_V2,
         )
-        .await?;
+        .await
+        .map_err(ClientError::WriteRequestError)?;
 
         // Read response from server
-        let response = Response::read_response(&mut self.stream).await?;
+        let response = Response::read_response(&mut self.stream, self.max_response_size).await
+            .map_err(ClientError::ReadResponseError)?;
 
         match response {
-            Response::ProtocolError(_) => Err(ClientError::ProtocolError),
+            Response::ProtocolError(_) => Err(ClientError::RequestProtocolError),
             Response::GenericError(error) => Err(ClientError::CeleriantError(error)),
             _ => Ok(response),
         }

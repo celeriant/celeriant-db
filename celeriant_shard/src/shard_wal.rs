@@ -13,7 +13,11 @@ use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use celeriant_disk::files::rwlock_timeout::write_with_timeout;
 use celeriant_wal::compression_type::CompressionType;
+use celeriant_wire::disk::metablock_bytes;
+use celeriant_wire::disk::serialised_datablock::{SerialisedDatablock, deserialise_datablock};
+use celeriant_wire::disk::versioned_block::deserialise_metablock;
 use glommio::sync::RwLock;
 
 use celeriant_disk::files::read_objects_absolute;
@@ -30,8 +34,6 @@ use celeriant_msg::response::aggregate_event_batch::AggregateEventBatch;
 use celeriant_msg::response::responses::{AggregateListItem, AggregateTypeListItem, ExistsResponse, FollowerRejection, ListAggregateTypesResponse, ListAggregatesResponse, ListOrgsResponse, OrgListItem, ReadResponse, ReplicationBatchResponse, ReplicationResult, SuccessResponse};
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
 use celeriant_rotating_log::reverse_metablock_scanner::ReverseMetablockScanner;
-use celeriant_rotating_log::rotating_log_error::RotatingLogError;
-use celeriant_rotating_log::rwlock_timeout::write_with_timeout;
 use celeriant_wal::aggregate_client_key::AggregateClientKey;
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::aggregate_type_key::AggregateTypeKey;
@@ -48,19 +50,11 @@ use celeriant_wal::metablocks::metablock_soft_delete::MetablockSoftDelete;
 use celeriant_wal::metablocks::metablock_soft_trim::MetablockSoftTrim;
 use celeriant_watch::aggregate_reader::AggregateReader;
 use celeriant_watch::aggregate_watchers::AggregateWatchers;
-use celeriant_wire::datablock_serialization::{deserialize_datablock, serialize_datablock};
-use celeriant_wire::metablock_bytes;
 use lru::LruCache;
 
 use crate::amortisation::coordinator::Coordinator;
 use crate::bloom::bloom_filter_cache::BloomFilterCache;
 use crate::bloom::event_type_filter::extract_unique_event_types;
-use crate::error::replication_error::ReplicationError;
-use crate::error::shard_cache_load_error::ShardCacheError;
-use crate::error::shard_error::ShardError;
-use crate::error::shard_fsync_error::ShardFsyncError;
-use crate::error::shard_read_error::ShardReadError;
-use crate::error::shard_write_error::ShardWriteError;
 use crate::in_memory_filtering;
 use crate::internal_shard_config::InternalShardConfig;
 use crate::loading_coordinator::LoadingCoordinator;
@@ -1049,7 +1043,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
                 // Check for soft delete first - if this aggregate was deleted, we're done
                 if metablock_bytes::is_soft_delete_for_aggregate(metablock_bytes, searching_for_aggregate_key) {
                     // Deserialize to get the deletion options
-                    let (metablock, _version) = celeriant_wire::version_aware_wire_format::deserialize_versioned_metablock(metablock_bytes)
+                    let metablock = deserialise_metablock(metablock_bytes)
                         .map_err(|_| ())?;
                     
                     if let MetablockKind::SoftDelete(soft_delete) = metablock.wal_metablock_type {
@@ -1244,7 +1238,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
         };
 
         // Serialize datablock - this can fail
-        let serialized_datablock = serialize_datablock(&datablock, write_request.compression_type, 0)?;
+        let serialized_datablock = SerialisedDatablock::new(&datablock, write_request.compression_type)?;
 
         let server_timestamp = self.config.timestamp_config.now();
 
@@ -1468,7 +1462,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
                 DatablockStorageKind::Block(_) => {
                     if let Some(datablock) = item.datablock {
                         let compression_type = CompressionType::from_tuple(item.metablock.datablock_compression_type, None);
-                        let serialized_datablock = serialize_datablock(&datablock, compression_type, 0)?;
+                        let serialized_datablock = SerialisedDatablock::new(&datablock, compression_type)?;
                         (serialized_datablock.external_data, Some(datablock))
                     } else {
                         return Ok(Some(FollowerRejection::MissingDatablock));
@@ -1659,7 +1653,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
                 }
 
                 // Deserialize metablock for filter check
-                let (metablock, _version) = celeriant_wire::version_aware_wire_format::deserialize_versioned_metablock(bytes)?;
+                let metablock = deserialise_metablock(bytes)?;
 
                 if !in_memory_filtering::is_include_batch(&metablock, filters) {
                     return Ok(None); // Continue - filtered out
@@ -1757,7 +1751,13 @@ pub async fn fetch_datablocks_for_metablocks(
             }
             DatablockStorageKind::Inline(_) => {
                 // Can deserialize immediately - no disk I/O needed
-                let datablock = deserialize_datablock(kept.metablock.uncompressed_size, &kept.metablock.datablock, None)?;
+                let datablock = deserialise_datablock(
+                    kept.metablock.uncompressed_size, 
+                    kept.metablock.compressed_size,
+                    kept.metablock.datablock_version,
+                    kept.metablock.datablock_compression_type, 
+                    &kept.metablock.datablock, 
+                    None)?;
                 results.push((kept.metablock.clone(), Some(datablock)));
             }
             DatablockStorageKind::Block(_) => {
@@ -1822,7 +1822,13 @@ pub async fn fetch_datablocks_for_metablocks(
         // Deserialize and update results
         for (result_idx, blob) in indices.into_iter().zip(blobs) {
             let metablock = &results[result_idx].0;
-            let datablock = deserialize_datablock(metablock.uncompressed_size, &metablock.datablock, Some(&blob))?;
+            let datablock = deserialise_datablock(
+                metablock.uncompressed_size,
+                metablock.compressed_size,
+                metablock.datablock_version,
+                metablock.datablock_compression_type,
+                &metablock.datablock, 
+                Some(&blob))?;
             results[result_idx].1 = Some(datablock);
         }
     }

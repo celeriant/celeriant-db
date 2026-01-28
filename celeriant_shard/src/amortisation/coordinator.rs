@@ -1,5 +1,5 @@
 use crate::amortisation::local_event::LocalEvent;
-use celeriant_rotating_log::rwlock_timeout::{read_with_timeout, write_with_timeout};
+use celeriant_disk::files::rwlock_timeout::{read_with_timeout, write_with_timeout};
 use glommio::sync::RwLock;
 use std::{rc::Rc, time::Duration};
 

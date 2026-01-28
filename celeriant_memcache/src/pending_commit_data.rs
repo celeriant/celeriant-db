@@ -1,5 +1,5 @@
 use crate::{pending_cache_item::PendingCacheItem};
-use celeriant_rotating_log::log_segment_file_metadata::LogSegmentFileMetadata;
+use celeriant_rotating_log::log_segment_file::log_segment_file_metadata::LogSegmentFileMetadata;
 use celeriant_wal::constants::FIXED_BLOCK_SIZE_BYTES;
 
 /// Data needed to complete a commit after successful replication
