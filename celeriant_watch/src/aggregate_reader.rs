@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use celeriant_wire::wire_format_error::WireFormatError;
+use celeriant_wire::{codec::codec_error::CodecError};
 
 use crate::aggregate_watchers::AggregateWatchers;
 
@@ -8,7 +8,7 @@ use crate::aggregate_watchers::AggregateWatchers;
 #[derive(Debug)]
 pub enum WatchReadError {
     Io(String),
-    Serialization(WireFormatError),
+    Serialization(CodecError),
     Other(String),
 }
 

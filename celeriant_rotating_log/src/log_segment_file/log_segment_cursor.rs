@@ -1,7 +1,6 @@
 use celeriant_wal::{constants::EntryHashBytes, shard_log_header::ShardLogHeader};
 
-use crate::aggregate_key_bloom::AggregateKeyBloom;
-
+use crate::log_segment_file::aggregate_key_bloom::AggregateKeyBloom;
 
 /// Cursor tracking positions within a log segment file.
 #[derive(Clone, Default)]

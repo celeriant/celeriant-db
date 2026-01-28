@@ -63,7 +63,16 @@ pub(crate) async fn commit_fsync_with_rollback(
     watched_aggregates: Rc<AggregateWatchers>,
     mut captured: FsyncCapturedData,
 ) -> Result<(), ShardFsyncError> {
-    log_segments_cache.rotate_to_next_log(captured.required_disk_space).await?;
+    let available_space = log_segments_cache.active_log_available_space();
+    if available_space < captured.required_disk_space {
+
+        if self.preallocate_bytes.saturating_sub(required_disk_space).saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64 * 2) == 0 {
+            return Err(RotatingLogError::BatchesTooLarge(self.preallocate_bytes));
+        }
+        
+        log_segments_cache.rotate_to_next_log().await?;
+    }
+    
     let active_log_segment = log_segments_cache.active();
 
     match sync(active_log_segment.clone(), &mut captured.sync_positions_snapshot).await {

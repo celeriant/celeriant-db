@@ -13,6 +13,7 @@ glommio.workspace = true
 futures-lite.workspace = true
 lru.workspace = true
 fastbloom.workspace = true
+bincode.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

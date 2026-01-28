@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 glommio.workspace = true
+futures-lite.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

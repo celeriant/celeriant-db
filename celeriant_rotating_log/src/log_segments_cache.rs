@@ -2,7 +2,7 @@ use celeriant_wal::constants::HEADER_BLOCK_SIZE_BYTES;
 use lru::LruCache;
 use std::{cell::{Cell, RefCell}, num::NonZeroUsize, path::PathBuf, rc::Rc};
 
-use crate::{log_segment_cursor::LogSegmentCursor, log_segment_file::LogSegmentFile, rotating_log_error::RotatingLogError};
+use crate::{errors::{open_or_create_error::OpenOrCreateError, ready_up_error::ReadyUpError}, log_segment_file::{log_segment_cursor::LogSegmentCursor, log_segment_file::LogSegmentFile}};
 
 /// Manages DmaFile handles for a shard with LRU caching.
 /// "Active File" file is the current log being written to
@@ -102,23 +102,14 @@ impl LogSegmentsCache {
             .unwrap_or(write_cursor)
     }
 
-    pub async fn rotate_to_next_log(&self, required_disk_space: u64) -> Result<bool, RotatingLogError> {
+    pub fn active_log_available_space(&self) -> u64 {
+        let active_file = self.active_file.borrow();
+        let metadata = active_file.metadata.borrow();
+        metadata.available_space()
+    }
 
-        let (current_log_id, available_space) = {
-            let active_file = self.active_file.borrow();
-            let active_file_metadata = active_file.metadata.borrow();
-            let available_space = active_file_metadata.available_space();
-            (active_file_metadata.log_id, available_space)
-        };
-
-        if available_space.saturating_sub(required_disk_space) > 0 {
-            return Ok(false)
-        }
-
-        if self.preallocate_bytes.saturating_sub(required_disk_space).saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64 * 2) == 0 {
-            return Err(RotatingLogError::BatchesTooLarge(self.preallocate_bytes));
-        }
-
+    pub async fn rotate_to_next_log(&self) -> Result<(), OpenOrCreateError> {
+        let current_log_id = self.active_log_id();
         let active_log_id = current_log_id.saturating_add(1);
 
         let new_log_segment_file = Rc::new(LogSegmentFile::open_or_create(&self.shard_dir, self.preallocate_bytes, active_log_id, false).await?);
@@ -128,24 +119,33 @@ impl LogSegmentsCache {
 
         self.lru_cache.borrow_mut().put(current_log_id, old);
 
-        Ok(true)
+        Ok(())
     }
 
     /// Called when starting up a shard, ensures we always have an active log file to write to
-    pub async fn ready_up(shard_dir: PathBuf, preallocate_bytes: u64, max_cached_files: usize) -> Result<Self, RotatingLogError> {
+    pub async fn ready_up(shard_dir: PathBuf, preallocate_bytes: u64, max_cached_files: usize) -> Result<Self, ReadyUpError> {
         if preallocate_bytes <= HEADER_BLOCK_SIZE_BYTES as u64 * 2 || preallocate_bytes % HEADER_BLOCK_SIZE_BYTES as u64 != 0 {
-            return Err(RotatingLogError::InvalidPreallocatedBytes(preallocate_bytes));
+            return Err(ReadyUpError::InvalidPreallocatedBytes(preallocate_bytes));
         }
 
-        std::fs::create_dir_all(&shard_dir)?;
+        std::fs::create_dir_all(&shard_dir)
+            .map_err(|source| ReadyUpError::UnableToCreateDirectory {
+                directory: shard_dir.to_string_lossy().to_string(),
+                source,
+            })?;
 
         let active_log_id = find_latest_log_file(&shard_dir)
-            .map_err(|e| RotatingLogError::IoError(e.to_string()))?
+            .map_err(|source| ReadyUpError::UnableToAccessDirectory {
+                directory: shard_dir.to_string_lossy().to_string(),
+                source,
+            })?
             .unwrap_or(FIRST_LOG_ID);
 
-        let active_file = LogSegmentFile::open_or_create(&shard_dir, preallocate_bytes, active_log_id, true).await?;
+        let active_file = LogSegmentFile::open_or_create(&shard_dir, preallocate_bytes, active_log_id, true).await
+            .map_err(|source| ReadyUpError::ActiveFileError(source))?;
 
         let cache_cap = NonZeroUsize::new(max_cached_files.max(1)).unwrap();
+        
         Ok(Self {
             active_file: RefCell::new(Rc::new(active_file)),
             lru_cache: RefCell::new(LruCache::new(cache_cap)),
@@ -166,11 +166,9 @@ impl LogSegmentsCache {
     /// Close all files and clear cache.
     /// Will wait on other writers to finish their writes and release locks
     /// before closing files.
-    pub async fn close(&self) -> Result<(), RotatingLogError> {
-        // Close active writer file
-        self.active_file.borrow().close().await?;
+    pub async fn close(&self) {
+        self.active_file.borrow().close().await;
 
-        // Drain cache by popping all entries
         let cached_files: Vec<Rc<LogSegmentFile>> = {
             let mut cache = self.lru_cache.borrow_mut();
             let mut files = Vec::with_capacity(cache.len());
@@ -181,14 +179,12 @@ impl LogSegmentsCache {
         };
 
         for file in cached_files {
-            file.close().await?;
+            file.close().await;
         }
-
-        Ok(())
     }
 
     /// Get file by log_id. Returns reader copy of active file or opens/caches older file.
-    pub async fn get(&self, log_id: u64) -> Result<Rc<LogSegmentFile>, RotatingLogError> {
+    pub async fn get(&self, log_id: u64) -> Result<Rc<LogSegmentFile>, OpenOrCreateError> {
         // Return the reader duplicate for active file to avoid blocking writers
         if log_id == self.active_log_id() {
             return Ok(self.active());
@@ -259,40 +255,221 @@ fn find_latest_log_file(dir: &PathBuf) -> Result<Option<u64>, std::io::Error> {
 
 
 #[cfg(test)]
-mod log_segments_cache_tests {
+mod tests {
+    use super::*;
     use glommio::{LocalExecutorBuilder, Placement};
 
-    use super::*;
+    macro_rules! glommio_test {
+        ($body:expr) => {
+            LocalExecutorBuilder::new(Placement::Fixed(0))
+                .spawn(|| async move { $body })
+                .unwrap()
+                .join()
+                .unwrap()
+        };
+    }
 
-    fn create_test_dir() -> (tempfile::TempDir, PathBuf) {
-        let tempdir = tempfile::tempdir().unwrap();
-        let shard_dir = tempdir.path().join("test_shard");
-        (tempdir, shard_dir)
+    fn test_dir() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("shard");
+        (tmp, dir)
+    }
+
+    const FILE_SIZE: u64 = 1024 * 1024 * 4;
+
+    #[test]
+    fn ready_up_creates_dir_and_first_log() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let cache = LogSegmentsCache::ready_up(dir.clone(), FILE_SIZE, 2).await.unwrap();
+
+            assert!(dir.exists());
+            assert!(dir.join("log_1.wal").exists());
+            assert_eq!(cache.active_log_id(), 1);
+
+            cache.close().await;
+        });
     }
 
     #[test]
-    fn ready_up_create() {
-        let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
-            .spawn(|| async move {
-                let (_tempdir, shard_dir) = create_test_dir();
-                let preallocate_bytes = 1024 * 1024 * 4;
+    fn ready_up_invalid_preallocate_bytes() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
 
-                let cache = LogSegmentsCache::ready_up(shard_dir.clone(), preallocate_bytes, 2)
-                    .await
-                    .unwrap();
-
-                // Verify directory and first log file were created
-                assert!(shard_dir.exists());
-                assert!(shard_dir.join("log_1.wal").exists());
-
-                // Verify file size matches preallocate_bytes
-                let metadata = std::fs::metadata(shard_dir.join("log_1.wal")).unwrap();
-                assert_eq!(metadata.len(), preallocate_bytes);
-
-                cache.close().await.unwrap();
-            })
-            .unwrap();
-        handle.join().unwrap();
+            for bad_size in [0, 512, HEADER_BLOCK_SIZE_BYTES as u64, HEADER_BLOCK_SIZE_BYTES as u64 * 2] {
+                let result = LogSegmentsCache::ready_up(dir.clone(), bad_size, 2).await;
+                assert!(matches!(result, Err(ReadyUpError::InvalidPreallocatedBytes(_))));
+            }
+        });
     }
 
+    #[test]
+    fn ready_up_finds_latest_existing_log() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            std::fs::create_dir_all(&dir).unwrap();
+
+            use crate::log_segment_file::log_segment_file::LogSegmentFile;
+            for id in [1, 3, 7] {
+                LogSegmentFile::open_or_create(&dir, FILE_SIZE, id, true).await.unwrap().close().await;
+            }
+
+            let cache = LogSegmentsCache::ready_up(dir.clone(), FILE_SIZE, 2).await.unwrap();
+            assert_eq!(cache.active_log_id(), 7);
+            cache.close().await;
+        });
+    }
+
+    #[test]
+    fn active_returns_current_file() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let cache = LogSegmentsCache::ready_up(dir, FILE_SIZE, 2).await.unwrap();
+
+            let active = cache.active();
+            assert_eq!(active.metadata.borrow().log_id, 1);
+
+            cache.close().await;
+        });
+    }
+
+    #[test]
+    fn get_returns_active_for_active_id() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let cache = LogSegmentsCache::ready_up(dir, FILE_SIZE, 2).await.unwrap();
+
+            let file = cache.get(1).await.unwrap();
+            assert_eq!(file.metadata.borrow().log_id, 1);
+
+            cache.close().await;
+        });
+    }
+
+    #[test]
+    fn rotate_creates_new_log_and_caches_old() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let cache = LogSegmentsCache::ready_up(dir.clone(), FILE_SIZE, 2).await.unwrap();
+
+            assert_eq!(cache.active_log_id(), 1);
+            cache.rotate_to_next_log().await.unwrap();
+            assert_eq!(cache.active_log_id(), 2);
+
+            assert!(dir.join("log_2.wal").exists());
+            assert!(cache.get_if_cached(1).is_some());
+
+            cache.close().await;
+        });
+    }
+
+    #[test]
+    fn get_opens_uncached_file() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let cache = LogSegmentsCache::ready_up(dir.clone(), FILE_SIZE, 2).await.unwrap();
+
+            cache.rotate_to_next_log().await.unwrap();
+            cache.rotate_to_next_log().await.unwrap();
+            cache.rotate_to_next_log().await.unwrap();
+
+            assert!(cache.get_if_cached(1).is_none());
+
+            let file = cache.get(1).await.unwrap();
+            assert_eq!(file.metadata.borrow().log_id, 1);
+            assert!(cache.get_if_cached(1).is_some());
+
+            cache.close().await;
+        });
+    }
+
+    #[test]
+    fn get_if_cached_returns_none_when_not_cached() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let cache = LogSegmentsCache::ready_up(dir, FILE_SIZE, 2).await.unwrap();
+
+            assert!(cache.get_if_cached(1).is_some());
+            assert!(cache.get_if_cached(99).is_none());
+
+            cache.close().await;
+        });
+    }
+
+    #[test]
+    fn lru_eviction() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let cache = LogSegmentsCache::ready_up(dir, FILE_SIZE, 2).await.unwrap();
+
+            for _ in 0..5 {
+                cache.rotate_to_next_log().await.unwrap();
+            }
+
+            assert!(cache.get_if_cached(1).is_none());
+            assert!(cache.get_if_cached(2).is_none());
+            assert!(cache.get_if_cached(3).is_none());
+            assert!(cache.get_if_cached(4).is_some());
+            assert!(cache.get_if_cached(5).is_some());
+            assert!(cache.get_if_cached(6).is_some());
+
+            cache.close().await;
+        });
+    }
+
+    #[test]
+    fn available_space_delegates_to_metadata() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let cache = LogSegmentsCache::ready_up(dir, FILE_SIZE, 2).await.unwrap();
+
+            let space = cache.active_log_available_space();
+            let expected = cache.active().metadata.borrow().available_space();
+            assert_eq!(space, expected);
+
+            cache.close().await;
+        });
+    }
+
+    #[test]
+    fn multiple_rotations() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let cache = LogSegmentsCache::ready_up(dir.clone(), FILE_SIZE, 8).await.unwrap();
+
+            for expected_id in 2..=10 {
+                cache.rotate_to_next_log().await.unwrap();
+                assert_eq!(cache.active_log_id(), expected_id);
+                assert!(dir.join(format!("log_{expected_id}.wal")).exists());
+            }
+
+            cache.close().await;
+        });
+    }
+
+    #[test]
+    fn get_nonexistent_fails() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let cache = LogSegmentsCache::ready_up(dir, FILE_SIZE, 2).await.unwrap();
+
+            let result = cache.get(99).await;
+            assert!(result.is_err());
+
+            cache.close().await;
+        });
+    }
+
+    #[test]
+    fn close_is_idempotent() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let cache = LogSegmentsCache::ready_up(dir, FILE_SIZE, 2).await.unwrap();
+
+            cache.rotate_to_next_log().await.unwrap();
+
+            cache.close().await;
+            cache.close().await;
+        });
+    }
 }
