@@ -5,9 +5,9 @@ use serde::Serialize;
 
 use crate::{codec, network::wire_error::WireError};
 
-const PROTOCOL_VERSION_V2: u32 = 2;
-const PROTOCOL_VERSION_V3: u32 = 3;
-const WIRE_HEADER_SIZE: usize = 17;
+pub const PROTOCOL_VERSION_V2: u32 = 2;
+pub const PROTOCOL_VERSION_V3: u32 = 3;
+pub const WIRE_HEADER_SIZE: usize = 17;
 pub const WIRE_FIXED_BODY_SIZE: usize = 1024 - WIRE_HEADER_SIZE;
 
 #[derive(Debug)]
@@ -89,43 +89,31 @@ impl WireHeader {
         reader.read_exact(&mut payload).await?;
         
         let uncompressed_length = self.uncompressed_length as usize;
-        let obj = match self.version {
+        match self.version {
             PROTOCOL_VERSION_V2 => {
-
-                // Save the extra heap allocation if no compression
                 if self.compression_type == CompressionType::None {
-                    codec::bincode::fixed_deserialise(&payload)?
+                    return Ok(codec::bincode::fixed_deserialise(&payload)?);
                 }
-
-                // Decompress and deserialize
                 let decompressed = codec::compression::decompress(
                     &payload,
                     self.compression_type,
                     uncompressed_length,
                 )?;
-
-                codec::bincode::fixed_deserialise(&decompressed)?
+                Ok(codec::bincode::fixed_deserialise(&decompressed)?)
             }
             PROTOCOL_VERSION_V3 => {
-
-                // Save the extra heap allocation if no compression
                 if self.compression_type == CompressionType::None {
-                    codec::msgpack::deserialise(&payload)?
+                    return Ok(codec::msgpack::deserialise(&payload)?);
                 }
-
-                // Decompress and deserialize
                 let decompressed = codec::compression::decompress(
                     &payload,
                     self.compression_type,
                     uncompressed_length,
                 )?;
-
-                codec::msgpack::deserialise(&decompressed)?
-            },
-            _ => return Err(WireError::UnsupportedProtocol(self.version)),
-        };
-
-        Ok(obj)
+                Ok(codec::msgpack::deserialise(&decompressed)?)
+            }
+            _ => Err(WireError::UnsupportedProtocol(self.version)),
+        }
     }
 
     /// Reads a fixed-size payload from the reader into the provided buffer.
@@ -502,6 +490,17 @@ mod tests {
     fn variable_size_roundtrip_v3_no_compression() {
         block_on(async {
             let msg = vec![1u8, 2, 3, 4, 5];
+            let result: Vec<u8> = roundtrip_variable(&msg, 1, CompressionType::None, 3).await;
+            assert_eq!(result, msg);
+        });
+    }
+
+    #[test]
+    fn variable_size_roundtrip_v3_large_no_compression() {
+        // Regression test: V3 + large payload + no compression must use the
+        // heap path in read_variable_size, not fall through to decompression
+        block_on(async {
+            let msg = vec![42u8; 2000];
             let result: Vec<u8> = roundtrip_variable(&msg, 1, CompressionType::None, 3).await;
             assert_eq!(result, msg);
         });

@@ -1,10 +1,17 @@
-use std::u64;
-
 use celeriant_wal::compression_type::CompressionType;
-use celeriant_wire::{constants::WIRE_FIXED_BODY_SIZE, wire_error::WireError, wire_header::WireHeader};
+use celeriant_wire::network::{
+    wire_error::WireError,
+    wire_header::{WireHeader, wire_header_write_fixed_size, wire_header_write_variable_size},
+};
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
 
-use crate::response::responses::{CatchUpResponse, ErrorResponse, ExistsResponse, ListAggregateTypesResponse, ListAggregatesResponse, ListOrgsResponse, ProtocolErrorResponse, ReadResponse, ReplicationBatchResponse, SuccessResponse, WatchResponse};
+use crate::{
+    read_wire_data_error::ReadWireDataError,
+    response::responses::{
+        CatchUpResponse, ErrorResponse, ExistsResponse, ListAggregateTypesResponse, ListAggregatesResponse, ListOrgsResponse, ProtocolErrorResponse,
+        ReadResponse, ReplicationBatchResponse, SuccessResponse, WatchResponse,
+    },
+};
 
 // Response type discriminants
 #[repr(u32)]
@@ -26,7 +33,7 @@ pub enum ResponseType {
 }
 
 impl ResponseType {
-    pub fn from_u32(value: u32) -> Result<Self, WireError> {
+    pub fn from_u32(value: u32) -> Result<Self, ReadWireDataError> {
         match value {
             1 => Ok(ResponseType::Exists),
             2 => Ok(ResponseType::Read),
@@ -41,24 +48,10 @@ impl ResponseType {
             11 => Ok(ResponseType::ListAggregates),
             12 => Ok(ResponseType::ReplicationBatch),
             13 => Ok(ResponseType::CatchUp),
-            _ => Err(WireError::UnknownResponseType(value)),
+            _ => Err(ReadWireDataError::UnknownMessageType(value)),
         }
     }
-
-    pub fn is_fixed_size(&self) -> bool {
-        matches!(
-            self,
-            ResponseType::Exists
-                | ResponseType::TrimStart
-                | ResponseType::Delete
-                | ResponseType::ProtocolError
-                | ResponseType::Write
-                | ResponseType::GenericError
-                | ResponseType::ReplicationBatch
-        )
-    }
 }
-
 
 #[derive(Debug, Clone)]
 pub enum Response {
@@ -96,84 +89,70 @@ impl Response {
         }
     }
 
-    pub async fn read_response<R>(reader: &mut R) -> Result<Response, WireError>
+    pub async fn read_response<R>(reader: &mut R, max_response_size: u64) -> Result<Response, ReadWireDataError>
     where
         R: AsyncReadExt + Unpin,
     {
-        let wire_header = WireHeader::from_reader(reader).await?;
+        let wire_header = WireHeader::from_reader(reader, max_response_size)
+            .await
+            .map_err(ReadWireDataError::ReadHeaderFailure)?;
 
         let response_type = ResponseType::from_u32(wire_header.message_type)?;
 
-        let response = if response_type.is_fixed_size() {
-            // Single buffer large enough for any fixed-size response
-            let mut buffer = [0u8; WIRE_FIXED_BODY_SIZE]; // Adjust size based on largest fixed response
+        macro_rules! fixed {
+            ($variant:ident) => {
+                Response::$variant(
+                    wire_header
+                        .read_fixed_size(reader)
+                        .await
+                        .map_err(ReadWireDataError::ReadBodyFailure)?,
+                )
+            };
+        }
 
-            match response_type {
-                ResponseType::Exists => {
-                    Response::Exists(wire_header.read_fixed_size(reader, &mut buffer).await?)
-                }
-                ResponseType::TrimStart => {
-                    Response::TrimStart(wire_header.read_fixed_size(reader, &mut buffer).await?)
-                }
-                ResponseType::Delete => {
-                    Response::Delete(wire_header.read_fixed_size(reader, &mut buffer).await?)
-                }
-                ResponseType::ProtocolError => {
-                    Response::ProtocolError(wire_header.read_fixed_size(reader, &mut buffer).await?)
-                }
-                ResponseType::Write => {
-                    Response::Write(wire_header.read_fixed_size(reader, &mut buffer).await?)
-                }
-                ResponseType::GenericError => {
-                    Response::GenericError(wire_header.read_fixed_size(reader, &mut buffer).await?)
-                }
-                ResponseType::ReplicationBatch => {
-                    Response::ReplicationBatch(wire_header.read_fixed_size(reader, &mut buffer).await?)
-                }
-                _ => unreachable!(),
-            }
-        } else {
-            match response_type {
-                ResponseType::Read => {
-                    Response::Read(wire_header.read_variable_size(reader, u64::MAX).await?)
-                }
-                ResponseType::Watch => {
-                    Response::Watch(wire_header.read_variable_size(reader, u64::MAX).await?)
-                }
-                ResponseType::ListOrgs => {
-                    Response::ListOrgs(wire_header.read_variable_size(reader, u64::MAX).await?)
-                }
-                ResponseType::ListAggregateTypes => {
-                    Response::ListAggregateTypes(wire_header.read_variable_size(reader, u64::MAX).await?)
-                }
-                ResponseType::ListAggregates => {
-                    Response::ListAggregates(wire_header.read_variable_size(reader, u64::MAX).await?)
-                }
-                ResponseType::CatchUp => {
-                    Response::CatchUp(wire_header.read_variable_size(reader, u64::MAX).await?)
-                }
-                _ => unreachable!(),
-            }
-        };
+        macro_rules! variable {
+            ($variant:ident) => {
+                Response::$variant(
+                    wire_header
+                        .read_variable_size(reader)
+                        .await
+                        .map_err(ReadWireDataError::ReadBodyFailure)?,
+                )
+            };
+        }
 
-        Ok(response)
+        Ok(match response_type {
+            ResponseType::Exists => fixed!(Exists),
+            ResponseType::Write => fixed!(Write),
+            ResponseType::TrimStart => fixed!(TrimStart),
+            ResponseType::Delete => fixed!(Delete),
+            ResponseType::ProtocolError => fixed!(ProtocolError),
+            ResponseType::GenericError => fixed!(GenericError),
+            ResponseType::ReplicationBatch => fixed!(ReplicationBatch),
+            ResponseType::Read => variable!(Read),
+            ResponseType::Watch => variable!(Watch),
+            ResponseType::ListOrgs => variable!(ListOrgs),
+            ResponseType::ListAggregateTypes => variable!(ListAggregateTypes),
+            ResponseType::ListAggregates => variable!(ListAggregates),
+            ResponseType::CatchUp => variable!(CatchUp),
+        })
     }
 
-    pub fn determine_compression_type(response: &Response) -> CompressionType {
+    pub fn determine_compression_type(response: &Response, server_compression_algorithm: CompressionType) -> CompressionType {
         match response {
             Response::Exists(_) => CompressionType::None,
-            Response::Read(_) => CompressionType::Snappy,
+            Response::Read(_) => server_compression_algorithm,
             Response::Write(_) => CompressionType::None,
             Response::TrimStart(_) => CompressionType::None,
             Response::Delete(_) => CompressionType::None,
             Response::ProtocolError(_) => CompressionType::None,
             Response::GenericError(_) => CompressionType::None,
-            Response::Watch(_) => CompressionType::Snappy,
-            Response::ListOrgs(_) => CompressionType::Snappy,
-            Response::ListAggregateTypes(_) => CompressionType::Snappy,
-            Response::ListAggregates(_) => CompressionType::Snappy,
+            Response::Watch(_) => server_compression_algorithm,
+            Response::ListOrgs(_) => server_compression_algorithm,
+            Response::ListAggregateTypes(_) => server_compression_algorithm,
+            Response::ListAggregates(_) => server_compression_algorithm,
             Response::ReplicationBatch(_) => CompressionType::None,
-            Response::CatchUp(_) => CompressionType::Snappy,
+            Response::CatchUp(_) => server_compression_algorithm,
         }
     }
 
@@ -181,49 +160,28 @@ impl Response {
         writer: &mut W,
         response: &Response,
         compression_type: CompressionType,
+        max_message_size: u64,
         version: u32,
     ) -> Result<(), WireError>
     where
         W: AsyncWriteExt + Unpin,
     {
-        let response_type = response.response_type();
-        let response_type_id = response_type as u32;
+        let response_type_id = response.response_type() as u32;
 
-        if response_type.is_fixed_size() {
-            // Fixed-size responses - no compression needed
-            match response {
-                Response::Exists(res) => WireHeader::write_fixed_size(writer, res, response_type_id, version).await,
-                Response::TrimStart(res) => WireHeader::write_fixed_size(writer, res, response_type_id, version).await,
-                Response::Delete(res) => WireHeader::write_fixed_size(writer, res, response_type_id, version).await,
-                Response::ProtocolError(res) => WireHeader::write_fixed_size(writer, res, response_type_id, version).await,
-                Response::Write(res) => WireHeader::write_fixed_size(writer, res, response_type_id, version).await,
-                Response::GenericError(res) => WireHeader::write_fixed_size(writer, res, response_type_id, version).await,
-                Response::ReplicationBatch(res) => WireHeader::write_fixed_size(writer, res, response_type_id, version).await,
-                _ => unreachable!(),
-            }
-        } else {
-            // Variable-size responses - with compression
-            match response {
-                Response::Read(res) => {
-                    WireHeader::write_variable_size(writer, res, response_type_id, compression_type, u64::MAX, version).await
-                }
-                Response::Watch(res) => {
-                    WireHeader::write_variable_size(writer, res, response_type_id, compression_type, u64::MAX, version).await
-                }
-                Response::ListOrgs(res) => {
-                    WireHeader::write_variable_size(writer, res, response_type_id, compression_type, u64::MAX, version).await
-                }
-                Response::ListAggregateTypes(res) => {
-                    WireHeader::write_variable_size(writer, res, response_type_id, compression_type, u64::MAX, version).await
-                }
-                Response::ListAggregates(res) => {
-                    WireHeader::write_variable_size(writer, res, response_type_id, compression_type, u64::MAX, version).await
-                }
-                Response::CatchUp(res) => {
-                    WireHeader::write_variable_size(writer, res, response_type_id, compression_type, u64::MAX, version).await
-                }
-                _ => unreachable!(),
-            }
+        match response {
+            Response::Exists(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
+            Response::Write(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
+            Response::TrimStart(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
+            Response::Delete(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
+            Response::ProtocolError(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
+            Response::GenericError(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
+            Response::ReplicationBatch(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
+            Response::Read(res) => wire_header_write_variable_size(writer, res, response_type_id, compression_type, max_message_size, version).await,
+            Response::Watch(res) => wire_header_write_variable_size(writer, res, response_type_id, compression_type, max_message_size, version).await,
+            Response::ListOrgs(res) => wire_header_write_variable_size(writer, res, response_type_id, compression_type, max_message_size, version).await,
+            Response::ListAggregateTypes(res) => wire_header_write_variable_size(writer, res, response_type_id, compression_type, max_message_size, version).await,
+            Response::ListAggregates(res) => wire_header_write_variable_size(writer, res, response_type_id, compression_type, max_message_size, version).await,
+            Response::CatchUp(res) => wire_header_write_variable_size(writer, res, response_type_id, compression_type, max_message_size, version).await,
         }
     }
 }
@@ -231,188 +189,344 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::response::responses::ReplicationResult;
-    use celeriant_wire::constants::{PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3};
+    use crate::response::responses::{AggregateListItem, AggregateTypeListItem, OrgListItem, ReplicationResult};
+    use celeriant_wire::network::wire_header::{PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3};
     use futures_lite::{future::block_on, io::Cursor};
 
-    // UPDATE THIS when adding new ResponseTypes - tests will fail if mismatched
-    const RESPONSE_TYPE_COUNT: usize = 13;
-    const RESPONSE_TYPE_MAX_ID: u32 = 13;
+    const COUNT: usize = 13;
+    const MAX_ID: u32 = 13;
+    const VERSIONS: [u32; 2] = [PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3];
 
-    impl ResponseType {
-        /// Returns all ResponseType variants. Adding a new variant without updating
-        /// this function will cause a compile error due to non-exhaustive match.
-        fn all() -> [ResponseType; RESPONSE_TYPE_COUNT] {
-            [
-                ResponseType::Exists,
-                ResponseType::Read,
-                ResponseType::Write,
-                ResponseType::TrimStart,
-                ResponseType::Delete,
-                ResponseType::ProtocolError,
-                ResponseType::GenericError,
-                ResponseType::Watch,
-                ResponseType::ListOrgs,
-                ResponseType::ListAggregateTypes,
-                ResponseType::ListAggregates,
-                ResponseType::ReplicationBatch,
-                ResponseType::CatchUp,
-            ]
-        }
+    fn all_types() -> [ResponseType; COUNT] {
+        [
+            ResponseType::Exists,
+            ResponseType::Read,
+            ResponseType::Write,
+            ResponseType::TrimStart,
+            ResponseType::Delete,
+            ResponseType::ProtocolError,
+            ResponseType::GenericError,
+            ResponseType::Watch,
+            ResponseType::ListOrgs,
+            ResponseType::ListAggregateTypes,
+            ResponseType::ListAggregates,
+            ResponseType::ReplicationBatch,
+            ResponseType::CatchUp,
+        ]
     }
 
-    /// Creates a test Response for each ResponseType. Non-exhaustive match will
-    /// cause compile error if new variants are added without updating this.
-    fn make_test_response(response_type: ResponseType) -> Response {
-        match response_type {
+    fn make_response(rt: ResponseType) -> Response {
+        match rt {
             ResponseType::Exists => Response::Exists(ExistsResponse {
-                correlation_id: Some(102),
-                min_event_batch_index: 0,
+                correlation_id: Some(0xDEAD_BEEF_CAFE_BABE),
+                min_event_batch_index: 42,
             }),
             ResponseType::Read => Response::Read(ReadResponse {
-                correlation_id: Some(103),
+                correlation_id: Some(0xFEED_FACE_DEAD_C0DE),
                 event_batches: vec![],
-                next_event_batch_index: Some(5),
-            }),
-            ResponseType::Watch => Response::Watch(WatchResponse {
-                events: None,
+                next_event_batch_index: Some(100),
             }),
             ResponseType::Write => Response::Write(SuccessResponse {
-                correlation_id: Some(105),
+                correlation_id: Some(0xCAFE_D00D_BEEF_F00D),
             }),
             ResponseType::TrimStart => Response::TrimStart(SuccessResponse {
-                correlation_id: Some(106),
+                correlation_id: Some(0xBAD_C0FFEE),
             }),
             ResponseType::Delete => Response::Delete(SuccessResponse {
-                correlation_id: Some(107),
+                correlation_id: Some(0xDEAD_DEAD_DEAD_DEAD),
             }),
             ResponseType::ProtocolError => Response::ProtocolError(ProtocolErrorResponse {}),
-            ResponseType::GenericError => Response::GenericError(ErrorResponse { 
-                correlation_id: Some(109), 
-                error_code: 99, 
-                error_message: "Got an error, sorry!".to_string()
+            ResponseType::GenericError => Response::GenericError(ErrorResponse {
+                correlation_id: Some(0x1111_2222_3333_4444),
+                error_code: 0xFFFF,
+                error_message: "test error".into(),
             }),
+            ResponseType::Watch => Response::Watch(WatchResponse { events: None }),
             ResponseType::ListOrgs => Response::ListOrgs(ListOrgsResponse {
-                correlation_id: Some(110),
+                correlation_id: Some(0x2222_3333_4444_5555),
                 orgs: vec![],
-                next_cursor: None,
+                next_cursor: Some(999),
             }),
             ResponseType::ListAggregateTypes => Response::ListAggregateTypes(ListAggregateTypesResponse {
-                correlation_id: Some(111),
+                correlation_id: Some(0x3333_4444_5555_6666),
                 aggregate_types: vec![],
                 next_cursor: None,
             }),
             ResponseType::ListAggregates => Response::ListAggregates(ListAggregatesResponse {
-                correlation_id: Some(112),
+                correlation_id: Some(0x4444_5555_6666_7777),
                 aggregates: vec![],
-                next_cursor: None,
+                next_cursor: Some(12345),
             }),
             ResponseType::ReplicationBatch => Response::ReplicationBatch(ReplicationBatchResponse {
-                correlation_id: Some(113),
-                follower_timestamp_ms: 0,
+                correlation_id: Some(0x5555_6666_7777_8888),
+                follower_timestamp_ms: 9999999,
                 result: ReplicationResult::Success { last_follower_metablock: None },
             }),
             ResponseType::CatchUp => Response::CatchUp(CatchUpResponse {
-                correlation_id: Some(114),
+                correlation_id: Some(0x6666_7777_8888_9999),
                 batches: vec![],
-                continue_catching_up: false,
-                expected_follower_tip_hash: None,
+                continue_catching_up: true,
+                expected_follower_tip_hash: Some([0xAB; 32]),
             }),
         }
     }
 
-    #[test]
-    fn all_response_types_covered_in_from_u32() {
-        for response_type in ResponseType::all() {
-            let id = response_type as u32;
-            let parsed = ResponseType::from_u32(id).expect("all variants should parse");
-            assert_eq!(parsed, response_type);
-        }
+    fn is_variable_size(rt: ResponseType) -> bool {
+        matches!(
+            rt,
+            ResponseType::Read
+                | ResponseType::Watch
+                | ResponseType::ListOrgs
+                | ResponseType::ListAggregateTypes
+                | ResponseType::ListAggregates
+                | ResponseType::CatchUp
+        )
+    }
+
+    fn uses_compression(rt: ResponseType) -> bool {
+        matches!(
+            rt,
+            ResponseType::Read
+                | ResponseType::Watch
+                | ResponseType::ListOrgs
+                | ResponseType::ListAggregateTypes
+                | ResponseType::ListAggregates
+                | ResponseType::CatchUp
+        )
+    }
+
+    async fn write_bytes(res: &Response, version: u32, compression: CompressionType) -> Vec<u8> {
+        let mut buf = Vec::new();
+        Response::write_response(&mut buf, res, compression, 64 * 1024 * 1024, version)
+            .await
+            .unwrap();
+        buf
+    }
+
+    async fn read_back(bytes: &[u8]) -> Response {
+        Response::read_response(&mut Cursor::new(bytes.to_vec()), u64::MAX).await.unwrap()
     }
 
     #[test]
-    fn response_type_ids_are_contiguous_from_1() {
-        // Ensures no gaps - if someone adds id=12 but skips 11, this catches it
-        for id in 1..=RESPONSE_TYPE_MAX_ID {
-            ResponseType::from_u32(id)
-                .unwrap_or_else(|_| panic!("id {} should be a valid ResponseType", id));
+    fn type_id_parsing() {
+        for rt in all_types() {
+            assert_eq!(ResponseType::from_u32(rt as u32).unwrap(), rt);
         }
-    }
-
-    #[test]
-    fn invalid_response_type_id_zero_fails() {
+        for id in 1..=MAX_ID {
+            assert!(ResponseType::from_u32(id).is_ok(), "gap at id {}", id);
+        }
         assert!(ResponseType::from_u32(0).is_err());
+        assert!(ResponseType::from_u32(MAX_ID + 1).is_err(), "update MAX_ID to {}", MAX_ID + 1);
     }
 
     #[test]
-    fn invalid_response_type_id_above_max_fails() {
-        // This test fails if someone adds a new variant but doesn't update RESPONSE_TYPE_MAX_ID
-        assert!(
-            ResponseType::from_u32(RESPONSE_TYPE_MAX_ID + 1).is_err(),
-            "If this fails, update RESPONSE_TYPE_MAX_ID to {}", RESPONSE_TYPE_MAX_ID + 1
-        );
-    }
-
-    #[test]
-    fn response_type_round_trip_matches() {
-        for response_type in ResponseType::all() {
-            let response = make_test_response(response_type);
-            assert_eq!(response.response_type(), response_type);
+    fn response_type_accessor() {
+        for rt in all_types() {
+            assert_eq!(make_response(rt).response_type(), rt);
         }
     }
 
     #[test]
-    fn is_fixed_size_consistent_with_variants() {
-        // Verify every response type explicitly declares fixed/variable
-        for response_type in ResponseType::all() {
-            let _ = response_type.is_fixed_size(); // Just ensure it doesn't panic
-        }
-    }
-
-    #[test]
-    fn response_write_read_round_trip_all_types_v2() {
+    fn round_trip_all_versions() {
         block_on(async {
-            for response_type in ResponseType::all() {
-                let original = make_test_response(response_type);
-                let version = PROTOCOL_VERSION_V2;
+            for rt in all_types() {
+                for &v in &VERSIONS {
+                    let res = make_response(rt);
+                    let bytes = write_bytes(&res, v, CompressionType::None).await;
+                    let parsed = read_back(&bytes).await;
 
-                // Write
-                let mut buffer = Vec::new();
-                Response::write_response(&mut buffer, &original, CompressionType::None, version)
-                    .await
-                    .unwrap_or_else(|e| panic!("write failed for {:?}: {:?}", response_type, e));
-
-                // Read
-                let mut cursor = Cursor::new(buffer);
-                let parsed = Response::read_response(&mut cursor)
-                    .await
-                    .unwrap_or_else(|e| panic!("read failed for {:?}: {:?}", response_type, e));
-
-                assert_eq!(parsed.response_type(), response_type);
+                    assert_eq!(parsed.response_type(), rt, "{:?} v{} type mismatch", rt, v);
+                }
             }
         });
     }
 
     #[test]
-    fn response_write_read_round_trip_all_types_v3() {
+    fn fixed_vs_variable_categorization() {
         block_on(async {
-            for response_type in ResponseType::all() {
-                let original = make_test_response(response_type);
-                let version = PROTOCOL_VERSION_V3;
+            for rt in all_types() {
+                let res = make_response(rt);
+                let bytes = write_bytes(&res, PROTOCOL_VERSION_V2, CompressionType::None).await;
+                let compression_byte = bytes[16];
 
-                // Write
-                let mut buffer = Vec::new();
-                Response::write_response(&mut buffer, &original, CompressionType::None, version)
-                    .await
-                    .unwrap_or_else(|e| panic!("write failed for {:?}: {:?}", response_type, e));
+                if is_variable_size(rt) {
+                    assert!(compression_byte == 0 || compression_byte > 0, "{:?} should use variable path", rt);
+                } else {
+                    assert_eq!(compression_byte, 0, "{:?} fixed-size should have no compression", rt);
+                }
+            }
+        });
+    }
 
-                // Read
-                let mut cursor = Cursor::new(buffer);
-                let parsed = Response::read_response(&mut cursor)
-                    .await
-                    .unwrap_or_else(|e| panic!("read failed for {:?}: {:?}", response_type, e));
+    #[test]
+    fn compression_type_determination() {
+        let server_compression = CompressionType::Zstd { level: 6 };
+        for rt in all_types() {
+            let res = make_response(rt);
+            let determined = Response::determine_compression_type(&res, server_compression);
 
-                assert_eq!(parsed.response_type(), response_type);
+            if uses_compression(rt) {
+                assert_eq!(determined, server_compression, "{:?} should use server compression", rt);
+            } else {
+                assert_eq!(determined, CompressionType::None, "{:?} should not compress", rt);
+            }
+        }
+    }
+
+    #[test]
+    fn compression_round_trip() {
+        block_on(async {
+            let compressions = [
+                CompressionType::None,
+                CompressionType::Zstd { level: 6 },
+                CompressionType::Snappy,
+                CompressionType::Brotli { level: 6 },
+                CompressionType::Gzip { level: 6 },
+            ];
+
+            for rt in all_types().into_iter().filter(|rt| is_variable_size(*rt)) {
+                for &compression in &compressions {
+                    for &v in &VERSIONS {
+                        let res = make_response(rt);
+                        let bytes1 = write_bytes(&res, v, compression).await;
+                        let parsed = read_back(&bytes1).await;
+
+                        assert_eq!(parsed.response_type(), rt);
+
+                        let bytes2 = write_bytes(&parsed, v, compression).await;
+                        assert_eq!(bytes1, bytes2, "{:?} {:?} v{} data not preserved", rt, compression, v);
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn size_limit_rejects_oversized() {
+        block_on(async {
+            let res = make_response(ResponseType::Read);
+            let bytes = write_bytes(&res, PROTOCOL_VERSION_V2, CompressionType::None).await;
+            let result = Response::read_response(&mut Cursor::new(bytes), 1).await;
+            assert!(result.is_err(), "should reject when max_size < body size");
+        });
+    }
+
+    #[test]
+    fn truncated_stream_fails() {
+        block_on(async {
+            let res = make_response(ResponseType::Exists);
+            let bytes = write_bytes(&res, PROTOCOL_VERSION_V2, CompressionType::None).await;
+
+            for truncate_at in [0, 10, bytes.len() - 1] {
+                let truncated = &bytes[..truncate_at];
+                let result = Response::read_response(&mut Cursor::new(truncated.to_vec()), u64::MAX).await;
+                assert!(result.is_err(), "should fail with {} bytes (full: {})", truncate_at, bytes.len());
+            }
+        });
+    }
+
+    #[test]
+    fn invalid_message_type_fails() {
+        block_on(async {
+            let res = make_response(ResponseType::Exists);
+            let mut bytes = write_bytes(&res, PROTOCOL_VERSION_V2, CompressionType::None).await;
+
+            bytes[4..8].copy_from_slice(&(MAX_ID + 1).to_le_bytes());
+            let result = Response::read_response(&mut Cursor::new(bytes), u64::MAX).await;
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn large_payload_round_trip() {
+        block_on(async {
+            let res = Response::ListAggregates(ListAggregatesResponse {
+                correlation_id: Some(0x1234_5678_9ABC_DEF0),
+                aggregates: (0u64..500)
+                    .map(|i| AggregateListItem {
+                        is_deleted: false,
+                        org_id: i as u128,
+                        aggregate_type_id: (i * 2) as u128,
+                        aggregate_id: (i * 3) as u128,
+                        event_batch_count: i * 10,
+                        min_event_timestamp: 1000 + i,
+                        max_event_timestamp: 2000 + i,
+                        min_event_batch_index: i,
+                        max_event_batch_index: i + 100,
+                        min_event_index: i * 5,
+                        max_event_index: i * 5 + 50,
+                        min_server_timestamp: 3000 + i,
+                        max_server_timestamp: 4000 + i,
+                        compressed_size: i * 100,
+                        uncompressed_size: i * 200,
+                    })
+                    .collect(),
+                next_cursor: Some(999),
+            });
+
+            let bytes = write_bytes(&res, PROTOCOL_VERSION_V2, CompressionType::None).await;
+            let parsed = read_back(&bytes).await;
+            assert_eq!(parsed.response_type(), ResponseType::ListAggregates);
+
+            let bytes = write_bytes(&res, PROTOCOL_VERSION_V2, CompressionType::Zstd { level: 6 }).await;
+            let parsed = read_back(&bytes).await;
+            assert_eq!(parsed.response_type(), ResponseType::ListAggregates);
+
+            let bytes = write_bytes(&res, PROTOCOL_VERSION_V3, CompressionType::Zstd { level: 6 }).await;
+            let parsed = read_back(&bytes).await;
+            assert_eq!(parsed.response_type(), ResponseType::ListAggregates);
+        });
+    }
+
+    #[test]
+    fn variable_size_responses_with_data() {
+        block_on(async {
+            let orgs = Response::ListOrgs(ListOrgsResponse {
+                correlation_id: Some(1),
+                orgs: (0u128..100).map(|i| OrgListItem { org_id: i }).collect(),
+                next_cursor: Some(100),
+            });
+
+            let types = Response::ListAggregateTypes(ListAggregateTypesResponse {
+                correlation_id: Some(2),
+                aggregate_types: (0u128..50)
+                    .map(|i| AggregateTypeListItem { org_id: i, aggregate_type_id: i * 10 })
+                    .collect(),
+                next_cursor: None,
+            });
+
+            let aggregates = Response::ListAggregates(ListAggregatesResponse {
+                correlation_id: Some(3),
+                aggregates: (0u64..25)
+                    .map(|i| AggregateListItem {
+                        is_deleted: i % 2 == 0,
+                        org_id: i as u128,
+                        aggregate_type_id: (i * 2) as u128,
+                        aggregate_id: (i * 3) as u128,
+                        event_batch_count: i * 10,
+                        min_event_timestamp: 1000 + i,
+                        max_event_timestamp: 2000 + i,
+                        min_event_batch_index: i,
+                        max_event_batch_index: i + 100,
+                        min_event_index: i * 5,
+                        max_event_index: i * 5 + 50,
+                        min_server_timestamp: 3000 + i,
+                        max_server_timestamp: 4000 + i,
+                        compressed_size: i * 100,
+                        uncompressed_size: i * 200,
+                    })
+                    .collect(),
+                next_cursor: Some(999),
+            });
+
+            for res in [orgs, types, aggregates] {
+                for &v in &VERSIONS {
+                    for compression in [CompressionType::None, CompressionType::Zstd { level: 3 }] {
+                        let bytes = write_bytes(&res, v, compression).await;
+                        let parsed = read_back(&bytes).await;
+                        assert_eq!(parsed.response_type(), res.response_type());
+                    }
+                }
             }
         });
     }

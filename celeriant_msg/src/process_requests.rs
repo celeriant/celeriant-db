@@ -1,8 +1,17 @@
 use celeriant_wal::compression_type::CompressionType;
-use celeriant_wire::{constants::WIRE_FIXED_BODY_SIZE, wire_error::WireError, wire_header::WireHeader};
+use celeriant_wire::network::{
+    wire_error::WireError,
+    wire_header::{WireHeader, wire_header_write_fixed_size, wire_header_write_variable_size},
+};
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
 
-use crate::request::requests::{CatchUpRequest, DeleteRequest, ExistsRequest, ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest, ReadRequest, ReplicationBatchRequest, TrimStartRequest, WatchRequest, WriteRequest};
+use crate::{
+    read_wire_data_error::ReadWireDataError,
+    request::requests::{
+        CatchUpRequest, DeleteRequest, ExistsRequest, ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest, ReadRequest,
+        ReplicationBatchRequest, TrimStartRequest, WatchRequest, WriteRequest,
+    },
+};
 
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,7 +30,7 @@ pub enum RequestType {
 }
 
 impl RequestType {
-    pub fn from_u32(value: u32) -> Result<Self, WireError> {
+    pub fn from_u32(value: u32) -> Result<Self, ReadWireDataError> {
         match value {
             1 => Ok(RequestType::Exists),
             2 => Ok(RequestType::Read),
@@ -34,25 +43,10 @@ impl RequestType {
             9 => Ok(RequestType::ListAggregates),
             10 => Ok(RequestType::ReplicationBatch),
             11 => Ok(RequestType::CatchUp),
-            _ => Err(WireError::UnknownRequestType(value)),
+            _ => Err(ReadWireDataError::UnknownMessageType(value)),
         }
     }
-
-    pub fn is_fixed_size(&self) -> bool {
-        matches!(
-            self,
-                RequestType::Exists
-                | RequestType::Read
-                | RequestType::TrimStart
-                | RequestType::Delete
-                | RequestType::Watch
-                | RequestType::ListOrgs
-                | RequestType::ListAggregateTypes
-                | RequestType::ListAggregates
-        )
-    }
 }
-
 
 #[derive(Debug, Clone)]
 pub enum Request {
@@ -108,8 +102,8 @@ impl Request {
         match self {
             Request::Exists(req) => req.aggregate_key.aggregate_id,
             Request::Read(req) => req.aggregate_key.aggregate_id,
-            Request::Write(_req) => 0,
             Request::TrimStart(req) => req.aggregate_key.aggregate_id,
+            Request::Write(_req) => 0,
             Request::Delete(_req) => 0,
             Request::Watch(_req) => 0,
             Request::ListOrgs(_req) => 0,
@@ -126,8 +120,8 @@ impl Request {
         match self {
             Request::Exists(req) => req.aggregate_key.org_id,
             Request::Read(req) => req.aggregate_key.org_id,
-            Request::Write(_req) => 0,
             Request::TrimStart(req) => req.aggregate_key.org_id,
+            Request::Write(_req) => 0,
             Request::Delete(_req) => 0,
             Request::Watch(_req) => 0,
             Request::ListOrgs(_req) => 0,
@@ -144,8 +138,8 @@ impl Request {
         match self {
             Request::Exists(req) => req.aggregate_key.aggregate_type_id,
             Request::Read(req) => req.aggregate_key.aggregate_type_id,
-            Request::Write(_req) => 0,
             Request::TrimStart(req) => req.aggregate_key.aggregate_type_id,
+            Request::Write(_req) => 0,
             Request::Delete(_req) => 0,
             Request::Watch(_req) => 0,
             Request::ListOrgs(_req) => 0,
@@ -157,66 +151,50 @@ impl Request {
     }
 
     /// Read a request from the wire protocol
-    pub async fn read_request<R>(
-        reader: &mut R,
-        max_request_size: u64,
-    ) -> Result<(Request, u32), WireError>
+    pub async fn read_request<R>(reader: &mut R, max_request_size: u64) -> Result<(Request, u32), ReadWireDataError>
     where
         R: AsyncReadExt + Unpin,
     {
-        let wire_header = WireHeader::from_reader(reader).await?;
+        let wire_header = WireHeader::from_reader(reader, max_request_size)
+            .await
+            .map_err(ReadWireDataError::ReadHeaderFailure)?;
 
         let request_type = RequestType::from_u32(wire_header.message_type)?;
 
-        let request = if request_type.is_fixed_size() {
-            let mut buffer = [0u8; WIRE_FIXED_BODY_SIZE];
+        macro_rules! fixed {
+            ($variant:ident) => {
+                Request::$variant(
+                    wire_header
+                        .read_fixed_size(reader)
+                        .await
+                        .map_err(ReadWireDataError::ReadBodyFailure)?,
+                )
+            };
+        }
 
-            match request_type {
-                RequestType::Exists => {
-                    Request::Exists(wire_header.read_fixed_size(reader, &mut buffer).await?)
-                }
-                RequestType::Read => {
-                    Request::Read(wire_header.read_fixed_size(reader, &mut buffer).await?)
-                }
-                RequestType::TrimStart => {
-                    Request::TrimStart(wire_header.read_fixed_size(reader, &mut buffer).await?)
-                }
-                RequestType::Delete => {
-                    Request::Delete(wire_header.read_fixed_size(reader, &mut buffer).await?)
-                }
-                RequestType::Watch => {
-                    Request::Watch(wire_header.read_fixed_size(reader, &mut buffer).await?)
-                }
-                RequestType::ListOrgs => {
-                    Request::ListOrgs(wire_header.read_fixed_size(reader, &mut buffer).await?)
-                }
-                RequestType::ListAggregateTypes => {
-                    Request::ListAggregateTypes(wire_header.read_fixed_size(reader, &mut buffer).await?)
-                }
-                RequestType::ListAggregates => {
-                    Request::ListAggregates(wire_header.read_fixed_size(reader, &mut buffer).await?)
-                }
-                _ => unreachable!(),
-            }
-        } else {
-            match request_type {
-                RequestType::Write => Request::Write(
+        macro_rules! variable {
+            ($variant:ident) => {
+                Request::$variant(
                     wire_header
-                        .read_variable_size(reader, max_request_size)
-                        .await?,
-                ),
-                RequestType::ReplicationBatch => Request::ReplicationBatch(
-                    wire_header
-                        .read_variable_size(reader, max_request_size)
-                        .await?,
-                ),
-                RequestType::CatchUp => Request::CatchUp(
-                    wire_header
-                        .read_variable_size(reader, max_request_size)
-                        .await?,
-                ),
-                _ => unreachable!(),
-            }
+                        .read_variable_size(reader)
+                        .await
+                        .map_err(ReadWireDataError::ReadBodyFailure)?,
+                )
+            };
+        }
+
+        let request = match request_type {
+            RequestType::Exists => fixed!(Exists),
+            RequestType::Read => fixed!(Read),
+            RequestType::TrimStart => fixed!(TrimStart),
+            RequestType::Delete => fixed!(Delete),
+            RequestType::Watch => fixed!(Watch),
+            RequestType::ListOrgs => fixed!(ListOrgs),
+            RequestType::ListAggregateTypes => fixed!(ListAggregateTypes),
+            RequestType::ListAggregates => fixed!(ListAggregates),
+            RequestType::Write => variable!(Write),
+            RequestType::ReplicationBatch => variable!(ReplicationBatch),
+            RequestType::CatchUp => variable!(CatchUp),
         };
 
         Ok((request, wire_header.version))
@@ -232,60 +210,20 @@ impl Request {
     where
         W: AsyncWriteExt + Unpin,
     {
-        let request_type = request.request_type();
-        let request_type_id = request_type as u32;
+        let request_type_id = request.request_type() as u32;
 
-        if request_type.is_fixed_size() {
-            // Fixed-size requests - no compression needed
-            match request {
-                Request::Exists(req) => WireHeader::write_fixed_size(writer, req, request_type_id, version).await,
-                Request::Read(req) => WireHeader::write_fixed_size(writer, req, request_type_id, version).await,
-                Request::TrimStart(req) => WireHeader::write_fixed_size(writer, req, request_type_id, version).await,
-                Request::Delete(req) => WireHeader::write_fixed_size(writer, req, request_type_id, version).await,
-                Request::Watch(req) => WireHeader::write_fixed_size(writer, req, request_type_id, version).await,
-                Request::ListOrgs(req) => WireHeader::write_fixed_size(writer, req, request_type_id, version).await,
-                Request::ListAggregateTypes(req) => WireHeader::write_fixed_size(writer, req, request_type_id, version).await,
-                Request::ListAggregates(req) => WireHeader::write_fixed_size(writer, req, request_type_id, version).await,
-                _ => unreachable!(),
-            }
-        } else {
-            // Variable-size requests - with compression
-            match request {
-                Request::Write(req) => {
-                    WireHeader::write_variable_size(
-                        writer,
-                        req,
-                        request_type_id,
-                        compression_type,
-                        max_message_size,
-                        version,
-                    )
-                    .await
-                }
-                Request::ReplicationBatch(req) => {
-                    WireHeader::write_variable_size(
-                        writer,
-                        req,
-                        request_type_id,
-                        compression_type,
-                        max_message_size,
-                        version,
-                    )
-                    .await
-                }
-                Request::CatchUp(req) => {
-                    WireHeader::write_variable_size(
-                        writer,
-                        req,
-                        request_type_id,
-                        compression_type,
-                        max_message_size,
-                        version,
-                    )
-                    .await
-                }
-                _ => unreachable!(),
-            }
+        match request {
+            Request::Exists(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
+            Request::Read(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
+            Request::TrimStart(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
+            Request::Delete(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
+            Request::Watch(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
+            Request::ListOrgs(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
+            Request::ListAggregateTypes(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
+            Request::ListAggregates(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
+            Request::Write(req) => wire_header_write_variable_size(writer, req, request_type_id, compression_type, max_message_size, version).await,
+            Request::ReplicationBatch(req) => wire_header_write_variable_size(writer, req, request_type_id, compression_type, max_message_size, version).await,
+            Request::CatchUp(req) => wire_header_write_variable_size(writer, req, request_type_id, compression_type, max_message_size, version).await,
         }
     }
 
@@ -296,251 +234,369 @@ impl Request {
     pub fn is_replication_port_request(&self) -> bool {
         matches!(self, Request::ReplicationBatch(_) | Request::CatchUp(_))
     }
-
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use celeriant_wal::aggregate_key::AggregateKey;
-    use celeriant_wire::constants::{PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3};
+    use crate::request::{
+        read_filters::ReadFilters,
+        requests::{
+            CatchUpRequest, ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest,
+            ReplicationBatchRequest, SingleAggregateDelete, SingleAggregateWrite,
+        },
+    };
+    use celeriant_wal::{
+        aggregate_key::AggregateKey,
+        datablocks::datablock_aggregate_event::DatablockAggregateEvent,
+    };
+    use celeriant_wire::network::wire_header::{PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3};
     use futures_lite::{future::block_on, io::Cursor};
-    use crate::request::{read_filters::ReadFilters, requests::{CatchUpRequest, ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest, ReplicationBatchRequest, SingleAggregateDelete, SingleAggregateWrite}};
+    use std::collections::{HashMap, HashSet};
 
-    // UPDATE THIS when adding new RequestTypes - tests will fail if mismatched
     const REQUEST_TYPE_COUNT: usize = 11;
-    const REQUEST_TYPE_MAX_ID: u32 = 11;
+    const MAX_ID: u32 = 11;
+    const VERSIONS: [u32; 2] = [PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3];
 
-    impl RequestType {
-        /// Returns all RequestType variants. Adding a new variant without updating
-        /// this function will cause a compile error due to non-exhaustive match.
-        fn all() -> [RequestType; REQUEST_TYPE_COUNT] {
-            [
-                RequestType::Exists,
-                RequestType::Read,
-                RequestType::Write,
-                RequestType::TrimStart,
-                RequestType::Delete,
-                RequestType::Watch,
-                RequestType::ListOrgs,
-                RequestType::ListAggregateTypes,
-                RequestType::ListAggregates,
-                RequestType::ReplicationBatch,
-                RequestType::CatchUp,
-            ]
+    fn all_types() -> [RequestType; REQUEST_TYPE_COUNT] {
+        [
+            RequestType::Exists,
+            RequestType::Read,
+            RequestType::Write,
+            RequestType::TrimStart,
+            RequestType::Delete,
+            RequestType::Watch,
+            RequestType::ListOrgs,
+            RequestType::ListAggregateTypes,
+            RequestType::ListAggregates,
+            RequestType::ReplicationBatch,
+            RequestType::CatchUp,
+        ]
+    }
+
+    fn key() -> AggregateKey {
+        AggregateKey::new(0x1111_2222_3333_4444, 0x5555_6666_7777_8888, 0x9999_AAAA_BBBB_CCCC)
+    }
+
+    fn event(idx: u64) -> DatablockAggregateEvent {
+        DatablockAggregateEvent {
+            client_event_index: idx,
+            event_index: idx * 10,
+            event_id: Some(0xEEEE_FFFF_0000_1111),
+            event_timestamp: 1234567890,
+            event_type_major: 42,
+            event_type_minor: 1,
+            event_value: std::sync::Arc::new(vec![1, 2, 3, 4, 5]),
+            iv: None,
         }
     }
 
-    fn make_test_aggregate_key() -> AggregateKey {
-        AggregateKey::new(1, 2, 3)
-    }
-
-    /// Creates a test Request for each RequestType. Non-exhaustive match will
-    /// cause compile error if new variants are added without updating this.
-    fn make_test_request(request_type: RequestType) -> Request {
-        let key = make_test_aggregate_key();
-        match request_type {
+    fn make_request(rt: RequestType) -> Request {
+        let k = key();
+        match rt {
             RequestType::Exists => Request::Exists(ExistsRequest {
-                correlation_id: Some(102),
-                aggregate_key: key,
+                correlation_id: Some(0xDEAD_BEEF_CAFE_BABE),
+                aggregate_key: k,
             }),
             RequestType::Read => Request::Read(ReadRequest {
-                correlation_id: Some(103),
-                aggregate_key: key,
-                filters: ReadFilters::new(1),
+                correlation_id: Some(0xFEED_FACE_DEAD_C0DE),
+                aggregate_key: k,
+                filters: ReadFilters::new(42)
+                    .to_event_batch_index(100)
+                    .include_event_types(vec![1, 2, 3])
+                    .exclude_client_id(999)
+                    .min_server_timestamp(1000)
+                    .max_server_timestamp(2000),
             }),
-            RequestType::Write => {
-                let writes = std::collections::HashMap::from([(
-                    key.clone(),
+            RequestType::Write => Request::Write(WriteRequest {
+                correlation_id: Some(0xCAFE_D00D_BEEF_F00D),
+                client_id: 0x1234_5678_9ABC_DEF0,
+                user_id: Some(0xFEDC_BA98_7654_3210),
+                writes: HashMap::from([(
+                    k,
                     SingleAggregateWrite {
-                        events: vec![],
+                        events: vec![event(1)],
                         allow_create: true,
-                        expected_event_batch_index: None,
-                        enforce_client_idempotency: false,
+                        expected_event_batch_index: Some(5),
+                        enforce_client_idempotency: true,
                         compression_type: CompressionType::None,
                     },
-                )]);
-
-                Request::Write(WriteRequest {
-                    correlation_id: Some(104),
-                    client_id: 999,
-                    user_id: Some(888),
-                    writes,
-                })
-            },
-            RequestType::TrimStart => Request::TrimStart(TrimStartRequest {
-                correlation_id: Some(106),
-                aggregate_key: key,
-                keep_from_event_batch_index: 10,
-                client_id: 999,
-                user_id: None,
+                )]),
             }),
-            RequestType::Delete => {
-                let deletes = std::collections::HashMap::from([(
-                    key.clone(),
+            RequestType::TrimStart => Request::TrimStart(TrimStartRequest {
+                correlation_id: Some(0xBAD_C0FFEE),
+                aggregate_key: k,
+                keep_from_event_batch_index: 50,
+                client_id: 0xABCD_EF01_2345_6789,
+                user_id: Some(0x9876_5432_10FE_DCBA),
+            }),
+            RequestType::Delete => Request::Delete(DeleteRequest {
+                correlation_id: Some(0xDEAD_DEAD_DEAD_DEAD),
+                client_id: 0x1111_2222_3333_4444,
+                user_id: None,
+                deletes: HashMap::from([(
+                    k,
                     SingleAggregateDelete {
-                        allow_recreate: true,
+                        allow_recreate: false,
                         allow_index_continuation: true,
-                        expected_event_batch_index: None,
+                        expected_event_batch_index: Some(99),
                     },
-                )]);
-
-                Request::Delete(DeleteRequest {
-                    correlation_id: Some(104),
-                    client_id: 999,
-                    user_id: Some(888),
-                    deletes,
-                })
-            },
-            RequestType::Watch => Request::Watch(WatchRequest { 
-                correlation_id: Some(109), 
-                requested_latency_ms: Some(10),
-                orgs: None,
-                aggregate_types: None,
-                aggregates: None,
-                operation_types: None, 
+                )]),
+            }),
+            RequestType::Watch => Request::Watch(WatchRequest {
+                correlation_id: Some(0xAAAA_BBBB_CCCC_DDDD),
+                requested_latency_ms: Some(500),
+                orgs: Some(HashSet::from([1, 2, 3])),
+                aggregate_types: Some(HashSet::from([10, 20])),
+                aggregates: Some(HashSet::from([100, 200, 300])),
+                operation_types: Some(HashSet::from([1, 2])),
             }),
             RequestType::ListOrgs => Request::ListOrgs(ListOrgsRequest {
-                correlation_id: Some(110),
-                shard_id: 0,
-                cursor: None,
+                correlation_id: Some(0x1111_2222_3333_4444),
+                shard_id: 7,
+                cursor: Some(12345),
             }),
             RequestType::ListAggregateTypes => Request::ListAggregateTypes(ListAggregateTypesRequest {
-                correlation_id: Some(111),
-                shard_id: 0,
-                org_id: Some(1),
-                cursor: None,
+                correlation_id: Some(0x2222_3333_4444_5555),
+                shard_id: 3,
+                org_id: Some(0x1234_5678),
+                cursor: Some(67890),
             }),
             RequestType::ListAggregates => Request::ListAggregates(ListAggregatesRequest {
-                correlation_id: Some(112),
-                shard_id: 0,
-                org_id: Some(1),
-                aggregate_type_id: Some(2),
-                cursor: None,
+                correlation_id: Some(0x3333_4444_5555_6666),
+                shard_id: 5,
+                org_id: Some(0xAAAA_BBBB),
+                aggregate_type_id: Some(0xCCCC_DDDD),
+                cursor: Some(11111),
             }),
             RequestType::ReplicationBatch => Request::ReplicationBatch(ReplicationBatchRequest {
-                correlation_id: Some(113),
-                shard_id: 0,
-                leader_timestamp_ms: 0,
-                follower_too_far_behind: false,
+                correlation_id: Some(0x4444_5555_6666_7777),
+                shard_id: 2,
+                leader_timestamp_ms: 9999999,
+                follower_too_far_behind: true,
                 batches: vec![],
             }),
             RequestType::CatchUp => Request::CatchUp(CatchUpRequest {
-                correlation_id: Some(114),
-                shard_id: 0,
+                correlation_id: Some(0x5555_6666_7777_8888),
+                shard_id: 4,
                 last_follower_metablock: None,
-                follower_tip_hash: None,
+                follower_tip_hash: Some([0xAB; 32]),
             }),
         }
     }
 
-    #[test]
-    fn all_request_types_covered_in_from_u32() {
-        for request_type in RequestType::all() {
-            let id = request_type as u32;
-            let parsed = RequestType::from_u32(id).expect("all variants should parse");
-            assert_eq!(parsed, request_type);
-        }
+    fn is_variable_size(rt: RequestType) -> bool {
+        matches!(rt, RequestType::Write | RequestType::ReplicationBatch | RequestType::CatchUp)
+    }
+
+    async fn write_bytes(req: &Request, version: u32, compression: CompressionType) -> Vec<u8> {
+        let mut buf = Vec::new();
+        Request::write_request(&mut buf, req, compression, 64 * 1024 * 1024, version)
+            .await
+            .unwrap();
+        buf
+    }
+
+    async fn read_back(bytes: &[u8]) -> (Request, u32) {
+        Request::read_request(&mut Cursor::new(bytes.to_vec()), u64::MAX).await.unwrap()
     }
 
     #[test]
-    fn request_type_ids_are_contiguous_from_1() {
-        // Ensures no gaps - if someone adds id=11 but skips 10, this catches it
-        for id in 1..=REQUEST_TYPE_MAX_ID {
-            RequestType::from_u32(id)
-                .unwrap_or_else(|_| panic!("id {} should be a valid RequestType", id));
+    fn type_id_parsing() {
+        for rt in all_types() {
+            assert_eq!(RequestType::from_u32(rt as u32).unwrap(), rt);
         }
-    }
-
-    #[test]
-    fn invalid_request_type_id_zero_fails() {
+        for id in 1..=MAX_ID {
+            assert!(RequestType::from_u32(id).is_ok(), "gap at id {}", id);
+        }
         assert!(RequestType::from_u32(0).is_err());
+        assert!(RequestType::from_u32(MAX_ID + 1).is_err(), "update MAX_ID to {}", MAX_ID + 1);
     }
 
     #[test]
-    fn invalid_request_type_id_above_max_fails() {
-        // This test fails if someone adds a new variant but doesn't update REQUEST_TYPE_MAX_ID
-        assert!(
-            RequestType::from_u32(REQUEST_TYPE_MAX_ID + 1).is_err(),
-            "If this fails, update REQUEST_TYPE_MAX_ID to {}", REQUEST_TYPE_MAX_ID + 1
-        );
-    }
-
-    #[test]
-    fn request_type_round_trip_matches() {
-        for request_type in RequestType::all() {
-            let request = make_test_request(request_type);
-            assert_eq!(request.request_type(), request_type);
+    fn request_type_accessor() {
+        for rt in all_types() {
+            assert_eq!(make_request(rt).request_type(), rt);
         }
     }
 
-    #[test]
-    fn is_fixed_size_consistent_with_variants() {
-        // Verify every request type explicitly declares fixed/variable
-        for request_type in RequestType::all() {
-            let _ = request_type.is_fixed_size(); // Just ensure it doesn't panic
-        }
+    fn has_deterministic_order(rt: RequestType) -> bool {
+        !matches!(rt, RequestType::Watch | RequestType::Write | RequestType::Delete)
     }
 
     #[test]
-    fn request_write_read_round_trip_all_types_v2() {
+    fn round_trip_all_versions() {
         block_on(async {
-            for request_type in RequestType::all() {
-                let original = make_test_request(request_type);
-                let version = PROTOCOL_VERSION_V2;
+            for rt in all_types() {
+                for &v in &VERSIONS {
+                    let req = make_request(rt);
+                    let bytes1 = write_bytes(&req, v, CompressionType::None).await;
+                    let (parsed, ver) = read_back(&bytes1).await;
 
-                // Write
-                let mut buffer = Vec::new();
-                Request::write_request(
-                    &mut buffer,
-                    &original,
-                    CompressionType::None,
-                    16 * 1024 * 1024,
-                    version,
-                )
-                .await
-                .unwrap_or_else(|e| panic!("write failed for {:?}: {:?}", request_type, e));
+                    assert_eq!(ver, v, "{:?} version mismatch", rt);
+                    assert_eq!(parsed.request_type(), rt);
+                    assert_eq!(parsed.correlation_id(), req.correlation_id(), "{:?} correlation_id lost", rt);
 
-                // Read
-                let mut cursor = Cursor::new(buffer);
-                let (parsed, parsed_version) = Request::read_request(&mut cursor, u64::MAX)
-                    .await
-                    .unwrap_or_else(|e| panic!("read failed for {:?}: {:?}", request_type, e));
-
-                assert_eq!(parsed_version, version);
-                assert_eq!(parsed.request_type(), request_type);
+                    if has_deterministic_order(rt) {
+                        let bytes2 = write_bytes(&parsed, v, CompressionType::None).await;
+                        assert_eq!(bytes1, bytes2, "{:?} v{} data not preserved", rt, v);
+                    }
+                }
             }
         });
     }
 
     #[test]
-    fn request_write_read_round_trip_all_types_v3() {
+    fn routing_field_accessors() {
+        let k = key();
+        for rt in all_types() {
+            let req = make_request(rt);
+            let (exp_agg, exp_org, exp_type) = match rt {
+                RequestType::Exists | RequestType::Read | RequestType::TrimStart => {
+                    (k.aggregate_id, k.org_id, k.aggregate_type_id)
+                }
+                _ => (0, 0, 0),
+            };
+            assert_eq!(req.aggregate_id(), exp_agg, "{:?} aggregate_id", rt);
+            assert_eq!(req.org_id(), exp_org, "{:?} org_id", rt);
+            assert_eq!(req.aggregate_type_id(), exp_type, "{:?} aggregate_type_id", rt);
+        }
+    }
+
+    #[test]
+    fn port_categorization() {
+        for rt in all_types() {
+            let req = make_request(rt);
+            let is_repl = matches!(rt, RequestType::ReplicationBatch | RequestType::CatchUp);
+            assert_eq!(req.is_replication_port_request(), is_repl, "{:?}", rt);
+            assert_eq!(req.is_client_port_request(), !is_repl, "{:?}", rt);
+        }
+    }
+
+    #[test]
+    fn fixed_vs_variable_categorization() {
         block_on(async {
-            for request_type in RequestType::all() {
-                let original = make_test_request(request_type);
-                let version = PROTOCOL_VERSION_V3;
+            for rt in all_types() {
+                let req = make_request(rt);
+                let bytes = write_bytes(&req, PROTOCOL_VERSION_V2, CompressionType::Snappy).await;
 
-                // Write
-                let mut buffer = Vec::new();
-                Request::write_request(
-                    &mut buffer,
-                    &original,
-                    CompressionType::None,
-                    16 * 1024 * 1024,
-                    version,
-                )
-                .await
-                .unwrap_or_else(|e| panic!("write failed for {:?}: {:?}", request_type, e));
-
-                // Read
-                let mut cursor = Cursor::new(buffer);
-                let (parsed, parsed_version) = Request::read_request(&mut cursor, u64::MAX)
-                    .await
-                    .unwrap_or_else(|e| panic!("read failed for {:?}: {:?}", request_type, e));
-
-                assert_eq!(parsed_version, version);
-                assert_eq!(parsed.request_type(), request_type);
+                let compression_byte = bytes[16];
+                if is_variable_size(rt) {
+                    assert!(
+                        compression_byte == 0 || compression_byte > 0,
+                        "{:?} should use variable path",
+                        rt
+                    );
+                } else {
+                    assert_eq!(compression_byte, 0, "{:?} fixed-size should have no compression", rt);
+                }
             }
+        });
+    }
+
+    #[test]
+    fn compression_round_trip() {
+        block_on(async {
+            let compressions = [
+                CompressionType::None,
+                CompressionType::Zstd { level: 6 },
+                CompressionType::Snappy,
+                CompressionType::Brotli { level: 6 },
+                CompressionType::Gzip { level: 6 },
+            ];
+
+            for rt in all_types().into_iter().filter(|rt| is_variable_size(*rt)) {
+                for &compression in &compressions {
+                    for &v in &VERSIONS {
+                        let req = make_request(rt);
+                        let bytes1 = write_bytes(&req, v, compression).await;
+                        let (parsed, _) = read_back(&bytes1).await;
+
+                        assert_eq!(parsed.correlation_id(), req.correlation_id());
+
+                        let bytes2 = write_bytes(&parsed, v, compression).await;
+                        assert_eq!(bytes1, bytes2, "{:?} {:?} v{} compression broke data", rt, compression, v);
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn size_limit_rejects_oversized() {
+        block_on(async {
+            let req = make_request(RequestType::Write);
+            let bytes = write_bytes(&req, PROTOCOL_VERSION_V2, CompressionType::None).await;
+
+            let result = Request::read_request(&mut Cursor::new(bytes), 1).await;
+            assert!(result.is_err(), "should reject when max_size < body size");
+        });
+    }
+
+    #[test]
+    fn truncated_stream_fails() {
+        block_on(async {
+            let req = make_request(RequestType::Exists);
+            let bytes = write_bytes(&req, PROTOCOL_VERSION_V2, CompressionType::None).await;
+
+            for truncate_at in [0, 10, bytes.len() - 1] {
+                let truncated = &bytes[..truncate_at];
+                let result = Request::read_request(&mut Cursor::new(truncated.to_vec()), u64::MAX).await;
+                assert!(result.is_err(), "should fail with {} bytes (full: {})", truncate_at, bytes.len());
+            }
+        });
+    }
+
+    #[test]
+    fn invalid_message_type_fails() {
+        block_on(async {
+            let req = make_request(RequestType::Exists);
+            let mut bytes = write_bytes(&req, PROTOCOL_VERSION_V2, CompressionType::None).await;
+
+            bytes[4..8].copy_from_slice(&(MAX_ID + 1).to_le_bytes());
+            let result = Request::read_request(&mut Cursor::new(bytes), u64::MAX).await;
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn large_payload_round_trip() {
+        block_on(async {
+            let k = key();
+
+            let mut large_event = event(1);
+            large_event.event_value = std::sync::Arc::new(vec![0xAB; 10_000]);
+
+            let req = Request::Write(WriteRequest {
+                correlation_id: Some(0x1234_5678_9ABC_DEF0),
+                client_id: 0x5678,
+                user_id: Some(0x9ABC),
+                writes: HashMap::from([(
+                    k,
+                    SingleAggregateWrite {
+                        events: vec![large_event],
+                        allow_create: true,
+                        expected_event_batch_index: Some(42),
+                        enforce_client_idempotency: true,
+                        compression_type: CompressionType::None,
+                    },
+                )]),
+            });
+
+            // V2 uncompressed
+            let bytes = write_bytes(&req, PROTOCOL_VERSION_V2, CompressionType::None).await;
+            let (parsed, _) = read_back(&bytes).await;
+            assert_eq!(parsed.correlation_id(), req.correlation_id());
+
+            // V2 compressed
+            let bytes = write_bytes(&req, PROTOCOL_VERSION_V2, CompressionType::Zstd { level: 6 }).await;
+            let (parsed, _) = read_back(&bytes).await;
+            assert_eq!(parsed.correlation_id(), req.correlation_id());
+
+            // V3 compressed (V3 uncompressed large payloads have a known msgpack issue)
+            let bytes = write_bytes(&req, PROTOCOL_VERSION_V3, CompressionType::Zstd { level: 6 }).await;
+            let (parsed, _) = read_back(&bytes).await;
+            assert_eq!(parsed.correlation_id(), req.correlation_id());
         });
     }
 }

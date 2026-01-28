@@ -100,4 +100,52 @@ mod tests {
 
         assert!(serialise_stack(&original, &mut buffer).is_err());
     }
+
+    #[test]
+    fn datablock_aggregate_event_with_iv() {
+        use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
+        use std::sync::Arc;
+
+        let event = DatablockAggregateEvent {
+            client_event_index: 1,
+            event_index: 10,
+            event_id: Some(0xDEADBEEF_CAFEBABE),
+            event_timestamp: 1234567890,
+            event_type_major: 42,
+            event_type_minor: 1,
+            event_value: Arc::new(vec![1, 2, 3, 4, 5]),
+            iv: Some([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]),
+        };
+
+        let encoded = serialise_heap(&event).unwrap();
+        let decoded: DatablockAggregateEvent = deserialise(&encoded).unwrap();
+
+        assert_eq!(event.client_event_index, decoded.client_event_index);
+        assert_eq!(event.event_index, decoded.event_index);
+        assert_eq!(event.event_id, decoded.event_id);
+        assert_eq!(event.iv, decoded.iv);
+    }
+
+    #[test]
+    fn datablock_aggregate_event_without_iv() {
+        use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
+        use std::sync::Arc;
+
+        let event = DatablockAggregateEvent {
+            client_event_index: 1,
+            event_index: 10,
+            event_id: Some(0xDEADBEEF_CAFEBABE),
+            event_timestamp: 1234567890,
+            event_type_major: 42,
+            event_type_minor: 1,
+            event_value: Arc::new(vec![1, 2, 3, 4, 5]),
+            iv: None,
+        };
+
+        let encoded = serialise_heap(&event).unwrap();
+        let decoded: DatablockAggregateEvent = deserialise(&encoded).unwrap();
+
+        assert_eq!(event.client_event_index, decoded.client_event_index);
+        assert_eq!(event.iv, decoded.iv);
+    }
 }

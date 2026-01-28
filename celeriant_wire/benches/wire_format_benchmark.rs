@@ -7,7 +7,7 @@ use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEven
 use celeriant_wal::metablocks::metablock_event_batch::{MetablockEventBatch, EventTypesKind};
 use celeriant_wal::compression_type::CompressionType;
 use celeriant_wire::codec::{
-    bincode::{variable_serialise_heap as bincode_serialise, variable_deserialise as bincode_deserialise},
+    bincode::{fixed_serialise_heap as bincode_serialise, fixed_deserialise as bincode_deserialise},
     msgpack::{serialise_heap as msgpack_serialise, deserialise as msgpack_deserialise},
     compression::{compress, decompress},
 };

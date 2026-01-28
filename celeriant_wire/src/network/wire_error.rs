@@ -2,14 +2,7 @@ use crate::{codec::{codec_error::CodecError, compression}};
 
 #[derive(Debug)]
 pub enum WireError {
-    // BufferTooSmall {
-    //     required: usize,
-    //     available: usize,
-    // },
-    // WireFormat(WireFormatError),
     NetworkError(std::io::Error),
-    // UnknownRequestType(u32),
-    // UnknownResponseType(u32),
     MessageTooLarge {
         message_length: u64,
         max_size_bytes: u64,
