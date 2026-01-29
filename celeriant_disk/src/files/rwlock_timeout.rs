@@ -1,15 +1,14 @@
 use std::time::Duration;
 use glommio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use glommio::timer::Timer;
-use glommio::GlommioError;
 use futures_lite::future::or;
 
 const DEADLOCK_TIMEOUT: Duration = Duration::from_secs(1);
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum LockTimeoutError {
     PotentialDeadlock { duration: Duration, operation: &'static str, location: &'static str },
-    LockError(GlommioError<()>),
+    LockError(String),
 }
 
 impl std::fmt::Display for LockTimeoutError {
@@ -39,7 +38,7 @@ pub async fn read_with_timeout<'a, T>(
 
     match result {
         Some(Ok(guard)) => Ok(guard),
-        Some(Err(e)) => Err(LockTimeoutError::LockError(e)),
+        Some(Err(e)) => Err(LockTimeoutError::LockError(e.to_string())),
         None => Err(LockTimeoutError::PotentialDeadlock {
             duration: DEADLOCK_TIMEOUT,
             operation: "read",
@@ -63,7 +62,7 @@ pub async fn write_with_timeout<'a, T>(
 
     match result {
         Some(Ok(guard)) => Ok(guard),
-        Some(Err(e)) => Err(LockTimeoutError::LockError(e)),
+        Some(Err(e)) => Err(LockTimeoutError::LockError(e.to_string())),
         None => Err(LockTimeoutError::PotentialDeadlock {
             duration: DEADLOCK_TIMEOUT,
             operation: "write",

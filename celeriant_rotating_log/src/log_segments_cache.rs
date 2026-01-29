@@ -20,7 +20,7 @@ pub struct LogSegmentsCache {
     /// Required as we lazy-load log files on demand in get()
     shard_dir: PathBuf,
 
-    preallocate_bytes: u64,
+    pub preallocate_bytes: u64,
 }
 
 impl LogSegmentsCache {

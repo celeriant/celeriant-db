@@ -8,3 +8,6 @@ pub mod rollback_error;
 pub mod replication_error;
 pub mod replication_to_follower_error;
 pub mod replication_to_s3_error;
+pub mod fetch_datablock_error;
+pub mod replication_rollback_failure;
+pub mod fetch_catchup_entries_error;

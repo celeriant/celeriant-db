@@ -1,9 +1,8 @@
-use glommio::GlommioError;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum WriteDualHeaderError {
     SerialiseError(String),
-    FileWriteError { from_back: bool, source: GlommioError<()> },
+    FileWriteError { from_back: bool },
 }
 
 impl From<bincode::error::EncodeError> for WriteDualHeaderError {

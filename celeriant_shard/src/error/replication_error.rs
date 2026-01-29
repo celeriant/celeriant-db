@@ -11,9 +11,11 @@
 //     SendFailed(String),
 // }
 
+use crate::error::{fetch_catchup_entries_error::FetchCatchupEntriesError, replication_rollback_failure::ReplicationRollbackFailure, replication_to_s3_error::ReplicateToS3Error};
+
 // /// Errors that can occur during replication operations.
-// #[derive(Debug, Clone)]
-// pub enum ReplicationError {
+#[derive(Debug, Clone)]
+pub enum ReplicationError {
 //     /// Network/transport errors - transient, may retry or failover to S3.
 //     Network(NetworkError),
 
@@ -23,8 +25,12 @@
 //     /// Failed to acquire lock within timeout.
 //     LockTimeout(String),
 
-//     /// Pending replication batches are empty due to rollback.
-//     RollbackInProgress,
+    /// Pending replication batches are empty due to rollback.
+    RollbackInProgress,
+    RollbackFailed(ReplicationRollbackFailure),
+    ReplicationClientLockTimeoutError,
+    ReplicateToS3Error(ReplicateToS3Error),
+    ExtendedCatchupFailure(FetchCatchupEntriesError),
 
 //     /// S3 sidecar is unavailable or returned error.
 //     S3Unavailable,
@@ -39,7 +45,7 @@
 //     WalEntriesUnavailable { requested_index: u64 },
 
 //     ExtendedCatchupFailure(ShardReadError),
-// }
+}
 
 // impl ReplicationError {
 //     pub fn is_network_error(&self) -> bool {

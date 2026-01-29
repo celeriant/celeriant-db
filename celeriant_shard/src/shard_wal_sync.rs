@@ -18,20 +18,18 @@ use celeriant_watch::aggregate_watchers::AggregateWatchers;
 use celeriant_wire::disk::versioned_block::serialize_versioned_message;
 
 use crate::amortisation::coordinator::CaptureResult;
+use crate::error::shard_fsync_error::ShardFsyncError;
 use crate::watch_event_collector::WatchEventCollector;
 
-/// Captured data from the fsync snapshot phase.
 pub(crate) struct FsyncCapturedData {
     pub required_disk_space: u64,
     pub sync_positions_snapshot: SyncPositionsSnapshot,
 }
 
-/// Capture phase: take snapshot from memcache.
-/// Must be called while the coordinator still holds the orchestrator event.
 pub(crate) fn capture_fsync_snapshot(shard_mem_cache: &Rc<RefCell<ShardMemCache>>) -> CaptureResult<FsyncCapturedData, ShardFsyncError> {
     let mut cache = shard_mem_cache.borrow_mut();
 
-    if cache.take_fsync_rollback_flag() && cache.pending_append_queue_is_empty() {
+    if cache.take_fsync_rollback_flag() {
         return CaptureResult::Failed(ShardFsyncError::RollbackInvalidatedWrites);
     }
 
@@ -48,30 +46,44 @@ pub(crate) fn capture_fsync_snapshot(shard_mem_cache: &Rc<RefCell<ShardMemCache>
     })
 }
 
-/// Commit phase: write captured data to disk and update caches.
 pub(crate) async fn commit_fsync_with_rollback(
     cluster_role: ClusterRole,
     log_segments_cache: Rc<LogSegmentsCache>,
     shard_mem_cache: Rc<RefCell<ShardMemCache>>,
     watched_aggregates: Rc<AggregateWatchers>,
-    mut captured: FsyncCapturedData,
+    mut captured: FsyncCapturedData, // Mutable because we set the datablocks_position while writing in metablocks
 ) -> Result<(), ShardFsyncError> {
     let available_space = log_segments_cache.active_log_available_space();
     if available_space < captured.required_disk_space {
+        if log_segments_cache
+            .preallocate_bytes
+            .saturating_sub(captured.required_disk_space)
+            .saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64 * 2)
+            == 0
+        {
+            return Err(ShardFsyncError::BatchesTooLarge {
+                preallocate_bytes: log_segments_cache.preallocate_bytes,
+            });
+        }
 
-        // TODO: batch too large for single log segment handling
-        // if self.preallocate_bytes.saturating_sub(required_disk_space).saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64 * 2) == 0 {
-        //     return Err(RotatingLogError::BatchesTooLarge(self.preallocate_bytes));
-        // }
-        
-        log_segments_cache.rotate_to_next_log().await?;
+        log_segments_cache
+            .rotate_to_next_log()
+            .await
+            .map_err(ShardFsyncError::UnableToRotateToNewLogSegmentFile)?;
     }
-    
+
     let active_log_segment = log_segments_cache.active();
 
     match sync(active_log_segment.clone(), &mut captured.sync_positions_snapshot).await {
         Ok(updated_log_segment_file_metadata) => {
-            commit_sync(cluster_role, shard_mem_cache, watched_aggregates, captured.sync_positions_snapshot, active_log_segment, updated_log_segment_file_metadata);
+            commit_sync(
+                cluster_role,
+                shard_mem_cache,
+                watched_aggregates,
+                captured.sync_positions_snapshot,
+                active_log_segment,
+                updated_log_segment_file_metadata,
+            );
             Ok(())
         }
         Err(e) => {
@@ -95,7 +107,7 @@ fn commit_sync(
         // Data is durable, so we can advance visible position
         new_metadata.advance_visible_position();
     }
-    
+
     *log_segment_file.metadata.borrow_mut() = new_metadata;
 
     let mut shard_mem_cache = shard_mem_cache.borrow_mut();
@@ -116,7 +128,6 @@ fn commit_sync(
     for queue_item in pending_append_queue {
         match &queue_item.metablock.wal_metablock_type {
             MetablockKind::EventBatchMetadata(event_batch_metadata) => {
-
                 if cluster_role != ClusterRole::Leader {
                     event_collector.add_write_event(event_batch_metadata);
 
@@ -136,10 +147,18 @@ fn commit_sync(
                 }
             }
             MetablockKind::SoftTrim(soft_trim) => {
-                shard_mem_cache.update_aggregate_min_event_batch_index(&soft_trim.aggregate_key, soft_trim.keep_from_event_batch_index, CachePath::Write);
-                
+                shard_mem_cache.update_aggregate_min_event_batch_index(
+                    &soft_trim.aggregate_key,
+                    soft_trim.keep_from_event_batch_index,
+                    CachePath::Write,
+                );
+
                 if cluster_role != ClusterRole::Leader {
-                    shard_mem_cache.update_aggregate_min_event_batch_index(&soft_trim.aggregate_key, soft_trim.keep_from_event_batch_index, CachePath::Read);
+                    shard_mem_cache.update_aggregate_min_event_batch_index(
+                        &soft_trim.aggregate_key,
+                        soft_trim.keep_from_event_batch_index,
+                        CachePath::Read,
+                    );
                     event_collector.add_trim_event(soft_trim.aggregate_key.clone(), soft_trim.keep_from_event_batch_index);
                 } else {
                     pending_commit_data.pending_queue.push(PendingCacheItem::new(queue_item));
@@ -197,13 +216,17 @@ fn rollback_sync(shard_mem_cache: Rc<RefCell<ShardMemCache>>, log_segments_cache
 /// 5. Writes dual headers
 /// 6. Calls fdatasync for durability
 /// sync_positions_snapshot is mutable because we need to set the datablocks absolute position as we write (only known at write time)
-pub(crate) async fn sync(log_segment_file: Rc<LogSegmentFile>, sync_positions_snapshot: &mut SyncPositionsSnapshot) -> Result<LogSegmentFileMetadata, ShardFsyncError> {
+pub(crate) async fn sync(
+    log_segment_file: Rc<LogSegmentFile>,
+    sync_positions_snapshot: &mut SyncPositionsSnapshot,
+) -> Result<LogSegmentFileMetadata, ShardFsyncError> {
     let mut log_segment_file_metadata = log_segment_file.metadata.borrow().clone();
 
-    let dma_file_writer = log_segment_file.lock_writer("sync").await?;
+    let dma_file_writer = log_segment_file.lock_writer("sync").await
+        .map_err(|_| ShardFsyncError::WriteLockTimeout)?;
     let dma_file_writer = dma_file_writer
         .as_ref()
-        .ok_or_else(|| RotatingLogError::IoError("No file handle".to_string()))?;
+        .ok_or_else(|| ShardFsyncError::ActiveWriteFileUnavailable)?;
 
     // Write datablocks first so we can get the positions to include into metablocks
     let buffer_size_datablocks: u64 = sync_positions_snapshot.buffer_size_datablocks();
@@ -255,7 +278,8 @@ pub(crate) async fn sync(log_segment_file: Rc<LogSegmentFile>, sync_positions_sn
 
         dma_file_writer
             .write_at(buffer_datablocks, new_datablocks_position.saturating_sub(front_carry_over as u64))
-            .await?;
+            .await
+            .map_err(|e| ShardFsyncError::WriteDatablocksError(e.to_string()))?;
     }
 
     let buffer_size_metablocks: u64 = sync_positions_snapshot.buffer_size_metablocks();
@@ -293,13 +317,11 @@ pub(crate) async fn sync(log_segment_file: Rc<LogSegmentFile>, sync_positions_sn
         item.metablock.previous_tip_hash = log_segment_file_metadata.write.tip_hash;
 
         let mut metablock_bytes = [0u8; FIXED_BLOCK_SIZE_BYTES];
-        serialize_versioned_message(&item.metablock, WIRE_VERSION_WAL_METABLOCK, &mut metablock_bytes)?;
+        serialize_versioned_message(&item.metablock, WIRE_VERSION_WAL_METABLOCK, &mut metablock_bytes)
+            .map_err(|e| ShardFsyncError::MetablockSerialisationError(e.to_string()))?;
 
         // Compute hash chain: hash = blake3(previous_hash || metablock_bytes)
-        log_segment_file_metadata.write.tip_hash = compute_entry_hash(
-            &log_segment_file_metadata.write.tip_hash,
-            &metablock_bytes,
-        );
+        log_segment_file_metadata.write.tip_hash = compute_entry_hash(&log_segment_file_metadata.write.tip_hash, &metablock_bytes);
 
         //let metablock_bytes: [u8; FIXED_BLOCK_SIZE_BYTES]
         buffer_metablocks_slice[position..position + FIXED_BLOCK_SIZE_BYTES].copy_from_slice(&metablock_bytes);
@@ -310,7 +332,8 @@ pub(crate) async fn sync(log_segment_file: Rc<LogSegmentFile>, sync_positions_sn
     let new_metablocks_position = log_segment_file_metadata.write.metablocks_position + buffer_metablocks.len() as u64;
     dma_file_writer
         .write_at(buffer_metablocks, log_segment_file_metadata.write.metablocks_position)
-        .await?;
+        .await
+        .map_err(|e| ShardFsyncError::WriteMetablocksError(e.to_string()))?;
 
     // Update bloom filter with aggregate keys from this batch
     for item in &sync_positions_snapshot.pending_append_queue {
@@ -327,9 +350,11 @@ pub(crate) async fn sync(log_segment_file: Rc<LogSegmentFile>, sync_positions_sn
     // Write header
     let header_end_start_pos = log_segment_file_metadata.file_len.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64);
     let header = log_segment_file_metadata.to_shard_log_header();
-    write_dual_shard_log_header(&dma_file_writer, header_end_start_pos, &header).await?;
+    write_dual_shard_log_header(&dma_file_writer, header_end_start_pos, &header).await
+        .map_err(ShardFsyncError::LogSegmentFileHeaderWriteFailure)?;
 
-    dma_file_writer.fdatasync().await?;
+    dma_file_writer.fdatasync().await
+        .map_err(|e| ShardFsyncError::FDataSyncError(e.to_string()))?;
 
     Ok(log_segment_file_metadata)
 }

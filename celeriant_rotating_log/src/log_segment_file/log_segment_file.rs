@@ -71,7 +71,7 @@ impl LogSegmentFile {
                 .map_err(|e| OpenOrCreateError::UnableToOpenExistingFile {
                     log_id,
                     path: log_path.to_string_lossy().into_owned(),
-                    source: e,
+                    source: e.to_string(),
                 })?
         } else {
             (
@@ -81,7 +81,7 @@ impl LogSegmentFile {
                         log_id,
                         path: log_path.to_string_lossy().into_owned(),
                         preallocate_bytes,
-                        source: e,
+                        source: e.to_string(),
                     })?,
                 preallocate_bytes,
             )
@@ -99,7 +99,7 @@ impl LogSegmentFile {
             .map_err(|e| OpenOrCreateError::UnableToOpenExistingFile {
                 log_id,
                 path: log_path.to_string_lossy().into_owned(),
-                source: e,
+                source: e.to_string(),
             })?;
 
         load_existing(log_id, &log_path, writer, file_len, true, true, shard_dir).await
@@ -119,7 +119,7 @@ async fn load_existing(
     let reader = writer.dup().map_err(|e| OpenOrCreateError::UnableToDuplicateWriterFD {
         log_id,
         path: log_path.to_string_lossy().into_owned(),
-        source: e,
+        source: e.to_string(),
     })?;
 
     let shard_log_header = if exists {
@@ -131,7 +131,7 @@ async fn load_existing(
     let datablocks_carry_over: Option<Vec<u8>> = read_datablocks_carry_over_bytes(&reader, shard_log_header.datablocks_position).await
         .map_err(|source| OpenOrCreateError::LogSegmentFileReadError {
             log_id,
-            source,
+            source: source.to_string(),
             step: "read_datablocks_carry_over_bytes".into(),
         })?;
 
@@ -160,7 +160,7 @@ async fn load_header_detecting_corruption(dma_file: &mut DmaFile, file_len: u64,
         .await
         .map_err(|source| OpenOrCreateError::LogSegmentFileReadError {
             log_id,
-            source,
+            source: source.to_string(),
             step: "read_header_front".into(),
         })?;
 
@@ -173,7 +173,7 @@ async fn load_header_detecting_corruption(dma_file: &mut DmaFile, file_len: u64,
                 .await
                 .map_err(|source| OpenOrCreateError::LogSegmentFileReadError {
                     log_id,
-                    source,
+                    source: source.to_string(),
                     step: "read_header_rear".into(),
                 })?;
 
@@ -204,28 +204,28 @@ async fn setup_new_file(dma_file: &mut DmaFile, log_id: u64, dir_path: &PathBuf,
     dma_file
         .fdatasync()
         .await
-        .map_err(|source| OpenOrCreateError::FSyncErrorOnNewFile { log_id, source })?;
+        .map_err(|source| OpenOrCreateError::FSyncErrorOnNewFile { log_id, source: source.to_string() })?;
 
     // Folder fsync - fsync the parent directory to ensure the file entry is durable
     let dir = glommio::io::Directory::open(dir_path)
         .await
         .map_err(|source| OpenOrCreateError::DirectoryFSyncErrorOnNewFile {
             log_id,
-            source,
+            source: source.to_string(),
             path: dir_path.to_string_lossy().into_owned(),
             step: "dir_open".into(),
         })?;
 
     dir.sync().await.map_err(|source| OpenOrCreateError::DirectoryFSyncErrorOnNewFile {
         log_id,
-        source,
+        source: source.to_string(),
         path: dir_path.to_string_lossy().into_owned(),
         step: "dir_sync".into(),
     })?;
 
     dir.close().await.map_err(|source| OpenOrCreateError::DirectoryFSyncErrorOnNewFile {
         log_id,
-        source,
+        source: source.to_string(),
         path: dir_path.to_string_lossy().into_owned(),
         step: "dir_close".into(),
     })?;
@@ -243,11 +243,11 @@ pub async fn write_dual_shard_log_header(dma_file: &DmaFile, header_end_start_po
     dma_file
         .write_rc_at(header_bytes.clone(), 0)
         .await
-        .map_err(|source| WriteDualHeaderError::FileWriteError { from_back: false, source })?;
+        .map_err(|_| WriteDualHeaderError::FileWriteError { from_back: false })?;
     dma_file
         .write_rc_at(header_bytes, header_end_start_pos)
         .await
-        .map_err(|source| WriteDualHeaderError::FileWriteError { from_back: true, source })?;
+        .map_err(|_| WriteDualHeaderError::FileWriteError { from_back: true })?;
 
     Ok(())
 }

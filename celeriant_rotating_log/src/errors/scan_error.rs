@@ -1,14 +1,13 @@
 use celeriant_disk::files::rwlock_timeout::LockTimeoutError;
-use glommio::GlommioError;
 
 use crate::errors::open_or_create_error::OpenOrCreateError;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ScanError<E> {
     OpenLogSegment(OpenOrCreateError),
     LockTimeout(LockTimeoutError),
     NoFileHandle { log_id: u64 },
-    Io { log_id: u64, source: GlommioError<()> },
+    Io { log_id: u64, source: String },
     Visitor(E),
 }
 

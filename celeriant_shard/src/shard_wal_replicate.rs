@@ -4,8 +4,11 @@ use std::rc::Rc;
 
 use celeriant_disk::files::rwlock_timeout::write_with_timeout;
 use celeriant_msg::request::requests::ReplicationBatchItem;
+use celeriant_rotating_log::log_segment_file::aggregate_key_bloom::AggregateKeyBloom;
 use celeriant_rotating_log::log_segment_file::log_segment_file::write_dual_shard_log_header;
 use celeriant_rotating_log::reverse_metablock_scanner::ReverseMetablockScanner;
+use celeriant_wal::shard_log_header::ShardLogHeader;
+use celeriant_wire::disk::disk_format_error::DiskFormatError;
 use celeriant_wire::disk::metablock_bytes;
 use celeriant_wire::disk::versioned_block::deserialise_metablock;
 use glommio::sync::RwLock;
@@ -14,13 +17,18 @@ use celeriant_memcache::cache_path::CachePath;
 use celeriant_memcache::pending_commit_data::PendingCommitData;
 use celeriant_memcache::shard_mem_cache::ShardMemCache;
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
-use celeriant_wal::constants::{FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES};
+use celeriant_wal::constants::{FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, GENESIS_HASH, HEADER_BLOCK_SIZE_BYTES};
 use celeriant_wal::metablocks::metablock_kind::MetablockKind;
 use celeriant_watch::aggregate_watchers::AggregateWatchers;
 
 use crate::amortisation::coordinator::{CaptureResult, Coordinator};
+use crate::collect_from_disk::{EventBatchFromLogSegmentFile, fetch_datablocks_for_metablocks};
+use crate::error::fetch_catchup_entries_error::FetchCatchupEntriesError;
+use crate::error::replication_error::ReplicationError;
+use crate::error::replication_rollback_failure::ReplicationRollbackFailure;
+use crate::error::replication_to_follower_error::ReplicateToFollowerError;
+use crate::error::shard_fsync_error::ShardFsyncError;
 use crate::replication_client::ReplicationClient;
-use crate::shard_wal::{KeptMetablock, fetch_datablocks_for_metablocks};
 use crate::watch_event_collector::WatchEventCollector;
 
 /// Returns the number of items from the start that fit within `max_size_bytes`.
@@ -65,6 +73,11 @@ pub(crate) fn capture_replication_snapshot(shard_mem_cache: &Rc<RefCell<ShardMem
     })
 }
 
+pub enum ReplicationDetails {
+    ReplicatedToFollower,
+    RepliatedToS3(ReplicateToFollowerError),
+}
+
 /// Commit phase: replicate captured data and update caches.
 pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
     replication_client: Rc<RwLock<R>>,
@@ -76,29 +89,41 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
     max_catchup_gap_bytes: u64,
     max_request_size: u64,
     read_max_chunk_size: u64,
-) -> Result<(), ReplicationError> {
-    let mut client_guard = write_with_timeout(&replication_client, "replicate_to_follower").await?;
+) -> Result<ReplicationDetails, ReplicationError> {
 
+    // This client_guard should always get the write lock without error due to single-leader of the replication, but just in case :)
+    let mut client_guard = write_with_timeout(&replication_client, "replicate_to_follower")
+        .await
+        .map_err(|_| ReplicationError::ReplicationClientLockTimeoutError)?;
+
+    // Because we are paginating data to the follower, we have a loop
+    // At any point we might have to fallback to s3. Also the follower
+    // can push back and require additional entries to be sent
     let mut follower_falling_behind_or_offline = replication_captured_data.follower_falling_behind_or_offline;
     let mut added_additional_entries = false;
 
+    // Final deets we send back to waiting callers
+    let mut replication_details = ReplicationDetails::ReplicatedToFollower;
+
     // Move replication batches into a flat list of items for replication
-    let mut batches: Vec<ReplicationBatchItem> = replication_captured_data.replication_snapshot.iter()
+    let mut batches: Vec<ReplicationBatchItem> = replication_captured_data
+        .replication_snapshot
+        .iter()
         .flat_map(|batch| batch.pending_queue.iter())
         .map(|item| ReplicationBatchItem {
             metablock: item.metablock.clone(), //Don't consume captured data as its needed for commit
-            datablock: item.datablock.clone(),
+            datablock: item.datablock.clone(), //Maybe we could optimise this further later, serialisation technincally only needs a ref
         })
         .collect();
 
-    // Loop until we run out of captured.replication_snapshot to replicate, or an unrecoverable error occurs.
-    // We must split captured.replication_snapshot into batches that are less than max_request_size (bytes)
-    // If captured.replication_snapshot at any point grows > max_catchup_gap_bytes, we must fallback so S3
+    // Loop until we run out of batches to replicate, or an unrecoverable error occurs.
+    // We must split batches into batches that are less than max_request_size (bytes)
+    // If batches at any point grows > max_catchup_gap_bytes (follower behind too far), we must fallback so S3
 
     let mut workset_size_bytes = batches.iter().map(|c| c.size_bytes()).sum::<u64>();
     while !batches.is_empty() {
 
-        // If at any point the amount of data that we have to replicate to the 
+        // If at any point the amount of data that we have to replicate to the
         // follower becomes too large,  we skip the follower and send the data to S3 instead.
         if workset_size_bytes > max_catchup_gap_bytes {
             follower_falling_behind_or_offline = true;
@@ -107,79 +132,129 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
         // Either the follower is too slow to keep up, or it has been offline for a while
         // and needs to catch up itself first, or the follower is completely offline
         if follower_falling_behind_or_offline {
+
+            // We send ALL batches in one go to s3, no pagination
             match client_guard.replicate_to_s3(batches).await {
                 Ok(()) => {
                     break;
-                },
+                }
                 Err(replication_err) => {
-                    return match rollback_replicate(&fsync_coordinator, &log_segments_cache, &shard_mem_cache, replication_captured_data.replication_snapshot).await {
-                        Ok(()) => Err(replication_err),
+                    return match rollback_replicate(
+                        &fsync_coordinator,
+                        &log_segments_cache,
+                        &shard_mem_cache,
+                        replication_captured_data.replication_snapshot,
+                    )
+                    .await
+                    {
+                        Ok(()) => Err(ReplicationError::ReplicateToS3Error(replication_err)),
                         Err(rollback_err) => Err(ReplicationError::RollbackFailed(rollback_err)),
-                    }
-                },
+                    };
+                }
             }
         }
 
+        // The happy low latency path - batched replication to follower
         let end_idx = batch_end_index(&batches, max_request_size);
-        
+
         match client_guard.replicate_to_follower(batches[..end_idx].to_vec()).await {
             Ok(()) => {
+                // Success means we can drain out the replicated entries and go again
+                // No leader commit yet, wait until full replication of the written batches is done
+                // This saves the complexity of doing a partial rollback, we just take read pos -> write pos which is easier
                 batches.drain(..end_idx);
             }
             Err(replication_err) => {
 
+                // Already got a rejection once, this is second or more. nothing leader can do here, just fallback to s3
                 if added_additional_entries {
+                    replication_details = ReplicationDetails::RepliatedToS3(replication_err);
                     follower_falling_behind_or_offline = true;
                     continue;
                 }
 
                 match replication_err {
-                    ReplicationError::FollowerRejected(follower_rejection) => {
+                    ReplicateToFollowerError::FollowerRejected(ref follower_rejection) => {
                         match follower_rejection {
                             celeriant_msg::response::responses::FollowerRejection::WalIndexMismatch { max_follower_wal_index } => {
                                 //We need to provide older wal entries to follower as they are behind
                                 //If we are unable to provide older wal entries, we need to fallback to S3
                                 let fetch_catchup_entries_result = fetch_catchup_entries(
                                     &log_segments_cache,
-                                    max_follower_wal_index,
+                                    *max_follower_wal_index,
                                     batches[0].metablock.wal_index,
                                     max_catchup_gap_bytes,
                                     read_max_chunk_size,
-                                ).await;
+                                )
+                                .await;
 
-                                let (additional_entries_for_follower, too_far_behind) = match fetch_catchup_entries_result {
-                                    Ok((entries, too_far_behind)) => (entries, too_far_behind),
-                                    Err(shard_read_err) => {
-                                        return match rollback_replicate(&fsync_coordinator, &log_segments_cache, &shard_mem_cache, replication_captured_data.replication_snapshot).await {
-                                            Ok(()) => Err(ReplicationError::ExtendedCatchupFailure(shard_read_err)),
-                                            Err(rollback_err) => Err(ReplicationError::RollbackFailed(rollback_err)),
+                                let additional_entries_for_follower = match fetch_catchup_entries_result {
+                                    Ok(entries) => entries,
+                                    Err(e) => {
+                                        match e {
+                                            FetchCatchupEntriesError::FollowerTooFarBehind => {
+                                                // We tried to get the event batches the follower needs
+                                                // but they are waaay too far behind which would kill our
+                                                // client write latency. So we fallback to S3 instead.
+                                                replication_details = ReplicationDetails::RepliatedToS3(ReplicateToFollowerError::FollowerTooFarBehind);
+                                                follower_falling_behind_or_offline = true;
+                                                vec![]
+                                            },
+                                            _ => {
+                                                // The rare scenario where our local disk has failed to read the entries
+                                                // In this case we rollback the writes and notify all clients to stop using this node
+                                                return match rollback_replicate(
+                                                    &fsync_coordinator,
+                                                    &log_segments_cache,
+                                                    &shard_mem_cache,
+                                                    replication_captured_data.replication_snapshot,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(()) => Err(ReplicationError::ExtendedCatchupFailure(e)),
+                                                    Err(rollback_err) => Err(ReplicationError::RollbackFailed(rollback_err)),
+                                                };
+                                            },
                                         }
-                                    },
+                                    }
                                 };
 
-                                if too_far_behind {
-                                    follower_falling_behind_or_offline = true;
-                                }
+                                let additional_batch_items: Vec<ReplicationBatchItem> = additional_entries_for_follower.into_iter().map(|f| ReplicationBatchItem {
+                                    datablock: f.datablock,
+                                    metablock: f.metablock,
+                                }).collect();
+                                workset_size_bytes += additional_batch_items.iter().map(|c| c.size_bytes()).sum::<u64>();
+                                batches.splice(0..0, additional_batch_items);
                                 
-                                workset_size_bytes += additional_entries_for_follower.iter().map(|c| c.size_bytes()).sum::<u64>();
-                                batches.splice(0..0, additional_entries_for_follower);
-                                added_additional_entries = true;
-                            },
-                            _ => follower_falling_behind_or_offline = true,
+                                added_additional_entries = true; //Stops infinite requests for more batches from follower
+                            }
+                            _ => {
+                                replication_details = ReplicationDetails::RepliatedToS3(replication_err);
+                                follower_falling_behind_or_offline = true;
+                            }
                         }
-                    },
-                    _ => follower_falling_behind_or_offline = true,
+                    }
+                    _ => {
+                        replication_details = ReplicationDetails::RepliatedToS3(replication_err);
+                        follower_falling_behind_or_offline = true;
+                    }
                 }
             }
         }
     }
 
-    commit_replication(&log_segments_cache, &shard_mem_cache, &watched_aggregates, replication_captured_data.replication_snapshot);
+    commit_replication(
+        &log_segments_cache,
+        &shard_mem_cache,
+        &watched_aggregates,
+        replication_captured_data.replication_snapshot,
+    );
 
-    Ok(())
+    Ok(replication_details)
 }
 
 /// Commits successful replication by updating read path, recent write cache, and broadcasting events.
+/// No failures here, all in-memory operations
 fn commit_replication(
     log_segments_cache: &Rc<LogSegmentsCache>,
     shard_mem_cache: &Rc<RefCell<ShardMemCache>>,
@@ -201,7 +276,6 @@ fn commit_replication(
         for item in commit_data.pending_queue {
             match &item.metablock.wal_metablock_type {
                 MetablockKind::EventBatchMetadata(event_batch) => {
-
                     shard_mem_cache.commit_read_position_snapshot(&event_batch, log_id, item.metablock_absolute_pos);
 
                     event_collector.add_write_event(event_batch);
@@ -220,16 +294,17 @@ fn commit_replication(
                     );
                 }
                 MetablockKind::SoftTrim(soft_trim) => {
-                    shard_mem_cache.update_aggregate_min_event_batch_index(&soft_trim.aggregate_key, soft_trim.keep_from_event_batch_index, CachePath::Read);
                     shard_mem_cache.update_aggregate_min_event_batch_index(
                         &soft_trim.aggregate_key,
                         soft_trim.keep_from_event_batch_index,
                         CachePath::Read,
                     );
-                    event_collector.add_trim_event(
-                        soft_trim.aggregate_key.clone(),
+                    shard_mem_cache.update_aggregate_min_event_batch_index(
+                        &soft_trim.aggregate_key,
                         soft_trim.keep_from_event_batch_index,
+                        CachePath::Read,
                     );
+                    event_collector.add_trim_event(soft_trim.aggregate_key.clone(), soft_trim.keep_from_event_batch_index);
                 }
                 MetablockKind::SoftDelete(soft_delete) => {
                     shard_mem_cache.put_aggregate_into_cache_as_deleted(
@@ -255,42 +330,83 @@ async fn rollback_replicate(
     log_segments_cache: &Rc<LogSegmentsCache>,
     shard_mem_cache: &Rc<RefCell<ShardMemCache>>,
     replication_snapshot: Vec<PendingCommitData>,
-) -> Result<(), RollbackError> {
+) -> Result<(), ReplicationRollbackFailure> {
+
+    // In replication rollback, we modify the write positions in the file header
+    // So we must drain and block any more writes to disk until rollback completes
     let _fsync_gate = fsync_coordinator
         .acquire_rollback_lock()
         .await
-        .ok_or_else(|| RollbackError::HeaderFsyncFailed("failed to acquire fsync gate".to_string()))?;
+        .ok_or_else(|| ReplicationRollbackFailure::FsyncAmortisedBatchLockTimeout)?;
+
+    // We nuke all the in-memory caches at this step at let everything rebuild naturally
+    // Key learning here is this failure mode is rare - follower and S3 must both be down
+    shard_mem_cache.borrow_mut().execute_replication_rollback();
 
     let log_ids: HashSet<u64> = replication_snapshot.iter().map(|c| c.log_id()).collect();
 
+    let mut trailing_shard_log_header: Option<ShardLogHeader> = None;
+
+    // Rollback each log segment file. Normally only one file, but could be two files if a rotation occurred
+    // Failure to rollback of a file stops entire process
     for log_id in log_ids {
         if let Some(log_segment) = log_segments_cache.get_if_cached(log_id) {
-            let mut metadata = log_segment.metadata.borrow_mut();
-            if let Some(read) = &metadata.read {
-                metadata.write = read.clone();
+            let (header, header_end_start_pos) = {
+                let mut metadata = log_segment.metadata.borrow_mut();
+                let shard_log_header_end_pos = metadata.file_len.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64);
 
-                let dma_file_writer = log_segment
-                    .lock_writer("rollback_replicate")
-                    .await
-                    .map_err(|e| RollbackError::HeaderFsyncFailed(format!("lock failed: {e:?}")))?;
-                let dma_file_writer = dma_file_writer
-                    .as_ref()
-                    .ok_or_else(|| RollbackError::HeaderFsyncFailed("no file handle".to_string()))?;
+                // This is actually a valid scenario - we have *just* rotated a log
+                // while still having uncommitted data in the previous log segment file
+                // *or* this is the first log file ever for this shard and we have to rollback the first batch
+                if metadata.read.is_none() {
+                    metadata.write.datablocks_position = shard_log_header_end_pos;
+                    metadata.write.metablocks_position = HEADER_BLOCK_SIZE_BYTES as u64;
+                    metadata.write.aggregate_key_bloom =  AggregateKeyBloom::new();
 
-                let header_end_start_pos = metadata.file_len.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64);
-                let header = metadata.to_shard_log_header();
-                write_dual_shard_log_header(dma_file_writer, header_end_start_pos, &header)
-                    .await
-                    .map_err(|e| RollbackError::HeaderFsyncFailed(format!("header write failed: {e:?}")))?;
-                dma_file_writer
-                    .fdatasync()
-                    .await
-                    .map_err(|e| RollbackError::HeaderFsyncFailed(format!("fsync failed: {e:?}")))?;
-            }
+                    if let Some(trailing_shard_log_header) = trailing_shard_log_header {
+                        metadata.write.wal_index = trailing_shard_log_header.wal_index;
+                        metadata.write.tip_hash = trailing_shard_log_header.tip_hash;
+                    } else {
+                        metadata.write.wal_index = 0;
+                        metadata.write.tip_hash = GENESIS_HASH;
+                    }
+                }
+
+                // The in-memory position needs updating
+                metadata.write = metadata.read.as_ref().unwrap().clone();
+
+                (metadata.to_shard_log_header(), shard_log_header_end_pos)
+            };
+
+            let dma_file_writer = log_segment
+                .lock_writer("rollback_replicate")
+                .await
+                .map_err(|_| ReplicationRollbackFailure::WriteLockTimeout { log_id })?;
+            let dma_file_writer = dma_file_writer
+                .as_ref()
+                .ok_or_else(|| ReplicationRollbackFailure::LogSegmentFileUnavailable { log_id })?;
+
+            write_dual_shard_log_header(dma_file_writer, header_end_start_pos, &header)
+                .await
+                .map_err(|source| ReplicationRollbackFailure::WriteDualHeaderError { log_id, source } )?;
+            
+            dma_file_writer
+                .fdatasync()
+                .await
+                .map_err(|_| ReplicationRollbackFailure::HeaderFsyncFailed { log_id })?;
+
+
+                
+
+            //metadata.datablocks_carry_over = "todo: need to set this";
+
+
+
+            // Critical we keep this to handle rollback of now-empty-shard log segment files
+            trailing_shard_log_header = Some(header);
         }
     }
 
-    shard_mem_cache.borrow_mut().execute_replication_rollback();
     Ok(())
 }
 
@@ -300,71 +416,63 @@ async fn fetch_catchup_entries(
     leader_wal_index: u64,
     max_size_bytes: u64,
     read_max_chunk_size: u64,
-) -> Result<(Vec<ReplicationBatchItem>, bool), ShardReadError> {
-
+) -> Result<Vec<EventBatchFromLogSegmentFile>, FetchCatchupEntriesError> {
     let current_log_id = log_segments_cache.active_log_id();
     let mut scanner = ReverseMetablockScanner::new(log_segments_cache, current_log_id, None, read_max_chunk_size);
 
-    let mut collected: Vec<KeptMetablock> = vec![];
+    let mut replication_items: Vec<EventBatchFromLogSegmentFile> = vec![];
     let mut accumulated_size = 0u64;
 
-    let _scan_result = scanner.scan(|log_id, _pos, bytes| {
-        let wal_index = metablock_bytes::read_wal_index(bytes);
+    let _scan_result = scanner
+        .scan(|log_id, _pos, bytes| {
+            let wal_index = metablock_bytes::read_wal_index(bytes);
 
-        // Stop if we've gone too far back
-        if wal_index <= follower_wal_index {
-            return Ok(Some(()));
-        }
-
-        // Include if in range
-        if wal_index < leader_wal_index {
-            let metablock = deserialise_metablock(bytes)
-                .map_err(|_e| "Failed to deserialize metablock")?;
-
-            // Estimate size (metablock + potential datablock)
-            let size_estimate = metablock.uncompressed_size.saturating_add(FIXED_BLOCK_SIZE_BYTES as u64);
-            accumulated_size += size_estimate;
-
-            let batch_size = metablock.uncompressed_size;
-
-            collected.push(KeptMetablock {
-                log_id,
-                metablock,
-                uncompressed_size: batch_size,
-                datablock: None,
-            });
-
-            // Stop if size limit exceeded
-            if accumulated_size > max_size_bytes {
+            // Stop if we've gone too far back
+            if wal_index <= follower_wal_index {
                 return Ok(Some(()));
             }
-        }
 
-        Ok::<Option<()>, &str>(None)
-    }).await?;
+            // Include if in range
+            if wal_index < leader_wal_index {
+                let metablock = deserialise_metablock(bytes)?;
+
+                // Estimate size (metablock + potential datablock)
+                let size_estimate = metablock.uncompressed_size.saturating_add(FIXED_BLOCK_SIZE_BYTES as u64);
+                accumulated_size += size_estimate;
+
+                replication_items.push(EventBatchFromLogSegmentFile {
+                    log_id,
+                    metablock,
+                    datablock: None,
+                });
+
+                // Stop if size limit exceeded
+                if accumulated_size > max_size_bytes {
+                    return Ok(Some(()));
+                }
+            }
+
+            Ok::<Option<()>, DiskFormatError>(None)
+        })
+        .await
+        .map_err(FetchCatchupEntriesError::MetablockDiscoveryError)?;
 
     // If nothing collected, return empty
     // This is still valid because the leader no longer has the entries
     // So the follower doesn't need them either (hard deleted)
-    if collected.is_empty() {
-        return Ok((vec![], false));
+    if replication_items.is_empty() {
+        return Ok(vec![]);
     }
 
     if accumulated_size > max_size_bytes {
-        return Ok((vec![], true));
+        return Err(FetchCatchupEntriesError::FollowerTooFarBehind);
     }
 
     // Reverse to get chronological order
-    collected.reverse();
+    replication_items.reverse();
 
-    let batches_with_data = fetch_datablocks_for_metablocks(&collected, read_max_chunk_size, log_segments_cache).await?;
+    fetch_datablocks_for_metablocks(&mut replication_items, read_max_chunk_size, log_segments_cache).await
+        .map_err(FetchCatchupEntriesError::FetchDatablockError)?;
 
-    let replication_items: Vec<ReplicationBatchItem> = batches_with_data.into_iter()
-        .map(|kept| ReplicationBatchItem {
-            metablock: kept.0,
-            datablock: kept.1,
-        })
-        .collect();
-
-    Ok((replication_items, false))
+    Ok(replication_items)
 }

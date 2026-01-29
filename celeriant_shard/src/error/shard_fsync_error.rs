@@ -1,92 +1,50 @@
-// use celeriant_rotating_log::{rotating_log_error::RotatingLogError, rwlock_timeout::LockTimeoutError};
-// use celeriant_wire::wire_format_error::WireFormatError;
-// use glommio::GlommioError;
-
-// use crate::error::replication_error::ReplicationError;
+use celeriant_rotating_log::errors::{open_or_create_error::OpenOrCreateError, write_dual_header_error::WriteDualHeaderError};
 
 // /// Storage/infrastructure errors—may be transient.
-// #[derive(Debug, Clone)]
-// pub enum ShardFsyncError {
-//     /// Disk I/O failure.
-//     IoError(String),
+#[derive(Debug, Clone)]
+pub enum ShardFsyncError {
+    /// We needed the carry over buffer during a datablocks write
+    /// due to Direct IO alignment, but it wasn't available in the
+    /// log segment file metadata.
+    DatablocksCarryOverBufferNotPresent,
 
-//     /// Serialization or deserialization failure.
-//     WireFormat(WireFormatError),
+    /// A rollback occurred and invalidated pending writes.
+    /// Writers should retry their operation. Rollback could be from
+    /// a local failure or replication failure
+    RollbackInvalidatedWrites,
 
-//     /// DMA file handle not initialized (startup issue).
-//     DmaFileNotInitialized,
+    /// We accumulated so many writes from clients that it
+    /// is impossible to write it to a single log segment file
+    /// Server possibly mis-configured the preallocate_bytes
+    BatchesTooLarge { preallocate_bytes: u64 },
 
-//     /// Log file header corrupted beyond recovery.
-//     HeaderCorrupted { log_id: Option<u64> },
+    /// Possibly out of disk space, unable to create
+    /// new log file and pre-allocate space for it
+    UnableToRotateToNewLogSegmentFile(OpenOrCreateError),
 
-//     /// Requested log file doesn't exist.
-//     LogFileNotFound { log_id: u64 },
+    /// We need the writer DmaFile but it's gone,
+    /// possible due to a server shutdown event
+    ActiveWriteFileUnavailable,
 
-//     DatablocksCarryOverBufferNotPresent,
+    /// We tried to lock the writer DmaFile for the active log
+    /// segment file but timed out. Shouldn't happen as we serialise
+    /// a single leader for fsync batching
+    WriteLockTimeout,
 
-//     NotEnoughLogFreeSpace {
-//         required: u64,
-//         available: u64,
-//     },
+    /// Whatever we got in the metablock it failed to serialize
+    /// this shouldn't happen as metablocks are always going to fit
+    /// in the provided buffer
+    MetablockSerialisationError(String),
 
-//     /// A rollback occurred and invalidated pending writes.
-//     /// Writers should retry their operation.
-//     RollbackInvalidatedWrites,
-// }
+    /// Failed trying to write batch of metablocks to the active file
+    WriteMetablocksError(String),
 
-// impl From<LockTimeoutError> for ShardFsyncError {
-//     fn from(e: LockTimeoutError) -> Self {
-//         Self::IoError(e.to_string())
-//     }
-// }
+    /// Failed trying to write the shard log header (front or back)
+    LogSegmentFileHeaderWriteFailure(WriteDualHeaderError),
 
-// impl From<GlommioError<()>> for ShardFsyncError {
-//     fn from(e: GlommioError<()>) -> Self {
-//         Self::IoError(e.to_string())
-//     }
-// }
+    /// Failed fsync to the disk
+    FDataSyncError(String),
 
-// impl From<WireFormatError> for ShardFsyncError {
-//     fn from(e: WireFormatError) -> Self {
-//         Self::WireFormat(e)
-//     }
-// }
-
-// impl From<std::io::Error> for ShardFsyncError {
-//     fn from(e: std::io::Error) -> Self {
-//         Self::IoError(e.to_string())
-//     }
-// }
-
-// impl From<RotatingLogError> for ShardFsyncError {
-//     fn from(e: RotatingLogError) -> Self {
-//         match e {
-//             RotatingLogError::InvalidPreallocatedBytes(b) => {
-//                 Self::IoError(format!("Invalid preallocated bytes: {}", b))
-//             }
-//             RotatingLogError::BatchesTooLarge(b) => {
-//                 Self::IoError(format!("Batches too large for log segment file of preallocated bytes: {}", b))
-//             }
-//             RotatingLogError::IoError(msg) => Self::IoError(msg),
-//             RotatingLogError::WireFormat(e) => Self::WireFormat(e),
-//             RotatingLogError::HeaderCorrupted { log_id } => Self::HeaderCorrupted { log_id },
-//             RotatingLogError::LogFileNotFound { log_id } => Self::LogFileNotFound { log_id },
-//         }
-//     }
-// }
-
-// impl From<ReplicationError> for ShardFsyncError {
-//     fn from(e: ReplicationError) -> Self {
-//         match e {
-//             ReplicationError::Network(net_err) => Self::IoError(format!("{:?}", net_err)),
-//             ReplicationError::FollowerRejected(rejection) => Self::IoError(format!("Follower rejected: {:?}", rejection)),
-//             ReplicationError::LockTimeout(msg) => Self::IoError(msg),
-//             ReplicationError::RollbackInProgress => Self::IoError("Rollback in progress".into()),
-//             ReplicationError::S3Unavailable => Self::IoError("S3 sidecar unavailable".into()),
-//             ReplicationError::RollbackFailed(rb_err) => Self::IoError(format!("Rollback failed: {:?}", rb_err)),
-//             ReplicationError::GapTooLarge { gap_bytes, threshold_bytes } => Self::IoError(format!("Gap too large: {} bytes exceeds threshold {} bytes", gap_bytes, threshold_bytes)),
-//             ReplicationError::WalEntriesUnavailable { requested_index } => Self::IoError(format!("WAL entries unavailable for index {}", requested_index)),
-//             ReplicationError::ExtendedCatchupFailure(_shard_read_error) => Self::IoError("Extended catchup failed".into()),
-//         }
-//     }
-// }
+    /// Failed trying to write batch of datablocks to the active file
+    WriteDatablocksError(String),
+}
