@@ -147,7 +147,7 @@ fn setup_populated_wal(shard_dir: PathBuf, target_bytes: usize) -> usize {
 
                 let shard_wal = shard_wal.clone();
                 handles.push(glommio::spawn_local(async move {
-                    shard_wal.write(0, write_request).await.unwrap();
+                    shard_wal.write(Some(0), write_request).await.unwrap();
 
                     // Progress indicator for large WALs
                     if i % 1000 == 0 && i > 0 {

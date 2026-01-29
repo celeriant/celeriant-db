@@ -252,7 +252,7 @@ pub async fn write_dual_shard_log_header(dma_file: &DmaFile, header_end_start_po
     Ok(())
 }
 
-async fn read_datablocks_carry_over_bytes(dma_file: &DmaFile, datablocks_position: u64) -> Result<Option<Vec<u8>>, GlommioError<()>> {
+pub async fn read_datablocks_carry_over_bytes(dma_file: &DmaFile, datablocks_position: u64) -> Result<Option<Vec<u8>>, GlommioError<()>> {
     let datablocks_carry_over_size = dma_file.align_up(datablocks_position).saturating_sub(datablocks_position);
 
     if datablocks_carry_over_size > 0 {

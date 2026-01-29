@@ -211,7 +211,7 @@ fn bench_write_fsync_delays(c: &mut Criterion) {
 
                                             // Measure only the write time
                                             let start = Instant::now();
-                                            let result = shard_wal.write(0, write_request).await;
+                                            let result = shard_wal.write(Some(0), write_request).await;
                                             let elapsed = start.elapsed();
 
                                             black_box(result.unwrap());
@@ -233,7 +233,7 @@ fn bench_write_fsync_delays(c: &mut Criterion) {
                                     cumulative_write_time += h.await;
                                 }
 
-                                shard_wal.close().await.unwrap();
+                                shard_wal.close().await;
                                 cumulative_write_time / TOTAL_WRITES as u32
                             })
                             .unwrap()
@@ -291,7 +291,7 @@ fn bench_write_fsync_delays(c: &mut Criterion) {
 
                                             // Measure only the write time
                                             let start = Instant::now();
-                                            let result = shard_wal.write(0, write_request).await;
+                                            let result = shard_wal.write(Some(0), write_request).await;
                                             let elapsed = start.elapsed();
 
                                             black_box(result.unwrap());
@@ -311,7 +311,7 @@ fn bench_write_fsync_delays(c: &mut Criterion) {
                                     cumulative_write_time += h.await;
                                 }
 
-                                shard_wal.close().await.unwrap();
+                                shard_wal.close().await;
                                 cumulative_write_time / TOTAL_WRITES as u32
                             })
                             .unwrap()
@@ -382,7 +382,7 @@ fn bench_write_cache_impact(c: &mut Criterion) {
 
                                             // Measure only the write time
                                             let start = Instant::now();
-                                            let result = shard_wal.write(0, write_request).await;
+                                            let result = shard_wal.write(Some(0), write_request).await;
                                             let elapsed = start.elapsed();
 
                                             black_box(result.unwrap());
@@ -402,7 +402,7 @@ fn bench_write_cache_impact(c: &mut Criterion) {
                                     cumulative_write_time += h.await;
                                 }
 
-                                shard_wal.close().await.unwrap();
+                                shard_wal.close().await;
                                 cumulative_write_time / TOTAL_WRITES as u32
                             })
                             .unwrap()
@@ -458,7 +458,7 @@ fn bench_write_cache_impact(c: &mut Criterion) {
 
                                             // Measure only the write time
                                             let start = Instant::now();
-                                            let result = shard_wal.write(0, write_request).await;
+                                            let result = shard_wal.write(Some(0), write_request).await;
                                             let elapsed = start.elapsed();
 
                                             black_box(result.unwrap());
@@ -478,7 +478,7 @@ fn bench_write_cache_impact(c: &mut Criterion) {
                                     cumulative_write_time += h.await;
                                 }
 
-                                shard_wal.close().await.unwrap();
+                                shard_wal.close().await;
                                 cumulative_write_time / TOTAL_WRITES as u32
                             })
                             .unwrap()

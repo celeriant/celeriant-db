@@ -11,5 +11,9 @@ pub enum ReplicationRollbackFailure {
     },
     HeaderFsyncFailed {
         log_id: u64,
+    },
+    UnableToReadDatablocksCarryOver {
+        source: String,
+        log_id: u64,
     }
 }

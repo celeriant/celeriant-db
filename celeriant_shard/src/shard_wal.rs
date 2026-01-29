@@ -1,26 +1,20 @@
-//! Main shard write-ahead log orchestrator.
-//!
-//! Coordinates validation, building, caching, and durability for a single shard.
-
-#[path = "shard_wal_sync.rs"]
-mod sync;
-
-use self::sync::{capture_fsync_snapshot, commit_fsync_with_rollback};
-
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{VecDeque};
 use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use celeriant_disk::files::rwlock_timeout::write_with_timeout;
+use celeriant_rotating_log::errors::ready_up_error::ReadyUpError;
+use celeriant_rotating_log::errors::scan_error::ScanError;
 use celeriant_wal::compression_type::CompressionType;
+use celeriant_wire::codec::codec_error::CodecError;
+use celeriant_wire::disk::disk_format_error::DiskFormatError;
 use celeriant_wire::disk::metablock_bytes;
-use celeriant_wire::disk::serialised_datablock::{SerialisedDatablock, deserialise_datablock};
+use celeriant_wire::disk::serialised_datablock::{SerialisedDatablock};
 use celeriant_wire::disk::versioned_block::deserialise_metablock;
 use glommio::sync::RwLock;
 
-use celeriant_disk::files::read_objects_absolute;
 use celeriant_memcache::cache_path::CachePath;
 use celeriant_memcache::mem_snapshot_aggregate::{AggregateStatus, MemSnapshotAggregate};
 use celeriant_memcache::metablock_position::MetablockPosition;
@@ -55,11 +49,24 @@ use lru::LruCache;
 use crate::amortisation::coordinator::Coordinator;
 use crate::bloom::bloom_filter_cache::BloomFilterCache;
 use crate::bloom::event_type_filter::extract_unique_event_types;
+use crate::collect_from_disk::{EventBatchFromLogSegmentFile, fetch_datablocks_for_metablocks};
+use crate::error::follower_replication_write_error::FollowerReplicationWriteError;
+use crate::error::replication_error::ReplicationError;
+use crate::error::shard_cache_load_error::ShardCacheLoadError;
+use crate::error::shard_delete_error::ShardDeleteError;
+use crate::error::shard_error::ShardError;
+use crate::error::shard_exists_error::ShardExistsError;
+use crate::error::shard_fsync_error::ShardFsyncError;
+use crate::error::shard_listing_error::ShardListingError;
+use crate::error::shard_read_error::ShardReadError;
+use crate::error::shard_trim_error::ShardTrimError;
+use crate::error::shard_write_error::ShardWriteError;
 use crate::in_memory_filtering;
 use crate::internal_shard_config::InternalShardConfig;
 use crate::loading_coordinator::LoadingCoordinator;
 use crate::replication_client::ReplicationClient;
 use crate::shard_wal_replicate::{capture_replication_snapshot, commit_replication_with_rollback};
+use crate::shard_wal_sync::{capture_fsync_snapshot, commit_fsync_with_rollback};
 
 /// Write-ahead log for a single shard.
 ///
@@ -115,56 +122,49 @@ impl<R: ReplicationClient + 'static> AggregateReader for ShardWal<R> {
 impl<R: ReplicationClient + 'static> ShardWal<R> {
     pub async fn process_request(&self, lease_index: Option<u64>, request: Request) -> Result<Response, ShardError> {
         match request {
-            Request::Exists(exists_request) => self.exists(&exists_request).await.map(Response::Exists).map_err(ShardError::Read),
+            Request::Exists(exists_request) => self.exists(&exists_request).await.map(Response::Exists).map_err(ShardError::Exists),
             Request::Read(read_request) => self.read(&read_request).await.map(Response::Read).map_err(ShardError::Read),
             Request::Write(write_request) => {
-                let lease_index = lease_index.ok_or(ShardWriteError::InvalidLeaseIndex)?;
                 self.write(lease_index, write_request)
                     .await
                     .map(Response::Write)
                     .map_err(ShardError::Write)
             }
             Request::TrimStart(trim_start_request) => {
-                let lease_index = lease_index.ok_or(ShardWriteError::InvalidLeaseIndex)?;
                 self.trim_start(lease_index, trim_start_request)
                     .await
                     .map(Response::TrimStart)
-                    .map_err(ShardError::Write)
+                    .map_err(ShardError::TrimStart)
             }
             Request::Delete(delete_request) => {
-                let lease_index = lease_index.ok_or(ShardWriteError::InvalidLeaseIndex)?;
                 self.delete(lease_index, delete_request)
                     .await
                     .map(Response::Delete)
-                    .map_err(ShardError::Write)
+                    .map_err(ShardError::Delete)
             }
-            Request::Watch(_) => Err(ShardError::Read(ShardReadError::IoError(
-                "Watch unprocessable via request/response model".to_string(),
-            ))),
+            Request::Watch(_) => Err(ShardError::WatchRequestInvalid),
             Request::ListOrgs(list_request) => {
-                self.list_orgs(list_request).await.map(Response::ListOrgs).map_err(ShardError::Read)
+                self.list_orgs(list_request).await.map(Response::ListOrgs).map_err(ShardError::ListOrgs)
             }
             Request::ListAggregateTypes(list_request) => {
                 self.list_aggregate_types(list_request)
                     .await
                     .map(Response::ListAggregateTypes)
-                    .map_err(ShardError::Read)
+                    .map_err(ShardError::ListAggregateTypes)
             }
             Request::ListAggregates(list_request) => {
                 self.list_aggregates(list_request)
                     .await
                     .map(Response::ListAggregates)
-                    .map_err(ShardError::Read)
+                    .map_err(ShardError::ListAggregates)
             }
             Request::ReplicationBatch(replication_request) => {
                 self.handle_replication_batch(replication_request)
                     .await
                     .map(Response::ReplicationBatch)
-                    .map_err(ShardError::Write)
+                    .map_err(ShardError::ReplicationBatch)
             }
-            Request::CatchUp(_) => Err(ShardError::Read(ShardReadError::IoError(
-                "CatchUp requests not implemented yet".to_string(),
-            ))),
+            Request::CatchUp(_) => Err(ShardError::CatchUpRequestInvalid),
         }
     }
 
@@ -172,7 +172,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
     ///
     /// If the shard directory exists with log files, reopens from the latest.
     /// Otherwise creates a new shard with an empty log file.
-    pub async fn open(config: InternalShardConfig, cluster_role: ClusterRole, replication_client: R) -> Result<Self, RotatingLogError> {
+    pub async fn open(config: InternalShardConfig, cluster_role: ClusterRole, replication_client: R) -> Result<Self, ReadyUpError> {
         let shard_mem_cache = ShardMemCache::new(
             config.recent_write_cache_bytes,
             config.aggregate_snapshots_cache_bytes,
@@ -207,7 +207,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
     /// 
     /// Scans WAL in reverse order, returning orgs with most recent activity first.
     /// Uses bounded LRU for deduplication within a page.
-    pub async fn list_orgs(&self, request: ListOrgsRequest) -> Result<ListOrgsResponse, ShardReadError> {
+    pub async fn list_orgs(&self, request: ListOrgsRequest) -> Result<ListOrgsResponse, ShardListingError> {
         let start_time = Instant::now();
         let max_duration = self.config.list_max_duration;
         let page_size = self.config.list_page_size;
@@ -232,7 +232,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
         );
 
         let scan_result = scanner
-            .scan::<bool, ShardReadError>(|log_id, pos, bytes| {
+            .scan::<bool, ()>(|log_id, pos, bytes| {
                 // Check time limit
                 if start_time.elapsed() >= max_duration {
                     return Ok(Some(false)); // Stop due to timeout, not end of WAL
@@ -269,7 +269,8 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
 
                 Ok(None)
             })
-            .await?;
+            .await
+            .map_err(ShardListingError::ReadFromDiskError)?;
 
         // If scan completed without early exit, we reached the end
         if scan_result.is_none() {
@@ -292,7 +293,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
     /// List aggregate types, optionally filtered by org_id.
     ///
     /// Scans WAL in reverse order, returning types with most recent activity first.
-    pub async fn list_aggregate_types(&self, request: ListAggregateTypesRequest) -> Result<ListAggregateTypesResponse, ShardReadError> {
+    pub async fn list_aggregate_types(&self, request: ListAggregateTypesRequest) -> Result<ListAggregateTypesResponse, ShardListingError> {
         let start_time = Instant::now();
         let max_duration = self.config.list_max_duration;
         let page_size = self.config.list_page_size;
@@ -317,7 +318,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
         );
 
         let scan_result = scanner
-            .scan::<bool, ShardReadError>(|log_id, pos, bytes| {
+            .scan::<bool, ()>(|log_id, pos, bytes| {
                 if start_time.elapsed() >= max_duration {
                     return Ok(Some(false));
                 }
@@ -360,7 +361,8 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
 
                 Ok(None)
             })
-            .await?;
+            .await
+            .map_err(ShardListingError::ReadFromDiskError)?;
 
         if scan_result.is_none() {
             reached_end = true;
@@ -383,7 +385,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
     ///
     /// Scans WAL in reverse order. Returns aggregates with accumulated statistics
     /// from batches seen within this page. Client must merge stats across pages.
-    pub async fn list_aggregates(&self, request: ListAggregatesRequest) -> Result<ListAggregatesResponse, ShardReadError> {
+    pub async fn list_aggregates(&self, request: ListAggregatesRequest) -> Result<ListAggregatesResponse, ShardListingError> {
         let start_time = Instant::now();
         let max_duration = self.config.list_max_duration;
         let page_size = self.config.list_page_size;
@@ -408,6 +410,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
             uncompressed_size: u64,
         }
 
+        // TODO: LRU behaviour here needs more testing & optimisation
         let mut seen: LruCache<AggregateKey, AggregatePageStats> = LruCache::new(
             NonZeroUsize::new(page_size.saturating_mul(4).max(100)).unwrap()
         );
@@ -426,7 +429,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
         );
 
         let scan_result = scanner
-            .scan::<bool, ShardReadError>(|log_id, pos, bytes| {
+            .scan::<bool, ()>(|log_id, pos, bytes| {
                 if start_time.elapsed() >= max_duration {
                     return Ok(Some(false));
                 }
@@ -551,7 +554,8 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
 
                 Ok(None)
             })
-            .await?;
+            .await
+            .map_err(ShardListingError::ReadFromDiskError)?;
 
         if scan_result.is_none() {
             reached_end = true;
@@ -611,11 +615,9 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
         let cached = self.shard_mem_cache.borrow_mut().find_nearest_wal_index_position(target_wal_index);
         
         if let Some((cached_wal_index, pos)) = cached {
-            // Only use cache if it's reasonably close (within ~1000 entries)
-            // and not too far ahead of target
+            //TODO: Benchmarking and testing of this, needs more thought on cache relevance
             if cached_wal_index <= target_wal_index && target_wal_index - cached_wal_index < 1000 {
-                // Start just after the cached position to include it in scan
-                return (pos.log_id, Some(pos.metablock_absolute_pos.saturating_add(FIXED_BLOCK_SIZE_BYTES as u64)));
+                return (pos.log_id, Some(pos.metablock_absolute_pos.saturating_add(FIXED_BLOCK_SIZE_BYTES as u64))); //Include self
             }
         }
 
@@ -623,7 +625,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
         (read_cursor.log_id, None)
     }
     
-    pub async fn exists(&self, exists_request: &ExistsRequest) -> Result<ExistsResponse, ShardReadError> {
+    pub async fn exists(&self, exists_request: &ExistsRequest) -> Result<ExistsResponse, ShardExistsError> {
         let exists = self.aggregate_exists_and_cache(&exists_request.aggregate_key, CachePath::Read).await?;
         if !exists {
             return Ok(ExistsResponse {
@@ -643,12 +645,15 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
         })
     }
 
-    pub async fn trim_start(&self, lease_index: u64, trim_request: TrimStartRequest) -> Result<SuccessResponse, ShardWriteError> {
+    pub async fn trim_start(&self, lease_index: Option<u64>, trim_request: TrimStartRequest) -> Result<SuccessResponse, ShardTrimError> {
+        
+        let lease_index = lease_index.ok_or(ShardTrimError::InvalidLeaseIndex)?;
+
         let aggregate_key = &trim_request.aggregate_key;
 
         // Ensure aggregate exists
         if !self.aggregate_exists_and_cache(aggregate_key, CachePath::Write).await? {
-            return Err(ShardWriteError::AggregateNotExists);
+            return Err(ShardTrimError::AggregateNotExists);
         }
 
         let current_indexes = self.shard_mem_cache.borrow_mut().get_write_event_indexes(aggregate_key);
@@ -662,7 +667,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
         }
 
         if trim_request.keep_from_event_batch_index > current_indexes.event_batch_index {
-            return Err(ShardWriteError::TrimIndexOutOfRange {
+            return Err(ShardTrimError::TrimIndexOutOfRange {
                 requested: trim_request.keep_from_event_batch_index,
                 max_event_batch_index: current_indexes.event_batch_index,
             });
@@ -715,17 +720,20 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
         })
     }
     
-    pub async fn delete(&self, lease_index: u64, delete_request: DeleteRequest) -> Result<SuccessResponse, ShardWriteError> {
+    pub async fn delete(&self, lease_index: Option<u64>, delete_request: DeleteRequest) -> Result<SuccessResponse, ShardDeleteError> {
+        
+        let lease_index = lease_index.ok_or(ShardDeleteError::InvalidLeaseIndex)?;
+
         // Make sure we have at least one aggregate to write
         if delete_request.deletes.is_empty() {
-            return Err(ShardWriteError::EmptyEventsList);
+            return Err(ShardDeleteError::EmptyDeleteList);
         }
 
         let mut prepared_deletes = Vec::with_capacity(delete_request.deletes.len());
         for (aggregate_key, single_delete) in &delete_request.deletes {
             // Ensure aggregate snapshot is in memcache, loading from disk if necessary
             if !self.aggregate_exists_and_cache(aggregate_key, CachePath::Write).await? {
-                return Err(ShardWriteError::AggregateNotExists);
+                return Err(ShardDeleteError::AggregateNotExists);
             }
 
             let aggregate_current_indexes = self.shard_mem_cache.borrow_mut().get_write_event_indexes(aggregate_key);
@@ -733,7 +741,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
             // Validate optimistic concurrency
             if let Some(expected) = single_delete.expected_event_batch_index {
                 if expected != aggregate_current_indexes.event_batch_index {
-                    return Err(ShardWriteError::OptimisticConcurrencyViolation {
+                    return Err(ShardDeleteError::OptimisticConcurrencyViolation {
                         expected_event_batch_index: expected,
                         current_event_batch_index: aggregate_current_indexes.event_batch_index,
                     });
@@ -808,7 +816,10 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
     /// # Arguments
     /// * `lease_index` - Current lease for write authorization
     /// * `request` - Write request with events to append
-    pub async fn write(&self, lease_index: u64, write_request: WriteRequest) -> Result<SuccessResponse, ShardWriteError> {
+    pub async fn write(&self, lease_index: Option<u64>, write_request: WriteRequest) -> Result<SuccessResponse, ShardWriteError> {
+        
+        let lease_index = lease_index.ok_or(ShardWriteError::InvalidLeaseIndex)?;
+
         // Make sure we have at least one aggregate to write
         if write_request.writes.is_empty() {
             return Err(ShardWriteError::EmptyEventsList);
@@ -833,7 +844,8 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
 
             // Ensure aggregate snapshot is in memcache, loading from disk if necessary
             // Returns true for Found, false for NotFound/Deleted
-            let aggregate_exists = self.aggregate_exists_and_cache(aggregate_key, CachePath::Write).await?;
+            let aggregate_exists = self.aggregate_exists_and_cache(aggregate_key, CachePath::Write).await
+                .map_err(ShardWriteError::AggregateExistsAndCacheError)?;
             
             if !aggregate_exists {
                 // Check if it was deleted with allow_recreate = false
@@ -853,7 +865,8 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
 
             // Prep work done outside of validate_and_prepare_write as it's async
             if single_write.enforce_client_idempotency {
-                self.cache_aggregate_client(aggregate_key, &aggregate_client_key).await?;
+                self.cache_aggregate_client(aggregate_key, &aggregate_client_key).await
+                    .map_err(ShardWriteError::CacheAggregateClientError)?;
             }
 
             // Validate and prepare - reads from memcache but does not mutate
@@ -906,13 +919,13 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
         }
 
         // 3. Collect metablocks with size-bounded accumulation (NO datablocks yet)
-        let collection = self.collect_metablocks_bounded(aggregate_key, filters, max_bytes, last_known).await?;
+        let mut collection = self.collect_metablocks_bounded(aggregate_key, filters, max_bytes, last_known).await?;
 
         // 4. Fetch datablocks only for kept metablocks
-        let batches_with_data = fetch_datablocks_for_metablocks(&collection.kept_metablocks, self.config.read_max_chunk_size, &self.log_segments_cache).await?;
+        fetch_datablocks_for_metablocks(&mut collection.kept_metablocks, self.config.read_max_chunk_size, &self.log_segments_cache).await?;
 
         // 5. Deserialize and apply event-level filters
-        let event_batches = self.build_filtered_response(batches_with_data, filters)?;
+        let event_batches = self.build_filtered_response(collection.kept_metablocks, filters);
 
         Ok(ReadResponse {
             correlation_id: request.correlation_id,
@@ -922,7 +935,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
     }
 
     /// Close the shard WAL, flushing any pending writes.
-    pub async fn close(&self) -> Result<(), RotatingLogError> {
+    pub async fn close(&self) {
         self.log_segments_cache.close().await
     }
 
@@ -931,7 +944,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
         self.watched_aggregates.clone()
     }
 
-    async fn cache_aggregate_client(&self, aggregate_key: &AggregateKey, aggregate_client_key: &AggregateClientKey) -> Result<(), ShardWriteError> {
+    async fn cache_aggregate_client(&self, aggregate_key: &AggregateKey, aggregate_client_key: &AggregateClientKey) -> Result<(), ShardCacheLoadError> {
         // If we are cached already
         if let (true, _exists) = self
             .shard_mem_cache
@@ -943,7 +956,8 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
 
         // Take an exclusive lock on this aggregate client
         let aggregate_lock = self.aggregate_client_loading.acquire(aggregate_client_key);
-        let _ = write_with_timeout(&aggregate_lock, "cache_aggregate_client").await?;
+        let _ = write_with_timeout(&aggregate_lock, "cache_aggregate_client").await
+            .map_err(|_| ShardCacheLoadError::AggregateLoadingLockTimeout)?;
 
         // We have exclusive access now, check if another concurrent task has already done the work
         if let (true, _exists) = self
@@ -992,7 +1006,8 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
                     Ok(Some(true)) //Done searching
                 }
             })
-            .await?;
+            .await
+            .map_err(ShardCacheLoadError::FileScanningError)?;
 
         let found = find_result.unwrap_or(false);
         if !found {
@@ -1003,7 +1018,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
         Ok(())
     }
 
-    async fn aggregate_exists_and_cache(&self, searching_for_aggregate_key: &AggregateKey, cache_path: CachePath) -> Result<bool, ShardCacheError> {
+    async fn aggregate_exists_and_cache(&self, searching_for_aggregate_key: &AggregateKey, cache_path: CachePath) -> Result<bool, ShardCacheLoadError> {
         // If we are cached already
         if let (true, status) = self.shard_mem_cache.borrow_mut().aggregate_load_status(searching_for_aggregate_key, cache_path) {
             return Ok(status == AggregateStatus::Found);
@@ -1011,7 +1026,8 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
 
         // Take an exclusive lock on this aggregate
         let aggregate_lock = self.aggregate_loading.acquire(searching_for_aggregate_key);
-        let _ = write_with_timeout(&aggregate_lock, "move_aggregate_to_memcache").await?;
+        let _ = write_with_timeout(&aggregate_lock, "move_aggregate_to_memcache").await
+            .map_err(|_| ShardCacheLoadError::AggregateLoadingLockTimeout)?;
 
         // We have exclusive access now, check if another concurrent task has already done the work
         if let (true, status) = self.shard_mem_cache.borrow_mut().aggregate_load_status(searching_for_aggregate_key, cache_path) {
@@ -1115,7 +1131,8 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
                     Ok(Some(true)) //Done searching
                 }
             })
-            .await?;
+            .await
+            .map_err(ShardCacheLoadError::FileScanningError)?;
 
         let found = find_result.unwrap_or(false);
         if find_result.is_none() {
@@ -1238,7 +1255,8 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
         };
 
         // Serialize datablock - this can fail
-        let serialized_datablock = SerialisedDatablock::new(&datablock, write_request.compression_type)?;
+        let serialized_datablock = SerialisedDatablock::new(&datablock, write_request.compression_type)
+            .map_err(ShardWriteError::FailedToSerialiseDatablocks)?;
 
         let server_timestamp = self.config.timestamp_config.now();
 
@@ -1381,7 +1399,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
     
     async fn handle_replication_batch(
         &self, request: celeriant_msg::request::requests::ReplicationBatchRequest
-    ) -> Result<ReplicationBatchResponse, ShardWriteError> {
+    ) -> Result<ReplicationBatchResponse, FollowerReplicationWriteError> {
         let follower_timestamp_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("System time before Unix epoch")
@@ -1420,6 +1438,9 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
             .map(|b| (b.metablock.previous_tip_hash, b.metablock.wal_index))
             .unwrap_or((GENESIS_HASH, 0));
 
+        //TODO: How to handle the scenario where we have compacted the log but yet to replicate? 
+        //It would be a rare scenario, maybe an invariant we can enforce during compaction
+
         if follower_wal_index.saturating_add(1) != leader_wal_index {
             return Ok(response(ReplicationResult::Rejected(FollowerRejection::WalIndexMismatch {
                 max_follower_wal_index: follower_wal_index,
@@ -1434,12 +1455,14 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
         }
 
         // Add all entries to pending queue synchronously (no fsync yet)
-        if let Some(rejection) = self.add_replicated_entries_to_queue(request.batches)? {
+        if let Some(rejection) = self.add_replicated_entries_to_queue(request.batches)
+            .map_err(FollowerReplicationWriteError::FailedToSerialiseDatablocks)? {
             return Ok(response(ReplicationResult::Rejected(rejection)));
         }
 
         // Single fsync for entire batch
-        self.sync_durable().await?;
+        self.sync_durable().await
+            .map_err(FollowerReplicationWriteError::ShardFSyncError)?;
 
         Ok(response(ReplicationResult::Success {
             last_follower_metablock: None,
@@ -1452,7 +1475,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
     fn add_replicated_entries_to_queue(
         &self,
         items: Vec<ReplicationBatchItem>,
-    ) -> Result<Option<FollowerRejection>, ShardWriteError> {
+    ) -> Result<Option<FollowerRejection>, CodecError> {
         let mut prepared = Vec::with_capacity(items.len());
 
         for item in items {
@@ -1490,7 +1513,7 @@ struct PreparedWrite {
 /// Result of size-bounded metablock collection
 struct MetablockCollection {
     /// Metablocks that fit within max_bytes, sorted by batch index ascending
-    kept_metablocks: Vec<KeptMetablock>,
+    kept_metablocks: Vec<EventBatchFromLogSegmentFile>,
     /// If we hit the size limit, this is the next batch index to continue from
     next_event_batch_index: Option<u64>,
 }
@@ -1509,8 +1532,8 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
         filters: &ReadFilters,
         max_bytes: u64,
         last_known: MetablockPosition,
-    ) -> Result<MetablockCollection, ShardReadError> {
-        let mut kept: Vec<KeptMetablock> = Vec::new();
+    ) -> Result<MetablockCollection, ScanError<DiskFormatError>> {
+        let mut kept: Vec<EventBatchFromLogSegmentFile> = Vec::new();
         let mut cumulative_size: u64 = 0;
         let mut evicted_batch_index: Option<u64> = None;
 
@@ -1545,8 +1568,8 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
             .await?;
         }
 
-        // Sort by batch index ascending (disk results were added in reverse)
-        kept.sort_by_key(|k| Self::get_batch_index(&k.metablock));
+        // Reverse to get chronological order
+        kept.reverse();
 
         Ok(MetablockCollection {
             kept_metablocks: kept,
@@ -1559,7 +1582,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
         aggregate_key: &AggregateKey,
         filters: &ReadFilters,
         max_bytes: u64,
-        kept: &mut Vec<KeptMetablock>,
+        kept: &mut Vec<EventBatchFromLogSegmentFile>,
         cumulative_size: &mut u64,
         evicted_batch_index: &mut Option<u64>,
     ) {
@@ -1588,10 +1611,9 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
             }
 
             *cumulative_size += batch_size;
-            kept.push(KeptMetablock {
+            kept.push(EventBatchFromLogSegmentFile {
                 log_id: 0, // Cache entries don't need log_id for fetch
                 metablock: write.metablock.clone(),
-                uncompressed_size: batch_size,
                 datablock: write.datablock.clone(),
             });
         }
@@ -1605,12 +1627,12 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
         last_known: MetablockPosition,
         filters: &ReadFilters,
         max_bytes: u64,
-        kept: &mut Vec<KeptMetablock>,
+        kept: &mut Vec<EventBatchFromLogSegmentFile>,
         cumulative_size: &mut u64,
         evicted_batch_index: &mut Option<u64>,
-    ) -> Result<(), ShardReadError> {
+    ) -> Result<(), ScanError<DiskFormatError>> {
         // Use a VecDeque for efficient eviction from the "newest" end
-        let mut disk_kept: VecDeque<KeptMetablock> = VecDeque::new();
+        let mut disk_kept: VecDeque<EventBatchFromLogSegmentFile> = VecDeque::new();
         let mut disk_cumulative: u64 = 0;
 
         let mut scanner = ReverseMetablockScanner::new(
@@ -1625,7 +1647,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
         let budget_for_disk = max_bytes.saturating_sub(*cumulative_size);
 
         scanner
-            .scan::<(), ShardReadError>(|log_id, _pos, bytes| {
+            .scan::<(), DiskFormatError>(|log_id, _pos, bytes| {
                 if !metablock_bytes::is_matches_aggregate_key(bytes, aggregate_key) {
                     return Ok(None); // Continue - different aggregate
                 }
@@ -1649,21 +1671,18 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
                     return Ok(None); // Continue - filtered out
                 }
 
-                let batch_size = metablock.uncompressed_size;
-
                 // Add to back (we're scanning backwards, newest seen first)
-                disk_cumulative += batch_size;
-                disk_kept.push_back(KeptMetablock {
+                disk_cumulative += metablock.uncompressed_size;
+                disk_kept.push_back(EventBatchFromLogSegmentFile {
                     log_id,
                     metablock,
-                    uncompressed_size: batch_size,
                     datablock: None,
                 });
 
                 // Evict from FRONT (newest) until under budget
                 while disk_cumulative > budget_for_disk && disk_kept.len() > 1 {
                     if let Some(evicted) = disk_kept.pop_front() {
-                        disk_cumulative -= evicted.uncompressed_size;
+                        disk_cumulative -= evicted.metablock.uncompressed_size;
                         let evicted_idx = Self::get_batch_index(&evicted.metablock);
                         // Track lowest evicted as continuation point
                         match evicted_batch_index {
@@ -1690,13 +1709,13 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
 
     fn build_filtered_response(
         &self,
-        batches_with_data: Vec<(Metablock, Option<Datablock>)>,
+        batches_with_data: Vec<EventBatchFromLogSegmentFile>,
         filters: &ReadFilters,
-    ) -> Result<Vec<AggregateEventBatch>, ShardReadError> {
+    ) -> Vec<AggregateEventBatch> {
         let mut event_batches = Vec::with_capacity(batches_with_data.len());
 
-        for (metablock, datablock) in batches_with_data {
-            let Some(mut datablock) = datablock else {
+        for item in batches_with_data {
+            let Some(mut datablock) = item.datablock else {
                 continue;
             };
 
@@ -1708,14 +1727,14 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
                 }
             }
 
-            let Some(batch) = AggregateEventBatch::from_wal(&metablock, &datablock) else {
+            let Some(batch) = AggregateEventBatch::from_wal(&item.metablock, &datablock) else {
                 continue;
             };
 
             event_batches.push(batch);
         }
 
-        Ok(event_batches)
+        event_batches
     }
 }
 

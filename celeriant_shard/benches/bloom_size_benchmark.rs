@@ -134,7 +134,7 @@ async fn populate_wal(shard_wal: Rc<ShardWal<StubReplicationClient>>, num_aggreg
                 let aggregate_key = AggregateKey::new(1, 1, aggregate_id);
                 let events = create_events(EVENTS_PER_WRITE, EVENT_SIZE_BYTES, 0);
                 let write_request = create_write_request(aggregate_key, events, write_id as u128);
-                let _ = shard_wal.write(0, write_request).await;
+                let _ = shard_wal.write(Some(0), write_request).await;
             });
             all_handles.push(handle);
         }
@@ -186,7 +186,7 @@ fn bench_bloom_effectiveness(c: &mut Criterion) {
                     let config = create_config(shard_dir);
                     let shard_wal = Rc::new(ShardWal::open(config, ClusterRole::Standalone, StubReplicationClient).await.unwrap());
                     populate_wal(shard_wal.clone(), num_aggregates, total_writes).await;
-                    shard_wal.close().await.unwrap();
+                    shard_wal.close().await;
                 })
                 .unwrap()
                 .join()

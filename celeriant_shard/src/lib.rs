@@ -10,3 +10,4 @@ pub mod watch_event_collector;
 pub mod replication_client;
 pub mod shard_wal_replicate;
 pub mod collect_from_disk;
+pub mod shard_wal_sync;
