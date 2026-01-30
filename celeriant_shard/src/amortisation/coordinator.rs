@@ -168,10 +168,24 @@ impl<E: Clone> Coordinator<E> {
 
             match acquired {
                 Acquired::Leader(event) => {
-                    glommio::timer::sleep(delay).await;
-
-                    // Acquire sync gate BEFORE capture - serializes sync execution
-                    let _sync_guard = write_with_timeout(&self.sync_gate, "two_phase_sync_gate").await.ok();
+                    // Fast path: server idle (sync_gate free) AND no followers yet — sync immediately.
+                    // Rc count == 1 means only the leader holds the event; no followers have joined.
+                    // This avoids wasting an fdatasync on a tiny batch when the gate happens to be
+                    // momentarily free between busy syncs.
+                    // Slow path: sleep for delay, then acquire the gate. The gate wait itself
+                    // also provides implicit batching under high load.
+                    let _sync_guard = if Rc::strong_count(&event) == 1 {
+                        match self.sync_gate.try_write() {
+                            Ok(guard) => Some(guard),
+                            Err(_) => {
+                                glommio::timer::sleep(delay).await;
+                                write_with_timeout(&self.sync_gate, "two_phase_sync_gate").await.ok()
+                            }
+                        }
+                    } else {
+                        glommio::timer::sleep(delay).await;
+                        write_with_timeout(&self.sync_gate, "two_phase_sync_gate").await.ok()
+                    };
 
                     // Phase 1: Capture snapshot FIRST (while orchestrator still has our event)
                     // Any writer that arrives now sees our event and becomes a follower

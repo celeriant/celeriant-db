@@ -84,6 +84,8 @@ impl TestServer {
 
         let args = config.to_cli_args();
 
+        println!("  Args: {:?}", args);
+
         let child = Command::new("cargo")
             .args(["run", "-p", "celeriant", "--release", "--"])
             .args(&args)

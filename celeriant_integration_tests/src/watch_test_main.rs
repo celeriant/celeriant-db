@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
+use std::u64;
 
 use celeriant_integration_tests::TestServer;
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
@@ -20,7 +21,7 @@ use celeriant_wal::{
     aggregate_key::AggregateKey, compression_type::CompressionType,
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
 };
-use celeriant_wire::constants::PROTOCOL_VERSION_V2;
+use celeriant_wire::network::wire_header::PROTOCOL_VERSION_V2;
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 use tokio_util::compat::TokioAsyncReadCompatExt;
@@ -170,7 +171,7 @@ impl WatchConnection {
     async fn read_response(
         &mut self,
     ) -> Result<Response, Box<dyn std::error::Error + Send + Sync>> {
-        let response = Response::read_response(&mut self.stream)
+        let response = Response::read_response(&mut self.stream, u64::MAX)
             .await
             .map_err(|e| format!("Wire error: {:?}", e))?;
         Ok(response)

@@ -1,7 +1,7 @@
 use celeriant_msg::process_requests::Request;
 use celeriant_msg::process_responses::Response;
 use celeriant_wal::compression_type::CompressionType;
-use celeriant_wire::constants::PROTOCOL_VERSION_V2;
+use celeriant_wire::network::wire_header::PROTOCOL_VERSION_V2;
 use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
@@ -90,7 +90,7 @@ impl CeleriantClient {
             .await?;
 
             // Read response from server
-            let response = Response::read_response(&mut self.stream).await?;
+            let response = Response::read_response(&mut self.stream, self.max_request_size).await?;
 
             match response {
                 Response::ProtocolError(_) => return Err(ClientError::ProtocolError),

@@ -7,16 +7,22 @@ use celeriant_msg::{
     response::responses::{ErrorResponse, WatchResponse},
 };
 use celeriant_shard::{
-    error::{shard_error::ShardError, shard_read_error::ShardReadError, shard_write_error::ShardWriteError, watch_session_error::WatchSessionError},
+    error::watch_session_error::WatchSessionError,
     replication_client::ReplicationClient,
     shard_wal::ShardWal,
 };
+use celeriant_wal::compression_type::CompressionType;
 use celeriant_watch::{watch_output_type::WatchOutputType, watch_session::WatchSession};
-use celeriant_wire::wire_error::WireError;
+use celeriant_msg::read_wire_data_error::ReadWireDataError;
+use celeriant_wire::network::wire_error::WireError;
 use glommio::{channels::channel_mesh::Senders, net::TcpStream};
 use tracing::warn;
 
-use super::{intrashard_messages::IntrashardMessages, shard_config::ShardConfig};
+use super::{
+    intrashard_messages::IntrashardMessages,
+    shard_config::ShardConfig,
+    shard_error_response::{shard_error_to_response, watch_read_error_to_response, watch_session_error_to_response},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PortType {
@@ -80,9 +86,9 @@ pub fn handle_new_connection<R: ReplicationClient + 'static>(mut tcp_stream: Tcp
             None => return,
         };
 
-        match check_redirect(tcp_stream, request, message_version, &ctx, port_type).await {
+        match check_redirect(tcp_stream, request, ctx.config.max_response_size, ctx.config.server_compression_algorithm, message_version, &ctx, port_type).await {
             RedirectResult::ProcessLocally(request, tcp_stream) => {
-                handle_pipelining(tcp_stream, request, message_version, ctx, port_type).await;
+                handle_pipelining(tcp_stream, request, ctx.config.max_request_size, ctx.config.max_response_size, ctx.config.server_compression_algorithm, message_version, ctx, port_type).await;
             }
             RedirectResult::Redirected => {}
             RedirectResult::ErrorSentContinue(_) => {}
@@ -94,6 +100,9 @@ pub fn handle_new_connection<R: ReplicationClient + 'static>(mut tcp_stream: Tcp
 pub fn handle_redirected_connection<R: ReplicationClient + 'static>(
     tcp_stream: TcpStream,
     request: Request,
+    max_request_size: u64,
+    max_response_size: u64,
+    server_compression_algorithm: CompressionType,
     message_version: u32,
     ctx: ConnectionContext<R>,
     port_type: PortType,
@@ -101,7 +110,7 @@ pub fn handle_redirected_connection<R: ReplicationClient + 'static>(
     let _ = tcp_stream.set_nodelay(true);
 
     glommio::spawn_local(async move {
-        handle_pipelining(tcp_stream, request, message_version, ctx, port_type).await;
+        handle_pipelining(tcp_stream, request, max_request_size, max_response_size, server_compression_algorithm, message_version, ctx, port_type).await;
     })
     .detach();
 }
@@ -109,6 +118,9 @@ pub fn handle_redirected_connection<R: ReplicationClient + 'static>(
 async fn handle_pipelining<R: ReplicationClient + 'static>(
     mut tcp_stream: TcpStream,
     request: Request,
+    max_request_size: u64,
+    max_response_size: u64,
+    server_compression_algorithm: CompressionType,
     mut message_version: u32,
     ctx: ConnectionContext<R>,
     port_type: PortType,
@@ -134,18 +146,18 @@ async fn handle_pipelining<R: ReplicationClient + 'static>(
                         }
                     ),
                 });
-                let _ = write_response(&mut tcp_stream, &response, message_version, ctx.config.slow_client_timeout).await;
+                let _ = write_response(&mut tcp_stream, &response, max_response_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
                 continue;
             }
 
             if port_type == PortType::Client {
                 if let Request::Watch(watch_request) = request {
-                    handle_watch(tcp_stream, watch_request, message_version, &ctx).await;
+                    handle_watch(tcp_stream, watch_request, max_response_size, server_compression_algorithm, message_version, &ctx).await;
                     return;
                 }
             }
 
-            process_request(&mut tcp_stream, &ctx, request, message_version).await;
+            process_request(&mut tcp_stream, &ctx, request, max_request_size, server_compression_algorithm, message_version).await;
         }
 
         if ctx.shutdown_requested.get() {
@@ -165,7 +177,7 @@ async fn handle_pipelining<R: ReplicationClient + 'static>(
         }
 
         if let Some(request) = optional_request.take() {
-            match check_redirect(tcp_stream, request, message_version, &ctx, port_type).await {
+            match check_redirect(tcp_stream, request, max_response_size, server_compression_algorithm, message_version, &ctx, port_type).await {
                 RedirectResult::ProcessLocally(req, stream) => {
                     optional_request = Some(req);
                     tcp_stream = stream;
@@ -190,6 +202,8 @@ fn is_valid_for_port(request: &Request, port_type: PortType) -> bool {
 async fn check_redirect<R: ReplicationClient + 'static>(
     mut tcp_stream: TcpStream,
     request: Request,
+    max_message_size: u64,
+    server_compression_algorithm: CompressionType,
     message_version: u32,
     ctx: &ConnectionContext<R>,
     port_type: PortType,
@@ -202,7 +216,7 @@ async fn check_redirect<R: ReplicationClient + 'static>(
                 error_code: 400,
                 error_message: format!("Shard routing error: {}", e),
             });
-            let _ = write_response(&mut tcp_stream, &response, message_version, ctx.config.slow_client_timeout).await;
+            let _ = write_response(&mut tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
             return RedirectResult::ErrorSentContinue(tcp_stream);
         }
     };
@@ -380,22 +394,30 @@ async fn read_request<R: ReplicationClient + 'static>(
     .await
     {
         Ok(Ok(result)) => Some(result),
-        Ok(Err(WireError::NetworkError(ref e))) if e.kind() == std::io::ErrorKind::UnexpectedEof => None,
-        Ok(Err(WireError::UnsupportedProtocol(_))) => None,
-        Ok(Err(_)) => None,
-        Err(_) => None,
+        Ok(Err(ReadWireDataError::ReadHeaderFailure(WireError::NetworkError(ref e))))
+            if e.kind() == std::io::ErrorKind::UnexpectedEof => None,
+        Ok(Err(e)) => {
+            warn!("Failed to read request: {e:?}");
+            None
+        }
+        Err(_) => {
+            warn!("Client timed out reading request");
+            None
+        }
     }
 }
 
 async fn write_response(
     tcp_stream: &mut TcpStream,
     response: &Response,
+    max_message_size: u64,
+    server_compression_algorithm: CompressionType,
     message_version: u32,
     timeout_duration: Duration,
 ) -> Result<(), WireError> {
-    let compression = Response::determine_compression_type(response);
+    let compression = Response::determine_compression_type(response, server_compression_algorithm);
     match glommio::timer::timeout(timeout_duration, async {
-        let result = Response::write_response(tcp_stream, response, compression, message_version).await;
+        let result = Response::write_response(tcp_stream, response, compression, max_message_size, message_version).await;
         Ok::<_, glommio::GlommioError<()>>(result)
     })
     .await
@@ -410,19 +432,23 @@ async fn process_request<R: ReplicationClient + 'static>(
     tcp_stream: &mut TcpStream,
     ctx: &ConnectionContext<R>,
     request: Request,
+    max_message_size: u64,
+    server_compression_algorithm: CompressionType,
     message_version: u32,
 ) {
     let correlation_id = request.correlation_id();
     let response = match ctx.shard_wal.process_request(Some(0), request).await {
         Ok(result) => result,
-        Err(error) => error_to_response(correlation_id, error),
+        Err(error) => shard_error_to_response(correlation_id, error),
     };
-    let _ = write_response(tcp_stream, &response, message_version, ctx.config.slow_client_timeout).await;
+    let _ = write_response(tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
 }
 
 async fn handle_watch<R: ReplicationClient + 'static>(
     mut tcp_stream: TcpStream,
     watch_request: WatchRequest,
+    max_message_size: u64,
+    server_compression_algorithm: CompressionType,
     message_version: u32,
     ctx: &ConnectionContext<R>,
 ) {
@@ -431,8 +457,8 @@ async fn handle_watch<R: ReplicationClient + 'static>(
     let mut watch_session = match create_watch_session(&ctx.shard_wal, watch_request, ctx.config.max_requested_latency) {
         Ok(session) => session,
         Err(error) => {
-            let response = error_to_response(correlation_id, ShardError::WatchSession(error));
-            let _ = write_response(&mut tcp_stream, &response, message_version, ctx.config.slow_client_timeout).await;
+            let response = watch_session_error_to_response(correlation_id, error);
+            let _ = write_response(&mut tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
             return;
         }
     };
@@ -442,20 +468,20 @@ async fn handle_watch<R: ReplicationClient + 'static>(
             Ok(WatchOutputType::Continue) => continue,
             Ok(WatchOutputType::Response(watch_response)) => {
                 let response = Response::Watch(watch_response);
-                if write_response(&mut tcp_stream, &response, message_version, ctx.config.slow_client_timeout).await.is_err() {
+                if write_response(&mut tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await.is_err() {
                     break;
                 }
             }
             Ok(WatchOutputType::Heartbeat) => {
                 let response = Response::Watch(WatchResponse { events: None });
-                if write_response(&mut tcp_stream, &response, message_version, ctx.config.slow_client_timeout).await.is_err() {
+                if write_response(&mut tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await.is_err() {
                     break;
                 }
             }
             Ok(WatchOutputType::Done) => break,
             Err(error) => {
-                let response = error_to_response(correlation_id, ShardError::Read(error.into()));
-                let _ = write_response(&mut tcp_stream, &response, message_version, ctx.config.slow_client_timeout).await;
+                let response = watch_read_error_to_response(correlation_id, error);
+                let _ = write_response(&mut tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
                 break;
             }
         }
@@ -478,55 +504,6 @@ fn create_watch_session<R: ReplicationClient + 'static>(
 
     let (watcher_id, subscribed_client) = shard_wal.watched_aggregates.add_subscriber(request);
     Ok(WatchSession::new(watcher_id, subscribed_client, shard_wal.clone()))
-}
-
-fn error_to_response(correlation_id: Option<u128>, error: ShardError) -> Response {
-    let (error_code, error_message) = match error {
-        ShardError::Read(read_error) => match read_error {
-            ShardReadError::AggregateNotExists => (404, "Aggregate does not exist".to_string()),
-            ShardReadError::IoError(msg) => (500, format!("IO error: {}", msg)),
-            ShardReadError::MaxBytesTooSmall { current_max_bytes, required_max_bytes } => (
-                400,
-                format!("Max bytes too small: current={}, required={}", current_max_bytes, required_max_bytes),
-            ),
-            ShardReadError::SerializationError(wire_error) => (500, format!("Serialization error: {:?}", wire_error)),
-            ShardReadError::UnavailableBatchIndex { minimum_available, requested } => (
-                410,
-                format!("Batch index unavailable: requested={}, minimum available={}", requested, minimum_available),
-            ),
-        },
-        ShardError::Write(write_error) => match write_error {
-            ShardWriteError::IoError(msg) => (500, format!("IO error: {}", msg)),
-            ShardWriteError::WireFormat(wire_error) => (500, format!("Serialization error: {:?}", wire_error)),
-            ShardWriteError::OptimisticConcurrencyViolation { expected_event_batch_index, current_event_batch_index } => (
-                409,
-                format!("Optimistic concurrency violation: expected={}, current={}", expected_event_batch_index, current_event_batch_index),
-            ),
-            ShardWriteError::ClientIdempotencyViolation { last_client_event_index, attempted_client_event_index } => (
-                409,
-                format!("Client idempotency violation: last={}, attempted={}", last_client_event_index, attempted_client_event_index),
-            ),
-            ShardWriteError::EmptyEventsList => (400, "Empty events list".to_string()),
-            ShardWriteError::ZeroEventType { client_event_index } => (400, format!("Zero event type at index {}", client_event_index)),
-            ShardWriteError::InvalidLeaseIndex => (400, "Invalid lease index".to_string()),
-            ShardWriteError::AggregateNotExists => (404, "Aggregate not found".to_string()),
-            ShardWriteError::AggregatePendingDelete => (400, "Aggregate pending deletion. Cannot write new events.".to_string()),
-            ShardWriteError::AggregateRecreateNotAllowed => (400, "Aggregate recreate not allowed. Cannot write new events.".to_string()),
-            ShardWriteError::TrimIndexOutOfRange { requested, max_event_batch_index } => (
-                400,
-                format!("Trim index {} out of range, max event batch index is {}", requested, max_event_batch_index),
-            ),
-            ShardWriteError::Replication(replication_error) => (500, format!("Replication error: {:?}", replication_error)),
-        },
-        ShardError::WatchSession(watch_session_error) => match watch_session_error {
-            WatchSessionError::WatchLatencyTooHigh { latency_ms, max_latency_ms } => (
-                400,
-                format!("Requested watch latency {}ms exceeds server max of {}ms", latency_ms, max_latency_ms),
-            ),
-        },
-    };
-
-    Response::GenericError(ErrorResponse { correlation_id, error_code, error_message })
 }
 
 #[cfg(test)]
@@ -559,6 +536,7 @@ mod tests {
             write_max_chunk_size: 1024,
             max_request_size: 1024,
             max_response_size: 1024,
+            server_compression_algorithm: CompressionType::Snappy,
             slow_client_timeout: Duration::from_secs(30),
             max_requested_latency: Duration::from_millis(100),
             shard_log_preallocate_bytes: 1024,
@@ -579,6 +557,7 @@ mod tests {
             replication_delay: Duration::from_millis(20),
             max_cluster_time_drift_ms: 5000,
             max_catchup_gap_bytes: 104_857_600,
+            internode_connection_timeout: None,
         }
     }
 

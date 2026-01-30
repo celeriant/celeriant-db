@@ -295,6 +295,7 @@ impl ShardMemCache {
         aggregate_key: &AggregateKey,
         event_index: u64,
         event_batch_index: u64,
+        min_event_batch_index: u64,
         client_id: u128,
         client_event_index: u64,
         shard_log_queue_item: ShardLogQueueItem,
@@ -310,6 +311,9 @@ impl ShardMemCache {
         if event_index > aggregate.event_index {
             aggregate.event_index = event_index;
         }
+
+        aggregate.min_event_batch_index = min_event_batch_index;
+        aggregate.pending_delete = false;
 
         aggregate
             .client_event_indexes
@@ -610,7 +614,7 @@ impl ShardMemCache {
         // Check queue first
         if let Some(queue_pos) = self.aggregate_queue_positions.get(aggregate_key) {
             return EventIndexes {
-                pending_delete: queue_pos.pending_delete,
+                pending_delete_or_deleted: queue_pos.pending_delete,
                 allow_recreate: queue_pos.allow_recreate,
                 allow_index_continuation: queue_pos.allow_index_continuation,
                 event_batch_index: queue_pos.event_batch_index,
@@ -622,7 +626,7 @@ impl ShardMemCache {
         // Fall back to file LRU
         if let Some(file_pos) = self.aggregate_write_snapshots.get(aggregate_key) {
             return EventIndexes {
-                pending_delete: file_pos.status == AggregateStatus::Deleted,
+                pending_delete_or_deleted: file_pos.status == AggregateStatus::Deleted,
                 allow_recreate: file_pos.allow_recreate,
                 allow_index_continuation: file_pos.allow_index_continuation,
                 event_batch_index: file_pos.event_batch_index,
@@ -632,7 +636,7 @@ impl ShardMemCache {
         }
 
         EventIndexes {
-            pending_delete: false,
+            pending_delete_or_deleted: false,
             allow_recreate: false,
             allow_index_continuation: false,
             event_batch_index: 0,
@@ -774,7 +778,7 @@ impl ShardMemCache {
 }
 
 pub struct EventIndexes {
-    pub pending_delete: bool,
+    pub pending_delete_or_deleted: bool,
     pub allow_recreate: bool,
     pub allow_index_continuation: bool,
     pub event_batch_index: u64,

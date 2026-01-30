@@ -361,6 +361,7 @@ async fn run_single_benchmark(num_connections: usize, verbose: bool) -> Result<O
         }
         let config = ServerConfig {
             log_level: "warn".to_string(),
+            fsync_delay_us: 30000,
             ..Default::default()
         };
         let server = TestServer::start_with_config(port, config).await?;

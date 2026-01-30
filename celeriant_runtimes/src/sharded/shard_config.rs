@@ -1,7 +1,7 @@
 use std::{path::PathBuf, time::Duration};
 
 use celeriant_shard::timestamp_config::TimestampConfig;
-use celeriant_wal::cluster_role::ClusterRole;
+use celeriant_wal::{cluster_role::ClusterRole, compression_type::CompressionType};
 
 use crate::sharded::routing_rule::RoutingRule;
 
@@ -22,6 +22,8 @@ pub struct ShardConfig {
     pub write_max_chunk_size: u64,
     pub max_request_size: u64,
     pub max_response_size: u64,
+    pub internode_connection_timeout: Option<Duration>,
+    pub server_compression_algorithm: CompressionType,
     pub slow_client_timeout: Duration,
     pub max_requested_latency: Duration,
     pub shard_log_preallocate_bytes: u64,

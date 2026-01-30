@@ -1172,11 +1172,8 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
         let aggregate_current_indexes = shard_mem_cache.get_write_event_indexes(aggregate_key);
 
         // There is a soft delete entry in the queue that hasn't been committed yet
-        if aggregate_current_indexes.pending_delete {
-            if !aggregate_current_indexes.allow_recreate {
-                return Err(ShardWriteError::AggregateRecreateNotAllowed);
-            }
-            // Pending delete with allow_recreate - fall through to create logic
+        if aggregate_current_indexes.pending_delete_or_deleted && !aggregate_current_indexes.allow_recreate {
+            return Err(ShardWriteError::AggregateRecreateNotAllowed);
         }
 
         // Validate optimistic concurrency (only for existing aggregates, not recreates)
@@ -1193,7 +1190,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
         drop(shard_mem_cache);
 
         // Determine starting indexes based on whether this is a recreate with index continuation
-        let is_recreate = aggregate_current_indexes.pending_delete 
+        let is_recreate = aggregate_current_indexes.pending_delete_or_deleted 
             || aggregate_current_indexes.event_batch_index == 0;
         
         let (mut event_index, event_batch_index, mut min_event_batch_index) = if is_recreate && aggregate_current_indexes.allow_index_continuation {
@@ -1283,6 +1280,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
             event_batch_index,
             latest_client_event_index,
             shard_log_queue_item,
+            min_event_batch_index,
         })
     }
 
@@ -1296,6 +1294,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
                 &prepared.aggregate_key,
                 prepared.event_index,
                 prepared.event_batch_index,
+                prepared.min_event_batch_index,
                 prepared.client_id,
                 prepared.latest_client_event_index,
                 prepared.shard_log_queue_item,
@@ -1506,6 +1505,7 @@ struct PreparedWrite {
     client_id: u128,
     event_index: u64,
     event_batch_index: u64,
+    min_event_batch_index: u64,
     latest_client_event_index: u64,
     shard_log_queue_item: ShardLogQueueItem,
 }
@@ -1567,9 +1567,6 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
             )
             .await?;
         }
-
-        // Reverse to get chronological order
-        kept.reverse();
 
         Ok(MetablockCollection {
             kept_metablocks: kept,
@@ -1702,7 +1699,10 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
             .await?;
 
         *cumulative_size += disk_cumulative;
-        kept.extend(disk_kept.into_iter());
+
+
+        // Reverse to get chronological order
+        kept.splice(0..0, disk_kept.into_iter().rev());
 
         Ok(())
     }
@@ -1738,3 +1738,771 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::replication_client::StubReplicationClient;
+    use celeriant_msg::request::requests::{CatchUpRequest, SingleAggregateDelete, WatchRequest};
+    use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
+    use crate::timestamp_config::TimestampConfig;
+    use glommio::{LocalExecutorBuilder, Placement};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    macro_rules! glommio_test {
+        ($body:expr) => {
+            LocalExecutorBuilder::new(Placement::Fixed(0))
+                .spawn(|| async move { $body })
+                .unwrap()
+                .join()
+                .unwrap()
+        };
+    }
+
+    fn test_dir() -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("shard");
+        (tmp, dir)
+    }
+
+    fn test_config(dir: &std::path::Path) -> InternalShardConfig {
+        InternalShardConfig {
+            node_id: 1,
+            max_open_files: 4,
+            shard_log_preallocate_bytes: 4 * 1024 * 1024,
+            fsync_delay: Duration::ZERO,
+            replication_delay: Duration::ZERO,
+            recent_write_cache_bytes: 64 * 1024 * 1024,
+            non_durable_writes: false,
+            shard_dir: dir.to_path_buf(),
+            max_response_size: 16 * 1024 * 1024,
+            max_request_size: 16 * 1024 * 1024,
+            aggregate_snapshots_cache_bytes: 64 * 1024 * 1024,
+            aggregate_client_snapshots_cache_bytes: 32 * 1024 * 1024,
+            read_max_chunk_size: 32 * 1024,
+            timestamp_config: TimestampConfig::default(),
+            list_page_size: 100,
+            list_max_duration: Duration::from_secs(2),
+            list_wal_index_cache_bytes: 1024 * 1024,
+            pending_replication_high_water_bytes: 64 * 1024 * 1024,
+            max_cluster_time_drift_ms: 5000,
+            max_catchup_gap_bytes: 100 * 1024 * 1024,
+        }
+    }
+
+    fn key(org: u128, atype: u128, id: u128) -> AggregateKey {
+        AggregateKey::new(org, atype, id)
+    }
+
+    fn events(count: usize) -> Vec<DatablockAggregateEvent> {
+        (1..=count as u64)
+            .map(|i| DatablockAggregateEvent {
+                client_event_index: i,
+                event_type_major: 1,
+                event_value: Arc::new(vec![i as u8; 8]),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    fn write_req(agg: AggregateKey, evts: Vec<DatablockAggregateEvent>) -> Request {
+        write_req_full(agg, evts, true, None, 1, false)
+    }
+
+    fn write_req_full(
+        agg: AggregateKey,
+        evts: Vec<DatablockAggregateEvent>,
+        allow_create: bool,
+        expected_batch: Option<u64>,
+        client_id: u128,
+        enforce_idempotency: bool,
+    ) -> Request {
+        let mut writes = HashMap::new();
+        writes.insert(
+            agg,
+            SingleAggregateWrite {
+                events: evts,
+                allow_create,
+                expected_event_batch_index: expected_batch,
+                enforce_client_idempotency: enforce_idempotency,
+                compression_type: CompressionType::None,
+            },
+        );
+        Request::Write(WriteRequest {
+            correlation_id: None,
+            client_id,
+            user_id: None,
+            writes,
+        })
+    }
+
+    fn read_req(agg: AggregateKey) -> Request {
+        Request::Read(ReadRequest {
+            correlation_id: None,
+            aggregate_key: agg,
+            filters: ReadFilters::new(0),
+        })
+    }
+
+    fn read_req_from(agg: AggregateKey, from: u64) -> Request {
+        Request::Read(ReadRequest {
+            correlation_id: None,
+            aggregate_key: agg,
+            filters: ReadFilters::new(from),
+        })
+    }
+
+    fn exists_req(agg: AggregateKey) -> Request {
+        Request::Exists(ExistsRequest {
+            correlation_id: None,
+            aggregate_key: agg,
+        })
+    }
+
+    fn delete_req(agg: AggregateKey) -> Request {
+        delete_req_full(agg, false, false, None)
+    }
+
+    fn delete_req_full(
+        agg: AggregateKey,
+        allow_recreate: bool,
+        allow_index_continuation: bool,
+        expected: Option<u64>,
+    ) -> Request {
+        let mut deletes = HashMap::new();
+        deletes.insert(
+            agg,
+            SingleAggregateDelete {
+                allow_recreate,
+                allow_index_continuation,
+                expected_event_batch_index: expected,
+            },
+        );
+        Request::Delete(DeleteRequest {
+            correlation_id: None,
+            client_id: 1,
+            user_id: None,
+            deletes,
+        })
+    }
+
+    fn trim_req(agg: AggregateKey, keep_from: u64) -> Request {
+        Request::TrimStart(TrimStartRequest {
+            correlation_id: None,
+            aggregate_key: agg,
+            keep_from_event_batch_index: keep_from,
+            client_id: 1,
+            user_id: None,
+        })
+    }
+
+    fn list_orgs_req() -> Request {
+        Request::ListOrgs(ListOrgsRequest {
+            correlation_id: None,
+            shard_id: 0,
+            cursor: None,
+        })
+    }
+
+    fn list_types_req(org: Option<u128>) -> Request {
+        Request::ListAggregateTypes(ListAggregateTypesRequest {
+            correlation_id: None,
+            shard_id: 0,
+            org_id: org,
+            cursor: None,
+        })
+    }
+
+    fn list_aggs_req(org: Option<u128>, atype: Option<u128>) -> Request {
+        Request::ListAggregates(ListAggregatesRequest {
+            correlation_id: None,
+            shard_id: 0,
+            org_id: org,
+            aggregate_type_id: atype,
+            cursor: None,
+        })
+    }
+
+    async fn open_shard(dir: &std::path::Path) -> ShardWal<StubReplicationClient> {
+        ShardWal::open(test_config(dir), ClusterRole::Standalone, StubReplicationClient)
+            .await
+            .unwrap()
+    }
+
+    async fn process(
+        shard: &ShardWal<StubReplicationClient>,
+        lease: Option<u64>,
+        req: Request,
+    ) -> Result<Response, ShardError> {
+        shard.process_request(lease, req).await
+    }
+
+    async fn write_ok(shard: &ShardWal<StubReplicationClient>, req: Request) {
+        let result = process(shard, Some(0), req).await;
+        assert!(
+            matches!(result, Ok(Response::Write(_))),
+            "write failed: {:?}",
+            result.err()
+        );
+    }
+
+    fn unwrap_read(result: Result<Response, ShardError>) -> ReadResponse {
+        match result.expect("read should succeed") {
+            Response::Read(r) => r,
+            other => panic!("expected Read, got {other:?}"),
+        }
+    }
+
+    fn unwrap_exists(result: Result<Response, ShardError>) -> ExistsResponse {
+        match result.expect("exists should succeed") {
+            Response::Exists(r) => r,
+            other => panic!("expected Exists, got {other:?}"),
+        }
+    }
+
+    fn unwrap_list_orgs(result: Result<Response, ShardError>) -> ListOrgsResponse {
+        match result.expect("list_orgs should succeed") {
+            Response::ListOrgs(r) => r,
+            other => panic!("expected ListOrgs, got {other:?}"),
+        }
+    }
+
+    fn unwrap_list_types(result: Result<Response, ShardError>) -> ListAggregateTypesResponse {
+        match result.expect("list_types should succeed") {
+            Response::ListAggregateTypes(r) => r,
+            other => panic!("expected ListAggregateTypes, got {other:?}"),
+        }
+    }
+
+    fn unwrap_list_aggs(result: Result<Response, ShardError>) -> ListAggregatesResponse {
+        match result.expect("list_aggs should succeed") {
+            Response::ListAggregates(r) => r,
+            other => panic!("expected ListAggregates, got {other:?}"),
+        }
+    }
+
+    // ── Happy path ──
+
+    #[test]
+    fn write_and_read_back() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 1, 1);
+
+            write_ok(&shard, write_req(agg.clone(), events(3))).await;
+
+            let read = unwrap_read(process(&shard, None, read_req(agg)).await);
+            assert_eq!(read.event_batches.len(), 1);
+            assert_eq!(read.event_batches[0].events.len(), 3);
+            assert_eq!(read.event_batches[0].event_batch_index, 1);
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn multiple_writes_produce_sequential_batches() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 1, 1);
+
+            for batch_num in 1u64..=5 {
+                let evts = vec![DatablockAggregateEvent {
+                    client_event_index: batch_num,
+                    event_type_major: 1,
+                    event_value: Arc::new(vec![batch_num as u8]),
+                    ..Default::default()
+                }];
+                write_ok(&shard, write_req(agg.clone(), evts)).await;
+            }
+
+            let read = unwrap_read(process(&shard, None, read_req(agg)).await);
+            assert_eq!(read.event_batches.len(), 5);
+            for (i, batch) in read.event_batches.iter().enumerate() {
+                assert_eq!(batch.event_batch_index, (i + 1) as u64);
+            }
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn write_to_multiple_aggregates() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+
+            let keys: Vec<_> = (1..=3).map(|i| key(1, 1, i)).collect();
+            for k in &keys {
+                write_ok(&shard, write_req(k.clone(), events(2))).await;
+            }
+
+            for k in &keys {
+                let read = unwrap_read(process(&shard, None, read_req(k.clone())).await);
+                assert_eq!(read.event_batches.len(), 1);
+                assert_eq!(read.event_batches[0].events.len(), 2);
+            }
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn read_nonexistent_aggregate_fails() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+
+            let result = process(&shard, None, read_req(key(1, 1, 999))).await;
+            assert!(matches!(result, Err(ShardError::Read(ShardReadError::AggregateNotExists))));
+
+            shard.close().await;
+        });
+    }
+
+    // ── Exists ──
+
+    #[test]
+    fn exists_missing_returns_zero() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+
+            let resp = unwrap_exists(process(&shard, None, exists_req(key(1, 1, 999))).await);
+            assert_eq!(resp.min_event_batch_index, 0);
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn exists_after_write_returns_min_batch() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 1, 1);
+
+            write_ok(&shard, write_req(agg.clone(), events(1))).await;
+
+            let resp = unwrap_exists(process(&shard, None, exists_req(agg)).await);
+            assert_eq!(resp.min_event_batch_index, FIRST_EVENT_BATCH_INDEX);
+
+            shard.close().await;
+        });
+    }
+
+    // ── Write validation errors ──
+
+    #[test]
+    fn write_without_lease_fails() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+
+            let result = process(&shard, None, write_req(key(1, 1, 1), events(1))).await;
+            assert!(matches!(result, Err(ShardError::Write(ShardWriteError::InvalidLeaseIndex))));
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn write_empty_events_fails() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+
+            let result = process(&shard, Some(0), write_req(key(1, 1, 1), vec![])).await;
+            assert!(matches!(result, Err(ShardError::Write(ShardWriteError::EmptyEventsList))));
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn write_zero_event_type_fails() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+
+            let evts = vec![DatablockAggregateEvent {
+                client_event_index: 1,
+                event_type_major: 0,
+                event_value: Arc::new(vec![1]),
+                ..Default::default()
+            }];
+            let result = process(&shard, Some(0), write_req(key(1, 1, 1), evts)).await;
+            assert!(matches!(result, Err(ShardError::Write(ShardWriteError::ZeroEventType { .. }))));
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn write_without_allow_create_fails() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+
+            let req = write_req_full(key(1, 1, 1), events(1), false, None, 1, false);
+            let result = process(&shard, Some(0), req).await;
+            assert!(matches!(result, Err(ShardError::Write(ShardWriteError::AggregateNotExists))));
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn optimistic_concurrency_violation() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 1, 1);
+
+            write_ok(&shard, write_req(agg.clone(), events(1))).await;
+
+            let req = write_req_full(agg, events(1), true, Some(999), 1, false);
+            let result = process(&shard, Some(0), req).await;
+            assert!(matches!(
+                result,
+                Err(ShardError::Write(ShardWriteError::OptimisticConcurrencyViolation { .. }))
+            ));
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn client_idempotency_violation() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 1, 1);
+
+            let req = write_req_full(agg.clone(), events(1), true, None, 42, true);
+            write_ok(&shard, req).await;
+
+            let req = write_req_full(agg, events(1), true, None, 42, true);
+            let result = process(&shard, Some(0), req).await;
+            assert!(matches!(
+                result,
+                Err(ShardError::Write(ShardWriteError::ClientIdempotencyViolation { .. }))
+            ));
+
+            shard.close().await;
+        });
+    }
+
+    // ── Delete ──
+
+    #[test]
+    fn delete_then_read_fails() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 1, 1);
+
+            write_ok(&shard, write_req(agg.clone(), events(1))).await;
+
+            let result = process(&shard, Some(0), delete_req(agg.clone())).await;
+            assert!(matches!(result, Ok(Response::Delete(_))));
+
+            let result = process(&shard, None, read_req(agg)).await;
+            assert!(matches!(result, Err(ShardError::Read(ShardReadError::AggregateNotExists))));
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn delete_then_write_without_recreate_fails() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 1, 1);
+
+            write_ok(&shard, write_req(agg.clone(), events(1))).await;
+            let _ = process(&shard, Some(0), delete_req(agg.clone())).await.unwrap();
+
+            let result = process(&shard, Some(0), write_req(agg, events(1))).await;
+            assert!(matches!(
+                result,
+                Err(ShardError::Write(ShardWriteError::AggregateRecreateNotAllowed))
+            ));
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn delete_with_recreate_allows_new_write() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 1, 1);
+
+            write_ok(&shard, write_req(agg.clone(), events(1))).await;
+
+            let del = delete_req_full(agg.clone(), true, false, None);
+            let _ = process(&shard, Some(0), del).await.unwrap();
+
+            write_ok(&shard, write_req(agg.clone(), events(1))).await;
+
+            let read = unwrap_read(process(&shard, None, read_req(agg)).await);
+            assert_eq!(read.event_batches.len(), 1);
+            assert_eq!(read.event_batches[0].event_batch_index, FIRST_EVENT_BATCH_INDEX);
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn delete_with_index_continuation() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 1, 1);
+
+            for _ in 0..3 {
+                write_ok(&shard, write_req(agg.clone(), events(1))).await;
+            }
+
+            let del = delete_req_full(agg.clone(), true, true, None);
+            let _ = process(&shard, Some(0), del).await.unwrap();
+
+            write_ok(&shard, write_req(agg.clone(), events(1))).await;
+
+            let read = unwrap_read(process(&shard, None, read_req_from(agg, 4)).await);
+            assert_eq!(read.event_batches.len(), 1);
+            assert_eq!(read.event_batches[0].event_batch_index, 4);
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn delete_validation_errors() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 1, 1);
+
+            let result = process(&shard, None, delete_req(agg.clone())).await;
+            assert!(matches!(result, Err(ShardError::Delete(ShardDeleteError::InvalidLeaseIndex))));
+
+            let empty_delete = Request::Delete(DeleteRequest {
+                correlation_id: None,
+                client_id: 1,
+                user_id: None,
+                deletes: HashMap::new(),
+            });
+            let result = process(&shard, Some(0), empty_delete).await;
+            assert!(matches!(result, Err(ShardError::Delete(ShardDeleteError::EmptyDeleteList))));
+
+            let result = process(&shard, Some(0), delete_req(agg.clone())).await;
+            assert!(matches!(result, Err(ShardError::Delete(ShardDeleteError::AggregateNotExists))));
+
+            write_ok(&shard, write_req(agg.clone(), events(1))).await;
+            let del = delete_req_full(agg, false, false, Some(999));
+            let result = process(&shard, Some(0), del).await;
+            assert!(matches!(
+                result,
+                Err(ShardError::Delete(ShardDeleteError::OptimisticConcurrencyViolation { .. }))
+            ));
+
+            shard.close().await;
+        });
+    }
+
+    // ── Trim ──
+
+    #[test]
+    fn trim_makes_earlier_batches_unavailable() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 1, 1);
+
+            for _ in 0..5 {
+                write_ok(&shard, write_req(agg.clone(), events(1))).await;
+            }
+
+            let result = process(&shard, Some(0), trim_req(agg.clone(), 3)).await;
+            assert!(matches!(result, Ok(Response::TrimStart(_))));
+
+            let result = process(&shard, None, read_req_from(agg.clone(), 1)).await;
+            assert!(matches!(
+                result,
+                Err(ShardError::Read(ShardReadError::UnavailableBatchIndex { .. }))
+            ));
+
+            let read = unwrap_read(process(&shard, None, read_req_from(agg, 3)).await);
+            assert!(!read.event_batches.is_empty());
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn trim_already_trimmed_is_noop() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 1, 1);
+
+            for _ in 0..3 {
+                write_ok(&shard, write_req(agg.clone(), events(1))).await;
+            }
+
+            let _ = process(&shard, Some(0), trim_req(agg.clone(), 2)).await.unwrap();
+            let result = process(&shard, Some(0), trim_req(agg, 2)).await;
+            assert!(matches!(result, Ok(Response::TrimStart(_))));
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn trim_validation_errors() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 1, 1);
+
+            let result = process(&shard, None, trim_req(agg.clone(), 1)).await;
+            assert!(matches!(result, Err(ShardError::TrimStart(ShardTrimError::InvalidLeaseIndex))));
+
+            let result = process(&shard, Some(0), trim_req(agg.clone(), 1)).await;
+            assert!(matches!(result, Err(ShardError::TrimStart(ShardTrimError::AggregateNotExists))));
+
+            write_ok(&shard, write_req(agg.clone(), events(1))).await;
+            let result = process(&shard, Some(0), trim_req(agg, 999)).await;
+            assert!(matches!(
+                result,
+                Err(ShardError::TrimStart(ShardTrimError::TrimIndexOutOfRange { .. }))
+            ));
+
+            shard.close().await;
+        });
+    }
+
+    // ── List operations ──
+
+    #[test]
+    fn list_orgs_types_aggregates() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+
+            for org in 1..=3u128 {
+                for atype in 1..=2u128 {
+                    write_ok(&shard, write_req(key(org, atype, 1), events(1))).await;
+                }
+            }
+
+            let orgs = unwrap_list_orgs(process(&shard, None, list_orgs_req()).await);
+            assert_eq!(orgs.orgs.len(), 3);
+
+            let types = unwrap_list_types(process(&shard, None, list_types_req(None)).await);
+            assert_eq!(types.aggregate_types.len(), 6);
+
+            let types_filtered = unwrap_list_types(process(&shard, None, list_types_req(Some(1))).await);
+            assert_eq!(types_filtered.aggregate_types.len(), 2);
+            assert!(types_filtered.aggregate_types.iter().all(|t| t.org_id == 1));
+
+            let aggs = unwrap_list_aggs(process(&shard, None, list_aggs_req(Some(1), Some(1))).await);
+            assert_eq!(aggs.aggregates.len(), 1);
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn list_empty_shard() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+
+            let orgs = unwrap_list_orgs(process(&shard, None, list_orgs_req()).await);
+            assert!(orgs.orgs.is_empty());
+            assert!(orgs.next_cursor.is_none());
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn list_aggregates_shows_deleted() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 1, 1);
+
+            write_ok(&shard, write_req(agg.clone(), events(1))).await;
+            let _ = process(&shard, Some(0), delete_req(agg)).await.unwrap();
+
+            let aggs = unwrap_list_aggs(process(&shard, None, list_aggs_req(Some(1), Some(1))).await);
+            assert_eq!(aggs.aggregates.len(), 1);
+            assert!(aggs.aggregates[0].is_deleted);
+
+            shard.close().await;
+        });
+    }
+
+    // ── Watch and CatchUp rejected ──
+
+    #[test]
+    fn watch_and_catchup_rejected() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+
+            let watch = Request::Watch(WatchRequest {
+                correlation_id: None,
+                requested_latency_ms: None,
+                orgs: None,
+                aggregate_types: None,
+                aggregates: None,
+                operation_types: None,
+            });
+            let result = process(&shard, None, watch).await;
+            assert!(matches!(result, Err(ShardError::WatchRequestInvalid)));
+
+            let catchup = Request::CatchUp(CatchUpRequest {
+                correlation_id: None,
+                shard_id: 0,
+                last_follower_metablock: None,
+                follower_tip_hash: None,
+            });
+            let result = process(&shard, None, catchup).await;
+            assert!(matches!(result, Err(ShardError::CatchUpRequestInvalid)));
+
+            shard.close().await;
+        });
+    }
+
+    // ── Exists after trim ──
+
+    #[test]
+    fn exists_reflects_trim() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 1, 1);
+
+            for _ in 0..5 {
+                write_ok(&shard, write_req(agg.clone(), events(1))).await;
+            }
+
+            let _ = process(&shard, Some(0), trim_req(agg.clone(), 3)).await.unwrap();
+
+            let resp = unwrap_exists(process(&shard, None, exists_req(agg)).await);
+            assert_eq!(resp.min_event_batch_index, 3);
+
+            shard.close().await;
+        });
+    }
+}

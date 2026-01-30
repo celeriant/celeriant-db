@@ -19,7 +19,7 @@ use glommio::timer::sleep;
 use glommio::{LocalExecutorBuilder, Placement};
 use tempfile::tempdir;
 
-criterion_group!(benches, bench_write_fsync_delays, bench_write_cache_impact);
+criterion_group!(benches, bench_write_fsync_delays, bench_write_cache_impact, bench_write_idle_latency);
 criterion_main!(benches);
 
 // =============================================================================
@@ -313,6 +313,86 @@ fn bench_write_fsync_delays(c: &mut Criterion) {
 
                                 shard_wal.close().await;
                                 cumulative_write_time / TOTAL_WRITES as u32
+                            })
+                            .unwrap()
+                            .join()
+                            .unwrap();
+
+                        total_duration += iteration_duration;
+                    }
+
+                    total_duration
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+/// Benchmark write latency at low load (sequential writes, one at a time).
+///
+/// Each write completes fully (including fsync) before the next starts.
+/// The sync_gate is always free, so the coordinator fast path fires every time.
+///
+/// Expected behavior with fast path:
+/// - All fsync delays show identical performance (delay is never used)
+/// Without fast path:
+/// - Higher delays = proportionally higher latency (delay added to every write)
+fn bench_write_idle_latency(c: &mut Criterion) {
+    const SEQUENTIAL_WRITES: usize = 100;
+
+    let mut group = c.benchmark_group("write_idle_latency");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(3));
+    group.warm_up_time(Duration::from_secs(1));
+
+    let bytes_per_iteration = EVENT_SIZE_BYTES * EVENTS_PER_WRITE * SEQUENTIAL_WRITES;
+    group.throughput(Throughput::Bytes(bytes_per_iteration as u64));
+
+    for (delay_name, fsync_delay) in fsync_delay_configs() {
+        group.bench_with_input(
+            BenchmarkId::new("sequential", delay_name),
+            &fsync_delay,
+            |b, &fsync_delay| {
+                b.iter_custom(|iters| {
+                    let mut total_duration = Duration::ZERO;
+
+                    for _ in 0..iters {
+                        let tempdir = tempdir().unwrap();
+                        let shard_dir = tempdir.path().to_path_buf();
+
+                        let iteration_duration = LocalExecutorBuilder::new(Placement::Fixed(0))
+                            .spawn(move || async move {
+                                let config =
+                                    create_config(shard_dir, fsync_delay, 64 * 1024 * 1024);
+                                let shard_wal = Rc::new(ShardWal::open(config, ClusterRole::Standalone, StubReplicationClient).await.unwrap());
+
+                                let aggregate_key = AggregateKey::new(1, 1, 1);
+                                let mut cumulative_write_time = Duration::ZERO;
+
+                                for write_id in 0..SEQUENTIAL_WRITES {
+                                    let base_index = (write_id * EVENTS_PER_WRITE) as u64;
+                                    let events = create_events(
+                                        EVENTS_PER_WRITE,
+                                        EVENT_SIZE_BYTES,
+                                        base_index,
+                                    );
+                                    let write_request = create_write_request(
+                                        aggregate_key.clone(),
+                                        events,
+                                        write_id as u128,
+                                    );
+
+                                    let start = Instant::now();
+                                    let result = shard_wal.write(Some(0), write_request).await;
+                                    cumulative_write_time += start.elapsed();
+
+                                    black_box(result.unwrap());
+                                }
+
+                                shard_wal.close().await;
+                                cumulative_write_time / SEQUENTIAL_WRITES as u32
                             })
                             .unwrap()
                             .join()

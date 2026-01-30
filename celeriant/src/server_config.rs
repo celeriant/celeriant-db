@@ -22,6 +22,16 @@ pub enum ConfigClusterRole {
     Follower,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, ValueEnum)]
+pub enum ConfigCompressionType {
+    None,
+    Zstd,
+    #[default]
+    Snappy,
+    Brotli,
+    Gzip,
+}
+
 #[derive(Clone, Debug, Parser)]
 #[command(name = "celeriant")]
 #[command(about = "Celeriant TCP Server", long_about = None)]
@@ -201,6 +211,28 @@ pub struct ServerConfig {
 
     #[arg(
         long,
+        env = "CELERIANT_INTERNODE_CONNECTION_TIMEOUT_MS",
+        help = "Timeout for inter-node connections in milliseconds (e.g. leader to follower replication)"
+    )]
+    pub internode_connection_timeout_ms: Option<u64>,
+
+    #[arg(
+        long,
+        default_value = "snappy",
+        env = "CELERIANT_SERVER_COMPRESSION_ALGORITHM",
+        help = "Compression algorithm for server responses: none, zstd, snappy, brotli, gzip"
+    )]
+    pub server_compression_algorithm: ConfigCompressionType,
+
+    #[arg(
+        long,
+        env = "CELERIANT_SERVER_COMPRESSION_LEVEL",
+        help = "Compression level for zstd, brotli, or gzip (ignored for none/snappy)"
+    )]
+    pub server_compression_level: Option<i32>,
+
+    #[arg(
+        long,
         default_value_t = 17000,
         env = "CELERIANT_FSYNC_DELAY_US",
         help = "Amortised fsync duration block (17ms)"
@@ -334,7 +366,7 @@ impl ServerConfig {
     }
 
     pub fn to_shard_config(&self, node_id: u128, num_shards: u32) -> ShardConfig {
-        use celeriant_runtimes::ClusterRole;
+        use celeriant_runtimes::{ClusterRole, CompressionType};
         ShardConfig {
             node_id,
             num_shards,
@@ -344,7 +376,8 @@ impl ServerConfig {
                 ConfigClusterRole::Follower => ClusterRole::Follower,
             },
             follower_address: self.follower_address.clone(),
-            data_root: self.data_root.clone(),
+            data_root: std::path::absolute(&self.data_root)
+                .expect("Failed to resolve data_root to an absolute path"),
             listen_address: self.listen_address.clone(),
             client_port: self.client_port,
             replication_port: self.replication_port,
@@ -377,6 +410,14 @@ impl ServerConfig {
             pending_replication_high_water_bytes: self.pending_replication_high_water_bytes,
             max_cluster_time_drift_ms: self.max_cluster_time_drift_ms,
             max_catchup_gap_bytes: self.max_catchup_gap_bytes,
+            internode_connection_timeout: self.internode_connection_timeout_ms.map(Duration::from_millis),
+            server_compression_algorithm: match self.server_compression_algorithm {
+                ConfigCompressionType::None => CompressionType::None,
+                ConfigCompressionType::Zstd => CompressionType::Zstd { level: self.server_compression_level.unwrap_or(6) },
+                ConfigCompressionType::Snappy => CompressionType::Snappy,
+                ConfigCompressionType::Brotli => CompressionType::Brotli { level: self.server_compression_level.unwrap_or(6) },
+                ConfigCompressionType::Gzip => CompressionType::Gzip { level: self.server_compression_level.unwrap_or(6) },
+            },
         }
     }
 
@@ -426,6 +467,9 @@ impl ServerConfig {
         check_field!(s3_subfolder);
         check_field!(client_connection_timeout_ms);
         check_field!(routing_rule);
+        check_field!(internode_connection_timeout_ms);
+        check_field!(server_compression_algorithm);
+        check_field!(server_compression_level);
 
         entries
     }
@@ -487,6 +531,9 @@ impl Default for ServerConfig {
             s3_endpoint_override: None,
             s3_skip_signature: false,
             s3_allow_http: false,
+            internode_connection_timeout_ms: None,
+            server_compression_algorithm: ConfigCompressionType::Snappy,
+            server_compression_level: None,
         }
     }
 }

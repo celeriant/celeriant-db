@@ -177,6 +177,9 @@ fn handle_intrashard_message<R: ReplicationClient + 'static>(msg: IntrashardMess
             handle_redirected_connection(
                 accepted_tcp_stream.bind_to_executor(),
                 request,
+                ctx.config.max_request_size,
+                ctx.config.max_response_size,
+                ctx.config.server_compression_algorithm,
                 message_version,
                 ctx.clone(),
                 port_type,
