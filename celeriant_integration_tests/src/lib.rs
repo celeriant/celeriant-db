@@ -1,6 +1,7 @@
 //! Shared test utilities for celeriant_integration_tests integration tests.
 
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 
 pub use celeriant_lib::server_config::{ConfigClusterRole, ServerConfig};
@@ -322,5 +323,191 @@ impl ServerConfigExt for ServerConfig {
         }
 
         args
+    }
+}
+
+/// A self-managed MinIO container for S3 integration tests.
+///
+/// Starts a MinIO Docker container, creates the test bucket, and provides
+/// methods for verifying S3 uploads. Automatically cleans up on drop.
+pub struct MinioContainer {
+    port: u16,
+    container_name: String,
+}
+
+impl MinioContainer {
+    /// Start a MinIO container on the given port.
+    ///
+    /// Waits for MinIO to accept connections and creates the test bucket.
+    /// Uses port allocation offset +10 from base to avoid collision with server ports.
+    pub async fn start(port: u16) -> Result<Self, Box<dyn std::error::Error>> {
+        let container_name = format!("celeriant-test-minio-{}", port);
+
+        println!("  Starting MinIO container {} on port {}...", container_name, port);
+
+        // Start MinIO container
+        let status = Command::new("docker")
+            .args([
+                "run", "-d",
+                "--name", &container_name,
+                "-p", &format!("{}:9000", port),
+                "-e", "MINIO_ROOT_USER=minioadmin",
+                "-e", "MINIO_ROOT_PASSWORD=minioadmin",
+                "minio/minio",
+                "server", "/data",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+
+        if !status.success() {
+            return Err(format!("Failed to start MinIO container: exit code {:?}", status.code()).into());
+        }
+
+        // Wait for MinIO to be ready by polling health endpoint
+        let client = reqwest::Client::new();
+        let health_url = format!("http://127.0.0.1:{}/minio/health/live", port);
+        let start = std::time::Instant::now();
+        let max_wait = Duration::from_secs(30);
+
+        while start.elapsed() < max_wait {
+            match client.get(&health_url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    println!("  MinIO is ready (took {:?})", start.elapsed());
+                    break;
+                }
+                _ => {
+                    sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+
+        if start.elapsed() >= max_wait {
+            let _ = Command::new("docker")
+                .args(["rm", "-f", &container_name])
+                .status();
+            return Err("MinIO failed to start within timeout".into());
+        }
+
+        // Create test bucket via docker exec (MinIO standalone uses dirs under /data)
+        let bucket_status = Command::new("docker")
+            .args(["exec", &container_name, "mkdir", "-p", "/data/test-fallback"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+
+        if !bucket_status.success() {
+            let _ = Command::new("docker")
+                .args(["rm", "-f", &container_name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            return Err("Failed to create test bucket in MinIO".into());
+        }
+
+        println!("  MinIO bucket 'test-fallback' created");
+
+        let container = Self {
+            port,
+            container_name,
+        };
+
+        Ok(container)
+    }
+
+    /// Returns the MinIO endpoint URL.
+    pub fn endpoint(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    /// Returns S3 config fields for ServerConfig.
+    ///
+    /// Returns: (region, bucket, access_key, secret_key, endpoint_override, allow_http)
+    pub fn s3_config_fields(&self) -> (String, String, String, String, String, bool) {
+        (
+            "us-east-1".to_string(),
+            "test-fallback".to_string(),
+            "minioadmin".to_string(),
+            "minioadmin".to_string(),
+            self.endpoint(),
+            true, // allow_http
+        )
+    }
+
+    /// List all object paths under the given prefix.
+    ///
+    /// Uses tokio runtime and object_store directly for test verification.
+    pub async fn list_objects(&self, prefix: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        use futures::StreamExt;
+        use object_store::ObjectStore;
+
+        let store = self.build_object_store()?;
+        let prefix_path = object_store::path::Path::from(prefix);
+
+        let mut objects = Vec::new();
+        let mut stream = store.list(Some(&prefix_path));
+
+        while let Some(meta) = stream.next().await {
+            let meta = meta?;
+            objects.push(meta.location.to_string());
+        }
+
+        Ok(objects)
+    }
+
+    /// Get object content at the given path.
+    ///
+    /// Uses tokio runtime and object_store directly for test verification.
+    pub async fn get_object(&self, path: &str) -> Result<bytes::Bytes, Box<dyn std::error::Error>> {
+        use object_store::ObjectStoreExt;
+
+        let store = self.build_object_store()?;
+        let object_path = object_store::path::Path::from(path);
+
+        let get_result = store.get(&object_path).await?;
+        let bytes = get_result.bytes().await?;
+
+        Ok(bytes)
+    }
+
+    /// Put arbitrary bytes at the given path.
+    ///
+    /// Used for pre-seeding test objects in S3.
+    pub async fn put_object(&self, path: &str, data: Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
+        use object_store::{ObjectStoreExt, PutPayload};
+
+        let store = self.build_object_store()?;
+        let object_path = object_store::path::Path::from(path);
+        let payload = PutPayload::from(data);
+
+        store.put(&object_path, payload).await?;
+
+        Ok(())
+    }
+
+    fn build_object_store(&self) -> Result<Arc<dyn object_store::ObjectStore>, Box<dyn std::error::Error>> {
+        use object_store::aws::AmazonS3Builder;
+
+        let store = AmazonS3Builder::new()
+            .with_bucket_name("test-fallback")
+            .with_region("us-east-1")
+            .with_access_key_id("minioadmin")
+            .with_secret_access_key("minioadmin")
+            .with_endpoint(self.endpoint())
+            .with_allow_http(true)
+            .build()?;
+
+        Ok(Arc::new(store))
+    }
+}
+
+impl Drop for MinioContainer {
+    fn drop(&mut self) {
+        println!("  Stopping MinIO container {}...", self.container_name);
+        let _ = Command::new("docker")
+            .args(["rm", "-f", &self.container_name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
 }

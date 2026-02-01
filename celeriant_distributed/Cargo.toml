@@ -9,3 +9,6 @@ license.workspace = true
 celeriant_wal = { path = "../celeriant_wal" }
 bincode.workspace = true
 blake3.workspace = true
+
+[dev-dependencies]
+celeriant_wire = { path = "../celeriant_wire" }

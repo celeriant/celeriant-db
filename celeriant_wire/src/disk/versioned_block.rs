@@ -1,5 +1,5 @@
-use crate::codec::bincode::fixed_serialise_stack;
-use celeriant_wal::{constants::{FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_METABLOCK, WIRE_VERSION_WAL_SHARD_LOG_HEADER}, metablocks::metablock::Metablock, shard_log_header::ShardLogHeader};
+use crate::codec::bincode::{fixed_serialise_stack, fixed_serialise_heap};
+use celeriant_wal::{constants::{FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_METABLOCK, WIRE_VERSION_WAL_SHARD_LOG_HEADER, WIRE_VERSION_S3_FALLBACK_BATCH}, metablocks::metablock::Metablock, s3::fallback_batch::FallbackBatch, shard_log_header::ShardLogHeader};
 use crate::{codec, disk::{disk_format_error::DiskFormatError}};
 
 const VERSION_SIZE: usize = 4;
@@ -30,6 +30,58 @@ where
     buffer[0..CRC_SIZE].copy_from_slice(&crc.to_le_bytes());
 
     Ok(())
+}
+
+pub fn serialize_versioned_message_heap<T>(
+    message: &T,
+    version: u32,
+) -> Result<Vec<u8>, bincode::error::EncodeError>
+where
+    T: bincode::Encode,
+{
+    let payload = fixed_serialise_heap(message)?;
+    let mut buffer = vec![0u8; HEADER_SIZE + payload.len()];
+
+    buffer[CRC_SIZE..HEADER_SIZE].copy_from_slice(&version.to_le_bytes());
+    buffer[HEADER_SIZE..].copy_from_slice(&payload);
+
+    let crc = crc32c::crc32c(&buffer[CRC_SIZE..]);
+    buffer[0..CRC_SIZE].copy_from_slice(&crc.to_le_bytes());
+
+    Ok(buffer)
+}
+
+pub fn deserialise_fallback_batch(
+    data: &[u8],
+) -> Result<FallbackBatch, DiskFormatError> {
+    if data.len() < HEADER_SIZE {
+        return Err(DiskFormatError::HeaderSizeMismatch {
+            expected: HEADER_SIZE,
+            actual: data.len(),
+        });
+    }
+
+    let stored_crc = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    let actual_crc = crc32c::crc32c(&data[CRC_SIZE..]);
+
+    if stored_crc != actual_crc {
+        return Err(DiskFormatError::ChecksumMismatch {
+            expected: stored_crc,
+            actual: actual_crc,
+        });
+    }
+
+    let version = u32::from_le_bytes([
+        data[CRC_SIZE],
+        data[CRC_SIZE + 1],
+        data[CRC_SIZE + 2],
+        data[CRC_SIZE + 3],
+    ]);
+
+    match version {
+        WIRE_VERSION_S3_FALLBACK_BATCH => Ok(codec::bincode::fixed_deserialise(&data[HEADER_SIZE..])?),
+        _ => Err(DiskFormatError::UnsupportedVersion(version)),
+    }
 }
 
 pub fn deserialise_metablock(

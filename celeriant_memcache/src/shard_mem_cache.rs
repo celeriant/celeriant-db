@@ -371,8 +371,10 @@ impl ShardMemCache {
     /// situation, it's not worth the extra logic... just go scorched earth
     pub fn execute_fsync_rollback(&mut self) {
         self.aggregate_queue_positions.clear();
-        self.pending_append_queue.clear();
-        self.fsync_rollback_occurred = true;
+        if !self.pending_append_queue.is_empty() {
+            self.pending_append_queue.clear();
+            self.fsync_rollback_occurred = true;
+        }
     }
 
     pub fn is_aggregate_snapshot_full_or_contains(&self, aggregate_key: &AggregateKey, cache_path: CachePath) -> bool {
@@ -711,13 +713,14 @@ impl ShardMemCache {
 
         self.execute_fsync_rollback();
 
-        self.replication_rollback_occurred = true;
-
         // Written to disk but not replicated
         self.aggregate_write_snapshots.clear();
         self.aggregate_write_client_snapshots.clear();
 
         // Pending replication, now cannot proceed
+        if !self.pending_replication_batches.is_empty() {
+            self.replication_rollback_occurred = true;
+        }
         self.pending_replication_batches.clear();
         self.pending_replication_bytes = 0;
     }

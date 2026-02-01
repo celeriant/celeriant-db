@@ -15,6 +15,8 @@ pub enum SidecarTarget {
     ControlPlaneLease,
     /// Cluster membership file operations.
     ControlPlaneMembership,
+    /// Data plane S3 replication fallback operations.
+    DataPlaneReplication,
 }
 
 impl SidecarTarget {
@@ -22,6 +24,7 @@ impl SidecarTarget {
         match self {
             SidecarTarget::ControlPlaneLease
             | SidecarTarget::ControlPlaneMembership => QoSClass::Control,
+            SidecarTarget::DataPlaneReplication => QoSClass::Data,
         }
     }
 }

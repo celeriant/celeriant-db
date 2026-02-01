@@ -249,12 +249,12 @@ fn rollback_detail(f: &ReplicationRollbackFailure) -> String {
 
 fn fsync_message(e: ShardFsyncError) -> String {
     match e {
-        ShardFsyncError::DatablocksCarryOverBufferNotPresent => "{}".into(),
-        ShardFsyncError::RollbackInvalidatedWrites => "{}".into(),
+        ShardFsyncError::DatablocksCarryOverBufferNotPresent => "{a}".into(),
+        ShardFsyncError::RollbackInvalidatedWrites => "{b}".into(),
         ShardFsyncError::BatchesTooLarge { preallocate_bytes } => format!(r#"{{"preallocate_bytes":{}}}"#, preallocate_bytes),
         ShardFsyncError::UnableToRotateToNewLogSegmentFile(e) => format!(r#"{{"detail":{}}}"#, json_string(&format!("{:?}", e))),
-        ShardFsyncError::ActiveWriteFileUnavailable => "{}".into(),
-        ShardFsyncError::WriteLockTimeout => "{}".into(),
+        ShardFsyncError::ActiveWriteFileUnavailable => "{c}".into(),
+        ShardFsyncError::WriteLockTimeout => "{d}".into(),
         ShardFsyncError::MetablockSerialisationError(msg) => format!(r#"{{"detail":{}}}"#, json_string(&msg)),
         ShardFsyncError::WriteMetablocksError(msg) => format!(r#"{{"detail":{}}}"#, json_string(&msg)),
         ShardFsyncError::LogSegmentFileHeaderWriteFailure(e) => format!(r#"{{"detail":{}}}"#, json_string(&format!("{:?}", e))),

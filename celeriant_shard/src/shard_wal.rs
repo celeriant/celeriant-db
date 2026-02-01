@@ -1741,6 +1741,8 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::replication_to_follower_error::ReplicateToFollowerError;
+    use crate::error::replication_to_s3_error::ReplicateToS3Error;
     use crate::replication_client::StubReplicationClient;
     use celeriant_msg::request::requests::{CatchUpRequest, SingleAggregateDelete, WatchRequest};
     use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
@@ -1930,15 +1932,15 @@ mod tests {
             .unwrap()
     }
 
-    async fn process(
-        shard: &ShardWal<StubReplicationClient>,
+    async fn process<R: ReplicationClient>(
+        shard: &ShardWal<R>,
         lease: Option<u64>,
         req: Request,
     ) -> Result<Response, ShardError> {
         shard.process_request(lease, req).await
     }
 
-    async fn write_ok(shard: &ShardWal<StubReplicationClient>, req: Request) {
+    async fn write_ok<R: ReplicationClient>(shard: &ShardWal<R>, req: Request) {
         let result = process(shard, Some(0), req).await;
         assert!(
             matches!(result, Ok(Response::Write(_))),
@@ -2501,6 +2503,110 @@ mod tests {
 
             let resp = unwrap_exists(process(&shard, None, exists_req(agg)).await);
             assert_eq!(resp.min_event_batch_index, 3);
+
+            shard.close().await;
+        });
+    }
+
+    /// Replication client that fails both follower and S3 for a configurable
+    /// number of calls, then succeeds. Simulates follower-offline + no-S3.
+    struct FailThenSucceedReplicationClient {
+        follower_failures_remaining: Cell<u32>,
+        s3_failures_remaining: Cell<u32>,
+    }
+
+    impl FailThenSucceedReplicationClient {
+        fn new(follower_failures: u32, s3_failures: u32) -> Self {
+            Self {
+                follower_failures_remaining: Cell::new(follower_failures),
+                s3_failures_remaining: Cell::new(s3_failures),
+            }
+        }
+    }
+
+    impl ReplicationClient for FailThenSucceedReplicationClient {
+        async fn replicate_to_follower(&mut self, _batches: Vec<celeriant_msg::request::requests::ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError> {
+            let remaining = self.follower_failures_remaining.get();
+            if remaining > 0 {
+                self.follower_failures_remaining.set(remaining - 1);
+                return Err(ReplicateToFollowerError::FollowerUnexpectedResponse);
+            }
+            Ok(())
+        }
+
+        async fn replicate_to_s3(&mut self, _batches: Vec<celeriant_msg::request::requests::ReplicationBatchItem>) -> Result<(), ReplicateToS3Error> {
+            let remaining = self.s3_failures_remaining.get();
+            if remaining > 0 {
+                self.s3_failures_remaining.set(remaining - 1);
+                return Err(ReplicateToS3Error::S3NotConfigured);
+            }
+            Ok(())
+        }
+    }
+
+    async fn open_leader_shard(dir: &std::path::Path, client: FailThenSucceedReplicationClient) -> ShardWal<FailThenSucceedReplicationClient> {
+        ShardWal::open(test_config(dir), ClusterRole::Leader, client)
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn write_succeeds_after_replication_rollback() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+
+            let client = FailThenSucceedReplicationClient::new(1, 1);
+            let shard = open_leader_shard(&dir, client).await;
+            let agg = key(1, 1, 1);
+
+            // Write 1: triggers rollback (follower offline + S3 not configured)
+            let result = process(&shard, Some(0), write_req(agg.clone(), events(1))).await;
+            assert!(
+                matches!(result, Err(ShardError::Write(ShardWriteError::ReplicationError(_)))),
+                "expected ReplicationError, got {:?}", result
+            );
+
+            // Write 2: must succeed — stale rollback flags must not block this
+            let result = process(&shard, Some(0), write_req(agg.clone(), events(1))).await;
+            assert!(
+                matches!(result, Ok(Response::Write(_))),
+                "write after rollback should succeed, got {:?}", result
+            );
+
+            let read = unwrap_read(process(&shard, None, read_req(agg)).await);
+            assert_eq!(read.event_batches.len(), 1);
+            assert_eq!(read.event_batches[0].events.len(), 1);
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn multiple_writes_succeed_after_replication_rollback() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+
+            let client = FailThenSucceedReplicationClient::new(2, 2);
+            let shard = open_leader_shard(&dir, client).await;
+            let agg = key(1, 1, 1);
+
+            // Write 1: rollback
+            let result = process(&shard, Some(0), write_req(agg.clone(), events(1))).await;
+            assert!(matches!(result, Err(ShardError::Write(ShardWriteError::ReplicationError(_)))));
+
+            // Write 2: rollback again
+            let result = process(&shard, Some(0), write_req(agg.clone(), events(1))).await;
+            assert!(matches!(result, Err(ShardError::Write(ShardWriteError::ReplicationError(_)))));
+
+            // Write 3: should succeed
+            let result = process(&shard, Some(0), write_req(agg.clone(), events(1))).await;
+            assert!(
+                matches!(result, Ok(Response::Write(_))),
+                "write after multiple rollbacks should succeed, got {:?}", result
+            );
+
+            let read = unwrap_read(process(&shard, None, read_req(agg)).await);
+            assert_eq!(read.event_batches.len(), 1);
 
             shard.close().await;
         });

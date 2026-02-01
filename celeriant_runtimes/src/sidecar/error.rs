@@ -9,7 +9,7 @@ pub enum ErrorKind {
     /// Permanent error that will not succeed on retry.
     TokioRuntimeFailure,
     ChannelClosed,
-    StoreError,
+    StoreError(celeriant_sidecar::error::ErrorKind),
 }
 
 /// Error returned from object store operations.
@@ -31,7 +31,7 @@ impl SidecarError {
 
 impl From<StoreError> for SidecarError {
     fn from(value: StoreError) -> Self {
-        SidecarError { kind: ErrorKind::StoreError, message: value.to_string() }
+        SidecarError { kind: ErrorKind::StoreError(value.kind()), message: value.to_string() }
     }
 }
 

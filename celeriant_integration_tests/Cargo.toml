@@ -33,6 +33,26 @@ path = "src/watch_test_main.rs"
 name = "replication_catchup_main"
 path = "src/replication_catchup_main.rs"
 
+[[bin]]
+name = "s3_fallback_main"
+path = "src/s3_fallback_main.rs"
+
+[[bin]]
+name = "s3_fallback_catchup_main"
+path = "src/s3_fallback_catchup_main.rs"
+
+[[bin]]
+name = "s3_fallback_no_s3_main"
+path = "src/s3_fallback_no_s3_main.rs"
+
+[[bin]]
+name = "s3_fallback_s3_down_main"
+path = "src/s3_fallback_s3_down_main.rs"
+
+[[bin]]
+name = "s3_fallback_createonly_main"
+path = "src/s3_fallback_createonly_main.rs"
+
 [dependencies]
 celeriant_lib = { package = "celeriant", path = "../celeriant" }
 celeriant_client_tokio = { path = "../celeriant_client_tokio" }
@@ -40,7 +60,13 @@ celeriant_msg = { path = "../celeriant_msg" }
 celeriant_runtimes = { path = "../celeriant_runtimes" }
 celeriant_wire = { path = "../celeriant_wire" }
 celeriant_wal = { path = "../celeriant_wal" }
+celeriant_distributed = { path = "../celeriant_distributed" }
+object_store.workspace = true
+bytes.workspace = true
+bincode.workspace = true
+futures.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 rand.workspace = true
 tempfile.workspace = true
+reqwest = { version = "0.12", features = ["blocking"] }

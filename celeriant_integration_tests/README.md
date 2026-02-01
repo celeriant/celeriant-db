@@ -58,6 +58,50 @@ Connection handling tests. Covers pipelining, cross-shard routing, connection ch
 cargo run --bin connection_test_main -p celeriant_integration_tests --release
 ```
 
+### S3 Fallback Replication
+
+These tests require Docker (for MinIO). Each test manages its own MinIO container lifecycle.
+
+#### s3_fallback_main
+
+Happy path: stops the follower, writes events, verifies they land in S3 at the correct paths (`batch_{start}_{end}.bin`), and confirms lexicographic ordering.
+
+```bash
+cargo run --bin s3_fallback_main -p celeriant_integration_tests --release
+```
+
+#### s3_fallback_catchup_main
+
+Full cycle: normal replication, follower goes down (S3 fallback), follower restarts, catches up via WAL, and normal replication resumes. Verifies follower has all events and no new S3 objects appear after catchup.
+
+```bash
+cargo run --bin s3_fallback_catchup_main -p celeriant_integration_tests --release
+```
+
+#### s3_fallback_no_s3_main
+
+S3 not configured. Follower goes down, leader has no S3 fallback, writes are rolled back and the client sees an error. Verifies writes resume after follower restarts.
+
+```bash
+cargo run --bin s3_fallback_no_s3_main -p celeriant_integration_tests --release
+```
+
+#### s3_fallback_s3_down_main
+
+S3 configured but unreachable (dead endpoint). Follower goes down, S3 put fails, writes are rolled back and the client sees an error.
+
+```bash
+cargo run --bin s3_fallback_s3_down_main -p celeriant_integration_tests --release
+```
+
+#### s3_fallback_createonly_main
+
+Pre-seeds S3 objects with garbage at paths the leader will target, then triggers fallback. Verifies `CreateOnly` is in effect: the write succeeds (`AlreadyExists` treated as OK) but the pre-seeded content is not overwritten.
+
+```bash
+cargo run --bin s3_fallback_createonly_main -p celeriant_integration_tests --release
+```
+
 ### Spinning up leader/follower manually
 cargo run --release -p celeriant -- --data-root data_follower --client-port 10002 --replication-port 10003 --cluster-role follower --num-shards 1
 cargo run --release -p celeriant -- --data-root data_leader --client-port 10000 --replication-port 10001   --cluster-role leader --follower-address 127.0.0.1:10003 --num-shards 1
