@@ -8,7 +8,7 @@ use futures_lite::{AsyncReadExt, AsyncWriteExt};
 use crate::{
     read_wire_data_error::ReadWireDataError,
     request::requests::{
-        CatchUpRequest, DeleteRequest, ExistsRequest, ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest, ReadRequest,
+        CatchUpRequest, DeleteRequest, ExistsRequest, HeartbeatRequest, ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest, ReadRequest,
         ReplicationBatchRequest, TrimStartRequest, WatchRequest, WriteRequest,
     },
 };
@@ -27,6 +27,7 @@ pub enum RequestType {
     ListAggregates = 9,
     ReplicationBatch = 10,
     CatchUp = 11,
+    Heartbeat = 12,
 }
 
 impl RequestType {
@@ -43,6 +44,7 @@ impl RequestType {
             9 => Ok(RequestType::ListAggregates),
             10 => Ok(RequestType::ReplicationBatch),
             11 => Ok(RequestType::CatchUp),
+            12 => Ok(RequestType::Heartbeat),
             _ => Err(ReadWireDataError::UnknownMessageType(value)),
         }
     }
@@ -61,6 +63,7 @@ pub enum Request {
     ListAggregates(ListAggregatesRequest),
     ReplicationBatch(ReplicationBatchRequest),
     CatchUp(CatchUpRequest),
+    Heartbeat(HeartbeatRequest),
 }
 
 impl Request {
@@ -77,6 +80,7 @@ impl Request {
             Request::ListAggregates(_) => RequestType::ListAggregates,
             Request::ReplicationBatch(_) => RequestType::ReplicationBatch,
             Request::CatchUp(_) => RequestType::CatchUp,
+            Request::Heartbeat(_) => RequestType::Heartbeat,
         }
     }
 
@@ -93,6 +97,7 @@ impl Request {
             Request::ListAggregates(req) => req.correlation_id,
             Request::ReplicationBatch(req) => req.correlation_id,
             Request::CatchUp(req) => req.correlation_id,
+            Request::Heartbeat(req) => req.correlation_id,
         }
     }
 
@@ -111,6 +116,7 @@ impl Request {
             Request::ListAggregates(_req) => 0,
             Request::ReplicationBatch(_req) => 0,
             Request::CatchUp(_req) => 0,
+            Request::Heartbeat(_req) => 0,
         }
     }
 
@@ -129,6 +135,7 @@ impl Request {
             Request::ListAggregates(_req) => 0,
             Request::ReplicationBatch(_req) => 0,
             Request::CatchUp(_req) => 0,
+            Request::Heartbeat(_req) => 0,
         }
     }
 
@@ -147,6 +154,7 @@ impl Request {
             Request::ListAggregates(_req) => 0,
             Request::ReplicationBatch(_req) => 0,
             Request::CatchUp(_req) => 0,
+            Request::Heartbeat(_req) => 0,
         }
     }
 
@@ -192,6 +200,7 @@ impl Request {
             RequestType::ListOrgs => fixed!(ListOrgs),
             RequestType::ListAggregateTypes => fixed!(ListAggregateTypes),
             RequestType::ListAggregates => fixed!(ListAggregates),
+            RequestType::Heartbeat => fixed!(Heartbeat),
             RequestType::Write => variable!(Write),
             RequestType::ReplicationBatch => variable!(ReplicationBatch),
             RequestType::CatchUp => variable!(CatchUp),
@@ -221,6 +230,7 @@ impl Request {
             Request::ListOrgs(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
             Request::ListAggregateTypes(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
             Request::ListAggregates(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
+            Request::Heartbeat(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
             Request::Write(req) => wire_header_write_variable_size(writer, req, request_type_id, compression_type, max_message_size, version).await,
             Request::ReplicationBatch(req) => wire_header_write_variable_size(writer, req, request_type_id, compression_type, max_message_size, version).await,
             Request::CatchUp(req) => wire_header_write_variable_size(writer, req, request_type_id, compression_type, max_message_size, version).await,
@@ -228,11 +238,11 @@ impl Request {
     }
 
     pub fn is_client_port_request(&self) -> bool {
-        !matches!(self, Request::ReplicationBatch(_) | Request::CatchUp(_))
+        !matches!(self, Request::ReplicationBatch(_) | Request::CatchUp(_) | Request::Heartbeat(_))
     }
 
     pub fn is_replication_port_request(&self) -> bool {
-        matches!(self, Request::ReplicationBatch(_) | Request::CatchUp(_))
+        matches!(self, Request::ReplicationBatch(_) | Request::CatchUp(_) | Request::Heartbeat(_))
     }
 }
 
@@ -254,8 +264,8 @@ mod tests {
     use futures_lite::{future::block_on, io::Cursor};
     use std::collections::{HashMap, HashSet};
 
-    const REQUEST_TYPE_COUNT: usize = 11;
-    const MAX_ID: u32 = 11;
+    const REQUEST_TYPE_COUNT: usize = 12;
+    const MAX_ID: u32 = 12;
     const VERSIONS: [u32; 2] = [PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3];
 
     fn all_types() -> [RequestType; REQUEST_TYPE_COUNT] {
@@ -271,6 +281,7 @@ mod tests {
             RequestType::ListAggregates,
             RequestType::ReplicationBatch,
             RequestType::CatchUp,
+            RequestType::Heartbeat,
         ]
     }
 
@@ -382,6 +393,11 @@ mod tests {
                 last_follower_metablock: None,
                 follower_tip_hash: Some([0xAB; 32]),
             }),
+            RequestType::Heartbeat => Request::Heartbeat(HeartbeatRequest {
+                correlation_id: Some(0x6666_7777_8888_9999),
+                shard_id: 0,
+                leader_timestamp_ms: 1234567890123,
+            }),
         }
     }
 
@@ -467,7 +483,7 @@ mod tests {
     fn port_categorization() {
         for rt in all_types() {
             let req = make_request(rt);
-            let is_repl = matches!(rt, RequestType::ReplicationBatch | RequestType::CatchUp);
+            let is_repl = matches!(rt, RequestType::ReplicationBatch | RequestType::CatchUp | RequestType::Heartbeat);
             assert_eq!(req.is_replication_port_request(), is_repl, "{:?}", rt);
             assert_eq!(req.is_client_port_request(), !is_repl, "{:?}", rt);
         }

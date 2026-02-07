@@ -5,6 +5,7 @@ use std::rc::Rc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use celeriant_disk::files::rwlock_timeout::write_with_timeout;
+use celeriant_distributed::node_status::NodeStatus;
 use celeriant_rotating_log::errors::ready_up_error::ReadyUpError;
 use celeriant_rotating_log::errors::scan_error::ScanError;
 use celeriant_wal::compression_type::CompressionType;
@@ -31,7 +32,6 @@ use celeriant_rotating_log::reverse_metablock_scanner::ReverseMetablockScanner;
 use celeriant_wal::aggregate_client_key::AggregateClientKey;
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::aggregate_type_key::AggregateTypeKey;
-use celeriant_wal::cluster_role::ClusterRole;
 use celeriant_wal::constants::{FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, GENESIS_HASH};
 use celeriant_wal::datablocks::datablock::Datablock;
 use celeriant_wal::datablocks::datablock_aggregate_event_batch::DatablockAggregateEventBatch;
@@ -99,7 +99,7 @@ pub struct ShardWal<R: ReplicationClient + 'static> {
     bloom_filter_cache: Rc<BloomFilterCache>,
 
     // Are we the leader? Follower? Single node mode? Note this can change at runtime.
-    cluster_role: Rc<Cell<ClusterRole>>,
+    pub node_status: Rc<Cell<NodeStatus>>,
 
     config: InternalShardConfig,
 
@@ -165,6 +165,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
                     .map_err(ShardError::ReplicationBatch)
             }
             Request::CatchUp(_) => Err(ShardError::CatchUpRequestInvalid),
+            Request::Heartbeat(_) => Err(ShardError::CatchUpRequestInvalid),
         }
     }
 
@@ -172,7 +173,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
     ///
     /// If the shard directory exists with log files, reopens from the latest.
     /// Otherwise creates a new shard with an empty log file.
-    pub async fn open(config: InternalShardConfig, cluster_role: ClusterRole, replication_client: R) -> Result<Self, ReadyUpError> {
+    pub async fn open(config: InternalShardConfig, node_status: NodeStatus, replication_client: R) -> Result<Self, ReadyUpError> {
         let shard_mem_cache = ShardMemCache::new(
             config.recent_write_cache_bytes,
             config.aggregate_snapshots_cache_bytes,
@@ -195,7 +196,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
             replication_coordinator: Rc::new(Coordinator::new()),
             watched_aggregates: Rc::new(AggregateWatchers::new()),
             bloom_filter_cache: Rc::new(BloomFilterCache::new()),
-            cluster_role: Rc::new(Cell::new(cluster_role)),
+            node_status: Rc::new(Cell::new(node_status)),
             config,
             aggregate_loading: LoadingCoordinator::new(),
             aggregate_client_loading: LoadingCoordinator::new(),
@@ -1309,7 +1310,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
         let rotating_log_cache = self.log_segments_cache.clone();
         let shard_mem_cache = self.shard_mem_cache.clone();
         let watched_aggregates = self.watched_aggregates.clone();
-        let cluster_role = self.cluster_role.clone();
+        let node_status = self.node_status.clone();
 
         if rotating_log_cache.force_immediate.get() {
             let mc_capture = shard_mem_cache.clone();
@@ -1317,7 +1318,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
                 .request_sync_two_phase(
                     None,
                     move || async move { capture_fsync_snapshot(&mc_capture) },
-                    move |captured| commit_fsync_with_rollback(cluster_role.get(), rotating_log_cache, shard_mem_cache, watched_aggregates, captured),
+                    move |captured| commit_fsync_with_rollback(node_status.get(), rotating_log_cache, shard_mem_cache, watched_aggregates, captured),
                 )
                 .await
         } else if !self.config.non_durable_writes {
@@ -1326,7 +1327,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
                 .request_sync_two_phase(
                     Some(self.config.fsync_delay),
                     move || async move { capture_fsync_snapshot(&mc_capture) },
-                    move |captured| commit_fsync_with_rollback(cluster_role.get(), rotating_log_cache, shard_mem_cache, watched_aggregates, captured),
+                    move |captured| commit_fsync_with_rollback(node_status.get(), rotating_log_cache, shard_mem_cache, watched_aggregates, captured),
                 )
                 .await
         } else {
@@ -1337,7 +1338,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
                     .request_sync_two_phase(
                         None,
                         move || async move { capture_fsync_snapshot(&mc_capture) },
-                        move |captured| commit_fsync_with_rollback(cluster_role.get(), rotating_log_cache, shard_mem_cache, watched_aggregates, captured),
+                        move |captured| commit_fsync_with_rollback(node_status.get(), rotating_log_cache, shard_mem_cache, watched_aggregates, captured),
                     )
                     .await;
             })
@@ -1348,7 +1349,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
 
     async fn replicate_durable(&self) -> Result<(), ReplicationError> {
         // Only leaders need to replicate
-        if self.cluster_role.get() != ClusterRole::Leader {
+        if !self.node_status.get().is_leader() {
             return Ok(());
         }
 
@@ -1410,7 +1411,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
             result,
         };
 
-        if self.cluster_role.get() != ClusterRole::Follower {
+        if !self.node_status.get().is_follower() {
             return Ok(response(ReplicationResult::Rejected(FollowerRejection::NotAFollower)));
         }
 
@@ -1927,7 +1928,7 @@ mod tests {
     }
 
     async fn open_shard(dir: &std::path::Path) -> ShardWal<StubReplicationClient> {
-        ShardWal::open(test_config(dir), ClusterRole::Standalone, StubReplicationClient)
+        ShardWal::open(test_config(dir), NodeStatus::Standalone, StubReplicationClient)
             .await
             .unwrap()
     }
@@ -2545,7 +2546,7 @@ mod tests {
     }
 
     async fn open_leader_shard(dir: &std::path::Path, client: FailThenSucceedReplicationClient) -> ShardWal<FailThenSucceedReplicationClient> {
-        ShardWal::open(test_config(dir), ClusterRole::Leader, client)
+        ShardWal::open(test_config(dir), NodeStatus::Leader { lease_index: 0 }, client)
             .await
             .unwrap()
     }

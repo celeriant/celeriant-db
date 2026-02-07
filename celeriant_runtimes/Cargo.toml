@@ -12,6 +12,7 @@ celeriant_wal = { path = "../celeriant_wal" }
 celeriant_msg = { path = "../celeriant_msg" }
 celeriant_wire = { path = "../celeriant_wire" }
 celeriant_watch = { path = "../celeriant_watch" }
+celeriant_distributed = { path = "../celeriant_distributed" }
 glommio.workspace = true
 tracing.workspace = true
 flume.workspace = true

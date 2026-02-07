@@ -142,3 +142,10 @@ pub struct CatchUpRequest {
     /// Either all 0's or the hash up and including the follower's last metablock
     pub follower_tip_hash: Option<EntryHashBytes>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub struct HeartbeatRequest {
+    pub correlation_id: Option<u128>,
+    pub shard_id: u64,
+    pub leader_timestamp_ms: u64,
+}

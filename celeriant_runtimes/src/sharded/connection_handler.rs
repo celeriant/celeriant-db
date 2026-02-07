@@ -525,8 +525,8 @@ mod tests {
         ShardConfig {
             node_id: 1,
             num_shards,
-            cluster_role: celeriant_wal::cluster_role::ClusterRole::Standalone,
-            follower_address: None,
+            node_status: celeriant_distributed::node_status::NodeStatus::Standalone,
+            advertised_replication_address: None,
             data_root: "/tmp".into(),
             listen_address: "127.0.0.1".into(),
             client_port: 8080,
@@ -558,6 +558,10 @@ mod tests {
             max_cluster_time_drift_ms: 5000,
             max_catchup_gap_bytes: 104_857_600,
             internode_connection_timeout: None,
+            heartbeat_interval_ms: 500,
+            heartbeat_lease_duration_ms: 1500,
+            max_clock_drift_ms: 500,
+            bootstrap_as_leader: false,
         }
     }
 

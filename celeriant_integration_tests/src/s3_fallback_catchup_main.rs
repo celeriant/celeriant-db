@@ -20,94 +20,11 @@
 //! Run with: cargo run --bin s3_fallback_catchup_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{ConfigClusterRole, MinioContainer, ServerConfig, TestServer};
-use celeriant_msg::{
-    process_requests::Request,
-    request::requests::{ReadRequest, SingleAggregateWrite, WriteRequest},
-};
+use celeriant_integration_tests::{count_events, write_event, MinioContainer, ServerConfig, TestServer};
 use celeriant_runtimes::RoutingRule;
-use celeriant_wal::{
-    aggregate_key::AggregateKey, compression_type::CompressionType,
-    datablocks::datablock_aggregate_event::DatablockAggregateEvent,
-};
+use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wire::disk::versioned_block::deserialise_fallback_batch;
-use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
-
-async fn write_event(
-    client: &mut CeleriantClient,
-    aggregate_key: &AggregateKey,
-    event_num: u64,
-    allow_create: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let event = DatablockAggregateEvent {
-        client_event_index: event_num,
-        event_index: 0,
-        event_id: None,
-        event_timestamp: 1000 + event_num,
-        event_type_major: 100,
-        event_type_minor: 0,
-        event_value: Arc::new(format!("{{\"event\":{}}}", event_num).into_bytes()),
-        iv: None,
-    };
-
-    let mut writes = HashMap::new();
-    writes.insert(
-        aggregate_key.clone(),
-        SingleAggregateWrite {
-            events: vec![event],
-            allow_create,
-            expected_event_batch_index: if event_num == 1 { Some(0) } else { None },
-            enforce_client_idempotency: false,
-            compression_type: CompressionType::None,
-        },
-    );
-
-    let write_req = WriteRequest {
-        correlation_id: Some(event_num as u128),
-        client_id: 999,
-        user_id: Some(888),
-        writes,
-    };
-
-    let response = client
-        .send_request(&Request::Write(write_req), CompressionType::None)
-        .await?;
-
-    match response {
-        celeriant_msg::process_responses::Response::Write(_) => Ok(()),
-        other => Err(format!("Write failed: {:?}", other).into()),
-    }
-}
-
-async fn count_events(
-    client: &mut CeleriantClient,
-    aggregate_key: &AggregateKey,
-) -> Result<usize, Box<dyn std::error::Error>> {
-    let read_req = ReadRequest {
-        correlation_id: Some(999),
-        aggregate_key: aggregate_key.clone(),
-        filters: celeriant_msg::request::read_filters::ReadFilters::new(1),
-    };
-
-    let response = client
-        .send_request(&Request::Read(read_req), CompressionType::None)
-        .await?;
-
-    match response {
-        celeriant_msg::process_responses::Response::Read(read_resp) => {
-            let total: usize = read_resp
-                .event_batches
-                .iter()
-                .map(|b| b.events.len())
-                .sum();
-            Ok(total)
-        }
-        celeriant_msg::process_responses::Response::GenericError(_) => Ok(0),
-        other => Err(format!("Unexpected response: {:?}", other).into()),
-    }
-}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -133,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let follower_config = ServerConfig {
         num_shards: Some(num_shards),
         log_level: "info".to_string(),
-        cluster_role: ConfigClusterRole::Follower,
+        bootstrap_as_leader: false,
         routing_rule: RoutingRule::AggregateTypeId,
         s3_enabled: true,
         s3_region: Some(region.clone()),
@@ -154,8 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let leader_config = ServerConfig {
         num_shards: Some(num_shards),
         log_level: "info".to_string(),
-        cluster_role: ConfigClusterRole::Leader,
-        follower_address: Some(format!("127.0.0.1:{}", follower_replication_port)),
+        bootstrap_as_leader: true,
         routing_rule: RoutingRule::AggregateTypeId,
         s3_enabled: true,
         s3_region: Some(region),
@@ -178,6 +94,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         follower.address()
     );
 
+    // Wait for S3 election + peer discovery + heartbeat establishment
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
     let mut leader_client = CeleriantClient::connect(leader.address()).await?;
 
     // ========================================
@@ -192,7 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("  Waiting for replication...");
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
     let follower_count = count_events(&mut follower_client, &aggregate_key).await?;

@@ -8,7 +8,7 @@ use futures_lite::{AsyncReadExt, AsyncWriteExt};
 use crate::{
     read_wire_data_error::ReadWireDataError,
     response::responses::{
-        CatchUpResponse, ErrorResponse, ExistsResponse, ListAggregateTypesResponse, ListAggregatesResponse, ListOrgsResponse, ProtocolErrorResponse,
+        CatchUpResponse, ErrorResponse, ExistsResponse, HeartbeatResponse, ListAggregateTypesResponse, ListAggregatesResponse, ListOrgsResponse, ProtocolErrorResponse,
         ReadResponse, ReplicationBatchResponse, SuccessResponse, WatchResponse,
     },
 };
@@ -30,6 +30,7 @@ pub enum ResponseType {
     ListAggregates = 11,
     ReplicationBatch = 12,
     CatchUp = 13,
+    Heartbeat = 14,
 }
 
 impl ResponseType {
@@ -48,6 +49,7 @@ impl ResponseType {
             11 => Ok(ResponseType::ListAggregates),
             12 => Ok(ResponseType::ReplicationBatch),
             13 => Ok(ResponseType::CatchUp),
+            14 => Ok(ResponseType::Heartbeat),
             _ => Err(ReadWireDataError::UnknownMessageType(value)),
         }
     }
@@ -68,6 +70,7 @@ pub enum Response {
     ListAggregates(ListAggregatesResponse),
     ReplicationBatch(ReplicationBatchResponse),
     CatchUp(CatchUpResponse),
+    Heartbeat(HeartbeatResponse),
 }
 
 impl Response {
@@ -86,6 +89,7 @@ impl Response {
             Response::ListAggregates(_) => ResponseType::ListAggregates,
             Response::ReplicationBatch(_) => ResponseType::ReplicationBatch,
             Response::CatchUp(_) => ResponseType::CatchUp,
+            Response::Heartbeat(_) => ResponseType::Heartbeat,
         }
     }
 
@@ -129,6 +133,7 @@ impl Response {
             ResponseType::ProtocolError => fixed!(ProtocolError),
             ResponseType::GenericError => fixed!(GenericError),
             ResponseType::ReplicationBatch => fixed!(ReplicationBatch),
+            ResponseType::Heartbeat => fixed!(Heartbeat),
             ResponseType::Read => variable!(Read),
             ResponseType::Watch => variable!(Watch),
             ResponseType::ListOrgs => variable!(ListOrgs),
@@ -153,6 +158,7 @@ impl Response {
             Response::ListAggregates(_) => server_compression_algorithm,
             Response::ReplicationBatch(_) => CompressionType::None,
             Response::CatchUp(_) => server_compression_algorithm,
+            Response::Heartbeat(_) => CompressionType::None,
         }
     }
 
@@ -176,6 +182,7 @@ impl Response {
             Response::ProtocolError(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
             Response::GenericError(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
             Response::ReplicationBatch(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
+            Response::Heartbeat(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
             Response::Read(res) => wire_header_write_variable_size(writer, res, response_type_id, compression_type, max_message_size, version).await,
             Response::Watch(res) => wire_header_write_variable_size(writer, res, response_type_id, compression_type, max_message_size, version).await,
             Response::ListOrgs(res) => wire_header_write_variable_size(writer, res, response_type_id, compression_type, max_message_size, version).await,
@@ -189,12 +196,12 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::response::responses::{AggregateListItem, AggregateTypeListItem, OrgListItem, ReplicationResult};
+    use crate::response::responses::{AggregateListItem, AggregateTypeListItem, HeartbeatResult, OrgListItem, ReplicationResult};
     use celeriant_wire::network::wire_header::{PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3};
     use futures_lite::{future::block_on, io::Cursor};
 
-    const COUNT: usize = 13;
-    const MAX_ID: u32 = 13;
+    const COUNT: usize = 14;
+    const MAX_ID: u32 = 14;
     const VERSIONS: [u32; 2] = [PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3];
 
     fn all_types() -> [ResponseType; COUNT] {
@@ -212,6 +219,7 @@ mod tests {
             ResponseType::ListAggregates,
             ResponseType::ReplicationBatch,
             ResponseType::CatchUp,
+            ResponseType::Heartbeat,
         ]
     }
 
@@ -267,6 +275,12 @@ mod tests {
                 batches: vec![],
                 continue_catching_up: true,
                 expected_follower_tip_hash: Some([0xAB; 32]),
+            }),
+            ResponseType::Heartbeat => Response::Heartbeat(HeartbeatResponse {
+                correlation_id: Some(0x7777_8888_9999_AAAA),
+                result: HeartbeatResult::Ack {
+                    follower_timestamp_ms: 1234567890123,
+                },
             }),
         }
     }
@@ -475,6 +489,33 @@ mod tests {
             let bytes = write_bytes(&res, PROTOCOL_VERSION_V3, CompressionType::Zstd { level: 6 }).await;
             let parsed = read_back(&bytes).await;
             assert_eq!(parsed.response_type(), ResponseType::ListAggregates);
+        });
+    }
+
+    #[test]
+    fn heartbeat_rejection_variants_round_trip() {
+        use crate::response::responses::HeartbeatRejection;
+        block_on(async {
+            let variants = [
+                HeartbeatRejection::ClockDriftTooHigh {
+                    leader_ms: 1000,
+                    follower_ms: 9000,
+                    max_allowed_ms: 5000,
+                },
+            ];
+
+            for reason in variants {
+                let res = Response::Heartbeat(HeartbeatResponse {
+                    correlation_id: Some(0x1234_5678_9ABC_DEF0),
+                    result: HeartbeatResult::Rejected(reason),
+                });
+
+                for &v in &VERSIONS {
+                    let bytes = write_bytes(&res, v, CompressionType::None).await;
+                    let parsed = read_back(&bytes).await;
+                    assert_eq!(parsed.response_type(), ResponseType::Heartbeat);
+                }
+            }
         });
     }
 

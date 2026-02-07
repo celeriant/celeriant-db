@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 celeriant_crypto = { path = "../celeriant_crypto" }
+celeriant_distributed = { path = "../celeriant_distributed" }
 celeriant_runtimes = { path = "../celeriant_runtimes" }
 celeriant_sidecar = { path = "../celeriant_sidecar" }
 celeriant_shard = { path = "../celeriant_shard" }

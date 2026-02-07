@@ -119,6 +119,23 @@ pub enum FollowerRejection {
     EmptyBatch,
     /// Batch item references external datablock but none provided.
     MissingDatablock,
+    /// Follower's lease index doesn't match leader's expectation.
+    StaleLease {
+        follower_lease_index: u64,
+        received_lease_index: u64,
+    },
+}
+
+/// Rejection reasons when follower refuses a heartbeat.
+/// Lease validation is handled by the replication path (FollowerRejection::StaleLease).
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode, PartialEq, Eq)]
+pub enum HeartbeatRejection {
+    /// Clock skew between leader and follower exceeds threshold.
+    ClockDriftTooHigh {
+        leader_ms: u64,
+        follower_ms: u64,
+        max_allowed_ms: u64,
+    },
 }
 
 /// Result of a replication batch - either success or explicit rejection.
@@ -148,4 +165,18 @@ pub struct CatchUpResponse {
     pub batches: Vec<ReplicationBatchItem>,
     /// Leader decides if the follower has caught up enough to become live
     pub continue_catching_up: bool,
+}
+
+/// Result of a heartbeat - either acknowledgement or explicit rejection.
+/// The heartbeat is purely a liveness signal. Lease fencing is the replication path's job.
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub enum HeartbeatResult {
+    Ack { follower_timestamp_ms: u64 },
+    Rejected(HeartbeatRejection),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub struct HeartbeatResponse {
+    pub correlation_id: Option<u128>,
+    pub result: HeartbeatResult,
 }

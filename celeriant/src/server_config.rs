@@ -1,3 +1,4 @@
+use celeriant_distributed::node_status::NodeStatus;
 use celeriant_runtimes::RoutingRule;
 use celeriant_runtimes::{ShardConfig, SidecarConfig};
 use celeriant_shard::timestamp_config::{TimestampConfig, TimestampPrecision};
@@ -14,13 +15,6 @@ pub enum ConfigTimestampPrecision {
     Nanoseconds,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, ValueEnum)]
-pub enum ConfigClusterRole {
-    #[default]
-    Standalone,
-    Leader,
-    Follower,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, ValueEnum)]
 pub enum ConfigCompressionType {
@@ -87,18 +81,26 @@ pub struct ServerConfig {
 
     #[arg(
         long,
-        default_value = "standalone",
-        env = "CELERIANT_CLUSTER_ROLE",
-        help = "Cluster role: standalone, leader, or follower"
+        env = "CELERIANT_ADVERTISED_REPLICATION_ADDRESS",
+        help = "Override the replication address advertised in S3 membership. If not set, defaults to {listen_address}:{replication_port}. Used in testing to route through a TCP proxy."
     )]
-    pub cluster_role: ConfigClusterRole,
+    pub advertised_replication_address: Option<String>,
 
     #[arg(
         long,
-        env = "CELERIANT_FOLLOWER_ADDRESS",
-        help = "Address of follower node for replication (required when cluster_role=leader)"
+        action = clap::ArgAction::SetTrue,
+        env = "CELERIANT_STANDALONE",
+        help = "Run in standalone mode (no replication, no S3 election)"
     )]
-    pub follower_address: Option<String>,
+    pub standalone: bool,
+
+    #[arg(
+        long,
+        action = clap::ArgAction::SetTrue,
+        env = "CELERIANT_BOOTSTRAP_AS_LEADER",
+        help = "Bootstrap as leader for S3 election (defaults to false)"
+    )]
+    pub bootstrap_as_leader: bool,
 
     #[arg(
         long,
@@ -366,16 +368,16 @@ impl ServerConfig {
     }
 
     pub fn to_shard_config(&self, node_id: u128, num_shards: u32) -> ShardConfig {
-        use celeriant_runtimes::{ClusterRole, CompressionType};
+        use celeriant_runtimes::{CompressionType};
         ShardConfig {
             node_id,
             num_shards,
-            cluster_role: match self.cluster_role {
-                ConfigClusterRole::Standalone => ClusterRole::Standalone,
-                ConfigClusterRole::Leader => ClusterRole::Leader,
-                ConfigClusterRole::Follower => ClusterRole::Follower,
+            node_status: if self.standalone {
+                NodeStatus::Standalone
+            } else {
+                NodeStatus::Fenced
             },
-            follower_address: self.follower_address.clone(),
+            advertised_replication_address: self.advertised_replication_address.clone(),
             data_root: std::path::absolute(&self.data_root)
                 .expect("Failed to resolve data_root to an absolute path"),
             listen_address: self.listen_address.clone(),
@@ -418,6 +420,10 @@ impl ServerConfig {
                 ConfigCompressionType::Brotli => CompressionType::Brotli { level: self.server_compression_level.unwrap_or(6) },
                 ConfigCompressionType::Gzip => CompressionType::Gzip { level: self.server_compression_level.unwrap_or(6) },
             },
+            heartbeat_interval_ms: 500,
+            heartbeat_lease_duration_ms: 1500,
+            max_clock_drift_ms: 500,
+            bootstrap_as_leader: self.bootstrap_as_leader,
         }
     }
 
@@ -494,8 +500,9 @@ impl Default for ServerConfig {
             listen_address: "0.0.0.0".to_string(),
             client_port: 10000,
             replication_port: 10001,
-            cluster_role: ConfigClusterRole::Standalone,
-            follower_address: None,
+            advertised_replication_address: None,
+            standalone: false,
+            bootstrap_as_leader: false,
             mesh_channel_size: 1024,
             num_shards: None,
             read_max_chunk_size: 32 * 1024,

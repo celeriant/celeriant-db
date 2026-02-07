@@ -1,7 +1,8 @@
 use std::{path::PathBuf, time::Duration};
 
 use celeriant_shard::timestamp_config::TimestampConfig;
-use celeriant_wal::{cluster_role::ClusterRole, compression_type::CompressionType};
+use celeriant_distributed::node_status::NodeStatus;
+use celeriant_wal::compression_type::CompressionType;
 
 use crate::sharded::routing_rule::RoutingRule;
 
@@ -11,8 +12,8 @@ use crate::sharded::routing_rule::RoutingRule;
 pub struct ShardConfig {
     pub node_id: u128,
     pub num_shards: u32,
-    pub cluster_role: ClusterRole,
-    pub follower_address: Option<String>,
+    pub node_status: NodeStatus,
+    pub advertised_replication_address: Option<String>,
     pub data_root: PathBuf,
     pub listen_address: String,
     pub client_port: u16,
@@ -41,4 +42,8 @@ pub struct ShardConfig {
     pub pending_replication_high_water_bytes: u64,
     pub max_cluster_time_drift_ms: u64,
     pub max_catchup_gap_bytes: u64,
+    pub heartbeat_interval_ms: u64,
+    pub heartbeat_lease_duration_ms: u64,
+    pub max_clock_drift_ms: u64,
+    pub bootstrap_as_leader: bool,
 }

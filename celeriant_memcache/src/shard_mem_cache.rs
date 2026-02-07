@@ -6,7 +6,7 @@ use crate::{
     aggregate_recent_write::AggregateRecentWrites, mem_snapshot_aggregate::MemSnapshotAggregate, queue_aggregate_positions::QueueAggregatePositions,
     recent_write::RecentWrite, shard_log_queue_item::ShardLogQueueItem, sync_positions_snapshot::{SyncPositionsSnapshot},
 };
-use celeriant_wal::cluster_role::ClusterRole;
+use celeriant_distributed::node_status::NodeStatus;
 use celeriant_wal::metablocks::metablock_event_batch::MetablockEventBatch;
 use celeriant_wal::{
     aggregate_client_key::AggregateClientKey, aggregate_key::AggregateKey, constants::FIXED_BLOCK_SIZE_BYTES, datablocks::datablock::Datablock,
@@ -488,7 +488,7 @@ impl ShardMemCache {
 
     /// Provide the aggregate_queue_positions snapshotted before disk write begun
     /// and this will update the aggregate_file_positions with the committed data.
-    pub fn commit_sync_positions_snapshot(&mut self, cluster_role: ClusterRole, sync_positions_snapshot: SyncPositionsSnapshot) {
+    pub fn commit_sync_positions_snapshot(&mut self, node_status: NodeStatus, sync_positions_snapshot: SyncPositionsSnapshot) {
         for (key, queue_positions) in sync_positions_snapshot.aggregate_queue_positions {
             if queue_positions.pending_delete {
                 continue; // Will be handled by put_aggregate_into_cache_as_deleted
@@ -518,7 +518,7 @@ impl ShardMemCache {
                 self.aggregate_write_snapshots.put(key.clone(), snapshot);
             }
 
-            if cluster_role != ClusterRole::Leader {
+            if !node_status.is_leader() {
                 // Single-node or follower: update read cache immediately.
                 if let Some(existing) = self.aggregate_read_snapshots.get_mut(&key)
                 && existing.status != AggregateStatus::NotFound {

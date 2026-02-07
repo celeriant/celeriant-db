@@ -12,7 +12,7 @@ use crate::{sharded::{intrashard_messages::IntrashardMessages, shard::Shard}, si
 mod sharded;
 mod sidecar;
 
-pub use {sharded::shard_config::ShardConfig, sidecar::sidecar_config::SidecarConfig, sharded::routing_rule::RoutingRule, celeriant_wal::cluster_role::ClusterRole, celeriant_wal::compression_type::CompressionType};
+pub use {sharded::shard_config::ShardConfig, sidecar::sidecar_config::SidecarConfig, sharded::routing_rule::RoutingRule, celeriant_wal::compression_type::CompressionType};
 
 pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig, sidecar_config: SidecarConfig, mesh_channel_size: usize, node_id: u128, sidecar_store: S) {
     info!("Starting {} shard executors on node {}", shard_config.num_shards, node_id);
@@ -67,17 +67,16 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                 max_cluster_time_drift_ms: shard_config.max_cluster_time_drift_ms,
                 max_catchup_gap_bytes: shard_config.max_catchup_gap_bytes,
             };
-            let follower_address = shard_config.follower_address.clone().unwrap_or_default();
             let s3_uploader = SidecarS3Uploader::new(sidecar_senders.clone());
             let replication_client = GlommioReplicationClient::new(
-                follower_address,
+                String::new(),
                 shard_config.internode_connection_timeout,
                 shard_config.max_request_size,
                 shard_config.max_response_size,
                 current_shard_id as u64,
                 Some(s3_uploader),
             );
-            let filesystem = ShardWal::open(internal_shard_config, shard_config.cluster_role, replication_client).await
+            let filesystem = ShardWal::open(internal_shard_config, shard_config.node_status, replication_client).await
                 .expect(&format!("Failed to initialize filesystem at {:?} - cannot initialize shard", shard_config.data_root));
 
             Shard::new(shard_config, current_shard_id, sender, receivers, sidecar_senders, client_tcp_listener, replication_tcp_listener, filesystem).run().await;

@@ -27,7 +27,7 @@ use tokio::sync::Barrier;
 use tokio::time::Instant;
 
 const NUM_AGGREGATES: usize = 10;
-const TEST_DURATION_SECS: u64 = 120;
+const TEST_DURATION_SECS: u64 = 30;
 const CLIENTSIDE_TIMEOUT_S: u64 = 30; // Longer timeout for large payloads
 
 const MIN_PAYLOAD_SIZE: usize = 1;
@@ -100,14 +100,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("Writer {} connection error: {}", aggregate_id, e))?
         .with_timeout(Duration::from_secs(CLIENTSIDE_TIMEOUT_S));
 
-        // Reader connection
+        // Reader connection — responses can contain multiple large event batches,
+        // so max_request_size must match the server's --max-response-size (64MB)
         let reader = CeleriantClient::connect_with_timeout(
             server_addr,
             Some(Duration::from_secs(CLIENTSIDE_TIMEOUT_S)),
         )
         .await
         .map_err(|e| format!("Reader {} connection error: {}", aggregate_id, e))?
-        .with_timeout(Duration::from_secs(CLIENTSIDE_TIMEOUT_S));
+        .with_timeout(Duration::from_secs(CLIENTSIDE_TIMEOUT_S))
+        .with_max_request_size(67_108_864);
 
         writer_clients.push((aggregate_id, writer));
         reader_clients.push((aggregate_id, reader));

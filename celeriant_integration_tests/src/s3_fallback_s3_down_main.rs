@@ -1,21 +1,20 @@
-//! S3 Configured But Unreachable Integration Test
+//! S3 Goes Down Integration Test
 //!
-//! Tests that when the follower is down and S3 is configured but the endpoint
-//! is unreachable, writes are rolled back.
+//! Tests that when S3 is initially available (for election), then goes down,
+//! and then the follower goes down, writes are rolled back.
 //!
 //! Scenario:
-//! 1. Start follower and leader. S3 config points to non-existent endpoint
-//!    (http://127.0.0.1:1). s3_enabled: true
-//! 2. Write events 1-3. Verify follower has 3 events (normal replication, S3 not involved)
-//! 3. Stop follower
-//! 4. Write event 4 to leader. Follower down, S3 unreachable — fallback fails
-//! 5. Verify the write is rejected — client receives error
-//! 6. No MinIO container needed
+//! 1. Start MinIO, follower, and leader. S3 election succeeds.
+//! 2. Write events 1-3. Verify follower has 3 events (normal replication)
+//! 3. Pause MinIO (S3 becomes unreachable)
+//! 4. Stop follower
+//! 5. Write event 4 to leader. Follower down, S3 unreachable — fallback fails
+//! 6. Verify the write is rejected — client receives error
 //!
 //! Run with: cargo run --bin s3_fallback_s3_down_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{ConfigClusterRole, ServerConfig, TestServer};
+use celeriant_integration_tests::{MinioContainer, ServerConfig, TestServer};
 use celeriant_msg::{
     process_requests::Request,
     request::requests::{ReadRequest, SingleAggregateWrite, WriteRequest},
@@ -105,28 +104,33 @@ async fn count_events(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== S3 Configured But Unreachable Integration Test ===\n");
+    println!("=== S3 Goes Down Integration Test ===\n");
 
-    let port = 10600 + (std::process::id() % 100) as u16;
+    let port = 10900 + (std::process::id() % 100) as u16;
+    let minio_port = port + 10;
 
     let num_shards = 4;
 
-    println!("Starting replicated cluster with UNREACHABLE S3...");
+    println!("Starting MinIO on port {}...", minio_port);
+    let minio = MinioContainer::start_with_bucket(minio_port, "test-s3down").await?;
+    let (region, bucket, access_key, secret_key, endpoint, allow_http) = minio.s3_config_fields();
+    println!("MinIO ready at {}\n", endpoint);
+
+    println!("Starting replicated cluster with S3...");
 
     let follower_port = port + 100;
     let follower_config = ServerConfig {
         num_shards: Some(num_shards),
         log_level: "info".to_string(),
-        cluster_role: ConfigClusterRole::Follower,
+        bootstrap_as_leader: false,
         routing_rule: RoutingRule::AggregateTypeId,
         s3_enabled: true,
-        s3_region: Some("us-east-1".to_string()),
-        s3_bucket: Some("test-fallback".to_string()),
-        s3_access_key_id: Some("minioadmin".to_string()),
-        s3_secret_access_key: Some("minioadmin".to_string()),
-        s3_endpoint_override: Some("http://127.0.0.1:1".to_string()),
-        s3_allow_http: true,
-        s3_skip_signature: false,
+        s3_region: Some(region.clone()),
+        s3_bucket: Some(bucket.clone()),
+        s3_access_key_id: Some(access_key.clone()),
+        s3_secret_access_key: Some(secret_key.clone()),
+        s3_endpoint_override: Some(endpoint.clone()),
+        s3_allow_http: allow_http,
         ..Default::default()
     };
     println!("Starting follower on port {}...", follower_port);
@@ -134,34 +138,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let follower_replication_port = follower_port + 1;
     let leader_config = ServerConfig {
         num_shards: Some(num_shards),
         log_level: "info".to_string(),
-        cluster_role: ConfigClusterRole::Leader,
-        follower_address: Some(format!("127.0.0.1:{}", follower_replication_port)),
+        bootstrap_as_leader: true,
         routing_rule: RoutingRule::AggregateTypeId,
         s3_enabled: true,
-        s3_region: Some("us-east-1".to_string()),
-        s3_bucket: Some("test-fallback".to_string()),
-        s3_access_key_id: Some("minioadmin".to_string()),
-        s3_secret_access_key: Some("minioadmin".to_string()),
-        s3_endpoint_override: Some("http://127.0.0.1:1".to_string()),
-        s3_allow_http: true,
-        s3_skip_signature: false,
+        s3_region: Some(region),
+        s3_bucket: Some(bucket),
+        s3_access_key_id: Some(access_key),
+        s3_secret_access_key: Some(secret_key),
+        s3_endpoint_override: Some(endpoint),
+        s3_allow_http: allow_http,
         ..Default::default()
     };
-    println!(
-        "Starting leader on port {} (replicating to 127.0.0.1:{})...",
-        port, follower_replication_port
-    );
+    println!("Starting leader on port {} (S3 election mode)...", port);
     let leader = TestServer::start_with_config(port, leader_config).await?;
+
     println!(
         "Cluster started: leader at {}, follower at {}\n",
         leader.address(),
         follower.address()
     );
-    println!("S3 endpoint configured but unreachable: http://127.0.0.1:1\n");
+
+    // Wait for S3 election to complete
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let mut leader_client = CeleriantClient::connect(leader.address()).await?;
     let aggregate_key = AggregateKey::new(1, 1, 1);
@@ -189,9 +190,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  ✓ Follower has {} events\n", follower_count);
 
     // ========================================
-    // Phase 2: Follower goes down, S3 unreachable
+    // Phase 2: S3 goes down
     // ========================================
-    println!("PHASE 2: Follower goes down, S3 unreachable");
+    println!("PHASE 2: S3 goes down (pause MinIO)");
+    println!("-----------------------------------");
+
+    println!("  Pausing MinIO container...");
+    minio.pause()?;
+    println!("  ✓ MinIO paused (S3 now unreachable)\n");
+
+    // ========================================
+    // Phase 3: Follower goes down, S3 unreachable
+    // ========================================
+    println!("PHASE 3: Follower goes down, S3 unreachable");
     println!("-------------------------------------------");
 
     println!("  Stopping follower...");

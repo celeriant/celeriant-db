@@ -42,16 +42,64 @@ name = "s3_fallback_catchup_main"
 path = "src/s3_fallback_catchup_main.rs"
 
 [[bin]]
-name = "s3_fallback_no_s3_main"
-path = "src/s3_fallback_no_s3_main.rs"
-
-[[bin]]
 name = "s3_fallback_s3_down_main"
 path = "src/s3_fallback_s3_down_main.rs"
 
 [[bin]]
 name = "s3_fallback_createonly_main"
 path = "src/s3_fallback_createonly_main.rs"
+
+[[bin]]
+name = "s3_election_main"
+path = "src/s3_election_main.rs"
+
+[[bin]]
+name = "s3_failover_main"
+path = "src/s3_failover_main.rs"
+
+[[bin]]
+name = "s3_split_brain_main"
+path = "src/s3_split_brain_main.rs"
+
+[[bin]]
+name = "s3_follower_crash_main"
+path = "src/s3_follower_crash_main.rs"
+
+[[bin]]
+name = "s3_stale_lease_main"
+path = "src/s3_stale_lease_main.rs"
+
+[[bin]]
+name = "s3_fencing_writes_main"
+path = "src/s3_fencing_writes_main.rs"
+
+[[bin]]
+name = "s3_lease_monotonicity_main"
+path = "src/s3_lease_monotonicity_main.rs"
+
+[[bin]]
+name = "s3_unreachable_failover_main"
+path = "src/s3_unreachable_failover_main.rs"
+
+[[bin]]
+name = "s3_network_partition_main"
+path = "src/s3_network_partition_main.rs"
+
+[[bin]]
+name = "s3_reconvergence_main"
+path = "src/s3_reconvergence_main.rs"
+
+[[bin]]
+name = "s3_old_leader_recovery_main"
+path = "src/s3_old_leader_recovery_main.rs"
+
+[[bin]]
+name = "s3_writes_during_fencing_main"
+path = "src/s3_writes_during_fencing_main.rs"
+
+[[bin]]
+name = "s3_concurrent_cas_main"
+path = "src/s3_concurrent_cas_main.rs"
 
 [dependencies]
 celeriant_lib = { package = "celeriant", path = "../celeriant" }

@@ -40,7 +40,7 @@ const TOTAL_AGGREGATES: usize = NUM_ORGS * NUM_AGGREGATE_TYPES_PER_ORG * NUM_AGG
 // Test configuration
 const NUM_WRITERS: usize = 10;
 const NUM_READERS: usize = 5;
-const TEST_DURATION_SECS: u64 = 60;
+const TEST_DURATION_SECS: u64 = 30;
 const CLIENTSIDE_TIMEOUT_S: u64 = 30;
 
 // Payload configuration

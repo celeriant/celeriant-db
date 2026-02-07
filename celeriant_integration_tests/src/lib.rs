@@ -1,10 +1,23 @@
 //! Shared test utilities for celeriant_integration_tests integration tests.
 
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
-pub use celeriant_lib::server_config::{ConfigClusterRole, ServerConfig};
+use celeriant_client_tokio::celeriant_client::CeleriantClient;
+use celeriant_msg::{
+    process_requests::Request,
+    request::requests::{ReadRequest, SingleAggregateWrite, WriteRequest},
+};
+use celeriant_wal::{
+    aggregate_key::AggregateKey, compression_type::CompressionType,
+    datablocks::datablock_aggregate_event::DatablockAggregateEvent,
+};
+pub use celeriant_lib::server_config::ServerConfig;
 use tempfile::TempDir;
 use tokio::net::TcpStream;
 use tokio::time::sleep;
@@ -40,9 +53,40 @@ pub struct TestServer {
     address: String,
     child: Child,
     config: ServerConfig,
+    label: String,
+    _log_thread: Option<JoinHandle<()>>,
 }
 
 impl TestServer {
+    /// Resolve the path to the pre-built server binary.
+    /// Uses the release binary next to the running test binary, falling back to cargo run.
+    fn server_binary_path() -> std::path::PathBuf {
+        let mut path = std::env::current_exe().unwrap();
+        path.pop(); // remove test binary name
+        // In release mode, binary is in target/release/
+        // In debug mode with deps, go up from target/debug/deps/ to target/debug/
+        if path.ends_with("deps") {
+            path.pop();
+        }
+        path.push("celeriant");
+        if path.exists() {
+            path
+        } else {
+            // Fallback: search workspace target directory
+            let workspace = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join("target/release/celeriant");
+            if workspace.exists() {
+                workspace
+            } else {
+                panic!(
+                    "Server binary not found. Build it first: cargo build --release -p celeriant"
+                );
+            }
+        }
+    }
+
     /// Start a new test server with sensible test defaults.
     ///
     /// Uses a unique port based on the process ID to avoid conflicts.
@@ -57,6 +101,7 @@ impl TestServer {
         let config = ServerConfig {
             num_shards: Some(1),
             log_level: "warn".to_string(),
+            standalone: true,
             ..Default::default()
         };
         Self::start_with_config(port, config).await
@@ -69,7 +114,23 @@ impl TestServer {
     /// provided port parameter.
     pub async fn start_with_config(
         port: u16,
+        config: ServerConfig,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let label = format!("server:{}", port);
+        Self::start_with_config_labeled(port, config, label).await
+    }
+
+    /// Start a new test server with custom configuration and a label for log output.
+    ///
+    /// Server stderr is captured and printed line-by-line prefixed with `[{label}]`.
+    ///
+    /// BEST PRACTICE: New integration tests should use this labeled variant for better
+    /// log readability in multi-node scenarios. Unlabeled variants exist for backward
+    /// compatibility with existing tests.
+    pub async fn start_with_config_labeled(
+        port: u16,
         mut config: ServerConfig,
+        label: String,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let temp_dir = TempDir::new()?;
         let data_root = temp_dir.path().to_path_buf();
@@ -87,12 +148,14 @@ impl TestServer {
 
         println!("  Args: {:?}", args);
 
-        let child = Command::new("cargo")
-            .args(["run", "-p", "celeriant", "--release", "--"])
+        let server_bin = Self::server_binary_path();
+        let mut child = Command::new(&server_bin)
             .args(&args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
+
+        let log_thread = spawn_log_reader(&label, &mut child);
 
         // Wait for server to start by polling the port
         let start = std::time::Instant::now();
@@ -107,6 +170,8 @@ impl TestServer {
                         address,
                         child,
                         config,
+                        label,
+                        _log_thread: log_thread,
                     });
                 }
                 Err(_) => {
@@ -144,12 +209,14 @@ impl TestServer {
     pub async fn restart(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let args = self.config.to_cli_args();
 
-        self.child = Command::new("cargo")
-            .args(["run", "-p", "celeriant", "--release", "--"])
+        let server_bin = Self::server_binary_path();
+        self.child = Command::new(&server_bin)
             .args(&args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
+
+        self._log_thread = spawn_log_reader(&self.label, &mut self.child);
 
         // Wait for server to start
         let start = std::time::Instant::now();
@@ -178,6 +245,22 @@ impl Drop for TestServer {
         let _ = self.child.wait();
         println!("  Test server shut down");
     }
+}
+
+/// Take stderr from a child process and spawn a thread that prints each line with a label prefix.
+/// Returns `None` if stderr is not available (already taken or not piped).
+fn spawn_log_reader(label: &str, child: &mut Child) -> Option<JoinHandle<()>> {
+    let stderr = child.stderr.take()?;
+    let label = label.to_string();
+    Some(std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            match line {
+                Ok(line) => eprintln!("  [{}] {}", label, line),
+                Err(_) => break,
+            }
+        }
+    }))
 }
 
 /// Extension trait for ServerConfig to convert to CLI arguments.
@@ -265,18 +348,18 @@ impl ServerConfigExt for ServerConfig {
         args.push("--list-wal-index-cache-bytes".to_string());
         args.push(self.list_wal_index_cache_bytes.to_string());
 
-        // Cluster role configuration
-        let role_str = match self.cluster_role {
-            ConfigClusterRole::Standalone => "standalone",
-            ConfigClusterRole::Leader => "leader",
-            ConfigClusterRole::Follower => "follower",
-        };
-        args.push("--cluster-role".to_string());
-        args.push(role_str.to_string());
+        // Cluster mode configuration
+        if self.standalone {
+            args.push("--standalone".to_string());
+        }
 
-        if let Some(follower_addr) = &self.follower_address {
-            args.push("--follower-address".to_string());
-            args.push(follower_addr.clone());
+        if self.bootstrap_as_leader {
+            args.push("--bootstrap-as-leader".to_string());
+        }
+
+        if let Some(addr) = &self.advertised_replication_address {
+            args.push("--advertised-replication-address".to_string());
+            args.push(addr.clone());
         }
 
         // S3 configuration (only if enabled)
@@ -333,17 +416,34 @@ impl ServerConfigExt for ServerConfig {
 pub struct MinioContainer {
     port: u16,
     container_name: String,
+    bucket_name: String,
 }
 
 impl MinioContainer {
-    /// Start a MinIO container on the given port.
+    /// Start a MinIO container on the given port with the default bucket name.
     ///
     /// Waits for MinIO to accept connections and creates the test bucket.
     /// Uses port allocation offset +10 from base to avoid collision with server ports.
+    /// Default bucket name: "test-fallback"
     pub async fn start(port: u16) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::start_with_bucket(port, "test-fallback").await
+    }
+
+    /// Start a MinIO container on the given port with a custom bucket name.
+    ///
+    /// Waits for MinIO to accept connections and creates the test bucket.
+    /// Uses port allocation offset +10 from base to avoid collision with server ports.
+    pub async fn start_with_bucket(port: u16, bucket_name: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let container_name = format!("celeriant-test-minio-{}", port);
 
         println!("  Starting MinIO container {} on port {}...", container_name, port);
+
+        // Remove any leftover container from a previous run
+        let _ = Command::new("docker")
+            .args(["rm", "-f", &container_name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
 
         // Start MinIO container
         let status = Command::new("docker")
@@ -390,8 +490,9 @@ impl MinioContainer {
         }
 
         // Create test bucket via docker exec (MinIO standalone uses dirs under /data)
+        let bucket_path = format!("/data/{}", bucket_name);
         let bucket_status = Command::new("docker")
-            .args(["exec", &container_name, "mkdir", "-p", "/data/test-fallback"])
+            .args(["exec", &container_name, "mkdir", "-p", &bucket_path])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()?;
@@ -405,11 +506,12 @@ impl MinioContainer {
             return Err("Failed to create test bucket in MinIO".into());
         }
 
-        println!("  MinIO bucket 'test-fallback' created");
+        println!("  MinIO bucket '{}' created", bucket_name);
 
         let container = Self {
             port,
             container_name,
+            bucket_name: bucket_name.to_string(),
         };
 
         Ok(container)
@@ -426,7 +528,7 @@ impl MinioContainer {
     pub fn s3_config_fields(&self) -> (String, String, String, String, String, bool) {
         (
             "us-east-1".to_string(),
-            "test-fallback".to_string(),
+            self.bucket_name.clone(),
             "minioadmin".to_string(),
             "minioadmin".to_string(),
             self.endpoint(),
@@ -489,7 +591,7 @@ impl MinioContainer {
         use object_store::aws::AmazonS3Builder;
 
         let store = AmazonS3Builder::new()
-            .with_bucket_name("test-fallback")
+            .with_bucket_name(&self.bucket_name)
             .with_region("us-east-1")
             .with_access_key_id("minioadmin")
             .with_secret_access_key("minioadmin")
@@ -498,6 +600,32 @@ impl MinioContainer {
             .build()?;
 
         Ok(Arc::new(store))
+    }
+
+    /// Pause the MinIO container (all S3 requests will timeout).
+    pub fn pause(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let status = Command::new("docker")
+            .args(["pause", &self.container_name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        if !status.success() {
+            return Err("Failed to pause MinIO container".into());
+        }
+        Ok(())
+    }
+
+    /// Unpause the MinIO container (S3 requests resume).
+    pub fn unpause(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let status = Command::new("docker")
+            .args(["unpause", &self.container_name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        if !status.success() {
+            return Err("Failed to unpause MinIO container".into());
+        }
+        Ok(())
     }
 }
 
@@ -509,5 +637,188 @@ impl Drop for MinioContainer {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+    }
+}
+
+/// A controllable TCP proxy for integration tests.
+/// Routes traffic between a listen port and a target port.
+/// Can be blocked/unblocked to simulate network partitions.
+pub struct TcpProxy {
+    listen_port: u16,
+    blocked: Arc<AtomicBool>,
+}
+
+impl TcpProxy {
+    /// Start a TCP proxy that forwards connections from listen_port to target_address.
+    pub async fn start(listen_port: u16, target_address: String) -> Result<Self, Box<dyn std::error::Error>> {
+        let blocked = Arc::new(AtomicBool::new(false));
+        let blocked_clone = blocked.clone();
+
+        let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", listen_port)).await?;
+
+        tokio::spawn(async move {
+            loop {
+                let (client, _) = match listener.accept().await {
+                    Ok(conn) => conn,
+                    Err(_) => break,
+                };
+
+                if blocked_clone.load(Ordering::Relaxed) {
+                    drop(client);
+                    continue;
+                }
+
+                let target = target_address.clone();
+                let blocked_inner = blocked_clone.clone();
+
+                let _ = client.set_nodelay(true);
+                tokio::spawn(async move {
+                    let server = match tokio::net::TcpStream::connect(&target).await {
+                        Ok(s) => {
+                            let _ = s.set_nodelay(true);
+                            s
+                        }
+                        Err(_) => return,
+                    };
+
+                    let (mut client_read, mut client_write) = tokio::io::split(client);
+                    let (mut server_read, mut server_write) = tokio::io::split(server);
+
+                    let blocked_a = blocked_inner.clone();
+                    let blocked_b = blocked_inner;
+
+                    let client_to_server = tokio::spawn(async move {
+                        let mut buf = [0u8; 8192];
+                        loop {
+                            if blocked_a.load(Ordering::Relaxed) { break; }
+                            match tokio::io::AsyncReadExt::read(&mut client_read, &mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    if tokio::io::AsyncWriteExt::write_all(&mut server_write, &buf[..n]).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    });
+
+                    let server_to_client = tokio::spawn(async move {
+                        let mut buf = [0u8; 8192];
+                        loop {
+                            if blocked_b.load(Ordering::Relaxed) { break; }
+                            match tokio::io::AsyncReadExt::read(&mut server_read, &mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    if tokio::io::AsyncWriteExt::write_all(&mut client_write, &buf[..n]).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    });
+
+                    let _ = tokio::join!(client_to_server, server_to_client);
+                });
+            }
+        });
+
+        Ok(Self { listen_port, blocked })
+    }
+
+    /// Block all traffic through the proxy (existing connections are dropped).
+    pub fn block(&self) {
+        self.blocked.store(true, Ordering::Relaxed);
+        println!("  TcpProxy on port {}: BLOCKED", self.listen_port);
+    }
+
+    /// Unblock traffic (new connections will be accepted and forwarded).
+    pub fn unblock(&self) {
+        self.blocked.store(false, Ordering::Relaxed);
+        println!("  TcpProxy on port {}: UNBLOCKED", self.listen_port);
+    }
+
+    /// Get the proxy's listen address.
+    pub fn address(&self) -> String {
+        format!("127.0.0.1:{}", self.listen_port)
+    }
+}
+
+/// Write a single event to a server via the client protocol.
+///
+/// Helper function for integration tests that need to write events.
+pub async fn write_event(
+    client: &mut CeleriantClient,
+    aggregate_key: &AggregateKey,
+    event_num: u64,
+    allow_create: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let event = DatablockAggregateEvent {
+        client_event_index: event_num,
+        event_index: 0,
+        event_id: None,
+        event_timestamp: 1000 + event_num,
+        event_type_major: 100,
+        event_type_minor: 0,
+        event_value: Arc::new(format!("{{\"event\":{}}}", event_num).into_bytes()),
+        iv: None,
+    };
+
+    let mut writes = HashMap::new();
+    writes.insert(
+        aggregate_key.clone(),
+        SingleAggregateWrite {
+            events: vec![event],
+            allow_create,
+            expected_event_batch_index: if event_num == 1 { Some(0) } else { None },
+            enforce_client_idempotency: false,
+            compression_type: CompressionType::None,
+        },
+    );
+
+    let write_req = WriteRequest {
+        correlation_id: Some(event_num as u128),
+        client_id: 999,
+        user_id: Some(888),
+        writes,
+    };
+
+    let response = client
+        .send_request(&Request::Write(write_req), CompressionType::None)
+        .await?;
+
+    match response {
+        celeriant_msg::process_responses::Response::Write(_) => Ok(()),
+        other => Err(format!("Write failed: {:?}", other).into()),
+    }
+}
+
+/// Count the total number of events for an aggregate.
+///
+/// Helper function for integration tests that need to verify replication.
+pub async fn count_events(
+    client: &mut CeleriantClient,
+    aggregate_key: &AggregateKey,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let read_req = ReadRequest {
+        correlation_id: Some(999),
+        aggregate_key: aggregate_key.clone(),
+        filters: celeriant_msg::request::read_filters::ReadFilters::new(1),
+    };
+
+    let response = client
+        .send_request(&Request::Read(read_req), CompressionType::None)
+        .await?;
+
+    match response {
+        celeriant_msg::process_responses::Response::Read(read_resp) => {
+            let total: usize = read_resp
+                .event_batches
+                .iter()
+                .map(|b| b.events.len())
+                .sum();
+            Ok(total)
+        }
+        celeriant_msg::process_responses::Response::GenericError(_) => Ok(0),
+        other => Err(format!("Unexpected response: {:?}", other).into()),
     }
 }

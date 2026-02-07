@@ -4,3 +4,4 @@ pub mod membership;
 pub mod paths;
 pub mod fallback;
 pub mod config;
+pub mod node_status;

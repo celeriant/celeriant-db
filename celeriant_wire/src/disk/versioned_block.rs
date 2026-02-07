@@ -1,5 +1,5 @@
 use crate::codec::bincode::{fixed_serialise_stack, fixed_serialise_heap};
-use celeriant_wal::{constants::{FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_METABLOCK, WIRE_VERSION_WAL_SHARD_LOG_HEADER, WIRE_VERSION_S3_FALLBACK_BATCH}, metablocks::metablock::Metablock, s3::fallback_batch::FallbackBatch, shard_log_header::ShardLogHeader};
+use celeriant_wal::{constants::{FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_METABLOCK, WIRE_VERSION_WAL_SHARD_LOG_HEADER, WIRE_VERSION_S3_FALLBACK_BATCH, WIRE_VERSION_S3_LEASE, WIRE_VERSION_S3_MEMBERSHIP}, metablocks::metablock::Metablock, s3::{fallback_batch::FallbackBatch, lease::Lease, membership::Membership}, shard_log_header::ShardLogHeader};
 use crate::{codec, disk::{disk_format_error::DiskFormatError}};
 
 const VERSION_SIZE: usize = 4;
@@ -51,9 +51,7 @@ where
     Ok(buffer)
 }
 
-pub fn deserialise_fallback_batch(
-    data: &[u8],
-) -> Result<FallbackBatch, DiskFormatError> {
+fn validate_header(data: &[u8]) -> Result<u32, DiskFormatError> {
     if data.len() < HEADER_SIZE {
         return Err(DiskFormatError::HeaderSizeMismatch {
             expected: HEADER_SIZE,
@@ -71,15 +69,36 @@ pub fn deserialise_fallback_batch(
         });
     }
 
-    let version = u32::from_le_bytes([
+    Ok(u32::from_le_bytes([
         data[CRC_SIZE],
         data[CRC_SIZE + 1],
         data[CRC_SIZE + 2],
         data[CRC_SIZE + 3],
-    ]);
+    ]))
+}
 
+pub fn deserialise_fallback_batch(
+    data: &[u8],
+) -> Result<FallbackBatch, DiskFormatError> {
+    let version = validate_header(data)?;
     match version {
         WIRE_VERSION_S3_FALLBACK_BATCH => Ok(codec::bincode::fixed_deserialise(&data[HEADER_SIZE..])?),
+        _ => Err(DiskFormatError::UnsupportedVersion(version)),
+    }
+}
+
+pub fn deserialise_lease(data: &[u8]) -> Result<Lease, DiskFormatError> {
+    let version = validate_header(data)?;
+    match version {
+        WIRE_VERSION_S3_LEASE => Ok(codec::bincode::fixed_deserialise(&data[HEADER_SIZE..])?),
+        _ => Err(DiskFormatError::UnsupportedVersion(version)),
+    }
+}
+
+pub fn deserialise_membership(data: &[u8]) -> Result<Membership, DiskFormatError> {
+    let version = validate_header(data)?;
+    match version {
+        WIRE_VERSION_S3_MEMBERSHIP => Ok(codec::bincode::fixed_deserialise(&data[HEADER_SIZE..])?),
         _ => Err(DiskFormatError::UnsupportedVersion(version)),
     }
 }
@@ -87,35 +106,16 @@ pub fn deserialise_fallback_batch(
 pub fn deserialise_metablock(
     data: &[u8; FIXED_BLOCK_SIZE_BYTES],
 ) -> Result<Metablock, DiskFormatError> {
-
-    let stored_crc = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-    let actual_crc = crc32c::crc32c(&data[CRC_SIZE..]);
-
-    if stored_crc != actual_crc {
-        return Err(DiskFormatError::ChecksumMismatch {
-            expected: stored_crc,
-            actual: actual_crc,
-        });
-    }
-
-    let version = u32::from_le_bytes([
-        data[CRC_SIZE],
-        data[CRC_SIZE + 1],
-        data[CRC_SIZE + 2],
-        data[CRC_SIZE + 3],
-    ]);
-
+    let version = validate_header(data)?;
     if version != WIRE_VERSION_WAL_METABLOCK {
         return Err(DiskFormatError::UnsupportedVersion(version));
     }
-
-    return Ok(codec::bincode::fixed_deserialise(&data[HEADER_SIZE..])?);
+    Ok(codec::bincode::fixed_deserialise(&data[HEADER_SIZE..])?)
 }
 
 pub fn deserialise_shard_log_header(
     data: &[u8],
 ) -> Result<ShardLogHeader, DiskFormatError> {
-
     if data.len() != HEADER_BLOCK_SIZE_BYTES {
         return Err(DiskFormatError::HeaderSizeMismatch {
             expected: HEADER_BLOCK_SIZE_BYTES,
@@ -123,28 +123,11 @@ pub fn deserialise_shard_log_header(
         });
     }
 
-    let stored_crc = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-    let actual_crc = crc32c::crc32c(&data[CRC_SIZE..]);
-
-    if stored_crc != actual_crc {
-        return Err(DiskFormatError::ChecksumMismatch {
-            expected: stored_crc,
-            actual: actual_crc,
-        });
-    }
-
-    let version = u32::from_le_bytes([
-        data[CRC_SIZE],
-        data[CRC_SIZE + 1],
-        data[CRC_SIZE + 2],
-        data[CRC_SIZE + 3],
-    ]);
-
+    let version = validate_header(data)?;
     if version != WIRE_VERSION_WAL_SHARD_LOG_HEADER {
         return Err(DiskFormatError::UnsupportedVersion(version));
     }
-
-    return Ok(codec::bincode::fixed_deserialise(&data[HEADER_SIZE..])?);
+    Ok(codec::bincode::fixed_deserialise(&data[HEADER_SIZE..])?)
 }
 
 #[cfg(test)]
@@ -532,5 +515,138 @@ mod tests {
         let version_bytes = &buffer[CRC_SIZE..HEADER_SIZE];
         let version = u32::from_le_bytes([version_bytes[0], version_bytes[1], version_bytes[2], version_bytes[3]]);
         assert_eq!(version, WIRE_VERSION_WAL_SHARD_LOG_HEADER);
+    }
+
+    #[test]
+    fn lease_roundtrip_through_versioned_format() {
+        let lease = Lease {
+            leader_node_id: 42,
+            lease_index: 5,
+            acquired_at_ms: 1000,
+            expires_at_ms: 6000,
+        };
+
+        let serialized = serialize_versioned_message_heap(&lease, WIRE_VERSION_S3_LEASE).unwrap();
+        let deserialized = deserialise_lease(&serialized).unwrap();
+
+        assert_eq!(deserialized.leader_node_id, lease.leader_node_id);
+        assert_eq!(deserialized.lease_index, lease.lease_index);
+        assert_eq!(deserialized.acquired_at_ms, lease.acquired_at_ms);
+        assert_eq!(deserialized.expires_at_ms, lease.expires_at_ms);
+    }
+
+    #[test]
+    fn membership_roundtrip_through_versioned_format() {
+        let leader_info = celeriant_wal::s3::membership::NodeInfo {
+            node_id: 1,
+            client_address: "10.0.0.1:10000".into(),
+            replication_address: "10.0.0.1:10001".into(),
+        };
+        let follower_info = celeriant_wal::s3::membership::NodeInfo {
+            node_id: 2,
+            client_address: "10.0.0.2:10000".into(),
+            replication_address: "10.0.0.2:10001".into(),
+        };
+        let membership = Membership {
+            nodes: [Some(leader_info.clone()), Some(follower_info.clone())],
+        };
+
+        let serialized = serialize_versioned_message_heap(&membership, WIRE_VERSION_S3_MEMBERSHIP).unwrap();
+        let deserialized = deserialise_membership(&serialized).unwrap();
+
+        assert_eq!(deserialized.nodes[0].as_ref().unwrap().node_id, 1);
+        assert_eq!(deserialized.nodes[1].as_ref().unwrap().node_id, 2);
+        assert_eq!(deserialized.nodes[0].as_ref().unwrap().client_address, "10.0.0.1:10000");
+        assert_eq!(deserialized.nodes[1].as_ref().unwrap().replication_address, "10.0.0.2:10001");
+    }
+
+    #[test]
+    fn lease_crc_corruption_detected() {
+        let lease = Lease {
+            leader_node_id: 99,
+            lease_index: 1,
+            acquired_at_ms: 2000,
+            expires_at_ms: 7000,
+        };
+
+        let mut serialized = serialize_versioned_message_heap(&lease, WIRE_VERSION_S3_LEASE).unwrap();
+
+        // Corrupt a byte in the payload
+        serialized[HEADER_SIZE + 10] ^= 0xFF;
+
+        let result = deserialise_lease(&serialized);
+        assert!(matches!(result, Err(DiskFormatError::ChecksumMismatch { .. })));
+    }
+
+    #[test]
+    fn lease_version_mismatch_rejected() {
+        let lease = Lease {
+            leader_node_id: 123,
+            lease_index: 7,
+            acquired_at_ms: 3000,
+            expires_at_ms: 8000,
+        };
+
+        let mut serialized = serialize_versioned_message_heap(&lease, WIRE_VERSION_S3_LEASE).unwrap();
+
+        // Overwrite version with unsupported value
+        let bad_version: u32 = 9999;
+        serialized[CRC_SIZE..HEADER_SIZE].copy_from_slice(&bad_version.to_le_bytes());
+
+        // Recalculate CRC so checksum passes but version fails
+        let new_crc = crc32c::crc32c(&serialized[CRC_SIZE..]);
+        serialized[..CRC_SIZE].copy_from_slice(&new_crc.to_le_bytes());
+
+        let result = deserialise_lease(&serialized);
+        assert!(matches!(result, Err(DiskFormatError::UnsupportedVersion(9999))));
+    }
+
+    #[test]
+    fn membership_crc_corruption_detected() {
+        let membership = Membership {
+            nodes: [
+                Some(celeriant_wal::s3::membership::NodeInfo {
+                    node_id: 11,
+                    client_address: "node1:10000".into(),
+                    replication_address: "node1:10001".into(),
+                }),
+                None,
+            ],
+        };
+
+        let mut serialized = serialize_versioned_message_heap(&membership, WIRE_VERSION_S3_MEMBERSHIP).unwrap();
+
+        // Corrupt a byte in the payload
+        serialized[HEADER_SIZE + 5] ^= 0x42;
+
+        let result = deserialise_membership(&serialized);
+        assert!(matches!(result, Err(DiskFormatError::ChecksumMismatch { .. })));
+    }
+
+    #[test]
+    fn membership_version_mismatch_rejected() {
+        let membership = Membership {
+            nodes: [
+                None,
+                Some(celeriant_wal::s3::membership::NodeInfo {
+                    node_id: 22,
+                    client_address: "node2:10000".into(),
+                    replication_address: "node2:10001".into(),
+                }),
+            ],
+        };
+
+        let mut serialized = serialize_versioned_message_heap(&membership, WIRE_VERSION_S3_MEMBERSHIP).unwrap();
+
+        // Overwrite version with unsupported value
+        let bad_version: u32 = 7777;
+        serialized[CRC_SIZE..HEADER_SIZE].copy_from_slice(&bad_version.to_le_bytes());
+
+        // Recalculate CRC
+        let new_crc = crc32c::crc32c(&serialized[CRC_SIZE..]);
+        serialized[..CRC_SIZE].copy_from_slice(&new_crc.to_le_bytes());
+
+        let result = deserialise_membership(&serialized);
+        assert!(matches!(result, Err(DiskFormatError::UnsupportedVersion(7777))));
     }
 }

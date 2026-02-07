@@ -32,6 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = ServerConfig {
         num_shards: Some(4),
         log_level: "warn".to_string(),
+        standalone: true,
         ..Default::default()
     };
     let port = 10100 + (std::process::id() % 100) as u16;
@@ -281,7 +282,7 @@ async fn test_mixed_operations(server_address: &str) -> Result<(), Box<dyn std::
     let read_request = Request::Read(ReadRequest {
         correlation_id: Some(102),
         aggregate_key: aggregate.clone(),
-        filters: ReadFilters::default(),
+        filters: ReadFilters::new(1),
     });
 
     let read_response = client
@@ -396,7 +397,7 @@ async fn test_shard_affinity(server_address: &str) -> Result<(), Box<dyn std::er
         let read_request = Request::Read(ReadRequest {
             correlation_id: Some(300 + shard),
             aggregate_key: aggregate.clone(),
-            filters: ReadFilters::default(),
+            filters: ReadFilters::new(1),
         });
 
         let response = read_client

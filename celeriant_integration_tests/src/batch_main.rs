@@ -9,7 +9,7 @@
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use celeriant_integration_tests::{ConfigClusterRole, ServerConfig, TestServer};
+use celeriant_integration_tests::{MinioContainer, ServerConfig, TestServer};
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
 use celeriant_msg::request::requests::WriteRequest;
@@ -42,15 +42,30 @@ struct TaskStats {
 struct ReplicatedServers {
     leader: TestServer,
     _follower: TestServer,
+    _minio: MinioContainer,
 }
 
 impl ReplicatedServers {
     async fn start(base_port: u16, log_level: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let minio_port = base_port + 10;
+
+        println!("Starting MinIO on port {}...", minio_port);
+        let minio = MinioContainer::start_with_bucket(minio_port, "test-batch").await?;
+        let (region, bucket, access_key, secret_key, endpoint, allow_http) = minio.s3_config_fields();
+        println!("MinIO ready at {}\n", endpoint);
+
         // Start follower first (it needs to be listening before leader connects)
         let follower_port = base_port + 100;
         let follower_config = ServerConfig {
             log_level: log_level.to_string(),
-            cluster_role: ConfigClusterRole::Follower,
+            bootstrap_as_leader: false,
+            s3_enabled: true,
+            s3_region: Some(region.clone()),
+            s3_bucket: Some(bucket.clone()),
+            s3_access_key_id: Some(access_key.clone()),
+            s3_secret_access_key: Some(secret_key.clone()),
+            s3_endpoint_override: Some(endpoint.clone()),
+            s3_allow_http: allow_http,
             ..Default::default()
         };
         println!("Starting follower on port {}...", follower_port);
@@ -59,20 +74,29 @@ impl ReplicatedServers {
         // Small delay to ensure follower is fully ready
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        // Start leader with follower address
-        let follower_replication_port = follower_port + 1;
+        // Start leader with S3 config for election/discovery
         let leader_config = ServerConfig {
             log_level: log_level.to_string(),
-            cluster_role: ConfigClusterRole::Leader,
-            follower_address: Some(format!("127.0.0.1:{}", follower_replication_port)),
+            bootstrap_as_leader: true,
+            s3_enabled: true,
+            s3_region: Some(region),
+            s3_bucket: Some(bucket),
+            s3_access_key_id: Some(access_key),
+            s3_secret_access_key: Some(secret_key),
+            s3_endpoint_override: Some(endpoint),
+            s3_allow_http: allow_http,
             ..Default::default()
         };
-        println!("Starting leader on port {} (replicating to 127.0.0.1:{})...", base_port, follower_replication_port);
+        println!("Starting leader on port {} (S3 election mode)...", base_port);
         let leader = TestServer::start_with_config(base_port, leader_config).await?;
+
+        // Wait for S3 election to complete
+        tokio::time::sleep(Duration::from_secs(2)).await;
 
         Ok(Self {
             leader,
             _follower: follower,
+            _minio: minio,
         })
     }
 

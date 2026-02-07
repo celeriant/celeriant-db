@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use celeriant_distributed::hash_chain::compute_entry_hash;
+use celeriant_distributed::node_status::NodeStatus;
 use celeriant_memcache::cache_path::CachePath;
 use celeriant_memcache::pending_cache_item::PendingCacheItem;
 use celeriant_memcache::pending_commit_data::PendingCommitData;
@@ -10,7 +11,6 @@ use celeriant_memcache::sync_positions_snapshot::SyncPositionsSnapshot;
 use celeriant_rotating_log::log_segment_file::log_segment_file::{LogSegmentFile, write_dual_shard_log_header};
 use celeriant_rotating_log::log_segment_file::log_segment_file_metadata::LogSegmentFileMetadata;
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
-use celeriant_wal::cluster_role::ClusterRole;
 use celeriant_wal::constants::{FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_METABLOCK};
 use celeriant_wal::metablocks::datablock_storage_kind::DatablockStorageKind;
 use celeriant_wal::metablocks::metablock_kind::MetablockKind;
@@ -47,7 +47,7 @@ pub(crate) fn capture_fsync_snapshot(shard_mem_cache: &Rc<RefCell<ShardMemCache>
 }
 
 pub(crate) async fn commit_fsync_with_rollback(
-    cluster_role: ClusterRole,
+    node_status: NodeStatus,
     log_segments_cache: Rc<LogSegmentsCache>,
     shard_mem_cache: Rc<RefCell<ShardMemCache>>,
     watched_aggregates: Rc<AggregateWatchers>,
@@ -77,7 +77,7 @@ pub(crate) async fn commit_fsync_with_rollback(
     match sync(active_log_segment.clone(), &mut captured.sync_positions_snapshot).await {
         Ok(updated_log_segment_file_metadata) => {
             commit_sync(
-                cluster_role,
+                node_status,
                 shard_mem_cache,
                 watched_aggregates,
                 captured.sync_positions_snapshot,
@@ -95,14 +95,14 @@ pub(crate) async fn commit_fsync_with_rollback(
 
 /// Commits a successful sync by updating caches and broadcasting watch events.
 fn commit_sync(
-    cluster_role: ClusterRole,
+    node_status: NodeStatus,
     shard_mem_cache: Rc<RefCell<ShardMemCache>>,
     watched_aggregates: Rc<AggregateWatchers>,
     mut sync_positions_snapshot: SyncPositionsSnapshot,
     log_segment_file: Rc<LogSegmentFile>,
     mut new_metadata: LogSegmentFileMetadata,
 ) {
-    if cluster_role != ClusterRole::Leader {
+    if !node_status.is_leader() {
         // Currently single node mode or is follower
         // Data is durable, so we can advance visible position
         new_metadata.advance_visible_position();
@@ -115,7 +115,7 @@ fn commit_sync(
     // Take the queue before committing the snapshot since commit consumes it
     let pending_append_queue = std::mem::take(&mut sync_positions_snapshot.pending_append_queue);
 
-    shard_mem_cache.commit_sync_positions_snapshot(cluster_role, sync_positions_snapshot);
+    shard_mem_cache.commit_sync_positions_snapshot(node_status, sync_positions_snapshot);
 
     let mut pending_commit_data = PendingCommitData {
         log_metadata: log_segment_file.metadata.borrow().clone(),
@@ -128,7 +128,7 @@ fn commit_sync(
     for queue_item in pending_append_queue {
         match &queue_item.metablock.wal_metablock_type {
             MetablockKind::EventBatchMetadata(event_batch_metadata) => {
-                if cluster_role != ClusterRole::Leader {
+                if !node_status.is_leader() {
                     event_collector.add_write_event(event_batch_metadata);
 
                     if event_batch_metadata.event_batch_index == FIRST_EVENT_BATCH_INDEX {
@@ -153,7 +153,7 @@ fn commit_sync(
                     CachePath::Write,
                 );
 
-                if cluster_role != ClusterRole::Leader {
+                if !node_status.is_leader() {
                     shard_mem_cache.update_aggregate_min_event_batch_index(
                         &soft_trim.aggregate_key,
                         soft_trim.keep_from_event_batch_index,
@@ -174,7 +174,7 @@ fn commit_sync(
                     CachePath::Write,
                 );
 
-                if cluster_role != ClusterRole::Leader {
+                if !node_status.is_leader() {
                     shard_mem_cache.put_aggregate_into_cache_as_deleted(
                         soft_delete.aggregate_key.clone(),
                         soft_delete.event_index,
@@ -192,7 +192,7 @@ fn commit_sync(
         }
     }
 
-    if cluster_role != ClusterRole::Leader {
+    if !node_status.is_leader() {
         event_collector.broadcast_all(&watched_aggregates);
     } else {
         // As leader, after fsync we can now allow replication to proceed

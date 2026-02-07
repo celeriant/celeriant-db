@@ -17,7 +17,7 @@
 //! Run with: cargo run --bin s3_fallback_createonly_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{ConfigClusterRole, MinioContainer, ServerConfig, TestServer};
+use celeriant_integration_tests::{MinioContainer, ServerConfig, TestServer};
 use celeriant_msg::{
     process_requests::Request,
     request::requests::{ReadRequest, SingleAggregateWrite, WriteRequest},
@@ -109,7 +109,7 @@ async fn count_events(
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== CreateOnly Prevents Overwrites Integration Test ===\n");
 
-    let port = 10600 + (std::process::id() % 100) as u16;
+    let port = 11100 + (std::process::id() % 100) as u16;
     let minio_port = port + 10;
 
     println!("Starting MinIO container on port {}...", minio_port);
@@ -150,7 +150,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let follower_config = ServerConfig {
         num_shards: Some(num_shards),
         log_level: "info".to_string(),
-        cluster_role: ConfigClusterRole::Follower,
+        bootstrap_as_leader: false,
         routing_rule: RoutingRule::AggregateTypeId,
         s3_enabled: true,
         s3_region: Some(region.clone()),
@@ -171,8 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let leader_config = ServerConfig {
         num_shards: Some(num_shards),
         log_level: "info".to_string(),
-        cluster_role: ConfigClusterRole::Leader,
-        follower_address: Some(format!("127.0.0.1:{}", follower_replication_port)),
+        bootstrap_as_leader: true,
         routing_rule: RoutingRule::AggregateTypeId,
         s3_enabled: true,
         s3_region: Some(region),
@@ -195,6 +194,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         follower.address()
     );
 
+    // Wait for S3 election + peer discovery + heartbeat establishment
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
     let mut leader_client = CeleriantClient::connect(leader.address()).await?;
 
     // ========================================
@@ -209,7 +211,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("  Waiting for replication...");
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
     let follower_count = count_events(&mut follower_client, &aggregate_key).await?;
