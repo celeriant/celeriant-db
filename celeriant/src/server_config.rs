@@ -96,14 +96,6 @@ pub struct ServerConfig {
 
     #[arg(
         long,
-        action = clap::ArgAction::SetTrue,
-        env = "CELERIANT_BOOTSTRAP_AS_LEADER",
-        help = "Bootstrap as leader for S3 election (defaults to false)"
-    )]
-    pub bootstrap_as_leader: bool,
-
-    #[arg(
-        long,
         default_value = "1024",
         env = "CELERIANT_MESH_CHANNEL_SIZE",
         help = "Mesh channel size for inter-shard communication"
@@ -423,7 +415,6 @@ impl ServerConfig {
             heartbeat_interval_ms: 500,
             heartbeat_lease_duration_ms: 1500,
             max_clock_drift_ms: 500,
-            bootstrap_as_leader: self.bootstrap_as_leader,
         }
     }
 
@@ -502,7 +493,6 @@ impl Default for ServerConfig {
             replication_port: 10001,
             advertised_replication_address: None,
             standalone: false,
-            bootstrap_as_leader: false,
             mesh_channel_size: 1024,
             num_shards: None,
             read_max_chunk_size: 32 * 1024,

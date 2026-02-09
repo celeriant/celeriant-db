@@ -479,3 +479,43 @@ async fn fetch_catchup_entries(
 
     Ok(replication_items)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use celeriant_msg::request::requests::ReplicationBatchItem;
+    use celeriant_wal::aggregate_key::AggregateKey;
+    use celeriant_wal::metablocks::metablock::Metablock;
+
+    fn item() -> ReplicationBatchItem {
+        ReplicationBatchItem {
+            metablock: Metablock::default_inline_event_batch_metadata(AggregateKey::default()),
+            datablock: None,
+        }
+    }
+
+    #[test]
+    fn batch_end_index_scenarios() {
+        let sz = item().size_bytes();
+        let items: Vec<_> = (0..5).map(|_| item()).collect();
+
+        let cases: Vec<(&[ReplicationBatchItem], u64, usize)> = vec![
+            (&items[..1], sz * 2, 1),         // single item, generous budget
+            (&items[..5], sz * 10, 5),         // all fit
+            (&items[..3], 1, 1),               // oversized first item, progress guarantee
+            (&items[..4], sz * 2, 2),           // exact budget for 2
+            (&items[..5], sz * 3, 3),           // budget for 3 of 5
+            (&items[..1], sz, 1),               // single item, exact budget
+            (&items[..5], sz * 5, 5),           // all fit exactly
+        ];
+
+        for (i, (slice, max_bytes, expected)) in cases.iter().enumerate() {
+            assert_eq!(
+                batch_end_index(slice, *max_bytes),
+                *expected,
+                "case {i}: items={}, max_bytes={max_bytes}",
+                slice.len()
+            );
+        }
+    }
+}

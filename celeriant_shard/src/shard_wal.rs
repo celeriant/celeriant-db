@@ -8,8 +8,6 @@ use celeriant_disk::files::rwlock_timeout::write_with_timeout;
 use celeriant_distributed::node_status::NodeStatus;
 use celeriant_rotating_log::errors::ready_up_error::ReadyUpError;
 use celeriant_rotating_log::errors::scan_error::ScanError;
-use celeriant_wal::compression_type::CompressionType;
-use celeriant_wire::codec::codec_error::CodecError;
 use celeriant_wire::disk::disk_format_error::DiskFormatError;
 use celeriant_wire::disk::metablock_bytes;
 use celeriant_wire::disk::serialised_datablock::{SerialisedDatablock};
@@ -24,7 +22,7 @@ use celeriant_memcache::shard_mem_cache::ShardMemCache;
 use celeriant_msg::process_requests::Request;
 use celeriant_msg::process_responses::Response;
 use celeriant_msg::request::read_filters::ReadFilters;
-use celeriant_msg::request::requests::{DeleteRequest, ExistsRequest, ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest, ReadRequest, ReplicationBatchItem, SingleAggregateWrite, TrimStartRequest, WriteRequest};
+use celeriant_msg::request::requests::{DeleteRequest, ExistsRequest, ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest, ReadRequest, SingleAggregateWrite, TrimStartRequest, WriteRequest};
 use celeriant_msg::response::aggregate_event_batch::AggregateEventBatch;
 use celeriant_msg::response::responses::{AggregateListItem, AggregateTypeListItem, ExistsResponse, FollowerRejection, ListAggregateTypesResponse, ListAggregatesResponse, ListOrgsResponse, OrgListItem, ReadResponse, ReplicationBatchResponse, ReplicationResult, SuccessResponse};
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
@@ -50,6 +48,7 @@ use crate::amortisation::coordinator::Coordinator;
 use crate::bloom::bloom_filter_cache::BloomFilterCache;
 use crate::bloom::event_type_filter::extract_unique_event_types;
 use crate::collect_from_disk::{EventBatchFromLogSegmentFile, fetch_datablocks_for_metablocks};
+use crate::error::apply_batch_error::ApplyBatchError;
 use crate::error::follower_replication_write_error::FollowerReplicationWriteError;
 use crate::error::replication_error::ReplicationError;
 use crate::error::shard_cache_load_error::ShardCacheLoadError;
@@ -66,6 +65,7 @@ use crate::internal_shard_config::InternalShardConfig;
 use crate::loading_coordinator::LoadingCoordinator;
 use crate::replication_client::ReplicationClient;
 use crate::shard_wal_replicate::{capture_replication_snapshot, commit_replication_with_rollback};
+use crate::shard_wal_s3_catchup;
 use crate::shard_wal_sync::{capture_fsync_snapshot, commit_fsync_with_rollback};
 
 /// Write-ahead log for a single shard.
@@ -1427,76 +1427,37 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
             return Ok(response(ReplicationResult::Rejected(FollowerRejection::EmptyBatch)));
         }
 
-        let (follower_tip_hash, follower_wal_index) = {
-            let active_log_segment_file = self.log_segments_cache.active();
-            let metadata = active_log_segment_file.metadata.borrow();
-            (metadata.write.tip_hash, metadata.write.wal_index)
-        };
-        let (leader_tip_hash, leader_wal_index) = request
-            .batches
-            .first()
-            .map(|b| (b.metablock.previous_tip_hash, b.metablock.wal_index))
-            .unwrap_or((GENESIS_HASH, 0));
-
         //TODO: How to handle the scenario where we have compacted the log but yet to replicate? 
         //It would be a rare scenario, maybe an invariant we can enforce during compaction
-
-        if follower_wal_index.saturating_add(1) != leader_wal_index {
-            return Ok(response(ReplicationResult::Rejected(FollowerRejection::WalIndexMismatch {
-                max_follower_wal_index: follower_wal_index,
-            })));
+        match shard_wal_s3_catchup::apply_external_batch(
+            &self.log_segments_cache, &self.shard_mem_cache, &request.batches,
+        ) {
+            Ok(()) => {}
+            Err(ApplyBatchError::WalIndexMismatch { current, .. }) => {
+                return Ok(response(ReplicationResult::Rejected(FollowerRejection::WalIndexMismatch {
+                    max_follower_wal_index: current,
+                })));
+            }
+            Err(ApplyBatchError::TipHashMismatch { current, batch }) => {
+                return Ok(response(ReplicationResult::Rejected(FollowerRejection::TipHashMismatch {
+                    follower: current,
+                    leader: batch,
+                })));
+            }
+            Err(ApplyBatchError::MissingDatablock) => {
+                return Ok(response(ReplicationResult::Rejected(FollowerRejection::MissingDatablock)));
+            }
+            Err(ApplyBatchError::SerialiseDatablocks(e)) => {
+                return Err(FollowerReplicationWriteError::FailedToSerialiseDatablocks(e));
+            }
         }
 
-        if follower_tip_hash != leader_tip_hash {
-            return Ok(response(ReplicationResult::Rejected(FollowerRejection::TipHashMismatch {
-                follower: follower_tip_hash,
-                leader: leader_tip_hash,
-            })));
-        }
-
-        // Add all entries to pending queue synchronously (no fsync yet)
-        if let Some(rejection) = self.add_replicated_entries_to_queue(request.batches)
-            .map_err(FollowerReplicationWriteError::FailedToSerialiseDatablocks)? {
-            return Ok(response(ReplicationResult::Rejected(rejection)));
-        }
-
-        // Single fsync for entire batch
         self.sync_durable().await
             .map_err(FollowerReplicationWriteError::ShardFSyncError)?;
 
         Ok(response(ReplicationResult::Success {
             last_follower_metablock: None,
         }))
-    }
-
-    /// Prepares and queues replicated entries.
-    /// Returns Ok(None) on success, Ok(Some(rejection)) for validation failures,
-    /// or Err for I/O errors.
-    fn add_replicated_entries_to_queue(
-        &self,
-        items: Vec<ReplicationBatchItem>,
-    ) -> Result<Option<FollowerRejection>, CodecError> {
-        let mut prepared = Vec::with_capacity(items.len());
-
-        for item in items {
-            let (datablock_bytes, datablock) = match item.metablock.datablock {
-                DatablockStorageKind::None => (None, None),
-                DatablockStorageKind::Inline(_) => (None, None),
-                DatablockStorageKind::Block(_) => {
-                    if let Some(datablock) = item.datablock {
-                        let compression_type = CompressionType::from_tuple(item.metablock.datablock_compression_type, None);
-                        let serialized_datablock = SerialisedDatablock::new(&datablock, compression_type)?;
-                        (serialized_datablock.external_data, Some(datablock))
-                    } else {
-                        return Ok(Some(FollowerRejection::MissingDatablock));
-                    }
-                }
-            };
-            prepared.push(ShardLogQueueItem::new(datablock, datablock_bytes, item.metablock));
-        }
-
-        self.shard_mem_cache.borrow_mut().add_to_pending_queue(prepared);
-        Ok(None)
     }
 }
 
@@ -1745,7 +1706,8 @@ mod tests {
     use crate::error::replication_to_follower_error::ReplicateToFollowerError;
     use crate::error::replication_to_s3_error::ReplicateToS3Error;
     use crate::replication_client::StubReplicationClient;
-    use celeriant_msg::request::requests::{CatchUpRequest, SingleAggregateDelete, WatchRequest};
+    use celeriant_msg::request::requests::{CatchUpRequest, ReplicationBatchItem, SingleAggregateDelete, WatchRequest};
+    use celeriant_wal::compression_type::CompressionType;
     use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
     use crate::timestamp_config::TimestampConfig;
     use glommio::{LocalExecutorBuilder, Placement};
@@ -2608,6 +2570,179 @@ mod tests {
 
             let read = unwrap_read(process(&shard, None, read_req(agg)).await);
             assert_eq!(read.event_batches.len(), 1);
+
+            shard.close().await;
+        });
+    }
+
+    // ── Replication (handle_replication_batch) ──
+
+    async fn open_follower_shard(dir: &std::path::Path) -> ShardWal<StubReplicationClient> {
+        ShardWal::open(test_config(dir), NodeStatus::Follower { leader_lease_index: 0 }, StubReplicationClient)
+            .await
+            .unwrap()
+    }
+
+    fn now_ms() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+    }
+
+    fn test_metablock(wal_index: u64, previous_tip_hash: [u8; 32]) -> Metablock {
+        let mut mb = Metablock::default_inline_event_batch_metadata(AggregateKey::new(1, 1, 1));
+        mb.wal_index = wal_index;
+        mb.previous_tip_hash = previous_tip_hash;
+        mb
+    }
+
+    fn replication_batch_req(batches: Vec<ReplicationBatchItem>) -> Request {
+        Request::ReplicationBatch(celeriant_msg::request::requests::ReplicationBatchRequest {
+            correlation_id: None,
+            shard_id: 0,
+            leader_timestamp_ms: now_ms(),
+            follower_too_far_behind: false,
+            batches,
+        })
+    }
+
+    fn unwrap_replication(result: Result<Response, ShardError>) -> ReplicationBatchResponse {
+        match result.expect("replication should not error") {
+            Response::ReplicationBatch(r) => r,
+            other => panic!("expected ReplicationBatch, got {other:?}"),
+        }
+    }
+
+    fn replication_item(wal_index: u64, tip_hash: [u8; 32]) -> ReplicationBatchItem {
+        ReplicationBatchItem {
+            metablock: test_metablock(wal_index, tip_hash),
+            datablock: None,
+        }
+    }
+
+    #[test]
+    fn replication_happy_path() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_follower_shard(&dir).await;
+
+            let resp = unwrap_replication(
+                process(&shard, None, replication_batch_req(vec![replication_item(1, GENESIS_HASH)])).await,
+            );
+            assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn replication_rejected_when_not_follower() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await; // Standalone
+
+            let resp = unwrap_replication(
+                process(&shard, None, replication_batch_req(vec![replication_item(1, GENESIS_HASH)])).await,
+            );
+            assert!(matches!(resp.result, ReplicationResult::Rejected(FollowerRejection::NotAFollower)));
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn replication_rejects_empty_batch() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_follower_shard(&dir).await;
+
+            let resp = unwrap_replication(process(&shard, None, replication_batch_req(vec![])).await);
+            assert!(matches!(resp.result, ReplicationResult::Rejected(FollowerRejection::EmptyBatch)));
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn replication_rejects_wal_index_gap() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_follower_shard(&dir).await;
+
+            // Follower at wal_index=0, batch starts at 5 (expects 1)
+            let resp = unwrap_replication(
+                process(&shard, None, replication_batch_req(vec![replication_item(5, GENESIS_HASH)])).await,
+            );
+            match resp.result {
+                ReplicationResult::Rejected(FollowerRejection::WalIndexMismatch { max_follower_wal_index }) => {
+                    assert_eq!(max_follower_wal_index, 0);
+                }
+                other => panic!("expected WalIndexMismatch, got {other:?}"),
+            }
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn replication_rejects_tip_hash_mismatch() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_follower_shard(&dir).await;
+
+            // Correct wal_index but wrong tip hash
+            let resp = unwrap_replication(
+                process(&shard, None, replication_batch_req(vec![replication_item(1, [0xFF; 32])])).await,
+            );
+            assert!(matches!(resp.result, ReplicationResult::Rejected(FollowerRejection::TipHashMismatch { .. })));
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn replication_sequential_batches() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_follower_shard(&dir).await;
+
+            // Batch 1
+            let resp = unwrap_replication(
+                process(&shard, None, replication_batch_req(vec![replication_item(1, GENESIS_HASH)])).await,
+            );
+            assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+
+            // Read tip_hash after batch 1 for chaining
+            let tip_after_1 = shard.log_segments_cache.active().metadata.borrow().write.tip_hash;
+            assert_ne!(tip_after_1, GENESIS_HASH);
+
+            // Batch 2 must chain from batch 1's tip
+            let resp = unwrap_replication(
+                process(&shard, None, replication_batch_req(vec![replication_item(2, tip_after_1)])).await,
+            );
+            assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+
+            // Verify WAL index advanced
+            let final_wal_index = shard.log_segments_cache.active().metadata.borrow().write.wal_index;
+            assert_eq!(final_wal_index, 2);
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn replication_rejects_time_drift() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_follower_shard(&dir).await;
+
+            let stale_request = Request::ReplicationBatch(celeriant_msg::request::requests::ReplicationBatchRequest {
+                correlation_id: None,
+                shard_id: 0,
+                leader_timestamp_ms: 1000, // ancient timestamp
+                follower_too_far_behind: false,
+                batches: vec![replication_item(1, GENESIS_HASH)],
+            });
+            let resp = unwrap_replication(process(&shard, None, stale_request).await);
+            assert!(matches!(resp.result, ReplicationResult::Rejected(FollowerRejection::TimeDriftTooHigh { .. })));
 
             shard.close().await;
         });

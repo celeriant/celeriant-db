@@ -52,7 +52,6 @@ impl ReplicatedServers {
         let follower_port = base_port + 100;
         let follower_config = ServerConfig {
             log_level: "warn".to_string(),
-            bootstrap_as_leader: false,
             routing_rule: RoutingRule::AggregateTypeId,
             s3_enabled: true,
             s3_region: Some(region.clone()),
@@ -71,7 +70,6 @@ impl ReplicatedServers {
         // Start leader with S3 config for election/discovery
         let leader_config = ServerConfig {
             log_level: "warn".to_string(),
-            bootstrap_as_leader: true,
             routing_rule: RoutingRule::AggregateTypeId,
             s3_enabled: true,
             s3_region: Some(region),

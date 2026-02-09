@@ -57,7 +57,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let node_a_config = ServerConfig {
         num_shards: Some(num_shards),
         log_level: "info".to_string(),
-        bootstrap_as_leader: true,
         routing_rule: RoutingRule::AggregateTypeId,
         s3_enabled: true,
         s3_region: Some(region.clone()),
@@ -78,7 +77,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let node_b_config = ServerConfig {
         num_shards: Some(num_shards),
         log_level: "info".to_string(),
-        bootstrap_as_leader: false,
         routing_rule: RoutingRule::AggregateTypeId,
         s3_enabled: true,
         s3_region: Some(region.clone()),

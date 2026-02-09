@@ -11,7 +11,7 @@ use celeriant_shard::timestamp_config::TimestampConfig;
 use celeriant_msg::request::requests::{SingleAggregateWrite, WriteRequest};
 use celeriant_shard::shard_wal::ShardWal;
 use celeriant_wal::aggregate_key::AggregateKey;
-use celeriant_wal::cluster_role::ClusterRole;
+use celeriant_distributed::node_status::NodeStatus;
 use celeriant_wal::compression_type::CompressionType;
 use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
@@ -187,7 +187,7 @@ fn bench_write_fsync_delays(c: &mut Criterion) {
                             .spawn(move || async move {
                                 let config =
                                     create_config(shard_dir, fsync_delay, 64 * 1024 * 1024);
-                                let shard_wal = Rc::new(ShardWal::open(config, ClusterRole::Standalone, StubReplicationClient).await.unwrap());
+                                let shard_wal = Rc::new(ShardWal::open(config, NodeStatus::Standalone, StubReplicationClient).await.unwrap());
 
                                 let mut all_handles = Vec::with_capacity(TOTAL_WRITES);
                                 let num_waves = TOTAL_WRITES / WRITES_PER_WAVE;
@@ -264,7 +264,7 @@ fn bench_write_fsync_delays(c: &mut Criterion) {
                             .spawn(move || async move {
                                 let config =
                                     create_config(shard_dir, fsync_delay, 64 * 1024 * 1024);
-                                let shard_wal = Rc::new(ShardWal::open(config, ClusterRole::Standalone, StubReplicationClient).await.unwrap());
+                                let shard_wal = Rc::new(ShardWal::open(config, NodeStatus::Standalone, StubReplicationClient).await.unwrap());
 
                                 let aggregate_key = AggregateKey::new(1, 1, 1);
                                 let mut all_handles = Vec::with_capacity(TOTAL_WRITES);
@@ -366,7 +366,7 @@ fn bench_write_idle_latency(c: &mut Criterion) {
                             .spawn(move || async move {
                                 let config =
                                     create_config(shard_dir, fsync_delay, 64 * 1024 * 1024);
-                                let shard_wal = Rc::new(ShardWal::open(config, ClusterRole::Standalone, StubReplicationClient).await.unwrap());
+                                let shard_wal = Rc::new(ShardWal::open(config, NodeStatus::Standalone, StubReplicationClient).await.unwrap());
 
                                 let aggregate_key = AggregateKey::new(1, 1, 1);
                                 let mut cumulative_write_time = Duration::ZERO;
@@ -439,7 +439,7 @@ fn bench_write_cache_impact(c: &mut Criterion) {
                         let iteration_duration = LocalExecutorBuilder::new(Placement::Fixed(0))
                             .spawn(move || async move {
                                 let config = create_config(shard_dir, fsync_delay, cache_bytes);
-                                let shard_wal = Rc::new(ShardWal::open(config, ClusterRole::Standalone, StubReplicationClient).await.unwrap());
+                                let shard_wal = Rc::new(ShardWal::open(config, NodeStatus::Standalone, StubReplicationClient).await.unwrap());
 
                                 let mut all_handles = Vec::with_capacity(TOTAL_WRITES);
                                 let num_waves = TOTAL_WRITES / WRITES_PER_WAVE;
@@ -511,7 +511,7 @@ fn bench_write_cache_impact(c: &mut Criterion) {
                         let iteration_duration = LocalExecutorBuilder::new(Placement::Fixed(0))
                             .spawn(move || async move {
                                 let config = create_config(shard_dir, fsync_delay, cache_bytes);
-                                let shard_wal = Rc::new(ShardWal::open(config, ClusterRole::Standalone, StubReplicationClient).await.unwrap());
+                                let shard_wal = Rc::new(ShardWal::open(config, NodeStatus::Standalone, StubReplicationClient).await.unwrap());
 
                                 let aggregate_key = AggregateKey::new(1, 1, 1);
                                 let mut all_handles = Vec::with_capacity(TOTAL_WRITES);

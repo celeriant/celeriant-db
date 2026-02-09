@@ -58,7 +58,6 @@ impl ReplicatedServers {
         let follower_port = base_port + 100;
         let follower_config = ServerConfig {
             log_level: log_level.to_string(),
-            bootstrap_as_leader: false,
             s3_enabled: true,
             s3_region: Some(region.clone()),
             s3_bucket: Some(bucket.clone()),
@@ -77,7 +76,6 @@ impl ReplicatedServers {
         // Start leader with S3 config for election/discovery
         let leader_config = ServerConfig {
             log_level: log_level.to_string(),
-            bootstrap_as_leader: true,
             s3_enabled: true,
             s3_region: Some(region),
             s3_bucket: Some(bucket),

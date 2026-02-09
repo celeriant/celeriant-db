@@ -40,7 +40,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start follower first
     let follower_config = ServerConfig {
         log_level: "info".to_string(),
-        bootstrap_as_leader: false,
         routing_rule: RoutingRule::AggregateTypeId,
         s3_enabled: true,
         s3_region: Some(region.clone()),
@@ -61,7 +60,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let follower_replication_port = follower_port + 1;
     let leader_config = ServerConfig {
         log_level: "info".to_string(),
-        bootstrap_as_leader: true,
         routing_rule: RoutingRule::AggregateTypeId,
         s3_enabled: true,
         s3_region: Some(region),

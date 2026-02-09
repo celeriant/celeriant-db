@@ -353,10 +353,6 @@ impl ServerConfigExt for ServerConfig {
             args.push("--standalone".to_string());
         }
 
-        if self.bootstrap_as_leader {
-            args.push("--bootstrap-as-leader".to_string());
-        }
-
         if let Some(addr) = &self.advertised_replication_address {
             args.push("--advertised-replication-address".to_string());
             args.push(addr.clone());

@@ -15,3 +15,5 @@ pub mod shard_delete_error;
 pub mod shard_trim_error;
 pub mod shard_exists_error;
 pub mod shard_listing_error;
+pub mod apply_batch_error;
+pub mod s3_catchup_error;

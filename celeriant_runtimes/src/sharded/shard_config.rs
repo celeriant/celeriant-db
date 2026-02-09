@@ -45,5 +45,4 @@ pub struct ShardConfig {
     pub heartbeat_interval_ms: u64,
     pub heartbeat_lease_duration_ms: u64,
     pub max_clock_drift_ms: u64,
-    pub bootstrap_as_leader: bool,
 }

@@ -561,7 +561,6 @@ mod tests {
             heartbeat_interval_ms: 500,
             heartbeat_lease_duration_ms: 1500,
             max_clock_drift_ms: 500,
-            bootstrap_as_leader: false,
         }
     }
 

@@ -10,7 +10,7 @@ use celeriant_shard::timestamp_config::TimestampConfig;
 use celeriant_msg::request::requests::{ExistsRequest, SingleAggregateWrite, WriteRequest};
 use celeriant_shard::shard_wal::ShardWal;
 use celeriant_wal::aggregate_key::AggregateKey;
-use celeriant_wal::cluster_role::ClusterRole;
+use celeriant_distributed::node_status::NodeStatus;
 use celeriant_wal::compression_type::CompressionType;
 use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
@@ -115,7 +115,7 @@ fn setup_populated_wal(shard_dir: PathBuf, target_bytes: usize) -> usize {
     let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
         .spawn(move || async move {
             let config = create_config(shard_dir);
-            let shard_wal = Rc::new(ShardWal::open(config, ClusterRole::Standalone, StubReplicationClient).await.unwrap());
+            let shard_wal = Rc::new(ShardWal::open(config, NodeStatus::Standalone, StubReplicationClient).await.unwrap());
 
             // Estimate bytes per write (events + metadata overhead ~512 bytes)
             let bytes_per_write_estimate = (EVENT_SIZE_BYTES * EVENTS_PER_BATCH) + 512;
@@ -205,7 +205,7 @@ fn bench_exists_wal_sizes(c: &mut Criterion) {
                     let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
                         .spawn(move || async move {
                             let config = create_config(shard_dir);
-                            let shard_wal = ShardWal::open(config, ClusterRole::Standalone, StubReplicationClient).await.unwrap();
+                            let shard_wal = ShardWal::open(config, NodeStatus::Standalone, StubReplicationClient).await.unwrap();
 
                             // Timed iterations - cycle through all known aggregates
                             let mut total_duration = Duration::ZERO;
@@ -250,7 +250,7 @@ fn bench_exists_wal_sizes(c: &mut Criterion) {
                     let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
                         .spawn(move || async move {
                             let config = create_config(shard_dir);
-                            let shard_wal = ShardWal::open(config, ClusterRole::Standalone, StubReplicationClient).await.unwrap();
+                            let shard_wal = ShardWal::open(config, NodeStatus::Standalone, StubReplicationClient).await.unwrap();
 
                             // Timed iterations - each uses a unique aggregate key
                             // Start from NUM_AGGREGATES to ensure they don't exist in WAL
