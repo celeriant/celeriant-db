@@ -1310,6 +1310,8 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
         let rotating_log_cache = self.log_segments_cache.clone();
         let shard_mem_cache = self.shard_mem_cache.clone();
         let watched_aggregates = self.watched_aggregates.clone();
+
+        // Node status goes into fsync because we need to know if we should advance read position (standalone or follower mode)
         let node_status = self.node_status.clone();
 
         if rotating_log_cache.force_immediate.get() {
