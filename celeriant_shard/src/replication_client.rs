@@ -2,7 +2,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use celeriant_client_glommio::{CeleriantClient, ClientError};
-use celeriant_distributed::fallback::{FallbackBatch, FallbackItem};
 use celeriant_distributed::paths::fallback_batch_path;
 use celeriant_msg::{
     process_requests::Request,
@@ -10,7 +9,7 @@ use celeriant_msg::{
     request::requests::{ReplicationBatchItem, ReplicationBatchRequest},
     response::responses::{ReplicationResult},
 };
-use celeriant_wal::compression_type::CompressionType;
+use celeriant_wal::{compression_type::CompressionType, s3::fallback_batch::{FallbackBatch, FallbackItem}};
 use tracing::warn;
 
 use crate::error::{replication_to_follower_error::ReplicateToFollowerError, replication_to_s3_error::ReplicateToS3Error};

@@ -23,6 +23,7 @@ deepsize.workspace = true
 lru.workspace = true
 bytes.workspace = true
 tracing.workspace = true
+blake3.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

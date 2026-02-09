@@ -525,6 +525,7 @@ dependencies = [
 name = "celeriant_shard"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "bytes",
  "celeriant_client_glommio",
  "celeriant_disk",

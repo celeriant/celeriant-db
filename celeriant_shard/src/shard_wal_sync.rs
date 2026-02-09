@@ -1,7 +1,6 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use celeriant_distributed::hash_chain::compute_entry_hash;
 use celeriant_distributed::node_status::NodeStatus;
 use celeriant_memcache::cache_path::CachePath;
 use celeriant_memcache::pending_cache_item::PendingCacheItem;
@@ -11,7 +10,7 @@ use celeriant_memcache::sync_positions_snapshot::SyncPositionsSnapshot;
 use celeriant_rotating_log::log_segment_file::log_segment_file::{LogSegmentFile, write_dual_shard_log_header};
 use celeriant_rotating_log::log_segment_file::log_segment_file_metadata::LogSegmentFileMetadata;
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
-use celeriant_wal::constants::{FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_METABLOCK};
+use celeriant_wal::constants::{EntryHashBytes, FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_METABLOCK};
 use celeriant_wal::metablocks::datablock_storage_kind::DatablockStorageKind;
 use celeriant_wal::metablocks::metablock_kind::MetablockKind;
 use celeriant_watch::aggregate_watchers::AggregateWatchers;
@@ -357,4 +356,11 @@ pub(crate) async fn sync(
         .map_err(|e| ShardFsyncError::FDataSyncError(e.to_string()))?;
 
     Ok(log_segment_file_metadata)
+}
+
+fn compute_entry_hash(previous_hash: &EntryHashBytes, content: &[u8]) -> EntryHashBytes {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(previous_hash);
+    hasher.update(content);
+    *hasher.finalize().as_bytes()
 }
