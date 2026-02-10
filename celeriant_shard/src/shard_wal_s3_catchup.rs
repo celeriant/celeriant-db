@@ -1,4 +1,4 @@
-use std::cell::{Cell, RefCell};
+use std::cell::{RefCell};
 use std::rc::Rc;
 
 use celeriant_distributed::node_status::NodeStatus;
@@ -41,7 +41,6 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader>(
     shard_mem_cache: &Rc<RefCell<ShardMemCache>>,
     fsync_coordinator: &Rc<Coordinator<ShardFsyncError>>,
     watched_aggregates: &Rc<AggregateWatchers>,
-    node_status: &Rc<Cell<NodeStatus>>,
     downloader: &D,
     shard_id: u32,
     max_rounds: u32,
@@ -59,7 +58,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader>(
 
         let round = catchup_round(
             log_segments_cache, shard_mem_cache, fsync_coordinator,
-            watched_aggregates, node_status, downloader, &prefix,
+            watched_aggregates, downloader, &prefix,
         ).await?;
 
         if round.batches == 0 {
@@ -84,7 +83,6 @@ async fn catchup_round<D: S3Downloader>(
     shard_mem_cache: &Rc<RefCell<ShardMemCache>>,
     fsync_coordinator: &Rc<Coordinator<ShardFsyncError>>,
     watched_aggregates: &Rc<AggregateWatchers>,
-    node_status: &Rc<Cell<NodeStatus>>,
     downloader: &D,
     prefix: &str,
 ) -> Result<RoundApplied, S3CatchupError> {
@@ -153,7 +151,7 @@ async fn catchup_round<D: S3Downloader>(
 
         sync_applied_batch(
             log_segments_cache, shard_mem_cache, fsync_coordinator,
-            watched_aggregates, node_status,
+            watched_aggregates,
         ).await.map_err(S3CatchupError::FsyncFailed)?;
 
         downloader.delete(&batch_ref.path).await?;
@@ -228,19 +226,19 @@ async fn sync_applied_batch(
     shard_mem_cache: &Rc<RefCell<ShardMemCache>>,
     fsync_coordinator: &Rc<Coordinator<ShardFsyncError>>,
     watched_aggregates: &Rc<AggregateWatchers>,
-    node_status: &Rc<Cell<NodeStatus>>,
 ) -> Result<(), ShardFsyncError> {
     let lsc = log_segments_cache.clone();
     let smc = shard_mem_cache.clone();
     let wa = watched_aggregates.clone();
-    let ns = node_status.clone();
     let mc_capture = smc.clone();
 
+    // We hardcode node status to standalone as we are in offline-catchup mode
+    // and can advance the read position immediately (no follower replication)
     fsync_coordinator
         .request_sync_two_phase(
             None,
             move || async move { capture_fsync_snapshot(&mc_capture) },
-            move |captured| commit_fsync_with_rollback(ns.get(), lsc, smc, wa, captured),
+            move |captured| commit_fsync_with_rollback(NodeStatus::Standalone, lsc, smc, wa, captured),
         )
         .await
 }
@@ -274,6 +272,7 @@ pub fn parse_fallback_path(path: &str) -> Option<(u32, u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -409,7 +408,6 @@ mod tests {
         shard_mem_cache: Rc<RefCell<ShardMemCache>>,
         fsync_coordinator: Rc<Coordinator<ShardFsyncError>>,
         watched_aggregates: Rc<AggregateWatchers>,
-        node_status: Rc<Cell<NodeStatus>>,
     }
 
     impl TestComponents {
@@ -422,7 +420,6 @@ mod tests {
                 shard_mem_cache: Rc::new(RefCell::new(ShardMemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 1024 * 1024, 64 * 1024 * 1024))),
                 fsync_coordinator: Rc::new(Coordinator::new()),
                 watched_aggregates: Rc::new(AggregateWatchers::new()),
-                node_status: Rc::new(Cell::new(NodeStatus::Follower { leader_lease_index: 0 })),
             }
         }
 
@@ -437,7 +434,7 @@ mod tests {
         async fn catchup(&self, downloader: &MockDownloader, shard_id: u32, max_rounds: u32) -> Result<S3CatchupResult, S3CatchupError> {
             catchup_from_s3(
                 &self.log_segments_cache, &self.shard_mem_cache, &self.fsync_coordinator,
-                &self.watched_aggregates, &self.node_status,
+                &self.watched_aggregates, 
                 downloader, shard_id, max_rounds,
             ).await
         }

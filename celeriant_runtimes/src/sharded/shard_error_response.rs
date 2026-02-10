@@ -43,7 +43,7 @@ const WRITE_REPLICATION_ERROR: u32 = 2007;
 const WRITE_FSYNC_ERROR: u32 = 2008;
 const WRITE_CACHE_AGGREGATE_CLIENT_ERROR: u32 = 2009;
 const WRITE_AGGREGATE_EXISTS_CACHE_ERROR: u32 = 2010;
-const WRITE_INVALID_LEASE_INDEX: u32 = 2011;
+const WRITE_CANNOT_ACCEPT_WRITES: u32 = 2011;
 
 // Trim errors: 3xxx
 const TRIM_AGGREGATE_NOT_EXISTS: u32 = 3000;
@@ -158,7 +158,7 @@ fn write_error(e: ShardWriteError) -> (u32, String) {
         ShardWriteError::ShardFsyncError(e) => (WRITE_FSYNC_ERROR, fsync_message(e)),
         ShardWriteError::CacheAggregateClientError(e) => cache_load_error(WRITE_CACHE_AGGREGATE_CLIENT_ERROR, WRITE_CACHE_AGGREGATE_CLIENT_ERROR, e),
         ShardWriteError::AggregateExistsAndCacheError(e) => cache_load_error(WRITE_AGGREGATE_EXISTS_CACHE_ERROR, WRITE_AGGREGATE_EXISTS_CACHE_ERROR, e),
-        ShardWriteError::InvalidLeaseIndex => (WRITE_INVALID_LEASE_INDEX, "{}".into()),
+        ShardWriteError::ShardCannotAcceptWrites => (WRITE_CANNOT_ACCEPT_WRITES, "{}".into()),
     }
 }
 
@@ -172,7 +172,7 @@ fn trim_error(e: ShardTrimError) -> (u32, String) {
             TRIM_INDEX_OUT_OF_RANGE,
             format!(r#"{{"requested":{},"max_event_batch_index":{}}}"#, requested, max_event_batch_index),
         ),
-        ShardTrimError::InvalidLeaseIndex => (TRIM_INVALID_LEASE_INDEX, "{}".into()),
+        ShardTrimError::ShardCannotAcceptWrites => (TRIM_INVALID_LEASE_INDEX, "{}".into()),
     }
 }
 
@@ -187,7 +187,7 @@ fn delete_error(e: ShardDeleteError) -> (u32, String) {
         ShardDeleteError::AggregateExistsAndCacheError(e) => cache_load_error(DELETE_CACHE_ERROR, DELETE_CACHE_ERROR, e),
         ShardDeleteError::ReplicationError(e) => (DELETE_REPLICATION_ERROR, replication_message(e)),
         ShardDeleteError::ShardFsyncError(e) => (DELETE_FSYNC_ERROR, fsync_message(e)),
-        ShardDeleteError::InvalidLeaseIndex => (DELETE_INVALID_LEASE_INDEX, "{}".into()),
+        ShardDeleteError::ShardCannotAcceptWrites => (DELETE_INVALID_LEASE_INDEX, "{}".into()),
     }
 }
 

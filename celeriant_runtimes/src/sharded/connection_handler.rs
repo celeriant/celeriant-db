@@ -437,7 +437,7 @@ async fn process_request<R: ReplicationClient + 'static>(
     message_version: u32,
 ) {
     let correlation_id = request.correlation_id();
-    let response = match ctx.shard_wal.process_request(Some(0), request).await {
+    let response = match ctx.shard_wal.process_request(request).await {
         Ok(result) => result,
         Err(error) => shard_error_to_response(correlation_id, error),
     };

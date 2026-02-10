@@ -11,7 +11,7 @@ pub enum ShardDeleteError {
     AggregateExistsAndCacheError(ShardCacheLoadError),
     ReplicationError(ReplicationError),
     ShardFsyncError(ShardFsyncError),
-    InvalidLeaseIndex,
+    ShardCannotAcceptWrites,
 }
 
 impl From<ShardFsyncError> for ShardDeleteError {

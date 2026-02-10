@@ -1,3 +1,6 @@
+use std::time::Instant;
+
+use celeriant_distributed::validated_node_status::ValidatedNodeStatus;
 use celeriant_shard::{internal_shard_config::InternalShardConfig, replication_client::GlommioReplicationClient, shard_wal::ShardWal};
 use celeriant_sidecar::store::SidecarStoreTrait;
 use glommio::{
@@ -27,6 +30,8 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
             panic!("Cannot start server without sidecar");
         },
     };
+
+    //TODO: Need a way to handle panics of shards & their restart. It's like a heartbeat
 
     LocalExecutorPoolBuilder::new(PoolPlacement::MaxSpread(shard_config.num_shards as usize, CpuSet::online().ok()))
         .on_all_shards(enclose!((mesh, shard_config, sidecar_senders) move || async move {
@@ -76,7 +81,9 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                 current_shard_id as u64,
                 Some(s3_uploader),
             );
-            let filesystem = ShardWal::open(internal_shard_config, shard_config.node_status, replication_client).await
+
+            let validated_node_status = ValidatedNodeStatus::new(shard_config.node_status, Instant::now());
+            let filesystem = ShardWal::open(internal_shard_config, validated_node_status, replication_client).await
                 .expect(&format!("Failed to initialize filesystem at {:?} - cannot initialize shard", shard_config.data_root));
 
             Shard::new(shard_config, current_shard_id, sender, receivers, sidecar_senders, client_tcp_listener, replication_tcp_listener, filesystem).run().await;

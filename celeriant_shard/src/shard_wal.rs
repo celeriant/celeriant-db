@@ -6,6 +6,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use celeriant_disk::files::rwlock_timeout::write_with_timeout;
 use celeriant_distributed::node_status::NodeStatus;
+use celeriant_distributed::validated_node_status::ValidatedNodeStatus;
 use celeriant_rotating_log::errors::ready_up_error::ReadyUpError;
 use celeriant_rotating_log::errors::scan_error::ScanError;
 use celeriant_wire::disk::disk_format_error::DiskFormatError;
@@ -99,7 +100,7 @@ pub struct ShardWal<R: ReplicationClient + 'static> {
     bloom_filter_cache: Rc<BloomFilterCache>,
 
     // Are we the leader? Follower? Single node mode? Note this can change at runtime.
-    pub node_status: Rc<Cell<NodeStatus>>,
+    pub node_status: Rc<Cell<ValidatedNodeStatus>>,
 
     config: InternalShardConfig,
 
@@ -120,24 +121,24 @@ impl<R: ReplicationClient + 'static> AggregateReader for ShardWal<R> {
 }
 
 impl<R: ReplicationClient + 'static> ShardWal<R> {
-    pub async fn process_request(&self, lease_index: Option<u64>, request: Request) -> Result<Response, ShardError> {
+    pub async fn process_request(&self, request: Request) -> Result<Response, ShardError> {
         match request {
             Request::Exists(exists_request) => self.exists(&exists_request).await.map(Response::Exists).map_err(ShardError::Exists),
             Request::Read(read_request) => self.read(&read_request).await.map(Response::Read).map_err(ShardError::Read),
             Request::Write(write_request) => {
-                self.write(lease_index, write_request)
+                self.write(write_request)
                     .await
                     .map(Response::Write)
                     .map_err(ShardError::Write)
             }
             Request::TrimStart(trim_start_request) => {
-                self.trim_start(lease_index, trim_start_request)
+                self.trim_start(trim_start_request)
                     .await
                     .map(Response::TrimStart)
                     .map_err(ShardError::TrimStart)
             }
             Request::Delete(delete_request) => {
-                self.delete(lease_index, delete_request)
+                self.delete(delete_request)
                     .await
                     .map(Response::Delete)
                     .map_err(ShardError::Delete)
@@ -173,7 +174,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
     ///
     /// If the shard directory exists with log files, reopens from the latest.
     /// Otherwise creates a new shard with an empty log file.
-    pub async fn open(config: InternalShardConfig, node_status: NodeStatus, replication_client: R) -> Result<Self, ReadyUpError> {
+    pub async fn open(config: InternalShardConfig, node_status: ValidatedNodeStatus, replication_client: R) -> Result<Self, ReadyUpError> {
         let shard_mem_cache = ShardMemCache::new(
             config.recent_write_cache_bytes,
             config.aggregate_snapshots_cache_bytes,
@@ -646,9 +647,13 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
         })
     }
 
-    pub async fn trim_start(&self, lease_index: Option<u64>, trim_request: TrimStartRequest) -> Result<SuccessResponse, ShardTrimError> {
+    pub async fn trim_start(&self, trim_request: TrimStartRequest) -> Result<SuccessResponse, ShardTrimError> {
         
-        let lease_index = lease_index.ok_or(ShardTrimError::InvalidLeaseIndex)?;
+        let lease_index = match self.node_status.get().effective() {
+            NodeStatus::Leader { lease_index } => lease_index,
+            NodeStatus::Standalone => 0,
+            _ => return Err(ShardTrimError::ShardCannotAcceptWrites),
+        };
 
         let aggregate_key = &trim_request.aggregate_key;
 
@@ -721,9 +726,13 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
         })
     }
     
-    pub async fn delete(&self, lease_index: Option<u64>, delete_request: DeleteRequest) -> Result<SuccessResponse, ShardDeleteError> {
+    pub async fn delete(&self, delete_request: DeleteRequest) -> Result<SuccessResponse, ShardDeleteError> {
         
-        let lease_index = lease_index.ok_or(ShardDeleteError::InvalidLeaseIndex)?;
+        let lease_index = match self.node_status.get().effective() {
+            NodeStatus::Leader { lease_index } => lease_index,
+            NodeStatus::Standalone => 0,
+            _ => return Err(ShardDeleteError::ShardCannotAcceptWrites),
+        };
 
         // Make sure we have at least one aggregate to write
         if delete_request.deletes.is_empty() {
@@ -817,9 +826,13 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
     /// # Arguments
     /// * `lease_index` - Current lease for write authorization
     /// * `request` - Write request with events to append
-    pub async fn write(&self, lease_index: Option<u64>, write_request: WriteRequest) -> Result<SuccessResponse, ShardWriteError> {
+    pub async fn write(&self, write_request: WriteRequest) -> Result<SuccessResponse, ShardWriteError> {
         
-        let lease_index = lease_index.ok_or(ShardWriteError::InvalidLeaseIndex)?;
+        let lease_index = match self.node_status.get().effective() {
+            NodeStatus::Leader { lease_index } => lease_index,
+            NodeStatus::Standalone => 0,
+            _ => return Err(ShardWriteError::ShardCannotAcceptWrites),
+        };
 
         // Make sure we have at least one aggregate to write
         if write_request.writes.is_empty() {
@@ -1312,7 +1325,8 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
         let watched_aggregates = self.watched_aggregates.clone();
 
         // Node status goes into fsync because we need to know if we should advance read position (standalone or follower mode)
-        let node_status = self.node_status.clone();
+        // We already pass lease status checks so can use raw()
+        let node_status = self.node_status.get().raw();
 
         if rotating_log_cache.force_immediate.get() {
             let mc_capture = shard_mem_cache.clone();
@@ -1320,7 +1334,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
                 .request_sync_two_phase(
                     None,
                     move || async move { capture_fsync_snapshot(&mc_capture) },
-                    move |captured| commit_fsync_with_rollback(node_status.get(), rotating_log_cache, shard_mem_cache, watched_aggregates, captured),
+                    move |captured| commit_fsync_with_rollback(node_status, rotating_log_cache, shard_mem_cache, watched_aggregates, captured),
                 )
                 .await
         } else if !self.config.non_durable_writes {
@@ -1329,7 +1343,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
                 .request_sync_two_phase(
                     Some(self.config.fsync_delay),
                     move || async move { capture_fsync_snapshot(&mc_capture) },
-                    move |captured| commit_fsync_with_rollback(node_status.get(), rotating_log_cache, shard_mem_cache, watched_aggregates, captured),
+                    move |captured| commit_fsync_with_rollback(node_status, rotating_log_cache, shard_mem_cache, watched_aggregates, captured),
                 )
                 .await
         } else {
@@ -1340,7 +1354,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
                     .request_sync_two_phase(
                         None,
                         move || async move { capture_fsync_snapshot(&mc_capture) },
-                        move |captured| commit_fsync_with_rollback(node_status.get(), rotating_log_cache, shard_mem_cache, watched_aggregates, captured),
+                        move |captured| commit_fsync_with_rollback(node_status, rotating_log_cache, shard_mem_cache, watched_aggregates, captured),
                     )
                     .await;
             })
@@ -1350,11 +1364,6 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
     }
 
     async fn replicate_durable(&self) -> Result<(), ReplicationError> {
-        // Only leaders need to replicate
-        if !self.node_status.get().is_leader() {
-            return Ok(());
-        }
-
         let replication_client = self.replication_client.clone();
         let fsync_coordinator = self.fsync_coordinator.clone();
         let rotating_log_cache = self.log_segments_cache.clone();
@@ -1416,6 +1425,10 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
         if !self.node_status.get().is_follower() {
             return Ok(response(ReplicationResult::Rejected(FollowerRejection::NotAFollower)));
         }
+
+        //TODO: Validate metablock.lease_index >= leader_lease_index from NodeStatus::Follower.
+        // Reject with StaleLease if less, update local leader_lease_index if greater.
+        // Depends on election broadcasting real leader_lease_index via StatusUpdate.
 
         if follower_timestamp_ms.saturating_sub(request.leader_timestamp_ms) > self.config.max_cluster_time_drift_ms {
             return Ok(response(ReplicationResult::Rejected(FollowerRejection::TimeDriftTooHigh {
@@ -1892,21 +1905,20 @@ mod tests {
     }
 
     async fn open_shard(dir: &std::path::Path) -> ShardWal<StubReplicationClient> {
-        ShardWal::open(test_config(dir), NodeStatus::Standalone, StubReplicationClient)
+        ShardWal::open(test_config(dir), ValidatedNodeStatus::standalone(), StubReplicationClient)
             .await
             .unwrap()
     }
 
     async fn process<R: ReplicationClient>(
         shard: &ShardWal<R>,
-        lease: Option<u64>,
         req: Request,
     ) -> Result<Response, ShardError> {
-        shard.process_request(lease, req).await
+        shard.process_request(req).await
     }
 
     async fn write_ok<R: ReplicationClient>(shard: &ShardWal<R>, req: Request) {
-        let result = process(shard, Some(0), req).await;
+        let result = process(shard, req).await;
         assert!(
             matches!(result, Ok(Response::Write(_))),
             "write failed: {:?}",
@@ -1960,7 +1972,7 @@ mod tests {
 
             write_ok(&shard, write_req(agg.clone(), events(3))).await;
 
-            let read = unwrap_read(process(&shard, None, read_req(agg)).await);
+            let read = unwrap_read(process(&shard, read_req(agg)).await);
             assert_eq!(read.event_batches.len(), 1);
             assert_eq!(read.event_batches[0].events.len(), 3);
             assert_eq!(read.event_batches[0].event_batch_index, 1);
@@ -1986,7 +1998,7 @@ mod tests {
                 write_ok(&shard, write_req(agg.clone(), evts)).await;
             }
 
-            let read = unwrap_read(process(&shard, None, read_req(agg)).await);
+            let read = unwrap_read(process(&shard, read_req(agg)).await);
             assert_eq!(read.event_batches.len(), 5);
             for (i, batch) in read.event_batches.iter().enumerate() {
                 assert_eq!(batch.event_batch_index, (i + 1) as u64);
@@ -2008,7 +2020,7 @@ mod tests {
             }
 
             for k in &keys {
-                let read = unwrap_read(process(&shard, None, read_req(k.clone())).await);
+                let read = unwrap_read(process(&shard, read_req(k.clone())).await);
                 assert_eq!(read.event_batches.len(), 1);
                 assert_eq!(read.event_batches[0].events.len(), 2);
             }
@@ -2023,7 +2035,7 @@ mod tests {
             let (_tmp, dir) = test_dir();
             let shard = open_shard(&dir).await;
 
-            let result = process(&shard, None, read_req(key(1, 1, 999))).await;
+            let result = process(&shard, read_req(key(1, 1, 999))).await;
             assert!(matches!(result, Err(ShardError::Read(ShardReadError::AggregateNotExists))));
 
             shard.close().await;
@@ -2038,7 +2050,7 @@ mod tests {
             let (_tmp, dir) = test_dir();
             let shard = open_shard(&dir).await;
 
-            let resp = unwrap_exists(process(&shard, None, exists_req(key(1, 1, 999))).await);
+            let resp = unwrap_exists(process(&shard, exists_req(key(1, 1, 999))).await);
             assert_eq!(resp.min_event_batch_index, 0);
 
             shard.close().await;
@@ -2054,7 +2066,7 @@ mod tests {
 
             write_ok(&shard, write_req(agg.clone(), events(1))).await;
 
-            let resp = unwrap_exists(process(&shard, None, exists_req(agg)).await);
+            let resp = unwrap_exists(process(&shard, exists_req(agg)).await);
             assert_eq!(resp.min_event_batch_index, FIRST_EVENT_BATCH_INDEX);
 
             shard.close().await;
@@ -2068,9 +2080,10 @@ mod tests {
         glommio_test!({
             let (_tmp, dir) = test_dir();
             let shard = open_shard(&dir).await;
+            shard.node_status.set(ValidatedNodeStatus::new(NodeStatus::Fenced, Instant::now()));
 
-            let result = process(&shard, None, write_req(key(1, 1, 1), events(1))).await;
-            assert!(matches!(result, Err(ShardError::Write(ShardWriteError::InvalidLeaseIndex))));
+            let result = process(&shard, write_req(key(1, 1, 1), events(1))).await;
+            assert!(matches!(result, Err(ShardError::Write(ShardWriteError::ShardCannotAcceptWrites))));
 
             shard.close().await;
         });
@@ -2082,7 +2095,7 @@ mod tests {
             let (_tmp, dir) = test_dir();
             let shard = open_shard(&dir).await;
 
-            let result = process(&shard, Some(0), write_req(key(1, 1, 1), vec![])).await;
+            let result = process(&shard, write_req(key(1, 1, 1), vec![])).await;
             assert!(matches!(result, Err(ShardError::Write(ShardWriteError::EmptyEventsList))));
 
             shard.close().await;
@@ -2101,7 +2114,7 @@ mod tests {
                 event_value: Arc::new(vec![1]),
                 ..Default::default()
             }];
-            let result = process(&shard, Some(0), write_req(key(1, 1, 1), evts)).await;
+            let result = process(&shard, write_req(key(1, 1, 1), evts)).await;
             assert!(matches!(result, Err(ShardError::Write(ShardWriteError::ZeroEventType { .. }))));
 
             shard.close().await;
@@ -2115,7 +2128,7 @@ mod tests {
             let shard = open_shard(&dir).await;
 
             let req = write_req_full(key(1, 1, 1), events(1), false, None, 1, false);
-            let result = process(&shard, Some(0), req).await;
+            let result = process(&shard, req).await;
             assert!(matches!(result, Err(ShardError::Write(ShardWriteError::AggregateNotExists))));
 
             shard.close().await;
@@ -2132,7 +2145,7 @@ mod tests {
             write_ok(&shard, write_req(agg.clone(), events(1))).await;
 
             let req = write_req_full(agg, events(1), true, Some(999), 1, false);
-            let result = process(&shard, Some(0), req).await;
+            let result = process(&shard, req).await;
             assert!(matches!(
                 result,
                 Err(ShardError::Write(ShardWriteError::OptimisticConcurrencyViolation { .. }))
@@ -2153,7 +2166,7 @@ mod tests {
             write_ok(&shard, req).await;
 
             let req = write_req_full(agg, events(1), true, None, 42, true);
-            let result = process(&shard, Some(0), req).await;
+            let result = process(&shard, req).await;
             assert!(matches!(
                 result,
                 Err(ShardError::Write(ShardWriteError::ClientIdempotencyViolation { .. }))
@@ -2174,10 +2187,10 @@ mod tests {
 
             write_ok(&shard, write_req(agg.clone(), events(1))).await;
 
-            let result = process(&shard, Some(0), delete_req(agg.clone())).await;
+            let result = process(&shard, delete_req(agg.clone())).await;
             assert!(matches!(result, Ok(Response::Delete(_))));
 
-            let result = process(&shard, None, read_req(agg)).await;
+            let result = process(&shard, read_req(agg)).await;
             assert!(matches!(result, Err(ShardError::Read(ShardReadError::AggregateNotExists))));
 
             shard.close().await;
@@ -2192,9 +2205,9 @@ mod tests {
             let agg = key(1, 1, 1);
 
             write_ok(&shard, write_req(agg.clone(), events(1))).await;
-            let _ = process(&shard, Some(0), delete_req(agg.clone())).await.unwrap();
+            let _ = process(&shard, delete_req(agg.clone())).await.unwrap();
 
-            let result = process(&shard, Some(0), write_req(agg, events(1))).await;
+            let result = process(&shard, write_req(agg, events(1))).await;
             assert!(matches!(
                 result,
                 Err(ShardError::Write(ShardWriteError::AggregateRecreateNotAllowed))
@@ -2214,11 +2227,11 @@ mod tests {
             write_ok(&shard, write_req(agg.clone(), events(1))).await;
 
             let del = delete_req_full(agg.clone(), true, false, None);
-            let _ = process(&shard, Some(0), del).await.unwrap();
+            let _ = process(&shard, del).await.unwrap();
 
             write_ok(&shard, write_req(agg.clone(), events(1))).await;
 
-            let read = unwrap_read(process(&shard, None, read_req(agg)).await);
+            let read = unwrap_read(process(&shard, read_req(agg)).await);
             assert_eq!(read.event_batches.len(), 1);
             assert_eq!(read.event_batches[0].event_batch_index, FIRST_EVENT_BATCH_INDEX);
 
@@ -2238,11 +2251,11 @@ mod tests {
             }
 
             let del = delete_req_full(agg.clone(), true, true, None);
-            let _ = process(&shard, Some(0), del).await.unwrap();
+            let _ = process(&shard, del).await.unwrap();
 
             write_ok(&shard, write_req(agg.clone(), events(1))).await;
 
-            let read = unwrap_read(process(&shard, None, read_req_from(agg, 4)).await);
+            let read = unwrap_read(process(&shard, read_req_from(agg, 4)).await);
             assert_eq!(read.event_batches.len(), 1);
             assert_eq!(read.event_batches[0].event_batch_index, 4);
 
@@ -2257,24 +2270,21 @@ mod tests {
             let shard = open_shard(&dir).await;
             let agg = key(1, 1, 1);
 
-            let result = process(&shard, None, delete_req(agg.clone())).await;
-            assert!(matches!(result, Err(ShardError::Delete(ShardDeleteError::InvalidLeaseIndex))));
-
             let empty_delete = Request::Delete(DeleteRequest {
                 correlation_id: None,
                 client_id: 1,
                 user_id: None,
                 deletes: HashMap::new(),
             });
-            let result = process(&shard, Some(0), empty_delete).await;
+            let result = process(&shard, empty_delete).await;
             assert!(matches!(result, Err(ShardError::Delete(ShardDeleteError::EmptyDeleteList))));
 
-            let result = process(&shard, Some(0), delete_req(agg.clone())).await;
+            let result = process(&shard, delete_req(agg.clone())).await;
             assert!(matches!(result, Err(ShardError::Delete(ShardDeleteError::AggregateNotExists))));
 
             write_ok(&shard, write_req(agg.clone(), events(1))).await;
             let del = delete_req_full(agg, false, false, Some(999));
-            let result = process(&shard, Some(0), del).await;
+            let result = process(&shard, del).await;
             assert!(matches!(
                 result,
                 Err(ShardError::Delete(ShardDeleteError::OptimisticConcurrencyViolation { .. }))
@@ -2297,16 +2307,16 @@ mod tests {
                 write_ok(&shard, write_req(agg.clone(), events(1))).await;
             }
 
-            let result = process(&shard, Some(0), trim_req(agg.clone(), 3)).await;
+            let result = process(&shard, trim_req(agg.clone(), 3)).await;
             assert!(matches!(result, Ok(Response::TrimStart(_))));
 
-            let result = process(&shard, None, read_req_from(agg.clone(), 1)).await;
+            let result = process(&shard, read_req_from(agg.clone(), 1)).await;
             assert!(matches!(
                 result,
                 Err(ShardError::Read(ShardReadError::UnavailableBatchIndex { .. }))
             ));
 
-            let read = unwrap_read(process(&shard, None, read_req_from(agg, 3)).await);
+            let read = unwrap_read(process(&shard, read_req_from(agg, 3)).await);
             assert!(!read.event_batches.is_empty());
 
             shard.close().await;
@@ -2324,8 +2334,8 @@ mod tests {
                 write_ok(&shard, write_req(agg.clone(), events(1))).await;
             }
 
-            let _ = process(&shard, Some(0), trim_req(agg.clone(), 2)).await.unwrap();
-            let result = process(&shard, Some(0), trim_req(agg, 2)).await;
+            let _ = process(&shard, trim_req(agg.clone(), 2)).await.unwrap();
+            let result = process(&shard, trim_req(agg, 2)).await;
             assert!(matches!(result, Ok(Response::TrimStart(_))));
 
             shard.close().await;
@@ -2339,14 +2349,11 @@ mod tests {
             let shard = open_shard(&dir).await;
             let agg = key(1, 1, 1);
 
-            let result = process(&shard, None, trim_req(agg.clone(), 1)).await;
-            assert!(matches!(result, Err(ShardError::TrimStart(ShardTrimError::InvalidLeaseIndex))));
-
-            let result = process(&shard, Some(0), trim_req(agg.clone(), 1)).await;
+            let result = process(&shard, trim_req(agg.clone(), 1)).await;
             assert!(matches!(result, Err(ShardError::TrimStart(ShardTrimError::AggregateNotExists))));
 
             write_ok(&shard, write_req(agg.clone(), events(1))).await;
-            let result = process(&shard, Some(0), trim_req(agg, 999)).await;
+            let result = process(&shard, trim_req(agg, 999)).await;
             assert!(matches!(
                 result,
                 Err(ShardError::TrimStart(ShardTrimError::TrimIndexOutOfRange { .. }))
@@ -2370,17 +2377,17 @@ mod tests {
                 }
             }
 
-            let orgs = unwrap_list_orgs(process(&shard, None, list_orgs_req()).await);
+            let orgs = unwrap_list_orgs(process(&shard, list_orgs_req()).await);
             assert_eq!(orgs.orgs.len(), 3);
 
-            let types = unwrap_list_types(process(&shard, None, list_types_req(None)).await);
+            let types = unwrap_list_types(process(&shard, list_types_req(None)).await);
             assert_eq!(types.aggregate_types.len(), 6);
 
-            let types_filtered = unwrap_list_types(process(&shard, None, list_types_req(Some(1))).await);
+            let types_filtered = unwrap_list_types(process(&shard, list_types_req(Some(1))).await);
             assert_eq!(types_filtered.aggregate_types.len(), 2);
             assert!(types_filtered.aggregate_types.iter().all(|t| t.org_id == 1));
 
-            let aggs = unwrap_list_aggs(process(&shard, None, list_aggs_req(Some(1), Some(1))).await);
+            let aggs = unwrap_list_aggs(process(&shard, list_aggs_req(Some(1), Some(1))).await);
             assert_eq!(aggs.aggregates.len(), 1);
 
             shard.close().await;
@@ -2393,7 +2400,7 @@ mod tests {
             let (_tmp, dir) = test_dir();
             let shard = open_shard(&dir).await;
 
-            let orgs = unwrap_list_orgs(process(&shard, None, list_orgs_req()).await);
+            let orgs = unwrap_list_orgs(process(&shard, list_orgs_req()).await);
             assert!(orgs.orgs.is_empty());
             assert!(orgs.next_cursor.is_none());
 
@@ -2409,9 +2416,9 @@ mod tests {
             let agg = key(1, 1, 1);
 
             write_ok(&shard, write_req(agg.clone(), events(1))).await;
-            let _ = process(&shard, Some(0), delete_req(agg)).await.unwrap();
+            let _ = process(&shard, delete_req(agg)).await.unwrap();
 
-            let aggs = unwrap_list_aggs(process(&shard, None, list_aggs_req(Some(1), Some(1))).await);
+            let aggs = unwrap_list_aggs(process(&shard, list_aggs_req(Some(1), Some(1))).await);
             assert_eq!(aggs.aggregates.len(), 1);
             assert!(aggs.aggregates[0].is_deleted);
 
@@ -2435,7 +2442,7 @@ mod tests {
                 aggregates: None,
                 operation_types: None,
             });
-            let result = process(&shard, None, watch).await;
+            let result = process(&shard, watch).await;
             assert!(matches!(result, Err(ShardError::WatchRequestInvalid)));
 
             let catchup = Request::CatchUp(CatchUpRequest {
@@ -2444,7 +2451,7 @@ mod tests {
                 last_follower_metablock: None,
                 follower_tip_hash: None,
             });
-            let result = process(&shard, None, catchup).await;
+            let result = process(&shard, catchup).await;
             assert!(matches!(result, Err(ShardError::CatchUpRequestInvalid)));
 
             shard.close().await;
@@ -2464,9 +2471,9 @@ mod tests {
                 write_ok(&shard, write_req(agg.clone(), events(1))).await;
             }
 
-            let _ = process(&shard, Some(0), trim_req(agg.clone(), 3)).await.unwrap();
+            let _ = process(&shard, trim_req(agg.clone(), 3)).await.unwrap();
 
-            let resp = unwrap_exists(process(&shard, None, exists_req(agg)).await);
+            let resp = unwrap_exists(process(&shard, exists_req(agg)).await);
             assert_eq!(resp.min_event_batch_index, 3);
 
             shard.close().await;
@@ -2510,7 +2517,7 @@ mod tests {
     }
 
     async fn open_leader_shard(dir: &std::path::Path, client: FailThenSucceedReplicationClient) -> ShardWal<FailThenSucceedReplicationClient> {
-        ShardWal::open(test_config(dir), NodeStatus::Leader { lease_index: 0 }, client)
+        ShardWal::open(test_config(dir), ValidatedNodeStatus::new(NodeStatus::Leader { lease_index: 0 }, Instant::now() + Duration::from_secs(10)), client)
             .await
             .unwrap()
     }
@@ -2525,20 +2532,20 @@ mod tests {
             let agg = key(1, 1, 1);
 
             // Write 1: triggers rollback (follower offline + S3 not configured)
-            let result = process(&shard, Some(0), write_req(agg.clone(), events(1))).await;
+            let result = process(&shard, write_req(agg.clone(), events(1))).await;
             assert!(
                 matches!(result, Err(ShardError::Write(ShardWriteError::ReplicationError(_)))),
                 "expected ReplicationError, got {:?}", result
             );
 
             // Write 2: must succeed — stale rollback flags must not block this
-            let result = process(&shard, Some(0), write_req(agg.clone(), events(1))).await;
+            let result = process(&shard, write_req(agg.clone(), events(1))).await;
             assert!(
                 matches!(result, Ok(Response::Write(_))),
                 "write after rollback should succeed, got {:?}", result
             );
 
-            let read = unwrap_read(process(&shard, None, read_req(agg)).await);
+            let read = unwrap_read(process(&shard, read_req(agg)).await);
             assert_eq!(read.event_batches.len(), 1);
             assert_eq!(read.event_batches[0].events.len(), 1);
 
@@ -2556,21 +2563,21 @@ mod tests {
             let agg = key(1, 1, 1);
 
             // Write 1: rollback
-            let result = process(&shard, Some(0), write_req(agg.clone(), events(1))).await;
+            let result = process(&shard, write_req(agg.clone(), events(1))).await;
             assert!(matches!(result, Err(ShardError::Write(ShardWriteError::ReplicationError(_)))));
 
             // Write 2: rollback again
-            let result = process(&shard, Some(0), write_req(agg.clone(), events(1))).await;
+            let result = process(&shard, write_req(agg.clone(), events(1))).await;
             assert!(matches!(result, Err(ShardError::Write(ShardWriteError::ReplicationError(_)))));
 
             // Write 3: should succeed
-            let result = process(&shard, Some(0), write_req(agg.clone(), events(1))).await;
+            let result = process(&shard, write_req(agg.clone(), events(1))).await;
             assert!(
                 matches!(result, Ok(Response::Write(_))),
                 "write after multiple rollbacks should succeed, got {:?}", result
             );
 
-            let read = unwrap_read(process(&shard, None, read_req(agg)).await);
+            let read = unwrap_read(process(&shard, read_req(agg)).await);
             assert_eq!(read.event_batches.len(), 1);
 
             shard.close().await;
@@ -2580,7 +2587,7 @@ mod tests {
     // ── Replication (handle_replication_batch) ──
 
     async fn open_follower_shard(dir: &std::path::Path) -> ShardWal<StubReplicationClient> {
-        ShardWal::open(test_config(dir), NodeStatus::Follower { leader_lease_index: 0 }, StubReplicationClient)
+        ShardWal::open(test_config(dir), ValidatedNodeStatus::new(NodeStatus::Follower { leader_lease_index: 0 }, Instant::now() + Duration::from_secs(10)), StubReplicationClient)
             .await
             .unwrap()
     }
@@ -2627,7 +2634,7 @@ mod tests {
             let shard = open_follower_shard(&dir).await;
 
             let resp = unwrap_replication(
-                process(&shard, None, replication_batch_req(vec![replication_item(1, GENESIS_HASH)])).await,
+                process(&shard, replication_batch_req(vec![replication_item(1, GENESIS_HASH)])).await,
             );
             assert!(matches!(resp.result, ReplicationResult::Success { .. }));
 
@@ -2642,7 +2649,7 @@ mod tests {
             let shard = open_shard(&dir).await; // Standalone
 
             let resp = unwrap_replication(
-                process(&shard, None, replication_batch_req(vec![replication_item(1, GENESIS_HASH)])).await,
+                process(&shard, replication_batch_req(vec![replication_item(1, GENESIS_HASH)])).await,
             );
             assert!(matches!(resp.result, ReplicationResult::Rejected(FollowerRejection::NotAFollower)));
 
@@ -2656,7 +2663,7 @@ mod tests {
             let (_tmp, dir) = test_dir();
             let shard = open_follower_shard(&dir).await;
 
-            let resp = unwrap_replication(process(&shard, None, replication_batch_req(vec![])).await);
+            let resp = unwrap_replication(process(&shard, replication_batch_req(vec![])).await);
             assert!(matches!(resp.result, ReplicationResult::Rejected(FollowerRejection::EmptyBatch)));
 
             shard.close().await;
@@ -2671,7 +2678,7 @@ mod tests {
 
             // Follower at wal_index=0, batch starts at 5 (expects 1)
             let resp = unwrap_replication(
-                process(&shard, None, replication_batch_req(vec![replication_item(5, GENESIS_HASH)])).await,
+                process(&shard, replication_batch_req(vec![replication_item(5, GENESIS_HASH)])).await,
             );
             match resp.result {
                 ReplicationResult::Rejected(FollowerRejection::WalIndexMismatch { max_follower_wal_index }) => {
@@ -2692,7 +2699,7 @@ mod tests {
 
             // Correct wal_index but wrong tip hash
             let resp = unwrap_replication(
-                process(&shard, None, replication_batch_req(vec![replication_item(1, [0xFF; 32])])).await,
+                process(&shard, replication_batch_req(vec![replication_item(1, [0xFF; 32])])).await,
             );
             assert!(matches!(resp.result, ReplicationResult::Rejected(FollowerRejection::TipHashMismatch { .. })));
 
@@ -2708,7 +2715,7 @@ mod tests {
 
             // Batch 1
             let resp = unwrap_replication(
-                process(&shard, None, replication_batch_req(vec![replication_item(1, GENESIS_HASH)])).await,
+                process(&shard, replication_batch_req(vec![replication_item(1, GENESIS_HASH)])).await,
             );
             assert!(matches!(resp.result, ReplicationResult::Success { .. }));
 
@@ -2718,7 +2725,7 @@ mod tests {
 
             // Batch 2 must chain from batch 1's tip
             let resp = unwrap_replication(
-                process(&shard, None, replication_batch_req(vec![replication_item(2, tip_after_1)])).await,
+                process(&shard, replication_batch_req(vec![replication_item(2, tip_after_1)])).await,
             );
             assert!(matches!(resp.result, ReplicationResult::Success { .. }));
 
@@ -2743,7 +2750,7 @@ mod tests {
                 follower_too_far_behind: false,
                 batches: vec![replication_item(1, GENESIS_HASH)],
             });
-            let resp = unwrap_replication(process(&shard, None, stale_request).await);
+            let resp = unwrap_replication(process(&shard, stale_request).await);
             assert!(matches!(resp.result, ReplicationResult::Rejected(FollowerRejection::TimeDriftTooHigh { .. })));
 
             shard.close().await;
