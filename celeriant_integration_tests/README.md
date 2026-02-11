@@ -105,3 +105,21 @@ cargo run --bin s3_fallback_createonly_main -p celeriant_integration_tests --rel
 ### Spinning up leader/follower manually
 cargo run --release -p celeriant -- --data-root data_follower --client-port 10002 --replication-port 10003 --cluster-role follower --num-shards 1
 cargo run --release -p celeriant -- --data-root data_leader --client-port 10000 --replication-port 10001   --cluster-role leader --follower-address 127.0.0.1:10003 --num-shards 1
+
+
+## Running MinIO in Docker
+
+docker run -d \
+  --name celeriant-minio \
+  -p 9000:9000 \
+  -p 9001:9001 \
+  -e MINIO_ROOT_USER=minioadmin \
+  -e MINIO_ROOT_PASSWORD=minioadmin \
+  minio/minio server /data --console-address ":9001"
+Then create the bucket (matching the --s3-bucket celeriant in the launch config):
+
+
+docker exec celeriant-minio mkdir -p /data/celeriant
+API: http://127.0.0.1:9000
+Console UI: http://127.0.0.1:9001 (login: minioadmin / minioadmin)
+To tear it down later: docker rm -f celeriant-minio

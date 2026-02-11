@@ -86,6 +86,44 @@
         {
             "type": "lldb",
             "request": "launch",
+            "name": "Debug celeriant distributed + S3 (single node)",
+            "cargo": {
+                "args": [
+                    "build",
+                    "-p",
+                    "celeriant"
+                ],
+                "filter": {
+                    "name": "celeriant",
+                    "kind": "bin"
+                }
+            },
+            "args": [
+                "--num-shards",
+                "3",
+                "--shard-log-preallocate-bytes",
+                "20971520",
+                "--log-level",
+                "debug",
+                "--s3-enabled",
+                "--s3-region",
+                "us-east-1",
+                "--s3-bucket",
+                "celeriant",
+                "--s3-access-key-id",
+                "minioadmin",
+                "--s3-secret-access-key",
+                "minioadmin",
+                "--s3-endpoint-override",
+                "http://127.0.0.1:9000",
+                "--s3-allow-http"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {}
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
             "name": "Debug batch_main",
             "cargo": {
                 "args": [

@@ -48,3 +48,9 @@ pub enum ShardFsyncError {
     /// Failed trying to write batch of datablocks to the active file
     WriteDatablocksError(String),
 }
+
+impl ShardFsyncError {
+    pub fn is_retriable(&self) -> bool {
+        matches!(self, Self::RollbackInvalidatedWrites | Self::WriteLockTimeout)
+    }
+}

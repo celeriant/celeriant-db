@@ -22,7 +22,7 @@ use crate::error::shard_fsync_error::ShardFsyncError;
 use crate::s3_downloader::S3Downloader;
 use crate::shard_wal_sync::{capture_fsync_snapshot, commit_fsync_with_rollback};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct S3CatchupResult {
     pub batches_applied: u64,
     pub bytes_downloaded: u64,
@@ -41,7 +41,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader>(
     shard_mem_cache: &Rc<RefCell<ShardMemCache>>,
     fsync_coordinator: &Rc<Coordinator<ShardFsyncError>>,
     watched_aggregates: &Rc<AggregateWatchers>,
-    downloader: &D,
+    downloader: &Rc<D>,
     shard_id: u32,
     max_rounds: u32,
 ) -> Result<S3CatchupResult, S3CatchupError> {
@@ -83,7 +83,7 @@ async fn catchup_round<D: S3Downloader>(
     shard_mem_cache: &Rc<RefCell<ShardMemCache>>,
     fsync_coordinator: &Rc<Coordinator<ShardFsyncError>>,
     watched_aggregates: &Rc<AggregateWatchers>,
-    downloader: &D,
+    downloader: &Rc<D>,
     prefix: &str,
 ) -> Result<RoundApplied, S3CatchupError> {
     let objects = downloader.list_objects(prefix).await?;
@@ -431,7 +431,7 @@ mod tests {
             self.log_segments_cache.active().metadata.borrow().write.tip_hash
         }
 
-        async fn catchup(&self, downloader: &MockDownloader, shard_id: u32, max_rounds: u32) -> Result<S3CatchupResult, S3CatchupError> {
+        async fn catchup(&self, downloader: &Rc<MockDownloader>, shard_id: u32, max_rounds: u32) -> Result<S3CatchupResult, S3CatchupError> {
             catchup_from_s3(
                 &self.log_segments_cache, &self.shard_mem_cache, &self.fsync_coordinator,
                 &self.watched_aggregates, 
@@ -504,7 +504,7 @@ mod tests {
         glommio_test!({
             let (_tmp, dir) = test_dir();
             let tc = TestComponents::new(&dir).await;
-            let dl = MockDownloader::new();
+            let dl = Rc::new(MockDownloader::new());
 
             let result = tc.catchup(&dl, 0, 10).await.unwrap();
             assert_eq!(result.batches_applied, 0);
@@ -520,7 +520,7 @@ mod tests {
         glommio_test!({
             let (_tmp, dir) = test_dir();
             let tc = TestComponents::new(&dir).await;
-            let dl = MockDownloader::new();
+            let dl = Rc::new(MockDownloader::new());
 
             let (path, data) = make_fallback_batch(0, 1, 1, GENESIS_HASH);
             dl.insert(path, data);
@@ -540,7 +540,7 @@ mod tests {
         glommio_test!({
             let (_tmp, dir) = test_dir();
             let tc = TestComponents::new(&dir).await;
-            let dl = MockDownloader::new();
+            let dl = Rc::new(MockDownloader::new());
 
             let (path, data) = make_fallback_batch(0, 1, 5, GENESIS_HASH);
             dl.insert(path, data);
@@ -559,7 +559,7 @@ mod tests {
         glommio_test!({
             let (_tmp, dir) = test_dir();
             let tc = TestComponents::new(&dir).await;
-            let dl = MockDownloader::new();
+            let dl = Rc::new(MockDownloader::new());
 
             let (path, data) = make_fallback_batch(0, 1, 2, GENESIS_HASH);
             dl.insert(path, data);
@@ -579,7 +579,7 @@ mod tests {
         glommio_test!({
             let (_tmp, dir) = test_dir();
             let tc = TestComponents::new(&dir).await;
-            let dl = MockDownloader::new();
+            let dl = Rc::new(MockDownloader::new());
 
             let (path, data) = make_fallback_batch(0, 1, 3, GENESIS_HASH);
             let expected_path = path.clone();
@@ -598,7 +598,7 @@ mod tests {
         glommio_test!({
             let (_tmp, dir) = test_dir();
             let tc = TestComponents::new(&dir).await;
-            let dl = MockDownloader::new();
+            let dl = Rc::new(MockDownloader::new());
 
             // Simulate leader writing faster than we catch up:
             // After each round's deletes, inject a new batch for the next round
@@ -620,7 +620,7 @@ mod tests {
         glommio_test!({
             let (_tmp, dir) = test_dir();
             let tc = TestComponents::new(&dir).await;
-            let dl = MockDownloader::new();
+            let dl = Rc::new(MockDownloader::new());
 
             // Apply batch 1 first
             let (path, data) = make_fallback_batch(0, 1, 1, GENESIS_HASH);
@@ -648,7 +648,7 @@ mod tests {
         glommio_test!({
             let (_tmp, dir) = test_dir();
             let tc = TestComponents::new(&dir).await;
-            let dl = MockDownloader::new();
+            let dl = Rc::new(MockDownloader::new());
 
             // Shard 0 batch
             let (path, data) = make_fallback_batch(0, 1, 1, GENESIS_HASH);
@@ -670,7 +670,7 @@ mod tests {
         glommio_test!({
             let (_tmp, dir) = test_dir();
             let tc = TestComponents::new(&dir).await;
-            let dl = MockDownloader::new();
+            let dl = Rc::new(MockDownloader::new());
 
             // Apply batch 1-3 first
             let (path, data) = make_fallback_batch(0, 1, 3, GENESIS_HASH);
@@ -698,7 +698,7 @@ mod tests {
         glommio_test!({
             let (_tmp, dir) = test_dir();
             let tc = TestComponents::new(&dir).await;
-            let dl = MockDownloader::new();
+            let dl = Rc::new(MockDownloader::new());
 
             // Round 1: batch 1-3 available immediately
             let (path, data) = make_fallback_batch(0, 1, 3, GENESIS_HASH);

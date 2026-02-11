@@ -10,7 +10,7 @@ use glommio::{
 };
 use tracing::{error, info};
 
-use crate::{sharded::{intrashard_messages::IntrashardMessages, shard::Shard}, sidecar::{sidecar_channels::{SidecarSenders, create_sidecar_channel}, sidecar_runtime::SidecarRuntime, sidecar_s3_uploader::SidecarS3Uploader}};
+use crate::{sharded::{intrashard_messages::IntrashardMessages, shard::Shard}, sidecar::{sidecar_channels::{SidecarSenders, create_sidecar_channel}, sidecar_runtime::SidecarRuntime, sidecar_s3_downloader::SidecarS3Downloader, sidecar_s3_uploader::SidecarS3Uploader}};
 
 mod sharded;
 mod sidecar;
@@ -53,6 +53,8 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
             let internal_shard_config = InternalShardConfig { 
                 shard_log_preallocate_bytes: shard_config.shard_log_preallocate_bytes, 
                 node_id, 
+                shard_id: current_shard_id as u32,
+                s3_download_max_rounds: shard_config.s3_download_max_rounds,
                 fsync_delay: shard_config.fsync_delay,
                 replication_delay: shard_config.replication_delay,
                 non_durable_writes: shard_config.non_durable_writes, 
@@ -71,19 +73,21 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                 pending_replication_high_water_bytes: shard_config.pending_replication_high_water_bytes,
                 max_cluster_time_drift_ms: shard_config.max_cluster_time_drift_ms,
                 max_catchup_gap_bytes: shard_config.max_catchup_gap_bytes,
+                max_s3_fallback_batch_bytes: shard_config.max_s3_fallback_batch_bytes,
             };
             let s3_uploader = SidecarS3Uploader::new(sidecar_senders.clone());
             let replication_client = GlommioReplicationClient::new(
-                String::new(),
+                String::new(), //TODO: Follower address needs to be set for replication to happen. but we can only know it from s3 membership.bin
                 shard_config.internode_connection_timeout,
                 shard_config.max_request_size,
                 shard_config.max_response_size,
                 current_shard_id as u64,
                 Some(s3_uploader),
             );
+            let s3_downloader = SidecarS3Downloader::new(sidecar_senders.clone());
 
             let validated_node_status = ValidatedNodeStatus::new(shard_config.node_status, Instant::now());
-            let filesystem = ShardWal::open(internal_shard_config, validated_node_status, replication_client).await
+            let filesystem = ShardWal::open(internal_shard_config, validated_node_status, replication_client, s3_downloader).await
                 .expect(&format!("Failed to initialize filesystem at {:?} - cannot initialize shard", shard_config.data_root));
 
             Shard::new(shard_config, current_shard_id, sender, receivers, sidecar_senders, client_tcp_listener, replication_tcp_listener, filesystem).run().await;

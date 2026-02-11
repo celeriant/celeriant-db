@@ -5,13 +5,14 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use celeriant_distributed::validated_node_status::ValidatedNodeStatus;
 use celeriant_shard::internal_shard_config::InternalShardConfig;
 use celeriant_shard::replication_client::StubReplicationClient;
+use celeriant_shard::s3_downloader::StubS3Downloader;
 use celeriant_shard::timestamp_config::TimestampConfig;
 use celeriant_msg::request::requests::{ExistsRequest, SingleAggregateWrite, WriteRequest};
 use celeriant_shard::shard_wal::ShardWal;
 use celeriant_wal::aggregate_key::AggregateKey;
-use celeriant_distributed::node_status::NodeStatus;
 use celeriant_wal::compression_type::CompressionType;
 use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
@@ -76,6 +77,9 @@ fn create_config(shard_dir: PathBuf) -> InternalShardConfig {
         pending_replication_high_water_bytes: 67_108_864, // 64MB
         max_cluster_time_drift_ms: 5000,
         max_catchup_gap_bytes: 104_857_600,
+        s3_download_max_rounds: 3,
+        shard_id: 1,
+        max_s3_fallback_batch_bytes: 100 * 1024 * 1024,
     }
 }
 
@@ -120,7 +124,7 @@ fn create_write_request(
 }
 
 /// Populate WAL with specified number of unique aggregates
-async fn populate_wal(shard_wal: Rc<ShardWal<StubReplicationClient>>, num_aggregates: usize, total_writes: usize) {
+async fn populate_wal(shard_wal: Rc<ShardWal<StubReplicationClient, StubS3Downloader>>, num_aggregates: usize, total_writes: usize) {
     let num_waves = total_writes / WRITES_PER_WAVE;
     let mut all_handles = Vec::with_capacity(total_writes);
 
@@ -134,7 +138,7 @@ async fn populate_wal(shard_wal: Rc<ShardWal<StubReplicationClient>>, num_aggreg
                 let aggregate_key = AggregateKey::new(1, 1, aggregate_id);
                 let events = create_events(EVENTS_PER_WRITE, EVENT_SIZE_BYTES, 0);
                 let write_request = create_write_request(aggregate_key, events, write_id as u128);
-                let _ = shard_wal.write(Some(0), write_request).await;
+                let _ = shard_wal.write(write_request).await;
             });
             all_handles.push(handle);
         }
@@ -184,7 +188,7 @@ fn bench_bloom_effectiveness(c: &mut Criterion) {
             LocalExecutorBuilder::new(Placement::Fixed(0))
                 .spawn(move || async move {
                     let config = create_config(shard_dir);
-                    let shard_wal = Rc::new(ShardWal::open(config, NodeStatus::Standalone, StubReplicationClient).await.unwrap());
+                    let shard_wal = Rc::new(ShardWal::open(config, ValidatedNodeStatus::standalone(), StubReplicationClient, StubS3Downloader).await.unwrap());
                     populate_wal(shard_wal.clone(), num_aggregates, total_writes).await;
                     shard_wal.close().await;
                 })
@@ -216,7 +220,7 @@ fn bench_bloom_effectiveness(c: &mut Criterion) {
                     let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
                         .spawn(move || async move {
                             let config = create_config(shard_dir);
-                            let shard_wal = ShardWal::open(config, NodeStatus::Standalone, StubReplicationClient).await.unwrap();
+                            let shard_wal = ShardWal::open(config, ValidatedNodeStatus::standalone(), StubReplicationClient, StubS3Downloader).await.unwrap();
 
                             let mut total_duration = Duration::ZERO;
 
@@ -260,7 +264,7 @@ fn bench_bloom_effectiveness(c: &mut Criterion) {
                     let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
                         .spawn(move || async move {
                             let config = create_config(shard_dir);
-                            let shard_wal = ShardWal::open(config, NodeStatus::Standalone, StubReplicationClient).await.unwrap();
+                            let shard_wal = ShardWal::open(config, ValidatedNodeStatus::standalone(), StubReplicationClient, StubS3Downloader).await.unwrap();
 
                             let mut total_duration = Duration::ZERO;
                             // Use IDs way outside the written range

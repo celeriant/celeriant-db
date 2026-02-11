@@ -12,3 +12,22 @@ pub trait S3Downloader {
     async fn download(&self, path: &str) -> Result<Bytes, S3CatchupError>;
     async fn delete(&self, path: &str) -> Result<(), S3CatchupError>;
 }
+
+pub struct StubS3Downloader;
+
+impl S3Downloader for StubS3Downloader {
+    async fn list_objects(&self, _prefix: &str) -> Result<Vec<S3ObjectRef>, S3CatchupError> {
+        glommio::timer::sleep(std::time::Duration::from_millis(30)).await;
+        Ok(vec![])
+    }
+    
+    async fn download(&self, _path: &str) -> Result<Bytes, S3CatchupError> {
+        glommio::timer::sleep(std::time::Duration::from_millis(30)).await;
+        Ok(Bytes::new())
+    }
+    
+    async fn delete(&self, _path: &str) -> Result<(), S3CatchupError> {
+        glommio::timer::sleep(std::time::Duration::from_millis(30)).await;
+        Ok(())
+    }
+}

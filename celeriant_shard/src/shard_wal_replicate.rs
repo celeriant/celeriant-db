@@ -88,6 +88,7 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
     replication_captured_data: ReplicationCapturedData,
     max_catchup_gap_bytes: u64,
     max_request_size: u64,
+    max_s3_fallback_batch_bytes: u64,
     read_max_chunk_size: u64,
 ) -> Result<(), ReplicationError> {
     // This client_guard should always get the write lock without error due to single-leader of the replication, but just in case :)
@@ -130,10 +131,12 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
         // Either the follower is too slow to keep up, or it has been offline for a while
         // and needs to catch up itself first, or the follower is completely offline
         if follower_falling_behind_or_offline {
-            // We send ALL batches in one go to s3, no pagination
-            match client_guard.replicate_to_s3(batches).await {
+
+            let end_idx = batch_end_index(&batches, max_s3_fallback_batch_bytes);
+            match client_guard.replicate_to_s3(batches[..end_idx].to_vec()).await {
                 Ok(()) => {
-                    break;
+                    batches.drain(..end_idx);
+                    continue;
                 }
                 Err(replication_err) => {
                     return match rollback_replicate(
@@ -483,9 +486,28 @@ async fn fetch_catchup_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    use glommio::{LocalExecutorBuilder, Placement};
+
+    use celeriant_memcache::pending_cache_item::PendingCacheItem;
     use celeriant_msg::request::requests::ReplicationBatchItem;
+    use celeriant_rotating_log::log_segment_file::log_segment_cursor::LogSegmentCursor;
+    use celeriant_rotating_log::log_segment_file::log_segment_file_metadata::LogSegmentFileMetadata;
     use celeriant_wal::aggregate_key::AggregateKey;
     use celeriant_wal::metablocks::metablock::Metablock;
+
+    use crate::error::replication_to_s3_error::ReplicateToS3Error;
+
+    macro_rules! glommio_test {
+        ($body:expr) => {
+            LocalExecutorBuilder::new(Placement::Fixed(0))
+                .spawn(|| async move { $body })
+                .unwrap()
+                .join()
+                .unwrap()
+        };
+    }
 
     fn item() -> ReplicationBatchItem {
         ReplicationBatchItem {
@@ -517,5 +539,95 @@ mod tests {
                 slice.len()
             );
         }
+    }
+
+    // ── S3 fallback chunking ──
+
+    struct RecordingReplicationClient {
+        s3_item_counts: Rc<RefCell<Vec<usize>>>,
+    }
+
+    impl RecordingReplicationClient {
+        fn new() -> (Self, Rc<RefCell<Vec<usize>>>) {
+            let counts = Rc::new(RefCell::new(Vec::new()));
+            (Self { s3_item_counts: counts.clone() }, counts)
+        }
+    }
+
+    impl ReplicationClient for RecordingReplicationClient {
+        async fn replicate_to_follower(&mut self, _: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError> {
+            unreachable!("s3 path should not call replicate_to_follower")
+        }
+
+        async fn replicate_to_s3(&mut self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToS3Error> {
+            self.s3_item_counts.borrow_mut().push(batches.len());
+            Ok(())
+        }
+    }
+
+    fn make_captured_data(count: usize) -> ReplicationCapturedData {
+        let items: Vec<PendingCacheItem> = (0..count)
+            .map(|_| PendingCacheItem {
+                metablock: Metablock::default_inline_event_batch_metadata(AggregateKey::default()),
+                datablock: None,
+                metablock_absolute_pos: 0,
+            })
+            .collect();
+
+        ReplicationCapturedData {
+            follower_falling_behind_or_offline: true,
+            replication_snapshot: vec![PendingCommitData {
+                log_metadata: LogSegmentFileMetadata {
+                    log_id: 999999,
+                    file_len: 0,
+                    write: LogSegmentCursor::default(),
+                    read: None,
+                    datablocks_carry_over: None,
+                },
+                pending_queue: items,
+            }],
+        }
+    }
+
+    fn test_dir() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("shard");
+        (tmp, dir)
+    }
+
+    #[test]
+    fn s3_fallback_splits_by_max_batch_bytes() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let lsc = Rc::new(
+                LogSegmentsCache::ready_up(dir, 4 * 1024 * 1024, 4).await.unwrap()
+            );
+            let smc = Rc::new(RefCell::new(
+                ShardMemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 1024 * 1024, 64 * 1024 * 1024)
+            ));
+
+            let (client, s3_counts) = RecordingReplicationClient::new();
+            let client = Rc::new(RwLock::new(client));
+
+            let sz = item().size_bytes();
+
+            commit_replication_with_rollback(
+                client,
+                Rc::new(Coordinator::new()),
+                lsc.clone(),
+                smc,
+                Rc::new(AggregateWatchers::new()),
+                make_captured_data(5),
+                u64::MAX,   // max_catchup_gap_bytes (irrelevant, already flagged)
+                u64::MAX,   // max_request_size (irrelevant, S3 path)
+                sz * 2,     // max_s3_fallback_batch_bytes: 2 items per chunk
+                64 * 1024,  // read_max_chunk_size
+            ).await.unwrap();
+
+            // 5 items, 2 per chunk: [2, 2, 1]
+            assert_eq!(*s3_counts.borrow(), vec![2, 2, 1]);
+
+            lsc.close().await;
+        });
     }
 }

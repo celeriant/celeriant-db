@@ -5,6 +5,8 @@ use crate::timestamp_config::TimestampConfig;
 #[derive(Clone, Debug)]
 pub struct InternalShardConfig {
     pub node_id: u128,
+    pub shard_id: u32,
+    pub s3_download_max_rounds: u32,
     pub max_open_files: u64,
     pub shard_log_preallocate_bytes: u64,
     pub fsync_delay: Duration,
@@ -17,6 +19,7 @@ pub struct InternalShardConfig {
     pub aggregate_snapshots_cache_bytes: u64,
     pub aggregate_client_snapshots_cache_bytes: u64,
     pub read_max_chunk_size: u64,
+    pub max_s3_fallback_batch_bytes: u64,
     pub timestamp_config: TimestampConfig,
     pub list_page_size: usize,
     pub list_max_duration: Duration,

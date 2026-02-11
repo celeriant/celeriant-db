@@ -52,6 +52,7 @@ use crate::collect_from_disk::{EventBatchFromLogSegmentFile, fetch_datablocks_fo
 use crate::error::apply_batch_error::ApplyBatchError;
 use crate::error::follower_replication_write_error::FollowerReplicationWriteError;
 use crate::error::replication_error::ReplicationError;
+use crate::error::s3_catchup_error::S3CatchupError;
 use crate::error::shard_cache_load_error::ShardCacheLoadError;
 use crate::error::shard_delete_error::ShardDeleteError;
 use crate::error::shard_error::ShardError;
@@ -65,8 +66,9 @@ use crate::in_memory_filtering;
 use crate::internal_shard_config::InternalShardConfig;
 use crate::loading_coordinator::LoadingCoordinator;
 use crate::replication_client::ReplicationClient;
+use crate::s3_downloader::S3Downloader;
 use crate::shard_wal_replicate::{capture_replication_snapshot, commit_replication_with_rollback};
-use crate::shard_wal_s3_catchup;
+use crate::shard_wal_s3_catchup::{self, S3CatchupResult, catchup_from_s3};
 use crate::shard_wal_sync::{capture_fsync_snapshot, commit_fsync_with_rollback};
 
 /// Write-ahead log for a single shard.
@@ -80,7 +82,10 @@ use crate::shard_wal_sync::{capture_fsync_snapshot, commit_fsync_with_rollback};
 /// - Watch notifications
 ///
 /// Not thread-safe—designed for single-threaded per-core access.
-pub struct ShardWal<R: ReplicationClient + 'static> {
+pub struct ShardWal<R: ReplicationClient + 'static, D: S3Downloader + 'static> {
+    /// Trait implementation to download replicated data stored on S3 for catchup
+    s3_downloader: Rc<D>,
+
     /// No async in shard_mem_cache and no interior mutability
     shard_mem_cache: Rc<RefCell<ShardMemCache>>,
 
@@ -114,13 +119,13 @@ pub struct ShardWal<R: ReplicationClient + 'static> {
     replication_client: Rc<RwLock<R>>,
 }
 
-impl<R: ReplicationClient + 'static> AggregateReader for ShardWal<R> {
+impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> AggregateReader for ShardWal<R, D> {
     fn watched_aggregates(&self) -> Rc<AggregateWatchers> {
         Rc::clone(&self.watched_aggregates)
     }
 }
 
-impl<R: ReplicationClient + 'static> ShardWal<R> {
+impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     pub async fn process_request(&self, request: Request) -> Result<Response, ShardError> {
         match request {
             Request::Exists(exists_request) => self.exists(&exists_request).await.map(Response::Exists).map_err(ShardError::Exists),
@@ -174,7 +179,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
     ///
     /// If the shard directory exists with log files, reopens from the latest.
     /// Otherwise creates a new shard with an empty log file.
-    pub async fn open(config: InternalShardConfig, node_status: ValidatedNodeStatus, replication_client: R) -> Result<Self, ReadyUpError> {
+    pub async fn open(config: InternalShardConfig, node_status: ValidatedNodeStatus, replication_client: R, s3_downloader: D) -> Result<Self, ReadyUpError> {
         let shard_mem_cache = ShardMemCache::new(
             config.recent_write_cache_bytes,
             config.aggregate_snapshots_cache_bytes,
@@ -191,6 +196,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
         .await?;
 
         Ok(Self {
+            s3_downloader: Rc::new(s3_downloader),
             shard_mem_cache: Rc::new(RefCell::new(shard_mem_cache)),
             log_segments_cache: Rc::new(log_segments_cache),
             fsync_coordinator: Rc::new(Coordinator::new()),
@@ -1372,6 +1378,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
         let max_catchup_gap_bytes = self.config.max_catchup_gap_bytes;
         let max_request_size = self.config.max_request_size;
         let read_max_chunk_size = self.config.read_max_chunk_size;
+        let max_s3_fallback_batch_bytes = self.config.max_s3_fallback_batch_bytes;
 
         if rotating_log_cache.force_immediate.get() {
             let mc_capture = shard_mem_cache.clone();
@@ -1379,7 +1386,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
                 .request_sync_two_phase(
                     None,
                     move || async move { capture_replication_snapshot(&mc_capture) },
-                    move |captured| commit_replication_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates, captured, max_catchup_gap_bytes, max_request_size, read_max_chunk_size),
+                    move |captured| commit_replication_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates, captured, max_catchup_gap_bytes, max_request_size, max_s3_fallback_batch_bytes, read_max_chunk_size),
                 )
                 .await
         } else if !self.config.non_durable_writes {
@@ -1388,7 +1395,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
                 .request_sync_two_phase(
                     Some(self.config.replication_delay),
                     move || async move { capture_replication_snapshot(&mc_capture) },
-                    move |captured| commit_replication_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates, captured, max_catchup_gap_bytes, max_request_size, read_max_chunk_size),
+                    move |captured| commit_replication_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates, captured, max_catchup_gap_bytes, max_request_size, max_s3_fallback_batch_bytes, read_max_chunk_size),
                 )
                 .await
         } else {
@@ -1399,7 +1406,7 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
                     .request_sync_two_phase(
                         None,
                         move || async move { capture_replication_snapshot(&mc_capture) },
-                        move |captured| commit_replication_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates, captured, max_catchup_gap_bytes, max_request_size, read_max_chunk_size),
+                        move |captured| commit_replication_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates, captured, max_catchup_gap_bytes, max_request_size, max_s3_fallback_batch_bytes, read_max_chunk_size),
                     )
                     .await;
             })
@@ -1495,7 +1502,7 @@ struct MetablockCollection {
     next_event_batch_index: Option<u64>,
 }
 
-impl<R: ReplicationClient + 'static> ShardWal<R> {
+impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     fn get_batch_index(metablock: &Metablock) -> u64 {
         match &metablock.wal_metablock_type {
             MetablockKind::EventBatchMetadata(m) => m.event_batch_index,
@@ -1713,6 +1720,25 @@ impl<R: ReplicationClient + 'static> ShardWal<R> {
 
         event_batches
     }
+
+    pub async fn enter_s3_catchup(&self) -> Result<S3CatchupResult, S3CatchupError> {
+        
+        let catchup_status = match self.node_status.get().raw() {
+            NodeStatus::Follower { leader_lease_index } => NodeStatus::FollowerCatchingUp { leader_lease_index },
+            _ => NodeStatus::BootCatchup,
+        };
+        self.node_status.set(ValidatedNodeStatus::new(catchup_status, self.node_status.get().valid_until()));
+
+        catchup_from_s3(
+            &self.log_segments_cache, 
+            &self.shard_mem_cache, 
+            &self.fsync_coordinator, 
+            &self.watched_aggregates, 
+            &self.s3_downloader, 
+            self.config.shard_id,
+            self.config.s3_download_max_rounds).await
+
+    }
 }
 
 #[cfg(test)]
@@ -1721,6 +1747,7 @@ mod tests {
     use crate::error::replication_to_follower_error::ReplicateToFollowerError;
     use crate::error::replication_to_s3_error::ReplicateToS3Error;
     use crate::replication_client::StubReplicationClient;
+    use crate::s3_downloader::StubS3Downloader;
     use celeriant_msg::request::requests::{CatchUpRequest, ReplicationBatchItem, SingleAggregateDelete, WatchRequest};
     use celeriant_wal::compression_type::CompressionType;
     use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
@@ -1749,6 +1776,8 @@ mod tests {
     fn test_config(dir: &std::path::Path) -> InternalShardConfig {
         InternalShardConfig {
             node_id: 1,
+            shard_id: 1,
+            s3_download_max_rounds: 3,
             max_open_files: 4,
             shard_log_preallocate_bytes: 4 * 1024 * 1024,
             fsync_delay: Duration::ZERO,
@@ -1768,6 +1797,7 @@ mod tests {
             pending_replication_high_water_bytes: 64 * 1024 * 1024,
             max_cluster_time_drift_ms: 5000,
             max_catchup_gap_bytes: 100 * 1024 * 1024,
+            max_s3_fallback_batch_bytes: 1024 * 1024 * 100,
         }
     }
 
@@ -1904,20 +1934,20 @@ mod tests {
         })
     }
 
-    async fn open_shard(dir: &std::path::Path) -> ShardWal<StubReplicationClient> {
-        ShardWal::open(test_config(dir), ValidatedNodeStatus::standalone(), StubReplicationClient)
+    async fn open_shard(dir: &std::path::Path) -> ShardWal<StubReplicationClient, StubS3Downloader> {
+        ShardWal::open(test_config(dir), ValidatedNodeStatus::standalone(), StubReplicationClient, StubS3Downloader)
             .await
             .unwrap()
     }
 
-    async fn process<R: ReplicationClient>(
-        shard: &ShardWal<R>,
+    async fn process<R: ReplicationClient, D: S3Downloader>(
+        shard: &ShardWal<R, D>,
         req: Request,
     ) -> Result<Response, ShardError> {
         shard.process_request(req).await
     }
 
-    async fn write_ok<R: ReplicationClient>(shard: &ShardWal<R>, req: Request) {
+    async fn write_ok<R: ReplicationClient, D: S3Downloader>(shard: &ShardWal<R, D>, req: Request) {
         let result = process(shard, req).await;
         assert!(
             matches!(result, Ok(Response::Write(_))),
@@ -2516,8 +2546,8 @@ mod tests {
         }
     }
 
-    async fn open_leader_shard(dir: &std::path::Path, client: FailThenSucceedReplicationClient) -> ShardWal<FailThenSucceedReplicationClient> {
-        ShardWal::open(test_config(dir), ValidatedNodeStatus::new(NodeStatus::Leader { lease_index: 0 }, Instant::now() + Duration::from_secs(10)), client)
+    async fn open_leader_shard(dir: &std::path::Path, client: FailThenSucceedReplicationClient) -> ShardWal<FailThenSucceedReplicationClient, StubS3Downloader> {
+        ShardWal::open(test_config(dir), ValidatedNodeStatus::new(NodeStatus::Leader { lease_index: 0 }, Instant::now() + Duration::from_secs(10)), client, StubS3Downloader)
             .await
             .unwrap()
     }
@@ -2586,8 +2616,8 @@ mod tests {
 
     // ── Replication (handle_replication_batch) ──
 
-    async fn open_follower_shard(dir: &std::path::Path) -> ShardWal<StubReplicationClient> {
-        ShardWal::open(test_config(dir), ValidatedNodeStatus::new(NodeStatus::Follower { leader_lease_index: 0 }, Instant::now() + Duration::from_secs(10)), StubReplicationClient)
+    async fn open_follower_shard(dir: &std::path::Path) -> ShardWal<StubReplicationClient, StubS3Downloader> {
+        ShardWal::open(test_config(dir), ValidatedNodeStatus::new(NodeStatus::Follower { leader_lease_index: 0 }, Instant::now() + Duration::from_secs(10)), StubReplicationClient, StubS3Downloader)
             .await
             .unwrap()
     }

@@ -12,3 +12,11 @@ pub enum S3CatchupError {
     ApplyFailed(ApplyBatchError),
     FsyncFailed(ShardFsyncError),
 }
+
+impl S3CatchupError {
+    pub fn is_retriable(&self) -> bool {
+        matches!(self,
+            Self::S3ListFailed { .. } | Self::S3GetFailed { .. } | Self::S3DeleteFailed { .. }
+        ) || matches!(self, Self::FsyncFailed(e) if e.is_retriable())
+    }
+}

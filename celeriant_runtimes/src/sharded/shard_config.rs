@@ -29,6 +29,7 @@ pub struct ShardConfig {
     pub max_requested_latency: Duration,
     pub shard_log_preallocate_bytes: u64,
     pub fsync_delay: Duration,
+    pub s3_download_max_rounds: u32,
     pub replication_delay: Duration,
     pub recent_write_cache_bytes: u64,
     pub routing_rule: RoutingRule,
@@ -45,4 +46,5 @@ pub struct ShardConfig {
     pub heartbeat_interval_ms: u64,
     pub heartbeat_lease_duration_ms: u64,
     pub max_clock_drift_ms: u64,
+    pub max_s3_fallback_batch_bytes: u64,
 }

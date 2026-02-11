@@ -323,6 +323,26 @@ pub struct ServerConfig {
         help = "Allow data transmitted in plaintext using http instead of https."
     )]
     pub s3_allow_http: bool,
+
+    #[arg(
+        long,
+        default_value_t = 3,
+        env = "CELERIANT_S3_CATCHUP_MAX_ROUNDS",
+        help = "Maximum S3 List -> Download rounds performed in shard catchup (3)"
+    )]
+    pub s3_catchup_max_rounds: u32,
+
+    #[arg(long, default_value_t = 500, env = "CELERIANT_HEARTBEAT_INTERVAL_MS", help = "Interval between leader heartbeats to followers (500ms)")]
+    pub heartbeat_interval_ms: u64,
+
+    #[arg(long, default_value_t = 1500, env = "CELERIANT_HEARTBEAT_LEASE_DURATION_MS", help = "Duration before a missed heartbeat is considered a lease expiry (1500ms)")]
+    pub heartbeat_lease_duration_ms: u64,
+
+    #[arg(long, default_value_t = 500, env = "CELERIANT_MAX_CLOCK_DRIFT_MS", help = "Allowed clock drift added to heartbeat lease checks (500ms)")]
+    pub max_clock_drift_ms: u64,
+
+    #[arg(long, default_value_t = 1024 * 1024 * 100, env = "CELERIANT_MAX_S3_FALLBACK_BATCH_BYTES", help = "Maximum batch size for S3 fallback replication uploads (100MB)")]
+    pub max_s3_fallback_batch_bytes: u64,
 }
 
 impl ServerConfig {
@@ -364,6 +384,7 @@ impl ServerConfig {
         ShardConfig {
             node_id,
             num_shards,
+            s3_download_max_rounds: self.s3_catchup_max_rounds,
             node_status: if self.standalone {
                 NodeStatus::Standalone
             } else {
@@ -412,9 +433,10 @@ impl ServerConfig {
                 ConfigCompressionType::Brotli => CompressionType::Brotli { level: self.server_compression_level.unwrap_or(6) },
                 ConfigCompressionType::Gzip => CompressionType::Gzip { level: self.server_compression_level.unwrap_or(6) },
             },
-            heartbeat_interval_ms: 500,
-            heartbeat_lease_duration_ms: 1500,
-            max_clock_drift_ms: 500,
+            heartbeat_interval_ms: self.heartbeat_interval_ms,
+            heartbeat_lease_duration_ms: self.heartbeat_lease_duration_ms,
+            max_clock_drift_ms: self.max_clock_drift_ms,
+            max_s3_fallback_batch_bytes: self.max_s3_fallback_batch_bytes,
         }
     }
 
@@ -436,22 +458,37 @@ impl ServerConfig {
             };
         }
 
+        check_field!(timestamp_precision);
+        check_field!(timestamp_epoch_offset_secs);
         check_field!(data_root);
         check_field!(listen_address);
         check_field!(client_port);
         check_field!(replication_port);
+        check_field!(advertised_replication_address);
+        check_field!(standalone);
         check_field!(mesh_channel_size);
         check_field!(num_shards);
         check_field!(max_open_files);
         check_field!(read_max_chunk_size);
         check_field!(write_max_chunk_size);
-        check_field!(recent_write_cache_bytes);
-        check_field!(aggregate_client_snapshots_cache_bytes);
-        check_field!(aggregate_snapshots_cache_bytes);
+        check_field!(routing_rule);
         check_field!(max_request_size);
         check_field!(max_response_size);
         check_field!(max_requested_latency_ms);
+        check_field!(list_max_duration_ms);
+        check_field!(list_page_size);
+        check_field!(list_wal_index_cache_bytes);
+        check_field!(client_connection_timeout_ms);
         check_field!(shard_log_preallocate_bytes);
+        check_field!(recent_write_cache_bytes);
+        check_field!(aggregate_client_snapshots_cache_bytes);
+        check_field!(aggregate_snapshots_cache_bytes);
+        check_field!(pending_replication_high_water_bytes);
+        check_field!(max_cluster_time_drift_ms);
+        check_field!(max_catchup_gap_bytes);
+        check_field!(internode_connection_timeout_ms);
+        check_field!(server_compression_algorithm);
+        check_field!(server_compression_level);
         check_field!(fsync_delay_us);
         check_field!(replication_delay_us);
         check_field!(non_durable_writes);
@@ -462,11 +499,14 @@ impl ServerConfig {
         check_field!(s3_access_key_id, sensitive);
         check_field!(s3_secret_access_key, sensitive);
         check_field!(s3_subfolder);
-        check_field!(client_connection_timeout_ms);
-        check_field!(routing_rule);
-        check_field!(internode_connection_timeout_ms);
-        check_field!(server_compression_algorithm);
-        check_field!(server_compression_level);
+        check_field!(s3_endpoint_override);
+        check_field!(s3_skip_signature);
+        check_field!(s3_allow_http);
+        check_field!(s3_catchup_max_rounds);
+        check_field!(heartbeat_interval_ms);
+        check_field!(heartbeat_lease_duration_ms);
+        check_field!(max_clock_drift_ms);
+        check_field!(max_s3_fallback_batch_bytes);
 
         entries
     }
@@ -531,6 +571,11 @@ impl Default for ServerConfig {
             internode_connection_timeout_ms: None,
             server_compression_algorithm: ConfigCompressionType::Snappy,
             server_compression_level: None,
+            s3_catchup_max_rounds: 3,
+            heartbeat_interval_ms: 500,
+            heartbeat_lease_duration_ms: 1500,
+            max_clock_drift_ms: 500,
+            max_s3_fallback_batch_bytes: 1024 * 1024 * 100,
         }
     }
 }

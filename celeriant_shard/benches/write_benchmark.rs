@@ -5,13 +5,14 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use celeriant_distributed::validated_node_status::ValidatedNodeStatus;
 use celeriant_shard::internal_shard_config::InternalShardConfig;
 use celeriant_shard::replication_client::StubReplicationClient;
+use celeriant_shard::s3_downloader::StubS3Downloader;
 use celeriant_shard::timestamp_config::TimestampConfig;
 use celeriant_msg::request::requests::{SingleAggregateWrite, WriteRequest};
 use celeriant_shard::shard_wal::ShardWal;
 use celeriant_wal::aggregate_key::AggregateKey;
-use celeriant_distributed::node_status::NodeStatus;
 use celeriant_wal::compression_type::CompressionType;
 use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
@@ -97,6 +98,9 @@ fn create_config(
         pending_replication_high_water_bytes: 67_108_864, // 64MB
         max_cluster_time_drift_ms: 5000,
         max_catchup_gap_bytes: 104_857_600,
+        s3_download_max_rounds: 3,
+        shard_id: 1,
+        max_s3_fallback_batch_bytes: 100 * 1024 * 1024,
     }
 }
 
@@ -187,7 +191,7 @@ fn bench_write_fsync_delays(c: &mut Criterion) {
                             .spawn(move || async move {
                                 let config =
                                     create_config(shard_dir, fsync_delay, 64 * 1024 * 1024);
-                                let shard_wal = Rc::new(ShardWal::open(config, NodeStatus::Standalone, StubReplicationClient).await.unwrap());
+                                let shard_wal = Rc::new(ShardWal::open(config, ValidatedNodeStatus::standalone(), StubReplicationClient, StubS3Downloader).await.unwrap());
 
                                 let mut all_handles = Vec::with_capacity(TOTAL_WRITES);
                                 let num_waves = TOTAL_WRITES / WRITES_PER_WAVE;
@@ -211,7 +215,7 @@ fn bench_write_fsync_delays(c: &mut Criterion) {
 
                                             // Measure only the write time
                                             let start = Instant::now();
-                                            let result = shard_wal.write(Some(0), write_request).await;
+                                            let result = shard_wal.write(write_request).await;
                                             let elapsed = start.elapsed();
 
                                             black_box(result.unwrap());
@@ -264,7 +268,7 @@ fn bench_write_fsync_delays(c: &mut Criterion) {
                             .spawn(move || async move {
                                 let config =
                                     create_config(shard_dir, fsync_delay, 64 * 1024 * 1024);
-                                let shard_wal = Rc::new(ShardWal::open(config, NodeStatus::Standalone, StubReplicationClient).await.unwrap());
+                                let shard_wal = Rc::new(ShardWal::open(config, ValidatedNodeStatus::standalone(), StubReplicationClient, StubS3Downloader).await.unwrap());
 
                                 let aggregate_key = AggregateKey::new(1, 1, 1);
                                 let mut all_handles = Vec::with_capacity(TOTAL_WRITES);
@@ -291,7 +295,7 @@ fn bench_write_fsync_delays(c: &mut Criterion) {
 
                                             // Measure only the write time
                                             let start = Instant::now();
-                                            let result = shard_wal.write(Some(0), write_request).await;
+                                            let result = shard_wal.write(write_request).await;
                                             let elapsed = start.elapsed();
 
                                             black_box(result.unwrap());
@@ -366,7 +370,7 @@ fn bench_write_idle_latency(c: &mut Criterion) {
                             .spawn(move || async move {
                                 let config =
                                     create_config(shard_dir, fsync_delay, 64 * 1024 * 1024);
-                                let shard_wal = Rc::new(ShardWal::open(config, NodeStatus::Standalone, StubReplicationClient).await.unwrap());
+                                let shard_wal = Rc::new(ShardWal::open(config, ValidatedNodeStatus::standalone(), StubReplicationClient, StubS3Downloader).await.unwrap());
 
                                 let aggregate_key = AggregateKey::new(1, 1, 1);
                                 let mut cumulative_write_time = Duration::ZERO;
@@ -385,7 +389,7 @@ fn bench_write_idle_latency(c: &mut Criterion) {
                                     );
 
                                     let start = Instant::now();
-                                    let result = shard_wal.write(Some(0), write_request).await;
+                                    let result = shard_wal.write(write_request).await;
                                     cumulative_write_time += start.elapsed();
 
                                     black_box(result.unwrap());
@@ -439,7 +443,7 @@ fn bench_write_cache_impact(c: &mut Criterion) {
                         let iteration_duration = LocalExecutorBuilder::new(Placement::Fixed(0))
                             .spawn(move || async move {
                                 let config = create_config(shard_dir, fsync_delay, cache_bytes);
-                                let shard_wal = Rc::new(ShardWal::open(config, NodeStatus::Standalone, StubReplicationClient).await.unwrap());
+                                let shard_wal = Rc::new(ShardWal::open(config, ValidatedNodeStatus::standalone(), StubReplicationClient, StubS3Downloader).await.unwrap());
 
                                 let mut all_handles = Vec::with_capacity(TOTAL_WRITES);
                                 let num_waves = TOTAL_WRITES / WRITES_PER_WAVE;
@@ -462,7 +466,7 @@ fn bench_write_cache_impact(c: &mut Criterion) {
 
                                             // Measure only the write time
                                             let start = Instant::now();
-                                            let result = shard_wal.write(Some(0), write_request).await;
+                                            let result = shard_wal.write(write_request).await;
                                             let elapsed = start.elapsed();
 
                                             black_box(result.unwrap());
@@ -511,7 +515,7 @@ fn bench_write_cache_impact(c: &mut Criterion) {
                         let iteration_duration = LocalExecutorBuilder::new(Placement::Fixed(0))
                             .spawn(move || async move {
                                 let config = create_config(shard_dir, fsync_delay, cache_bytes);
-                                let shard_wal = Rc::new(ShardWal::open(config, NodeStatus::Standalone, StubReplicationClient).await.unwrap());
+                                let shard_wal = Rc::new(ShardWal::open(config, ValidatedNodeStatus::standalone(), StubReplicationClient, StubS3Downloader).await.unwrap());
 
                                 let aggregate_key = AggregateKey::new(1, 1, 1);
                                 let mut all_handles = Vec::with_capacity(TOTAL_WRITES);
@@ -538,7 +542,7 @@ fn bench_write_cache_impact(c: &mut Criterion) {
 
                                             // Measure only the write time
                                             let start = Instant::now();
-                                            let result = shard_wal.write(Some(0), write_request).await;
+                                            let result = shard_wal.write(write_request).await;
                                             let elapsed = start.elapsed();
 
                                             black_box(result.unwrap());
