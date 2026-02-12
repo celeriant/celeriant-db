@@ -5,3 +5,4 @@ pub mod sidecar_s3_uploader;
 pub mod sidecar_s3_downloader;
 pub mod error;
 pub mod sidecar_runtime;
+pub mod sidecar_lease_storage;

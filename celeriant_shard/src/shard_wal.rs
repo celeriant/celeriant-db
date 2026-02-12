@@ -1380,6 +1380,10 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let read_max_chunk_size = self.config.read_max_chunk_size;
         let max_s3_fallback_batch_bytes = self.config.max_s3_fallback_batch_bytes;
 
+        if !self.node_status.get().raw().is_leader() {
+            return Ok(());
+        }
+
         if rotating_log_cache.force_immediate.get() {
             let mc_capture = shard_mem_cache.clone();
             self.replication_coordinator

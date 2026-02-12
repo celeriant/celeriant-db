@@ -12,3 +12,4 @@ blake3.workspace = true
 
 [dev-dependencies]
 celeriant_wire = { path = "../celeriant_wire" }
+futures.workspace = true

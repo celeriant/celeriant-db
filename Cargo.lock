@@ -436,6 +436,7 @@ dependencies = [
  "blake3",
  "celeriant_wal",
  "celeriant_wire",
+ "futures",
 ]
 
 [[package]]
