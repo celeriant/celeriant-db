@@ -1,6 +1,4 @@
-use std::time::Instant;
-
-use celeriant_distributed::node_status::NodeStatus;
+use celeriant_distributed::validated_node_status::ValidatedNodeStatus;
 use celeriant_msg::process_requests::Request;
 use celeriant_shard::{error::s3_catchup_error::S3CatchupError, shard_wal_s3_catchup::S3CatchupResult};
 use glommio::net::AcceptedTcpStream;
@@ -17,9 +15,10 @@ pub enum IntrashardMessages {
         port_type: PortType,
     },
     EnterS3Catchup,
-    S3CatchupComplete { 
+    S3CatchupComplete {
         shard_id: usize,
-        result: Result<S3CatchupResult, S3CatchupError> 
+        result: Result<S3CatchupResult, S3CatchupError>
     },
-    StatusUpdate { status: NodeStatus, valid_until: Instant },
+    StatusUpdate { status: ValidatedNodeStatus },
+    UpdateFollower { replication_address: Option<String> }
 }

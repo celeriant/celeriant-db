@@ -3,6 +3,7 @@ use celeriant_wire::network::wire_error::WireError;
 
 #[derive(Debug)]
 pub enum ClientError {
+    NoAddress,
     ConnectionTimeout,
     ConnectionFailed(glommio::GlommioError<()>),
     SetNoDelayError(glommio::GlommioError<()>),

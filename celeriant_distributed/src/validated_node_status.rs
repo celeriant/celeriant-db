@@ -1,39 +1,43 @@
-use std::time::Instant;
-
+use crate::heartbeat::now_ms;
 use crate::node_status::NodeStatus;
 
-/// NodeStatus with a TTL. If shard 0 doesn't refresh before `valid_until`,
+/// NodeStatus with a TTL. If shard 0 doesn't refresh before `expires_at_ms`,
 /// the effective status decays to Fenced.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct ValidatedNodeStatus {
     status: NodeStatus,
-    valid_until: Instant,
+    expires_at_ms: u64,
 }
 
 impl ValidatedNodeStatus {
 
     pub fn fenced() -> Self {
-        Self { status: NodeStatus::Fenced, valid_until: Instant::now() }
+        Self { status: NodeStatus::Fenced, expires_at_ms: 0 }
     }
 
     pub fn standalone() -> Self {
-        Self { status: NodeStatus::Standalone, valid_until: Instant::now() }
+        Self { status: NodeStatus::Standalone, expires_at_ms: 0 }
     }
 
     pub fn boot_catchup() -> Self {
-        Self { status: NodeStatus::BootCatchup, valid_until: Instant::now() }
+        Self { status: NodeStatus::BootCatchup, expires_at_ms: 0 }
     }
 
-    pub fn new(status: NodeStatus, valid_until: Instant) -> Self {
-        Self { status, valid_until }
+    pub fn new(status: NodeStatus, expires_at_ms: u64) -> Self {
+        Self { status, expires_at_ms }
     }
 
     /// Returns the effective status. Fenced if expired.
-    /// Standalone and BootCatchup are TTL-exempt (no shard 0 refresh loop yet).
+    /// TTL-exempt: Standalone, BootCatchup, FollowerCatchingUp, FollowerCaughtUp.
+    /// Catchup states are orchestrated by shard 0, which provides a fresh TTL on exit.
     pub fn effective(&self) -> NodeStatus {
         match self.status {
-            NodeStatus::Standalone | NodeStatus::BootCatchup => self.status,
-            _ if Instant::now() > self.valid_until => NodeStatus::Fenced,
+            NodeStatus::Standalone
+            | NodeStatus::BootCatchup
+            | NodeStatus::Fenced
+            | NodeStatus::FollowerCatchingUp { .. }
+            | NodeStatus::FollowerCaughtUp { .. } => self.status,
+            _ if now_ms() > self.expires_at_ms => NodeStatus::Fenced,
             _ => self.status,
         }
     }
@@ -43,8 +47,8 @@ impl ValidatedNodeStatus {
         self.status
     }
 
-    pub fn valid_until(&self) -> Instant {
-        self.valid_until
+    pub fn expires_at_ms(&self) -> u64 {
+        self.expires_at_ms
     }
 
     pub fn is_follower(&self) -> bool {

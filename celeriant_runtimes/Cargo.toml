@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+celeriant_disk = { path = "../celeriant_disk" }
 celeriant_shard = { path = "../celeriant_shard" }
 celeriant_sidecar = { path = "../celeriant_sidecar" }
 celeriant_wal = { path = "../celeriant_wal" }

@@ -399,7 +399,39 @@ impl ServerConfigExt for ServerConfig {
             if self.s3_allow_http {
                 args.push("--s3-allow-http".to_string());
             }
+
+            args.push("--s3-catchup-max-rounds".to_string());
+            args.push(self.s3_catchup_max_rounds.to_string());
+
+            args.push("--max-s3-fallback-batch-bytes".to_string());
+            args.push(self.max_s3_fallback_batch_bytes.to_string());
         }
+
+        args.push("--pending-replication-high-water-bytes".to_string());
+        args.push(self.pending_replication_high_water_bytes.to_string());
+
+        args.push("--max-cluster-time-drift-ms".to_string());
+        args.push(self.max_cluster_time_drift_ms.to_string());
+
+        args.push("--max-catchup-gap-bytes".to_string());
+        args.push(self.max_catchup_gap_bytes.to_string());
+
+        if let Some(timeout) = self.internode_connection_timeout_ms {
+            args.push("--internode-connection-timeout-ms".to_string());
+            args.push(timeout.to_string());
+        }
+
+        args.push("--replication-delay-us".to_string());
+        args.push(self.replication_delay_us.to_string());
+
+        args.push("--heartbeat-interval-ms".to_string());
+        args.push(self.heartbeat_interval_ms.to_string());
+
+        args.push("--heartbeat-lease-duration-ms".to_string());
+        args.push(self.heartbeat_lease_duration_ms.to_string());
+
+        args.push("--max-clock-drift-ms".to_string());
+        args.push(self.max_clock_drift_ms.to_string());
 
         args
     }

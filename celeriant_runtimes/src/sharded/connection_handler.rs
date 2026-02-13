@@ -1,5 +1,6 @@
 use std::{cell::Cell, fmt, rc::Rc, time::Duration};
 
+use celeriant_distributed::{lease_manager::LeaseManager, lease_store::LeaseStore};
 use celeriant_msg::{
     process_requests::Request,
     process_responses::Response,
@@ -33,16 +34,17 @@ pub struct CatchupCompletionMsg {
     pub result: Result<S3CatchupResult, S3CatchupError>,
 }
 
-pub struct ConnectionContext<R: ReplicationClient + 'static, D: S3Downloader + 'static> {
+pub struct ConnectionContext<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static> {
     pub config: Rc<ShardConfig>,
     pub current_shard_id: usize,
     pub intrashard_sender: Rc<Senders<IntrashardMessages>>,
     pub shutdown_requested: Rc<Cell<bool>>,
     pub shard_wal: Rc<ShardWal<R, D>>,
     pub catchup_completion_tx: Option<Rc<LocalSender<CatchupCompletionMsg>>>,
+    pub lease_manager: Option<Rc<LeaseManager<S>>>,
 }
 
-impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> Clone for ConnectionContext<R, D> {
+impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static> Clone for ConnectionContext<R, D, S> {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
@@ -51,6 +53,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> Clone for Connec
             shutdown_requested: self.shutdown_requested.clone(),
             shard_wal: self.shard_wal.clone(),
             catchup_completion_tx: self.catchup_completion_tx.clone(),
+            lease_manager: self.lease_manager.clone(),
         }
     }
 }
@@ -78,7 +81,7 @@ enum RedirectResult {
     ErrorSentContinue(TcpStream),
 }
 
-pub fn handle_new_connection<R: ReplicationClient + 'static, D: S3Downloader + 'static>(mut tcp_stream: TcpStream, ctx: ConnectionContext<R, D>, port_type: PortType) {
+pub fn handle_new_connection<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(mut tcp_stream: TcpStream, ctx: ConnectionContext<R, D, S>, port_type: PortType) {
     let _ = tcp_stream.set_nodelay(true);
 
     glommio::spawn_local(async move {
@@ -102,14 +105,14 @@ pub fn handle_new_connection<R: ReplicationClient + 'static, D: S3Downloader + '
     .detach();
 }
 
-pub fn handle_redirected_connection<R: ReplicationClient + 'static, D: S3Downloader + 'static>(
+pub fn handle_redirected_connection<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
     tcp_stream: TcpStream,
     request: Request,
     max_request_size: u64,
     max_response_size: u64,
     server_compression_algorithm: CompressionType,
     message_version: u32,
-    ctx: ConnectionContext<R, D>,
+    ctx: ConnectionContext<R, D, S>,
     port_type: PortType,
 ) {
     let _ = tcp_stream.set_nodelay(true);
@@ -120,8 +123,8 @@ pub fn handle_redirected_connection<R: ReplicationClient + 'static, D: S3Downloa
     .detach();
 }
 
-pub fn handle_enter_s3_catchup<R: ReplicationClient + 'static, D: S3Downloader + 'static>(
-    ctx: ConnectionContext<R, D>,
+pub fn handle_enter_s3_catchup<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
+    ctx: ConnectionContext<R, D, S>,
 ) {
     glommio::spawn_local(async move {        
         let result = ctx.shard_wal.enter_s3_catchup().await;
@@ -133,14 +136,14 @@ pub fn handle_enter_s3_catchup<R: ReplicationClient + 'static, D: S3Downloader +
     .detach();
 }
 
-async fn handle_pipelining<R: ReplicationClient + 'static, D: S3Downloader + 'static>(
+async fn handle_pipelining<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
     mut tcp_stream: TcpStream,
     request: Request,
     max_request_size: u64,
     max_response_size: u64,
     server_compression_algorithm: CompressionType,
     mut message_version: u32,
-    ctx: ConnectionContext<R, D>,
+    ctx: ConnectionContext<R, D, S>,
     port_type: PortType,
 ) {
     let mut optional_request = Some(request);
@@ -217,13 +220,13 @@ fn is_valid_for_port(request: &Request, port_type: PortType) -> bool {
     }
 }
 
-async fn check_redirect<R: ReplicationClient + 'static, D: S3Downloader + 'static>(
+async fn check_redirect<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
     mut tcp_stream: TcpStream,
     request: Request,
     max_message_size: u64,
     server_compression_algorithm: CompressionType,
     message_version: u32,
-    ctx: &ConnectionContext<R, D>,
+    ctx: &ConnectionContext<R, D, S>,
     port_type: PortType,
 ) -> RedirectResult {
     let target_shard = match determine_shard(&request, &ctx.config, port_type) {
@@ -401,9 +404,9 @@ fn collect_unique_shard_id(
     shard_id.ok_or(ShardRoutingError::NoRoutingKeyProvided)
 }
 
-async fn read_request<R: ReplicationClient + 'static, D: S3Downloader + 'static>(
+async fn read_request<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
     tcp_stream: &mut TcpStream,
-    ctx: &ConnectionContext<R, D>,
+    ctx: &ConnectionContext<R, D, S>,
 ) -> Option<(Request, u32)> {
     match glommio::timer::timeout(ctx.config.slow_client_timeout, async {
         let result = Request::read_request(tcp_stream, ctx.config.max_request_size).await;
@@ -446,9 +449,9 @@ async fn write_response(
     }
 }
 
-async fn process_request<R: ReplicationClient + 'static, D: S3Downloader + 'static>(
+async fn process_request<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
     tcp_stream: &mut TcpStream,
-    ctx: &ConnectionContext<R, D>,
+    ctx: &ConnectionContext<R, D, S>,
     request: Request,
     max_message_size: u64,
     server_compression_algorithm: CompressionType,
@@ -462,13 +465,13 @@ async fn process_request<R: ReplicationClient + 'static, D: S3Downloader + 'stat
     let _ = write_response(tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
 }
 
-async fn handle_watch<R: ReplicationClient + 'static, D: S3Downloader + 'static>(
+async fn handle_watch<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
     mut tcp_stream: TcpStream,
     watch_request: WatchRequest,
     max_message_size: u64,
     server_compression_algorithm: CompressionType,
     message_version: u32,
-    ctx: &ConnectionContext<R, D>,
+    ctx: &ConnectionContext<R, D, S>,
 ) {
     let correlation_id = watch_request.correlation_id;
 
@@ -544,7 +547,7 @@ mod tests {
             node_id: 1,
             num_shards,
             s3_download_max_rounds: 3,
-            node_status: celeriant_distributed::node_status::NodeStatus::Standalone,
+            replication_config: None,
             advertised_replication_address: None,
             data_root: "/tmp".into(),
             listen_address: "127.0.0.1".into(),
@@ -577,9 +580,6 @@ mod tests {
             max_cluster_time_drift_ms: 5000,
             max_catchup_gap_bytes: 104_857_600,
             internode_connection_timeout: None,
-            heartbeat_interval_ms: 500,
-            heartbeat_lease_duration_ms: 1500,
-            max_clock_drift_ms: 500,
             max_s3_fallback_batch_bytes: 1024 * 1024 * 100,
         }
     }

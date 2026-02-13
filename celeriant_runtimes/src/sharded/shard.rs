@@ -1,10 +1,11 @@
 use std::{
     cell::Cell,
     rc::Rc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
-use celeriant_distributed::validated_node_status::ValidatedNodeStatus;
+use celeriant_disk::files::rwlock_timeout::write_with_timeout;
+use celeriant_distributed::{lease_manager::LeaseManager, lease_store::LeaseStore};
 use celeriant_shard::{replication_client::ReplicationClient, s3_downloader::S3Downloader, shard_wal::ShardWal};
 use glommio::{
     channels::{
@@ -14,39 +15,36 @@ use glommio::{
     },
     net::TcpListener,
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
-use crate::{
-    sharded::{
-        connection_handler::{
-            CatchupCompletionMsg, ConnectionContext, PortType, handle_enter_s3_catchup, handle_new_connection, handle_redirected_connection,
-        },
-        intrashard_messages::IntrashardMessages,
-        shard_config::ShardConfig,
-        signal_handler::SignalHandler,
+use crate::sharded::{
+    connection_handler::{
+        CatchupCompletionMsg, ConnectionContext, PortType, handle_enter_s3_catchup, handle_new_connection, handle_redirected_connection,
     },
-    sidecar::sidecar_channels::SidecarSenders,
+    intrashard_messages::IntrashardMessages,
+    shard_config::ShardConfig,
+    signal_handler::SignalHandler,
 };
 
-pub struct Shard<R: ReplicationClient + 'static, D: S3Downloader + 'static> {
+pub struct Shard<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static> {
     intrashard_receivers: Receivers<IntrashardMessages>,
     client_tcp_listener: Rc<TcpListener>,
     replication_tcp_listener: Rc<TcpListener>,
-    ctx: ConnectionContext<R, D>,
+    ctx: ConnectionContext<R, D, S>,
     shutdown_requested: Rc<Cell<bool>>,
     shard_wal: Rc<ShardWal<R, D>>,
 }
 
-impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> Shard<R, D> {
+impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static> Shard<R, D, S> {
     pub fn new(
         config: ShardConfig,
         current_shard_id: usize,
         sender: Senders<IntrashardMessages>,
         receivers: Receivers<IntrashardMessages>,
-        _sidecar_senders: SidecarSenders,
         client_tcp_listener: TcpListener,
         replication_tcp_listener: TcpListener,
         shard_wal: ShardWal<R, D>,
+        lease_manager: Option<LeaseManager<S>>,
     ) -> Self {
         info!("Initializing shard {current_shard_id}");
 
@@ -60,6 +58,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> Shard<R, D> {
             shutdown_requested: shutdown_requested.clone(),
             shard_wal: shard_wal.clone(),
             catchup_completion_tx: None,
+            lease_manager: lease_manager.map(Rc::new),
         };
 
         Self {
@@ -75,9 +74,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> Shard<R, D> {
     pub async fn run(&mut self) {
         spawn_shard_zero_shutdown_handler(self.ctx.clone());
 
-        let shard_0_distributed_mode = self.ctx.current_shard_id == 0 && !self.shard_wal.node_status.get().raw().is_standalone();
-
-        let rx = if shard_0_distributed_mode {
+        let rx = if self.ctx.lease_manager.is_some() {
             let (tx, rx) = glommio::channels::local_channel::new_unbounded();
             self.ctx.catchup_completion_tx = Some(Rc::new(tx));
             Some(rx)
@@ -150,7 +147,7 @@ async fn broadcast_message_to_other_shards(current_shard_id: usize, message: Int
     }
 }
 
-fn spawn_shard_zero_shutdown_handler<R: ReplicationClient + 'static, D: S3Downloader + 'static>(ctx: ConnectionContext<R, D>) {
+fn spawn_shard_zero_shutdown_handler<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(ctx: ConnectionContext<R, D, S>) {
     if ctx.current_shard_id != 0 {
         return;
     }
@@ -178,10 +175,11 @@ fn spawn_shard_zero_shutdown_handler<R: ReplicationClient + 'static, D: S3Downlo
     .detach();
 }
 
-fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'static>(
-    ctx: ConnectionContext<R, D>,
+fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
+    ctx: ConnectionContext<R, D, S>,
     rx: LocalReceiver<CatchupCompletionMsg>,
 ) {
+    let lease_manager = ctx.lease_manager.clone().unwrap();
     glommio::spawn_local(async move {
         let shard_count = ctx.config.num_shards as usize;
 
@@ -237,41 +235,91 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
             glommio::timer::sleep(Duration::from_secs(5)).await;
         }
 
-        info!("All shards caught up, ready for S3 election");
+        info!("All shards caught up, running election");
 
-        ctx.shard_wal.node_status.set(ValidatedNodeStatus::new(
-            celeriant_distributed::node_status::NodeStatus::Leader { lease_index: 1 }, 
-            Instant::now() + Duration::from_hours(1)));
+        if let Err(e) = lease_manager.register_self().await {
+            error!(error = ?e, "Failed to register node in membership, shutting down");
+            ctx.shutdown_requested.set(true);
+            broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::Shutdown, ctx.intrashard_sender.clone()).await;
+            return;
+        }
+
+        let outcome = match lease_manager.run_election().await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                error!(error = ?e, "Election failed, shutting down");
+                ctx.shutdown_requested.set(true);
+                broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::Shutdown, ctx.intrashard_sender.clone()).await;
+                return;
+            }
+        };
+
+        info!(status = ?outcome.status, peer = ?outcome.peer_info, "Election complete");
+
+        ctx.shard_wal.node_status.set(outcome.status);
 
         for peer in 1..shard_count {
             let _ = ctx
                 .intrashard_sender
-                .send_to(
-                    peer,
-                    IntrashardMessages::StatusUpdate {
-                        status: celeriant_distributed::node_status::NodeStatus::Leader { lease_index: 1 },
-                        valid_until: Instant::now() + Duration::from_hours(1),
-                    },
-                )
+                .send_to(peer, IntrashardMessages::StatusUpdate { status: outcome.status })
                 .await;
+        }
+
+        // Resolve follower address: immediate if known, discovery loop if leader with no peer
+        let peer_info = match outcome.peer_info {
+            Some(info) => Some(info),
+            None if outcome.status.raw().is_leader() => {
+                info!("Follower not yet discovered, entering discovery loop");
+                let mut backoff = Duration::from_secs(1);
+                loop {
+                    glommio::timer::sleep(backoff).await;
+                    match lease_manager.discover_peer().await {
+                        Ok(Some(info)) => {
+                            info!(peer = ?info, "Follower discovered");
+                            break Some(info);
+                        }
+                        Ok(None) => {
+                            debug!("Follower not yet registered, retrying");
+                            backoff = (backoff * 2).min(Duration::from_secs(10));
+                        }
+                        Err(e) => {
+                            warn!(error = ?e, "Discovery failed, retrying");
+                            backoff = (backoff * 2).min(Duration::from_secs(10));
+                        }
+                    }
+                }
+            }
+            None => None,
+        };
+
+        if let Some(peer_info) = &peer_info {
+            let mut guard = ctx.shard_wal.replication_client.write().await.unwrap();
+            guard.set_follower_address(Some(peer_info.replication_address.clone()));
+
+            for peer in 1..shard_count {
+                let _ = ctx
+                    .intrashard_sender
+                    .send_to(peer, IntrashardMessages::UpdateFollower { replication_address: Some(peer_info.replication_address.clone()) })
+                    .await;
+            }
         }
     })
     .detach();
 }
 
-fn spawn_intrashard_message_handler<R: ReplicationClient + 'static, D: S3Downloader + 'static>(
+fn spawn_intrashard_message_handler<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
     stream: ConnectedReceiver<IntrashardMessages>,
-    ctx: ConnectionContext<R, D>,
+    ctx: ConnectionContext<R, D, S>,
 ) {
     glommio::spawn_local(async move {
         while let Some(msg) = stream.recv().await {
-            handle_intrashard_message(msg, &ctx);
+            handle_intrashard_message(msg, &ctx).await;
         }
     })
     .detach();
 }
 
-fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Downloader + 'static>(msg: IntrashardMessages, ctx: &ConnectionContext<R, D>) {
+async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(msg: IntrashardMessages, ctx: &ConnectionContext<R, D, S>) {
     match msg {
         IntrashardMessages::Shutdown => {
             ctx.shutdown_requested.set(true);
@@ -299,8 +347,15 @@ fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Downloader + '
                 let _ = tx.try_send(CatchupCompletionMsg { result, shard_id });
             }
         }
-        IntrashardMessages::StatusUpdate { status, valid_until } => {
-            ctx.shard_wal.node_status.set(ValidatedNodeStatus::new(status, valid_until));
+        IntrashardMessages::StatusUpdate { status } => {
+            ctx.shard_wal.node_status.set(status);
+        }
+        IntrashardMessages::UpdateFollower { replication_address } => {
+            if let Ok(mut guard) = write_with_timeout(&ctx.shard_wal.replication_client, "set_follower_address").await {
+                guard.set_follower_address(replication_address);
+            } else {
+                warn!("Failed to acquire replication client lock for follower address update");
+            }
         }
     }
 }

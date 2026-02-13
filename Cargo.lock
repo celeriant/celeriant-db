@@ -508,6 +508,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "celeriant_disk",
  "celeriant_distributed",
  "celeriant_msg",
  "celeriant_shard",

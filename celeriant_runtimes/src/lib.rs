@@ -1,5 +1,4 @@
-use std::time::Instant;
-
+use celeriant_distributed::lease_manager::LeaseManager;
 use celeriant_distributed::validated_node_status::ValidatedNodeStatus;
 use celeriant_shard::{internal_shard_config::InternalShardConfig, replication_client::GlommioReplicationClient, shard_wal::ShardWal};
 use celeriant_sidecar::store::SidecarStoreTrait;
@@ -10,7 +9,7 @@ use glommio::{
 };
 use tracing::{error, info};
 
-use crate::{sharded::{intrashard_messages::IntrashardMessages, shard::Shard}, sidecar::{sidecar_channels::{SidecarSenders, create_sidecar_channel}, sidecar_runtime::SidecarRuntime, sidecar_s3_downloader::SidecarS3Downloader, sidecar_s3_uploader::SidecarS3Uploader}};
+use crate::{sharded::{intrashard_messages::IntrashardMessages, shard::Shard}, sidecar::{sidecar_channels::{SidecarSenders, create_sidecar_channel}, sidecar_lease_storage::SidecarLeaseStorage, sidecar_runtime::SidecarRuntime, sidecar_s3_downloader::SidecarS3Downloader, sidecar_s3_uploader::SidecarS3Uploader}};
 
 mod sharded;
 mod sidecar;
@@ -77,7 +76,7 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
             };
             let s3_uploader = SidecarS3Uploader::new(sidecar_senders.clone());
             let replication_client = GlommioReplicationClient::new(
-                String::new(), //TODO: Follower address needs to be set for replication to happen. but we can only know it from s3 membership.bin
+                None,
                 shard_config.internode_connection_timeout,
                 shard_config.max_request_size,
                 shard_config.max_response_size,
@@ -86,11 +85,23 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
             );
             let s3_downloader = SidecarS3Downloader::new(sidecar_senders.clone());
 
-            let validated_node_status = ValidatedNodeStatus::new(shard_config.node_status, Instant::now());
+            let validated_node_status = if shard_config.replication_config.is_some() {
+                ValidatedNodeStatus::boot_catchup()
+            } else {
+                ValidatedNodeStatus::standalone()
+            };
             let filesystem = ShardWal::open(internal_shard_config, validated_node_status, replication_client, s3_downloader).await
                 .expect(&format!("Failed to initialize filesystem at {:?} - cannot initialize shard", shard_config.data_root));
 
-            Shard::new(shard_config, current_shard_id, sender, receivers, sidecar_senders, client_tcp_listener, replication_tcp_listener, filesystem).run().await;
+            let lease_manager = if shard_config.replication_config.is_some() && current_shard_id == 0 {
+                let lease_storage = SidecarLeaseStorage::new(sidecar_senders.clone());
+                let replication_config = shard_config.replication_config.clone().unwrap();
+                Some(LeaseManager::new(lease_storage, replication_config))
+            } else {
+                None
+            };
+
+            Shard::new(shard_config, current_shard_id, sender, receivers, client_tcp_listener, replication_tcp_listener, filesystem, lease_manager).run().await;
 
         }))
         .unwrap()

@@ -116,7 +116,7 @@ pub struct ShardWal<R: ReplicationClient + 'static, D: S3Downloader + 'static> {
     aggregate_client_loading: LoadingCoordinator<AggregateClientKey>,
 
     /// Client for replicating data to followers or S3
-    replication_client: Rc<RwLock<R>>,
+    pub replication_client: Rc<RwLock<R>>,
 }
 
 impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> AggregateReader for ShardWal<R, D> {
@@ -1731,7 +1731,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             NodeStatus::Follower { leader_lease_index } => NodeStatus::FollowerCatchingUp { leader_lease_index },
             _ => NodeStatus::BootCatchup,
         };
-        self.node_status.set(ValidatedNodeStatus::new(catchup_status, self.node_status.get().valid_until()));
+        self.node_status.set(ValidatedNodeStatus::new(catchup_status, 0));
 
         catchup_from_s3(
             &self.log_segments_cache, 
@@ -2114,7 +2114,7 @@ mod tests {
         glommio_test!({
             let (_tmp, dir) = test_dir();
             let shard = open_shard(&dir).await;
-            shard.node_status.set(ValidatedNodeStatus::new(NodeStatus::Fenced, Instant::now()));
+            shard.node_status.set(ValidatedNodeStatus::fenced());
 
             let result = process(&shard, write_req(key(1, 1, 1), events(1))).await;
             assert!(matches!(result, Err(ShardError::Write(ShardWriteError::ShardCannotAcceptWrites))));
@@ -2548,10 +2548,14 @@ mod tests {
             }
             Ok(())
         }
+        
+        fn set_follower_address(&mut self, _address: Option<String>) {
+
+        }
     }
 
     async fn open_leader_shard(dir: &std::path::Path, client: FailThenSucceedReplicationClient) -> ShardWal<FailThenSucceedReplicationClient, StubS3Downloader> {
-        ShardWal::open(test_config(dir), ValidatedNodeStatus::new(NodeStatus::Leader { lease_index: 0 }, Instant::now() + Duration::from_secs(10)), client, StubS3Downloader)
+        ShardWal::open(test_config(dir), ValidatedNodeStatus::new(NodeStatus::Leader { lease_index: 0 }, now_ms() + 10_000), client, StubS3Downloader)
             .await
             .unwrap()
     }
@@ -2621,7 +2625,7 @@ mod tests {
     // ── Replication (handle_replication_batch) ──
 
     async fn open_follower_shard(dir: &std::path::Path) -> ShardWal<StubReplicationClient, StubS3Downloader> {
-        ShardWal::open(test_config(dir), ValidatedNodeStatus::new(NodeStatus::Follower { leader_lease_index: 0 }, Instant::now() + Duration::from_secs(10)), StubReplicationClient, StubS3Downloader)
+        ShardWal::open(test_config(dir), ValidatedNodeStatus::new(NodeStatus::Follower { leader_lease_index: 0 }, now_ms() + 10_000), StubReplicationClient, StubS3Downloader)
             .await
             .unwrap()
     }

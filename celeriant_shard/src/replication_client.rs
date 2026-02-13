@@ -17,6 +17,7 @@ use crate::s3_uploader::S3Uploader;
 
 #[allow(async_fn_in_trait)]
 pub trait ReplicationClient {
+    fn set_follower_address(&mut self, address: Option<String>);
     async fn replicate_to_follower(&mut self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError>;
     async fn replicate_to_s3(&mut self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToS3Error>;
 }
@@ -24,6 +25,8 @@ pub trait ReplicationClient {
 pub struct StubReplicationClient;
 
 impl ReplicationClient for StubReplicationClient {
+    fn set_follower_address(&mut self, _address: Option<String>) {}
+
     async fn replicate_to_follower(&mut self, _batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError> {
         glommio::timer::sleep(std::time::Duration::from_millis(30)).await;
         Ok(())
@@ -36,7 +39,7 @@ impl ReplicationClient for StubReplicationClient {
 }
 
 pub struct GlommioReplicationClient<S: S3Uploader> {
-    follower_address: String,
+    follower_address: Option<String>,
     shard_id: u64,
     client: Option<CeleriantClient>,
     connection_timeout: Option<std::time::Duration>,
@@ -47,7 +50,7 @@ pub struct GlommioReplicationClient<S: S3Uploader> {
 
 impl<S: S3Uploader> GlommioReplicationClient<S> {
     pub fn new(
-        follower_address: String,
+        follower_address: Option<String>,
         connection_timeout: Option<Duration>,
         max_request_size: u64,
         max_response_size: u64,
@@ -72,13 +75,22 @@ impl<S: S3Uploader> GlommioReplicationClient<S> {
             client.close().await?;
         }
         if self.client.is_none() {
-            self.client = Some(CeleriantClient::connect_with_timeout(&self.follower_address, self.connection_timeout, self.max_request_size, self.max_response_size).await?);
+            let address = self.follower_address.as_deref()
+                .ok_or(ClientError::NoAddress)?;
+            self.client = Some(CeleriantClient::connect_with_timeout(address, self.connection_timeout, self.max_request_size, self.max_response_size).await?);
         }
         Ok(self.client.as_mut().unwrap())
     }
 }
 
 impl<S: S3Uploader> ReplicationClient for GlommioReplicationClient<S> {
+    fn set_follower_address(&mut self, address: Option<String>) {
+        if self.follower_address != address {
+            self.follower_address = address;
+            self.client = None;
+        }
+    }
+
     async fn replicate_to_follower(&mut self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError> {
         if batches.is_empty() {
             return Ok(());
@@ -253,7 +265,7 @@ mod tests {
             let (mock_uploader, calls) = MockS3Uploader::new();
 
             let mut client = GlommioReplicationClient {
-                follower_address: "127.0.0.1:8080".to_string(),
+                follower_address: Some("127.0.0.1:8080".to_string()),
                 shard_id: 7,
                 client: None,
                 connection_timeout: None,
@@ -273,7 +285,7 @@ mod tests {
     fn no_uploader_returns_s3_not_configured() {
         LocalExecutor::default().run(async {
             let mut client: GlommioReplicationClient<MockS3Uploader> = GlommioReplicationClient {
-                follower_address: "127.0.0.1:8080".to_string(),
+                follower_address: Some("127.0.0.1:8080".to_string()),
                 shard_id: 7,
                 client: None,
                 connection_timeout: None,
@@ -299,7 +311,7 @@ mod tests {
             let (mock_uploader, calls) = MockS3Uploader::new();
 
             let mut client = GlommioReplicationClient {
-                follower_address: "127.0.0.1:8080".to_string(),
+                follower_address: Some("127.0.0.1:8080".to_string()),
                 shard_id: 7,
                 client: None,
                 connection_timeout: None,
@@ -344,7 +356,7 @@ mod tests {
             let (mock_uploader, calls) = MockS3Uploader::new();
 
             let mut client = GlommioReplicationClient {
-                follower_address: "127.0.0.1:8080".to_string(),
+                follower_address: Some("127.0.0.1:8080".to_string()),
                 shard_id: 5,
                 client: None,
                 connection_timeout: None,
@@ -399,7 +411,7 @@ mod tests {
             );
 
             let mut client = GlommioReplicationClient {
-                follower_address: "127.0.0.1:8080".to_string(),
+                follower_address: Some("127.0.0.1:8080".to_string()),
                 shard_id: 7,
                 client: None,
                 connection_timeout: None,

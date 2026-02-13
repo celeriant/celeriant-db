@@ -5,6 +5,7 @@ use crate::config::ReplicationConfig;
 use crate::heartbeat::now_ms;
 use crate::lease_store::{LeaseStore, LeaseStoreError, MembershipWithEtag};
 use crate::node_status::NodeStatus;
+use crate::validated_node_status::ValidatedNodeStatus;
 
 /// Max CAS retries for membership updates. In a 2-node cluster, one retry
 /// suffices — the second attempt merges the concurrent write. Extra retries
@@ -13,7 +14,7 @@ const MEMBERSHIP_CAS_MAX_RETRIES: u32 = 5;
 
 #[derive(Debug, Clone)]
 pub struct ElectionOutcome {
-    pub status: NodeStatus,
+    pub status: ValidatedNodeStatus,
     pub peer_info: Option<NodeInfo>,
 }
 
@@ -78,23 +79,23 @@ impl<S: LeaseStore> LeaseManager<S> {
                     self.config.initial_lease_duration.as_millis() as u64,
                 );
                 match self.store.put_lease_create_only(&lease).await {
-                    Ok(_) => self.become_leader(1).await,
+                    Ok(_) => self.become_leader(&lease).await,
                     Err(LeaseStoreError::AlreadyExists) => {
                         let lwe = self.store.get_lease().await?.ok_or_else(|| {
                             LeaseStoreError::Unavailable {
                                 message: "lease disappeared after AlreadyExists".into(),
                             }
                         })?;
-                        self.become_follower(lwe.lease).await
+                        self.become_follower(&lwe.lease).await
                     }
                     Err(e) => Err(e),
                 }
             }
             Some(lwe) if !lwe.lease.is_expired(now) => {
                 if lwe.lease.leader_node_id == self.config.node_id {
-                    self.become_leader(lwe.lease.lease_index).await
+                    self.become_leader(&lwe.lease).await
                 } else {
-                    self.become_follower(lwe.lease).await
+                    self.become_follower(&lwe.lease).await
                 }
             }
             Some(lwe) => {
@@ -108,14 +109,14 @@ impl<S: LeaseStore> LeaseManager<S> {
                     .put_lease_conditional(&promoted, &lwe.etag)
                     .await
                 {
-                    Ok(_) => self.become_leader(promoted.lease_index).await,
+                    Ok(_) => self.become_leader(&promoted).await,
                     Err(LeaseStoreError::PreconditionFailed) => {
                         let new_lwe = self.store.get_lease().await?.ok_or_else(|| {
                             LeaseStoreError::Unavailable {
                                 message: "lease disappeared after PreconditionFailed".into(),
                             }
                         })?;
-                        self.become_follower(new_lwe.lease).await
+                        self.become_follower(&new_lwe.lease).await
                     }
                     Err(e) => Err(e),
                 }
@@ -128,20 +129,24 @@ impl<S: LeaseStore> LeaseManager<S> {
         Ok(membership.and_then(|mwe| mwe.membership.peer_of(self.config.node_id).cloned()))
     }
 
-    async fn become_follower(&self, lease: Lease) -> Result<ElectionOutcome, LeaseStoreError> {
+    async fn become_follower(&self, lease: &Lease) -> Result<ElectionOutcome, LeaseStoreError> {
         let peer_info = self.discover_peer().await.ok().flatten();
         Ok(ElectionOutcome {
-            status: NodeStatus::Follower {
-                leader_lease_index: lease.lease_index,
-            },
+            status: ValidatedNodeStatus::new(
+                NodeStatus::Follower { leader_lease_index: lease.lease_index },
+                lease.expires_at_ms,
+            ),
             peer_info,
         })
     }
 
-    async fn become_leader(&self, lease_index: u64) -> Result<ElectionOutcome, LeaseStoreError> {
+    async fn become_leader(&self, lease: &Lease) -> Result<ElectionOutcome, LeaseStoreError> {
         let peer_info = self.discover_peer().await.ok().flatten();
         Ok(ElectionOutcome {
-            status: NodeStatus::Leader { lease_index },
+            status: ValidatedNodeStatus::new(
+                NodeStatus::Leader { lease_index: lease.lease_index },
+                lease.expires_at_ms,
+            ),
             peer_info,
         })
     }
@@ -317,7 +322,7 @@ mod tests {
         let outcome = block_on(manager.run_election()).unwrap();
 
         assert!(matches!(
-            outcome.status,
+            outcome.status.raw(),
             NodeStatus::Leader { lease_index: 1 }
         ));
         assert!(outcome.peer_info.is_none());
@@ -337,7 +342,7 @@ mod tests {
         let outcome = block_on(manager.run_election()).unwrap();
 
         assert!(matches!(
-            outcome.status,
+            outcome.status.raw(),
             NodeStatus::Follower {
                 leader_lease_index: 1
             }
@@ -359,7 +364,7 @@ mod tests {
         let outcome = block_on(manager.run_election()).unwrap();
 
         assert!(matches!(
-            outcome.status,
+            outcome.status.raw(),
             NodeStatus::Leader { lease_index: 3 }
         ));
     }
@@ -376,7 +381,7 @@ mod tests {
         let outcome = block_on(manager.run_election()).unwrap();
 
         assert!(matches!(
-            outcome.status,
+            outcome.status.raw(),
             NodeStatus::Follower {
                 leader_lease_index: 5
             }
@@ -397,7 +402,7 @@ mod tests {
         let outcome = block_on(manager.run_election()).unwrap();
 
         assert!(matches!(
-            outcome.status,
+            outcome.status.raw(),
             NodeStatus::Follower {
                 leader_lease_index: 2
             }
@@ -420,7 +425,7 @@ mod tests {
         let outcome = block_on(manager.run_election()).unwrap();
 
         assert!(matches!(
-            outcome.status,
+            outcome.status.raw(),
             NodeStatus::Leader { lease_index: 4 }
         ));
         assert_eq!(outcome.peer_info.as_ref().unwrap().node_id, 2);
@@ -440,7 +445,7 @@ mod tests {
         let outcome = block_on(manager.run_election()).unwrap();
 
         assert!(matches!(
-            outcome.status,
+            outcome.status.raw(),
             NodeStatus::Leader { lease_index: 3 }
         ));
     }
@@ -459,7 +464,7 @@ mod tests {
         let outcome = block_on(manager.run_election()).unwrap();
 
         assert!(matches!(
-            outcome.status,
+            outcome.status.raw(),
             NodeStatus::Follower {
                 leader_lease_index: 4
             }

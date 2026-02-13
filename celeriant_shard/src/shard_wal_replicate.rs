@@ -563,6 +563,10 @@ mod tests {
             self.s3_item_counts.borrow_mut().push(batches.len());
             Ok(())
         }
+        
+        fn set_follower_address(&mut self, _address: Option<String>) {
+
+        }
     }
 
     fn make_captured_data(count: usize) -> ReplicationCapturedData {

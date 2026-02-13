@@ -1,4 +1,4 @@
-use celeriant_distributed::node_status::NodeStatus;
+use celeriant_distributed::config::ReplicationConfig;
 use celeriant_runtimes::RoutingRule;
 use celeriant_runtimes::{ShardConfig, SidecarConfig};
 use celeriant_shard::timestamp_config::{TimestampConfig, TimestampPrecision};
@@ -381,15 +381,30 @@ impl ServerConfig {
 
     pub fn to_shard_config(&self, node_id: u128, num_shards: u32) -> ShardConfig {
         use celeriant_runtimes::{CompressionType};
+
+        let replication_config = if self.standalone {
+            None
+        } else {
+            let client_address = format!("{}:{}", self.listen_address, self.client_port);
+            let replication_address = self.advertised_replication_address.clone()
+                .unwrap_or_else(|| format!("{}:{}", self.listen_address, self.replication_port));
+            Some(ReplicationConfig {
+                node_id,
+                client_address,
+                replication_address,
+                num_shards,
+                initial_lease_duration: Duration::from_millis(self.heartbeat_lease_duration_ms),
+                heartbeat_interval: Duration::from_millis(self.heartbeat_interval_ms),
+                max_clock_drift: Duration::from_millis(self.max_clock_drift_ms),
+                ..Default::default()
+            })
+        };
+
         ShardConfig {
             node_id,
             num_shards,
             s3_download_max_rounds: self.s3_catchup_max_rounds,
-            node_status: if self.standalone {
-                NodeStatus::Standalone
-            } else {
-                NodeStatus::Fenced
-            },
+            replication_config,
             advertised_replication_address: self.advertised_replication_address.clone(),
             data_root: std::path::absolute(&self.data_root)
                 .expect("Failed to resolve data_root to an absolute path"),
@@ -433,9 +448,6 @@ impl ServerConfig {
                 ConfigCompressionType::Brotli => CompressionType::Brotli { level: self.server_compression_level.unwrap_or(6) },
                 ConfigCompressionType::Gzip => CompressionType::Gzip { level: self.server_compression_level.unwrap_or(6) },
             },
-            heartbeat_interval_ms: self.heartbeat_interval_ms,
-            heartbeat_lease_duration_ms: self.heartbeat_lease_duration_ms,
-            max_clock_drift_ms: self.max_clock_drift_ms,
             max_s3_fallback_batch_bytes: self.max_s3_fallback_batch_bytes,
         }
     }
