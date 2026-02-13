@@ -136,6 +136,7 @@ pub enum HeartbeatRejection {
         follower_ms: u64,
         max_allowed_ms: u64,
     },
+    NotAFollower,
 }
 
 /// Result of a replication batch - either success or explicit rejection.

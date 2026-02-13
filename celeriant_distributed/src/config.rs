@@ -57,6 +57,12 @@ impl ReplicationConfig {
         self.heartbeat_interval * self.max_missed_heartbeats
     }
 
+    /// How long shards trust their status without a heartbeat refresh.
+    /// Gives enough headroom for max_missed_heartbeats + clock drift before self-fencing.
+    pub fn status_ttl_ms(&self) -> u64 {
+        (self.heartbeat_timeout() + self.max_clock_drift).as_millis() as u64
+    }
+
     /// Validates the configuration for consistency.
     pub fn validate(&self) -> Result<(), String> {
         let timeout = self.heartbeat_timeout();

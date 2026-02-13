@@ -5,7 +5,8 @@ use std::{
 };
 
 use celeriant_disk::files::rwlock_timeout::write_with_timeout;
-use celeriant_distributed::{lease_manager::LeaseManager, lease_store::LeaseStore};
+use celeriant_distributed::{heartbeat::now_ms, lease_manager::LeaseManager, lease_store::LeaseStore, validated_node_status::ValidatedNodeStatus};
+use celeriant_msg::response::responses::HeartbeatResult;
 use celeriant_shard::{replication_client::ReplicationClient, s3_downloader::S3Downloader, shard_wal::ShardWal};
 use glommio::{
     channels::{
@@ -175,64 +176,120 @@ fn spawn_shard_zero_shutdown_handler<R: ReplicationClient + 'static, D: S3Downlo
     .detach();
 }
 
+/// Returns true if all shards caught up successfully, false if shutdown was triggered.
+async fn run_s3_catchup<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
+    ctx: &ConnectionContext<R, D, S>,
+    rx: &LocalReceiver<CatchupCompletionMsg>,
+) -> bool {
+    let shard_count = ctx.config.num_shards as usize;
+
+    loop {
+        for peer in 1..shard_count {
+            let _ = ctx.intrashard_sender.send_to(peer, IntrashardMessages::EnterS3Catchup).await;
+        }
+
+        let mut results = vec![];
+
+        // Shard0 is NOT part of ctx.intrashard_sender so kick it off explicitly
+        let shard0_result = ctx.shard_wal.enter_s3_catchup().await;
+        results.push(CatchupCompletionMsg { shard_id: 0, result: shard0_result });
+
+        let mut remaining = shard_count - 1;
+        while remaining > 0 {
+            match rx.recv().await {
+                Some(msg) => {
+                    results.push(msg);
+                    remaining -= 1;
+                }
+                None => break,
+            }
+        }
+
+        let mut has_retriable = false;
+        let mut has_fatal = false;
+
+        for msg in &results {
+            match &msg.result {
+                Ok(_) => {}
+                Err(e) if e.is_retriable() => {
+                    warn!(shard_id = msg.shard_id, error = ?e, "S3 catchup retriable error, will retry");
+                    has_retriable = true;
+                }
+                Err(e) => {
+                    error!(shard_id = msg.shard_id, error = ?e, "S3 catchup fatal error, shutting down");
+                    has_fatal = true;
+                }
+            }
+        }
+
+        if has_fatal {
+            ctx.shutdown_requested.set(true);
+            broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::Shutdown, ctx.intrashard_sender.clone()).await;
+            return false;
+        }
+
+        if !has_retriable {
+            return true;
+        }
+
+        glommio::timer::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+async fn update_follower_address<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
+    ctx: &ConnectionContext<R, D, S>,
+    address: Option<String>,
+) {
+    if let Ok(mut guard) = write_with_timeout(&ctx.shard_wal.replication_client, "set_follower_address").await {
+        guard.set_follower_address(address.clone());
+    } else {
+        warn!("Failed to acquire replication client lock for follower address update");
+    }
+    broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::UpdateFollower { replication_address: address }, ctx.intrashard_sender.clone()).await;
+}
+
+/// Renew leadership via S3 CAS when heartbeat path is unavailable.
+/// CAS-promotes the existing lease for a fresh TTL, updates node_status,
+/// and broadcasts to all local shards.
+async fn renew_s3_lease_and_broadcast<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
+    lease_manager: &LeaseManager<S>,
+    ctx: &ConnectionContext<R, D, S>,
+) -> Result<(), celeriant_distributed::lease_store::LeaseStoreError> {
+    let outcome = lease_manager.run_election().await?;
+    ctx.shard_wal.node_status.set(outcome.status);
+    broadcast_message_to_other_shards(
+        ctx.current_shard_id,
+        IntrashardMessages::StatusUpdate { status: outcome.status },
+        ctx.intrashard_sender.clone(),
+    ).await;
+    Ok(())
+}
+
+/// Check if the follower in membership differs from the current peer.
+/// Returns Some(new_peer) if changed, None if same or lookup failed.
+async fn check_follower_changed<S: LeaseStore>(
+    lease_manager: &LeaseManager<S>,
+    current_peer: &celeriant_wal::s3::membership::NodeInfo,
+) -> Option<celeriant_wal::s3::membership::NodeInfo> {
+    match lease_manager.discover_peer().await {
+        Ok(Some(peer)) if peer != *current_peer => {
+            info!(old = ?current_peer, new = ?peer, "Follower address changed in membership");
+            Some(peer)
+        }
+        _ => None,
+    }
+}
+
 fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
     ctx: ConnectionContext<R, D, S>,
     rx: LocalReceiver<CatchupCompletionMsg>,
 ) {
     let lease_manager = ctx.lease_manager.clone().unwrap();
     glommio::spawn_local(async move {
-        let shard_count = ctx.config.num_shards as usize;
 
-        loop {
-            for peer in 1..shard_count {
-                let _ = ctx.intrashard_sender.send_to(peer, IntrashardMessages::EnterS3Catchup).await;
-            }
-
-            let mut results = vec![];
-
-            // Shard0 is NOT part of ctx.intrashard_sender so kick it off explicitly
-            let shard0_result = ctx.shard_wal.enter_s3_catchup().await;
-            results.push(CatchupCompletionMsg { shard_id: 0, result: shard0_result });
-
-            let mut remaining = shard_count - 1;
-            while remaining > 0 {
-                match rx.recv().await {
-                    Some(msg) => {
-                        results.push(msg);
-                        remaining -= 1;
-                    }
-                    None => break,
-                }
-            }
-
-            let mut has_retriable = false;
-            let mut has_fatal = false;
-
-            for msg in &results {
-                match &msg.result {
-                    Ok(_) => {}
-                    Err(e) if e.is_retriable() => {
-                        warn!(shard_id = msg.shard_id, error = ?e, "S3 catchup retriable error, will retry");
-                        has_retriable = true;
-                    }
-                    Err(e) => {
-                        error!(shard_id = msg.shard_id, error = ?e, "S3 catchup fatal error, shutting down");
-                        has_fatal = true;
-                    }
-                }
-            }
-
-            if has_fatal {
-                ctx.shutdown_requested.set(true);
-                broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::Shutdown, ctx.intrashard_sender.clone()).await;
-                return;
-            }
-
-            if !has_retriable {
-                break;
-            }
-
-            glommio::timer::sleep(Duration::from_secs(5)).await;
+        info!("Starting pre-election S3 catchup");
+        if !run_s3_catchup(&ctx, &rx).await {
+            return;
         }
 
         info!("All shards caught up, running election");
@@ -254,53 +311,91 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
             }
         };
 
-        info!(status = ?outcome.status, peer = ?outcome.peer_info, "Election complete");
+        info!(status = ?outcome.status, peer = ?outcome.peer_info, "Election complete. Starting post-election S3 catchup");
+
+        if !run_s3_catchup(&ctx, &rx).await {
+            return;
+        }
 
         ctx.shard_wal.node_status.set(outcome.status);
 
-        for peer in 1..shard_count {
-            let _ = ctx
-                .intrashard_sender
-                .send_to(peer, IntrashardMessages::StatusUpdate { status: outcome.status })
-                .await;
+        broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::StatusUpdate { status: outcome.status }, ctx.intrashard_sender.clone()).await;
+
+        //TODO: Killing heartbeat loop when not leader
+        //Node could become leader later
+        if !outcome.status.raw().is_leader() {
+            return;
         }
 
-        // Resolve follower address: immediate if known, discovery loop if leader with no peer
-        let peer_info = match outcome.peer_info {
-            Some(info) => Some(info),
-            None if outcome.status.raw().is_leader() => {
-                info!("Follower not yet discovered, entering discovery loop");
-                let mut backoff = Duration::from_secs(1);
-                loop {
-                    glommio::timer::sleep(backoff).await;
-                    match lease_manager.discover_peer().await {
-                        Ok(Some(info)) => {
-                            info!(peer = ?info, "Follower discovered");
-                            break Some(info);
-                        }
-                        Ok(None) => {
-                            debug!("Follower not yet registered, retrying");
-                            backoff = (backoff * 2).min(Duration::from_secs(10));
-                        }
-                        Err(e) => {
-                            warn!(error = ?e, "Discovery failed, retrying");
-                            backoff = (backoff * 2).min(Duration::from_secs(10));
+        //Unwrap safety - we are on shard0 which always has replication_config
+        let rc = ctx.config.replication_config.as_ref().unwrap();
+        let heartbeat_interval = rc.heartbeat_interval;
+        let status_ttl_ms = rc.status_ttl_ms();
+
+        // Use peer from election as initial hint; None means we need to discover
+        let mut known_peer = outcome.peer_info;
+
+        loop {
+            // Phase 1: discover a follower
+            let peer_info = match known_peer.take() {
+                Some(info) => info,
+                None => {
+                    let mut backoff = Duration::from_secs(1);
+                    loop {
+                        glommio::timer::sleep(backoff).await;
+                        match lease_manager.discover_peer().await {
+                            Ok(Some(info)) => {
+                                info!(peer = ?info, "Follower discovered");
+                                break info;
+                            }
+                            Ok(None) => {
+                                debug!("Follower not yet registered, retrying");
+                                update_follower_address(&ctx, None).await;
+                                backoff = (backoff * 2).min(Duration::from_secs(10));
+                            }
+                            Err(e) => {
+                                warn!(error = ?e, "Discovery failed, retrying");
+                                backoff = (backoff * 2).min(Duration::from_secs(10));
+                            }
                         }
                     }
                 }
-            }
-            None => None,
-        };
+            };
 
-        if let Some(peer_info) = &peer_info {
-            let mut guard = ctx.shard_wal.replication_client.write().await.unwrap();
-            guard.set_follower_address(Some(peer_info.replication_address.clone()));
+            update_follower_address(&ctx, Some(peer_info.replication_address.clone())).await;
 
-            for peer in 1..shard_count {
-                let _ = ctx
-                    .intrashard_sender
-                    .send_to(peer, IntrashardMessages::UpdateFollower { replication_address: Some(peer_info.replication_address.clone()) })
-                    .await;
+            // Phase 2: heartbeat loop
+            // On failure: renew lease via S3, check if follower changed in membership.
+            // If changed, set known_peer and break to re-discover. Otherwise keep
+            // trying — transient failures don't mean the follower is gone.
+            loop {
+                glommio::timer::sleep(heartbeat_interval).await;
+
+                let result = match write_with_timeout(&ctx.shard_wal.replication_client, "send_heartbeat").await {
+                    Ok(mut guard) => guard.send_heartbeat().await,
+                    Err(_) => {
+                        warn!("Replication client lock contention, skipping heartbeat");
+                        continue;
+                    }
+                };
+
+                if let Ok(HeartbeatResult::Ack { .. }) = result {
+                    let leader_ms = now_ms();
+                    let refreshed = ValidatedNodeStatus::new(outcome.status.raw(), leader_ms + status_ttl_ms);
+                    ctx.shard_wal.node_status.set(refreshed);
+                    broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::StatusUpdate { status: refreshed }, ctx.intrashard_sender.clone()).await;
+                    continue;
+                }
+
+                warn!(result = ?result, "Heartbeat unsuccessful, renewing lease via S3");
+                if let Err(e) = renew_s3_lease_and_broadcast(&lease_manager, &ctx).await {
+                    error!(error = ?e, "S3 lease renewal failed");
+                }
+
+                if let Some(new_peer) = check_follower_changed(&lease_manager, &peer_info).await {
+                    known_peer = Some(new_peer);
+                    break;
+                }
             }
         }
     })

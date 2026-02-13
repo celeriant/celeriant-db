@@ -17,3 +17,4 @@ pub mod shard_exists_error;
 pub mod shard_listing_error;
 pub mod apply_batch_error;
 pub mod s3_catchup_error;
+pub mod send_heartbeat_error;

@@ -6,13 +6,13 @@ use celeriant_distributed::paths::fallback_batch_path;
 use celeriant_msg::{
     process_requests::Request,
     process_responses::Response,
-    request::requests::{ReplicationBatchItem, ReplicationBatchRequest},
-    response::responses::{ReplicationResult},
+    request::requests::{HeartbeatRequest, ReplicationBatchItem, ReplicationBatchRequest},
+    response::responses::{HeartbeatResult, ReplicationResult},
 };
 use celeriant_wal::{compression_type::CompressionType, s3::fallback_batch::{FallbackBatch, FallbackItem}};
 use tracing::warn;
 
-use crate::error::{replication_to_follower_error::ReplicateToFollowerError, replication_to_s3_error::ReplicateToS3Error};
+use crate::error::{replication_to_follower_error::ReplicateToFollowerError, replication_to_s3_error::ReplicateToS3Error, send_heartbeat_error::SendHeartbeatError};
 use crate::s3_uploader::S3Uploader;
 
 #[allow(async_fn_in_trait)]
@@ -20,6 +20,7 @@ pub trait ReplicationClient {
     fn set_follower_address(&mut self, address: Option<String>);
     async fn replicate_to_follower(&mut self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError>;
     async fn replicate_to_s3(&mut self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToS3Error>;
+    async fn send_heartbeat(&mut self) -> Result<HeartbeatResult, SendHeartbeatError>;
 }
 
 pub struct StubReplicationClient;
@@ -35,6 +36,10 @@ impl ReplicationClient for StubReplicationClient {
     async fn replicate_to_s3(&mut self, _batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToS3Error> {
         glommio::timer::sleep(std::time::Duration::from_millis(230)).await;
         Ok(())
+    }
+
+    async fn send_heartbeat(&mut self) -> Result<HeartbeatResult, SendHeartbeatError> {
+        Ok(HeartbeatResult::Ack { follower_timestamp_ms: celeriant_distributed::heartbeat::now_ms() })
     }
 }
 
@@ -174,6 +179,29 @@ impl<S: S3Uploader> ReplicationClient for GlommioReplicationClient<S> {
         );
 
         s3_uploader.upload(path, Bytes::from(serialized)).await
+    }
+
+    async fn send_heartbeat(&mut self) -> Result<HeartbeatResult, SendHeartbeatError> {
+        let request = Request::Heartbeat(HeartbeatRequest {
+            correlation_id: None,
+            shard_id: self.shard_id,
+            leader_timestamp_ms: celeriant_distributed::heartbeat::now_ms(),
+        });
+
+        let client = self.ensure_connected(false).await?;
+        let response = match client.send_request(&request, CompressionType::None).await {
+            Ok(r) => r,
+            Err(_) => {
+                let client = self.ensure_connected(true).await?;
+                client.send_request(&request, CompressionType::None).await?
+            }
+        };
+
+        match response {
+            Response::Heartbeat(resp) => Ok(resp.result),
+            Response::GenericError(err) => Err(SendHeartbeatError::ServerError(err.error_message)),
+            _ => Err(SendHeartbeatError::UnexpectedResponse),
+        }
     }
 }
 

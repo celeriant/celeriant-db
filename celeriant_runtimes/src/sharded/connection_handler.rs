@@ -1,11 +1,11 @@
 use std::{cell::Cell, fmt, rc::Rc, time::Duration};
 
-use celeriant_distributed::{lease_manager::LeaseManager, lease_store::LeaseStore};
+use celeriant_distributed::{heartbeat::now_ms, lease_manager::LeaseManager, lease_store::LeaseStore, validated_node_status::ValidatedNodeStatus};
 use celeriant_msg::{
     process_requests::Request,
     process_responses::Response,
-    request::requests::WatchRequest,
-    response::responses::{ErrorResponse, WatchResponse},
+    request::requests::{HeartbeatRequest, WatchRequest},
+    response::responses::{ErrorResponse, HeartbeatRejection, HeartbeatResponse, HeartbeatResult, WatchResponse},
 };
 use celeriant_shard::{
     error::{s3_catchup_error::S3CatchupError, watch_session_error::WatchSessionError}, replication_client::ReplicationClient, s3_downloader::S3Downloader, shard_wal::ShardWal, shard_wal_s3_catchup::S3CatchupResult
@@ -457,12 +457,89 @@ async fn process_request<R: ReplicationClient + 'static, D: S3Downloader + 'stat
     server_compression_algorithm: CompressionType,
     message_version: u32,
 ) {
+    // Heartbeat is intercepted here rather than in ShardWal because the handler
+    // needs intrashard broadcast access to refresh TTL on all local follower shards.
+    if let Request::Heartbeat(ref heartbeat_req) = request {
+        let response = handle_heartbeat(heartbeat_req, ctx).await;
+        let _ = write_response(tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
+        return;
+    }
+
     let correlation_id = request.correlation_id();
     let response = match ctx.shard_wal.process_request(request).await {
         Ok(result) => result,
         Err(error) => shard_error_to_response(correlation_id, error),
     };
     let _ = write_response(tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
+}
+
+/// Follower shard 0 heartbeat handler.
+///
+/// Validates role and clock drift, then refreshes the TTL on all local shards
+/// so they don't self-fence via ValidatedNodeStatus::effective().
+async fn handle_heartbeat<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
+    req: &HeartbeatRequest,
+    ctx: &ConnectionContext<R, D, S>,
+) -> Response {
+    let follower_ms = now_ms();
+
+    if !ctx.shard_wal.node_status.get().is_follower() {
+        return Response::Heartbeat(HeartbeatResponse {
+            correlation_id: req.correlation_id,
+            result: HeartbeatResult::Rejected(HeartbeatRejection::NotAFollower),
+        });
+    }
+
+    // Clock drift too high — nodes' clocks are dangerously skewed. Fence all local
+    // shards immediately rather than waiting for TTL expiry, because we can't trust
+    // any time-based decisions with skewed clocks.
+    let drift = follower_ms.abs_diff(req.leader_timestamp_ms);
+    if drift > ctx.config.max_cluster_time_drift_ms {
+        let fenced = ValidatedNodeStatus::fenced();
+        ctx.shard_wal.node_status.set(fenced);
+        broadcast_status(ctx, fenced).await;
+
+        return Response::Heartbeat(HeartbeatResponse {
+            correlation_id: req.correlation_id,
+            result: HeartbeatResult::Rejected(HeartbeatRejection::ClockDriftTooHigh {
+                leader_ms: req.leader_timestamp_ms,
+                follower_ms,
+                max_allowed_ms: ctx.config.max_cluster_time_drift_ms,
+            }),
+        });
+    }
+
+    let status_ttl_ms = match &ctx.config.replication_config {
+        Some(rc) => rc.status_ttl_ms(),
+        None => 5000,
+    };
+    let new_expires_at = follower_ms + status_ttl_ms;
+    let current_status = ctx.shard_wal.node_status.get().raw();
+    let refreshed = ValidatedNodeStatus::new(current_status, new_expires_at);
+
+    ctx.shard_wal.node_status.set(refreshed);
+    broadcast_status(ctx, refreshed).await;
+
+    Response::Heartbeat(HeartbeatResponse {
+        correlation_id: req.correlation_id,
+        result: HeartbeatResult::Ack { follower_timestamp_ms: follower_ms },
+    })
+}
+
+/// Broadcast a status update to all other local shards via intrashard mesh.
+async fn broadcast_status<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
+    ctx: &ConnectionContext<R, D, S>,
+    status: ValidatedNodeStatus,
+) {
+    let shard_count = ctx.intrashard_sender.nr_consumers();
+    for peer in 0..shard_count {
+        if peer == ctx.current_shard_id {
+            continue;
+        }
+        let _ = ctx.intrashard_sender.send_to(
+            peer, IntrashardMessages::StatusUpdate { status }
+        ).await;
+    }
 }
 
 async fn handle_watch<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(

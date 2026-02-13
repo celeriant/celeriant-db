@@ -2549,8 +2549,10 @@ mod tests {
             Ok(())
         }
         
-        fn set_follower_address(&mut self, _address: Option<String>) {
+        fn set_follower_address(&mut self, _address: Option<String>) {}
 
+        async fn send_heartbeat(&mut self) -> Result<celeriant_msg::response::responses::HeartbeatResult, crate::error::send_heartbeat_error::SendHeartbeatError> {
+            Ok(celeriant_msg::response::responses::HeartbeatResult::Ack { follower_timestamp_ms: celeriant_distributed::heartbeat::now_ms() })
         }
     }
 

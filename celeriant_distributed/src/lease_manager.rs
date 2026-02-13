@@ -63,11 +63,9 @@ impl<S: LeaseStore> LeaseManager<S> {
     /// Determine this node's role via S3 lease.
     ///
     /// - No lease: fresh cluster, race with CreateOnly.
-    /// - Valid lease: authoritative — resume if ours, follow if theirs.
+    /// - Valid lease, someone else's: become follower.
+    /// - Valid lease, ours: CAS-promote for fresh TTL (safe to extend at boot or renewal).
     /// - Expired lease: race with CAS. Exactly one node wins.
-    ///
-    /// Used at boot and on heartbeat failure. The lease state determines
-    /// the outcome — callers don't need different methods.
     pub async fn run_election(&self) -> Result<ElectionOutcome, LeaseStoreError> {
         let now = now_ms();
 
@@ -91,12 +89,11 @@ impl<S: LeaseStore> LeaseManager<S> {
                     Err(e) => Err(e),
                 }
             }
-            Some(lwe) if !lwe.lease.is_expired(now) => {
-                if lwe.lease.leader_node_id == self.config.node_id {
-                    self.become_leader(&lwe.lease).await
-                } else {
-                    self.become_follower(&lwe.lease).await
-                }
+            // Valid lease held by another node — follow unconditionally
+            Some(lwe) if !lwe.lease.is_expired(now)
+                && lwe.lease.leader_node_id != self.config.node_id =>
+            {
+                self.become_follower(&lwe.lease).await
             }
             Some(lwe) => {
                 let promoted = lwe.lease.promote(
@@ -353,11 +350,12 @@ mod tests {
     // --- run_election: valid lease ---
 
     #[test]
-    fn test_valid_lease_own_node_resumes_leader() {
+    fn test_valid_lease_own_node_extends() {
         let store = MockLeaseStore::new();
         let now = now_ms();
 
         store.push_get_lease(Ok(Some(make_lease_with_etag(1, 3, now, 10000))));
+        store.push_put_lease_conditional(Ok("etag2".into()));
         store.push_get_membership(Ok(None));
 
         let manager = LeaseManager::new(store, test_config(1));
@@ -365,7 +363,7 @@ mod tests {
 
         assert!(matches!(
             outcome.status.raw(),
-            NodeStatus::Leader { lease_index: 3 }
+            NodeStatus::Leader { lease_index: 4 }
         ));
     }
 

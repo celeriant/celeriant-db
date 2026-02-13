@@ -563,9 +563,11 @@ mod tests {
             self.s3_item_counts.borrow_mut().push(batches.len());
             Ok(())
         }
-        
-        fn set_follower_address(&mut self, _address: Option<String>) {
 
+        fn set_follower_address(&mut self, _address: Option<String>) {}
+
+        async fn send_heartbeat(&mut self) -> Result<celeriant_msg::response::responses::HeartbeatResult, crate::error::send_heartbeat_error::SendHeartbeatError> {
+            unreachable!("s3 replication test should not call send_heartbeat")
         }
     }
 
