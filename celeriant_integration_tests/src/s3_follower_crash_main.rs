@@ -1,27 +1,27 @@
 //! S3 Lease Integration Test - Follower crash + leader self-heal
 //!
-//! Tests the follower crash failure mode: leader detects heartbeat loss, fences,
-//! races to S3, wins (follower dead), unfences with new lease, continues operation.
-//! Then follower restarts and rejoins.
+//! Tests the follower crash failure mode: leader detects heartbeat loss,
+//! pre-renews its S3 lease without fencing (asymmetric behavior), continues
+//! serving writes with incremented lease_index. Then follower restarts and rejoins.
 //!
 //! Scenario:
 //! 1. Start MinIO, establish two-node cluster (leader + follower)
 //! 2. Write events 1-3, verify cluster is healthy (replication works)
-//! 3. Read initial lease from S3, record lease_index (should be 1)
+//! 3. Read initial lease from S3, record lease_index
 //! 4. Kill follower process (simulate crash)
-//! 5. Wait for leader to detect heartbeat loss and self-heal via S3
-//! 6. Verify leader still accepts writes, lease_index incremented to 2
-//! 7. Restart follower process
-//! 8. Wait for follower to re-register and rejoin cluster
-//! 9. Verify follower receives replicated data from leader
+//! 5. Wait for leader to detect heartbeat loss and self-heal via S3 pre-renewal
+//! 6. Verify leader still accepts writes, lease_index incremented
+//! 7. Verify S3 fallback batches carry the new lease_index
+//! 8. Restart follower process
+//! 9. Wait for follower to re-register and rejoin cluster
+//! 10. Verify follower receives replicated data from leader
 //!
-//! Run with: cargo test --test s3_follower_crash_main
+//! Run with: cargo run --bin s3_follower_crash_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{count_events, write_event, MinioContainer, ServerConfig, TestServer};
-use celeriant_runtimes::RoutingRule;
+use celeriant_integration_tests::{count_events, s3_cluster_config, write_event, MinioContainer, TestServer};
 use celeriant_wal::aggregate_key::AggregateKey;
-use celeriant_wire::disk::versioned_block::deserialise_lease;
+use celeriant_wire::disk::versioned_block::{deserialise_fallback_batch, deserialise_lease};
 use std::time::Duration;
 
 #[tokio::main]
@@ -35,11 +35,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Starting MinIO container on port {}...", minio_port);
     let minio = MinioContainer::start_with_bucket(minio_port, "test-follower-crash").await?;
-    let (region, bucket_name, access_key, secret_key, minio_endpoint, allow_http) = minio.s3_config_fields();
-    println!("MinIO ready at {}\n", minio_endpoint);
+    let (region, bucket, access_key, secret_key, endpoint, allow_http) = minio.s3_config_fields();
+    println!("MinIO ready at {}\n", endpoint);
 
     let num_shards = 4;
     let aggregate_key = AggregateKey::new(1, 1, 1);
+    let expected_shard = (aggregate_key.aggregate_type_id % num_shards as u128) as u32;
+    let shard_prefix = format!("cluster/fallback/shard_{:03}/", expected_shard);
+
+    let config = s3_cluster_config(num_shards, &region, &bucket, &access_key, &secret_key, &endpoint, allow_http);
 
     // ========================================
     // PHASE 1: Start cluster and establish leader/follower
@@ -47,44 +51,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("PHASE 1: Start cluster and establish leader/follower");
     println!("-----------------------------------------------------");
 
-    let leader_config = ServerConfig {
-        num_shards: Some(num_shards),
-        log_level: "info".to_string(),
-        routing_rule: RoutingRule::AggregateTypeId,
-        s3_enabled: true,
-        s3_region: Some(region.clone()),
-        s3_bucket: Some(bucket_name.clone()),
-        s3_access_key_id: Some(access_key.clone()),
-        s3_secret_access_key: Some(secret_key.clone()),
-        s3_endpoint_override: Some(minio_endpoint.clone()),
-        s3_allow_http: allow_http,
-        s3_skip_signature: false,
-        ..Default::default()
-    };
+    // Leader starts first — wins CreateOnly election race
     println!("  Starting leader on port {}...", leader_port);
-    let leader = TestServer::start_with_config(leader_port, leader_config).await?;
-
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let follower_config = ServerConfig {
-        num_shards: Some(num_shards),
-        log_level: "info".to_string(),
-        routing_rule: RoutingRule::AggregateTypeId,
-        s3_enabled: true,
-        s3_region: Some(region),
-        s3_bucket: Some(bucket_name),
-        s3_access_key_id: Some(access_key),
-        s3_secret_access_key: Some(secret_key),
-        s3_endpoint_override: Some(minio_endpoint),
-        s3_allow_http: allow_http,
-        s3_skip_signature: false,
-        ..Default::default()
-    };
+    let leader = TestServer::start_with_config_labeled(leader_port, config.clone(), "leader".into()).await?;
     println!("  Starting follower on port {}...", follower_port);
-    let mut follower = TestServer::start_with_config(follower_port, follower_config).await?;
+    let mut follower = TestServer::start_with_config_labeled(follower_port, config, "follower".into()).await?;
 
-    println!("  Waiting for election and heartbeat establishment...");
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    println!("  Waiting for election + discovery + heartbeat establishment...");
+    tokio::time::sleep(Duration::from_secs(8)).await;
 
     let mut leader_client = CeleriantClient::connect(leader.address()).await?;
 
@@ -93,12 +67,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         write_event(&mut leader_client, &aggregate_key, i, i == 1).await?;
     }
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
     let follower_count = count_events(&mut follower_client, &aggregate_key).await?;
     assert_eq!(follower_count, 3, "Follower should have 3 events");
-    println!("  ✓ Cluster healthy: follower has {} events\n", follower_count);
+    println!("  Cluster healthy: follower has {} events\n", follower_count);
 
     // ========================================
     // PHASE 2: Record initial lease state
@@ -113,8 +87,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Initial lease: leader_node_id={:x}, lease_index={}",
         initial_lease.leader_node_id, initial_lease.lease_index);
 
-    assert_eq!(initial_lease.lease_index, 1, "Initial lease_index should be 1");
-    println!("  ✓ Recorded initial state\n");
+    assert!(initial_lease.lease_index >= 1, "Initial lease_index should be >= 1");
+    println!("  Recorded initial state\n");
 
     // ========================================
     // PHASE 3: Kill follower (simulate crash)
@@ -125,7 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Stopping follower process...");
     drop(follower_client);
     follower.stop();
-    println!("  ✓ Follower stopped\n");
+    println!("  Follower stopped\n");
 
     // ========================================
     // PHASE 4: Wait for leader self-heal
@@ -133,7 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("PHASE 4: Wait for leader self-heal");
     println!("----------------------------------");
 
-    println!("  Waiting for leader to detect heartbeat loss and self-heal...");
+    println!("  Waiting for leader to detect heartbeat loss and pre-renew S3 lease...");
     println!("  (heartbeat timeout ~2s + S3 race ~1s = ~5s total)");
     tokio::time::sleep(Duration::from_secs(5)).await;
 
@@ -146,7 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Writing events 4-5 to leader (should still work)...");
     write_event(&mut leader_client, &aggregate_key, 4, false).await?;
     write_event(&mut leader_client, &aggregate_key, 5, false).await?;
-    println!("  ✓ Leader accepted writes after self-heal");
+    println!("  Leader accepted writes after self-heal");
 
     let new_lease_bytes = minio.get_object("cluster/lease.bin").await?;
     let new_lease = deserialise_lease(&new_lease_bytes)
@@ -162,7 +136,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         new_lease.leader_node_id, initial_lease.leader_node_id,
         "leader_node_id should NOT have changed (same leader self-healed)"
     );
-    println!("  ✓ Lease updated: lease_index={}, same leader\n", new_lease.lease_index);
+    println!("  Lease updated: lease_index={}, same leader", new_lease.lease_index);
+
+    // ========================================
+    // PHASE 5.5: Verify S3 fallback batches carry new lease_index
+    // ========================================
+    println!("\nPHASE 5.5: Verify S3 fallback batches carry new lease_index");
+    println!("------------------------------------------------------------");
+
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    let fallback_objects = minio.list_objects(&shard_prefix).await?;
+    println!("  S3 fallback objects: {}", fallback_objects.len());
+    assert!(!fallback_objects.is_empty(), "Expected S3 fallback objects after follower crash");
+
+    let last_object = &fallback_objects[fallback_objects.len() - 1];
+    let batch_bytes = minio.get_object(last_object).await?;
+    let batch = deserialise_fallback_batch(&batch_bytes)
+        .map_err(|e| format!("Failed to deserialise fallback batch: {:?}", e))?;
+
+    let batch_lease_index = batch.items[0].metablock.lease_index;
+    println!("  Fallback batch lease_index={}, initial lease_index={}",
+        batch_lease_index, initial_lease.lease_index);
+    assert!(
+        batch_lease_index > initial_lease.lease_index,
+        "S3 fallback batch lease_index ({}) should be > initial ({}) — proves self-heal renewed before writing",
+        batch_lease_index, initial_lease.lease_index
+    );
+    println!("  lease_index correctly stamped on S3 fallback batches\n");
 
     // ========================================
     // PHASE 6: Restart follower
@@ -175,8 +176,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Follower process restarted");
 
     println!("  Waiting for follower to re-register and rejoin...");
-    println!("  (startup + registration + discovery + catch-up = ~8s)");
-    tokio::time::sleep(Duration::from_secs(8)).await;
+    println!("  (startup + registration + discovery + catch-up = ~10s)");
+    tokio::time::sleep(Duration::from_secs(10)).await;
 
     // ========================================
     // PHASE 7: Verify follower rejoined and receives new writes
@@ -186,10 +187,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut restarted_follower_client = CeleriantClient::connect(follower.address()).await?;
 
-    // The follower's persisted WAL has events 1-3 from before the crash.
-    // Events 4-5 were written while follower was down — catching up on those
-    // requires the follower kick/rejoin protocol (not yet implemented).
-    // Verify that NEW writes after follower restart DO replicate.
     println!("  Writing events 6-7 to leader (after follower restart)...");
     write_event(&mut leader_client, &aggregate_key, 6, false).await?;
     write_event(&mut leader_client, &aggregate_key, 7, false).await?;
@@ -200,14 +197,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let final_follower_count = count_events(&mut restarted_follower_client, &aggregate_key).await?;
     println!("  Restarted follower has {} events", final_follower_count);
 
-    // Follower should have at least the original 3 + the 2 new ones.
-    // It may or may not have events 4-5 (depends on kick/rejoin protocol).
-    assert!(
-        final_follower_count >= 5,
-        "Restarted follower should have at least 5 events (3 original + 2 new), got {}",
+    assert_eq!(
+        final_follower_count, 7,
+        "Restarted follower should have all 7 events (3 persisted + 2 from S3 catchup + 2 new), got {}",
         final_follower_count
     );
-    println!("  ✓ Follower rejoined and receives new replication");
+    println!("  Follower rejoined and has all events");
 
     println!("\n=== All Tests Passed ===\n");
 

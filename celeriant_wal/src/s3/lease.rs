@@ -23,13 +23,6 @@ impl Lease {
         }
     }
 
-    pub fn renew(&self, now_millis: u64, duration_millis: u64) -> Self {
-        Self {
-            expires_at_ms: now_millis + duration_millis,
-            ..self.clone()
-        }
-    }
-
     pub fn promote(
         &self,
         new_leader_node_id: u128,
@@ -71,10 +64,6 @@ mod tests {
         assert!(!lease.is_expired(3000));
         assert!(lease.is_expired(6001));
         assert_eq!(lease.remaining_millis(3000), 3000);
-
-        let renewed = lease.renew(4000, 5000);
-        assert_eq!(renewed.lease_index, 1);
-        assert_eq!(renewed.expires_at_ms, 9000);
 
         let promoted = lease.promote(99, 7000, 5000);
         assert_eq!(promoted.lease_index, 2);

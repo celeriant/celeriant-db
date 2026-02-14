@@ -4,20 +4,18 @@
 //! and data lands at the correct S3 paths.
 //!
 //! Scenario:
-//! 1. Start MinIO container, create bucket
-//! 2. Start follower (with S3 config), then leader (with S3 config + follower address)
-//! 3. Write events 1-3 to leader. Verify follower has 3 events (normal replication)
-//! 4. Stop follower
-//! 5. Write events 4-6 to leader. Leader fails to replicate, falls back to S3
-//! 6. Verify S3 directly: list objects under cluster/fallback/shard_000/, verify content
-//! 7. Write event 7 to leader (still no follower — another S3 fallback)
-//! 8. Verify S3 directly: expect second object with higher WAL index
+//! 1. Start MinIO + two-node cluster via S3 election
+//! 2. Write events 1-3 to leader. Verify follower has 3 events (normal replication)
+//! 3. Stop follower
+//! 4. Write events 4-6 to leader. Leader fails to replicate, falls back to S3
+//! 5. Verify S3 directly: list objects under cluster/fallback/shard_000/, verify content
+//! 6. Write event 7 to leader (still no follower — another S3 fallback)
+//! 7. Verify S3 directly: expect second object with higher WAL index
 //!
 //! Run with: cargo run --bin s3_fallback_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{count_events, write_event, MinioContainer, ServerConfig, TestServer};
-use celeriant_runtimes::RoutingRule;
+use celeriant_integration_tests::{count_events, s3_cluster_config, write_event, MinioContainer, TestServer};
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wire::disk::versioned_block::deserialise_fallback_batch;
 use std::time::Duration;
@@ -26,8 +24,10 @@ use std::time::Duration;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== S3 Fallback Integration Test — Happy Path ===\n");
 
-    let port = 10400 + (std::process::id() % 100) as u16;
-    let minio_port = port + 10;
+    let port_base = 10400 + (std::process::id() % 100) as u16;
+    let leader_port = port_base;
+    let follower_port = port_base + 100;
+    let minio_port = port_base + 10;
 
     println!("Starting MinIO container on port {}...", minio_port);
     let minio = MinioContainer::start(minio_port).await?;
@@ -40,56 +40,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shard_prefix = format!("cluster/fallback/shard_{:03}/", expected_shard);
     println!("  Expected shard: {} (prefix: {})", expected_shard, shard_prefix);
 
-    println!("Starting replicated cluster with S3 fallback...");
+    let config = s3_cluster_config(num_shards, &region, &bucket, &access_key, &secret_key, &endpoint, allow_http);
 
-    let follower_port = port + 100;
-    let follower_config = ServerConfig {
-        num_shards: Some(num_shards),
-        log_level: "info".to_string(),
-        routing_rule: RoutingRule::AggregateTypeId,
-        s3_enabled: true,
-        s3_region: Some(region.clone()),
-        s3_bucket: Some(bucket.clone()),
-        s3_access_key_id: Some(access_key.clone()),
-        s3_secret_access_key: Some(secret_key.clone()),
-        s3_endpoint_override: Some(endpoint.clone()),
-        s3_allow_http: allow_http,
-        s3_skip_signature: false,
-        ..Default::default()
-    };
-    println!("Starting follower on port {}...", follower_port);
-    let follower = TestServer::start_with_config(follower_port, follower_config).await?;
+    // Leader starts first — wins CreateOnly election race
+    println!("Starting two-node cluster...");
+    let leader = TestServer::start_with_config_labeled(leader_port, config.clone(), "leader".into()).await?;
+    let follower = TestServer::start_with_config_labeled(follower_port, config, "follower".into()).await?;
+    println!("  Leader at {}, Follower at {}", leader.address(), follower.address());
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let follower_replication_port = follower_port + 1;
-    let leader_config = ServerConfig {
-        num_shards: Some(num_shards),
-        log_level: "info".to_string(),
-        routing_rule: RoutingRule::AggregateTypeId,
-        s3_enabled: true,
-        s3_region: Some(region),
-        s3_bucket: Some(bucket),
-        s3_access_key_id: Some(access_key),
-        s3_secret_access_key: Some(secret_key),
-        s3_endpoint_override: Some(endpoint),
-        s3_allow_http: allow_http,
-        s3_skip_signature: false,
-        ..Default::default()
-    };
-    println!(
-        "Starting leader on port {} (replicating to 127.0.0.1:{})...",
-        port, follower_replication_port
-    );
-    let leader = TestServer::start_with_config(port, leader_config).await?;
-    println!(
-        "Cluster started: leader at {}, follower at {}\n",
-        leader.address(),
-        follower.address()
-    );
-
-    // Wait for S3 election to complete
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    println!("Waiting for election + discovery + replication connection...");
+    tokio::time::sleep(Duration::from_secs(8)).await;
 
     let mut leader_client = CeleriantClient::connect(leader.address()).await?;
 
@@ -105,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("  Waiting for replication...");
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
     let follower_count = count_events(&mut follower_client, &aggregate_key).await?;
@@ -113,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         follower_count, 3,
         "Follower should have 3 events after normal replication"
     );
-    println!("  ✓ Follower has {} events\n", follower_count);
+    println!("  Follower has {} events\n", follower_count);
 
     // ========================================
     // Phase 2: Follower goes down, S3 fallback
@@ -130,7 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 4..=6 {
         write_event(&mut leader_client, &aggregate_key, i, false).await?;
     }
-    println!("  ✓ Leader writes succeeded (S3 fallback active)\n");
+    println!("  Leader writes succeeded (S3 fallback active)\n");
 
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
@@ -159,7 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fallback_batch = deserialise_fallback_batch(&object_bytes)
         .map_err(|e| format!("deserialise fallback batch: {:?}", e))?;
     println!(
-        "  ✓ Deserialized FallbackBatch: shard_id={}, fallback_index={}, items={}",
+        "  Deserialized FallbackBatch: shard_id={}, fallback_index={}, items={}",
         fallback_batch.shard_id,
         fallback_batch.fallback_index,
         fallback_batch.items.len()
@@ -176,7 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let first_wal_index = fallback_batch.items[0].metablock.wal_index;
     println!(
-        "  ✓ First item WAL index: {} (should match fallback_index={})",
+        "  First item WAL index: {} (should match fallback_index={})",
         first_wal_index, fallback_batch.fallback_index
     );
     assert_eq!(
@@ -192,7 +152,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("  Writing event 7 to leader (still no follower)...");
     write_event(&mut leader_client, &aggregate_key, 7, false).await?;
-    println!("  ✓ Write succeeded\n");
+    println!("  Write succeeded\n");
 
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
@@ -214,7 +174,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         objects_after, sorted_objects,
         "S3 objects should be in lexicographic (temporal) order"
     );
-    println!("  ✓ S3 objects are lexicographically ordered");
+    println!("  S3 objects are lexicographically ordered");
 
     // Verify second object has higher WAL index
     if objects_after.len() >= 2 {
@@ -233,7 +193,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             second_batch.fallback_index > fallback_batch.fallback_index,
             "Second batch fallback_index should be higher than first"
         );
-        println!("  ✓ Second batch has higher fallback_index");
+        println!("  Second batch has higher fallback_index");
     }
 
     println!("\n=== All Tests Passed ===\n");

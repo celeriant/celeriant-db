@@ -18,6 +18,7 @@ use celeriant_wal::{
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
 };
 pub use celeriant_lib::server_config::ServerConfig;
+pub use celeriant_runtimes::RoutingRule;
 use tempfile::TempDir;
 use tokio::net::TcpStream;
 use tokio::time::sleep;
@@ -848,5 +849,49 @@ pub async fn count_events(
         }
         celeriant_msg::process_responses::Response::GenericError(_) => Ok(0),
         other => Err(format!("Unexpected response: {:?}", other).into()),
+    }
+}
+
+/// Build a ServerConfig for S3-backed cluster tests.
+///
+/// Sets up S3 connection fields, routing rule, and heartbeat lease duration.
+/// The caller provides MinIO connection details from `MinioContainer::s3_config_fields()`.
+pub fn s3_cluster_config(
+    num_shards: usize,
+    region: &str,
+    bucket: &str,
+    access_key: &str,
+    secret_key: &str,
+    endpoint: &str,
+    allow_http: bool,
+) -> ServerConfig {
+    ServerConfig {
+        num_shards: Some(num_shards),
+        log_level: "info".to_string(),
+        routing_rule: RoutingRule::AggregateTypeId,
+        // S3 lease: 10s initial TTL (enough for discovery + first heartbeat)
+        // Heartbeat status TTL: ~2s from defaults (heartbeat_interval=500ms × 3 + clock_drift=500ms)
+        heartbeat_lease_duration_ms: 10_000,
+        s3_enabled: true,
+        s3_region: Some(region.to_string()),
+        s3_bucket: Some(bucket.to_string()),
+        s3_access_key_id: Some(access_key.to_string()),
+        s3_secret_access_key: Some(secret_key.to_string()),
+        s3_endpoint_override: Some(endpoint.to_string()),
+        s3_allow_http: allow_http,
+        ..Default::default()
+    }
+}
+
+/// Probe whether a node is the leader by attempting a write.
+///
+/// Returns `true` if the node accepts the write (is leader),
+/// `false` if it rejects (is follower or fenced).
+pub async fn is_leader(address: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    let probe_key = AggregateKey::new(999, 999, 999);
+    let mut client = CeleriantClient::connect(address).await?;
+    match write_event(&mut client, &probe_key, 1, true).await {
+        Ok(_) => Ok(true),
+        Err(_) => Ok(false),
     }
 }

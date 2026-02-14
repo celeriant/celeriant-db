@@ -1,27 +1,23 @@
 //! S3 Fallback + Follower Catchup Integration Test
 //!
 //! Tests the full cycle: normal replication, follower goes down, S3 fallback,
-//! follower comes back, catchup, and continued normal replication.
+//! follower comes back via boot catchup from S3, and continued normal replication.
 //!
 //! Scenario:
-//! 1. Start MinIO, follower, leader (all with S3 config)
+//! 1. Start MinIO + two-node cluster via S3 election
 //! 2. Write events 1-3. Verify follower has 3 events
 //! 3. Stop follower
 //! 4. Write events 4-8 to leader (S3 fallback for these)
-//! 5. Restart follower
-//! 6. Write event 9. This triggers leader to attempt follower replication;
-//!    follower reports WAL index mismatch; leader sends catchup entries
-//! 7. Wait for replication
-//! 8. Verify follower has all 9 events via client protocol read
-//! 9. Verify S3 objects exist from step 4
-//! 10. Write events 10-12. Verify follower gets them via normal replication
-//!     (no new S3 objects)
+//! 5. Restart follower — boot catchup reads S3 fallback batches
+//! 6. Write event 9. Verify follower has all 9 events
+//! 7. Verify S3 objects exist from step 4
+//! 8. Write events 10-12. Verify follower gets them via normal replication
+//!    (no new S3 objects)
 //!
 //! Run with: cargo run --bin s3_fallback_catchup_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{count_events, write_event, MinioContainer, ServerConfig, TestServer};
-use celeriant_runtimes::RoutingRule;
+use celeriant_integration_tests::{count_events, s3_cluster_config, write_event, MinioContainer, TestServer};
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wire::disk::versioned_block::deserialise_fallback_batch;
 use std::time::Duration;
@@ -30,8 +26,10 @@ use std::time::Duration;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== S3 Fallback + Follower Catchup Integration Test ===\n");
 
-    let port = 10500 + (std::process::id() % 100) as u16;
-    let minio_port = port + 10;
+    let port_base = 10500 + (std::process::id() % 100) as u16;
+    let leader_port = port_base;
+    let follower_port = port_base + 100;
+    let minio_port = port_base + 10;
 
     println!("Starting MinIO container on port {}...", minio_port);
     let minio = MinioContainer::start(minio_port).await?;
@@ -44,56 +42,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shard_prefix = format!("cluster/fallback/shard_{:03}/", expected_shard);
     println!("  Expected shard: {} (prefix: {})", expected_shard, shard_prefix);
 
-    println!("Starting replicated cluster with S3 fallback...");
+    let config = s3_cluster_config(num_shards, &region, &bucket, &access_key, &secret_key, &endpoint, allow_http);
 
-    let follower_port = port + 100;
-    let follower_config = ServerConfig {
-        num_shards: Some(num_shards),
-        log_level: "info".to_string(),
-        routing_rule: RoutingRule::AggregateTypeId,
-        s3_enabled: true,
-        s3_region: Some(region.clone()),
-        s3_bucket: Some(bucket.clone()),
-        s3_access_key_id: Some(access_key.clone()),
-        s3_secret_access_key: Some(secret_key.clone()),
-        s3_endpoint_override: Some(endpoint.clone()),
-        s3_allow_http: allow_http,
-        s3_skip_signature: false,
-        ..Default::default()
-    };
-    println!("Starting follower on port {}...", follower_port);
-    let mut follower = TestServer::start_with_config(follower_port, follower_config).await?;
+    // Leader starts first — wins CreateOnly election race
+    println!("Starting two-node cluster...");
+    let leader = TestServer::start_with_config_labeled(leader_port, config.clone(), "leader".into()).await?;
+    let mut follower = TestServer::start_with_config_labeled(follower_port, config, "follower".into()).await?;
+    println!("  Leader at {}, Follower at {}", leader.address(), follower.address());
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let follower_replication_port = follower_port + 1;
-    let leader_config = ServerConfig {
-        num_shards: Some(num_shards),
-        log_level: "info".to_string(),
-        routing_rule: RoutingRule::AggregateTypeId,
-        s3_enabled: true,
-        s3_region: Some(region),
-        s3_bucket: Some(bucket),
-        s3_access_key_id: Some(access_key),
-        s3_secret_access_key: Some(secret_key),
-        s3_endpoint_override: Some(endpoint),
-        s3_allow_http: allow_http,
-        s3_skip_signature: false,
-        ..Default::default()
-    };
-    println!(
-        "Starting leader on port {} (replicating to 127.0.0.1:{})...",
-        port, follower_replication_port
-    );
-    let leader = TestServer::start_with_config(port, leader_config).await?;
-    println!(
-        "Cluster started: leader at {}, follower at {}\n",
-        leader.address(),
-        follower.address()
-    );
-
-    // Wait for S3 election + peer discovery + heartbeat establishment
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    println!("Waiting for election + discovery + replication connection...");
+    tokio::time::sleep(Duration::from_secs(8)).await;
 
     let mut leader_client = CeleriantClient::connect(leader.address()).await?;
 
@@ -117,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         follower_count, 3,
         "Follower should have 3 events after normal replication"
     );
-    println!("  ✓ Follower has {} events\n", follower_count);
+    println!("  Follower has {} events\n", follower_count);
 
     // ========================================
     // Phase 2: Follower goes down, S3 fallback
@@ -134,58 +92,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 4..=8 {
         write_event(&mut leader_client, &aggregate_key, i, false).await?;
     }
-    println!("  ✓ Leader writes succeeded (S3 fallback active)\n");
+    println!("  Leader writes succeeded (S3 fallback active)\n");
 
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
     // ========================================
-    // Phase 3: Follower restarts, catchup happens
+    // Phase 3: Verify S3 objects exist from fallback period (before follower consumes them)
     // ========================================
-    println!("PHASE 3: Follower restarts, catchup on next write");
-    println!("-------------------------------------------------");
-
-    println!("  Restarting follower...");
-    follower.restart().await?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let mut follower_client = CeleriantClient::connect(follower.address()).await?;
-
-    let follower_count = count_events(&mut follower_client, &aggregate_key).await?;
-    println!("  Follower currently has {} events (behind leader)", follower_count);
-    assert_eq!(
-        follower_count, 3,
-        "Follower should still have only 3 events after restart"
-    );
-
-    println!("  Writing event 9 to leader (should trigger catchup)...");
-    write_event(&mut leader_client, &aggregate_key, 9, false).await?;
-
-    println!("  Waiting for catchup replication...");
-    tokio::time::sleep(Duration::from_millis(1000)).await;
-
-    // ========================================
-    // Phase 4: Verify follower caught up
-    // ========================================
-    println!("\nPHASE 4: Verify follower caught up");
-    println!("----------------------------------");
-
-    let follower_count = count_events(&mut follower_client, &aggregate_key).await?;
-    println!("  Follower now has {} events", follower_count);
-
-    assert_eq!(
-        follower_count, 9,
-        "Follower should have all 9 events after catchup"
-    );
-    println!("  ✓ Catchup successful! Follower has all 9 events");
-
-    let leader_count = count_events(&mut leader_client, &aggregate_key).await?;
-    assert_eq!(leader_count, 9, "Leader should have 9 events");
-    println!("  ✓ Leader has {} events", leader_count);
-
-    // ========================================
-    // Phase 5: Verify S3 objects exist from fallback period
-    // ========================================
-    println!("\nPHASE 5: Verify S3 fallback objects");
+    println!("PHASE 3: Verify S3 fallback objects");
     println!("-----------------------------------");
 
     let objects = minio.list_objects(&shard_prefix).await?;
@@ -204,13 +118,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fallback_batch = deserialise_fallback_batch(&object_bytes)
         .map_err(|e| format!("deserialise fallback batch: {:?}", e))?;
     println!(
-        "  ✓ Valid FallbackBatch: shard_id={}, fallback_index={}, items={}",
+        "  Valid FallbackBatch: shard_id={}, fallback_index={}, items={}",
         fallback_batch.shard_id,
         fallback_batch.fallback_index,
         fallback_batch.items.len()
     );
 
-    let s3_object_count_before = objects.len();
+    // ========================================
+    // Phase 4: Follower restarts — boot catchup reads S3 fallback batches
+    // ========================================
+    println!("\nPHASE 4: Follower restarts, boot catchup from S3");
+    println!("-------------------------------------------------");
+
+    println!("  Restarting follower...");
+    follower.restart().await?;
+
+    // Wait for boot catchup + election + leader discovery + heartbeat
+    println!("  Waiting for boot catchup + cluster rejoin...");
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    let mut follower_client = CeleriantClient::connect(follower.address()).await?;
+
+    // After restart, follower's boot catchup applies S3 fallback batches.
+    // WAL has events 1-3 from before crash. Boot catchup applies events 4-8 from S3.
+    let follower_count = count_events(&mut follower_client, &aggregate_key).await?;
+    println!("  Follower has {} events after restart + boot catchup", follower_count);
+    assert!(
+        follower_count >= 3,
+        "Follower should have at least 3 events (persisted WAL) after restart, got {}",
+        follower_count
+    );
+
+    println!("  Writing event 9 to leader...");
+    write_event(&mut leader_client, &aggregate_key, 9, false).await?;
+
+    println!("  Waiting for replication...");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // ========================================
+    // Phase 5: Verify follower caught up
+    // ========================================
+    println!("\nPHASE 5: Verify follower caught up");
+    println!("----------------------------------");
+
+    let follower_count = count_events(&mut follower_client, &aggregate_key).await?;
+    println!("  Follower now has {} events", follower_count);
+
+    assert_eq!(
+        follower_count, 9,
+        "Follower should have all 9 events after catchup + replication"
+    );
+    println!("  Catchup successful! Follower has all 9 events");
+
+    let leader_count = count_events(&mut leader_client, &aggregate_key).await?;
+    assert_eq!(leader_count, 9, "Leader should have 9 events");
+    println!("  Leader has {} events", leader_count);
 
     // ========================================
     // Phase 6: Normal replication resumes (no new S3 objects)
@@ -218,30 +180,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nPHASE 6: Normal replication resumes (no new S3 objects)");
     println!("-------------------------------------------------------");
 
+    // Check no new S3 fallback objects were created (TCP replication handled events 10-12)
+    let objects_before_phase6 = minio.list_objects(&shard_prefix).await?;
+    // Note: boot catchup may have consumed the original fallback objects, so count could be 0
+    let count_before = objects_before_phase6.len();
+
     println!("  Writing events 10-12 to leader (follower is online)...");
     for i in 10..=12 {
         write_event(&mut leader_client, &aggregate_key, i, false).await?;
     }
 
     println!("  Waiting for replication...");
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let follower_count = count_events(&mut follower_client, &aggregate_key).await?;
     assert_eq!(
         follower_count, 12,
         "Follower should have 12 events after normal replication"
     );
-    println!("  ✓ Follower has {} events", follower_count);
+    println!("  Follower has {} events", follower_count);
 
     let objects_after = minio.list_objects(&shard_prefix).await?;
-    println!("  S3 objects now: {}", objects_after.len());
+    println!("  S3 objects: {} before, {} after", count_before, objects_after.len());
 
     assert_eq!(
         objects_after.len(),
-        s3_object_count_before,
+        count_before,
         "No new S3 objects should appear after follower is back online"
     );
-    println!("  ✓ No new S3 objects created (normal replication resumed)");
+    println!("  No new S3 objects created (normal replication resumed)");
 
     println!("\n=== All Tests Passed ===\n");
 

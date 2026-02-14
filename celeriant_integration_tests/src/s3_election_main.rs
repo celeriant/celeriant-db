@@ -1,58 +1,23 @@
 //! S3 Lease Election Integration Test
 //!
-//! Tests cold-start S3 election, follower discovery, and TCP replication.
+//! Tests cold-start S3 election, split-brain prevention, multi-shard replication,
+//! and S3 control plane state.
 //!
 //! 1. Start MinIO + two nodes concurrently — one wins CreateOnly race
 //! 2. Probe both to discover who is leader (who accepts writes)
-//! 3. Write events via leader, verify follower has them via TCP replication
-//! 4. Verify lease.bin and membership.bin in S3
-//! 5. Verify NO S3 fallback data (follower is active, TCP replication only)
+//! 3. Verify exactly one leader (split-brain prevention via S3 CreateOnly)
+//! 4. Write events via leader to multiple shards, verify follower has them
+//! 5. Verify follower rejects writes
+//! 6. Verify lease.bin and membership.bin in S3
+//! 7. Verify NO S3 fallback data (follower is active, TCP replication only)
 //!
 //! Run with: cargo run --bin s3_election_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{count_events, write_event, MinioContainer, ServerConfig, TestServer};
-use celeriant_runtimes::RoutingRule;
+use celeriant_integration_tests::{count_events, is_leader, s3_cluster_config, write_event, MinioContainer, TestServer};
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wire::disk::versioned_block::{deserialise_lease, deserialise_membership};
 use std::time::Duration;
-
-fn s3_cluster_config(
-    num_shards: usize,
-    region: &str,
-    bucket: &str,
-    access_key: &str,
-    secret_key: &str,
-    endpoint: &str,
-    allow_http: bool,
-) -> ServerConfig {
-    ServerConfig {
-        num_shards: Some(num_shards),
-        log_level: "info".to_string(),
-        routing_rule: RoutingRule::AggregateTypeId,
-        // 1hr TTL — no heartbeat yet, status must not self-fence during test
-        heartbeat_lease_duration_ms: 3_600_000,
-        s3_enabled: true,
-        s3_region: Some(region.to_string()),
-        s3_bucket: Some(bucket.to_string()),
-        s3_access_key_id: Some(access_key.to_string()),
-        s3_secret_access_key: Some(secret_key.to_string()),
-        s3_endpoint_override: Some(endpoint.to_string()),
-        s3_allow_http: allow_http,
-        ..Default::default()
-    }
-}
-
-/// Try writing a probe event to determine if this node is the leader.
-/// Returns true if the write was accepted.
-async fn is_leader(address: &str) -> Result<bool, Box<dyn std::error::Error>> {
-    let probe_key = AggregateKey::new(999, 999, 999);
-    let mut client = CeleriantClient::connect(address).await?;
-    match write_event(&mut client, &probe_key, 1, true).await {
-        Ok(_) => Ok(true),
-        Err(_) => Ok(false),
-    }
-}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -82,10 +47,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::sleep(Duration::from_secs(8)).await;
 
     // ========================================
-    // Phase 1: Discover who won the election
+    // Phase 1: Discover who won the election (split-brain prevention)
     // ========================================
-    println!("\nPHASE 1: Discover leader");
-    println!("------------------------");
+    println!("\nPHASE 1: Discover leader (split-brain prevention)");
+    println!("-------------------------------------------------");
 
     let a_is_leader = is_leader(node_a.address()).await?;
     let b_is_leader = is_leader(node_b.address()).await?;
@@ -95,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     assert!(
         a_is_leader ^ b_is_leader,
-        "Exactly one node should be leader (a={}, b={})",
+        "Exactly one node should be leader — S3 CreateOnly prevents split-brain (a={}, b={})",
         a_is_leader, b_is_leader
     );
 
@@ -108,18 +73,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // ========================================
-    // Phase 2: Write events via leader
+    // Phase 2: Write events to multiple shards via leader
     // ========================================
-    println!("\nPHASE 2: Write events to leader");
-    println!("-------------------------------");
+    println!("\nPHASE 2: Write events to multiple shards");
+    println!("-----------------------------------------");
 
-    let aggregate_key = AggregateKey::new(1, 1, 1);
+    // Two aggregate keys that route to different shards (AggregateTypeId routing: shard = type_id % num_shards)
+    let key_shard_1 = AggregateKey::new(1, 1, 1); // 1 % 4 = shard 1
+    let key_shard_2 = AggregateKey::new(1, 2, 1); // 2 % 4 = shard 2
+
     let mut leader_client = CeleriantClient::connect(leader_addr).await?;
 
-    for i in 1..=5 {
-        write_event(&mut leader_client, &aggregate_key, i, i == 1).await?;
+    for i in 1..=3 {
+        write_event(&mut leader_client, &key_shard_1, i, i == 1).await?;
+        write_event(&mut leader_client, &key_shard_2, i, i == 1).await?;
     }
-    println!("  Wrote 5 events to leader");
+    println!("  Wrote 3 events to shard 1, 3 events to shard 2");
 
     // ========================================
     // Phase 3: Verify follower rejects writes
@@ -128,26 +97,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("----------------------------------------");
 
     let mut follower_client = CeleriantClient::connect(follower_addr).await?;
-    let write_result = write_event(&mut follower_client, &aggregate_key, 99, false).await;
+    let write_result = write_event(&mut follower_client, &key_shard_1, 99, false).await;
     assert!(write_result.is_err(), "Follower must reject writes");
     println!("  Follower rejected write");
 
     // ========================================
-    // Phase 4: Verify replication (data readable on both nodes)
+    // Phase 4: Verify multi-shard replication
     // ========================================
-    println!("\nPHASE 4: Verify replication");
-    println!("---------------------------");
+    println!("\nPHASE 4: Verify multi-shard replication");
+    println!("---------------------------------------");
 
     println!("  Waiting for replication...");
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    let leader_count = count_events(&mut leader_client, &aggregate_key).await?;
-    assert_eq!(leader_count, 5, "Leader should have 5 events");
-    println!("  Leader has {} events", leader_count);
+    let leader_count_s1 = count_events(&mut leader_client, &key_shard_1).await?;
+    let leader_count_s2 = count_events(&mut leader_client, &key_shard_2).await?;
+    assert_eq!(leader_count_s1, 3, "Leader shard 1 should have 3 events");
+    assert_eq!(leader_count_s2, 3, "Leader shard 2 should have 3 events");
+    println!("  Leader: shard 1 = {} events, shard 2 = {} events", leader_count_s1, leader_count_s2);
 
-    let follower_count = count_events(&mut follower_client, &aggregate_key).await?;
-    assert_eq!(follower_count, 5, "Follower should have 5 events via TCP replication");
-    println!("  Follower has {} events", follower_count);
+    let follower_count_s1 = count_events(&mut follower_client, &key_shard_1).await?;
+    let follower_count_s2 = count_events(&mut follower_client, &key_shard_2).await?;
+    assert_eq!(follower_count_s1, 3, "Follower shard 1 should have 3 events via TCP replication");
+    assert_eq!(follower_count_s2, 3, "Follower shard 2 should have 3 events via TCP replication");
+    println!("  Follower: shard 1 = {} events, shard 2 = {} events", follower_count_s1, follower_count_s2);
 
     // ========================================
     // Phase 5: Verify S3 lease and membership
@@ -160,7 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("Failed to deserialise lease: {:?}", e))?;
 
     println!("  lease_index={}, leader_node_id={:x}", lease.lease_index, lease.leader_node_id);
-    assert_eq!(lease.lease_index, 1, "Initial election should produce lease_index=1");
+    assert!(lease.lease_index >= 1, "Election should produce lease_index >= 1 (got {})", lease.lease_index);
     assert_ne!(lease.leader_node_id, 0, "leader_node_id must be set");
 
     let membership_bytes = minio.get_object("cluster/membership.bin").await?;

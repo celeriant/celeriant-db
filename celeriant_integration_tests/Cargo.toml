@@ -30,10 +30,6 @@ name = "watch_test_main"
 path = "src/watch_test_main.rs"
 
 [[bin]]
-name = "replication_catchup_main"
-path = "src/replication_catchup_main.rs"
-
-[[bin]]
 name = "s3_fallback_main"
 path = "src/s3_fallback_main.rs"
 
@@ -58,8 +54,8 @@ name = "s3_failover_main"
 path = "src/s3_failover_main.rs"
 
 [[bin]]
-name = "s3_split_brain_main"
-path = "src/s3_split_brain_main.rs"
+name = "s3_leader_solo_main"
+path = "src/s3_leader_solo_main.rs"
 
 [[bin]]
 name = "s3_follower_crash_main"

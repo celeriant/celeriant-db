@@ -1433,13 +1433,10 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             result,
         };
 
-        if !self.node_status.get().is_follower() {
-            return Ok(response(ReplicationResult::Rejected(FollowerRejection::NotAFollower)));
-        }
-
-        //TODO: Validate metablock.lease_index >= leader_lease_index from NodeStatus::Follower.
-        // Reject with StaleLease if less, update local leader_lease_index if greater.
-        // Depends on election broadcasting real leader_lease_index via StatusUpdate.
+        let leader_lease_index = match self.node_status.get().effective() {
+            NodeStatus::Follower { leader_lease_index } => leader_lease_index,
+            _ => return Ok(response(ReplicationResult::Rejected(FollowerRejection::NotAFollower))),
+        };
 
         if follower_timestamp_ms.saturating_sub(request.leader_timestamp_ms) > self.config.max_cluster_time_drift_ms {
             return Ok(response(ReplicationResult::Rejected(FollowerRejection::TimeDriftTooHigh {
@@ -1451,6 +1448,14 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
         if request.batches.is_empty() {
             return Ok(response(ReplicationResult::Rejected(FollowerRejection::EmptyBatch)));
+        }
+
+        let batch_lease_index = request.batches[0].metablock.lease_index;
+        if batch_lease_index < leader_lease_index {
+            return Ok(response(ReplicationResult::Rejected(FollowerRejection::StaleLease {
+                follower_lease_index: leader_lease_index,
+                received_lease_index: batch_lease_index,
+            })));
         }
 
         //TODO: How to handle the scenario where we have compacted the log but yet to replicate? 

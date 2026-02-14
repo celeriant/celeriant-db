@@ -5,7 +5,7 @@ use std::{
 };
 
 use celeriant_disk::files::rwlock_timeout::write_with_timeout;
-use celeriant_distributed::{heartbeat::now_ms, lease_manager::LeaseManager, lease_store::LeaseStore, validated_node_status::ValidatedNodeStatus};
+use celeriant_distributed::{heartbeat::now_ms, lease_manager::{ElectionOutcome, LeaseManager}, lease_store::LeaseStore, validated_node_status::ValidatedNodeStatus};
 use celeriant_msg::response::responses::HeartbeatResult;
 use celeriant_shard::{replication_client::ReplicationClient, s3_downloader::S3Downloader, shard_wal::ShardWal};
 use glommio::{
@@ -254,7 +254,7 @@ async fn update_follower_address<R: ReplicationClient + 'static, D: S3Downloader
 async fn renew_s3_lease_and_broadcast<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
     lease_manager: &LeaseManager<S>,
     ctx: &ConnectionContext<R, D, S>,
-) -> Result<(), celeriant_distributed::lease_store::LeaseStoreError> {
+) -> Result<ElectionOutcome, celeriant_distributed::lease_store::LeaseStoreError> {
     let outcome = lease_manager.run_election().await?;
     ctx.shard_wal.node_status.set(outcome.status);
     broadcast_message_to_other_shards(
@@ -262,7 +262,7 @@ async fn renew_s3_lease_and_broadcast<R: ReplicationClient + 'static, D: S3Downl
         IntrashardMessages::StatusUpdate { status: outcome.status },
         ctx.intrashard_sender.clone(),
     ).await;
-    Ok(())
+    Ok(outcome)
 }
 
 /// Check if the follower in membership differs from the current peer.
@@ -337,25 +337,35 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
 
         loop {
             // Phase 1: discover a follower
+            // Each iteration renews the S3 lease (prevents self-fencing during
+            // extended discovery) and discovers the peer in one shot —
+            // run_election() calls discover_peer() internally.
+            // Backoff is capped at half the S3 lease TTL so renewal always
+            // lands with headroom before the lease expires.
             let peer_info = match known_peer.take() {
                 Some(info) => info,
                 None => {
-                    let mut backoff = Duration::from_secs(1);
+                    let max_backoff = rc.initial_lease_duration / 2;
+                    let mut backoff = Duration::from_secs(1).min(max_backoff);
                     loop {
                         glommio::timer::sleep(backoff).await;
-                        match lease_manager.discover_peer().await {
-                            Ok(Some(info)) => {
-                                info!(peer = ?info, "Follower discovered");
-                                break info;
+                        match renew_s3_lease_and_broadcast(&lease_manager, &ctx).await {
+                            Ok(outcome) if !outcome.status.raw().is_leader() => {
+                                warn!("Lost leadership during follower discovery");
+                                return;
                             }
-                            Ok(None) => {
+                            Ok(outcome) => {
+                                if let Some(info) = outcome.peer_info {
+                                    info!(peer = ?info, "Follower discovered");
+                                    break info;
+                                }
                                 debug!("Follower not yet registered, retrying");
                                 update_follower_address(&ctx, None).await;
-                                backoff = (backoff * 2).min(Duration::from_secs(10));
+                                backoff = (backoff * 2).min(max_backoff);
                             }
                             Err(e) => {
-                                warn!(error = ?e, "Discovery failed, retrying");
-                                backoff = (backoff * 2).min(Duration::from_secs(10));
+                                warn!(error = ?e, "S3 lease renewal failed during discovery, retrying");
+                                backoff = (backoff * 2).min(max_backoff);
                             }
                         }
                     }

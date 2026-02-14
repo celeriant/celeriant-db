@@ -33,6 +33,29 @@ use celeriant_wal::{
 /// Enable replicated mode: writes to leader, reads from follower
 const REPLICATED_MODE: bool = true;
 
+fn s3_cluster_config(
+    region: &str,
+    bucket: &str,
+    access_key: &str,
+    secret_key: &str,
+    endpoint: &str,
+    allow_http: bool,
+) -> ServerConfig {
+    ServerConfig {
+        log_level: "warn".to_string(),
+        routing_rule: RoutingRule::AggregateTypeId,
+        heartbeat_lease_duration_ms: 10_000,
+        s3_enabled: true,
+        s3_region: Some(region.to_string()),
+        s3_bucket: Some(bucket.to_string()),
+        s3_access_key_id: Some(access_key.to_string()),
+        s3_secret_access_key: Some(secret_key.to_string()),
+        s3_endpoint_override: Some(endpoint.to_string()),
+        s3_allow_http: allow_http,
+        ..Default::default()
+    }
+}
+
 struct ReplicatedServers {
     leader: TestServer,
     follower: TestServer,
@@ -48,43 +71,17 @@ impl ReplicatedServers {
         let (region, bucket, access_key, secret_key, endpoint, allow_http) = minio.s3_config_fields();
         println!("MinIO ready at {}\n", endpoint);
 
-        // Start follower first
+        let config = s3_cluster_config(&region, &bucket, &access_key, &secret_key, &endpoint, allow_http);
+
+        // Leader starts first — wins CreateOnly election race
         let follower_port = base_port + 100;
-        let follower_config = ServerConfig {
-            log_level: "warn".to_string(),
-            routing_rule: RoutingRule::AggregateTypeId,
-            s3_enabled: true,
-            s3_region: Some(region.clone()),
-            s3_bucket: Some(bucket.clone()),
-            s3_access_key_id: Some(access_key.clone()),
-            s3_secret_access_key: Some(secret_key.clone()),
-            s3_endpoint_override: Some(endpoint.clone()),
-            s3_allow_http: allow_http,
-            ..Default::default()
-        };
+        println!("Starting leader on port {}...", base_port);
+        let leader = TestServer::start_with_config_labeled(base_port, config.clone(), "leader".into()).await?;
         println!("Starting follower on port {}...", follower_port);
-        let follower = TestServer::start_with_config(follower_port, follower_config).await?;
+        let follower = TestServer::start_with_config_labeled(follower_port, config, "follower".into()).await?;
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        // Start leader with S3 config for election/discovery
-        let leader_config = ServerConfig {
-            log_level: "warn".to_string(),
-            routing_rule: RoutingRule::AggregateTypeId,
-            s3_enabled: true,
-            s3_region: Some(region),
-            s3_bucket: Some(bucket),
-            s3_access_key_id: Some(access_key),
-            s3_secret_access_key: Some(secret_key),
-            s3_endpoint_override: Some(endpoint),
-            s3_allow_http: allow_http,
-            ..Default::default()
-        };
-        println!("Starting leader on port {} (S3 election mode)...", base_port);
-        let leader = TestServer::start_with_config(base_port, leader_config).await?;
-
-        // Wait for S3 election to complete
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        println!("Waiting for election + discovery + replication connection...");
+        tokio::time::sleep(Duration::from_secs(8)).await;
 
         Ok(Self { leader, follower, _minio: minio })
     }
@@ -93,7 +90,7 @@ impl ReplicatedServers {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mode_str = if REPLICATED_MODE {
-        "Replicated (writes→leader, reads→follower)"
+        "Replicated (writes->leader, reads->follower)"
     } else {
         "Standalone"
     };
@@ -226,6 +223,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => println!("Idempotent retry result: {:?}", e),
     }
 
+    // Wait for replication before reading from follower
+    if REPLICATED_MODE {
+        println!("\n  Waiting for replication...");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
     // Read back events from both aggregates (use read_client - follower in replicated mode)
     println!("\n=== Reading events from both aggregates ===");
     if REPLICATED_MODE {
@@ -336,6 +339,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         Ok(response) => println!("Delete aggregate 1: {:?}", response),
         Err(e) => println!("Delete aggregate 1 failed: {:?}", e),
+    }
+
+    // Wait for delete to replicate
+    if REPLICATED_MODE {
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
     // === List Aggregates again to verify delete ===
