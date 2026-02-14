@@ -318,7 +318,6 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
         }
 
         ctx.shard_wal.node_status.set(outcome.status);
-
         broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::StatusUpdate { status: outcome.status }, ctx.intrashard_sender.clone()).await;
 
         //TODO: Killing heartbeat loop when not leader
@@ -398,13 +397,22 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                 }
 
                 warn!(result = ?result, "Heartbeat unsuccessful, renewing lease via S3");
-                if let Err(e) = renew_s3_lease_and_broadcast(&lease_manager, &ctx).await {
-                    error!(error = ?e, "S3 lease renewal failed");
-                }
-
-                if let Some(new_peer) = check_follower_changed(&lease_manager, &peer_info).await {
-                    known_peer = Some(new_peer);
-                    break;
+                match renew_s3_lease_and_broadcast(&lease_manager, &ctx).await {
+                    Ok(renewal) if !renewal.status.raw().is_leader() => {
+                        info!("Lost leadership after S3 CAS race");
+                        return;
+                    }
+                    Ok(_) => {
+                        if let Some(new_peer) = check_follower_changed(&lease_manager, &peer_info).await {
+                            known_peer = Some(new_peer);
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        // Both heartbeat and S3 unavailable. Writes already rejected
+                        // (replication has no target). TTL self-fencing is the safety bound.
+                        error!(error = ?e, "S3 lease renewal failed, relying on TTL");
+                    }
                 }
             }
         }
