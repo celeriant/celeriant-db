@@ -320,104 +320,172 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
         ctx.shard_wal.node_status.set(outcome.status);
         broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::StatusUpdate { status: outcome.status }, ctx.intrashard_sender.clone()).await;
 
-        //TODO: Killing heartbeat loop when not leader
-        //Node could become leader later
-        if !outcome.status.raw().is_leader() {
-            return;
-        }
-
-        //Unwrap safety - we are on shard0 which always has replication_config
-        let rc = ctx.config.replication_config.as_ref().unwrap();
-        let heartbeat_interval = rc.heartbeat_interval;
-        let status_ttl_ms = rc.status_ttl_ms();
-
-        // Use peer from election as initial hint; None means we need to discover
-        let mut known_peer = outcome.peer_info;
+        let mut initial_peer = outcome.peer_info;
 
         loop {
-            // Phase 1: discover a follower
-            // Each iteration renews the S3 lease (prevents self-fencing during
-            // extended discovery) and discovers the peer in one shot —
-            // run_election() calls discover_peer() internally.
-            // Backoff is capped at half the S3 lease TTL so renewal always
-            // lands with headroom before the lease expires.
-            let peer_info = match known_peer.take() {
-                Some(info) => info,
-                None => {
-                    let max_backoff = rc.initial_lease_duration / 2;
-                    let mut backoff = Duration::from_secs(1).min(max_backoff);
-                    loop {
-                        glommio::timer::sleep(backoff).await;
-                        match renew_s3_lease_and_broadcast(&lease_manager, &ctx).await {
-                            Ok(outcome) if !outcome.status.raw().is_leader() => {
-                                warn!("Lost leadership during follower discovery");
-                                return;
-                            }
-                            Ok(outcome) => {
-                                if let Some(info) = outcome.peer_info {
-                                    info!(peer = ?info, "Follower discovered");
-                                    break info;
-                                }
-                                debug!("Follower not yet registered, retrying");
-                                update_follower_address(&ctx, None).await;
-                                backoff = (backoff * 2).min(max_backoff);
-                            }
-                            Err(e) => {
-                                warn!(error = ?e, "S3 lease renewal failed during discovery, retrying");
-                                backoff = (backoff * 2).min(max_backoff);
-                            }
-                        }
-                    }
-                }
-            };
-
-            update_follower_address(&ctx, Some(peer_info.replication_address.clone())).await;
-
-            // Phase 2: heartbeat loop
-            // On failure: renew lease via S3, check if follower changed in membership.
-            // If changed, set known_peer and break to re-discover. Otherwise keep
-            // trying — transient failures don't mean the follower is gone.
-            loop {
-                glommio::timer::sleep(heartbeat_interval).await;
-
-                let result = match write_with_timeout(&ctx.shard_wal.replication_client, "send_heartbeat").await {
-                    Ok(mut guard) => guard.send_heartbeat().await,
-                    Err(_) => {
-                        warn!("Replication client lock contention, skipping heartbeat");
-                        continue;
-                    }
-                };
-
-                if let Ok(HeartbeatResult::Ack { .. }) = result {
-                    let leader_ms = now_ms();
-                    let refreshed = ValidatedNodeStatus::new(outcome.status.raw(), leader_ms + status_ttl_ms);
-                    ctx.shard_wal.node_status.set(refreshed);
-                    broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::StatusUpdate { status: refreshed }, ctx.intrashard_sender.clone()).await;
-                    continue;
-                }
-
-                warn!(result = ?result, "Heartbeat unsuccessful, renewing lease via S3");
-                match renew_s3_lease_and_broadcast(&lease_manager, &ctx).await {
-                    Ok(renewal) if !renewal.status.raw().is_leader() => {
-                        info!("Lost leadership after S3 CAS race");
-                        return;
-                    }
-                    Ok(_) => {
-                        if let Some(new_peer) = check_follower_changed(&lease_manager, &peer_info).await {
-                            known_peer = Some(new_peer);
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        // Both heartbeat and S3 unavailable. Writes already rejected
-                        // (replication has no target). TTL self-fencing is the safety bound.
-                        error!(error = ?e, "S3 lease renewal failed, relying on TTL");
-                    }
-                }
+            if ctx.shard_wal.node_status.get().raw().is_leader() {
+                run_leader_loop(&lease_manager, &ctx, initial_peer.take()).await;
+                update_follower_address(&ctx, None).await;
+            } else {
+                run_follower_watchdog(&lease_manager, &ctx).await;
+            }
+            if ctx.shutdown_requested.get() {
+                break;
             }
         }
     })
     .detach();
+}
+
+/// Leader steady-state: discover follower, heartbeat, renew S3 lease on failure.
+/// Returns when leadership is lost (status already set to Follower by renew_s3_lease_and_broadcast).
+async fn run_leader_loop<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
+    lease_manager: &Rc<LeaseManager<S>>,
+    ctx: &ConnectionContext<R, D, S>,
+    initial_peer: Option<celeriant_wal::s3::membership::NodeInfo>,
+) {
+    let rc = ctx.config.replication_config.as_ref().unwrap();
+    let heartbeat_interval = rc.heartbeat_interval;
+    let status_ttl_ms = rc.status_ttl_ms();
+
+    let mut known_peer = initial_peer;
+
+    loop {
+        // Phase 1: discover a follower
+        // Each iteration renews the S3 lease (prevents self-fencing during
+        // extended discovery) and discovers the peer in one shot —
+        // run_election() calls discover_peer() internally.
+        // Backoff is capped at half the S3 lease TTL so renewal always
+        // lands with headroom before the lease expires.
+        let peer_info = match known_peer.take() {
+            Some(info) => info,
+            None => {
+                let max_backoff = rc.initial_lease_duration / 2;
+                let mut backoff = Duration::from_secs(1).min(max_backoff);
+                loop {
+                    glommio::timer::sleep(backoff).await;
+                    match renew_s3_lease_and_broadcast(lease_manager, ctx).await {
+                        Ok(outcome) if !outcome.status.raw().is_leader() => {
+                            warn!("Lost leadership during follower discovery");
+                            return;
+                        }
+                        Ok(outcome) => {
+                            if let Some(info) = outcome.peer_info {
+                                info!(peer = ?info, "Follower discovered");
+                                break info;
+                            }
+                            debug!("Follower not yet registered, retrying");
+                            update_follower_address(ctx, None).await;
+                            backoff = (backoff * 2).min(max_backoff);
+                        }
+                        Err(e) => {
+                            warn!(error = ?e, "S3 lease renewal failed during discovery, retrying");
+                            backoff = (backoff * 2).min(max_backoff);
+                        }
+                    }
+                }
+            }
+        };
+
+        update_follower_address(ctx, Some(peer_info.replication_address.clone())).await;
+
+        // Phase 2: heartbeat loop
+        // On failure: renew lease via S3, check if follower changed in membership.
+        // If changed, set known_peer and break to re-discover. Otherwise keep
+        // trying — transient failures don't mean the follower is gone.
+        loop {
+            glommio::timer::sleep(heartbeat_interval).await;
+
+            let result = match write_with_timeout(&ctx.shard_wal.replication_client, "send_heartbeat").await {
+                Ok(mut guard) => guard.send_heartbeat().await,
+                Err(_) => {
+                    warn!("Replication client lock contention, skipping heartbeat");
+                    continue;
+                }
+            };
+
+            if let Ok(HeartbeatResult::Ack { .. }) = result {
+                let leader_ms = now_ms();
+                let current_status = ctx.shard_wal.node_status.get().raw();
+                let refreshed = ValidatedNodeStatus::new(current_status, leader_ms + status_ttl_ms);
+                ctx.shard_wal.node_status.set(refreshed);
+                broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::StatusUpdate { status: refreshed }, ctx.intrashard_sender.clone()).await;
+                continue;
+            }
+
+            warn!(result = ?result, "Heartbeat unsuccessful, renewing lease via S3");
+            match renew_s3_lease_and_broadcast(lease_manager, ctx).await {
+                Ok(renewal) if !renewal.status.raw().is_leader() => {
+                    info!("Lost leadership after S3 CAS race");
+                    return;
+                }
+                Ok(_) => {
+                    if let Some(new_peer) = check_follower_changed(lease_manager, &peer_info).await {
+                        known_peer = Some(new_peer);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    // Both heartbeat and S3 unavailable. Writes already rejected
+                    // (replication has no target). TTL self-fencing is the safety bound.
+                    error!(error = ?e, "S3 lease renewal failed, relying on TTL");
+                }
+            }
+        }
+    }
+}
+
+/// Monitor heartbeat liveness and race to S3 when leader is presumed dead.
+/// Returns when this node wins the CAS race (status already set to Leader).
+async fn run_follower_watchdog<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
+    lease_manager: &Rc<LeaseManager<S>>,
+    ctx: &ConnectionContext<R, D, S>,
+) {
+    info!("Entering follower watchdog");
+
+    loop {
+        // Sleep until exact TTL expiry. If a heartbeat refreshes the TTL
+        // during our sleep, we wake at the old deadline, re-check, and
+        // sleep the delta to the new deadline. Zero artificial delay.
+        loop {
+            let status = ctx.shard_wal.node_status.get();
+            if !status.is_follower() {
+                break;
+            }
+            let sleep_ms = status.expires_at_ms().saturating_sub(now_ms());
+            glommio::timer::sleep(Duration::from_millis(sleep_ms)).await;
+        }
+
+        // TTL expired — leader presumed dead.
+        // Self-fencing via TTL already rejects writes/replication.
+        // Explicit broadcast updates raw() for observability.
+        info!("Leader heartbeat expired, racing to S3");
+        let fenced = ValidatedNodeStatus::fenced();
+        ctx.shard_wal.node_status.set(fenced);
+        broadcast_message_to_other_shards(
+            ctx.current_shard_id,
+            IntrashardMessages::StatusUpdate { status: fenced },
+            ctx.intrashard_sender.clone(),
+        ).await;
+
+        match renew_s3_lease_and_broadcast(lease_manager, ctx).await {
+            Ok(outcome) if outcome.status.raw().is_leader() => {
+                info!("Won S3 CAS race, becoming leader");
+                return;
+            }
+            Ok(_) => {
+                info!("Lost S3 CAS race, resuming watchdog");
+                // Status already set to Follower with fresh TTL by
+                // renew_s3_lease_and_broadcast. Inner loop will sleep
+                // until the new leader's heartbeats stop.
+            }
+            Err(e) => {
+                // Already fenced. Retry after backoff.
+                error!(error = ?e, "S3 race failed, retrying");
+                glommio::timer::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
 }
 
 fn spawn_intrashard_message_handler<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(

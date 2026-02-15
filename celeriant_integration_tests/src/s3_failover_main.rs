@@ -113,7 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Initial lease: leader_node_id={:x}, lease_index={}",
         initial_lease.leader_node_id, initial_lease.lease_index);
 
-    assert_eq!(initial_lease.lease_index, 1, "Initial lease_index should be 1");
+    let initial_lease_index = initial_lease.lease_index;
     let original_leader_node_id = initial_lease.leader_node_id;
     println!("  ✓ Recorded initial state\n");
 
@@ -155,12 +155,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  New lease: leader_node_id={:x}, lease_index={}",
         new_lease.leader_node_id, new_lease.lease_index);
 
-    assert_eq!(new_lease.lease_index, 2, "lease_index should be 2 after failover takeover");
+    assert!(
+        new_lease.lease_index > initial_lease_index,
+        "lease_index should have increased after failover: was {}, now {}",
+        initial_lease_index, new_lease.lease_index
+    );
     assert_ne!(
         new_lease.leader_node_id, original_leader_node_id,
         "leader_node_id should have changed"
     );
-    println!("  ✓ Lease updated: lease_index=2, new leader\n");
+    println!("  ✓ Lease updated: lease_index {} → {}, new leader\n",
+        initial_lease_index, new_lease.lease_index);
 
     // ========================================
     // PHASE 6: Restart old leader

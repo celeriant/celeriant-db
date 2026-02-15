@@ -76,8 +76,8 @@ impl NodeStatus {
             (FollowerCatchingUp { .. }, FollowerCaughtUp { .. }) => true,
             (FollowerCaughtUp { .. }, Follower { .. }) => true,
 
-            // Leader can update lease_index (renewal)
-            (Leader { .. }, Leader { .. }) => true,
+            // Leader can update lease_index (renewal) or become follower (lost S3 CAS)
+            (Leader { .. }, Leader { .. }) | (Leader { .. }, Follower { .. }) => true,
 
             // Everything else is invalid
             _ => false,
@@ -176,8 +176,8 @@ mod tests {
     fn valid_transitions_from_leader() {
         let leader = NodeStatus::Leader { lease_index: 5 };
         assert!(leader.is_valid_transition_to(&NodeStatus::Leader { lease_index: 6 }));
+        assert!(leader.is_valid_transition_to(&NodeStatus::Follower { leader_lease_index: 6 }));
         assert!(leader.is_valid_transition_to(&NodeStatus::Fenced));
-        assert!(!leader.is_valid_transition_to(&NodeStatus::Follower { leader_lease_index: 6 }));
         assert!(!leader.is_valid_transition_to(&NodeStatus::FollowerCatchingUp { leader_lease_index: 6 }));
         assert!(!leader.is_valid_transition_to(&NodeStatus::Standalone));
     }

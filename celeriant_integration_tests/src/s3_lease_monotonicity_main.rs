@@ -106,9 +106,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("  Initial lease: leader_node_id={:x}, lease_index={}",
         lease_1.leader_node_id, lease_1.lease_index);
-    assert_eq!(lease_1.lease_index, 1, "Initial lease_index should be 1");
+    let initial_lease_index = lease_1.lease_index;
     let node_a_id = lease_1.leader_node_id;
-    println!("  ✓ Initial state verified: lease_index=1\n");
+    println!("  ✓ Initial state verified: lease_index={}\n", initial_lease_index);
 
     // ========================================
     // PHASE 2: First failover - Kill leader A
@@ -137,10 +137,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("  Lease after failover 1: leader_node_id={:x}, lease_index={}",
         lease_2.leader_node_id, lease_2.lease_index);
-    assert_eq!(lease_2.lease_index, 2, "lease_index should be 2 after first failover");
+    assert!(
+        lease_2.lease_index > initial_lease_index,
+        "lease_index should have increased after first failover: was {}, now {}",
+        initial_lease_index, lease_2.lease_index
+    );
     assert_ne!(lease_2.leader_node_id, node_a_id, "leader_node_id should have changed");
     let node_b_id = lease_2.leader_node_id;
-    println!("  ✓ Lease updated: lease_index=2, new leader B");
+    let lease_index_after_failover_1 = lease_2.lease_index;
+    println!("  ✓ Lease updated: lease_index {} → {}, new leader B",
+        initial_lease_index, lease_2.lease_index);
 
     println!("  Writing events 4-5 to new leader B...");
     for i in 4..=5 {
@@ -199,10 +205,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("  Lease after failover 2: leader_node_id={:x}, lease_index={}",
         lease_3.leader_node_id, lease_3.lease_index);
-    assert_eq!(lease_3.lease_index, 3, "lease_index should be 3 after second failover");
+    assert!(
+        lease_3.lease_index > lease_index_after_failover_1,
+        "lease_index should have increased after second failover: was {}, now {}",
+        lease_index_after_failover_1, lease_3.lease_index
+    );
     assert_eq!(lease_3.leader_node_id, node_a_id, "leader should be A again");
     assert_ne!(lease_3.leader_node_id, node_b_id, "leader should not be B");
-    println!("  ✓ Lease updated: lease_index=3, leader is A again");
+    println!("  ✓ Lease updated: lease_index {} → {}, leader is A again",
+        lease_index_after_failover_1, lease_3.lease_index);
 
     println!("  Writing events 6-7 to re-promoted leader A...");
     for i in 6..=7 {
@@ -222,10 +233,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ========================================
     println!("=== All Tests Passed ===\n");
     println!("Summary: lease_index monotonicity verified across multiple failovers:");
-    println!("  - Initial state (Leader A): lease_index=1");
-    println!("  - After failover 1 (A→B):   lease_index=2");
-    println!("  - After failover 2 (B→A):   lease_index=3");
-    println!("  - Invariant satisfied: 1 < 2 < 3 (strictly monotonically increasing)");
+    println!("  - Initial state (Leader A): lease_index={}", initial_lease_index);
+    println!("  - After failover 1 (A→B):   lease_index={}", lease_index_after_failover_1);
+    println!("  - After failover 2 (B→A):   lease_index={}", lease_3.lease_index);
+    println!("  - Invariant satisfied: {} < {} < {} (strictly monotonically increasing)",
+        initial_lease_index, lease_index_after_failover_1, lease_3.lease_index);
 
     Ok(())
 }

@@ -108,7 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("Failed to deserialise initial lease: {:?}", e))?;
     println!("  ✓ Initial lease: leader_node_id={:x}, lease_index={}\n",
         initial_lease.leader_node_id, initial_lease.lease_index);
-    assert_eq!(initial_lease.lease_index, 1, "Initial lease_index should be 1");
+    let initial_lease_index = initial_lease.lease_index;
 
     // ========================================
     // PHASE 2: Pause MinIO (S3 unreachable)
@@ -191,7 +191,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("  ✓ Final lease: leader_node_id={:x}, lease_index={}",
         final_lease.leader_node_id, final_lease.lease_index);
-    assert_eq!(final_lease.lease_index, 2, "lease_index should be 2 after takeover");
+    assert!(
+        final_lease.lease_index > initial_lease_index,
+        "lease_index should have increased after takeover: was {}, now {}",
+        initial_lease_index, final_lease.lease_index
+    );
 
     println!("  ✓ Verifying replication of event 6...");
     tokio::time::sleep(Duration::from_millis(500)).await;

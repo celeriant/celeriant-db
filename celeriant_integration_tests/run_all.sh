@@ -16,17 +16,17 @@ TESTS=(
   s3_election_main
   s3_follower_crash_main
   s3_leader_solo_main
-  # --- Require follower-side failover (not yet implemented) ---
-  # s3_failover_main
-  # s3_stale_lease_main
-  # s3_fencing_writes_main
-  # s3_lease_monotonicity_main
-  # s3_unreachable_failover_main
-  # s3_network_partition_main
-  # s3_reconvergence_main
-  # s3_old_leader_recovery_main
-  # s3_writes_during_fencing_main
-  # s3_concurrent_cas_main
+  # --- Follower-side failover (watchdog) ---
+  s3_failover_main
+  s3_stale_lease_main
+  s3_fencing_writes_main
+  s3_lease_monotonicity_main
+  s3_unreachable_failover_main
+  s3_network_partition_main
+  s3_reconvergence_main
+  s3_old_leader_recovery_main
+  s3_writes_during_fencing_main
+  s3_concurrent_cas_main
 )
 
 # Pre-build everything so compilation isn't counted in per-test timeout
