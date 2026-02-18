@@ -6,9 +6,9 @@
 //!
 //! Scenario:
 //! 1. Start cluster, establish leader/follower, verify healthy
-//! 2. Kill follower — leader self-heals (lease_index 1 → 2)
+//! 2. Kill follower — leader self-heals (lease_index increments via S3 CAS renewals)
 //! 3. Restart follower — it reads the stale S3 lease (different leader, expired)
-//! 4. Verify follower does NOT race to S3 — lease_index stays at 2, leader unchanged
+//! 4. Verify follower does NOT race to S3 — leader_node_id unchanged
 //! 5. Verify follower rejoins as follower and replication works
 //!
 //! The key invariant: a restarting node seeing a stale lease from another leader
@@ -171,14 +171,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         post_restart_lease.leader_node_id, post_restart_lease.lease_index);
 
     assert_eq!(
-        post_restart_lease.lease_index, lease_index_after_heal,
-        "lease_index should NOT have changed (follower should not have raced)"
-    );
-    assert_eq!(
         post_restart_lease.leader_node_id, leader_node_id,
         "leader_node_id should NOT have changed"
     );
-    println!("  ✓ Follower did NOT attempt takeover despite stale S3 lease\n");
+    assert!(
+        post_restart_lease.lease_index >= lease_index_after_heal,
+        "lease_index should not have gone backwards"
+    );
+    println!("  ✓ Follower did NOT attempt takeover despite stale S3 lease");
+    println!("    (lease_index advanced {} → {} from leader self-renewal, same leader)\n",
+        lease_index_after_heal, post_restart_lease.lease_index);
 
     // ========================================
     // PHASE 5: Verify cluster works after follower rejoin

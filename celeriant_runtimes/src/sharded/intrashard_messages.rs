@@ -20,5 +20,5 @@ pub enum IntrashardMessages {
         result: Result<S3CatchupResult, S3CatchupError>
     },
     StatusUpdate { status: ValidatedNodeStatus },
-    UpdateFollower { replication_address: Option<String> }
+    UpdateFollower { replication_address: Option<String> },
 }

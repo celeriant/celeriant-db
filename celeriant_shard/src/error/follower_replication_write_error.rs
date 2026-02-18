@@ -6,4 +6,6 @@ use crate::error::shard_fsync_error::ShardFsyncError;
 pub enum FollowerReplicationWriteError {
     ShardFSyncError(ShardFsyncError),
     FailedToSerialiseDatablocks(CodecError),
+    BlockBecameInline,
+    BatchWalIndexGap { index: usize, expected: u64, actual: u64 },
 }

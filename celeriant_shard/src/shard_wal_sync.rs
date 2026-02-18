@@ -11,9 +11,11 @@ use celeriant_rotating_log::log_segment_file::log_segment_file::{LogSegmentFile,
 use celeriant_rotating_log::log_segment_file::log_segment_file_metadata::LogSegmentFileMetadata;
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
 use celeriant_wal::constants::{EntryHashBytes, FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_METABLOCK};
-use celeriant_wal::metablocks::datablock_storage_kind::DatablockStorageKind;
+
+use celeriant_wal::metablocks::metablock::Metablock;
 use celeriant_wal::metablocks::metablock_kind::MetablockKind;
 use celeriant_watch::aggregate_watchers::AggregateWatchers;
+use celeriant_wire::disk::versioned_block;
 use celeriant_wire::disk::versioned_block::serialize_versioned_message;
 
 use crate::amortisation::coordinator::CaptureResult;
@@ -256,16 +258,16 @@ pub(crate) async fn sync(
                 .copy_from_slice(&datablocks_carry_over.as_ref().unwrap());
         }
 
-        let mut position = 0usize;
+        let mut position = buffer_size_datablocks as usize;
         for item in &sync_positions_snapshot.pending_append_queue {
             if let Some(datablock_bytes) = &item.datablock_bytes {
                 let len = datablock_bytes.len();
+                position -= len;
                 let start_idx = front_carry_over + position;
                 let end_idx = front_carry_over + position + len;
 
                 datablocks_absolute_write_positions.push(new_datablocks_position + position as u64);
                 buffer_datablocks_slice[start_idx..end_idx].copy_from_slice(datablock_bytes);
-                position += len;
             }
         }
 
@@ -288,12 +290,7 @@ pub(crate) async fn sync(
     let mut index = 0;
     for item in &mut sync_positions_snapshot.pending_append_queue {
         if item.datablock_bytes.is_some() && item.datablock.is_some() {
-            match &mut item.metablock.datablock {
-                DatablockStorageKind::Block(datablock_block_ref) => {
-                    datablock_block_ref.datablock_position = datablocks_absolute_write_positions[index];
-                }
-                _ => {}
-            }
+            item.metablock.datablock_position = datablocks_absolute_write_positions[index];
             index += 1;
         }
 
@@ -319,7 +316,7 @@ pub(crate) async fn sync(
         serialize_versioned_message(&item.metablock, WIRE_VERSION_WAL_METABLOCK, &mut metablock_bytes)
             .map_err(|e| ShardFsyncError::MetablockSerialisationError(e.to_string()))?;
 
-        // Compute hash chain: hash = blake3(previous_hash || metablock_bytes)
+        // Compute hash chain, excluding datablock_position (node-local offset that differs between nodes)
         log_segment_file_metadata.write.tip_hash = compute_entry_hash(&log_segment_file_metadata.write.tip_hash, &metablock_bytes);
 
         //let metablock_bytes: [u8; FIXED_BLOCK_SIZE_BYTES]
@@ -358,9 +355,16 @@ pub(crate) async fn sync(
     Ok(log_segment_file_metadata)
 }
 
+/// Hash chain: blake3(previous_hash || metablock_bytes), skipping the CRC (which covers
+/// datablock_position) and the datablock_position field itself — both are node-local.
 fn compute_entry_hash(previous_hash: &EntryHashBytes, content: &[u8]) -> EntryHashBytes {
+    const CRC_END: usize = versioned_block::CRC_SIZE;
+    const SKIP_START: usize = versioned_block::HEADER_SIZE + Metablock::OFFSET_DATABLOCK_POSITION;
+    const SKIP_END: usize = SKIP_START + Metablock::WIRE_SIZE_DATABLOCK_POSITION;
+
     let mut hasher = blake3::Hasher::new();
     hasher.update(previous_hash);
-    hasher.update(content);
+    hasher.update(&content[CRC_END..SKIP_START]);
+    hasher.update(&content[SKIP_END..]);
     *hasher.finalize().as_bytes()
 }

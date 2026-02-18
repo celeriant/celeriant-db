@@ -70,6 +70,7 @@ const LIST_AGGREGATES_DISK_READ: u32 = 5002;
 // Replication batch errors: 6xxx
 const REPLICATION_BATCH_FSYNC: u32 = 6000;
 const REPLICATION_BATCH_SERIALISE_DATABLOCKS: u32 = 6001;
+const REPLICATION_BATCH_WAL_INDEX_GAP: u32 = 6002;
 
 // Exists errors: 7xxx
 const EXISTS_CACHE_ERROR: u32 = 7000;
@@ -207,6 +208,14 @@ fn replication_batch_error(e: FollowerReplicationWriteError) -> (u32, String) {
             REPLICATION_BATCH_SERIALISE_DATABLOCKS,
             format!(r#"{{"detail":{}}}"#, json_string(&format!("{:?}", e))),
         ),
+        FollowerReplicationWriteError::BlockBecameInline => (
+            REPLICATION_BATCH_SERIALISE_DATABLOCKS,
+            r#"{"detail":"leader Block storage became Inline on follower re-serialization"}"#.to_string(),
+        ),
+        FollowerReplicationWriteError::BatchWalIndexGap { index, expected, actual } => (
+            REPLICATION_BATCH_WAL_INDEX_GAP,
+            format!(r#"{{"index":{index},"expected":{expected},"actual":{actual}}}"#),
+        ),
     }
 }
 
@@ -228,9 +237,9 @@ fn cache_load_error(lock_code: u32, scan_code: u32, e: ShardCacheLoadError) -> (
 
 fn replication_message(e: ReplicationError) -> String {
     match e {
-        ReplicationError::RollbackInProgress => "{}".into(),
+        ReplicationError::RollbackInProgress => format!(r#"{{"detail":{}}}"#, "RollbackInProgress"),
         ReplicationError::RollbackFailed(f) => format!(r#"{{"detail":{}}}"#, json_string(&rollback_detail(&f))),
-        ReplicationError::ReplicationClientLockTimeoutError => "{}".into(),
+        ReplicationError::ReplicationClientLockTimeoutError => format!(r#"{{"detail":{}}}"#, "ReplicationClientLockTimeoutError"),
         ReplicationError::ReplicateToS3Error(e) => format!(r#"{{"detail":{}}}"#, json_string(&format!("{:?}", e))),
         ReplicationError::ExtendedCatchupFailure(e) => format!(r#"{{"detail":{}}}"#, json_string(&format!("{:?}", e))),
     }

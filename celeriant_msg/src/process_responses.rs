@@ -8,7 +8,7 @@ use futures_lite::{AsyncReadExt, AsyncWriteExt};
 use crate::{
     read_wire_data_error::ReadWireDataError,
     response::responses::{
-        CatchUpResponse, ErrorResponse, ExistsResponse, HeartbeatResponse, ListAggregateTypesResponse, ListAggregatesResponse, ListOrgsResponse, ProtocolErrorResponse,
+        CatchUpResponse, ErrorResponse, ExistsResponse, HeartbeatResponse, KickFollowerResponse, ListAggregateTypesResponse, ListAggregatesResponse, ListOrgsResponse, ProtocolErrorResponse,
         ReadResponse, ReplicationBatchResponse, SuccessResponse, WatchResponse,
     },
 };
@@ -31,6 +31,7 @@ pub enum ResponseType {
     ReplicationBatch = 12,
     CatchUp = 13,
     Heartbeat = 14,
+    KickFollower = 15,
 }
 
 impl ResponseType {
@@ -50,6 +51,7 @@ impl ResponseType {
             12 => Ok(ResponseType::ReplicationBatch),
             13 => Ok(ResponseType::CatchUp),
             14 => Ok(ResponseType::Heartbeat),
+            15 => Ok(ResponseType::KickFollower),
             _ => Err(ReadWireDataError::UnknownMessageType(value)),
         }
     }
@@ -71,6 +73,7 @@ pub enum Response {
     ReplicationBatch(ReplicationBatchResponse),
     CatchUp(CatchUpResponse),
     Heartbeat(HeartbeatResponse),
+    KickFollower(KickFollowerResponse),
 }
 
 impl Response {
@@ -90,6 +93,7 @@ impl Response {
             Response::ReplicationBatch(_) => ResponseType::ReplicationBatch,
             Response::CatchUp(_) => ResponseType::CatchUp,
             Response::Heartbeat(_) => ResponseType::Heartbeat,
+            Response::KickFollower(_) => ResponseType::KickFollower,
         }
     }
 
@@ -134,6 +138,7 @@ impl Response {
             ResponseType::GenericError => fixed!(GenericError),
             ResponseType::ReplicationBatch => fixed!(ReplicationBatch),
             ResponseType::Heartbeat => fixed!(Heartbeat),
+            ResponseType::KickFollower => fixed!(KickFollower),
             ResponseType::Read => variable!(Read),
             ResponseType::Watch => variable!(Watch),
             ResponseType::ListOrgs => variable!(ListOrgs),
@@ -159,6 +164,7 @@ impl Response {
             Response::ReplicationBatch(_) => CompressionType::None,
             Response::CatchUp(_) => server_compression_algorithm,
             Response::Heartbeat(_) => CompressionType::None,
+            Response::KickFollower(_) => CompressionType::None,
         }
     }
 
@@ -183,6 +189,7 @@ impl Response {
             Response::GenericError(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
             Response::ReplicationBatch(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
             Response::Heartbeat(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
+            Response::KickFollower(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
             Response::Read(res) => wire_header_write_variable_size(writer, res, response_type_id, compression_type, max_message_size, version).await,
             Response::Watch(res) => wire_header_write_variable_size(writer, res, response_type_id, compression_type, max_message_size, version).await,
             Response::ListOrgs(res) => wire_header_write_variable_size(writer, res, response_type_id, compression_type, max_message_size, version).await,
@@ -200,8 +207,8 @@ mod tests {
     use celeriant_wire::network::wire_header::{PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3};
     use futures_lite::{future::block_on, io::Cursor};
 
-    const COUNT: usize = 14;
-    const MAX_ID: u32 = 14;
+    const COUNT: usize = 15;
+    const MAX_ID: u32 = 15;
     const VERSIONS: [u32; 2] = [PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3];
 
     fn all_types() -> [ResponseType; COUNT] {
@@ -220,6 +227,7 @@ mod tests {
             ResponseType::ReplicationBatch,
             ResponseType::CatchUp,
             ResponseType::Heartbeat,
+            ResponseType::KickFollower,
         ]
     }
 
@@ -281,6 +289,10 @@ mod tests {
                 result: HeartbeatResult::Ack {
                     follower_timestamp_ms: 1234567890123,
                 },
+            }),
+            ResponseType::KickFollower => Response::KickFollower(KickFollowerResponse {
+                correlation_id: Some(0x8888_9999_AAAA_BBBB),
+                acknowledged: true,
             }),
         }
     }

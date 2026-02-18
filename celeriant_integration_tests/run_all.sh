@@ -27,6 +27,14 @@ TESTS=(
   s3_old_leader_recovery_main
   s3_writes_during_fencing_main
   s3_concurrent_cas_main
+  # --- Invariant tests ---
+  invariant_read_count_main
+  invariant_concurrent_write_main
+  invariant_replication_convergence_main
+  invariant_s3_fallback_dedup_main
+  invariant_replication_queue_pressure_main
+  # --- Follower-kick ---
+  s3_follower_kick_main
 )
 
 # Pre-build everything so compilation isn't counted in per-test timeout

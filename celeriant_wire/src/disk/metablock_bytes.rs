@@ -279,6 +279,7 @@ mod tests {
             wal_metablock_type: MetablockKind::EventBatchMetadata(event_batch),
             datablock,
             previous_tip_hash: GENESIS_HASH,
+            datablock_position: 0,
         }
     }
 
@@ -309,6 +310,7 @@ mod tests {
             }),
             datablock: DatablockStorageKind::None,
             previous_tip_hash: GENESIS_HASH,
+            datablock_position: 0,
         }
     }
 
@@ -337,6 +339,7 @@ mod tests {
             }),
             datablock: DatablockStorageKind::None,
             previous_tip_hash: GENESIS_HASH,
+            datablock_position: 0,
         }
     }
 
@@ -355,6 +358,7 @@ mod tests {
             wal_metablock_type: MetablockKind::SnapshotOrg(MetablockSnapshotOrg { org_id }),
             datablock: DatablockStorageKind::None,
             previous_tip_hash: GENESIS_HASH,
+            datablock_position: 0,
         }
     }
 
@@ -385,6 +389,7 @@ mod tests {
             }),
             datablock: DatablockStorageKind::None,
             previous_tip_hash: GENESIS_HASH,
+            datablock_position: 0,
         }
     }
 

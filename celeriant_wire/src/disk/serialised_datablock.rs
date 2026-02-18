@@ -52,10 +52,7 @@ impl SerialisedDatablock {
         // Calculate CRC over the compressed data
         let crc32c = crc32c::crc32c(&compressed);
 
-        let block_ref = DatablockBlockRef {
-            crc32c,
-            datablock_position: 0, // To be filled in by the fsync write process
-        };
+        let block_ref = DatablockBlockRef { crc32c };
 
         Ok(Self {
             uncompressed_size: uncompressed_size as u64,
@@ -303,10 +300,8 @@ mod tests {
 
         let serialized = SerialisedDatablock::new(&original, CompressionType::None).unwrap();
 
-        // Position is filled in later by fsync write process
-        if let DatablockStorageKind::Block(ref block_ref) = serialized.storage_kind {
-            assert_eq!(block_ref.datablock_position, 0);
-        }
+        // Block variant should exist for large datablocks
+        assert!(matches!(serialized.storage_kind, DatablockStorageKind::Block(_)));
 
         let deserialized = roundtrip_deserialise(&serialized).unwrap();
 

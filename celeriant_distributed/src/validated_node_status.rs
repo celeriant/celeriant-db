@@ -28,15 +28,14 @@ impl ValidatedNodeStatus {
     }
 
     /// Returns the effective status. Fenced if expired.
-    /// TTL-exempt: Standalone, BootCatchup, FollowerCatchingUp, FollowerCaughtUp.
+    /// TTL-exempt: Standalone, BootCatchup, FollowerCatchingUp.
     /// Catchup states are orchestrated by shard 0, which provides a fresh TTL on exit.
     pub fn effective(&self) -> NodeStatus {
         match self.status {
             NodeStatus::Standalone
             | NodeStatus::BootCatchup
             | NodeStatus::Fenced
-            | NodeStatus::FollowerCatchingUp { .. }
-            | NodeStatus::FollowerCaughtUp { .. } => self.status,
+            | NodeStatus::FollowerCatchingUp { .. } => self.status,
             _ if now_ms() > self.expires_at_ms => NodeStatus::Fenced,
             _ => self.status,
         }
@@ -69,6 +68,10 @@ impl ValidatedNodeStatus {
 
     pub fn is_catching_up(&self) -> bool {
         self.effective().is_catching_up()
+    }
+
+    pub fn is_any_follower_state(&self) -> bool {
+        self.effective().is_any_follower_state()
     }
 
     pub fn can_accept_writes(&self) -> bool {

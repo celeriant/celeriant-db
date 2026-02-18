@@ -124,21 +124,59 @@
         {
             "type": "lldb",
             "request": "launch",
-            "name": "Debug batch_main",
+            "name": "Debug invariant_replication_queue_pressure_main",
             "cargo": {
                 "args": [
                     "build",
                     "--bin",
-                    "batch_main",
+                    "invariant_replication_queue_pressure_main",
                     "-p",
                     "celeriant_integration_tests",
                 ],
                 "filter": {
-                    "name": "batch_main",
+                    "name": "invariant_replication_queue_pressure_main",
                     "kind": "bin"
                 }
             },
             "args": [],
+            "cwd": "${workspaceFolder}",
+            "env": {}
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug follower (pressure test)",
+            "cargo": {
+                "args": [
+                    "build",
+                    "-p",
+                    "celeriant"
+                ],
+                "filter": {
+                    "name": "celeriant",
+                    "kind": "bin"
+                }
+            },
+            "args": [
+                "--data-root", "data_debug_follower",
+                "--client-port", "11100",
+                "--replication-port", "11101",
+                "--num-shards", "2",
+                "--routing-rule", "aggregate_type_id",
+                "--log-level", "debug",
+                "--advertised-replication-address", "127.0.0.1:11200",
+                "--pending-replication-high-water-bytes", "262144",
+                "--max-catchup-gap-bytes", "100000000",
+                "--heartbeat-lease-duration-ms", "600000",
+                "--internode-connection-timeout-ms", "60000",
+                "--s3-enabled",
+                "--s3-region", "us-east-1",
+                "--s3-bucket", "test-pressure",
+                "--s3-access-key-id", "minioadmin",
+                "--s3-secret-access-key", "minioadmin",
+                "--s3-endpoint-override", "http://127.0.0.1:11010",
+                "--s3-allow-http"
+            ],
             "cwd": "${workspaceFolder}",
             "env": {}
         }

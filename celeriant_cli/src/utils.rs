@@ -36,5 +36,6 @@ pub fn format_response(response: &Response) -> String {
             celeriant_msg::response::responses::HeartbeatResult::Ack { .. } => "Heartbeat: ack".to_string(),
             celeriant_msg::response::responses::HeartbeatResult::Rejected(reason) => format!("Heartbeat: rejected ({:?})", reason),
         },
+        Response::KickFollower(r) => format!("KickFollower: acknowledged={}", r.acknowledged),
     }
 }

@@ -186,7 +186,9 @@ pub(crate) fn apply_external_batch(
     if current_tip_hash != batch_tip_hash {
         return Err(ApplyBatchError::TipHashMismatch {
             current: current_tip_hash,
+            current_wal_index,
             batch: batch_tip_hash,
+            batch_wal_index
         });
     }
 
@@ -197,6 +199,16 @@ fn queue_replicated_entries(
     shard_mem_cache: &Rc<RefCell<ShardMemCache>>,
     items: &[ReplicationBatchItem],
 ) -> Result<(), ApplyBatchError> {
+    for (i, w) in items.windows(2).enumerate() {
+        if w[0].metablock.wal_index + 1 != w[1].metablock.wal_index {
+            return Err(ApplyBatchError::BatchWalIndexGap {
+                index: i + 1,
+                expected: w[0].metablock.wal_index + 1,
+                actual: w[1].metablock.wal_index,
+            });
+        }
+    }
+
     let mut prepared = Vec::with_capacity(items.len());
 
     for item in items {
@@ -207,7 +219,9 @@ fn queue_replicated_entries(
                     let compression_type = CompressionType::from_tuple(item.metablock.datablock_compression_type, None);
                     let serialized = SerialisedDatablock::new(datablock, compression_type)
                         .map_err(ApplyBatchError::SerialiseDatablocks)?;
-                    (serialized.external_data, Some(datablock.clone()))
+                    let external_data = serialized.external_data
+                        .ok_or(ApplyBatchError::BlockBecameInline)?;
+                    (Some(external_data), Some(datablock.clone()))
                 } else {
                     return Err(ApplyBatchError::MissingDatablock);
                 }
@@ -773,8 +787,8 @@ mod tests {
             }),
             datablock: DatablockStorageKind::Block(celeriant_wal::metablocks::datablock_block_ref::DatablockBlockRef {
                 crc32c: 0,
-                datablock_position: 1000,
             }),
+            datablock_position: 1000,
         };
 
         let metablock2 = Metablock {
@@ -802,6 +816,7 @@ mod tests {
                 event_types_data: celeriant_wal::metablocks::metablock_event_batch::EventTypesKind::Direct([7, 0, 0, 0]),
             }),
             datablock: DatablockStorageKind::None,
+            datablock_position: 0,
         };
 
         let datablock1 = Some(Datablock {
@@ -878,6 +893,7 @@ mod tests {
                 event_types_data: celeriant_wal::metablocks::metablock_event_batch::EventTypesKind::Direct([7, 0, 0, 0]),
             }),
             datablock: DatablockStorageKind::None,
+            datablock_position: 0,
         };
 
         let metablock_second = Metablock {

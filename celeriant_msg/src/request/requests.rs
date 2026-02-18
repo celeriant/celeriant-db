@@ -108,9 +108,6 @@ pub struct ReplicationBatchRequest {
     pub shard_id: u64,
     /// Leader provides its current time to follower to catch clock drift
     pub leader_timestamp_ms: u64,
-    /// Leader has decided to kick the follower
-    /// Follower won't rejoin until it's caught back up
-    pub follower_too_far_behind: bool,
     /// If there are batches to replicate, they are provided to the follower
     /// Otherwise it's just a heartbeat message
     pub batches: Vec<ReplicationBatchItem>,
@@ -148,4 +145,9 @@ pub struct HeartbeatRequest {
     pub correlation_id: Option<u128>,
     pub shard_id: u64,
     pub leader_timestamp_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub struct KickFollowerRequest {
+    pub correlation_id: Option<u128>,
 }

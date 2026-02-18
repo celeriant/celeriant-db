@@ -9,7 +9,7 @@
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use celeriant_integration_tests::{MinioContainer, ServerConfig, TestServer};
+use celeriant_integration_tests::{count_events, MinioContainer, ServerConfig, TestServer};
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
 use celeriant_msg::request::requests::WriteRequest;
@@ -41,7 +41,7 @@ struct TaskStats {
 /// Holds both leader and follower servers for replicated mode
 struct ReplicatedServers {
     leader: TestServer,
-    _follower: TestServer,
+    follower: TestServer,
     _minio: MinioContainer,
 }
 
@@ -54,9 +54,8 @@ impl ReplicatedServers {
         let (region, bucket, access_key, secret_key, endpoint, allow_http) = minio.s3_config_fields();
         println!("MinIO ready at {}\n", endpoint);
 
-        // Start follower first (it needs to be listening before leader connects)
-        let follower_port = base_port + 100;
-        let follower_config = ServerConfig {
+        // Start leader first so it wins the S3 lease election (CreateOnly — first come first served)
+        let leader_config = ServerConfig {
             log_level: log_level.to_string(),
             s3_enabled: true,
             s3_region: Some(region.clone()),
@@ -67,14 +66,15 @@ impl ReplicatedServers {
             s3_allow_http: allow_http,
             ..Default::default()
         };
-        println!("Starting follower on port {}...", follower_port);
-        let follower = TestServer::start_with_config(follower_port, follower_config).await?;
+        println!("Starting leader on port {} (S3 election mode)...", base_port);
+        let leader = TestServer::start_with_config(base_port, leader_config).await?;
 
-        // Small delay to ensure follower is fully ready
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Wait for leader to grab the S3 lease before starting follower
+        tokio::time::sleep(Duration::from_secs(3)).await;
 
-        // Start leader with S3 config for election/discovery
-        let leader_config = ServerConfig {
+        // Start follower — it will see the valid lease and become follower
+        let follower_port = base_port + 100;
+        let follower_config = ServerConfig {
             log_level: log_level.to_string(),
             s3_enabled: true,
             s3_region: Some(region),
@@ -85,21 +85,25 @@ impl ReplicatedServers {
             s3_allow_http: allow_http,
             ..Default::default()
         };
-        println!("Starting leader on port {} (S3 election mode)...", base_port);
-        let leader = TestServer::start_with_config(base_port, leader_config).await?;
+        println!("Starting follower on port {}...", follower_port);
+        let follower = TestServer::start_with_config(follower_port, follower_config).await?;
 
-        // Wait for S3 election to complete
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        // Wait for follower election + replication connection establishment
+        tokio::time::sleep(Duration::from_secs(5)).await;
 
         Ok(Self {
             leader,
-            _follower: follower,
+            follower,
             _minio: minio,
         })
     }
 
     fn address(&self) -> &str {
         self.leader.address()
+    }
+
+    fn follower_address(&self) -> &str {
+        self.follower.address()
     }
 }
 
@@ -150,6 +154,7 @@ async fn run_sweep_benchmark() -> Result<(), Box<dyn std::error::Error>> {
         println!("Starting standalone test server...");
         let config = ServerConfig {
             log_level: "warn".to_string(),
+            standalone: true,
             ..Default::default()
         };
         let server = TestServer::start_with_config(port, config).await?;
@@ -383,7 +388,8 @@ async fn run_single_benchmark(num_connections: usize, verbose: bool) -> Result<O
         }
         let config = ServerConfig {
             log_level: "warn".to_string(),
-            fsync_delay_us: 30000,
+            fsync_delay_us: 17000,
+            standalone: true,
             ..Default::default()
         };
         let server = TestServer::start_with_config(port, config).await?;
@@ -522,6 +528,44 @@ async fn run_single_benchmark(num_connections: usize, verbose: bool) -> Result<O
         println!("P99.9: {}ms", p999);
         println!("Max: {}ms", max_latency);
         println!("Min: {}ms", min_latency);
+    }
+
+    // Verify follower replication caught up
+    if REPLICATED_MODE {
+        if let Some(ref replicated) = _replicated {
+            println!("\n=== Verifying Replication ===");
+            println!("Waiting for follower to catch up...");
+            tokio::time::sleep(Duration::from_secs(5)).await;
+
+            let mut leader_client = CeleriantClient::connect(replicated.address()).await?;
+            let mut follower_client = CeleriantClient::connect(replicated.follower_address()).await?;
+
+            // Sample aggregate keys spread across the range used by the benchmark
+            let sample_ids: Vec<u128> = (0..10).map(|i| (i * (NUM_AGGREGATES / 10)) as u128).collect();
+            let mut total_leader = 0usize;
+            let mut total_follower = 0usize;
+
+            for &agg_id in &sample_ids {
+                let key = AggregateKey::new(1, 1, agg_id);
+                let lc = count_events(&mut leader_client, &key).await?;
+                let fc = count_events(&mut follower_client, &key).await?;
+                total_leader += lc;
+                total_follower += fc;
+                if lc != fc {
+                    println!("  agg_id={}: leader={}, follower={} MISMATCH", agg_id, lc, fc);
+                }
+            }
+
+            println!(
+                "Sampled {} keys: leader={} events, follower={} events",
+                sample_ids.len(), total_leader, total_follower
+            );
+            assert_eq!(
+                total_leader, total_follower,
+                "Follower should have caught up on all sampled aggregates"
+            );
+            println!("Replication verified!");
+        }
     }
 
     Ok(None)

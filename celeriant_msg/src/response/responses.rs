@@ -113,7 +113,9 @@ pub enum FollowerRejection {
     /// Follower's tip hash doesn't match leader's expected hash.
     TipHashMismatch {
         follower: EntryHashBytes,
+        follower_wal_index: u64,
         leader: EntryHashBytes,
+        leader_wal_index: u64,
     },
     /// Leader sent empty batch.
     EmptyBatch,
@@ -180,4 +182,10 @@ pub enum HeartbeatResult {
 pub struct HeartbeatResponse {
     pub correlation_id: Option<u128>,
     pub result: HeartbeatResult,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub struct KickFollowerResponse {
+    pub correlation_id: Option<u128>,
+    pub acknowledged: bool,
 }

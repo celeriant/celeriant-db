@@ -28,6 +28,9 @@ pub struct Metablock {
     pub datablock_compression_type: u8,
     /// Hash of the previous WAL entry's tip, forming a hash chain
     pub previous_tip_hash: EntryHashBytes,
+    /// Absolute position where the datablock payload is located in the shard log.
+    /// Excluded from hash chain computation as it varies between nodes.
+    pub datablock_position: u64,
     /// Different types of fixed 512 byte metablocks
     pub wal_metablock_type: MetablockKind,
     /// Type of datablock linked to this metablock, if any
@@ -47,6 +50,7 @@ impl Metablock {
     const WIRE_SIZE_DATABLOCK_VERSION: usize = 4;
     const WIRE_SIZE_DATABLOCK_COMPRESSION_TYPE: usize = 1;
     const WIRE_SIZE_PREVIOUS_TIP_HASH: usize = 32;
+    pub const WIRE_SIZE_DATABLOCK_POSITION: usize = 8;
 
     pub const OFFSET_WAL_INDEX: usize = 0;
 
@@ -74,8 +78,11 @@ impl Metablock {
     pub const OFFSET_PREVIOUS_TIP_HASH: usize =
         Self::OFFSET_DATABLOCK_COMPRESSION_TYPE + Self::WIRE_SIZE_DATABLOCK_COMPRESSION_TYPE;
 
-    pub const OFFSET_WAL_METABLOCK_TYPE: usize =
+    pub const OFFSET_DATABLOCK_POSITION: usize =
         Self::OFFSET_PREVIOUS_TIP_HASH + Self::WIRE_SIZE_PREVIOUS_TIP_HASH;
+
+    pub const OFFSET_WAL_METABLOCK_TYPE: usize =
+        Self::OFFSET_DATABLOCK_POSITION + Self::WIRE_SIZE_DATABLOCK_POSITION;
 
     pub fn default_inline_event_batch_metadata(aggregate_key: AggregateKey) -> Self {
         Self {
@@ -88,6 +95,7 @@ impl Metablock {
             datablock_version: 0,
             datablock_compression_type: 0,
             previous_tip_hash: [0u8; 32],
+            datablock_position: 0,
             wal_metablock_type: MetablockKind::EventBatchMetadata(MetablockEventBatch {
                 aggregate_key,
                 event_batch_index: 0,

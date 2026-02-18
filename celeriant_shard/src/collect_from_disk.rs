@@ -32,6 +32,15 @@ impl LogSegmentDatablockPositions {
             end_pos: datablock_end_pos,
         });
     }
+
+    /// Datablock positions are collected in chronological (metablock) order, which is
+    /// monotonically descending because the datablocks region grows downward and each
+    /// sync batch writes its datablocks in reverse queue order. A simple reverse
+    /// produces the ascending position order that read_objects_absolute requires.
+    fn reverse_positions(&mut self) {
+        self.metablock_indexes.reverse();
+        self.datablock_positions.reverse();
+    }
 }
 
 /// Populates the datablock in-memory representations in kept_metablocks, 
@@ -70,17 +79,19 @@ pub async fn fetch_datablocks_for_metablocks(
 
                 kept.datablock = Some(datablock);
             }
-            DatablockStorageKind::Block(block) => {
+            DatablockStorageKind::Block(_) => {
                 disk_fetches_by_log_id.entry(kept.log_id).or_default().push(
                     metablock_idx,
-                    block.datablock_position,
-                    block.datablock_position.saturating_add(kept.metablock.compressed_size),
+                    kept.metablock.datablock_position,
+                    kept.metablock.datablock_position.saturating_add(kept.metablock.compressed_size),
                 );
             }
         }
     }
 
-    for (log_id, log_fetches) in disk_fetches_by_log_id {
+    for (log_id, mut log_fetches) in disk_fetches_by_log_id {
+        log_fetches.reverse_positions();
+
         let blobs = {
             let log_segment_file = log_segments_cache.get(log_id).await.map_err(FetchDatablockError::LogSegmentFileError)?;
             let file_len = log_segment_file.metadata.borrow().file_len;

@@ -6,7 +6,7 @@ use celeriant_distributed::paths::fallback_batch_path;
 use celeriant_msg::{
     process_requests::Request,
     process_responses::Response,
-    request::requests::{HeartbeatRequest, ReplicationBatchItem, ReplicationBatchRequest},
+    request::requests::{HeartbeatRequest, KickFollowerRequest, ReplicationBatchItem, ReplicationBatchRequest},
     response::responses::{HeartbeatResult, ReplicationResult},
 };
 use celeriant_wal::{compression_type::CompressionType, s3::fallback_batch::{FallbackBatch, FallbackItem}};
@@ -21,6 +21,7 @@ pub trait ReplicationClient {
     async fn replicate_to_follower(&mut self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError>;
     async fn replicate_to_s3(&mut self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToS3Error>;
     async fn send_heartbeat(&mut self) -> Result<HeartbeatResult, SendHeartbeatError>;
+    async fn send_kick(&mut self) -> Result<bool, SendHeartbeatError>;
 }
 
 pub struct StubReplicationClient;
@@ -41,6 +42,8 @@ impl ReplicationClient for StubReplicationClient {
     async fn send_heartbeat(&mut self) -> Result<HeartbeatResult, SendHeartbeatError> {
         Ok(HeartbeatResult::Ack { follower_timestamp_ms: celeriant_distributed::heartbeat::now_ms() })
     }
+
+    async fn send_kick(&mut self) -> Result<bool, SendHeartbeatError> { Ok(true) }
 }
 
 pub struct GlommioReplicationClient<S: S3Uploader> {
@@ -108,7 +111,6 @@ impl<S: S3Uploader> ReplicationClient for GlommioReplicationClient<S> {
             correlation_id: None,
             shard_id,
             leader_timestamp_ms: SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64,
-            follower_too_far_behind: false,
             batches,
         };
 
@@ -203,6 +205,28 @@ impl<S: S3Uploader> ReplicationClient for GlommioReplicationClient<S> {
             _ => Err(SendHeartbeatError::UnexpectedResponse),
         }
     }
+
+    async fn send_kick(&mut self) -> Result<bool, SendHeartbeatError> {
+        let request = Request::KickFollower(KickFollowerRequest {
+            correlation_id: None,
+        });
+
+        let client = self.ensure_connected(false).await?;
+        let response = match client.send_request(&request, CompressionType::None).await {
+            Ok(r) => r,
+            Err(_) => {
+                let client = self.ensure_connected(true).await?;
+                client.send_request(&request, CompressionType::None).await?
+            }
+        };
+
+        match response {
+            Response::KickFollower(resp) => Ok(resp.acknowledged),
+            Response::GenericError(err) => Err(SendHeartbeatError::ServerError(err.error_message)),
+            _ => Err(SendHeartbeatError::UnexpectedResponse),
+        }
+    }
+
 }
 
 #[cfg(test)]
@@ -260,6 +284,7 @@ mod tests {
             datablock_version: 1,
             datablock_compression_type: 1,
             previous_tip_hash: [1u8; 32],
+            datablock_position: 0,
             wal_metablock_type: MetablockKind::EventBatchMetadata(MetablockEventBatch {
                 aggregate_key,
                 event_batch_index: 10,
@@ -300,7 +325,7 @@ mod tests {
                 max_request_size: 1024,
                 max_response_size: 1024,
                 s3_uploader: Some(mock_uploader),
-            };
+                };
 
             let result = client.replicate_to_s3(vec![]).await;
 
@@ -320,7 +345,7 @@ mod tests {
                 max_request_size: 1024,
                 max_response_size: 1024,
                 s3_uploader: None,
-            };
+                };
 
             let batches = vec![ReplicationBatchItem {
                 metablock: create_test_metablock(42),
@@ -346,7 +371,7 @@ mod tests {
                 max_request_size: 1024,
                 max_response_size: 1024,
                 s3_uploader: Some(mock_uploader),
-            };
+                };
 
             let batches = vec![
                 ReplicationBatchItem {
@@ -391,7 +416,7 @@ mod tests {
                 max_request_size: 1024,
                 max_response_size: 1024,
                 s3_uploader: Some(mock_uploader),
-            };
+                };
 
             let batches = vec![
                 ReplicationBatchItem {
@@ -446,7 +471,7 @@ mod tests {
                 max_request_size: 1024,
                 max_response_size: 1024,
                 s3_uploader: Some(mock_uploader),
-            };
+                };
 
             let batches = vec![ReplicationBatchItem {
                 metablock: create_test_metablock(42),

@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -199,6 +199,22 @@ impl TestServer {
         &self.config
     }
 
+    /// Check if the server process is still running.
+    /// Returns Ok(()) if alive, or Err with exit status if the process exited.
+    pub fn check_alive(&mut self) -> Result<(), String> {
+        match self.child.try_wait() {
+            Ok(Some(status)) => Err(format!(
+                "[{}] Server process exited unexpectedly: {}",
+                self.label, status
+            )),
+            Ok(None) => Ok(()),
+            Err(e) => Err(format!(
+                "[{}] Failed to check server process status: {}",
+                self.label, e
+            )),
+        }
+    }
+
     /// Stop the server process (can be restarted later).
     pub fn stop(&mut self) {
         let _ = self.child.kill();
@@ -248,13 +264,14 @@ impl Drop for TestServer {
     }
 }
 
-/// Take stderr from a child process and spawn a thread that prints each line with a label prefix.
-/// Returns `None` if stderr is not available (already taken or not piped).
+/// Take stdout from a child process and spawn a thread that prints each line with a label prefix.
+/// The server uses `tracing_subscriber::fmt().init()` which writes to stdout, not stderr.
+/// Returns `None` if stdout is not available (already taken or not piped).
 fn spawn_log_reader(label: &str, child: &mut Child) -> Option<JoinHandle<()>> {
-    let stderr = child.stderr.take()?;
+    let stdout = child.stdout.take()?;
     let label = label.to_string();
     Some(std::thread::spawn(move || {
-        let reader = BufReader::new(stderr);
+        let reader = BufReader::new(stdout);
         for line in reader.lines() {
             match line {
                 Ok(line) => eprintln!("  [{}] {}", label, line),
@@ -671,10 +688,12 @@ impl Drop for MinioContainer {
 
 /// A controllable TCP proxy for integration tests.
 /// Routes traffic between a listen port and a target port.
-/// Can be blocked/unblocked to simulate network partitions.
+/// Can be blocked/unblocked to simulate network partitions,
+/// or throttled to simulate slow followers.
 pub struct TcpProxy {
     listen_port: u16,
     blocked: Arc<AtomicBool>,
+    throttle_ms: Arc<AtomicU64>,
 }
 
 impl TcpProxy {
@@ -682,6 +701,8 @@ impl TcpProxy {
     pub async fn start(listen_port: u16, target_address: String) -> Result<Self, Box<dyn std::error::Error>> {
         let blocked = Arc::new(AtomicBool::new(false));
         let blocked_clone = blocked.clone();
+        let throttle_ms = Arc::new(AtomicU64::new(0));
+        let throttle_clone = throttle_ms.clone();
 
         let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", listen_port)).await?;
 
@@ -699,6 +720,7 @@ impl TcpProxy {
 
                 let target = target_address.clone();
                 let blocked_inner = blocked_clone.clone();
+                let throttle_inner = throttle_clone.clone();
 
                 let _ = client.set_nodelay(true);
                 tokio::spawn(async move {
@@ -715,6 +737,8 @@ impl TcpProxy {
 
                     let blocked_a = blocked_inner.clone();
                     let blocked_b = blocked_inner;
+                    let throttle_a = throttle_inner.clone();
+                    let throttle_b = throttle_inner;
 
                     let client_to_server = tokio::spawn(async move {
                         let mut buf = [0u8; 8192];
@@ -725,6 +749,10 @@ impl TcpProxy {
                                 Ok(n) => {
                                     if tokio::io::AsyncWriteExt::write_all(&mut server_write, &buf[..n]).await.is_err() {
                                         break;
+                                    }
+                                    let delay = throttle_a.load(Ordering::Relaxed);
+                                    if delay > 0 {
+                                        tokio::time::sleep(Duration::from_millis(delay)).await;
                                     }
                                 }
                             }
@@ -741,6 +769,10 @@ impl TcpProxy {
                                     if tokio::io::AsyncWriteExt::write_all(&mut client_write, &buf[..n]).await.is_err() {
                                         break;
                                     }
+                                    let delay = throttle_b.load(Ordering::Relaxed);
+                                    if delay > 0 {
+                                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                                    }
                                 }
                             }
                         }
@@ -751,7 +783,7 @@ impl TcpProxy {
             }
         });
 
-        Ok(Self { listen_port, blocked })
+        Ok(Self { listen_port, blocked, throttle_ms })
     }
 
     /// Block all traffic through the proxy (existing connections are dropped).
@@ -764,6 +796,19 @@ impl TcpProxy {
     pub fn unblock(&self) {
         self.blocked.store(false, Ordering::Relaxed);
         println!("  TcpProxy on port {}: UNBLOCKED", self.listen_port);
+    }
+
+    /// Throttle traffic by adding a delay (ms) after forwarding each 8KB chunk.
+    /// Slows down replication without severing connections.
+    pub fn throttle(&self, delay_per_chunk_ms: u64) {
+        self.throttle_ms.store(delay_per_chunk_ms, Ordering::Relaxed);
+        println!("  TcpProxy on port {}: THROTTLED ({}ms/chunk)", self.listen_port, delay_per_chunk_ms);
+    }
+
+    /// Remove throttle — forward at full speed.
+    pub fn unthrottle(&self) {
+        self.throttle_ms.store(0, Ordering::Relaxed);
+        println!("  TcpProxy on port {}: UNTHROTTLED", self.listen_port);
     }
 
     /// Get the proxy's listen address.
@@ -821,6 +866,59 @@ pub async fn write_event(
     }
 }
 
+/// Write a single event with a large payload to create replication pressure.
+/// The payload_bytes parameter controls how many bytes the event value occupies.
+pub async fn write_large_event(
+    client: &mut CeleriantClient,
+    aggregate_key: &AggregateKey,
+    event_num: u64,
+    payload_bytes: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut payload = format!("{{\"event\":{},\"pad\":\"", event_num);
+    let pad_len = payload_bytes.saturating_sub(payload.len() + 2); // 2 for closing "}
+    payload.extend(std::iter::repeat('x').take(pad_len));
+    payload.push_str("\"}");
+
+    let event = DatablockAggregateEvent {
+        client_event_index: event_num,
+        event_index: 0,
+        event_id: None,
+        event_timestamp: 1000 + event_num,
+        event_type_major: 100,
+        event_type_minor: 0,
+        event_value: Arc::new(payload.into_bytes()),
+        iv: None,
+    };
+
+    let mut writes = HashMap::new();
+    writes.insert(
+        aggregate_key.clone(),
+        SingleAggregateWrite {
+            events: vec![event],
+            allow_create: false,
+            expected_event_batch_index: None,
+            enforce_client_idempotency: false,
+            compression_type: CompressionType::None,
+        },
+    );
+
+    let write_req = WriteRequest {
+        correlation_id: Some(event_num as u128),
+        client_id: 999,
+        user_id: Some(888),
+        writes,
+    };
+
+    let response = client
+        .send_request(&Request::Write(write_req), CompressionType::None)
+        .await?;
+
+    match response {
+        celeriant_msg::process_responses::Response::Write(_) => Ok(()),
+        other => Err(format!("Write failed: {:?}", other).into()),
+    }
+}
+
 /// Count the total number of events for an aggregate.
 ///
 /// Helper function for integration tests that need to verify replication.
@@ -828,27 +926,46 @@ pub async fn count_events(
     client: &mut CeleriantClient,
     aggregate_key: &AggregateKey,
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    let read_req = ReadRequest {
-        correlation_id: Some(999),
-        aggregate_key: aggregate_key.clone(),
-        filters: celeriant_msg::request::read_filters::ReadFilters::new(1),
-    };
+    let mut total = 0usize;
+    let mut from_batch = 1u64;
 
-    let response = client
-        .send_request(&Request::Read(read_req), CompressionType::None)
-        .await?;
+    loop {
+        let read_req = ReadRequest {
+            correlation_id: Some(999),
+            aggregate_key: aggregate_key.clone(),
+            filters: celeriant_msg::request::read_filters::ReadFilters::new(from_batch),
+        };
 
-    match response {
-        celeriant_msg::process_responses::Response::Read(read_resp) => {
-            let total: usize = read_resp
-                .event_batches
-                .iter()
-                .map(|b| b.events.len())
-                .sum();
-            Ok(total)
+        let response = client
+            .send_request(&Request::Read(read_req), CompressionType::None)
+            .await;
+
+        match response {
+            Ok(o) => match o {
+                celeriant_msg::process_responses::Response::Read(read_resp) => {
+                    total += read_resp
+                        .event_batches
+                        .iter()
+                        .map(|b| b.events.len())
+                        .sum::<usize>();
+                    match read_resp.next_event_batch_index {
+                        Some(next) => from_batch = next,
+                        None => return Ok(total),
+                    }
+                }
+                other => return Err(format!("Unexpected response: {:?}", other).into()),
+            },
+            Err(e) => match &e {
+                celeriant_client_tokio::client_error::ClientError::CeleriantError(error_response) => {
+                    if error_response.error_code == 1001 {
+                        return Ok(total);
+                    } else {
+                        return Err(Box::new(e));
+                    }
+                }
+                _ => return Err(Box::new(e)),
+            },
         }
-        celeriant_msg::process_responses::Response::GenericError(_) => Ok(0),
-        other => Err(format!("Unexpected response: {:?}", other).into()),
     }
 }
 

@@ -3,6 +3,7 @@ use std::collections::{VecDeque};
 use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use tracing::warn;
 
 use celeriant_disk::files::rwlock_timeout::write_with_timeout;
 use celeriant_distributed::node_status::NodeStatus;
@@ -172,6 +173,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             }
             Request::CatchUp(_) => Err(ShardError::CatchUpRequestInvalid),
             Request::Heartbeat(_) => Err(ShardError::CatchUpRequestInvalid),
+            Request::KickFollower(_) => Err(ShardError::CatchUpRequestInvalid),
         }
     }
 
@@ -706,6 +708,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             datablock: DatablockStorageKind::None,
             wal_metablock_type: MetablockKind::SoftTrim(metablock_soft_trim),
             previous_tip_hash: GENESIS_HASH,
+            datablock_position: 0,
         };
 
         let shard_log_queue_item = ShardLogQueueItem::new(None, None, metablock);
@@ -787,6 +790,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                 datablock: DatablockStorageKind::None,
                 wal_metablock_type: MetablockKind::SoftDelete(metablock_soft_delete.clone()),
                 previous_tip_hash: GENESIS_HASH,
+                datablock_position: 0,
             };
 
             let shard_log_queue_item = ShardLogQueueItem::new(None, None, metablock);
@@ -834,10 +838,14 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     /// * `request` - Write request with events to append
     pub async fn write(&self, write_request: WriteRequest) -> Result<SuccessResponse, ShardWriteError> {
         
-        let lease_index = match self.node_status.get().effective() {
+        let status = self.node_status.get();
+        let lease_index = match status.effective() {
             NodeStatus::Leader { lease_index } => lease_index,
             NodeStatus::Standalone => 0,
-            _ => return Err(ShardWriteError::ShardCannotAcceptWrites),
+            other => {
+                warn!(effective = ?other, raw = ?status.raw(), expires_at_ms = status.expires_at_ms(), now_ms = celeriant_distributed::heartbeat::now_ms(), "Write rejected: not Leader/Standalone");
+                return Err(ShardWriteError::ShardCannotAcceptWrites);
+            }
         };
 
         // Make sure we have at least one aggregate to write
@@ -1289,6 +1297,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             datablock: serialized_datablock.storage_kind,
             wal_metablock_type: MetablockKind::EventBatchMetadata(metablock_event_batch),
             previous_tip_hash: GENESIS_HASH,
+            datablock_position: 0,
         };
 
         let shard_log_queue_item = ShardLogQueueItem::new(Some(datablock), serialized_datablock.external_data, metablock);
@@ -1469,10 +1478,12 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                     max_follower_wal_index: current,
                 })));
             }
-            Err(ApplyBatchError::TipHashMismatch { current, batch }) => {
+            Err(ApplyBatchError::TipHashMismatch { current, current_wal_index, batch, batch_wal_index }) => {
                 return Ok(response(ReplicationResult::Rejected(FollowerRejection::TipHashMismatch {
                     follower: current,
+                    follower_wal_index: current_wal_index,
                     leader: batch,
+                    leader_wal_index: batch_wal_index,
                 })));
             }
             Err(ApplyBatchError::MissingDatablock) => {
@@ -1480,6 +1491,12 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             }
             Err(ApplyBatchError::SerialiseDatablocks(e)) => {
                 return Err(FollowerReplicationWriteError::FailedToSerialiseDatablocks(e));
+            }
+            Err(ApplyBatchError::BlockBecameInline) => {
+                return Err(FollowerReplicationWriteError::BlockBecameInline);
+            }
+            Err(ApplyBatchError::BatchWalIndexGap { index, expected, actual }) => {
+                return Err(FollowerReplicationWriteError::BatchWalIndexGap { index, expected, actual });
             }
         }
 
@@ -1733,7 +1750,11 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     pub async fn enter_s3_catchup(&self) -> Result<S3CatchupResult, S3CatchupError> {
         
         let catchup_status = match self.node_status.get().raw() {
-            NodeStatus::Follower { leader_lease_index } => NodeStatus::FollowerCatchingUp { leader_lease_index },
+            NodeStatus::Follower { leader_lease_index }
+            | NodeStatus::FollowerCatchingUp { leader_lease_index } => {
+                NodeStatus::FollowerCatchingUp { leader_lease_index }
+            }
+            NodeStatus::BootCatchup => NodeStatus::BootCatchup,
             _ => NodeStatus::BootCatchup,
         };
         self.node_status.set(ValidatedNodeStatus::new(catchup_status, 0));
@@ -2559,6 +2580,8 @@ mod tests {
         async fn send_heartbeat(&mut self) -> Result<celeriant_msg::response::responses::HeartbeatResult, crate::error::send_heartbeat_error::SendHeartbeatError> {
             Ok(celeriant_msg::response::responses::HeartbeatResult::Ack { follower_timestamp_ms: celeriant_distributed::heartbeat::now_ms() })
         }
+
+        async fn send_kick(&mut self) -> Result<bool, crate::error::send_heartbeat_error::SendHeartbeatError> { Ok(true) }
     }
 
     async fn open_leader_shard(dir: &std::path::Path, client: FailThenSucceedReplicationClient) -> ShardWal<FailThenSucceedReplicationClient, StubS3Downloader> {
@@ -2653,7 +2676,6 @@ mod tests {
             correlation_id: None,
             shard_id: 0,
             leader_timestamp_ms: now_ms(),
-            follower_too_far_behind: false,
             batches,
         })
     }
@@ -2792,7 +2814,6 @@ mod tests {
                 correlation_id: None,
                 shard_id: 0,
                 leader_timestamp_ms: 1000, // ancient timestamp
-                follower_too_far_behind: false,
                 batches: vec![replication_item(1, GENESIS_HASH)],
             });
             let resp = unwrap_replication(process(&shard, stale_request).await);

@@ -1,11 +1,11 @@
 use std::{cell::Cell, fmt, rc::Rc, time::Duration};
 
-use celeriant_distributed::{heartbeat::now_ms, lease_manager::LeaseManager, lease_store::LeaseStore, validated_node_status::ValidatedNodeStatus};
+use celeriant_distributed::{heartbeat::now_ms, lease_manager::LeaseManager, lease_store::LeaseStore, node_status::NodeStatus, validated_node_status::ValidatedNodeStatus};
 use celeriant_msg::{
     process_requests::Request,
     process_responses::Response,
-    request::requests::{HeartbeatRequest, WatchRequest},
-    response::responses::{ErrorResponse, HeartbeatRejection, HeartbeatResponse, HeartbeatResult, WatchResponse},
+    request::requests::{HeartbeatRequest, KickFollowerRequest, WatchRequest},
+    response::responses::{ErrorResponse, HeartbeatRejection, HeartbeatResponse, HeartbeatResult, KickFollowerResponse, WatchResponse},
 };
 use celeriant_shard::{
     error::{s3_catchup_error::S3CatchupError, watch_session_error::WatchSessionError}, replication_client::ReplicationClient, s3_downloader::S3Downloader, shard_wal::ShardWal, shard_wal_s3_catchup::S3CatchupResult
@@ -15,7 +15,7 @@ use celeriant_watch::{watch_output_type::WatchOutputType, watch_session::WatchSe
 use celeriant_msg::read_wire_data_error::ReadWireDataError;
 use celeriant_wire::network::wire_error::WireError;
 use glommio::{channels::{channel_mesh::Senders, local_channel::LocalSender}, net::TcpStream};
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::{
     intrashard_messages::IntrashardMessages,
@@ -268,6 +268,7 @@ pub fn determine_shard(
     match request {
         Request::ReplicationBatch(req) => validate_shard_id(req.shard_id, num_shards),
         Request::CatchUp(req) => validate_shard_id(req.shard_id, num_shards),
+        Request::KickFollower(_) => Ok(0),
         Request::Watch(req) if port_type == PortType::Client => {
             determine_shard_watch(req, config)
         }
@@ -418,7 +419,7 @@ async fn read_request<R: ReplicationClient + 'static, D: S3Downloader + 'static,
         Ok(Err(ReadWireDataError::ReadHeaderFailure(WireError::NetworkError(ref e))))
             if e.kind() == std::io::ErrorKind::UnexpectedEof => None,
         Ok(Err(e)) => {
-            warn!("Failed to read request: {e:?}");
+            warn!(shard = ctx.current_shard_id, "Failed to read request: {e:?}");
             None
         }
         Err(_) => {
@@ -457,10 +458,15 @@ async fn process_request<R: ReplicationClient + 'static, D: S3Downloader + 'stat
     server_compression_algorithm: CompressionType,
     message_version: u32,
 ) {
-    // Heartbeat is intercepted here rather than in ShardWal because the handler
-    // needs intrashard broadcast access to refresh TTL on all local follower shards.
+    // Heartbeat and KickFollower are intercepted here rather than in ShardWal because
+    // they need intrashard broadcast access (TTL refresh / kick coordination).
     if let Request::Heartbeat(ref heartbeat_req) = request {
         let response = handle_heartbeat(heartbeat_req, ctx).await;
+        let _ = write_response(tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
+        return;
+    }
+    if let Request::KickFollower(ref kick_req) = request {
+        let response = handle_kick_follower(kick_req, ctx).await;
         let _ = write_response(tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
         return;
     }
@@ -483,7 +489,7 @@ async fn handle_heartbeat<R: ReplicationClient + 'static, D: S3Downloader + 'sta
 ) -> Response {
     let follower_ms = now_ms();
 
-    if !ctx.shard_wal.node_status.get().is_follower() {
+    if !ctx.shard_wal.node_status.get().is_any_follower_state() {
         return Response::Heartbeat(HeartbeatResponse {
             correlation_id: req.correlation_id,
             result: HeartbeatResult::Rejected(HeartbeatRejection::NotAFollower),
@@ -516,13 +522,43 @@ async fn handle_heartbeat<R: ReplicationClient + 'static, D: S3Downloader + 'sta
     let new_expires_at = follower_ms + status_ttl_ms;
     let current_status = ctx.shard_wal.node_status.get().raw();
     let refreshed = ValidatedNodeStatus::new(current_status, new_expires_at);
-
     ctx.shard_wal.node_status.set(refreshed);
     broadcast_status(ctx, refreshed).await;
 
     Response::Heartbeat(HeartbeatResponse {
         correlation_id: req.correlation_id,
         result: HeartbeatResult::Ack { follower_timestamp_ms: follower_ms },
+    })
+}
+
+/// Handle KickFollower from the leader. Always routed to shard 0.
+/// Transitions to FollowerCatchingUp and broadcasts to all shards.
+async fn handle_kick_follower<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
+    req: &KickFollowerRequest,
+    ctx: &ConnectionContext<R, D, S>,
+) -> Response {
+    let status = ctx.shard_wal.node_status.get();
+    if !status.is_any_follower_state() {
+        return Response::KickFollower(KickFollowerResponse {
+            correlation_id: req.correlation_id,
+            acknowledged: false,
+        });
+    }
+
+    // Only transition from Follower (already catching up → ignore duplicate kicks)
+    if status.raw().is_follower() {
+        let leader_lease_index = status.raw().lease_index_for_logging();
+        let catching_up = ValidatedNodeStatus::new(
+            NodeStatus::FollowerCatchingUp { leader_lease_index }, 0,
+        );
+        ctx.shard_wal.node_status.set(catching_up);
+        broadcast_status(ctx, catching_up).await;
+        info!("Kicked by leader — transitioning to FollowerCatchingUp");
+    }
+
+    Response::KickFollower(KickFollowerResponse {
+        correlation_id: req.correlation_id,
+        acknowledged: true,
     })
 }
 
@@ -686,7 +722,6 @@ mod tests {
             shard_id: 0,
             batches: vec![],
             leader_timestamp_ms: 0,
-            follower_too_far_behind: false,
         });
         assert!(!is_valid_for_port(&repl, PortType::Client));
         assert!(is_valid_for_port(&repl, PortType::Replication));
@@ -733,7 +768,6 @@ mod tests {
             correlation_id: None,
             shard_id: 2,
             leader_timestamp_ms: 0,
-            follower_too_far_behind: false,
             batches: vec![],
         });
         let shard = determine_shard(&request, &config, PortType::Replication).unwrap();
@@ -747,7 +781,6 @@ mod tests {
             correlation_id: None,
             shard_id: 10,
             leader_timestamp_ms: 0,
-            follower_too_far_behind: false,
             batches: vec![],
         });
         let result = determine_shard(&request, &config, PortType::Replication);

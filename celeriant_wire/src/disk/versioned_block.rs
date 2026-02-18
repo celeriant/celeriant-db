@@ -3,8 +3,8 @@ use celeriant_wal::{constants::{FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES,
 use crate::{codec, disk::{disk_format_error::DiskFormatError}};
 
 const VERSION_SIZE: usize = 4;
-const CRC_SIZE: usize = 4;
-pub(crate) const HEADER_SIZE: usize = VERSION_SIZE + CRC_SIZE;
+pub const CRC_SIZE: usize = 4;
+pub const HEADER_SIZE: usize = VERSION_SIZE + CRC_SIZE;
 
 pub fn serialize_versioned_message<T>(
     message: &T,
@@ -163,6 +163,7 @@ mod tests {
             ),
             datablock: celeriant_wal::metablocks::datablock_storage_kind::DatablockStorageKind::None,
             previous_tip_hash: GENESIS_HASH,
+            datablock_position: 0,
         }
     }
 
@@ -193,6 +194,7 @@ mod tests {
             ),
             datablock: celeriant_wal::metablocks::datablock_storage_kind::DatablockStorageKind::None,
             previous_tip_hash: GENESIS_HASH,
+            datablock_position: 0,
         }
     }
 

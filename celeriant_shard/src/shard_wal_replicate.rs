@@ -92,15 +92,29 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
     read_max_chunk_size: u64,
 ) -> Result<(), ReplicationError> {
     // This client_guard should always get the write lock without error due to single-leader of the replication, but just in case :)
-    let mut client_guard = write_with_timeout(&replication_client, "replicate_to_follower")
-        .await
-        .map_err(|_| ReplicationError::ReplicationClientLockTimeoutError)?;
+    let mut client_guard = match write_with_timeout(&replication_client, "replicate_to_follower").await {
+        Ok(guard) => guard,
+        Err(_) => {
+            return match rollback_replicate(
+                &fsync_coordinator,
+                &log_segments_cache,
+                &shard_mem_cache,
+                replication_captured_data.replication_snapshot,
+            )
+            .await
+            {
+                Ok(()) => Err(ReplicationError::ReplicationClientLockTimeoutError),
+                Err(rollback_err) => Err(ReplicationError::RollbackFailed(rollback_err)),
+            };
+        }
+    };
 
     // Because we are paginating data to the follower, we have a loop
     // At any point we might have to fallback to s3. Also the follower
     // can push back and require additional entries to be sent
     let mut follower_falling_behind_or_offline = replication_captured_data.follower_falling_behind_or_offline;
     let mut added_additional_entries = false;
+    let mut kick_sent = false;
 
     // Final deets we send back to waiting callers
     let mut _replication_details = ReplicationDetails::ReplicatedToFollower;
@@ -131,11 +145,15 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
         // Either the follower is too slow to keep up, or it has been offline for a while
         // and needs to catch up itself first, or the follower is completely offline
         if follower_falling_behind_or_offline {
-
             let end_idx = batch_end_index(&batches, max_s3_fallback_batch_bytes);
             match client_guard.replicate_to_s3(batches[..end_idx].to_vec()).await {
                 Ok(()) => {
                     batches.drain(..end_idx);
+                    // Kick after S3 write — follower's catchup will find data
+                    if !kick_sent && batches.is_empty() {
+                        let _ = client_guard.send_kick().await;
+                        kick_sent = true;
+                    }
                     continue;
                 }
                 Err(replication_err) => {
@@ -569,6 +587,11 @@ mod tests {
         async fn send_heartbeat(&mut self) -> Result<celeriant_msg::response::responses::HeartbeatResult, crate::error::send_heartbeat_error::SendHeartbeatError> {
             unreachable!("s3 replication test should not call send_heartbeat")
         }
+
+        async fn send_kick(&mut self) -> Result<bool, crate::error::send_heartbeat_error::SendHeartbeatError> {
+            Ok(true)
+        }
+
     }
 
     fn make_captured_data(count: usize) -> ReplicationCapturedData {

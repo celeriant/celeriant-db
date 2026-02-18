@@ -56,6 +56,7 @@ fn test_metablock(aggregate_key: AggregateKey, event_batch_index: u64, max_event
         datablock_version: 1,
         datablock_compression_type: 0,
         previous_tip_hash: GENESIS_HASH,
+        datablock_position: 0,
         wal_metablock_type: MetablockKind::EventBatchMetadata(MetablockEventBatch {
             aggregate_key,
             event_batch_index,

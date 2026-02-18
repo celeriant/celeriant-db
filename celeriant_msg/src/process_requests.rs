@@ -8,7 +8,7 @@ use futures_lite::{AsyncReadExt, AsyncWriteExt};
 use crate::{
     read_wire_data_error::ReadWireDataError,
     request::requests::{
-        CatchUpRequest, DeleteRequest, ExistsRequest, HeartbeatRequest, ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest, ReadRequest,
+        CatchUpRequest, DeleteRequest, ExistsRequest, HeartbeatRequest, KickFollowerRequest, ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest, ReadRequest,
         ReplicationBatchRequest, TrimStartRequest, WatchRequest, WriteRequest,
     },
 };
@@ -28,6 +28,7 @@ pub enum RequestType {
     ReplicationBatch = 10,
     CatchUp = 11,
     Heartbeat = 12,
+    KickFollower = 13,
 }
 
 impl RequestType {
@@ -45,6 +46,7 @@ impl RequestType {
             10 => Ok(RequestType::ReplicationBatch),
             11 => Ok(RequestType::CatchUp),
             12 => Ok(RequestType::Heartbeat),
+            13 => Ok(RequestType::KickFollower),
             _ => Err(ReadWireDataError::UnknownMessageType(value)),
         }
     }
@@ -64,6 +66,7 @@ pub enum Request {
     ReplicationBatch(ReplicationBatchRequest),
     CatchUp(CatchUpRequest),
     Heartbeat(HeartbeatRequest),
+    KickFollower(KickFollowerRequest),
 }
 
 impl Request {
@@ -81,6 +84,7 @@ impl Request {
             Request::ReplicationBatch(_) => RequestType::ReplicationBatch,
             Request::CatchUp(_) => RequestType::CatchUp,
             Request::Heartbeat(_) => RequestType::Heartbeat,
+            Request::KickFollower(_) => RequestType::KickFollower,
         }
     }
 
@@ -98,6 +102,7 @@ impl Request {
             Request::ReplicationBatch(req) => req.correlation_id,
             Request::CatchUp(req) => req.correlation_id,
             Request::Heartbeat(req) => req.correlation_id,
+            Request::KickFollower(req) => req.correlation_id,
         }
     }
 
@@ -117,6 +122,7 @@ impl Request {
             Request::ReplicationBatch(_req) => 0,
             Request::CatchUp(_req) => 0,
             Request::Heartbeat(_req) => 0,
+            Request::KickFollower(_req) => 0,
         }
     }
 
@@ -136,6 +142,7 @@ impl Request {
             Request::ReplicationBatch(_req) => 0,
             Request::CatchUp(_req) => 0,
             Request::Heartbeat(_req) => 0,
+            Request::KickFollower(_req) => 0,
         }
     }
 
@@ -155,6 +162,7 @@ impl Request {
             Request::ReplicationBatch(_req) => 0,
             Request::CatchUp(_req) => 0,
             Request::Heartbeat(_req) => 0,
+            Request::KickFollower(_req) => 0,
         }
     }
 
@@ -201,6 +209,7 @@ impl Request {
             RequestType::ListAggregateTypes => fixed!(ListAggregateTypes),
             RequestType::ListAggregates => fixed!(ListAggregates),
             RequestType::Heartbeat => fixed!(Heartbeat),
+            RequestType::KickFollower => fixed!(KickFollower),
             RequestType::Write => variable!(Write),
             RequestType::ReplicationBatch => variable!(ReplicationBatch),
             RequestType::CatchUp => variable!(CatchUp),
@@ -231,6 +240,7 @@ impl Request {
             Request::ListAggregateTypes(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
             Request::ListAggregates(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
             Request::Heartbeat(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
+            Request::KickFollower(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
             Request::Write(req) => wire_header_write_variable_size(writer, req, request_type_id, compression_type, max_message_size, version).await,
             Request::ReplicationBatch(req) => wire_header_write_variable_size(writer, req, request_type_id, compression_type, max_message_size, version).await,
             Request::CatchUp(req) => wire_header_write_variable_size(writer, req, request_type_id, compression_type, max_message_size, version).await,
@@ -238,11 +248,11 @@ impl Request {
     }
 
     pub fn is_client_port_request(&self) -> bool {
-        !matches!(self, Request::ReplicationBatch(_) | Request::CatchUp(_) | Request::Heartbeat(_))
+        !matches!(self, Request::ReplicationBatch(_) | Request::CatchUp(_) | Request::Heartbeat(_) | Request::KickFollower(_))
     }
 
     pub fn is_replication_port_request(&self) -> bool {
-        matches!(self, Request::ReplicationBatch(_) | Request::CatchUp(_) | Request::Heartbeat(_))
+        matches!(self, Request::ReplicationBatch(_) | Request::CatchUp(_) | Request::Heartbeat(_) | Request::KickFollower(_))
     }
 }
 
@@ -264,8 +274,8 @@ mod tests {
     use futures_lite::{future::block_on, io::Cursor};
     use std::collections::{HashMap, HashSet};
 
-    const REQUEST_TYPE_COUNT: usize = 12;
-    const MAX_ID: u32 = 12;
+    const REQUEST_TYPE_COUNT: usize = 13;
+    const MAX_ID: u32 = 13;
     const VERSIONS: [u32; 2] = [PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3];
 
     fn all_types() -> [RequestType; REQUEST_TYPE_COUNT] {
@@ -282,6 +292,7 @@ mod tests {
             RequestType::ReplicationBatch,
             RequestType::CatchUp,
             RequestType::Heartbeat,
+            RequestType::KickFollower,
         ]
     }
 
@@ -384,7 +395,6 @@ mod tests {
                 correlation_id: Some(0x4444_5555_6666_7777),
                 shard_id: 2,
                 leader_timestamp_ms: 9999999,
-                follower_too_far_behind: true,
                 batches: vec![],
             }),
             RequestType::CatchUp => Request::CatchUp(CatchUpRequest {
@@ -397,6 +407,9 @@ mod tests {
                 correlation_id: Some(0x6666_7777_8888_9999),
                 shard_id: 0,
                 leader_timestamp_ms: 1234567890123,
+            }),
+            RequestType::KickFollower => Request::KickFollower(KickFollowerRequest {
+                correlation_id: Some(0x7777_8888_9999_AAAA),
             }),
         }
     }
@@ -483,7 +496,7 @@ mod tests {
     fn port_categorization() {
         for rt in all_types() {
             let req = make_request(rt);
-            let is_repl = matches!(rt, RequestType::ReplicationBatch | RequestType::CatchUp | RequestType::Heartbeat);
+            let is_repl = matches!(rt, RequestType::ReplicationBatch | RequestType::CatchUp | RequestType::Heartbeat | RequestType::KickFollower);
             assert_eq!(req.is_replication_port_request(), is_repl, "{:?}", rt);
             assert_eq!(req.is_client_port_request(), !is_repl, "{:?}", rt);
         }

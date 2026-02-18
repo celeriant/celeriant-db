@@ -5,7 +5,7 @@ use std::{
 };
 
 use celeriant_disk::files::rwlock_timeout::write_with_timeout;
-use celeriant_distributed::{heartbeat::now_ms, lease_manager::{ElectionOutcome, LeaseManager}, lease_store::LeaseStore, validated_node_status::ValidatedNodeStatus};
+use celeriant_distributed::{heartbeat::now_ms, lease_manager::{ElectionOutcome, LeaseManager}, lease_store::LeaseStore, node_status::NodeStatus, validated_node_status::ValidatedNodeStatus};
 use celeriant_msg::response::responses::HeartbeatResult;
 use celeriant_shard::{replication_client::ReplicationClient, s3_downloader::S3Downloader, shard_wal::ShardWal};
 use glommio::{
@@ -323,9 +323,12 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
         let mut initial_peer = outcome.peer_info;
 
         loop {
-            if ctx.shard_wal.node_status.get().raw().is_leader() {
+            let status = ctx.shard_wal.node_status.get().raw();
+            if status.is_leader() {
                 run_leader_loop(&lease_manager, &ctx, initial_peer.take()).await;
                 update_follower_address(&ctx, None).await;
+            } else if matches!(status, NodeStatus::FollowerCatchingUp { .. }) {
+                run_kick_catchup(&ctx, &rx).await;
             } else {
                 run_follower_watchdog(&lease_manager, &ctx).await;
             }
@@ -436,7 +439,9 @@ async fn run_leader_loop<R: ReplicationClient + 'static, D: S3Downloader + 'stat
 }
 
 /// Monitor heartbeat liveness and race to S3 when leader is presumed dead.
-/// Returns when this node wins the CAS race (status already set to Leader).
+/// Returns when:
+/// - This node wins the CAS race (status set to Leader by renew_s3_lease_and_broadcast)
+/// - A kick transitions status to FollowerCatchingUp (role-flip loop handles catchup)
 async fn run_follower_watchdog<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
     lease_manager: &Rc<LeaseManager<S>>,
     ctx: &ConnectionContext<R, D, S>,
@@ -444,15 +449,21 @@ async fn run_follower_watchdog<R: ReplicationClient + 'static, D: S3Downloader +
     info!("Entering follower watchdog");
 
     loop {
-        // Sleep until exact TTL expiry. If a heartbeat refreshes the TTL
-        // during our sleep, we wake at the old deadline, re-check, and
-        // sleep the delta to the new deadline. Zero artificial delay.
+        // Sleep until TTL expiry or kick detection. If a heartbeat refreshes
+        // the TTL during our sleep, we wake at the old deadline, re-check,
+        // and sleep the delta to the new deadline.
+        // For TTL-exempt catchup states, poll every 500ms to detect kicks.
         loop {
             let status = ctx.shard_wal.node_status.get();
-            if !status.is_follower() {
+            if !status.is_any_follower_state() {
                 break;
             }
-            let sleep_ms = status.expires_at_ms().saturating_sub(now_ms());
+            // Kick received — return to role-flip loop for catchup orchestration
+            if status.raw().is_catching_up() {
+                info!("Kick detected, returning to role-flip loop for catchup");
+                return;
+            }
+            let sleep_ms = status.expires_at_ms().saturating_sub(now_ms()).min(500);
             glommio::timer::sleep(Duration::from_millis(sleep_ms)).await;
         }
 
@@ -488,14 +499,54 @@ async fn run_follower_watchdog<R: ReplicationClient + 'static, D: S3Downloader +
     }
 }
 
+/// Coordinated S3 catchup after being kicked by the leader.
+/// Reuses the same catchup logic as boot. On success, transitions directly
+/// to Follower — the leader's next TCP replication attempt succeeds naturally.
+async fn run_kick_catchup<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
+    ctx: &ConnectionContext<R, D, S>,
+    rx: &LocalReceiver<CatchupCompletionMsg>,
+) {
+    info!("Starting kick catchup (S3)");
+    if !run_s3_catchup(ctx, rx).await {
+        return; // fatal error, shutdown already triggered
+    }
+
+    let current = ctx.shard_wal.node_status.get().raw();
+    match current {
+        NodeStatus::FollowerCatchingUp { leader_lease_index } => {
+            let rc = ctx.config.replication_config.as_ref();
+            let status_ttl_ms = rc.map(|r| r.status_ttl_ms()).unwrap_or(5000);
+            let follower = ValidatedNodeStatus::new(
+                NodeStatus::Follower { leader_lease_index },
+                now_ms() + status_ttl_ms,
+            );
+            ctx.shard_wal.node_status.set(follower);
+            broadcast_message_to_other_shards(
+                ctx.current_shard_id,
+                IntrashardMessages::StatusUpdate { status: follower },
+                ctx.intrashard_sender.clone(),
+            ).await;
+            info!("Kick catchup complete — resuming as Follower");
+        }
+        NodeStatus::Fenced => {
+            info!("Leader died during kick catchup — fenced, will race");
+        }
+        other => {
+            warn!(status = ?other, "Unexpected status after kick catchup");
+        }
+    }
+}
+
 fn spawn_intrashard_message_handler<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
     stream: ConnectedReceiver<IntrashardMessages>,
     ctx: ConnectionContext<R, D, S>,
 ) {
+    let shard_id = ctx.current_shard_id;
     glommio::spawn_local(async move {
         while let Some(msg) = stream.recv().await {
             handle_intrashard_message(msg, &ctx).await;
         }
+        error!(shard_id, "Intrashard message handler exited — channel closed");
     })
     .detach();
 }

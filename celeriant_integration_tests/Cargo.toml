@@ -97,6 +97,34 @@ path = "src/s3_writes_during_fencing_main.rs"
 name = "s3_concurrent_cas_main"
 path = "src/s3_concurrent_cas_main.rs"
 
+[[bin]]
+name = "s3_follower_kick_main"
+path = "src/s3_follower_kick_main.rs"
+
+[[bin]]
+name = "invariant_read_count_main"
+path = "src/invariant_read_count_main.rs"
+
+[[bin]]
+name = "invariant_concurrent_write_main"
+path = "src/invariant_concurrent_write_main.rs"
+
+[[bin]]
+name = "invariant_replication_convergence_main"
+path = "src/invariant_replication_convergence_main.rs"
+
+[[bin]]
+name = "invariant_s3_fallback_dedup_main"
+path = "src/invariant_s3_fallback_dedup_main.rs"
+
+[[bin]]
+name = "invariant_replication_queue_pressure_main"
+path = "src/invariant_replication_queue_pressure_main.rs"
+
+[[bin]]
+name = "debug_follower_pressure_main"
+path = "src/debug_follower_pressure_main.rs"
+
 [dependencies]
 celeriant_lib = { package = "celeriant", path = "../celeriant" }
 celeriant_client_tokio = { path = "../celeriant_client_tokio" }
