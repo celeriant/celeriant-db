@@ -206,9 +206,17 @@ pub struct ServerConfig {
     #[arg(
         long,
         env = "CELERIANT_INTERNODE_CONNECTION_TIMEOUT_MS",
-        help = "Timeout for inter-node connections in milliseconds (e.g. leader to follower replication)"
+        help = "Timeout for inter-node TCP connection establishment in milliseconds"
     )]
     pub internode_connection_timeout_ms: Option<u64>,
+
+    #[arg(
+        long,
+        default_value_t = 10_000,
+        env = "CELERIANT_INTERNODE_REQUEST_TIMEOUT_MS",
+        help = "Timeout for inter-node request/response round-trips in milliseconds (10s)"
+    )]
+    pub internode_request_timeout_ms: u64,
 
     #[arg(
         long,
@@ -441,6 +449,7 @@ impl ServerConfig {
             max_cluster_time_drift_ms: self.max_cluster_time_drift_ms,
             max_catchup_gap_bytes: self.max_catchup_gap_bytes,
             internode_connection_timeout: self.internode_connection_timeout_ms.map(Duration::from_millis),
+            internode_request_timeout: Duration::from_millis(self.internode_request_timeout_ms),
             server_compression_algorithm: match self.server_compression_algorithm {
                 ConfigCompressionType::None => CompressionType::None,
                 ConfigCompressionType::Zstd => CompressionType::Zstd { level: self.server_compression_level.unwrap_or(6) },
@@ -499,6 +508,7 @@ impl ServerConfig {
         check_field!(max_cluster_time_drift_ms);
         check_field!(max_catchup_gap_bytes);
         check_field!(internode_connection_timeout_ms);
+        check_field!(internode_request_timeout_ms);
         check_field!(server_compression_algorithm);
         check_field!(server_compression_level);
         check_field!(fsync_delay_us);
@@ -581,6 +591,7 @@ impl Default for ServerConfig {
             s3_skip_signature: false,
             s3_allow_http: false,
             internode_connection_timeout_ms: None,
+            internode_request_timeout_ms: 10_000,
             server_compression_algorithm: ConfigCompressionType::Snappy,
             server_compression_level: None,
             s3_catchup_max_rounds: 3,

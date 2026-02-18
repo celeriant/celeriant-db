@@ -472,6 +472,8 @@ impl ShardMemCache {
             if event_batch.max_event_index > existing.event_index {
                 existing.event_index = event_batch.max_event_index;
             }
+            existing.log_id = log_id;
+            existing.metablock_absolute_pos = metablock_absolute_pos;
         } else {
             self.aggregate_read_snapshots.put(event_batch.aggregate_key.clone(), MemSnapshotAggregate {
                 log_id: log_id,
@@ -495,7 +497,7 @@ impl ShardMemCache {
             }
 
             // Always update write cache
-            if let Some(existing) = self.aggregate_write_snapshots.get_mut(&key) 
+            if let Some(existing) = self.aggregate_write_snapshots.get_mut(&key)
             && existing.status != AggregateStatus::NotFound {
                 existing.status = AggregateStatus::Found;
                 if queue_positions.event_batch_index > existing.event_batch_index {
@@ -504,6 +506,8 @@ impl ShardMemCache {
                 if queue_positions.event_index > existing.event_index {
                     existing.event_index = queue_positions.event_index;
                 }
+                existing.log_id = queue_positions.log_id;
+                existing.metablock_absolute_pos = queue_positions.metablock_absolute_pos;
             } else {
                 let snapshot = MemSnapshotAggregate {
                     log_id: queue_positions.log_id,
@@ -529,6 +533,8 @@ impl ShardMemCache {
                     if queue_positions.event_index > existing.event_index {
                         existing.event_index = queue_positions.event_index;
                     }
+                    existing.log_id = queue_positions.log_id;
+                    existing.metablock_absolute_pos = queue_positions.metablock_absolute_pos;
                 } else {
                     self.aggregate_read_snapshots.put(key.clone(), MemSnapshotAggregate {
                         log_id: queue_positions.log_id,

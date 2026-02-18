@@ -230,7 +230,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match count_events(&mut fc, key).await {
                 Ok(c) => {
                     follower_total += c;
-                    if c < *leader_count {
+                    if c != *leader_count {
                         all_match = false;
                     }
                 }

@@ -439,6 +439,9 @@ impl ServerConfigExt for ServerConfig {
             args.push(timeout.to_string());
         }
 
+        args.push("--internode-request-timeout-ms".to_string());
+        args.push(self.internode_request_timeout_ms.to_string());
+
         args.push("--replication-delay-us".to_string());
         args.push(self.replication_delay_us.to_string());
 

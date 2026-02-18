@@ -24,6 +24,7 @@ pub struct ShardConfig {
     pub max_request_size: u64,
     pub max_response_size: u64,
     pub internode_connection_timeout: Option<Duration>,
+    pub internode_request_timeout: Duration,
     pub server_compression_algorithm: CompressionType,
     pub slow_client_timeout: Duration,
     pub max_requested_latency: Duration,

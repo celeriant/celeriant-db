@@ -14,8 +14,6 @@ use celeriant_wire::disk::disk_format_error::DiskFormatError;
 use celeriant_wire::disk::metablock_bytes;
 use celeriant_wire::disk::serialised_datablock::{SerialisedDatablock};
 use celeriant_wire::disk::versioned_block::deserialise_metablock;
-use glommio::sync::RwLock;
-
 use celeriant_memcache::cache_path::CachePath;
 use celeriant_memcache::mem_snapshot_aggregate::{AggregateStatus, MemSnapshotAggregate};
 use celeriant_memcache::metablock_position::MetablockPosition;
@@ -116,8 +114,9 @@ pub struct ShardWal<R: ReplicationClient + 'static, D: S3Downloader + 'static> {
     /// Serializes concurrent client event index loading from disk
     aggregate_client_loading: LoadingCoordinator<AggregateClientKey>,
 
-    /// Client for replicating data to followers or S3
-    pub replication_client: Rc<RwLock<R>>,
+    /// Client for replicating data to followers or S3.
+    /// Interior mutability — FollowerConnection manages its own split locks.
+    pub replication_client: Rc<R>,
 }
 
 impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> AggregateReader for ShardWal<R, D> {
@@ -209,7 +208,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             config,
             aggregate_loading: LoadingCoordinator::new(),
             aggregate_client_loading: LoadingCoordinator::new(),
-            replication_client: Rc::new(RwLock::new(replication_client)),
+            replication_client: Rc::new(replication_client),
         })
     }
 
@@ -2557,7 +2556,7 @@ mod tests {
     }
 
     impl ReplicationClient for FailThenSucceedReplicationClient {
-        async fn replicate_to_follower(&mut self, _batches: Vec<celeriant_msg::request::requests::ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError> {
+        async fn replicate_to_follower(&self, _batches: Vec<celeriant_msg::request::requests::ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError> {
             let remaining = self.follower_failures_remaining.get();
             if remaining > 0 {
                 self.follower_failures_remaining.set(remaining - 1);
@@ -2566,7 +2565,7 @@ mod tests {
             Ok(())
         }
 
-        async fn replicate_to_s3(&mut self, _batches: Vec<celeriant_msg::request::requests::ReplicationBatchItem>) -> Result<(), ReplicateToS3Error> {
+        async fn replicate_to_s3(&self, _batches: Vec<celeriant_msg::request::requests::ReplicationBatchItem>) -> Result<(), ReplicateToS3Error> {
             let remaining = self.s3_failures_remaining.get();
             if remaining > 0 {
                 self.s3_failures_remaining.set(remaining - 1);
@@ -2574,14 +2573,14 @@ mod tests {
             }
             Ok(())
         }
-        
-        fn set_follower_address(&mut self, _address: Option<String>) {}
 
-        async fn send_heartbeat(&mut self) -> Result<celeriant_msg::response::responses::HeartbeatResult, crate::error::send_heartbeat_error::SendHeartbeatError> {
+        fn set_follower_address(&self, _address: Option<String>) {}
+
+        async fn send_heartbeat(&self) -> Result<celeriant_msg::response::responses::HeartbeatResult, crate::error::send_heartbeat_error::SendHeartbeatError> {
             Ok(celeriant_msg::response::responses::HeartbeatResult::Ack { follower_timestamp_ms: celeriant_distributed::heartbeat::now_ms() })
         }
 
-        async fn send_kick(&mut self) -> Result<bool, crate::error::send_heartbeat_error::SendHeartbeatError> { Ok(true) }
+        async fn send_kick(&self) -> Result<bool, crate::error::send_heartbeat_error::SendHeartbeatError> { Ok(true) }
     }
 
     async fn open_leader_shard(dir: &std::path::Path, client: FailThenSucceedReplicationClient) -> ShardWal<FailThenSucceedReplicationClient, StubS3Downloader> {

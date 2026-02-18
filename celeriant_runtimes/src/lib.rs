@@ -1,6 +1,6 @@
 use celeriant_distributed::lease_manager::LeaseManager;
 use celeriant_distributed::validated_node_status::ValidatedNodeStatus;
-use celeriant_shard::{internal_shard_config::InternalShardConfig, replication_client::GlommioReplicationClient, shard_wal::ShardWal};
+use celeriant_shard::{internal_shard_config::InternalShardConfig, replication_client::FollowerConnection, shard_wal::ShardWal};
 use celeriant_sidecar::store::SidecarStoreTrait;
 use glommio::{
     CpuSet, LocalExecutorPoolBuilder, PoolPlacement,
@@ -75,9 +75,10 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                 max_s3_fallback_batch_bytes: shard_config.max_s3_fallback_batch_bytes,
             };
             let s3_uploader = SidecarS3Uploader::new(sidecar_senders.clone());
-            let replication_client = GlommioReplicationClient::new(
+            let replication_client = FollowerConnection::new(
                 None,
                 shard_config.internode_connection_timeout,
+                Some(shard_config.internode_request_timeout),
                 shard_config.max_request_size,
                 shard_config.max_response_size,
                 current_shard_id as u64,

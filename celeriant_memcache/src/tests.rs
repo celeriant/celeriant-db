@@ -434,13 +434,15 @@ fn commit_read_position_snapshot_advances_existing_entry() {
     let batch1 = test_event_batch(k.clone(), 1, 5);
     c.commit_read_position_snapshot(&batch1, 1, 100);
 
-    // Second commit with higher indexes
+    // Second commit with higher indexes on a new log segment
     let batch2 = test_event_batch(k.clone(), 3, 15);
-    c.commit_read_position_snapshot(&batch2, 1, 200);
+    c.commit_read_position_snapshot(&batch2, 2, 200);
 
     let pos = c.get_aggregate_last_metablock_pos(&k, CachePath::Read);
     assert_eq!(pos.event_batch_index, 3);
     assert_eq!(pos.event_index, 15);
+    assert_eq!(pos.log_id, 2);
+    assert_eq!(pos.metablock_absolute_pos, 200);
 }
 
 #[test]
@@ -451,13 +453,15 @@ fn commit_read_position_does_not_regress_indexes() {
     let batch_high = test_event_batch(k.clone(), 10, 50);
     c.commit_read_position_snapshot(&batch_high, 1, 100);
 
-    // Lower indexes should not overwrite
+    // Lower indexes should not overwrite, but position still advances
     let batch_low = test_event_batch(k.clone(), 2, 5);
-    c.commit_read_position_snapshot(&batch_low, 1, 50);
+    c.commit_read_position_snapshot(&batch_low, 2, 50);
 
     let pos = c.get_aggregate_last_metablock_pos(&k, CachePath::Read);
     assert_eq!(pos.event_batch_index, 10);
     assert_eq!(pos.event_index, 50);
+    assert_eq!(pos.log_id, 2, "log_id should advance even when indexes don't");
+    assert_eq!(pos.metablock_absolute_pos, 50, "position should advance even when indexes don't");
 }
 
 // ── Copy Write to Read Snapshot ──

@@ -1,7 +1,9 @@
+use std::cell::RefCell;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use celeriant_client_glommio::{CeleriantClient, ClientError};
+use celeriant_disk::files::rwlock_timeout::write_with_timeout;
 use celeriant_distributed::paths::fallback_batch_path;
 use celeriant_msg::{
     process_requests::Request,
@@ -10,6 +12,7 @@ use celeriant_msg::{
     response::responses::{HeartbeatResult, ReplicationResult},
 };
 use celeriant_wal::{compression_type::CompressionType, s3::fallback_batch::{FallbackBatch, FallbackItem}};
+use glommio::sync::RwLock;
 use tracing::warn;
 
 use crate::error::{replication_to_follower_error::ReplicateToFollowerError, replication_to_s3_error::ReplicateToS3Error, send_heartbeat_error::SendHeartbeatError};
@@ -17,114 +20,152 @@ use crate::s3_uploader::S3Uploader;
 
 #[allow(async_fn_in_trait)]
 pub trait ReplicationClient {
-    fn set_follower_address(&mut self, address: Option<String>);
-    async fn replicate_to_follower(&mut self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError>;
-    async fn replicate_to_s3(&mut self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToS3Error>;
-    async fn send_heartbeat(&mut self) -> Result<HeartbeatResult, SendHeartbeatError>;
-    async fn send_kick(&mut self) -> Result<bool, SendHeartbeatError>;
+    fn set_follower_address(&self, address: Option<String>);
+    async fn replicate_to_follower(&self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError>;
+    async fn replicate_to_s3(&self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToS3Error>;
+    async fn send_heartbeat(&self) -> Result<HeartbeatResult, SendHeartbeatError>;
+    async fn send_kick(&self) -> Result<bool, SendHeartbeatError>;
 }
 
 pub struct StubReplicationClient;
 
 impl ReplicationClient for StubReplicationClient {
-    fn set_follower_address(&mut self, _address: Option<String>) {}
+    fn set_follower_address(&self, _address: Option<String>) {}
 
-    async fn replicate_to_follower(&mut self, _batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError> {
+    async fn replicate_to_follower(&self, _batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError> {
         glommio::timer::sleep(std::time::Duration::from_millis(30)).await;
         Ok(())
     }
 
-    async fn replicate_to_s3(&mut self, _batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToS3Error> {
+    async fn replicate_to_s3(&self, _batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToS3Error> {
         glommio::timer::sleep(std::time::Duration::from_millis(230)).await;
         Ok(())
     }
 
-    async fn send_heartbeat(&mut self) -> Result<HeartbeatResult, SendHeartbeatError> {
+    async fn send_heartbeat(&self) -> Result<HeartbeatResult, SendHeartbeatError> {
         Ok(HeartbeatResult::Ack { follower_timestamp_ms: celeriant_distributed::heartbeat::now_ms() })
     }
 
-    async fn send_kick(&mut self) -> Result<bool, SendHeartbeatError> { Ok(true) }
+    async fn send_kick(&self) -> Result<bool, SendHeartbeatError> { Ok(true) }
 }
 
-pub struct GlommioReplicationClient<S: S3Uploader> {
-    follower_address: Option<String>,
-    shard_id: u64,
+/// Managed TCP connection state. Tracks which address the connection was
+/// established to so that address changes are detected lazily.
+struct ConnState {
     client: Option<CeleriantClient>,
-    connection_timeout: Option<std::time::Duration>,
+    connected_to: Option<String>,
+}
+
+impl ConnState {
+    fn new() -> Self {
+        Self { client: None, connected_to: None }
+    }
+
+    /// Ensure the TCP connection is established to `address`.
+    /// Drops and reconnects if the address changed or `reset` is true.
+    async fn ensure_connected(
+        &mut self,
+        address: &Option<String>,
+        reset: bool,
+        connection_timeout: Option<Duration>,
+        request_timeout: Option<Duration>,
+        max_request_size: u64,
+        max_response_size: u64,
+    ) -> Result<(), ClientError> {
+        if self.connected_to.as_ref() != address.as_ref() {
+            self.client = None;
+            self.connected_to = None;
+        }
+        if reset {
+            if let Some(client) = self.client.take() {
+                client.close().await?;
+            }
+            self.connected_to = None;
+        }
+        if self.client.is_none() {
+            let addr = address.as_deref().ok_or(ClientError::NoAddress)?;
+            let client = CeleriantClient::connect_with_timeout(addr, connection_timeout, max_request_size, max_response_size).await?;
+            self.client = Some(match request_timeout {
+                Some(t) => client.with_timeout(t),
+                None => client,
+            });
+            self.connected_to = address.clone();
+        }
+        Ok(())
+    }
+}
+
+/// Manage follower communication with split internal locks
+pub struct FollowerConnection<S: S3Uploader> {
+    follower_address: RefCell<Option<String>>,
+    shard_id: u64,
+    replication_conn: RwLock<ConnState>,
+    heartbeat_conn: RwLock<ConnState>,
+    connection_timeout: Option<Duration>,
+    request_timeout: Option<Duration>,
     max_request_size: u64,
     max_response_size: u64,
     s3_uploader: Option<S>,
 }
 
-impl<S: S3Uploader> GlommioReplicationClient<S> {
+impl<S: S3Uploader> FollowerConnection<S> {
     pub fn new(
         follower_address: Option<String>,
         connection_timeout: Option<Duration>,
+        request_timeout: Option<Duration>,
         max_request_size: u64,
         max_response_size: u64,
         shard_id: u64,
-        s3_uploader: Option<S>) -> Self {
-        // Validate shard_id fits in u32 (FallbackBatch.shard_id is u32)
+        s3_uploader: Option<S>,
+    ) -> Self {
         assert!(shard_id <= u32::MAX as u64, "shard_id {} exceeds u32::MAX", shard_id);
-
         Self {
-            follower_address,
+            follower_address: RefCell::new(follower_address),
             shard_id,
-            client: None,
+            replication_conn: RwLock::new(ConnState::new()),
+            heartbeat_conn: RwLock::new(ConnState::new()),
             connection_timeout,
+            request_timeout,
             max_request_size,
             max_response_size,
             s3_uploader,
         }
     }
-
-    async fn ensure_connected(&mut self, reset: bool) -> Result<&mut CeleriantClient, ClientError> {
-        if reset && let Some(client) = self.client.take() {
-            client.close().await?;
-        }
-        if self.client.is_none() {
-            let address = self.follower_address.as_deref()
-                .ok_or(ClientError::NoAddress)?;
-            self.client = Some(CeleriantClient::connect_with_timeout(address, self.connection_timeout, self.max_request_size, self.max_response_size).await?);
-        }
-        Ok(self.client.as_mut().unwrap())
-    }
 }
 
-impl<S: S3Uploader> ReplicationClient for GlommioReplicationClient<S> {
-    fn set_follower_address(&mut self, address: Option<String>) {
-        if self.follower_address != address {
-            self.follower_address = address;
-            self.client = None;
-        }
+impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
+    fn set_follower_address(&self, address: Option<String>) {
+        *self.follower_address.borrow_mut() = address;
     }
 
-    async fn replicate_to_follower(&mut self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError> {
+    async fn replicate_to_follower(&self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError> {
         if batches.is_empty() {
             return Ok(());
         }
 
-        let shard_id = self.shard_id;
-        let client = self.ensure_connected(false).await?;
+        let mut guard = write_with_timeout(&self.replication_conn, "replicate_to_follower").await
+            .map_err(|_| ReplicateToFollowerError::LockTimeout)?;
 
-        let replication_request = ReplicationBatchRequest {
+        let address = self.follower_address.borrow().clone();
+        let shard_id = self.shard_id;
+
+        guard.ensure_connected(&address, false, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size).await?;
+
+        let mut request = Request::ReplicationBatch(ReplicationBatchRequest {
             correlation_id: None,
             shard_id,
             leader_timestamp_ms: SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64,
             batches,
-        };
+        });
 
-        let mut request = Request::ReplicationBatch(replication_request);
-
-        let response = match client.send_request(&request, CompressionType::Snappy).await
-        {
+        let response = match guard.client.as_mut().unwrap().send_request(&request, CompressionType::Snappy).await {
             Ok(r) => r,
             Err(_) => {
-                let client = self.ensure_connected(true).await?;
+                guard.ensure_connected(&address, true, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size).await?;
                 if let Request::ReplicationBatch(ref mut req) = request {
                     req.leader_timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
                 }
-                client.send_request(&request, CompressionType::Snappy).await?
+                guard.client.as_mut().unwrap().send_request(&request, CompressionType::Snappy).await?
             }
         };
 
@@ -140,7 +181,7 @@ impl<S: S3Uploader> ReplicationClient for GlommioReplicationClient<S> {
         }
     }
 
-    async fn replicate_to_s3(&mut self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToS3Error> {
+    async fn replicate_to_s3(&self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToS3Error> {
         if batches.is_empty() {
             return Ok(());
         }
@@ -183,19 +224,25 @@ impl<S: S3Uploader> ReplicationClient for GlommioReplicationClient<S> {
         s3_uploader.upload(path, Bytes::from(serialized)).await
     }
 
-    async fn send_heartbeat(&mut self) -> Result<HeartbeatResult, SendHeartbeatError> {
+    async fn send_heartbeat(&self) -> Result<HeartbeatResult, SendHeartbeatError> {
+        let mut guard = write_with_timeout(&self.heartbeat_conn, "send_heartbeat").await
+            .map_err(|_| SendHeartbeatError::LockTimeout)?;
+
+        let address = self.follower_address.borrow().clone();
+
+        guard.ensure_connected(&address, false, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size).await?;
+
         let request = Request::Heartbeat(HeartbeatRequest {
             correlation_id: None,
             shard_id: self.shard_id,
             leader_timestamp_ms: celeriant_distributed::heartbeat::now_ms(),
         });
 
-        let client = self.ensure_connected(false).await?;
-        let response = match client.send_request(&request, CompressionType::None).await {
+        let response = match guard.client.as_mut().unwrap().send_request(&request, CompressionType::None).await {
             Ok(r) => r,
             Err(_) => {
-                let client = self.ensure_connected(true).await?;
-                client.send_request(&request, CompressionType::None).await?
+                guard.ensure_connected(&address, true, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size).await?;
+                guard.client.as_mut().unwrap().send_request(&request, CompressionType::None).await?
             }
         };
 
@@ -206,17 +253,23 @@ impl<S: S3Uploader> ReplicationClient for GlommioReplicationClient<S> {
         }
     }
 
-    async fn send_kick(&mut self) -> Result<bool, SendHeartbeatError> {
+    async fn send_kick(&self) -> Result<bool, SendHeartbeatError> {
+        let mut guard = write_with_timeout(&self.replication_conn, "send_kick").await
+            .map_err(|_| SendHeartbeatError::LockTimeout)?;
+
+        let address = self.follower_address.borrow().clone();
+
+        guard.ensure_connected(&address, false, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size).await?;
+
         let request = Request::KickFollower(KickFollowerRequest {
             correlation_id: None,
         });
 
-        let client = self.ensure_connected(false).await?;
-        let response = match client.send_request(&request, CompressionType::None).await {
+        let response = match guard.client.as_mut().unwrap().send_request(&request, CompressionType::None).await {
             Ok(r) => r,
             Err(_) => {
-                let client = self.ensure_connected(true).await?;
-                client.send_request(&request, CompressionType::None).await?
+                guard.ensure_connected(&address, true, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size).await?;
+                guard.client.as_mut().unwrap().send_request(&request, CompressionType::None).await?
             }
         };
 
@@ -226,7 +279,6 @@ impl<S: S3Uploader> ReplicationClient for GlommioReplicationClient<S> {
             _ => Err(SendHeartbeatError::UnexpectedResponse),
         }
     }
-
 }
 
 #[cfg(test)]
@@ -241,7 +293,6 @@ mod tests {
     use celeriant_wal::datablocks::datablock_kind::DatablockKind;
     use celeriant_wal::datablocks::datablock_aggregate_event_batch::DatablockAggregateEventBatch;
     use glommio::LocalExecutor;
-    use std::cell::RefCell;
     use std::rc::Rc;
 
     type MockCalls = Rc<RefCell<Vec<(String, Bytes)>>>;
@@ -317,15 +368,15 @@ mod tests {
         LocalExecutor::default().run(async {
             let (mock_uploader, calls) = MockS3Uploader::new();
 
-            let mut client = GlommioReplicationClient {
-                follower_address: Some("127.0.0.1:8080".to_string()),
-                shard_id: 7,
-                client: None,
-                connection_timeout: None,
-                max_request_size: 1024,
-                max_response_size: 1024,
-                s3_uploader: Some(mock_uploader),
-                };
+            let client = FollowerConnection::new(
+                Some("127.0.0.1:8080".to_string()),
+                None,
+                None,
+                1024,
+                1024,
+                7,
+                Some(mock_uploader),
+            );
 
             let result = client.replicate_to_s3(vec![]).await;
 
@@ -337,15 +388,15 @@ mod tests {
     #[test]
     fn no_uploader_returns_s3_not_configured() {
         LocalExecutor::default().run(async {
-            let mut client: GlommioReplicationClient<MockS3Uploader> = GlommioReplicationClient {
-                follower_address: Some("127.0.0.1:8080".to_string()),
-                shard_id: 7,
-                client: None,
-                connection_timeout: None,
-                max_request_size: 1024,
-                max_response_size: 1024,
-                s3_uploader: None,
-                };
+            let client: FollowerConnection<MockS3Uploader> = FollowerConnection::new(
+                Some("127.0.0.1:8080".to_string()),
+                None,
+                None,
+                1024,
+                1024,
+                7,
+                None,
+            );
 
             let batches = vec![ReplicationBatchItem {
                 metablock: create_test_metablock(42),
@@ -363,15 +414,15 @@ mod tests {
         LocalExecutor::default().run(async {
             let (mock_uploader, calls) = MockS3Uploader::new();
 
-            let mut client = GlommioReplicationClient {
-                follower_address: Some("127.0.0.1:8080".to_string()),
-                shard_id: 7,
-                client: None,
-                connection_timeout: None,
-                max_request_size: 1024,
-                max_response_size: 1024,
-                s3_uploader: Some(mock_uploader),
-                };
+            let client = FollowerConnection::new(
+                Some("127.0.0.1:8080".to_string()),
+                None,
+                None,
+                1024,
+                1024,
+                7,
+                Some(mock_uploader),
+            );
 
             let batches = vec![
                 ReplicationBatchItem {
@@ -408,15 +459,15 @@ mod tests {
         LocalExecutor::default().run(async {
             let (mock_uploader, calls) = MockS3Uploader::new();
 
-            let mut client = GlommioReplicationClient {
-                follower_address: Some("127.0.0.1:8080".to_string()),
-                shard_id: 5,
-                client: None,
-                connection_timeout: None,
-                max_request_size: 1024,
-                max_response_size: 1024,
-                s3_uploader: Some(mock_uploader),
-                };
+            let client = FollowerConnection::new(
+                Some("127.0.0.1:8080".to_string()),
+                None,
+                None,
+                1024,
+                1024,
+                5,
+                Some(mock_uploader),
+            );
 
             let batches = vec![
                 ReplicationBatchItem {
@@ -463,15 +514,15 @@ mod tests {
                 })
             );
 
-            let mut client = GlommioReplicationClient {
-                follower_address: Some("127.0.0.1:8080".to_string()),
-                shard_id: 7,
-                client: None,
-                connection_timeout: None,
-                max_request_size: 1024,
-                max_response_size: 1024,
-                s3_uploader: Some(mock_uploader),
-                };
+            let client = FollowerConnection::new(
+                Some("127.0.0.1:8080".to_string()),
+                None,
+                None,
+                1024,
+                1024,
+                7,
+                Some(mock_uploader),
+            );
 
             let batches = vec![ReplicationBatchItem {
                 metablock: create_test_metablock(42),

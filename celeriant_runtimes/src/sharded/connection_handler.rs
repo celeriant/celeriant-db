@@ -693,6 +693,7 @@ mod tests {
             max_cluster_time_drift_ms: 5000,
             max_catchup_gap_bytes: 104_857_600,
             internode_connection_timeout: None,
+            internode_request_timeout: Duration::from_secs(10),
             max_s3_fallback_batch_bytes: 1024 * 1024 * 100,
         }
     }

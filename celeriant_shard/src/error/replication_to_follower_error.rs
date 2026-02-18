@@ -7,6 +7,7 @@ pub enum ReplicateToFollowerError {
     FollowerServerError(String),
     FollowerUnexpectedResponse,
     FollowerTooFarBehind,
+    LockTimeout,
     SystemTimeError(std::time::SystemTimeError),
 }
 

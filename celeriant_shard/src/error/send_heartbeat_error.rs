@@ -5,6 +5,7 @@ pub enum SendHeartbeatError {
     NetworkError(ClientError),
     ServerError(String),
     UnexpectedResponse,
+    LockTimeout,
 }
 
 impl From<ClientError> for SendHeartbeatError {

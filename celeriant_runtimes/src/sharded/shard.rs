@@ -4,10 +4,9 @@ use std::{
     time::Duration,
 };
 
-use celeriant_disk::files::rwlock_timeout::write_with_timeout;
 use celeriant_distributed::{heartbeat::now_ms, lease_manager::{ElectionOutcome, LeaseManager}, lease_store::LeaseStore, node_status::NodeStatus, validated_node_status::ValidatedNodeStatus};
 use celeriant_msg::response::responses::HeartbeatResult;
-use celeriant_shard::{replication_client::ReplicationClient, s3_downloader::S3Downloader, shard_wal::ShardWal};
+use celeriant_shard::{error::send_heartbeat_error::SendHeartbeatError, replication_client::ReplicationClient, s3_downloader::S3Downloader, shard_wal::ShardWal};
 use glommio::{
     channels::{
         channel_mesh::{Receivers, Senders},
@@ -240,11 +239,7 @@ async fn update_follower_address<R: ReplicationClient + 'static, D: S3Downloader
     ctx: &ConnectionContext<R, D, S>,
     address: Option<String>,
 ) {
-    if let Ok(mut guard) = write_with_timeout(&ctx.shard_wal.replication_client, "set_follower_address").await {
-        guard.set_follower_address(address.clone());
-    } else {
-        warn!("Failed to acquire replication client lock for follower address update");
-    }
+    ctx.shard_wal.replication_client.set_follower_address(address.clone());
     broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::UpdateFollower { replication_address: address }, ctx.intrashard_sender.clone()).await;
 }
 
@@ -399,13 +394,12 @@ async fn run_leader_loop<R: ReplicationClient + 'static, D: S3Downloader + 'stat
         loop {
             glommio::timer::sleep(heartbeat_interval).await;
 
-            let result = match write_with_timeout(&ctx.shard_wal.replication_client, "send_heartbeat").await {
-                Ok(mut guard) => guard.send_heartbeat().await,
-                Err(_) => {
-                    warn!("Replication client lock contention, skipping heartbeat");
-                    continue;
-                }
-            };
+            let result = ctx.shard_wal.replication_client.send_heartbeat().await;
+
+            if let Err(SendHeartbeatError::LockTimeout) = &result {
+                warn!("Heartbeat lock contention, skipping heartbeat");
+                continue;
+            }
 
             if let Ok(HeartbeatResult::Ack { .. }) = result {
                 let leader_ms = now_ms();
@@ -583,11 +577,7 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
             ctx.shard_wal.node_status.set(status);
         }
         IntrashardMessages::UpdateFollower { replication_address } => {
-            if let Ok(mut guard) = write_with_timeout(&ctx.shard_wal.replication_client, "set_follower_address").await {
-                guard.set_follower_address(replication_address);
-            } else {
-                warn!("Failed to acquire replication client lock for follower address update");
-            }
+            ctx.shard_wal.replication_client.set_follower_address(replication_address);
         }
     }
 }

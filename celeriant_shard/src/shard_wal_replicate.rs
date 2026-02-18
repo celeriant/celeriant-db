@@ -2,7 +2,6 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
 
-use celeriant_disk::files::rwlock_timeout::write_with_timeout;
 use celeriant_msg::request::requests::ReplicationBatchItem;
 use celeriant_rotating_log::log_segment_file::aggregate_key_bloom::AggregateKeyBloom;
 use celeriant_rotating_log::log_segment_file::log_segment_file::{read_datablocks_carry_over_bytes, write_dual_shard_log_header};
@@ -11,8 +10,6 @@ use celeriant_wal::shard_log_header::ShardLogHeader;
 use celeriant_wire::disk::disk_format_error::DiskFormatError;
 use celeriant_wire::disk::metablock_bytes;
 use celeriant_wire::disk::versioned_block::deserialise_metablock;
-use glommio::sync::RwLock;
-
 use celeriant_memcache::cache_path::CachePath;
 use celeriant_memcache::pending_commit_data::PendingCommitData;
 use celeriant_memcache::shard_mem_cache::ShardMemCache;
@@ -80,7 +77,7 @@ pub enum ReplicationDetails {
 
 /// Commit phase: replicate captured data and update caches.
 pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
-    replication_client: Rc<RwLock<R>>,
+    replication_client: Rc<R>,
     fsync_coordinator: Rc<Coordinator<ShardFsyncError>>,
     log_segments_cache: Rc<LogSegmentsCache>,
     shard_mem_cache: Rc<RefCell<ShardMemCache>>,
@@ -91,23 +88,6 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
     max_s3_fallback_batch_bytes: u64,
     read_max_chunk_size: u64,
 ) -> Result<(), ReplicationError> {
-    // This client_guard should always get the write lock without error due to single-leader of the replication, but just in case :)
-    let mut client_guard = match write_with_timeout(&replication_client, "replicate_to_follower").await {
-        Ok(guard) => guard,
-        Err(_) => {
-            return match rollback_replicate(
-                &fsync_coordinator,
-                &log_segments_cache,
-                &shard_mem_cache,
-                replication_captured_data.replication_snapshot,
-            )
-            .await
-            {
-                Ok(()) => Err(ReplicationError::ReplicationClientLockTimeoutError),
-                Err(rollback_err) => Err(ReplicationError::RollbackFailed(rollback_err)),
-            };
-        }
-    };
 
     // Because we are paginating data to the follower, we have a loop
     // At any point we might have to fallback to s3. Also the follower
@@ -146,12 +126,12 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
         // and needs to catch up itself first, or the follower is completely offline
         if follower_falling_behind_or_offline {
             let end_idx = batch_end_index(&batches, max_s3_fallback_batch_bytes);
-            match client_guard.replicate_to_s3(batches[..end_idx].to_vec()).await {
+            match replication_client.replicate_to_s3(batches[..end_idx].to_vec()).await {
                 Ok(()) => {
                     batches.drain(..end_idx);
                     // Kick after S3 write — follower's catchup will find data
                     if !kick_sent && batches.is_empty() {
-                        let _ = client_guard.send_kick().await;
+                        let _ = replication_client.send_kick().await;
                         kick_sent = true;
                     }
                     continue;
@@ -175,7 +155,7 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
         // The happy low latency path - batched replication to follower
         let end_idx = batch_end_index(&batches, max_request_size);
 
-        match client_guard.replicate_to_follower(batches[..end_idx].to_vec()).await {
+        match replication_client.replicate_to_follower(batches[..end_idx].to_vec()).await {
             Ok(()) => {
                 // Success means we can drain out the replicated entries and go again
                 // No leader commit yet, wait until full replication of the written batches is done
@@ -319,7 +299,7 @@ fn commit_replication(
                     shard_mem_cache.update_aggregate_min_event_batch_index(
                         &soft_trim.aggregate_key,
                         soft_trim.keep_from_event_batch_index,
-                        CachePath::Read,
+                        CachePath::Write,
                     );
                     shard_mem_cache.update_aggregate_min_event_batch_index(
                         &soft_trim.aggregate_key,
@@ -573,25 +553,24 @@ mod tests {
     }
 
     impl ReplicationClient for RecordingReplicationClient {
-        async fn replicate_to_follower(&mut self, _: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError> {
+        async fn replicate_to_follower(&self, _: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError> {
             unreachable!("s3 path should not call replicate_to_follower")
         }
 
-        async fn replicate_to_s3(&mut self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToS3Error> {
+        async fn replicate_to_s3(&self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToS3Error> {
             self.s3_item_counts.borrow_mut().push(batches.len());
             Ok(())
         }
 
-        fn set_follower_address(&mut self, _address: Option<String>) {}
+        fn set_follower_address(&self, _address: Option<String>) {}
 
-        async fn send_heartbeat(&mut self) -> Result<celeriant_msg::response::responses::HeartbeatResult, crate::error::send_heartbeat_error::SendHeartbeatError> {
+        async fn send_heartbeat(&self) -> Result<celeriant_msg::response::responses::HeartbeatResult, crate::error::send_heartbeat_error::SendHeartbeatError> {
             unreachable!("s3 replication test should not call send_heartbeat")
         }
 
-        async fn send_kick(&mut self) -> Result<bool, crate::error::send_heartbeat_error::SendHeartbeatError> {
+        async fn send_kick(&self) -> Result<bool, crate::error::send_heartbeat_error::SendHeartbeatError> {
             Ok(true)
         }
-
     }
 
     fn make_captured_data(count: usize) -> ReplicationCapturedData {
@@ -636,7 +615,7 @@ mod tests {
             ));
 
             let (client, s3_counts) = RecordingReplicationClient::new();
-            let client = Rc::new(RwLock::new(client));
+            let client = Rc::new(client);
 
             let sz = item().size_bytes();
 
