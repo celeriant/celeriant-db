@@ -110,9 +110,7 @@ impl LogSegmentsCache {
 
     pub async fn rotate_to_next_log(&self) -> Result<(), OpenOrCreateError> {
         let current_log_id = self.active_log_id();
-        let active_log_id = current_log_id.saturating_add(1);
-
-        let new_log_segment_file = Rc::new(LogSegmentFile::open_or_create(&self.shard_dir, self.preallocate_bytes, active_log_id, false).await?);
+        let new_log_segment_file = Rc::new(self.active().rotate(&self.shard_dir, self.preallocate_bytes).await?);
 
         let mut current_log_segment_cache = self.active_file.borrow_mut();
         let old = std::mem::replace(&mut *current_log_segment_cache, new_log_segment_file);
@@ -141,7 +139,7 @@ impl LogSegmentsCache {
             })?
             .unwrap_or(FIRST_LOG_ID);
 
-        let active_file = LogSegmentFile::open_or_create(&shard_dir, preallocate_bytes, active_log_id, true).await
+        let active_file = LogSegmentFile::open_or_create_first_file_for_shard(&shard_dir, preallocate_bytes, active_log_id, true).await
             .map_err(|source| ReadyUpError::ActiveFileError(source))?;
 
         let cache_cap = NonZeroUsize::new(max_cached_files.max(1)).unwrap();
@@ -311,7 +309,7 @@ mod tests {
 
             use crate::log_segment_file::log_segment_file::LogSegmentFile;
             for id in [1, 3, 7] {
-                LogSegmentFile::open_or_create(&dir, FILE_SIZE, id, true).await.unwrap().close().await;
+                LogSegmentFile::open_or_create_first_file_for_shard(&dir, FILE_SIZE, id, true).await.unwrap().close().await;
             }
 
             let cache = LogSegmentsCache::ready_up(dir.clone(), FILE_SIZE, 2).await.unwrap();
