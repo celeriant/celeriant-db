@@ -72,6 +72,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
     }
 
     pub async fn run(&mut self) {
+        info!("Shard {} entering run loop", self.ctx.current_shard_id);
         spawn_shard_zero_shutdown_handler(self.ctx.clone());
 
         let rx = if self.ctx.lease_manager.is_some() {
@@ -96,6 +97,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
     }
 
     async fn enter_main_loop_until_shutdown(&self) {
+        info!("Shard {} entering main loop (shutdown_requested={})", self.ctx.current_shard_id, self.shutdown_requested.get());
         let client_listener = self.client_tcp_listener.clone();
         let client_ctx = self.ctx.clone();
         glommio::spawn_local(async move {

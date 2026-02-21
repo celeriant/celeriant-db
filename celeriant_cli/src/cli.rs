@@ -18,7 +18,7 @@ pub struct Cli {
 pub enum Commands {
     
     /// Check if an aggregate exists
-    Exists(AggregateKeyArgs),
+    AggregateDetails(AggregateKeyArgs),
 
     /// Read events from an aggregate
     Read(ReadArgs),

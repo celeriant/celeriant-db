@@ -8,7 +8,7 @@ use futures_lite::{AsyncReadExt, AsyncWriteExt};
 use crate::{
     read_wire_data_error::ReadWireDataError,
     request::requests::{
-        CatchUpRequest, DeleteRequest, ExistsRequest, HeartbeatRequest, KickFollowerRequest, ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest, ReadRequest,
+        CatchUpRequest, DeleteRequest, AggregateDetailsRequest, HeartbeatRequest, KickFollowerRequest, ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest, ReadRequest,
         ReplicationBatchRequest, TrimStartRequest, WatchRequest, WriteRequest,
     },
 };
@@ -16,7 +16,7 @@ use crate::{
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestType {
-    Exists = 1,
+    AggregateDetails = 1,
     Read = 2,
     Write = 3,
     TrimStart = 4,
@@ -34,7 +34,7 @@ pub enum RequestType {
 impl RequestType {
     pub fn from_u32(value: u32) -> Result<Self, ReadWireDataError> {
         match value {
-            1 => Ok(RequestType::Exists),
+            1 => Ok(RequestType::AggregateDetails),
             2 => Ok(RequestType::Read),
             3 => Ok(RequestType::Write),
             4 => Ok(RequestType::TrimStart),
@@ -54,7 +54,7 @@ impl RequestType {
 
 #[derive(Debug, Clone)]
 pub enum Request {
-    Exists(ExistsRequest),
+    AggregateDetails(AggregateDetailsRequest),
     Read(ReadRequest),
     Write(WriteRequest),
     TrimStart(TrimStartRequest),
@@ -72,7 +72,7 @@ pub enum Request {
 impl Request {
     pub fn request_type(&self) -> RequestType {
         match self {
-            Request::Exists(_) => RequestType::Exists,
+            Request::AggregateDetails(_) => RequestType::AggregateDetails,
             Request::Read(_) => RequestType::Read,
             Request::Write(_) => RequestType::Write,
             Request::TrimStart(_) => RequestType::TrimStart,
@@ -90,7 +90,7 @@ impl Request {
 
     pub fn correlation_id(&self) -> Option<u128> {
         match self {
-            Request::Exists(req) => req.correlation_id,
+            Request::AggregateDetails(req) => req.correlation_id,
             Request::Read(req) => req.correlation_id,
             Request::Write(req) => req.correlation_id,
             Request::TrimStart(req) => req.correlation_id,
@@ -110,7 +110,7 @@ impl Request {
     /// Returns 0 for requests without a specific aggregate
     pub fn aggregate_id(&self) -> u128 {
         match self {
-            Request::Exists(req) => req.aggregate_key.aggregate_id,
+            Request::AggregateDetails(req) => req.aggregate_key.aggregate_id,
             Request::Read(req) => req.aggregate_key.aggregate_id,
             Request::TrimStart(req) => req.aggregate_key.aggregate_id,
             Request::Write(_req) => 0,
@@ -130,7 +130,7 @@ impl Request {
     /// Returns 0 for requests without a specific aggregate
     pub fn org_id(&self) -> u128 {
         match self {
-            Request::Exists(req) => req.aggregate_key.org_id,
+            Request::AggregateDetails(req) => req.aggregate_key.org_id,
             Request::Read(req) => req.aggregate_key.org_id,
             Request::TrimStart(req) => req.aggregate_key.org_id,
             Request::Write(_req) => 0,
@@ -150,7 +150,7 @@ impl Request {
     /// Returns 0 for requests without a specific aggregate
     pub fn aggregate_type_id(&self) -> u128 {
         match self {
-            Request::Exists(req) => req.aggregate_key.aggregate_type_id,
+            Request::AggregateDetails(req) => req.aggregate_key.aggregate_type_id,
             Request::Read(req) => req.aggregate_key.aggregate_type_id,
             Request::TrimStart(req) => req.aggregate_key.aggregate_type_id,
             Request::Write(_req) => 0,
@@ -200,7 +200,7 @@ impl Request {
         }
 
         let request = match request_type {
-            RequestType::Exists => fixed!(Exists),
+            RequestType::AggregateDetails => fixed!(AggregateDetails),
             RequestType::Read => fixed!(Read),
             RequestType::TrimStart => fixed!(TrimStart),
             RequestType::Delete => fixed!(Delete),
@@ -231,7 +231,7 @@ impl Request {
         let request_type_id = request.request_type() as u32;
 
         match request {
-            Request::Exists(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
+            Request::AggregateDetails(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
             Request::Read(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
             Request::TrimStart(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
             Request::Delete(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
@@ -280,7 +280,7 @@ mod tests {
 
     fn all_types() -> [RequestType; REQUEST_TYPE_COUNT] {
         [
-            RequestType::Exists,
+            RequestType::AggregateDetails,
             RequestType::Read,
             RequestType::Write,
             RequestType::TrimStart,
@@ -316,7 +316,7 @@ mod tests {
     fn make_request(rt: RequestType) -> Request {
         let k = key();
         match rt {
-            RequestType::Exists => Request::Exists(ExistsRequest {
+            RequestType::AggregateDetails => Request::AggregateDetails(AggregateDetailsRequest {
                 correlation_id: Some(0xDEAD_BEEF_CAFE_BABE),
                 aggregate_key: k,
             }),
@@ -481,7 +481,7 @@ mod tests {
         for rt in all_types() {
             let req = make_request(rt);
             let (exp_agg, exp_org, exp_type) = match rt {
-                RequestType::Exists | RequestType::Read | RequestType::TrimStart => {
+                RequestType::AggregateDetails | RequestType::Read | RequestType::TrimStart => {
                     (k.aggregate_id, k.org_id, k.aggregate_type_id)
                 }
                 _ => (0, 0, 0),
@@ -565,7 +565,7 @@ mod tests {
     #[test]
     fn truncated_stream_fails() {
         block_on(async {
-            let req = make_request(RequestType::Exists);
+            let req = make_request(RequestType::AggregateDetails);
             let bytes = write_bytes(&req, PROTOCOL_VERSION_V2, CompressionType::None).await;
 
             for truncate_at in [0, 10, bytes.len() - 1] {
@@ -579,7 +579,7 @@ mod tests {
     #[test]
     fn invalid_message_type_fails() {
         block_on(async {
-            let req = make_request(RequestType::Exists);
+            let req = make_request(RequestType::AggregateDetails);
             let mut bytes = write_bytes(&req, PROTOCOL_VERSION_V2, CompressionType::None).await;
 
             bytes[4..8].copy_from_slice(&(MAX_ID + 1).to_le_bytes());

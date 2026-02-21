@@ -355,7 +355,7 @@ fn draw_watch(f: &mut Frame, app: &App, area: Rect) {
         .style(et_style)
         .block(Block::default()
             .borders(Borders::ALL)
-            .title(" Event Types (0=DEL,1=WRITE,2=READ,3=TRIM,4=EXISTS,5=CREATE) "));
+            .title(" Event Types (0=DEL,1=WRITE,2=READ,3=TRIM,4=DETAILS,5=CREATE) "));
     f.render_widget(et_input, input_chunks[0]);
 
     // Latency input
@@ -514,7 +514,7 @@ fn draw_org_watch(f: &mut Frame, app: &App, area: Rect) {
         .style(et_style)
         .block(Block::default()
             .borders(Borders::ALL)
-            .title(" Event Types (0=DEL,1=WRITE,2=READ,3=TRIM,4=EXISTS,5=CREATE) "));
+            .title(" Event Types (0=DEL,1=WRITE,2=READ,3=TRIM,4=DETAILS,5=CREATE) "));
     f.render_widget(et_input, input_chunks[2]);
 
     // Latency input
@@ -1038,7 +1038,7 @@ fn draw_help(f: &mut Frame, _app: &App, area: Rect) {
         Line::from(""),
         Line::from(Span::styled("Event Types:", Style::default().fg(DIM_COLOR))),
         Line::from("  0=DELETE  1=WRITE  2=READ"),
-        Line::from("  3=TRIM_START  4=EXISTS  5=CREATE"),
+        Line::from("  3=TRIM_START  4=DETAILS  5=CREATE"),
         Line::from(""),
         Line::from(Span::styled("Actions", Style::default().bold())),
         Line::from("  r             Refresh current list"),

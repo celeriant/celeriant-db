@@ -34,10 +34,13 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
 
     LocalExecutorPoolBuilder::new(PoolPlacement::MaxSpread(shard_config.num_shards as usize, CpuSet::online().ok()))
         .on_all_shards(enclose!((mesh, shard_config, sidecar_senders) move || async move {
-            
+
             let (sender, receivers) = mesh.join().await
                 .expect("Failed to join mesh - cannot initialize shard");
-            
+
+            let current_shard_id = sender.peer_id();
+            info!(shard_id = current_shard_id, "Shard executor started, binding listeners");
+
             let client_bind_address = format!("{}:{}", shard_config.listen_address, shard_config.client_port);
             let client_tcp_listener = TcpListener::bind(&client_bind_address)
                 .expect(&format!("Failed to bind client TCP listener to {} - cannot initialize shard", client_bind_address));
@@ -45,8 +48,6 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
             let replication_bind_address = format!("{}:{}", shard_config.listen_address, shard_config.replication_port);
             let replication_tcp_listener = TcpListener::bind(&replication_bind_address)
                 .expect(&format!("Failed to bind replication TCP listener to {} - cannot initialize shard", replication_bind_address));
-            
-            let current_shard_id = sender.peer_id();
 
             let shard_dir = shard_config.data_root.join(format!("shard_{current_shard_id}"));
             let internal_shard_config = InternalShardConfig { 
@@ -91,8 +92,17 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
             } else {
                 ValidatedNodeStatus::standalone()
             };
-            let filesystem = ShardWal::open(internal_shard_config, validated_node_status, replication_client, s3_downloader).await
-                .expect(&format!("Failed to initialize filesystem at {:?} - cannot initialize shard", shard_config.data_root));
+            info!(shard_id = current_shard_id, "Opening WAL");
+            let filesystem = match ShardWal::open(internal_shard_config, validated_node_status, replication_client, s3_downloader).await {
+                Ok(wal) => {
+                    info!(shard_id = current_shard_id, "WAL opened successfully");
+                    wal
+                }
+                Err(e) => {
+                    error!(shard_id = current_shard_id, error = ?e, "Failed to open WAL");
+                    panic!("Failed to initialize filesystem at {:?}: {:?}", shard_config.data_root, e);
+                }
+            };
 
             let lease_manager = if shard_config.replication_config.is_some() && current_shard_id == 0 {
                 let lease_storage = SidecarLeaseStorage::new(sidecar_senders.clone());

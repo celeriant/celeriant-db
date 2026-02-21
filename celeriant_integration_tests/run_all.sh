@@ -35,6 +35,43 @@ TESTS=(
   invariant_replication_queue_pressure_main
   # --- Follower-kick ---
   s3_follower_kick_main
+  # --- Mode transition ---
+  standalone_to_distributed_main
+  # --- Edge cases ---
+  edge_empty_replication_batch_main
+  edge_stale_cache_rotation_main
+  edge_s3_missing_batches_main
+  edge_s3_batch_ordering_main
+  edge_log_rotation_mid_replication_main
+  edge_log_eviction_before_s3_main
+  # --- Replication client locking regression guards (#14, #15) ---
+  edge_heartbeat_lock_contention_main
+  edge_concurrent_heartbeat_replication_s3_main
+  # --- Batch 2 edge cases (#1, #4, #10) ---
+  edge_split_brain_s3_unavailable_main
+  edge_corrupted_s3_batch_main
+  edge_list_pagination_cache_eviction_main
+  # --- WAL tip hash divergence (#2, #3) ---
+  edge_wal_tip_hash_divergence_main
+  edge_wal_divergence_recovery_main
+  # --- Pilot Phase 1: Correctness ---
+  p1_1_dcb_rollback_main
+  p1_2_concurrent_dcb_main
+  p1_3_cross_shard_rejection_main
+  p1_4_exactly_once_main
+  p1_6_ordering_verification_main
+  p1_7_multitenancy_isolation_main
+  # --- Pilot Phase 2: Durability ---
+  p2_1_write_survival_main
+  p2_2_dual_restart_main
+  p2_3_wal_corruption_main
+  p2_4_s3_capacity_main
+  # --- Pilot Phase 3: Architecture ---
+  p3_1_cold_read_latency_main
+  p3_2_bloom_filter_main
+  p3_3_sequential_cold_reads_main
+  # --- Pilot Phase 4: Operational ---
+  p4_1_rolling_upgrade_main
 )
 
 # Pre-build everything so compilation isn't counted in per-test timeout

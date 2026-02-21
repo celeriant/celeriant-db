@@ -99,7 +99,7 @@ impl AggregateWatchEvent {
     pub const WRITE: u8 = 1;
     pub const READ: u8 = 2;
     pub const TRIM_START: u8 = 3;
-    pub const EXISTS: u8 = 4;
+    pub const DETAILS: u8 = 4;
 }
 ```
 

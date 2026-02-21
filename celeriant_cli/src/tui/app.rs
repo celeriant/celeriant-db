@@ -325,13 +325,13 @@ impl App {
             .map_err(|e| format!("Connection failed: {}", e))?;
         
         let key = AggregateKey::new(ctx.org_id, ctx.aggregate_type_id, ctx.aggregate_id);
-        let request = Request::Exists(ExistsRequest {
+        let request = Request::AggregateDetails(AggregateDetailsRequest {
             correlation_id: None,
             aggregate_key: key,
         });
         
         match client.send_request(&request, CompressionType::None).await {
-            Ok(Response::Exists(res)) => {
+            Ok(Response::AggregateDetails(res)) => {
                 ctx.info = Some(AggregateContextInfo {
                     min_batch: res.min_event_batch_index,
                 });
@@ -1011,7 +1011,7 @@ async fn watch_task(
                                         1 => "WRITE",
                                         2 => "READ",
                                         3 => "TRIM_START",
-                                        4 => "EXISTS",
+                                        4 => "DETAILS",
                                         5 => "CREATE",
                                         _ => "UNKNOWN",
                                     };
@@ -1115,7 +1115,7 @@ async fn org_watch_task(
                                         1 => "WRITE",
                                         2 => "READ",
                                         3 => "TRIM_START",
-                                        4 => "EXISTS",
+                                        4 => "DETAILS",
                                         5 => "CREATE",
                                         _ => "UNKNOWN",
                                     };

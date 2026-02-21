@@ -646,7 +646,7 @@ mod tests {
     use celeriant_msg::request::{
         read_filters::ReadFilters,
         requests::{
-            CatchUpRequest, DeleteRequest, ExistsRequest, ListAggregateTypesRequest,
+            CatchUpRequest, DeleteRequest, AggregateDetailsRequest, ListAggregateTypesRequest,
             ListAggregatesRequest, ListOrgsRequest, ReadRequest, ReplicationBatchRequest,
             SingleAggregateDelete, SingleAggregateWrite, TrimStartRequest, WriteRequest,
         },
@@ -700,7 +700,7 @@ mod tests {
 
     #[test]
     fn port_validation_client_requests() {
-        let exists = Request::Exists(ExistsRequest {
+        let exists = Request::AggregateDetails(AggregateDetailsRequest {
             correlation_id: None,
             aggregate_key: AggregateKey::new(1, 1, 1),
         });
@@ -731,7 +731,7 @@ mod tests {
     #[test]
     fn routing_exists_request_by_aggregate_id() {
         let config = test_config(4, crate::RoutingRule::AggregateId);
-        let request = Request::Exists(ExistsRequest {
+        let request = Request::AggregateDetails(AggregateDetailsRequest {
             correlation_id: None,
             aggregate_key: AggregateKey::new(100, 200, 7),
         });
@@ -742,7 +742,7 @@ mod tests {
     #[test]
     fn routing_exists_request_by_org_id() {
         let config = test_config(4, crate::RoutingRule::OrgId);
-        let request = Request::Exists(ExistsRequest {
+        let request = Request::AggregateDetails(AggregateDetailsRequest {
             correlation_id: None,
             aggregate_key: AggregateKey::new(5, 200, 7),
         });

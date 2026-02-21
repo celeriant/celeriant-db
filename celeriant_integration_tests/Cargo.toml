@@ -122,8 +122,120 @@ name = "invariant_replication_queue_pressure_main"
 path = "src/invariant_replication_queue_pressure_main.rs"
 
 [[bin]]
+name = "standalone_to_distributed_main"
+path = "src/standalone_to_distributed_main.rs"
+
+[[bin]]
 name = "debug_follower_pressure_main"
 path = "src/debug_follower_pressure_main.rs"
+
+[[bin]]
+name = "edge_empty_replication_batch_main"
+path = "src/edge_empty_replication_batch_main.rs"
+
+[[bin]]
+name = "edge_stale_cache_rotation_main"
+path = "src/edge_stale_cache_rotation_main.rs"
+
+[[bin]]
+name = "edge_s3_missing_batches_main"
+path = "src/edge_s3_missing_batches_main.rs"
+
+[[bin]]
+name = "edge_s3_batch_ordering_main"
+path = "src/edge_s3_batch_ordering_main.rs"
+
+[[bin]]
+name = "edge_log_rotation_mid_replication_main"
+path = "src/edge_log_rotation_mid_replication_main.rs"
+
+[[bin]]
+name = "edge_log_eviction_before_s3_main"
+path = "src/edge_log_eviction_before_s3_main.rs"
+
+[[bin]]
+name = "edge_heartbeat_lock_contention_main"
+path = "src/edge_heartbeat_lock_contention_main.rs"
+
+[[bin]]
+name = "edge_concurrent_heartbeat_replication_s3_main"
+path = "src/edge_concurrent_heartbeat_replication_s3_main.rs"
+
+[[bin]]
+name = "edge_split_brain_s3_unavailable_main"
+path = "src/edge_split_brain_s3_unavailable_main.rs"
+
+[[bin]]
+name = "edge_corrupted_s3_batch_main"
+path = "src/edge_corrupted_s3_batch_main.rs"
+
+[[bin]]
+name = "edge_list_pagination_cache_eviction_main"
+path = "src/edge_list_pagination_cache_eviction_main.rs"
+
+[[bin]]
+name = "edge_wal_tip_hash_divergence_main"
+path = "src/edge_wal_tip_hash_divergence_main.rs"
+
+[[bin]]
+name = "edge_wal_divergence_recovery_main"
+path = "src/edge_wal_divergence_recovery_main.rs"
+
+[[bin]]
+name = "p1_1_dcb_rollback_main"
+path = "src/p1_1_dcb_rollback_main.rs"
+
+[[bin]]
+name = "p1_7_multitenancy_isolation_main"
+path = "src/p1_7_multitenancy_isolation_main.rs"
+
+[[bin]]
+name = "p1_2_concurrent_dcb_main"
+path = "src/p1_2_concurrent_dcb_main.rs"
+
+[[bin]]
+name = "p1_6_ordering_verification_main"
+path = "src/p1_6_ordering_verification_main.rs"
+
+[[bin]]
+name = "p1_4_exactly_once_main"
+path = "src/p1_4_exactly_once_main.rs"
+
+[[bin]]
+name = "p1_3_cross_shard_rejection_main"
+path = "src/p1_3_cross_shard_rejection_main.rs"
+
+[[bin]]
+name = "p2_2_dual_restart_main"
+path = "src/p2_2_dual_restart_main.rs"
+
+[[bin]]
+name = "p2_4_s3_capacity_main"
+path = "src/p2_4_s3_capacity_main.rs"
+
+[[bin]]
+name = "p2_1_write_survival_main"
+path = "src/p2_1_write_survival_main.rs"
+
+[[bin]]
+name = "p2_3_wal_corruption_main"
+path = "src/p2_3_wal_corruption_main.rs"
+
+[[bin]]
+name = "p3_1_cold_read_latency_main"
+path = "src/p3_1_cold_read_latency_main.rs"
+
+[[bin]]
+name = "p3_2_bloom_filter_main"
+path = "src/p3_2_bloom_filter_main.rs"
+
+[[bin]]
+name = "p3_3_sequential_cold_reads_main"
+path = "src/p3_3_sequential_cold_reads_main.rs"
+
+[[bin]]
+name = "p4_1_rolling_upgrade_main"
+path = "src/p4_1_rolling_upgrade_main.rs"
 
 [dependencies]
 celeriant_lib = { package = "celeriant", path = "../celeriant" }

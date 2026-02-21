@@ -10,7 +10,7 @@ use celeriant_shard::error::{
     shard_cache_load_error::ShardCacheLoadError,
     shard_delete_error::ShardDeleteError,
     shard_error::ShardError,
-    shard_exists_error::ShardExistsError,
+    shard_exists_error::ShardAggregateDetailsError,
     shard_fsync_error::ShardFsyncError,
     shard_listing_error::ShardListingError,
     shard_read_error::ShardReadError,
@@ -95,7 +95,7 @@ pub fn shard_error_to_response(correlation_id: Option<u128>, error: ShardError) 
         ShardError::ListAggregateTypes(e) => listing_error(LIST_AGGREGATE_TYPES_DISK_READ, e),
         ShardError::ListAggregates(e) => listing_error(LIST_AGGREGATES_DISK_READ, e),
         ShardError::ReplicationBatch(e) => replication_batch_error(e),
-        ShardError::Exists(e) => exists_error(e),
+        ShardError::AggregateDetails(e) => exists_error(e),
         ShardError::WatchRequestInvalid => (WATCH_REQUEST_INVALID, "{}".into()),
         ShardError::CatchUpRequestInvalid => (CATCHUP_REQUEST_INVALID, "{}".into()),
     };
@@ -219,9 +219,9 @@ fn replication_batch_error(e: FollowerReplicationWriteError) -> (u32, String) {
     }
 }
 
-fn exists_error(e: ShardExistsError) -> (u32, String) {
+fn exists_error(e: ShardAggregateDetailsError) -> (u32, String) {
     match e {
-        ShardExistsError::AggregateExistsAndCacheError(e) => cache_load_error(EXISTS_CACHE_ERROR, EXISTS_CACHE_ERROR, e),
+        ShardAggregateDetailsError::AggregateExistsAndCacheError(e) => cache_load_error(EXISTS_CACHE_ERROR, EXISTS_CACHE_ERROR, e),
     }
 }
 

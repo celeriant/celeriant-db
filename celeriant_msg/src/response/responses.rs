@@ -59,7 +59,7 @@ pub struct ListAggregatesResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
-pub struct ExistsResponse {
+pub struct AggregateDetailsResponse {
     pub correlation_id: Option<u128>,
     pub min_event_batch_index: u64,
     //TODO: Include other metadata.

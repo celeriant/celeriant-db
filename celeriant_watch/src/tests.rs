@@ -57,7 +57,7 @@ mod tests {
     fn exists_event(org: u128, type_id: u128, id: u128) -> AggregateWatchEvent {
         AggregateWatchEvent {
             aggregate_key: AggregateKey::new(org, type_id, id),
-            operation: AggregateWatchEventOperation::Exists {},
+            operation: AggregateWatchEventOperation::AggregateDetails {},
         }
     }
 
@@ -257,7 +257,7 @@ mod tests {
                     to_event_batch_index: Some(5),
                 },
                 AggregateWatchEventOperation::Delete {},
-                AggregateWatchEventOperation::Exists {},
+                AggregateWatchEventOperation::AggregateDetails {},
                 AggregateWatchEventOperation::TrimStart {
                     keep_from_event_batch_index: 10,
                 },
@@ -363,7 +363,7 @@ mod tests {
             let events = &response.unwrap().events.unwrap()[&k];
             assert_eq!(events.len(), 2);
             assert!(events[&AggregateWatchEvent::DELETE].is_none());
-            assert!(events[&AggregateWatchEvent::EXISTS].is_none());
+            assert!(events[&AggregateWatchEvent::DETAILS].is_none());
         })
     }
 
@@ -577,11 +577,11 @@ mod tests {
         assert_eq!(AggregateWatchEvent::WRITE, 1);
         assert_eq!(AggregateWatchEvent::READ, 2);
         assert_eq!(AggregateWatchEvent::TRIM_START, 3);
-        assert_eq!(AggregateWatchEvent::EXISTS, 4);
+        assert_eq!(AggregateWatchEvent::DETAILS, 4);
 
         assert_eq!(delete_event(1, 1, 1).operation_as_u8(), AggregateWatchEvent::DELETE);
         assert_eq!(write_event(1, 1, 1, 0).operation_as_u8(), AggregateWatchEvent::WRITE);
-        assert_eq!(exists_event(1, 1, 1).operation_as_u8(), AggregateWatchEvent::EXISTS);
+        assert_eq!(exists_event(1, 1, 1).operation_as_u8(), AggregateWatchEvent::DETAILS);
     }
 
     #[test]

@@ -52,7 +52,7 @@ Shard-level write-ahead log orchestrator. Coordinates validation, queue manageme
 | `ShardWal::write` | Append events to aggregates |
 | `ShardWal::delete` | Soft-delete aggregates |
 | `ShardWal::trim_start` | Remove old event batches |
-| `ShardWal::exists` | Check aggregate existence |
+| `ShardWal::aggregatedetails` | Check aggregate existence |
 | `ShardWal::list_orgs/aggregate_types/aggregates` | Discovery with pagination |
 | `ShardWal::close` | Flush and close shard |
 | `Coordinator::request_sync` | Batched fsync with delay |

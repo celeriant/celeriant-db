@@ -22,9 +22,9 @@ use celeriant_memcache::shard_mem_cache::ShardMemCache;
 use celeriant_msg::process_requests::Request;
 use celeriant_msg::process_responses::Response;
 use celeriant_msg::request::read_filters::ReadFilters;
-use celeriant_msg::request::requests::{DeleteRequest, ExistsRequest, ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest, ReadRequest, SingleAggregateWrite, TrimStartRequest, WriteRequest};
+use celeriant_msg::request::requests::{DeleteRequest, AggregateDetailsRequest, ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest, ReadRequest, SingleAggregateWrite, TrimStartRequest, WriteRequest};
 use celeriant_msg::response::aggregate_event_batch::AggregateEventBatch;
-use celeriant_msg::response::responses::{AggregateListItem, AggregateTypeListItem, ExistsResponse, FollowerRejection, ListAggregateTypesResponse, ListAggregatesResponse, ListOrgsResponse, OrgListItem, ReadResponse, ReplicationBatchResponse, ReplicationResult, SuccessResponse};
+use celeriant_msg::response::responses::{AggregateListItem, AggregateTypeListItem, AggregateDetailsResponse, FollowerRejection, ListAggregateTypesResponse, ListAggregatesResponse, ListOrgsResponse, OrgListItem, ReadResponse, ReplicationBatchResponse, ReplicationResult, SuccessResponse};
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
 use celeriant_rotating_log::reverse_metablock_scanner::ReverseMetablockScanner;
 use celeriant_wal::aggregate_client_key::AggregateClientKey;
@@ -55,7 +55,7 @@ use crate::error::s3_catchup_error::S3CatchupError;
 use crate::error::shard_cache_load_error::ShardCacheLoadError;
 use crate::error::shard_delete_error::ShardDeleteError;
 use crate::error::shard_error::ShardError;
-use crate::error::shard_exists_error::ShardExistsError;
+use crate::error::shard_exists_error::ShardAggregateDetailsError;
 use crate::error::shard_fsync_error::ShardFsyncError;
 use crate::error::shard_listing_error::ShardListingError;
 use crate::error::shard_read_error::ShardReadError;
@@ -128,7 +128,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> AggregateReader 
 impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     pub async fn process_request(&self, request: Request) -> Result<Response, ShardError> {
         match request {
-            Request::Exists(exists_request) => self.exists(&exists_request).await.map(Response::Exists).map_err(ShardError::Exists),
+            Request::AggregateDetails(exists_request) => self.exists(&exists_request).await.map(Response::AggregateDetails).map_err(ShardError::AggregateDetails),
             Request::Read(read_request) => self.read(&read_request).await.map(Response::Read).map_err(ShardError::Read),
             Request::Write(write_request) => {
                 self.write(write_request)
@@ -634,10 +634,10 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         (read_cursor.log_id, None)
     }
     
-    pub async fn exists(&self, exists_request: &ExistsRequest) -> Result<ExistsResponse, ShardExistsError> {
+    pub async fn exists(&self, exists_request: &AggregateDetailsRequest) -> Result<AggregateDetailsResponse, ShardAggregateDetailsError> {
         let exists = self.aggregate_exists_and_cache(&exists_request.aggregate_key, CachePath::Read).await?;
         if !exists {
-            return Ok(ExistsResponse {
+            return Ok(AggregateDetailsResponse {
                 correlation_id: exists_request.correlation_id,
                 min_event_batch_index: 0,
             });
@@ -648,7 +648,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             .borrow_mut()
             .get_aggregate_last_metablock_pos(&exists_request.aggregate_key, CachePath::Read);
 
-        Ok(ExistsResponse {
+        Ok(AggregateDetailsResponse {
             correlation_id: exists_request.correlation_id,
             min_event_batch_index: last_known_metablock.min_event_batch_index,
         })
@@ -1893,7 +1893,7 @@ mod tests {
     }
 
     fn exists_req(agg: AggregateKey) -> Request {
-        Request::Exists(ExistsRequest {
+        Request::AggregateDetails(AggregateDetailsRequest {
             correlation_id: None,
             aggregate_key: agg,
         })
@@ -1992,9 +1992,9 @@ mod tests {
         }
     }
 
-    fn unwrap_exists(result: Result<Response, ShardError>) -> ExistsResponse {
+    fn unwrap_exists(result: Result<Response, ShardError>) -> AggregateDetailsResponse {
         match result.expect("exists should succeed") {
-            Response::Exists(r) => r,
+            Response::AggregateDetails(r) => r,
             other => panic!("expected Exists, got {other:?}"),
         }
     }
@@ -2817,6 +2817,114 @@ mod tests {
             });
             let resp = unwrap_replication(process(&shard, stale_request).await);
             assert!(matches!(resp.result, ReplicationResult::Rejected(FollowerRejection::TimeDriftTooHigh { .. })));
+
+            shard.close().await;
+        });
+    }
+
+    // ── Batch 1 Test Gaps: P1-1, P1-6, P1-7 ──
+
+    fn multi_write_req(writes: Vec<(AggregateKey, Vec<DatablockAggregateEvent>, Option<u64>)>) -> Request {
+        let mut map = HashMap::new();
+        for (agg, evts, expected) in writes {
+            map.insert(
+                agg,
+                SingleAggregateWrite {
+                    events: evts,
+                    allow_create: true,
+                    expected_event_batch_index: expected,
+                    enforce_client_idempotency: false,
+                    compression_type: CompressionType::None,
+                },
+            );
+        }
+        Request::Write(WriteRequest {
+            correlation_id: None,
+            client_id: 1,
+            user_id: None,
+            writes: map,
+        })
+    }
+
+    #[test]
+    fn multi_aggregate_occ_rollback() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let (a, b) = (key(1, 1, 1), key(1, 1, 2));
+
+            write_ok(&shard, write_req(a.clone(), events(1))).await;
+            write_ok(&shard, write_req(b.clone(), events(1))).await;
+
+            // Advance B to batch 2
+            write_ok(&shard, write_req_full(b.clone(), events(1), false, Some(1), 1, false)).await;
+
+            // Multi-write: A expects 1 (correct), B expects 1 (stale - now at 2)
+            let req = multi_write_req(vec![
+                (a.clone(), events(1), Some(1)),
+                (b.clone(), events(1), Some(1)),
+            ]);
+            let result = process(&shard, req).await;
+            assert!(matches!(
+                result,
+                Err(ShardError::Write(ShardWriteError::OptimisticConcurrencyViolation { .. }))
+            ));
+
+            // Verify A was NOT written (rollback)
+            let read_a = unwrap_read(process(&shard, read_req(a)).await);
+            assert_eq!(read_a.event_batches.len(), 1);
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn sequential_writes_produce_contiguous_batch_indices() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 1, 1);
+
+            for i in 0..5 {
+                write_ok(&shard, write_req_full(agg.clone(), events(1), i == 0, None, 1, false)).await;
+            }
+
+            let read = unwrap_read(process(&shard, read_req(agg)).await);
+            let indices: Vec<u64> = read.event_batches.iter().map(|b| b.event_batch_index).collect();
+            assert_eq!(indices, vec![1, 2, 3, 4, 5]);
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn read_wrong_org_returns_not_found() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+
+            write_ok(&shard, write_req(key(1, 1, 1), events(1))).await;
+
+            let result = process(&shard, read_req(key(2, 1, 1))).await;
+            assert!(matches!(
+                result,
+                Err(ShardError::Read(ShardReadError::AggregateNotExists))
+            ));
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn list_wrong_org_returns_empty() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+
+            write_ok(&shard, write_req(key(1, 1, 1), events(1))).await;
+
+            let aggs = unwrap_list_aggs(process(&shard, list_aggs_req(Some(2), None)).await);
+            assert!(aggs.aggregates.is_empty());
 
             shard.close().await;
         });

@@ -38,7 +38,7 @@ pub struct ListAggregatesRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
-pub struct ExistsRequest {
+pub struct AggregateDetailsRequest {
     pub correlation_id: Option<u128>,
     pub aggregate_key: AggregateKey,
 }

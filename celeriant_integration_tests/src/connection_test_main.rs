@@ -13,7 +13,7 @@ use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_msg::{
     process_requests::Request,
     request::read_filters::ReadFilters,
-    request::requests::{ExistsRequest, ReadRequest, SingleAggregateWrite, WriteRequest},
+    request::requests::{AggregateDetailsRequest, ReadRequest, SingleAggregateWrite, WriteRequest},
 };
 use celeriant_wal::{
     aggregate_key::AggregateKey, compression_type::CompressionType,
@@ -153,7 +153,7 @@ async fn test_single_request(server_address: &str) -> Result<(), Box<dyn std::er
     let mut client = CeleriantClient::connect(server_address).await?;
 
     let aggregate = AggregateKey::new(1, 1, 1000);
-    let request = Request::Exists(ExistsRequest {
+    let request = Request::AggregateDetails(AggregateDetailsRequest {
         aggregate_key: aggregate,
         correlation_id: Some(1),
     });
@@ -174,7 +174,7 @@ async fn test_pipelining(server_address: &str) -> Result<(), Box<dyn std::error:
     for i in 0..10 {
         // All the same shard as we route by aggregate
         let aggregate = AggregateKey::new(1, i, 2000);
-        let request = Request::Exists(ExistsRequest {
+        let request = Request::AggregateDetails(AggregateDetailsRequest {
             aggregate_key: aggregate.clone(),
             correlation_id: Some(i as u128),
         });
@@ -209,7 +209,7 @@ async fn test_cross_shard_routing(server_address: &str) -> Result<(), Box<dyn st
 
     for (agg_id, expected_shard) in shard_targets {
         let aggregate = AggregateKey::new(1, 1, agg_id);
-        let request = Request::Exists(ExistsRequest {
+        let request = Request::AggregateDetails(AggregateDetailsRequest {
             aggregate_key: aggregate.clone(),
             correlation_id: Some(agg_id as u128),
         });
@@ -268,7 +268,7 @@ async fn test_mixed_operations(server_address: &str) -> Result<(), Box<dyn std::
     println!("  Write response: {:?}", write_response);
 
     // Check exists on same connection
-    let exists_request = Request::Exists(ExistsRequest {
+    let exists_request = Request::AggregateDetails(AggregateDetailsRequest {
         aggregate_key: aggregate.clone(),
         correlation_id: Some(101),
     });
@@ -306,7 +306,7 @@ async fn test_parallel_connections(server_address: &str) -> Result<(), Box<dyn s
 
             for req_id in 0..5 {
                 let aggregate = AggregateKey::new(1, 1, 5000 + conn_id * 100 + req_id);
-                let request = Request::Exists(ExistsRequest {
+                let request = Request::AggregateDetails(AggregateDetailsRequest {
                     aggregate_key: aggregate,
                     correlation_id: Some((conn_id * 100 + req_id) as u128),
                 });
@@ -341,7 +341,7 @@ async fn test_connection_churn(server_address: &str) -> Result<(), Box<dyn std::
         let mut client = CeleriantClient::connect(server_address).await?;
 
         let aggregate = AggregateKey::new(1, 1, 6000 + cycle);
-        let request = Request::Exists(ExistsRequest {
+        let request = Request::AggregateDetails(AggregateDetailsRequest {
             aggregate_key: aggregate,
             correlation_id: Some(cycle as u128),
         });
@@ -425,7 +425,7 @@ async fn test_long_lived_connection(
 
     for i in 0..num_requests {
         let aggregate = AggregateKey::new(1, 1, 8000 + i);
-        let request = Request::Exists(ExistsRequest {
+        let request = Request::AggregateDetails(AggregateDetailsRequest {
             aggregate_key: aggregate,
             correlation_id: Some(i as u128),
         });

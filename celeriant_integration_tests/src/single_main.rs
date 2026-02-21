@@ -20,7 +20,7 @@ use celeriant_msg::{
     request::{
         read_filters::ReadFilters,
         requests::{
-            DeleteRequest, ExistsRequest, ReadRequest, SingleAggregateDelete, SingleAggregateWrite,
+            DeleteRequest, AggregateDetailsRequest, ReadRequest, SingleAggregateDelete, SingleAggregateWrite,
             WriteRequest,
         },
     },
@@ -128,7 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Check if aggregates exist (use read_client)
     println!("=== Checking if aggregates exist ===");
     for agg in [&aggregate_1, &aggregate_2] {
-        let request = Request::Exists(ExistsRequest {
+        let request = Request::AggregateDetails(AggregateDetailsRequest {
             aggregate_key: agg.clone(),
             correlation_id: None,
         });

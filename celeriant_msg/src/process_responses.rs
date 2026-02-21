@@ -8,7 +8,7 @@ use futures_lite::{AsyncReadExt, AsyncWriteExt};
 use crate::{
     read_wire_data_error::ReadWireDataError,
     response::responses::{
-        CatchUpResponse, ErrorResponse, ExistsResponse, HeartbeatResponse, KickFollowerResponse, ListAggregateTypesResponse, ListAggregatesResponse, ListOrgsResponse, ProtocolErrorResponse,
+        CatchUpResponse, ErrorResponse, AggregateDetailsResponse, HeartbeatResponse, KickFollowerResponse, ListAggregateTypesResponse, ListAggregatesResponse, ListOrgsResponse, ProtocolErrorResponse,
         ReadResponse, ReplicationBatchResponse, SuccessResponse, WatchResponse,
     },
 };
@@ -17,7 +17,7 @@ use crate::{
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponseType {
-    Exists = 1,
+    AggregateDetails = 1,
     Read = 2,
     Write = 3,
     TrimStart = 4,
@@ -37,7 +37,7 @@ pub enum ResponseType {
 impl ResponseType {
     pub fn from_u32(value: u32) -> Result<Self, ReadWireDataError> {
         match value {
-            1 => Ok(ResponseType::Exists),
+            1 => Ok(ResponseType::AggregateDetails),
             2 => Ok(ResponseType::Read),
             3 => Ok(ResponseType::Write),
             4 => Ok(ResponseType::TrimStart),
@@ -59,7 +59,7 @@ impl ResponseType {
 
 #[derive(Debug, Clone)]
 pub enum Response {
-    Exists(ExistsResponse),
+    AggregateDetails(AggregateDetailsResponse),
     Read(ReadResponse),
     Write(SuccessResponse),
     TrimStart(SuccessResponse),
@@ -79,7 +79,7 @@ pub enum Response {
 impl Response {
     pub fn response_type(&self) -> ResponseType {
         match self {
-            Response::Exists(_) => ResponseType::Exists,
+            Response::AggregateDetails(_) => ResponseType::AggregateDetails,
             Response::Read(_) => ResponseType::Read,
             Response::Write(_) => ResponseType::Write,
             Response::TrimStart(_) => ResponseType::TrimStart,
@@ -130,7 +130,7 @@ impl Response {
         }
 
         Ok(match response_type {
-            ResponseType::Exists => fixed!(Exists),
+            ResponseType::AggregateDetails => fixed!(AggregateDetails),
             ResponseType::Write => fixed!(Write),
             ResponseType::TrimStart => fixed!(TrimStart),
             ResponseType::Delete => fixed!(Delete),
@@ -150,7 +150,7 @@ impl Response {
 
     pub fn determine_compression_type(response: &Response, server_compression_algorithm: CompressionType) -> CompressionType {
         match response {
-            Response::Exists(_) => CompressionType::None,
+            Response::AggregateDetails(_) => CompressionType::None,
             Response::Read(_) => server_compression_algorithm,
             Response::Write(_) => CompressionType::None,
             Response::TrimStart(_) => CompressionType::None,
@@ -181,7 +181,7 @@ impl Response {
         let response_type_id = response.response_type() as u32;
 
         match response {
-            Response::Exists(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
+            Response::AggregateDetails(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
             Response::Write(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
             Response::TrimStart(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
             Response::Delete(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
@@ -213,7 +213,7 @@ mod tests {
 
     fn all_types() -> [ResponseType; COUNT] {
         [
-            ResponseType::Exists,
+            ResponseType::AggregateDetails,
             ResponseType::Read,
             ResponseType::Write,
             ResponseType::TrimStart,
@@ -233,7 +233,7 @@ mod tests {
 
     fn make_response(rt: ResponseType) -> Response {
         match rt {
-            ResponseType::Exists => Response::Exists(ExistsResponse {
+            ResponseType::AggregateDetails => Response::AggregateDetails(AggregateDetailsResponse {
                 correlation_id: Some(0xDEAD_BEEF_CAFE_BABE),
                 min_event_batch_index: 42,
             }),
@@ -440,7 +440,7 @@ mod tests {
     #[test]
     fn truncated_stream_fails() {
         block_on(async {
-            let res = make_response(ResponseType::Exists);
+            let res = make_response(ResponseType::AggregateDetails);
             let bytes = write_bytes(&res, PROTOCOL_VERSION_V2, CompressionType::None).await;
 
             for truncate_at in [0, 10, bytes.len() - 1] {
@@ -454,7 +454,7 @@ mod tests {
     #[test]
     fn invalid_message_type_fails() {
         block_on(async {
-            let res = make_response(ResponseType::Exists);
+            let res = make_response(ResponseType::AggregateDetails);
             let mut bytes = write_bytes(&res, PROTOCOL_VERSION_V2, CompressionType::None).await;
 
             bytes[4..8].copy_from_slice(&(MAX_ID + 1).to_le_bytes());

@@ -24,7 +24,7 @@ pub async fn execute_command(server: &str, command: Commands) -> Result<()> {
         .with_context(|| format!("Failed to connect to {}", server))?;
 
     match command {
-        Commands::Exists(args) => check_exists(&mut client, args).await,
+        Commands::AggregateDetails(args) => check_aggregatedetails(&mut client, args).await,
         Commands::Read(args) => read_events(&mut client, args).await,
         Commands::Write(args) => write_event(&mut client, args).await,
         Commands::Trim(args) => trim_start(&mut client, args).await,
@@ -32,9 +32,9 @@ pub async fn execute_command(server: &str, command: Commands) -> Result<()> {
     }
 }
 
-async fn check_exists(client: &mut CeleriantClient, args: AggregateKeyArgs) -> Result<()> {
+async fn check_aggregatedetails(client: &mut CeleriantClient, args: AggregateKeyArgs) -> Result<()> {
     let key = AggregateKey::new(args.org, args.aggregate_type, args.id);
-    let request = Request::Exists(ExistsRequest {
+    let request = Request::AggregateDetails(AggregateDetailsRequest {
         correlation_id: args.correlation_id,
         aggregate_key: key,
     });
@@ -42,8 +42,8 @@ async fn check_exists(client: &mut CeleriantClient, args: AggregateKeyArgs) -> R
     let response = client.send_request(&request, CompressionType::None).await?;
 
     match &response {
-        Response::Exists(res) => {
-            println!("Aggregate exists:");
+        Response::AggregateDetails(res) => {
+            println!("Aggregate details:");
             println!("  Min batch index: {}", res.min_event_batch_index);
         }
         Response::GenericError(err) => {

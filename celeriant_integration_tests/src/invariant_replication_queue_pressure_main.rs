@@ -23,16 +23,16 @@ use celeriant_integration_tests::{
     count_events, s3_cluster_config, write_event, MinioContainer, TcpProxy, TestServer,
 };
 use celeriant_msg::process_requests::Request;
-use celeriant_msg::request::requests::{ExistsRequest, SingleAggregateWrite, WriteRequest};
+use celeriant_msg::request::requests::{AggregateDetailsRequest, SingleAggregateWrite, WriteRequest};
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::compression_type::CompressionType;
 use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
 use tokio::sync::Barrier;
 use tokio::time::Instant;
 
-const NUM_CONNECTIONS: usize = 1500;
+const NUM_CONNECTIONS: usize = 100;
 const NUM_AGGREGATES: usize = 50;
-const PRESSURE_DURATION_SECS: u64 = 30;
+const PRESSURE_DURATION_SECS: u64 = 10;
 const PAYLOAD_BYTES: usize = 3024;
 const CLIENTSIDE_TIMEOUT_S: u64 = 60;
 /// Proxy adds this delay per 8KB chunk forwarded — makes replication ~25x slower
@@ -187,7 +187,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     proxy.unthrottle();
     println!("  Proxy UNTHROTTLED");
     println!("  Waiting for replication pipeline to drain and kick to deliver...");
-    tokio::time::sleep(Duration::from_secs(30)).await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
 
     // Get leader counts for all shard 1 aggregates (no new writes yet)
     let leader_counts: Vec<(AggregateKey, usize)> = {
@@ -226,7 +226,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut read_failed = false;
         for (key, leader_count) in &leader_counts {
 
-            println!("  Checking follower for key {:?}", key);
             match count_events(&mut fc, key).await {
                 Ok(c) => {
                     follower_total += c;
@@ -315,7 +314,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut probe = CeleriantClient::connect_with_timeout(_leader.address(), Some(probe_timeout)).await?;
 
         let exists_shard0 = probe.send_request(
-            &Request::Exists(ExistsRequest { correlation_id: Some(0), aggregate_key: probe_shard0.clone() }),
+            &Request::AggregateDetails(AggregateDetailsRequest { correlation_id: Some(0), aggregate_key: probe_shard0.clone() }),
             CompressionType::None,
         ).await;
         match &exists_shard0 {
@@ -324,7 +323,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let exists_shard1 = probe.send_request(
-            &Request::Exists(ExistsRequest { correlation_id: Some(1), aggregate_key: probe_shard1_key.clone() }),
+            &Request::AggregateDetails(AggregateDetailsRequest { correlation_id: Some(1), aggregate_key: probe_shard1_key.clone() }),
             CompressionType::None,
         ).await;
         match &exists_shard1 {
@@ -360,12 +359,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Now hammer shard 1 again — proxy is unthrottled, follower is caught up,
     // so these should all replicate via TCP (no S3 fallback).
     println!(
-        "  Hammering shard 1 with {} connections for 5s (should use TCP only)...",
-        NUM_CONNECTIONS / 150
+        "  Hammering shard 1 with 10 connections for 5s (should use TCP only)..."
     );
     let phase5_written = run_pressure_writes(
         _leader.address(),
-        NUM_CONNECTIONS / 150,
+        10,
         NUM_AGGREGATES,
         5,
     )

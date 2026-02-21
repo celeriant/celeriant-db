@@ -10,7 +10,7 @@ use celeriant_shard::internal_shard_config::InternalShardConfig;
 use celeriant_shard::replication_client::StubReplicationClient;
 use celeriant_shard::s3_downloader::StubS3Downloader;
 use celeriant_shard::timestamp_config::TimestampConfig;
-use celeriant_msg::request::requests::{ExistsRequest, SingleAggregateWrite, WriteRequest};
+use celeriant_msg::request::requests::{AggregateDetailsRequest, SingleAggregateWrite, WriteRequest};
 use celeriant_shard::shard_wal::ShardWal;
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::compression_type::CompressionType;
@@ -230,7 +230,7 @@ fn bench_bloom_effectiveness(c: &mut Criterion) {
                                     let aggregate_id = (i % num_aggregates) as u128;
                                     let aggregate_key = AggregateKey::new(1, 1, aggregate_id);
 
-                                    let exists_request = ExistsRequest {
+                                    let exists_request = AggregateDetailsRequest {
                                         correlation_id: None,
                                         aggregate_key,
                                     };
@@ -276,7 +276,7 @@ fn bench_bloom_effectiveness(c: &mut Criterion) {
                                     let aggregate_id = base_unknown_id + (iter * EXISTS_CHECKS_PER_ITER as u64 + i as u64) as u128;
                                     let aggregate_key = AggregateKey::new(1, 1, aggregate_id);
 
-                                    let exists_request = ExistsRequest {
+                                    let exists_request = AggregateDetailsRequest {
                                         correlation_id: None,
                                         aggregate_key,
                                     };

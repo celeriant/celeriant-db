@@ -169,7 +169,7 @@ Variable-size responses use Snappy by default (fast decompression). `determine_c
 ```rust
 Response::Read(_) => CompressionType::Snappy,
 Response::Watch(_) => CompressionType::Snappy,
-Response::Exists(_) => CompressionType::None,  // Fixed-size
+Response::AggregateDetails(_) => CompressionType::None,  // Fixed-size
 ```
 
 ## Usage

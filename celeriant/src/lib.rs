@@ -24,6 +24,12 @@ pub fn startup(args: Vec<String>) -> Result<(), std::io::Error> {
         )
         .init();
 
+    // Route panics through tracing so they appear in stdout (captured by test harness).
+    // The default panic hook writes to stderr, which integration tests don't read.
+    std::panic::set_hook(Box::new(|info| {
+        error!("PANIC: {}", info);
+    }));
+
     server_config.log_non_defaults();
 
     // Verify Direct I/O is actually working

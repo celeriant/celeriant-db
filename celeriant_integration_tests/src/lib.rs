@@ -253,6 +253,112 @@ impl TestServer {
 
         Err("Server failed to restart within timeout".into())
     }
+
+    /// Restart the server with a new configuration.
+    ///
+    /// Preserves the existing data_root, client_port, and replication_port
+    /// (the data directory is owned by _temp_dir and must not change).
+    /// Use this to change a server's mode (e.g. standalone -> distributed)
+    /// while keeping the same data on disk.
+    pub async fn restart_with_config(
+        &mut self,
+        mut config: ServerConfig,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        config.data_root = self.config.data_root.clone();
+        config.client_port = self.config.client_port;
+        config.replication_port = self.config.replication_port;
+        self.config = config;
+
+        let args = self.config.to_cli_args();
+        let server_bin = Self::server_binary_path();
+        self.child = Command::new(&server_bin)
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+
+        self._log_thread = spawn_log_reader(&self.label, &mut self.child);
+
+        let start = std::time::Instant::now();
+        let max_wait = Duration::from_secs(30);
+
+        while start.elapsed() < max_wait {
+            match TcpStream::connect(&self.address).await {
+                Ok(_) => {
+                    println!(
+                        "  Server restarted with new config on port {} (took {:?})",
+                        self.config.client_port,
+                        start.elapsed()
+                    );
+                    return Ok(());
+                }
+                Err(_) => {
+                    sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+
+        Err("Server failed to restart within timeout".into())
+    }
+
+    /// Start a test server using a caller-provided TempDir.
+    ///
+    /// Like `start_with_config_labeled` but uses an existing data directory
+    /// instead of creating a fresh one. The TempDir ownership transfers to
+    /// TestServer for cleanup on drop. Use for tests that pre-populate data
+    /// directories (e.g. copying WAL files from another node).
+    pub async fn start_with_existing_dir(
+        port: u16,
+        mut config: ServerConfig,
+        label: String,
+        temp_dir: TempDir,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let data_root = temp_dir.path().to_path_buf();
+        let address = format!("127.0.0.1:{}", port);
+
+        config.data_root = data_root.clone();
+        config.client_port = port;
+        config.replication_port = port + 1;
+
+        println!("  Starting test server on port {} (existing dir)...", port);
+        println!("  Data directory: {:?}", data_root);
+
+        let args = config.to_cli_args();
+        println!("  Args: {:?}", args);
+
+        let server_bin = Self::server_binary_path();
+        let mut child = Command::new(&server_bin)
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+
+        let log_thread = spawn_log_reader(&label, &mut child);
+
+        let start = std::time::Instant::now();
+        let max_wait = Duration::from_secs(30);
+
+        while start.elapsed() < max_wait {
+            match TcpStream::connect(&address).await {
+                Ok(_) => {
+                    println!("  Server is ready (took {:?})", start.elapsed());
+                    return Ok(Self {
+                        _temp_dir: temp_dir,
+                        address,
+                        child,
+                        config,
+                        label,
+                        _log_thread: log_thread,
+                    });
+                }
+                Err(_) => {
+                    sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+
+        Err("Server failed to start within timeout".into())
+    }
 }
 
 impl Drop for TestServer {
@@ -636,6 +742,20 @@ impl MinioContainer {
         Ok(())
     }
 
+    /// Delete the object at the given path.
+    ///
+    /// Used for simulating missing S3 batches in gap-detection tests.
+    pub async fn delete_object(&self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        use object_store::ObjectStoreExt;
+
+        let store = self.build_object_store()?;
+        let object_path = object_store::path::Path::from(path);
+
+        store.delete(&object_path).await?;
+
+        Ok(())
+    }
+
     fn build_object_store(&self) -> Result<Arc<dyn object_store::ObjectStore>, Box<dyn std::error::Error>> {
         use object_store::aws::AmazonS3Builder;
 
@@ -1001,6 +1121,29 @@ pub fn s3_cluster_config(
         s3_allow_http: allow_http,
         ..Default::default()
     }
+}
+
+/// Copy only `shard_*` subdirectories from `src` to `dst`.
+///
+/// Skips node identity files so each server generates a fresh node_id.
+pub fn copy_shard_dirs(src: &std::path::Path, dst: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with("shard_") || !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let dst_shard = dst.join(&name);
+        std::fs::create_dir_all(&dst_shard)?;
+        for file in std::fs::read_dir(entry.path())? {
+            let file = file?;
+            if file.file_type()?.is_file() {
+                std::fs::copy(file.path(), dst_shard.join(file.file_name()))?;
+            }
+        }
+        println!("  Copied shard dir: {}", name.to_string_lossy());
+    }
+    Ok(())
 }
 
 /// Probe whether a node is the leader by attempting a write.
