@@ -63,7 +63,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shard_log_preallocate_bytes: 2 * 1024 * 1024,
         // Extend list timeout to handle full log scans with cache misses
         list_max_duration_ms: 10_000,
-        non_durable_writes: true,
         ..Default::default()
     };
 

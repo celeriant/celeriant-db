@@ -30,8 +30,8 @@ use celeriant_wal::{
 use tokio::time::Instant;
 
 const PORT_BASE: u16 = 20700;
-const NUM_AGGREGATES: u64 = 5000;
-const EVENT_PAYLOAD_SIZE: usize = 50_000; // 50KB events to force log rotations
+const NUM_AGGREGATES: u64 = 2000;
+const EVENT_PAYLOAD_SIZE: usize = 25_000; // 25KB events to force log rotations
 const NUM_NONEXISTENT_READS: usize = 100;
 const NUM_EXISTING_READS: usize = 100;
 

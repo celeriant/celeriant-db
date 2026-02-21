@@ -4,21 +4,22 @@
 //! wipe the divergent node and let it re-sync from S3 as a fresh follower.
 //!
 //! Setup (same divergence scenario as test #2):
-//! 1. Start node A (standalone), write 5 events, stop. (wal_index = 5)
+//! 1. Start node A as distributed leader (with S3), write 5 events, stop.
+//!    S3 fallback batches created for events 1-5 (no follower).
 //! 2. Copy A's shard data to B.
 //! 3. Start B (standalone from copy), write 1 LARGE divergent event (event 6), stop.
 //!    B: wal_index = 6, tip_hash at 6 = hash(tip_5 || large_event_6)
-//! 4. Start A (original data), write 3 SMALL events (events 6, 7, 8), stop.
+//! 4. Restart A as distributed leader, write 3 SMALL events (events 6, 7, 8).
 //!    A: wal_index = 8, tip_hash at 6 = hash(tip_5 || small_event_6) ≠ B's
-//! 5. Start A as distributed leader. S3 fallback batches for events 6-8 land in S3.
-//! 6. Start B as distributed follower (divergent wal_index=6).
+//!    S3 fallback batches for events 6-8 also land in S3.
+//! 5. Start B as distributed follower (divergent wal_index=6).
 //!    - TipHashMismatch → follower shuts down (same as test #2).
 //!
 //! Recovery:
-//! 7. Start a FRESH follower (clean data dir, no divergent state).
-//!    - Fresh follower has no WAL data → S3 catchup applies events 6-8 cleanly.
+//! 6. Start a FRESH follower (clean data dir, no divergent state).
+//!    - Fresh follower has no WAL data → S3 catchup applies events 1-8.
 //!    - Replication resumes normally.
-//! 8. Verify: fresh follower has all 8 events. New writes replicate correctly.
+//! 7. Verify: fresh follower has all 8 events. New writes replicate correctly.
 //!
 //! The correct recovery for WAL divergence is to wipe the divergent follower
 //! and let it re-join from scratch via S3 catchup.
@@ -67,19 +68,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log_level: "info".to_string(),
         standalone: true,
         routing_rule: RoutingRule::AggregateTypeId,
-        non_durable_writes: true,
         ..Default::default()
     };
 
-    // ========================================
-    // Phase 1: Start node A (standalone), write 5 events, stop.
-    // ========================================
-    println!("PHASE 1: Write 5 events to standalone node A");
-    println!("----------------------------------------------");
+    let cluster_config = s3_cluster_config(
+        num_shards,
+        &region,
+        &bucket,
+        &access_key,
+        &secret_key,
+        &endpoint,
+        allow_http,
+    );
 
+    // ========================================
+    // Phase 1: Start node A as distributed leader (with S3), write 5 events, stop.
+    //          S3 fallback batches are created for events 1-5 (no follower present).
+    // ========================================
+    println!("PHASE 1: Write 5 events to distributed node A (with S3)");
+    println!("--------------------------------------------------------");
+
+    let leader_config = ServerConfig {
+        routing_rule: RoutingRule::AggregateTypeId,
+        ..cluster_config.clone()
+    };
     let mut node_a = TestServer::start_with_config_labeled(
         port_a,
-        standalone_config.clone(),
+        leader_config,
         "node-a-standalone".into(),
     )
     .await?;
@@ -91,6 +106,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let count_a = count_events(&mut client_a, &aggregate_key).await?;
     assert_eq!(count_a, 5, "Node A should have 5 events, got {}", count_a);
     println!("  Node A has {} events (wal_index=5)", count_a);
+
+    println!("  Waiting 4s for S3 fallback writes for events 1-5...");
+    tokio::time::sleep(Duration::from_secs(4)).await;
 
     drop(client_a);
     node_a.stop();
@@ -135,22 +153,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("PHASE 3: Restart A as distributed leader, write 3 small events (6, 7, 8)");
     println!("--------------------------------------------------------------------------");
 
-    let cluster_config = s3_cluster_config(
-        num_shards,
-        &region,
-        &bucket,
-        &access_key,
-        &secret_key,
-        &endpoint,
-        allow_http,
-    );
-    let leader_config = ServerConfig {
+    let restart_config = ServerConfig {
         routing_rule: RoutingRule::AggregateTypeId,
-        non_durable_writes: true,
         ..cluster_config.clone()
     };
 
-    node_a.restart_with_config(leader_config).await?;
+    node_a.restart_with_config(restart_config).await?;
     println!("  Node A restarted as distributed leader (no follower yet)");
 
     let mut client_a = CeleriantClient::connect(node_a.address()).await?;
@@ -186,7 +194,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let follower_config = ServerConfig {
         routing_rule: RoutingRule::AggregateTypeId,
-        non_durable_writes: true,
         ..cluster_config.clone()
     };
 
@@ -230,7 +237,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let fresh_config = ServerConfig {
         routing_rule: RoutingRule::AggregateTypeId,
-        non_durable_writes: true,
         ..cluster_config
     };
 

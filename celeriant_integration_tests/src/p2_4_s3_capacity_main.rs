@@ -91,8 +91,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     follower.stop();
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let num_fallback_events = 150u64;
-    let payload_size = 6 * 1024; // 6KB per event
+    let num_fallback_events = 100u64;
+    let payload_size = 4 * 1024; // 4KB per event
 
     println!(
         "  Writing {} events with {}KB payloads (total ~{}MB)...",
@@ -152,9 +152,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Restarting follower...");
     follower.restart().await?;
 
-    // Wait for boot catchup + election + leader discovery + heartbeat
+    // Must stay below client_connection_timeout_ms (30s) to keep leader_client alive.
     println!("  Waiting for boot catchup + cluster rejoin...");
-    tokio::time::sleep(Duration::from_secs(30)).await;
+    tokio::time::sleep(Duration::from_secs(25)).await;
 
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
 

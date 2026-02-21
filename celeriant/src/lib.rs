@@ -49,7 +49,17 @@ pub fn startup(args: Vec<String>) -> Result<(), std::io::Error> {
     };
 
     info!("node_id={}, data_root={:?}, listen_address={}, client_port={}, replication_port={}", node_id, server_config.data_root, server_config.listen_address, server_config.client_port, server_config.replication_port);
-    
+
+    // Check ports aren't already in use (Glommio uses SO_REUSEPORT, so bind won't fail).
+    // Connect to 127.0.0.1 regardless of listen_address since 0.0.0.0 isn't connectable.
+    for (label, port) in [("client", server_config.client_port), ("replication", server_config.replication_port)] {
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+        if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(100)).is_ok() {
+            error!("Port {} ({}) is already in use — another server may be running", port, label);
+            std::process::exit(1);
+        }
+    }
+
     let nbr_shards = server_config.num_shards.unwrap_or_else(num_cpus::get) as u32;
     let shard_config = server_config.to_shard_config(node_id, nbr_shards);
     let sidecar_config = server_config.to_sidecar_config(nbr_shards);

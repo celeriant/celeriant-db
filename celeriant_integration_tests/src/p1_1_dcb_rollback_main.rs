@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
+use celeriant_client_tokio::client_error::ClientError;
 use celeriant_integration_tests::{count_events, ServerConfig, TestServer};
 use celeriant_msg::{
     process_requests::Request,
@@ -190,13 +191,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         writes,
     });
 
-    let response = client
+    let result = client
         .send_request(&request, CompressionType::None)
-        .await?;
+        .await;
 
-    // Verify the DCB write was rejected with OCC error (code 2003)
-    match response {
-        Response::GenericError(error) => {
+    // The server returns OCC violation as a CeleriantError, not a Response
+    match result {
+        Err(ClientError::CeleriantError(error)) => {
             println!("  ✓ DCB write rejected with error: {}", error.error_message);
             assert_eq!(
                 error.error_code, 2003,
@@ -205,7 +206,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             println!("  ✓ Error code is 2003 (WRITE_OPTIMISTIC_CONCURRENCY_VIOLATION)");
         }
-        _ => panic!("Expected error response, got: {:?}", response),
+        Ok(resp) => panic!("Expected OCC error, got success: {:?}", resp),
+        Err(e) => panic!("Expected OCC error (code 2003), got: {:?}", e),
     }
 
     // Phase 4: Verify rollback - both A and B unchanged

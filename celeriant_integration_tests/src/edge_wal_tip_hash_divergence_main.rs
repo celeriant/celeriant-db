@@ -67,7 +67,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log_level: "info".to_string(),
         standalone: true,
         routing_rule: RoutingRule::AggregateTypeId,
-        non_durable_writes: true,
         ..Default::default()
     };
 
@@ -147,7 +146,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let leader_config = ServerConfig {
         routing_rule: RoutingRule::AggregateTypeId,
-        non_durable_writes: true,
         ..cluster_config.clone()
     };
 
@@ -191,7 +189,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let follower_config = ServerConfig {
         routing_rule: RoutingRule::AggregateTypeId,
-        non_durable_writes: true,
         ..cluster_config
     };
 

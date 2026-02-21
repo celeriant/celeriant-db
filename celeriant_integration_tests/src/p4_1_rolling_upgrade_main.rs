@@ -272,13 +272,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let total_events = count_events(&mut client_b, &aggregate_key).await?;
     println!("  Events stored: {}", total_events);
 
-    // Verify: successful writes should equal stored events
-    assert_eq!(
-        total_events, final_success as usize,
-        "Event count mismatch: {} stored vs {} successful writes",
+    // At-least-once: during SIGKILL failover, writes may be committed on the server
+    // but the acknowledgment lost before reaching the client. So stored >= successful.
+    assert!(
+        total_events >= final_success as usize,
+        "Data loss detected: {} stored < {} successful writes",
         total_events, final_success
     );
-    println!("  ✓ All successful writes present (no data loss)");
+    let unacked = total_events - final_success as usize;
+    if unacked > 0 {
+        println!("  {} writes committed but not acknowledged (expected during SIGKILL)", unacked);
+    }
+    println!("  ✓ No acknowledged writes lost");
 
     // Report failure rate during transitions
     let failure_rate = if final_success + final_failures > 0 {
@@ -292,7 +297,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Rolling restart test passed:");
     println!("  - {} writes succeeded", final_success);
     println!("  - {} writes failed (expected during failover)", final_failures);
-    println!("  - {} events stored (100% of successful writes)", total_events);
+    println!("  - {} events stored ({} unacked commits during failover)", total_events, unacked);
     println!("  - No acknowledged writes lost");
     println!("  - Cluster recovered after each restart");
 
