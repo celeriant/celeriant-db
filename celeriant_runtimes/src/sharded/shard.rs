@@ -1,6 +1,7 @@
 use std::{
     cell::Cell,
     rc::Rc,
+    sync::{Arc, atomic::{AtomicBool, Ordering}},
     time::Duration,
 };
 
@@ -33,6 +34,7 @@ pub struct Shard<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: L
     ctx: ConnectionContext<R, D, S>,
     shutdown_requested: Rc<Cell<bool>>,
     shard_wal: Rc<ShardWal<R, D>>,
+    shard_failed: Arc<AtomicBool>,
 }
 
 impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static> Shard<R, D, S> {
@@ -45,6 +47,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
         replication_tcp_listener: TcpListener,
         shard_wal: ShardWal<R, D>,
         lease_manager: Option<LeaseManager<S>>,
+        shard_failed: Arc<AtomicBool>,
     ) -> Self {
         info!("Initializing shard {current_shard_id}");
 
@@ -68,6 +71,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
             ctx,
             shutdown_requested,
             shard_wal,
+            shard_failed,
         }
     }
 
@@ -96,13 +100,18 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
         info!("Shard {} shutdown complete", self.ctx.current_shard_id);
     }
 
+    fn should_shutdown(&self) -> bool {
+        self.shutdown_requested.get() || self.shard_failed.load(Ordering::Relaxed)
+    }
+
     async fn enter_main_loop_until_shutdown(&self) {
         info!("Shard {} entering main loop (shutdown_requested={})", self.ctx.current_shard_id, self.shutdown_requested.get());
         let client_listener = self.client_tcp_listener.clone();
         let client_ctx = self.ctx.clone();
+        let client_shard_failed = self.shard_failed.clone();
         glommio::spawn_local(async move {
             loop {
-                if client_ctx.shutdown_requested.get() {
+                if client_ctx.shutdown_requested.get() || client_shard_failed.load(Ordering::Relaxed) {
                     break;
                 }
                 match glommio::timer::timeout(Duration::from_secs(1), client_listener.shared_accept()).await {
@@ -115,9 +124,10 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
 
         let repl_listener = self.replication_tcp_listener.clone();
         let repl_ctx = self.ctx.clone();
+        let repl_shard_failed = self.shard_failed.clone();
         glommio::spawn_local(async move {
             loop {
-                if repl_ctx.shutdown_requested.get() {
+                if repl_ctx.shutdown_requested.get() || repl_shard_failed.load(Ordering::Relaxed) {
                     break;
                 }
                 match glommio::timer::timeout(Duration::from_secs(1), repl_listener.shared_accept()).await {
@@ -129,7 +139,8 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
         .detach();
 
         loop {
-            if self.shutdown_requested.get() {
+            if self.should_shutdown() {
+                self.shutdown_requested.set(true);
                 let _ = self.shard_wal.close().await;
                 break;
             }

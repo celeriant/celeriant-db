@@ -1,6 +1,6 @@
 use celeriant_wal::constants::HEADER_BLOCK_SIZE_BYTES;
 use lru::LruCache;
-use std::{cell::{Cell, RefCell}, num::NonZeroUsize, path::PathBuf, rc::Rc};
+use std::{cell::RefCell, num::NonZeroUsize, path::PathBuf, rc::Rc};
 
 use crate::{errors::{open_or_create_error::OpenOrCreateError, ready_up_error::ReadyUpError}, log_segment_file::{log_segment_cursor::LogSegmentCursor, log_segment_file::LogSegmentFile}};
 
