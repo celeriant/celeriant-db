@@ -12,6 +12,7 @@ use celeriant_runtimes::RoutingRule;
 
 use celeriant_integration_tests::{MinioContainer, ServerConfig, TestServer};
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
+use celeriant_client_tokio::client_error::ClientError;
 use celeriant_client_tokio::list_operations::{
     ListAggregateTypesIterator, ListAggregatesIterator, ListOptions, ListOrgsIterator,
 };
@@ -125,8 +126,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let aggregate_2 = AggregateKey::new(1, 2 + 32, 201);
     let client_id: u128 = 999;
 
-    // Check if aggregates exist (use read_client)
-    println!("=== Checking if aggregates exist ===");
+    // Verify nonexistent aggregates return error 7001
+    println!("=== Checking nonexistent aggregates return error ===");
     for agg in [&aggregate_1, &aggregate_2] {
         let request = Request::AggregateDetails(AggregateDetailsRequest {
             aggregate_key: agg.clone(),
@@ -136,8 +137,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .send_request(&request, CompressionType::None)
             .await
         {
-            Ok(response) => println!("Aggregate {:?}: {:?}", agg, response),
-            Err(e) => println!("Aggregate {:?}: Error - {:?}", agg, e),
+            Err(ClientError::CeleriantError(e)) => {
+                assert_eq!(e.error_code, 7001, "expected error 7001 for nonexistent aggregate");
+                println!("Aggregate {:?}: correctly returned error {}", agg, e.error_code);
+            }
+            Ok(response) => panic!("Expected error for nonexistent aggregate {:?}, got {:?}", agg, response),
+            Err(e) => panic!("Aggregate {:?}: transport error - {:?}", agg, e),
         }
     }
 

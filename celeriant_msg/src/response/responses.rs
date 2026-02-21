@@ -62,7 +62,14 @@ pub struct ListAggregatesResponse {
 pub struct AggregateDetailsResponse {
     pub correlation_id: Option<u128>,
     pub min_event_batch_index: u64,
-    //TODO: Include other metadata.
+    pub max_event_batch_index: u64,
+    pub max_event_index: u64,
+    pub is_deleted: bool,
+    pub allow_recreate: bool,
+    pub allow_index_continuation: bool,
+    pub last_server_timestamp: u64,
+    pub last_client_id: u128,
+    pub last_user_id: Option<u128>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]

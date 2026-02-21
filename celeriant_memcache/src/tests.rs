@@ -269,6 +269,36 @@ fn trim_only_increases_min_event_batch_index() {
 }
 
 #[test]
+fn trim_commit_does_not_corrupt_snapshot_log_id() {
+    let mut c = cache();
+    let k = agg(1, 1, 1);
+
+    // Write an event, simulate disk write setting log_id=5, then commit
+    queue_write(&mut c, &k, 10, 3, 100, 1);
+    let mut snapshot = c.take_sync_positions_snapshot();
+    snapshot.aggregate_queue_positions.get_mut(&k).unwrap().log_id = 5;
+    snapshot.aggregate_queue_positions.get_mut(&k).unwrap().metablock_absolute_pos = 2048;
+    c.commit_sync_positions_snapshot(NodeStatus::Standalone, snapshot);
+
+    // Verify position was set correctly
+    let pos = c.get_aggregate_last_metablock_pos(&k, CachePath::Write);
+    assert_eq!(pos.log_id, 5);
+    assert_eq!(pos.metablock_absolute_pos, 2048);
+
+    // Now add a trim (creates QueueAggregatePositions with default log_id=0)
+    let trim_item = test_queue_item(k.clone(), 0, 0, 0);
+    c.add_pending_trim_to_queue(&k, 2, trim_item);
+    sync_and_commit_standalone(&mut c);
+
+    // log_id and metablock_absolute_pos must NOT have been overwritten to 0
+    for path in [CachePath::Write, CachePath::Read] {
+        let pos = c.get_aggregate_last_metablock_pos(&k, path);
+        assert_eq!(pos.log_id, 5, "trim must not corrupt log_id on {:?}", path);
+        assert_eq!(pos.metablock_absolute_pos, 2048, "trim must not corrupt metablock_absolute_pos on {:?}", path);
+    }
+}
+
+#[test]
 fn buffer_size_calculations() {
     let mut c = cache();
     let k = agg(1, 1, 1);
@@ -506,7 +536,7 @@ fn put_aggregate_deleted() {
     let mut c = cache();
     let k = agg(1, 1, 1);
 
-    c.put_aggregate_into_cache_as_deleted(k.clone(), 10, 5, true, true, CachePath::Write);
+    c.put_aggregate_into_cache_as_deleted(k.clone(), 0, 0, 10, 5, true, true, CachePath::Write);
 
     let (loaded, status) = c.aggregate_load_status(&k, CachePath::Write);
     assert!(loaded);
@@ -810,7 +840,7 @@ fn put_deleted_on_read_path_clears_recent_writes() {
     }
 
     // Mark deleted on read path - should clear recent writes
-    c.put_aggregate_into_cache_as_deleted(k.clone(), 10, 5, false, false, CachePath::Read);
+    c.put_aggregate_into_cache_as_deleted(k.clone(), 0, 0, 10, 5, false, false, CachePath::Read);
 
     let writes: Vec<_> = c.get_cached_writes_from(&k, 1, u64::MAX).collect();
     assert_eq!(writes.len(), 0);
@@ -824,7 +854,7 @@ fn put_deleted_on_write_path_does_not_clear_recent_writes() {
     let mb = test_metablock(k.clone(), 1, 1, 1, 1);
     c.cache_recent_write(k.clone(), 1, mb, None, 64);
 
-    c.put_aggregate_into_cache_as_deleted(k.clone(), 10, 5, false, false, CachePath::Write);
+    c.put_aggregate_into_cache_as_deleted(k.clone(), 0, 0, 10, 5, false, false, CachePath::Write);
 
     let writes: Vec<_> = c.get_cached_writes_from(&k, 1, u64::MAX).collect();
     assert_eq!(writes.len(), 1);

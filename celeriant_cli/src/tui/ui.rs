@@ -752,9 +752,19 @@ fn draw_aggregate_context(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(HEADER_COLOR),
             )));
             info_lines.push(Line::from(vec![
-                Span::styled("Min batch: ", Style::default().fg(DIM_COLOR)),
-                Span::raw(info.min_batch.to_string()),
+                Span::styled("Batch range: ", Style::default().fg(DIM_COLOR)),
+                Span::raw(format!("{} - {}", info.min_batch, info.max_batch)),
             ]));
+            info_lines.push(Line::from(vec![
+                Span::styled("Max event index: ", Style::default().fg(DIM_COLOR)),
+                Span::raw(info.max_event_index.to_string()),
+            ]));
+            if info.is_deleted {
+                info_lines.push(Line::from(Span::styled(
+                    "DELETED",
+                    Style::default().fg(ERROR_COLOR).bold(),
+                )));
+            }
         } else {
             info_lines.push(Line::from(Span::styled(
                 "Press 'r' to load aggregate info",

@@ -21,7 +21,21 @@ use celeriant_wal::{
 };
 use tokio::time::Duration;
 
+use celeriant_client_tokio::client_error::ClientError;
+
 const CLIENT_ID: u128 = 12345;
+
+/// Send a request and treat server-level errors (like "aggregate not found") as success.
+/// Only transport/protocol errors are propagated.
+async fn send_probe(
+    client: &mut CeleriantClient,
+    request: &Request,
+) -> Result<(), ClientError> {
+    match client.send_request(request, CompressionType::None).await {
+        Ok(_) | Err(ClientError::CeleriantError(_)) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -158,10 +172,8 @@ async fn test_single_request(server_address: &str) -> Result<(), Box<dyn std::er
         correlation_id: Some(1),
     });
 
-    let response = client
-        .send_request(&request, CompressionType::None)
-        .await?;
-    println!("  Single request response: {:?}", response);
+    send_probe(&mut client, &request).await?;
+    println!("  Single request round-trip successful");
 
     Ok(())
 }
@@ -179,10 +191,8 @@ async fn test_pipelining(server_address: &str) -> Result<(), Box<dyn std::error:
             correlation_id: Some(i as u128),
         });
 
-        let response = client
-            .send_request(&request, CompressionType::None)
-            .await?;
-        println!("  Pipeline request {} -> {:?}", i, response);
+        send_probe(&mut client, &request).await?;
+        println!("  Pipeline request {} ok", i);
     }
 
     println!("  Successfully sent 10 requests on single connection");
@@ -214,21 +224,11 @@ async fn test_cross_shard_routing(server_address: &str) -> Result<(), Box<dyn st
             correlation_id: Some(agg_id as u128),
         });
 
-        let response = client
-            .send_request(&request, CompressionType::None)
-            .await?;
-        println!(
-            "  Aggregate {} (should route to shard {}) -> {:?}",
-            agg_id, expected_shard, response
-        );
+        send_probe(&mut client, &request).await?;
+        println!("  Aggregate {} (should route to shard {}) -> ok", agg_id, expected_shard);
 
-        let response = client
-            .send_request(&request, CompressionType::None)
-            .await?;
-        println!(
-            "  Aggregate {} (should route to shard {}) -> {:?}",
-            agg_id, expected_shard, response
-        );
+        send_probe(&mut client, &request).await?;
+        println!("  Aggregate {} (should route to shard {}) -> ok (repeat)", agg_id, expected_shard);
     }
 
     println!("  Cross-shard routing successful on single connection");
@@ -311,9 +311,7 @@ async fn test_parallel_connections(server_address: &str) -> Result<(), Box<dyn s
                     correlation_id: Some((conn_id * 100 + req_id) as u128),
                 });
 
-                client
-                    .send_request(&request, CompressionType::None)
-                    .await?;
+                send_probe(&mut client, &request).await?;
             }
 
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
@@ -346,9 +344,7 @@ async fn test_connection_churn(server_address: &str) -> Result<(), Box<dyn std::
             correlation_id: Some(cycle as u128),
         });
 
-        client
-            .send_request(&request, CompressionType::None)
-            .await?;
+        send_probe(&mut client, &request).await?;
         // Connection drops here when client goes out of scope
     }
 
@@ -430,9 +426,7 @@ async fn test_long_lived_connection(
             correlation_id: Some(i as u128),
         });
 
-        client
-            .send_request(&request, CompressionType::None)
-            .await?;
+        send_probe(&mut client, &request).await?;
 
         if (i + 1) % 25 == 0 {
             println!("  Completed {} requests on long-lived connection", i + 1);

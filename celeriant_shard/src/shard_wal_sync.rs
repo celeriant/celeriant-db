@@ -116,6 +116,14 @@ fn commit_sync(
     // Take the queue before committing the snapshot since commit consumes it
     let pending_append_queue = std::mem::take(&mut sync_positions_snapshot.pending_append_queue);
 
+    // Extract disk positions for deleted aggregates before commit consumes the snapshot
+    let deleted_positions: std::collections::HashMap<_, _> = sync_positions_snapshot
+        .aggregate_queue_positions
+        .iter()
+        .filter(|(_, pos)| pos.pending_delete)
+        .map(|(key, pos)| (key.clone(), (pos.log_id, pos.metablock_absolute_pos)))
+        .collect();
+
     shard_mem_cache.commit_sync_positions_snapshot(node_status, sync_positions_snapshot);
 
     let mut pending_commit_data = PendingCommitData {
@@ -166,8 +174,13 @@ fn commit_sync(
                 }
             }
             MetablockKind::SoftDelete(soft_delete) => {
+                let (del_log_id, del_pos) = deleted_positions
+                    .get(&soft_delete.aggregate_key)
+                    .copied()
+                    .unwrap_or((0, 0));
                 shard_mem_cache.put_aggregate_into_cache_as_deleted(
                     soft_delete.aggregate_key.clone(),
+                    del_log_id, del_pos,
                     soft_delete.event_index,
                     soft_delete.event_batch_index,
                     soft_delete.allow_recreate,
@@ -178,6 +191,7 @@ fn commit_sync(
                 if !node_status.is_leader() {
                     shard_mem_cache.put_aggregate_into_cache_as_deleted(
                         soft_delete.aggregate_key.clone(),
+                        del_log_id, del_pos,
                         soft_delete.event_index,
                         soft_delete.event_batch_index,
                         soft_delete.allow_recreate,

@@ -635,23 +635,75 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     }
     
     pub async fn exists(&self, exists_request: &AggregateDetailsRequest) -> Result<AggregateDetailsResponse, ShardAggregateDetailsError> {
-        let exists = self.aggregate_exists_and_cache(&exists_request.aggregate_key, CachePath::Read).await?;
-        if !exists {
-            return Ok(AggregateDetailsResponse {
-                correlation_id: exists_request.correlation_id,
-                min_event_batch_index: 0,
-            });
-        }
+        self.aggregate_exists_and_cache(&exists_request.aggregate_key, CachePath::Read).await?;
 
-        let last_known_metablock = self
+        let snapshot = self
             .shard_mem_cache
             .borrow_mut()
-            .get_aggregate_last_metablock_pos(&exists_request.aggregate_key, CachePath::Read);
+            .get_aggregate_snapshot(&exists_request.aggregate_key, CachePath::Read);
+
+        let snapshot = match snapshot {
+            Some(s) if s.status == AggregateStatus::NotFound => {
+                return Err(ShardAggregateDetailsError::AggregateNotExists);
+            }
+            Some(s) => s,
+            None => return Err(ShardAggregateDetailsError::AggregateNotExists),
+        };
+
+        let is_deleted = snapshot.status == AggregateStatus::Deleted;
+
+        // Read last metablock from disk for server_timestamp, client_id, user_id
+        let (last_server_timestamp, last_client_id, last_user_id) =
+            self.read_metablock_details(snapshot.log_id, snapshot.metablock_absolute_pos).await?;
 
         Ok(AggregateDetailsResponse {
             correlation_id: exists_request.correlation_id,
-            min_event_batch_index: last_known_metablock.min_event_batch_index,
+            min_event_batch_index: snapshot.min_event_batch_index,
+            max_event_batch_index: snapshot.event_batch_index,
+            max_event_index: snapshot.event_index,
+            is_deleted,
+            allow_recreate: snapshot.allow_recreate,
+            allow_index_continuation: snapshot.allow_index_continuation,
+            last_server_timestamp,
+            last_client_id,
+            last_user_id,
         })
+    }
+
+    /// Read a single metablock from disk and extract client_id, user_id, server_timestamp.
+    async fn read_metablock_details(
+        &self,
+        log_id: u64,
+        metablock_absolute_pos: u64,
+    ) -> Result<(u64, u128, Option<u128>), ShardAggregateDetailsError> {
+        let log_segment = self.log_segments_cache.get(log_id).await
+            .map_err(|e| ShardAggregateDetailsError::MetablockReadError(format!("{:?}", e)))?;
+
+        let guard = log_segment.lock_reader("exists_metablock_read").await
+            .map_err(|e| ShardAggregateDetailsError::MetablockReadError(format!("{:?}", e)))?;
+
+        let dma_file = guard.as_ref()
+            .ok_or_else(|| ShardAggregateDetailsError::MetablockReadError("no file handle".into()))?;
+
+        let buf = dma_file.read_at(metablock_absolute_pos, FIXED_BLOCK_SIZE_BYTES).await
+            .map_err(|e| ShardAggregateDetailsError::MetablockReadError(format!("{:?}", e)))?;
+
+        let (chunks, _) = (*buf).as_chunks::<FIXED_BLOCK_SIZE_BYTES>();
+        let block = chunks.first()
+            .ok_or_else(|| ShardAggregateDetailsError::MetablockReadError("empty read".into()))?;
+
+        let metablock = deserialise_metablock(block)
+            .map_err(|e| ShardAggregateDetailsError::MetablockReadError(format!("{:?}", e)))?;
+
+        let (client_id, user_id) = match &metablock.wal_metablock_type {
+            MetablockKind::EventBatchMetadata(eb) => (eb.client_id, eb.user_id),
+            MetablockKind::SoftDelete(sd) => (sd.client_id, sd.user_id),
+            other => return Err(ShardAggregateDetailsError::MetablockReadError(
+                format!("unexpected metablock kind: {:?}", std::mem::discriminant(other)),
+            )),
+        };
+
+        Ok((metablock.server_timestamp, client_id, user_id))
     }
 
     pub async fn trim_start(&self, trim_request: TrimStartRequest) -> Result<SuccessResponse, ShardTrimError> {
@@ -1093,6 +1145,8 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                         let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
                         shard_mem_cache.put_aggregate_into_cache_as_deleted(
                             searching_for_aggregate_key.clone(),
+                            log_id,
+                            metablock_absolute_pos,
                             soft_delete.event_index,
                             soft_delete.event_batch_index,
                             soft_delete.allow_recreate,
@@ -2104,20 +2158,23 @@ mod tests {
     // ── Exists ──
 
     #[test]
-    fn exists_missing_returns_zero() {
+    fn exists_missing_returns_error() {
         glommio_test!({
             let (_tmp, dir) = test_dir();
             let shard = open_shard(&dir).await;
 
-            let resp = unwrap_exists(process(&shard, exists_req(key(1, 1, 999))).await);
-            assert_eq!(resp.min_event_batch_index, 0);
+            let result = process(&shard, exists_req(key(1, 1, 999))).await;
+            assert!(matches!(
+                result,
+                Err(ShardError::AggregateDetails(ShardAggregateDetailsError::AggregateNotExists))
+            ));
 
             shard.close().await;
         });
     }
 
     #[test]
-    fn exists_after_write_returns_min_batch() {
+    fn exists_after_write_returns_details() {
         glommio_test!({
             let (_tmp, dir) = test_dir();
             let shard = open_shard(&dir).await;
@@ -2127,6 +2184,11 @@ mod tests {
 
             let resp = unwrap_exists(process(&shard, exists_req(agg)).await);
             assert_eq!(resp.min_event_batch_index, FIRST_EVENT_BATCH_INDEX);
+            assert_eq!(resp.max_event_batch_index, FIRST_EVENT_BATCH_INDEX);
+            assert_eq!(resp.max_event_index, 1);
+            assert!(!resp.is_deleted);
+            assert!(resp.last_server_timestamp > 0);
+            assert_eq!(resp.last_client_id, 1);
 
             shard.close().await;
         });
@@ -2534,6 +2596,8 @@ mod tests {
 
             let resp = unwrap_exists(process(&shard, exists_req(agg)).await);
             assert_eq!(resp.min_event_batch_index, 3);
+            assert_eq!(resp.max_event_batch_index, FIRST_EVENT_BATCH_INDEX + 4);
+            assert!(!resp.is_deleted);
 
             shard.close().await;
         });

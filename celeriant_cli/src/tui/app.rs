@@ -49,6 +49,9 @@ pub struct AggregateContext {
 #[derive(Debug, Clone)]
 pub struct AggregateContextInfo {
     pub min_batch: u64,
+    pub max_batch: u64,
+    pub max_event_index: u64,
+    pub is_deleted: bool,
 }
 
 pub struct App {
@@ -334,6 +337,9 @@ impl App {
             Ok(Response::AggregateDetails(res)) => {
                 ctx.info = Some(AggregateContextInfo {
                     min_batch: res.min_event_batch_index,
+                    max_batch: res.max_event_batch_index,
+                    max_event_index: res.max_event_index,
+                    is_deleted: res.is_deleted,
                 });
                 self.set_status("Aggregate info loaded");
                 Ok(())

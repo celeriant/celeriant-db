@@ -41,6 +41,8 @@ impl MemSnapshotAggregate {
     }
 
     pub fn deleted(
+        log_id: u64,
+        metablock_absolute_pos: u64,
         event_index: u64,
         event_batch_index: u64,
         allow_recreate: bool,
@@ -50,8 +52,8 @@ impl MemSnapshotAggregate {
             status: AggregateStatus::Deleted,
             event_batch_index,
             event_index,
-            log_id: 0,
-            metablock_absolute_pos: 0,
+            log_id,
+            metablock_absolute_pos,
             min_event_batch_index: 0,
             allow_recreate,
             allow_index_continuation,

@@ -74,6 +74,8 @@ const REPLICATION_BATCH_WAL_INDEX_GAP: u32 = 6002;
 
 // Exists errors: 7xxx
 const EXISTS_CACHE_ERROR: u32 = 7000;
+const EXISTS_AGGREGATE_NOT_EXISTS: u32 = 7001;
+const EXISTS_METABLOCK_READ_ERROR: u32 = 7002;
 
 // Watch errors: 8xxx
 const WATCH_REQUEST_INVALID: u32 = 8000;
@@ -222,6 +224,8 @@ fn replication_batch_error(e: FollowerReplicationWriteError) -> (u32, String) {
 fn exists_error(e: ShardAggregateDetailsError) -> (u32, String) {
     match e {
         ShardAggregateDetailsError::AggregateExistsAndCacheError(e) => cache_load_error(EXISTS_CACHE_ERROR, EXISTS_CACHE_ERROR, e),
+        ShardAggregateDetailsError::AggregateNotExists => (EXISTS_AGGREGATE_NOT_EXISTS, "{}".into()),
+        ShardAggregateDetailsError::MetablockReadError(detail) => (EXISTS_METABLOCK_READ_ERROR, format!(r#"{{"detail":{}}}"#, json_string(&detail))),
     }
 }
 

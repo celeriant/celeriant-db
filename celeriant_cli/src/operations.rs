@@ -44,7 +44,18 @@ async fn check_aggregatedetails(client: &mut CeleriantClient, args: AggregateKey
     match &response {
         Response::AggregateDetails(res) => {
             println!("Aggregate details:");
-            println!("  Min batch index: {}", res.min_event_batch_index);
+            println!("  Batch index range: {} - {}", res.min_event_batch_index, res.max_event_batch_index);
+            println!("  Max event index: {}", res.max_event_index);
+            println!("  Deleted: {}", res.is_deleted);
+            if res.is_deleted {
+                println!("  Allow recreate: {}", res.allow_recreate);
+                println!("  Allow index continuation: {}", res.allow_index_continuation);
+            }
+            println!("  Last server timestamp: {}", format_timestamp(res.last_server_timestamp));
+            println!("  Last client ID: {}", res.last_client_id);
+            if let Some(user_id) = res.last_user_id {
+                println!("  Last user ID: {}", user_id);
+            }
         }
         Response::GenericError(err) => {
             anyhow::bail!("Error {}: {}", err.error_code, err.error_message);

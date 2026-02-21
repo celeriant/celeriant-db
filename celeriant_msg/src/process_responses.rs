@@ -236,6 +236,14 @@ mod tests {
             ResponseType::AggregateDetails => Response::AggregateDetails(AggregateDetailsResponse {
                 correlation_id: Some(0xDEAD_BEEF_CAFE_BABE),
                 min_event_batch_index: 42,
+                max_event_batch_index: 99,
+                max_event_index: 500,
+                is_deleted: false,
+                allow_recreate: true,
+                allow_index_continuation: false,
+                last_server_timestamp: 1700000000000,
+                last_client_id: 0xAAAA_BBBB_CCCC_DDDD,
+                last_user_id: Some(0x1111_2222_3333_4444),
             }),
             ResponseType::Read => Response::Read(ReadResponse {
                 correlation_id: Some(0xFEED_FACE_DEAD_C0DE),

@@ -311,6 +311,7 @@ fn commit_replication(
                 MetablockKind::SoftDelete(soft_delete) => {
                     shard_mem_cache.put_aggregate_into_cache_as_deleted(
                         soft_delete.aggregate_key.clone(),
+                        log_id, item.metablock_absolute_pos,
                         soft_delete.event_index,
                         soft_delete.event_batch_index,
                         soft_delete.allow_recreate,

@@ -416,13 +416,15 @@ impl ShardMemCache {
     pub fn put_aggregate_into_cache_as_deleted(
         &mut self,
         aggregate_key: AggregateKey,
+        log_id: u64,
+        metablock_absolute_pos: u64,
         event_index: u64,
         event_batch_index: u64,
         allow_recreate: bool,
         allow_index_continuation: bool,
         cache_path: CachePath,
     ) {
-        let snapshot = MemSnapshotAggregate::deleted(event_index, event_batch_index, allow_recreate, allow_index_continuation);
+        let snapshot = MemSnapshotAggregate::deleted(log_id, metablock_absolute_pos, event_index, event_batch_index, allow_recreate, allow_index_continuation);
         let cache = match cache_path {
             CachePath::Read => &mut self.aggregate_read_snapshots,
             CachePath::Write => &mut self.aggregate_write_snapshots,
@@ -439,6 +441,14 @@ impl ShardMemCache {
             // Remove from eviction queue (will be cleaned up lazily, but mark for skip)
             self.cache_eviction_queue.retain(|(k, _, _)| k != &aggregate_key);
         }
+    }
+
+    pub fn get_aggregate_snapshot(&mut self, aggregate_key: &AggregateKey, cache_path: CachePath) -> Option<MemSnapshotAggregate> {
+        let cache = match cache_path {
+            CachePath::Read => &mut self.aggregate_read_snapshots,
+            CachePath::Write => &mut self.aggregate_write_snapshots,
+        };
+        cache.get(aggregate_key).cloned()
     }
 
     pub fn put_aggregate_into_cache(
@@ -496,6 +506,10 @@ impl ShardMemCache {
                 continue; // Will be handled by put_aggregate_into_cache_as_deleted
             }
 
+            // Only update disk position when this batch had an EventBatch write.
+            // Trim-only batches have default log_id=0 which would corrupt the position.
+            let has_event_batch = queue_positions.event_batch_index > 0;
+
             // Always update write cache
             if let Some(existing) = self.aggregate_write_snapshots.get_mut(&key)
             && existing.status != AggregateStatus::NotFound {
@@ -506,8 +520,10 @@ impl ShardMemCache {
                 if queue_positions.event_index > existing.event_index {
                     existing.event_index = queue_positions.event_index;
                 }
-                existing.log_id = queue_positions.log_id;
-                existing.metablock_absolute_pos = queue_positions.metablock_absolute_pos;
+                if has_event_batch {
+                    existing.log_id = queue_positions.log_id;
+                    existing.metablock_absolute_pos = queue_positions.metablock_absolute_pos;
+                }
             } else {
                 let snapshot = MemSnapshotAggregate {
                     log_id: queue_positions.log_id,
@@ -533,8 +549,10 @@ impl ShardMemCache {
                     if queue_positions.event_index > existing.event_index {
                         existing.event_index = queue_positions.event_index;
                     }
-                    existing.log_id = queue_positions.log_id;
-                    existing.metablock_absolute_pos = queue_positions.metablock_absolute_pos;
+                    if has_event_batch {
+                        existing.log_id = queue_positions.log_id;
+                        existing.metablock_absolute_pos = queue_positions.metablock_absolute_pos;
+                    }
                 } else {
                     self.aggregate_read_snapshots.put(key.clone(), MemSnapshotAggregate {
                         log_id: queue_positions.log_id,

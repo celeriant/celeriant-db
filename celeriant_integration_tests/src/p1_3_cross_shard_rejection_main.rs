@@ -265,9 +265,9 @@ async fn test_no_partial_writes(server_address: &str) -> Result<(), Box<dyn std:
     {
         Ok(_) => return Err("Aggregate on shard 0 already exists before test!".into()),
         Err(celeriant_client_tokio::client_error::ClientError::CeleriantError(err)) => {
-            if err.error_code != 1001 {
+            if err.error_code != 7001 {
                 return Err(format!(
-                    "Expected error 1001 (not exists), got {}",
+                    "Expected error 7001 (not exists), got {}",
                     err.error_code
                 )
                 .into());
@@ -282,9 +282,9 @@ async fn test_no_partial_writes(server_address: &str) -> Result<(), Box<dyn std:
     {
         Ok(_) => return Err("Aggregate on shard 1 already exists before test!".into()),
         Err(celeriant_client_tokio::client_error::ClientError::CeleriantError(err)) => {
-            if err.error_code != 1001 {
+            if err.error_code != 7001 {
                 return Err(format!(
-                    "Expected error 1001 (not exists), got {}",
+                    "Expected error 7001 (not exists), got {}",
                     err.error_code
                 )
                 .into());
@@ -341,9 +341,9 @@ async fn test_no_partial_writes(server_address: &str) -> Result<(), Box<dyn std:
     {
         Ok(_) => return Err("Aggregate on shard 0 was created despite rejection!".into()),
         Err(celeriant_client_tokio::client_error::ClientError::CeleriantError(err)) => {
-            if err.error_code != 1001 {
+            if err.error_code != 7001 {
                 return Err(format!(
-                    "Expected error 1001 (not exists) after rejection, got {}",
+                    "Expected error 7001 (not exists) after rejection, got {}",
                     err.error_code
                 )
                 .into());
@@ -360,9 +360,9 @@ async fn test_no_partial_writes(server_address: &str) -> Result<(), Box<dyn std:
     {
         Ok(_) => return Err("Aggregate on shard 1 was created despite rejection!".into()),
         Err(celeriant_client_tokio::client_error::ClientError::CeleriantError(err)) => {
-            if err.error_code != 1001 {
+            if err.error_code != 7001 {
                 return Err(format!(
-                    "Expected error 1001 (not exists) after rejection, got {}",
+                    "Expected error 7001 (not exists) after rejection, got {}",
                     err.error_code
                 )
                 .into());
