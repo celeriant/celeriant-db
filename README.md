@@ -1,22 +1,22 @@
 # Celeriant
 
-A fast, correct write-ahead log for event sourcing.
+A fast, distributed, append-only write-ahead log built specifically for event sourcing. It is dedicated to the write side of [CQRS](https://www.martinfowler.com/bliki/CQRS.html).
 
-Not a database. Not a stream. Just the write side of CQRS, done properly.
+Not a relational database. Not a message broker. Just the write side of event sourcing, done properly.
 
-## The Problem
+## Why Celeriant
 
-Event sourcing keeps getting built on the wrong foundations.
+PostgreSQL gives you correctness but not throughput. Kafka gives you throughput but not correctness. Celeriant gives you both.
 
-**Postgres** — Transactions and ACID are great. But append-only, high-cardinality, small-write workloads are its worst case. You'll spend more time tuning vacuum and fighting WAL amplification than building your product.
+**PostgreSQL** — Transactions and ACID are great, but append-only, high-cardinality, small-write workloads are its worst case. You will spend more time tuning vacuum and fighting WAL amplification than building your product. Real-world event stores hit 10–20k writes/sec on PostgreSQL before it buckles.
 
-**Kafka** — Excellent at fan-out and replay. Terrible at per-aggregate ordering and optimistic concurrency. Partitions aren't aggregates. No way for consumers to filter by aggregate or event types. Operationally complex. And it dies at ~200k topics per partition. Want one topic per aggregate? Good luck.
+**Kafka** — Scales to millions of writes/sec, but it has no conditional writes and no per-aggregate ordering guarantee. Before a service can write events it needs to validate state, and that state may have changed between the read and the write. Kafka cannot help with that. There is also no way to filter events per-aggregate—every consumer gets the whole topic firehose.
 
-**KurrentDB** — Closest competitor. But it mixes read and write concerns, it's slow, and the licensing is complicated.
+**Celeriant** — Per-aggregate ordering, optimistic concurrency control, exactly-once writes, and durable cluster replication. Scales to millions of aggregates with bounded memory regardless of cardinality.
 
 ## What Celeriant Is
 
-A distributed, append-only log organised by aggregate.
+A distributed, append-only log organised by aggregate:
 
 ```
 org_id / aggregate_type_id / aggregate_id → ordered event stream
@@ -27,133 +27,67 @@ Each aggregate is an independent, totally-ordered stream. Writes are acknowledge
 **You get:**
 - Per-aggregate total ordering (no gaps, no reordering)
 - Optimistic concurrency control (expected batch index)
-- Dynamic consistency boundaries - Conditionally, atomically write events to multiple aggregates
-- Client idempotency (duplicate writes rejected)
-- Infinite cardinality (millions of aggregates, no tuning)
-- Schema validation (aggregate type x event type)
+- Dynamic consistency boundaries — conditionally, atomically write events to multiple aggregates
+- Exactly-once writes (client idempotency, duplicate writes rejected)
+- Infinite cardinality (millions of aggregates, no tuning, bounded memory)
 - Explicit offsets (you control your read position)
 - Event type filtering (bloom filter accelerated)
 - Watch API (real-time change notifications)
 - Compression (zstd, snappy, brotli, gzip)
 - In-memory read cache (recent events served from memory)
+- Per-event encryption support (AES-GCM, stored opaquely by server)
+- Blake3 hash chain linking every event to its predecessor (tamper-evident audit log)
 
 **You don't get:**
-- Queries
-- Indexes
+- Queries or indexes
 - Projections
-- Consumer groups
-- Automatic offset management
+- Consumer groups or automatic offset management
+- Schema validation (not yet implemented)
+- mTLS or OAuth (not yet implemented)
 
-It's not a state machine, a message streaming platform or a queue. You have to build your read side yourself.
-
-## Infinite Cardinality
-
-Kafka partitions don't scale past ~200k topics. Postgres tables with millions of aggregate IDs need careful indexing and partitioning. Most event stores require memory proportional to the number of aggregates.
-
-Celeriant doesn't.
-
-Memory usage is bounded and predictable regardless of how many aggregates you have. One aggregate or ten million - it's same memory footprint.
-
-How:
-- Bloom filters
-- LRU caches with fixed size bounds (not unbounded maps)
-- Reverse WAL scanning for cold aggregates (disk is cheap, RAM isn't)
-
-The tradeoff: cold aggregate reads hit disk. Hot aggregates are cached. You get predictable performance without capacity planning.
-
-This means you can model:
-- One stream per user
-- One stream per device
-- One stream per game match
-- One stream per order
-- One stream per anything
-
-Without worrying about whether your infrastructure will fall over.
+It is not a state machine, a message streaming platform, or a queue. You have to build your read side yourself.
 
 ## Performance
 
-Single node, NVMe, 16 cores:
+Benchmarked on a 32-core CPU with a single NVMe over PCIe5. Single "Hello World" event payload per acknowledged write. Clients and servers on localhost.
 
-| Mode | Throughput | Latency (p99) |
-|------|------------|---------------|
-| Durable (fsync before ACK) | 370,000 writes/sec | < 30ms |
-| Async (fsync in background) | 700,000 writes/sec | < 10ms |
+### Throughput benchmark (25,000 open connections)
 
-Kafka on the same hardware with default settings: ~40,000 writes/sec.
+| Mode | Throughput | Avg latency | p99 latency |
+|------|------------|-------------|-------------|
+| Single node | 350,000 writes/sec | 68ms | 170ms |
+| Replicated cluster | 190,000 writes/sec | 125ms | 272ms |
 
-## Quick Start
+### Latency benchmark (1,000 open connections)
 
-```bash
-docker run -d \
-  -p 10000:10000 \
-  -v celeriant-data:/data \
-  celeriant/celeriant:latest
-```
+| Mode | Throughput | Avg latency | p99 latency |
+|------|------------|-------------|-------------|
+| Single node | 50,000 writes/sec | 20ms | 27ms |
+| Replicated cluster | 15,000 writes/sec | 63ms | 88ms |
 
-```rust
-// Write events
-let response = client.write(WriteRequest {
-    aggregate_key: AggregateKey { org_id, aggregate_type_id, aggregate_id },
-    events: vec![Event { event_type: 1, payload: bytes }],
-    expected_event_batch_index: Some(0), // OCC
-    allow_create: true,
-    ..Default::default()
-}).await?;
-
-// Read events
-let events = client.read(ReadRequest {
-    aggregate_key,
-    from_event_batch_index: Some(0),
-    include_event_types: Some(vec![1, 2, 3]),
-    ..Default::default()
-}).await?;
-```
-
-## Schema Validation
-
-Enforce schemas at write time. No invalid events hit the log.
-
-```rust
-// Register a schema for an event type
-client.register_schema(RegisterSchemaRequest {
-    org_id,
-    aggregate_type_id,
-    event_type: 1,
-    schema_format: SchemaFormat::JsonSchema,
-    schema: json_schema_bytes,
-}).await?;
-
-// Writes with event_type=1 are now validated against this schema
-// Invalid payloads are rejected before persistence
-```
-
-Supported formats:
-- JSON Schema
-- Avro
-- Protobuf
-- MessagePack (with schema)
-
-Schemas are versioned. Event types can bump their major version for breaking changes.
+Kafka on comparable hardware with default settings: ~40,000 writes/sec with no OCC, no per-aggregate ordering.
 
 ## Architecture
 
 ### Thread-Per-Core
 
-One executor per CPU core. Each core owns a subset of aggregates. No locks on the hot path. Similar to ScyllaDB and TigerBeetle.
+One glommio executor per CPU core. Each core owns a subset of aggregates. No locks on the hot path. Inspired by [ScyllaDB](https://www.scylladb.com/) and [TigerBeetle](https://tigerbeetle.com/).
 
-### Replication
+### Durability Guarantees
 
-Two nodes: leader and follower. Synchronous replication before client ACK.
+Celeriant uses **Direct I/O**, bypassing the Linux kernel page cache. Buffered I/O through the page cache is vulnerable to [silent data loss on fsync failure](https://lwn.net/Articles/752063/). Direct I/O ensures fsync failures surface immediately.
 
-No Raft. No Paxos. We use S3 conditional writes for lease-based coordination.
+Events are batched and written durably to disk on the leader. The leader replicates to the follower, which also does a durable write. The leader ACKs to clients only after both writes confirm. Fsync and replication are amortised across concurrent writers to avoid paying the full fsync cost per write.
 
-Why? Consensus protocols are operationally complex and mostly overkill for append-only workloads. S3 provides strong read-after-write consistency and compare-and-swap via ETags. That's enough.
+Every metablock in the WAL includes `previous_tip_hash`, forming a Blake3 hash chain. This makes the log tamper-evident and allows followers to verify integrity without requiring identical on-disk layout.
 
-If the follower is unreachable, we replicate to S3 instead. No write is acknowledged until it's on two storage systems.
+### Replication and Cluster Coordination
 
-### Failure Modes
+Two nodes: leader and follower. No Raft. No Paxos.
 
-We document them. Explicitly.
+Leader election and coordination use [S3 conditional writes](https://aws.amazon.com/about-aws/whats-new/2024/08/amazon-s3-conditional-writes/). A single CAS-protected S3 object grants leader exclusivity. This is operationally simpler than consensus protocols and sufficient for append-only workloads.
+
+If the follower is unreachable, the leader replicates to S3 instead. No write is acknowledged until it is on two storage systems.
 
 | Scenario | Behaviour |
 |----------|-----------|
@@ -162,62 +96,150 @@ We document them. Explicitly.
 | Network partition | Fencing tokens prevent split-brain data corruption |
 | S3 outage | Replication continues to follower, coordination degrades gracefully |
 
-Clock skew must be < 15 seconds. Use NTP.
+Clock skew must be < 5 seconds. Use NTP.
+
+### Memory and Indexing Design
+
+Celeriant is designed for very high aggregate cardinality without memory growth proportional to aggregate count.
+
+- **Bloom filters**: per-log-segment bloom filters skip entire WAL segments during existence checks and event type filtering
+- **LRU caches**: fixed-size bounds on all caches; cold aggregates fall back to reverse WAL scanning
+- **Reverse WAL scanning**: disk reads for cold aggregates are efficient; the WAL is structured so reverse scans are O(log n) via bloom filter pruning
+
+One aggregate or ten million — the same memory footprint. You can model one stream per user, per device, per order, per game match, without worrying about whether your infrastructure will fall over.
+
+## Quick Start
+
+Build and run standalone:
+
+```bash
+cargo build --release -p celeriant
+
+./target/release/celeriant \
+  --standalone \
+  --data-root /var/lib/celeriant \
+  --client-port 10000
+```
+
+Run a clustered pair with S3 coordination:
+
+```bash
+celeriant \
+  --data-root /var/lib/celeriant \
+  --listen-address 10.0.0.1 \
+  --client-port 10000 \
+  --replication-port 10001 \
+  --s3-enabled \
+  --s3-region us-east-1 \
+  --s3-bucket my-celeriant-cluster \
+  --s3-subfolder prod
+```
+
+Or via environment variables in a `.env` file:
+
+```
+CELERIANT_DATA_ROOT=/var/lib/celeriant
+CELERIANT_LISTEN_ADDRESS=10.0.0.1
+CELERIANT_S3_ENABLED=true
+CELERIANT_S3_REGION=us-east-1
+CELERIANT_S3_BUCKET=my-celeriant-cluster
+CELERIANT_S3_SUBFOLDER=prod
+CELERIANT_S3_ACCESS_KEY_ID=AKIA...
+CELERIANT_S3_SECRET_ACCESS_KEY=...
+```
+
+## API Examples
+
+```rust
+// Write events
+client.send_request(Request::Write(WriteRequest {
+    writes: hashmap! {
+        aggregate_key => SingleAggregateWrite {
+            events: vec![Event { event_type: 1, payload: bytes }],
+            expected_event_batch_index: Some(0), // OCC
+            allow_create: true,
+            ..Default::default()
+        },
+    },
+    ..Default::default()
+})).await?;
+
+// Read events with filtering
+client.send_request(Request::Read(ReadRequest {
+    aggregate_key,
+    filters: ReadFilters::new(1)
+        .include_event_types(vec![1, 2, 3]),
+    ..Default::default()
+})).await?;
+```
 
 ## Multi-Aggregate Writes
 
-Atomic writes across multiple aggregates with OCC on all of them.
+Atomic writes across multiple aggregates with OCC on all of them:
 
 ```rust
-client.write(WriteRequest {
+client.send_request(Request::Write(WriteRequest {
     writes: hashmap! {
-        aggregate_a => WriteData { events: [...], expected_event_batch_index: Some(5) },
-        aggregate_b => WriteData { events: [...], expected_event_batch_index: Some(12) },
+        aggregate_a => SingleAggregateWrite {
+            events: vec![...],
+            expected_event_batch_index: Some(5),
+            ..Default::default()
+        },
+        aggregate_b => SingleAggregateWrite {
+            events: vec![...],
+            expected_event_batch_index: Some(12),
+            ..Default::default()
+        },
     },
     ..Default::default()
-}).await?;
+})).await?;
 ```
 
 All aggregates must hash to the same shard. If any OCC check fails, the entire write is rejected. No partial writes.
 
 ## Watch API
 
-Subscribe to aggregate changes in real-time.
+Subscribe to aggregate changes in real-time:
 
 ```rust
-let mut watch = client.watch(WatchRequest {
+// Sends WatchRequest, then streams WatchResponse messages
+client.send_request(Request::Watch(WatchRequest {
     aggregates: Some(hashset![aggregate_key]),
-    requested_latency_ms: 10,
-}).await?;
+    requested_latency_ms: Some(10),
+    ..Default::default()
+})).await?;
 
-while let Some(event) = watch.next().await {
-    // event.aggregate_key, event.operation, event.from_batch_index, event.to_batch_index
-}
+// Events arrive as WatchResponse with merged batch index ranges per aggregate
 ```
 
-Backpressure via bounded channels. If you can't keep up, you get disconnected.
+Backpressure via bounded channels. If a client cannot keep up, it gets disconnected.
 
 ## Listing and Discovery
 
-Filesystem-style navigation for when you need to find things.
-
 ```rust
-// List all orgs
-let orgs = client.list_orgs().await?;
+// List all orgs in a shard
+client.send_request(Request::ListOrgs(ListOrgsRequest { .. })).await?;
 
-// List aggregate types in an org
-let types = client.list_aggregate_types(org_id).await?;
+// List aggregate types
+client.send_request(Request::ListAggregateTypes(ListAggregateTypesRequest {
+    org_id: Some(org_id),
+    ..Default::default()
+})).await?;
 
-// List aggregates of a type (paginated)
-let aggregates = client.list_aggregates(ListAggregatesRequest {
-    org_id,
-    aggregate_type_id,
+// List aggregates with metadata (paginated)
+client.send_request(Request::ListAggregates(ListAggregatesRequest {
+    org_id: Some(org_id),
+    aggregate_type_id: Some(type_id),
     cursor: None,
     limit: 1000,
-}).await?;
+    ..Default::default()
+})).await?;
 
-// Check if an aggregate exists (without loading it)
-let exists = client.exists(aggregate_key).await?;
+// Aggregate existence and metadata
+client.send_request(Request::AggregateDetails(AggregateDetailsRequest {
+    aggregate_key,
+    ..Default::default()
+})).await?;
 ```
 
 ## Sharding
@@ -230,69 +252,57 @@ Aggregates are assigned to shards by configurable routing:
 | `AggregateTypeId` | `aggregate_type_id % num_shards` |
 | `AggregateId` | `aggregate_id % num_shards` |
 
-Clients connect to any node. Requests are redirected to the owning shard automatically.
+Clients connect to any shard. Requests are redirected to the owning shard automatically.
 
 ## Multi-Tenancy
 
-Aggregates are namespaced by `org_id`. Isolation is at the aggregate level, not the connection level.
-
-No shared state between orgs. No cross-org queries. Each org's data is completely independent.
-
-## Other Operations
-
-### Retention
-
-```rust
-client.trim_start(TrimStartRequest {
-    aggregate_key,
-    trim_to_event_batch_index: 1000, // Delete batches 0-999
-}).await?;
-```
-
-### Deletion
-
-```rust
-client.delete(DeleteRequest { aggregate_key }).await?;
-```
-
-### Metrics
-
-Prometheus endpoint at `/metrics`. Tracks:
-- Write/read throughput and latency
-- Fsync batch size and amortisation
-- Cache hit rates
-- Replication lag
-- Watcher backpressure
-
-### Backups
-
-- Copy the data directory at any time.
-- Spin up a server with the Watch API running
-- Or run a follower and snapshot it.
-
-## Client Libraries
-
-| Language | Status |
-|----------|--------|
-| Rust | Stable |
-| Go | Stable |
-| Node.js | Stable |
-| .NET | Beta |
-| Java | Beta |
+Aggregates are namespaced by `org_id`. No shared state between orgs. No cross-org queries. Each org's data is independent.
 
 ## When Not to Use Celeriant
 
-- You need ad-hoc queries over aggregate state → use a read database
-- You want server-managed consumer groups → use Kafka
-- You need transactions across arbitrary keys → use a database
-- You're not doing event sourcing → this is the wrong tool
+- You need ad-hoc queries over aggregate state — use a read database
+- You want server-managed consumer groups — use Kafka
+- You need transactions across arbitrary keys — use a relational database
+- You are not doing event sourcing — this is the wrong tool
+- You cannot tolerate an eventually consistent read model — use PostgreSQL
+
+Kafka remains a good choice when you do not need OCC and systems do not rely on shared state for their invariants.
+
+## Current State
+
+The project is approximately 80% complete. It is suitable for non-production pilot projects. Missing features:
+
+- WAL compaction
+- mTLS and OAuth
+- Schema validation for event types
+
+The plan is to release as Apache 2.0. Target: mid-2026.
+
+## Crate Structure
+
+Ordered by dependency level, from lowest to highest.
+
+| Crate | Description |
+|-------|-------------|
+| [`celeriant_wal`](celeriant_wal/README.md) | Data structures for the WAL — types and serialization only, no I/O |
+| [`celeriant_crypto`](celeriant_crypto/README.md) | Cryptographic key generation, node identity, and nonce-based client signing |
+| [`celeriant_disk`](celeriant_disk/README.md) | Low-level DMA I/O primitives using Direct I/O via glommio |
+| [`celeriant_wire`](celeriant_wire/README.md) | Serialization, compression, and wire protocol framing for network and WAL persistence |
+| [`celeriant_msg`](celeriant_msg/README.md) | Request and response message types for the Celeriant wire protocol |
+| [`celeriant_watch`](celeriant_watch/README.md) | Watch and subscription system for real-time aggregate change notifications |
+| [`celeriant_memcache`](celeriant_memcache/README.md) | In-memory caching layer: write queues, aggregate positions, client idempotency, replication visibility |
+| [`celeriant_rotating_log`](celeriant_rotating_log/README.md) | Rotating WAL log segments with LRU caching, DMA I/O, bloom filter optimization, and crash recovery |
+| [`celeriant_sidecar`](celeriant_sidecar/README.md) | Object store abstraction for S3: conditional puts, batch deletes, listing. Runs in a tokio sidecar |
+| [`celeriant_distributed`](celeriant_distributed/README.md) | Leader/follower coordination: S3 lease election, membership, heartbeat, node status state machine |
+| [`celeriant_shard`](celeriant_shard/README.md) | Shard-level WAL orchestrator: validation, durability, replication, S3 catchup, caching, read filtering |
+| [`celeriant_runtimes`](celeriant_runtimes/README.md) | Runtime orchestration: sharded glommio executors, inter-shard routing, cluster coordination, sidecar bridge |
+| [`celeriant`](celeriant/README.md) | Server executable: CLI parsing, environment validation, DIO check, executor launch |
+| [`celeriant_client_glommio`](celeriant_client_glommio/README.md) | Async TCP client for Celeriant using the glommio runtime — used internally for replication |
+| [`celeriant_client_tokio`](celeriant_client_tokio/README.md) | Async TCP client for Celeriant using the tokio runtime — for application use |
+| [`celeriant_cli`](celeriant_cli/README.md) | Command-line interface and terminal UI for interacting with the event store |
+| [`celeriant_embedded`](celeriant_embedded/README.md) | Reserved for future in-process embedded mode |
+| [`celeriant_integration_tests`](celeriant_integration_tests/README.md) | Integration tests: correctness, chaos, S3 replication, failover, edge cases, qualification suite |
 
 ## License
 
 Apache-2.0
-
-## Links
-
-- [Documentation](https://docs.celeriant.io)
-- [GitHub Discussions](https://github.com/celeriant/celeriant/discussions)
-- [Discord](https://discord.gg/celeriant)

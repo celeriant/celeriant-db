@@ -101,6 +101,28 @@ pub struct ErrorResponse {
     pub error_message: String,
 }
 
+impl ErrorResponse {
+    /// Error codes returned when a write/trim/delete is sent to a non-leader node.
+    /// The error_message JSON may contain `{"leader_address":"host:port"}`.
+    pub const WRITE_NOT_LEADER: u32 = 2011;
+    pub const TRIM_NOT_LEADER: u32 = 3005;
+    pub const DELETE_NOT_LEADER: u32 = 4006;
+
+    pub fn is_not_leader(&self) -> bool {
+        matches!(self.error_code, Self::WRITE_NOT_LEADER | Self::TRIM_NOT_LEADER | Self::DELETE_NOT_LEADER)
+    }
+
+    /// Extract leader address from error_message JSON like `{"leader_address":"host:port"}`.
+    /// Returns None if the message doesn't contain a leader address.
+    pub fn parse_leader_address(&self) -> Option<String> {
+        let key = "\"leader_address\":\"";
+        let start = self.error_message.find(key)? + key.len();
+        let rest = &self.error_message[start..];
+        let end = rest.find('"')?;
+        Some(rest[..end].to_string())
+    }
+}
+
 /// Rejection reasons when follower refuses a replication batch.
 /// These are logical errors indicating state mismatch, not network failures.
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode, PartialEq, Eq)]

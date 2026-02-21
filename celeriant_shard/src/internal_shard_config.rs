@@ -12,7 +12,6 @@ pub struct InternalShardConfig {
     pub fsync_delay: Duration,
     pub replication_delay: Duration,
     pub recent_write_cache_bytes: u64,
-    pub non_durable_writes: bool,
     pub shard_dir: PathBuf,
     pub max_response_size: u64,
     pub max_request_size: u64,

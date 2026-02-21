@@ -678,7 +678,6 @@ mod tests {
             fsync_delay: Duration::from_millis(10),
             recent_write_cache_bytes: 1024,
             routing_rule,
-            non_durable_writes: false,
             aggregate_client_snapshots_cache_bytes: 1024,
             aggregate_snapshots_cache_bytes: 1024,
             timestamp_config: celeriant_shard::timestamp_config::TimestampConfig {

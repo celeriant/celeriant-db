@@ -237,6 +237,10 @@ path = "src/p3_3_sequential_cold_reads_main.rs"
 name = "p4_1_rolling_upgrade_main"
 path = "src/p4_1_rolling_upgrade_main.rs"
 
+[[bin]]
+name = "not_leader_error_main"
+path = "src/not_leader_error_main.rs"
+
 [dependencies]
 celeriant_lib = { package = "celeriant", path = "../celeriant" }
 celeriant_client_tokio = { path = "../celeriant_client_tokio" }

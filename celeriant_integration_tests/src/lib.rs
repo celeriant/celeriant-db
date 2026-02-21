@@ -42,7 +42,6 @@ use tokio::time::sleep;
 ///     // Or with custom config
 ///     let config = ServerConfig {
 ///         num_shards: Some(4),
-///         non_durable_writes: true,
 ///         log_level: "debug".to_string(),
 ///         ..Default::default()
 ///     };
@@ -455,10 +454,6 @@ impl ServerConfigExt for ServerConfig {
 
         args.push("--fsync-delay-us".to_string());
         args.push(self.fsync_delay_us.to_string());
-
-        if self.non_durable_writes {
-            args.push("--non-durable-writes".to_string());
-        }
 
         args.push("--log-level".to_string());
         args.push(self.log_level.clone());

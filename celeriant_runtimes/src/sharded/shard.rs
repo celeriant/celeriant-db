@@ -245,6 +245,14 @@ async fn update_follower_address<R: ReplicationClient + 'static, D: S3Downloader
     broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::UpdateFollower { replication_address: address }, ctx.intrashard_sender.clone()).await;
 }
 
+async fn update_leader_client_address<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
+    ctx: &ConnectionContext<R, D, S>,
+    address: Option<String>,
+) {
+    *ctx.shard_wal.leader_client_address.borrow_mut() = address.clone();
+    broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::UpdateLeaderClientAddress { client_address: address }, ctx.intrashard_sender.clone()).await;
+}
+
 /// Renew leadership via S3 CAS when heartbeat path is unavailable.
 /// CAS-promotes the existing lease for a fresh TTL, updates node_status,
 /// and broadcasts to all local shards.
@@ -317,6 +325,13 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
         ctx.shard_wal.node_status.set(outcome.status);
         broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::StatusUpdate { status: outcome.status }, ctx.intrashard_sender.clone()).await;
 
+        let leader_addr = if outcome.status.is_any_follower_state() {
+            outcome.peer_info.as_ref().map(|p| p.client_address.clone())
+        } else {
+            None
+        };
+        update_leader_client_address(&ctx, leader_addr).await;
+
         let mut initial_peer = outcome.peer_info;
 
         loop {
@@ -367,6 +382,7 @@ async fn run_leader_loop<R: ReplicationClient + 'static, D: S3Downloader + 'stat
                     match renew_s3_lease_and_broadcast(lease_manager, ctx).await {
                         Ok(outcome) if !outcome.status.raw().is_leader() => {
                             warn!("Lost leadership during follower discovery");
+                            update_leader_client_address(ctx, outcome.peer_info.as_ref().map(|p| p.client_address.clone())).await;
                             return;
                         }
                         Ok(outcome) => {
@@ -416,6 +432,7 @@ async fn run_leader_loop<R: ReplicationClient + 'static, D: S3Downloader + 'stat
             match renew_s3_lease_and_broadcast(lease_manager, ctx).await {
                 Ok(renewal) if !renewal.status.raw().is_leader() => {
                     info!("Lost leadership after S3 CAS race");
+                    update_leader_client_address(ctx, renewal.peer_info.as_ref().map(|p| p.client_address.clone())).await;
                     return;
                 }
                 Ok(_) => {
@@ -478,10 +495,12 @@ async fn run_follower_watchdog<R: ReplicationClient + 'static, D: S3Downloader +
         match renew_s3_lease_and_broadcast(lease_manager, ctx).await {
             Ok(outcome) if outcome.status.raw().is_leader() => {
                 info!("Won S3 CAS race, becoming leader");
+                update_leader_client_address(ctx, None).await;
                 return;
             }
-            Ok(_) => {
+            Ok(outcome) => {
                 info!("Lost S3 CAS race, resuming watchdog");
+                update_leader_client_address(ctx, outcome.peer_info.as_ref().map(|p| p.client_address.clone())).await;
                 // Status already set to Follower with fresh TTL by
                 // renew_s3_lease_and_broadcast. Inner loop will sleep
                 // until the new leader's heartbeats stop.
@@ -580,6 +599,9 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
         }
         IntrashardMessages::UpdateFollower { replication_address } => {
             ctx.shard_wal.replication_client.set_follower_address(replication_address);
+        }
+        IntrashardMessages::UpdateLeaderClientAddress { client_address } => {
+            *ctx.shard_wal.leader_client_address.borrow_mut() = client_address;
         }
     }
 }

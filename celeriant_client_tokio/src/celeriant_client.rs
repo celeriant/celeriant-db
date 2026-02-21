@@ -94,7 +94,7 @@ impl CeleriantClient {
 
             match response {
                 Response::ProtocolError(_) => return Err(ClientError::ProtocolError),
-                Response::GenericError(error) => return Err(ClientError::CeleriantError(error)),
+                Response::GenericError(error) => return Err(ClientError::from_error_response(error)),
                 _ => {}
             }
 

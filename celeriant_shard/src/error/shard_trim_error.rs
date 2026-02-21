@@ -7,7 +7,7 @@ pub enum ShardTrimError {
     ReplicationError(ReplicationError),
     ShardFsyncError(ShardFsyncError),
     TrimIndexOutOfRange { requested: u64, max_event_batch_index: u64 },
-    ShardCannotAcceptWrites,
+    ShardCannotAcceptWrites { leader_address: Option<String> },
 }
 
 impl From<ShardFsyncError> for ShardTrimError {

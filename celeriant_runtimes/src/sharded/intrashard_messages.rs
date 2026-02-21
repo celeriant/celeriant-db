@@ -21,4 +21,5 @@ pub enum IntrashardMessages {
     },
     StatusUpdate { status: ValidatedNodeStatus },
     UpdateFollower { replication_address: Option<String> },
+    UpdateLeaderClientAddress { client_address: Option<String> },
 }

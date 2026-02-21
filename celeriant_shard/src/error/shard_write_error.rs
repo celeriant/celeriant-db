@@ -39,7 +39,7 @@ pub enum ShardWriteError {
     CacheAggregateClientError(ShardCacheLoadError),
 
     AggregateExistsAndCacheError(ShardCacheLoadError),
-    ShardCannotAcceptWrites,
+    ShardCannotAcceptWrites { leader_address: Option<String> },
 }
 
 impl From<ShardFsyncError> for ShardWriteError {

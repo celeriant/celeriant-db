@@ -48,7 +48,6 @@ fn test_config() -> InternalShardConfig {
         shard_log_preallocate_bytes: 1024 * 1024 * 1024,
         fsync_delay: Duration::from_millis(5),
         recent_write_cache_bytes: 10000,
-        non_durable_writes: false,
         shard_dir: PathBuf::from("/tmp/test_shard"),
         max_response_size: 10 * 1024 * 1024,
         ..Default::default()

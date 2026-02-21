@@ -16,6 +16,7 @@ TESTS=(
   s3_election_main
   s3_follower_crash_main
   s3_leader_solo_main
+  not_leader_error_main
   # --- Follower-side failover (watchdog) ---
   s3_failover_main
   s3_stale_lease_main

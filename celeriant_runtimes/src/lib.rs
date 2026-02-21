@@ -57,7 +57,6 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                 s3_download_max_rounds: shard_config.s3_download_max_rounds,
                 fsync_delay: shard_config.fsync_delay,
                 replication_delay: shard_config.replication_delay,
-                non_durable_writes: shard_config.non_durable_writes, 
                 shard_dir,
                 max_open_files: shard_config.max_open_files,
                 recent_write_cache_bytes: shard_config.recent_write_cache_bytes,

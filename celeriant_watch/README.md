@@ -7,7 +7,7 @@ Watch/subscription system for real-time aggregate change notifications. Handles 
 ```
 ShardWriteAheadLog                    WatchSession (per client)
        │                                      │
-       │ broadcast(AggregateWatchEvent)       │
+       │ notify_watchers(HashMap<...>)        │
        ▼                                      │
 ┌───────────────────┐                         │
 │ AggregateWatchers │                         │
@@ -25,7 +25,7 @@ ShardWriteAheadLog                    WatchSession (per client)
                                         (to TCP client)
 ```
 
-**Hot path**: WAL write → broadcast → filter → try_send (non-blocking)  
+**Hot path**: WAL write → notify_watchers → broadcast → filter → try_send (non-blocking)
 **Cold path**: Client accumulates events → waits for latency → flushes response
 
 ## Key Types
@@ -37,6 +37,7 @@ ShardWriteAheadLog                    WatchSession (per client)
 | `SubscribedClient` | Event accumulator with latency-based batching |
 | `WatchSession` | Async session loop coordinating receive/flush/heartbeat |
 | `AggregateWatchEvent` | Internal event with aggregate key + operation |
+| `AggregateWatchEventOperation` | Enum of operation variants (Write, Read, Delete, TrimStart, AggregateDetails, Create) |
 | `WatchOutputType` | Session output: Response, Heartbeat, Done, Continue |
 
 ## Key Functions
@@ -44,7 +45,8 @@ ShardWriteAheadLog                    WatchSession (per client)
 | Function | Purpose |
 |----------|---------|
 | `AggregateWatchers::add_subscriber` | Register new watcher, returns (id, client) |
-| `AggregateWatchers::broadcast` | Fan-out event to all matching subscribers |
+| `AggregateWatchers::notify_watchers` | Primary WAL entry point: fan-out a batch of keyed operations |
+| `AggregateWatchers::broadcast` | Fan-out a single event to all matching subscribers |
 | `WatcherHandle::notify_of_event` | Filter check + try_send to channel |
 | `SubscribedClient::accumulate_watch_event` | Merge event into pending response |
 | `WatchSession::next` | Async poll: receive events or timeout for flush/heartbeat |
@@ -71,25 +73,29 @@ Reduces network overhead for high-frequency writes.
 
 ```rust
 pub struct WatcherHandle {
+    pub id: u64,
+    pub local_sender_channel: LocalSender<AggregateWatchEvent>,
     pub orgs: Option<HashSet<u128>>,
-    pub aggregate_types: Option<HashSet<AggregateTypeKey>>,
-    pub aggregates: Option<HashSet<AggregateKey>>,
+    pub aggregate_types: Option<HashSet<u128>>,
+    pub aggregates: Option<HashSet<u128>>,
     pub operation_types: Option<HashSet<u8>>,
 }
 ```
 
-`None` = match all. Filters are OR'd: matches if any filter matches. Operation type filter applied first (cheapest check).
+`None` = match all. Filters are AND'd across categories: all non-None filters must match. Within a set, matching is OR (any element). Operation type filter applied first (cheapest check). Filter values for `aggregate_types` and `aggregates` are raw `u128` IDs, not typed key structs.
 
 ### Event merging
 
-Multiple operations on same aggregate get merged in `WatchResponse`:
+Multiple operations on the same aggregate are merged in `WatchResponse`. The map key is `(AggregateKey, operation_u8)`:
 
 | Operation | Merge Strategy |
 |-----------|---------------|
 | Write | Extend batch index range (min from, max to) |
-| Read | Extend batch index range |
+| Read | Extend batch index range (None to treated as open-ended) |
 | TrimStart | Replace (destructive, latest wins) |
-| Delete/Exists | Deduplicate (no payload) |
+| Delete | Deduplicate (no payload, stored as None) |
+| AggregateDetails | Deduplicate (no payload, stored as None) |
+| Create | Deduplicate (no payload, stored as None) |
 
 ### Operation type constants
 
@@ -100,6 +106,7 @@ impl AggregateWatchEvent {
     pub const READ: u8 = 2;
     pub const TRIM_START: u8 = 3;
     pub const DETAILS: u8 = 4;
+    pub const CREATE: u8 = 5;
 }
 ```
 
@@ -144,5 +151,5 @@ Abstraction allowing `WatchSession` to work with any WAL implementation. Impleme
 
 - `celeriant_msg` - WatchRequest/WatchResponse message types
 - `celeriant_wal` - AggregateKey, event batch types
-- `celeriant_wire` - Wire format errors
+- `celeriant_wire` - Wire format errors (CodecError used in WatchReadError)
 - `glommio` - Async runtime, local channels, timers

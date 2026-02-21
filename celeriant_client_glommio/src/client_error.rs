@@ -9,7 +9,19 @@ pub enum ClientError {
     SetNoDelayError(glommio::GlommioError<()>),
     RequestTimeout,
     RequestProtocolError,
+    NotLeader { leader_address: Option<String>, error: ErrorResponse },
     CeleriantError(ErrorResponse),
     WriteRequestError(WireError),
     ReadResponseError(ReadWireDataError),
+}
+
+impl ClientError {
+    pub(crate) fn from_error_response(error: ErrorResponse) -> Self {
+        if error.is_not_leader() {
+            let leader_address = error.parse_leader_address();
+            ClientError::NotLeader { leader_address, error }
+        } else {
+            ClientError::CeleriantError(error)
+        }
+    }
 }

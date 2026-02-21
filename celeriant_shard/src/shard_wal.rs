@@ -117,6 +117,10 @@ pub struct ShardWal<R: ReplicationClient + 'static, D: S3Downloader + 'static> {
     /// Client for replicating data to followers or S3.
     /// Interior mutability — FollowerConnection manages its own split locks.
     pub replication_client: Rc<R>,
+
+    /// Leader's client-facing address, set when this node is a follower.
+    /// Included in write-rejection errors so clients can redirect.
+    pub leader_client_address: RefCell<Option<String>>,
 }
 
 impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> AggregateReader for ShardWal<R, D> {
@@ -209,6 +213,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             aggregate_loading: LoadingCoordinator::new(),
             aggregate_client_loading: LoadingCoordinator::new(),
             replication_client: Rc::new(replication_client),
+            leader_client_address: RefCell::new(None),
         })
     }
 
@@ -711,7 +716,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let lease_index = match self.node_status.get().effective() {
             NodeStatus::Leader { lease_index } => lease_index,
             NodeStatus::Standalone => 0,
-            _ => return Err(ShardTrimError::ShardCannotAcceptWrites),
+            _ => return Err(ShardTrimError::ShardCannotAcceptWrites { leader_address: self.leader_client_address.borrow().clone() }),
         };
 
         let aggregate_key = &trim_request.aggregate_key;
@@ -791,7 +796,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let lease_index = match self.node_status.get().effective() {
             NodeStatus::Leader { lease_index } => lease_index,
             NodeStatus::Standalone => 0,
-            _ => return Err(ShardDeleteError::ShardCannotAcceptWrites),
+            _ => return Err(ShardDeleteError::ShardCannotAcceptWrites { leader_address: self.leader_client_address.borrow().clone() }),
         };
 
         // Make sure we have at least one aggregate to write
@@ -895,7 +900,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             NodeStatus::Standalone => 0,
             other => {
                 warn!(effective = ?other, raw = ?status.raw(), expires_at_ms = status.expires_at_ms(), now_ms = celeriant_distributed::heartbeat::now_ms(), "Write rejected: not Leader/Standalone");
-                return Err(ShardWriteError::ShardCannotAcceptWrites);
+                return Err(ShardWriteError::ShardCannotAcceptWrites { leader_address: self.leader_client_address.borrow().clone() });
             }
         };
 
@@ -1396,39 +1401,14 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         // We already pass lease status checks so can use raw()
         let node_status = self.node_status.get().raw();
 
-        if rotating_log_cache.force_immediate.get() {
-            let mc_capture = shard_mem_cache.clone();
-            self.fsync_coordinator
-                .request_sync_two_phase(
-                    None,
-                    move || async move { capture_fsync_snapshot(&mc_capture) },
-                    move |captured| commit_fsync_with_rollback(node_status, rotating_log_cache, shard_mem_cache, watched_aggregates, captured),
-                )
-                .await
-        } else if !self.config.non_durable_writes {
-            let mc_capture = shard_mem_cache.clone();
-            self.fsync_coordinator
-                .request_sync_two_phase(
-                    Some(self.config.fsync_delay),
-                    move || async move { capture_fsync_snapshot(&mc_capture) },
-                    move |captured| commit_fsync_with_rollback(node_status, rotating_log_cache, shard_mem_cache, watched_aggregates, captured),
-                )
-                .await
-        } else {
-            let fsync_coordinator = self.fsync_coordinator.clone();
-            glommio::spawn_local(async move {
-                let mc_capture = shard_mem_cache.clone();
-                let _ = fsync_coordinator
-                    .request_sync_two_phase(
-                        None,
-                        move || async move { capture_fsync_snapshot(&mc_capture) },
-                        move |captured| commit_fsync_with_rollback(node_status, rotating_log_cache, shard_mem_cache, watched_aggregates, captured),
-                    )
-                    .await;
-            })
-            .detach();
-            Ok(())
-        }
+        let mc_capture = shard_mem_cache.clone();
+        self.fsync_coordinator
+            .request_sync_two_phase(
+                Some(self.config.fsync_delay),
+                move || async move { capture_fsync_snapshot(&mc_capture) },
+                move |captured| commit_fsync_with_rollback(node_status, rotating_log_cache, shard_mem_cache, watched_aggregates, captured),
+            )
+            .await
     }
 
     async fn replicate_durable(&self) -> Result<(), ReplicationError> {
@@ -1446,39 +1426,14 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             return Ok(());
         }
 
-        if rotating_log_cache.force_immediate.get() {
-            let mc_capture = shard_mem_cache.clone();
-            self.replication_coordinator
-                .request_sync_two_phase(
-                    None,
-                    move || async move { capture_replication_snapshot(&mc_capture) },
-                    move |captured| commit_replication_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates, captured, max_catchup_gap_bytes, max_request_size, max_s3_fallback_batch_bytes, read_max_chunk_size),
-                )
-                .await
-        } else if !self.config.non_durable_writes {
-            let mc_capture = shard_mem_cache.clone();
-            self.replication_coordinator
-                .request_sync_two_phase(
-                    Some(self.config.replication_delay),
-                    move || async move { capture_replication_snapshot(&mc_capture) },
-                    move |captured| commit_replication_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates, captured, max_catchup_gap_bytes, max_request_size, max_s3_fallback_batch_bytes, read_max_chunk_size),
-                )
-                .await
-        } else {
-            let replication_coordinator = self.replication_coordinator.clone();
-            glommio::spawn_local(async move {
-                let mc_capture = shard_mem_cache.clone();
-                let _ = replication_coordinator
-                    .request_sync_two_phase(
-                        None,
-                        move || async move { capture_replication_snapshot(&mc_capture) },
-                        move |captured| commit_replication_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates, captured, max_catchup_gap_bytes, max_request_size, max_s3_fallback_batch_bytes, read_max_chunk_size),
-                    )
-                    .await;
-            })
-            .detach();
-            Ok(())
-        }
+        let mc_capture = shard_mem_cache.clone();
+        self.replication_coordinator
+            .request_sync_two_phase(
+                Some(self.config.replication_delay),
+                move || async move { capture_replication_snapshot(&mc_capture) },
+                move |captured| commit_replication_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates, captured, max_catchup_gap_bytes, max_request_size, max_s3_fallback_batch_bytes, read_max_chunk_size),
+            )
+            .await
     }
     
     async fn handle_replication_batch(
@@ -1866,7 +1821,6 @@ mod tests {
             fsync_delay: Duration::ZERO,
             replication_delay: Duration::ZERO,
             recent_write_cache_bytes: 64 * 1024 * 1024,
-            non_durable_writes: false,
             shard_dir: dir.to_path_buf(),
             max_response_size: 16 * 1024 * 1024,
             max_request_size: 16 * 1024 * 1024,
@@ -2204,7 +2158,7 @@ mod tests {
             shard.node_status.set(ValidatedNodeStatus::fenced());
 
             let result = process(&shard, write_req(key(1, 1, 1), events(1))).await;
-            assert!(matches!(result, Err(ShardError::Write(ShardWriteError::ShardCannotAcceptWrites))));
+            assert!(matches!(result, Err(ShardError::Write(ShardWriteError::ShardCannotAcceptWrites { .. }))));
 
             shard.close().await;
         });

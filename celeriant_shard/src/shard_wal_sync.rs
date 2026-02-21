@@ -88,7 +88,7 @@ pub(crate) async fn commit_fsync_with_rollback(
             Ok(())
         }
         Err(e) => {
-            rollback_sync(shard_mem_cache, &log_segments_cache);
+            rollback_sync(shard_mem_cache);
             Err(e)
         }
     }
@@ -215,10 +215,8 @@ fn commit_sync(
     }
 }
 
-/// Rolls back a failed sync by restoring queue positions and forcing immediate rotation.
-fn rollback_sync(shard_mem_cache: Rc<RefCell<ShardMemCache>>, log_segments_cache: &Rc<LogSegmentsCache>) {
+fn rollback_sync(shard_mem_cache: Rc<RefCell<ShardMemCache>>) {
     shard_mem_cache.borrow_mut().execute_fsync_rollback();
-    log_segments_cache.force_immediate.set(true);
 }
 
 /// Writes pending queue items to disk.

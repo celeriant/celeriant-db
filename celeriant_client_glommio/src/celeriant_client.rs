@@ -126,7 +126,7 @@ impl CeleriantClient {
 
         match response {
             Response::ProtocolError(_) => Err(ClientError::RequestProtocolError),
-            Response::GenericError(error) => Err(ClientError::CeleriantError(error)),
+            Response::GenericError(error) => Err(ClientError::from_error_response(error)),
             _ => Ok(response),
         }
     }

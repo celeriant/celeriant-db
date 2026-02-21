@@ -60,7 +60,6 @@ let server = TestServer::start().await?;
 // Or customize
 let config = ServerConfig {
     num_shards: Some(4),
-    non_durable_writes: true,
     log_level: "debug".to_string(),
     ..Default::default()
 };

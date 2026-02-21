@@ -15,7 +15,7 @@ Object store abstraction for S3 operations. Provides a trait-based interface for
 │  ┌────────────────────────────────────────────────────────────┐ │
 │  │                    SidecarStore                            │ │
 │  │  ┌──────────────────────────────────────────────────────┐  │ │
-│  │  │                    S3Client                          │  │ │
+│  │  │              S3Client (private)                      │  │ │
 │  │  │  • Subfolder prefix resolution                       │  │ │
 │  │  │  • Conditional puts (create, etag match)             │  │ │
 │  │  │  • Batch delete streaming                            │  │ │
@@ -27,6 +27,8 @@ Object store abstraction for S3 operations. Provides a trait-based interface for
 │                  object_store (AmazonS3)                        │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+`S3Client` is a private struct. All S3 interaction is encapsulated within `SidecarStore`; callers only see `SidecarStoreTrait`.
 
 ## Key Types
 
@@ -86,11 +88,13 @@ enum Response {
 
 ### Conditional puts
 
-| Condition | S3 Mode | Use Case |
-|-----------|---------|----------|
-| `None` | Overwrite | Unconditional write |
-| `CreateOnly` | Create | Fail if exists (leases) |
-| `IfMatchETag(etag)` | Update | Optimistic concurrency |
+`PutCondition` maps directly to `object_store::PutMode`:
+
+| Condition | object_store PutMode | Use Case |
+|-----------|---------------------|----------|
+| `None` | `PutMode::Overwrite` | Unconditional write |
+| `CreateOnly` | `PutMode::Create` | Fail if exists (leases) |
+| `IfMatchETag(etag)` | `PutMode::Update(UpdateVersion { e_tag })` | Optimistic concurrency |
 
 ### Subfolder prefix
 
@@ -108,7 +112,7 @@ Uses `object_store::delete_stream` for efficient bulk deletes. Non-fatal failure
 
 ### Error mapping
 
-`object_store::Error` variants mapped to domain-specific `StoreError`:
+`StoreError` implements `From<object_store::Error>` and `From<object_store::path::Error>` for ergonomic `?` propagation throughout store operations:
 
 | object_store | StoreError |
 |--------------|------------|
@@ -116,7 +120,15 @@ Uses `object_store::delete_stream` for efficient bulk deletes. Non-fatal failure
 | `AlreadyExists` | `AlreadyExists { path }` |
 | `Precondition` | `PreconditionFailed { path }` |
 | `InvalidPath` | `InvalidPath { path }` |
+| `path::Error` | `InvalidPath { path }` |
 | Other | `S3Error { message }` |
+
+### Debug impls
+
+Both `Request` and `SidecarStore` have custom `Debug` implementations:
+
+- `Request::ObjectPut` redacts the `data` field and emits `data_len` (byte count) instead, preventing large payloads from flooding logs.
+- `SidecarStore` emits `s3_configured: bool` instead of the full internal struct, hiding credentials from debug output.
 
 ### Optional S3
 

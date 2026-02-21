@@ -63,7 +63,6 @@ fn create_config(shard_dir: PathBuf) -> InternalShardConfig {
         fsync_delay: FSYNC_DELAY,
         replication_delay: Duration::from_millis(17),
         recent_write_cache_bytes: 64 * 1024 * 1024,
-        non_durable_writes: false,
         shard_dir,
         max_response_size: 16 * 1024 * 1024,
         max_request_size: 16 * 1024 * 1024,

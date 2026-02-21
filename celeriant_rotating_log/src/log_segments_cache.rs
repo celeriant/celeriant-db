@@ -12,8 +12,6 @@ pub struct LogSegmentsCache {
     /// to the LRU cache.
     active_file: RefCell<Rc<LogSegmentFile>>,
 
-    pub force_immediate: Cell<bool>,
-
     /// Cache of every open dma file other than the active log file.
     lru_cache: RefCell<LruCache<u64, Rc<LogSegmentFile>>>,
 
@@ -149,7 +147,6 @@ impl LogSegmentsCache {
             lru_cache: RefCell::new(LruCache::new(cache_cap)),
             shard_dir,
             preallocate_bytes,
-            force_immediate: Cell::new(false),
         })
     }
 

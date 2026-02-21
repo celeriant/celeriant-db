@@ -51,7 +51,7 @@ const TRIM_CACHE_ERROR: u32 = 3001;
 const TRIM_REPLICATION_ERROR: u32 = 3002;
 const TRIM_FSYNC_ERROR: u32 = 3003;
 const TRIM_INDEX_OUT_OF_RANGE: u32 = 3004;
-const TRIM_INVALID_LEASE_INDEX: u32 = 3005;
+const TRIM_CANNOT_ACCEPT_WRITES: u32 = 3005;
 
 // Delete errors: 4xxx
 const DELETE_AGGREGATE_NOT_EXISTS: u32 = 4000;
@@ -60,7 +60,7 @@ const DELETE_OPTIMISTIC_CONCURRENCY_VIOLATION: u32 = 4002;
 const DELETE_CACHE_ERROR: u32 = 4003;
 const DELETE_REPLICATION_ERROR: u32 = 4004;
 const DELETE_FSYNC_ERROR: u32 = 4005;
-const DELETE_INVALID_LEASE_INDEX: u32 = 4006;
+const DELETE_CANNOT_ACCEPT_WRITES: u32 = 4006;
 
 // Listing errors: 5xxx
 const LIST_ORGS_DISK_READ: u32 = 5000;
@@ -161,7 +161,7 @@ fn write_error(e: ShardWriteError) -> (u32, String) {
         ShardWriteError::ShardFsyncError(e) => (WRITE_FSYNC_ERROR, fsync_message(e)),
         ShardWriteError::CacheAggregateClientError(e) => cache_load_error(WRITE_CACHE_AGGREGATE_CLIENT_ERROR, WRITE_CACHE_AGGREGATE_CLIENT_ERROR, e),
         ShardWriteError::AggregateExistsAndCacheError(e) => cache_load_error(WRITE_AGGREGATE_EXISTS_CACHE_ERROR, WRITE_AGGREGATE_EXISTS_CACHE_ERROR, e),
-        ShardWriteError::ShardCannotAcceptWrites => (WRITE_CANNOT_ACCEPT_WRITES, "{}".into()),
+        ShardWriteError::ShardCannotAcceptWrites { leader_address } => (WRITE_CANNOT_ACCEPT_WRITES, cannot_accept_writes_message(leader_address)),
     }
 }
 
@@ -175,7 +175,7 @@ fn trim_error(e: ShardTrimError) -> (u32, String) {
             TRIM_INDEX_OUT_OF_RANGE,
             format!(r#"{{"requested":{},"max_event_batch_index":{}}}"#, requested, max_event_batch_index),
         ),
-        ShardTrimError::ShardCannotAcceptWrites => (TRIM_INVALID_LEASE_INDEX, "{}".into()),
+        ShardTrimError::ShardCannotAcceptWrites { leader_address } => (TRIM_CANNOT_ACCEPT_WRITES, cannot_accept_writes_message(leader_address)),
     }
 }
 
@@ -190,7 +190,7 @@ fn delete_error(e: ShardDeleteError) -> (u32, String) {
         ShardDeleteError::AggregateExistsAndCacheError(e) => cache_load_error(DELETE_CACHE_ERROR, DELETE_CACHE_ERROR, e),
         ShardDeleteError::ReplicationError(e) => (DELETE_REPLICATION_ERROR, replication_message(e)),
         ShardDeleteError::ShardFsyncError(e) => (DELETE_FSYNC_ERROR, fsync_message(e)),
-        ShardDeleteError::ShardCannotAcceptWrites => (DELETE_INVALID_LEASE_INDEX, "{}".into()),
+        ShardDeleteError::ShardCannotAcceptWrites { leader_address } => (DELETE_CANNOT_ACCEPT_WRITES, cannot_accept_writes_message(leader_address)),
     }
 }
 
@@ -287,6 +287,13 @@ fn fetch_datablock_message(e: FetchDatablockError) -> String {
         FetchDatablockError::LogSegmentFileUnavailable { log_id } => format!(r#"{{"log_id":{}}}"#, log_id),
         FetchDatablockError::DatablockReadError(msg) => format!(r#"{{"detail":{}}}"#, json_string(&msg)),
         FetchDatablockError::MissingDatablocksOnDisk => "{}".into(),
+    }
+}
+
+fn cannot_accept_writes_message(leader_address: Option<String>) -> String {
+    match leader_address {
+        Some(addr) => format!(r#"{{"leader_address":{}}}"#, json_string(&addr)),
+        None => "{}".into(),
     }
 }
 
@@ -483,6 +490,75 @@ mod tests {
             Response::GenericError(e) => {
                 assert_eq!(e.error_code, CATCHUP_REQUEST_INVALID);
                 assert_eq!(e.error_message, "{}");
+            }
+            _ => panic!("expected GenericError"),
+        }
+    }
+
+    #[test]
+    fn write_cannot_accept_writes_with_leader_address() {
+        let resp = shard_error_to_response(
+            Some(1),
+            ShardError::Write(ShardWriteError::ShardCannotAcceptWrites {
+                leader_address: Some("10.0.0.1:9000".into()),
+            }),
+        );
+        match resp {
+            Response::GenericError(e) => {
+                assert_eq!(e.error_code, WRITE_CANNOT_ACCEPT_WRITES);
+                assert_eq!(e.error_message, r#"{"leader_address":"10.0.0.1:9000"}"#);
+                assert_eq!(e.correlation_id, Some(1));
+            }
+            _ => panic!("expected GenericError"),
+        }
+    }
+
+    #[test]
+    fn write_cannot_accept_writes_without_leader_address() {
+        let resp = shard_error_to_response(
+            None,
+            ShardError::Write(ShardWriteError::ShardCannotAcceptWrites {
+                leader_address: None,
+            }),
+        );
+        match resp {
+            Response::GenericError(e) => {
+                assert_eq!(e.error_code, WRITE_CANNOT_ACCEPT_WRITES);
+                assert_eq!(e.error_message, "{}");
+            }
+            _ => panic!("expected GenericError"),
+        }
+    }
+
+    #[test]
+    fn delete_cannot_accept_writes_with_leader_address() {
+        let resp = shard_error_to_response(
+            None,
+            ShardError::Delete(ShardDeleteError::ShardCannotAcceptWrites {
+                leader_address: Some("10.0.0.2:9000".into()),
+            }),
+        );
+        match resp {
+            Response::GenericError(e) => {
+                assert_eq!(e.error_code, DELETE_CANNOT_ACCEPT_WRITES);
+                assert_eq!(e.error_message, r#"{"leader_address":"10.0.0.2:9000"}"#);
+            }
+            _ => panic!("expected GenericError"),
+        }
+    }
+
+    #[test]
+    fn trim_cannot_accept_writes_with_leader_address() {
+        let resp = shard_error_to_response(
+            None,
+            ShardError::TrimStart(ShardTrimError::ShardCannotAcceptWrites {
+                leader_address: Some("10.0.0.3:9000".into()),
+            }),
+        );
+        match resp {
+            Response::GenericError(e) => {
+                assert_eq!(e.error_code, TRIM_CANNOT_ACCEPT_WRITES);
+                assert_eq!(e.error_message, r#"{"leader_address":"10.0.0.3:9000"}"#);
             }
             _ => panic!("expected GenericError"),
         }

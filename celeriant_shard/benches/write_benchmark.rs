@@ -84,7 +84,6 @@ fn create_config(
         fsync_delay,
         replication_delay: Duration::from_millis(17),
         recent_write_cache_bytes,
-        non_durable_writes: false,
         shard_dir,
         max_response_size: 16 * 1024 * 1024,
         max_request_size: 16 * 1024 * 1024,

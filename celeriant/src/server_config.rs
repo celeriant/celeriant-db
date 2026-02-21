@@ -251,14 +251,6 @@ pub struct ServerConfig {
 
     #[arg(
         long,
-        action = clap::ArgAction::SetTrue,
-        env = "CELERIANT_NON_DURABLE_WRITES",
-        help = "Acknowledge writes to client before persisting to disk",
-    )]
-    pub non_durable_writes: bool,
-
-    #[arg(
-        long,
         default_value = "info",
         env = "CELERIANT_LOG_LEVEL",
         help = "Log level (trace, debug, info, warn, error)"
@@ -431,7 +423,6 @@ impl ServerConfig {
             fsync_delay: Duration::from_micros(self.fsync_delay_us),
             replication_delay: Duration::from_micros(self.replication_delay_us),
             routing_rule: self.routing_rule,
-            non_durable_writes: self.non_durable_writes,
             aggregate_client_snapshots_cache_bytes: self.aggregate_client_snapshots_cache_bytes,
             aggregate_snapshots_cache_bytes: self.aggregate_snapshots_cache_bytes,
             timestamp_config: TimestampConfig {
@@ -513,7 +504,6 @@ impl ServerConfig {
         check_field!(server_compression_level);
         check_field!(fsync_delay_us);
         check_field!(replication_delay_us);
-        check_field!(non_durable_writes);
         check_field!(log_level);
         check_field!(s3_enabled);
         check_field!(s3_region);
@@ -573,7 +563,6 @@ impl Default for ServerConfig {
             shard_log_preallocate_bytes: 1024 * 1024 * 1024,
             fsync_delay_us: 17000,
             replication_delay_us: 17000,
-            non_durable_writes: false,
             recent_write_cache_bytes: 512 * 1024 * 1024,
             client_connection_timeout_ms: 30000,
             routing_rule: RoutingRule::AggregateId,
