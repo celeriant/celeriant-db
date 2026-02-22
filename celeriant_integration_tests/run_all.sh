@@ -55,6 +55,7 @@ TESTS=(
   # --- WAL tip hash divergence (#2, #3) ---
   edge_wal_tip_hash_divergence_main
   edge_wal_divergence_recovery_main
+  edge_leader_crash_divergent_wal_main
   # --- Pilot Phase 1: Correctness ---
   p1_1_dcb_rollback_main
   p1_2_concurrent_dcb_main

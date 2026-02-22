@@ -182,6 +182,10 @@ name = "edge_wal_divergence_recovery_main"
 path = "src/edge_wal_divergence_recovery_main.rs"
 
 [[bin]]
+name = "edge_leader_crash_divergent_wal_main"
+path = "src/edge_leader_crash_divergent_wal_main.rs"
+
+[[bin]]
 name = "p1_1_dcb_rollback_main"
 path = "src/p1_1_dcb_rollback_main.rs"
 

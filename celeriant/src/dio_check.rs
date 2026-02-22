@@ -21,6 +21,26 @@ pub fn verify_direct_io(data_root: &Path) -> Result<(), String> {
     result
 }
 
+fn verify_min_alignment(fd: std::os::unix::io::RawFd) -> Result<(), String> {
+    const ALIGN: usize = 512;
+    let layout = std::alloc::Layout::from_size_align(ALIGN, ALIGN).unwrap();
+    let aligned_ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+    if aligned_ptr.is_null() {
+        return Err("Failed to allocate 512-byte aligned buffer".to_string());
+    }
+    let ret = unsafe { libc::pwrite(fd, aligned_ptr as *const libc::c_void, ALIGN, 0) };
+    unsafe { std::alloc::dealloc(aligned_ptr, layout) };
+    if ret < 0 {
+        let err = Error::last_os_error();
+        return Err(format!(
+            "512-byte aligned Direct I/O write failed: {}. \
+             This filesystem requires alignment larger than 512 bytes.",
+            err
+        ));
+    }
+    Ok(())
+}
+
 fn perform_dio_check(test_file: &Path) -> Result<(), String> {
     // Open file with O_DIRECT
     let file = OpenOptions::new()
@@ -48,13 +68,11 @@ fn perform_dio_check(test_file: &Path) -> Result<(), String> {
         )
     };
 
-    //TODO: Check alignment min size is 512 bytes
-
     if ret < 0 {
         let err = Error::last_os_error();
         if err.kind() == ErrorKind::InvalidInput {
-            // EINVAL means O_DIRECT is properly enforced
-            return Ok(());
+            // EINVAL means O_DIRECT is properly enforced, now verify 512-byte alignment works
+            return verify_min_alignment(fd);
         }
         return Err(format!("Unexpected error during Direct I/O check: {}", err));
     }

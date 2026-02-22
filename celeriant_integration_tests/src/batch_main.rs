@@ -1,17 +1,25 @@
-//! Batch Write Performance Test
+//! Batch Write Performance Benchmark
 //!
-//! Stress tests write throughput with many concurrent connections.
-//! Creates a temporary data directory and spawns the server automatically.
+//! Benchmarks write throughput and latency in standalone and replicated modes.
+//! Starts servers automatically with temporary data directories.
 //!
-//! Run with: cargo run --bin batch_main
+//! Default mode runs 4 scenarios:
+//!   1. Standalone  — throughput  (24k connections)
+//!   2. Standalone  — latency    (1k connections)
+//!   3. Replicated  — throughput  (24k connections)
+//!   4. Replicated  — latency    (1k connections)
 //!
-//! Set SWEEP_MODE=1 to run connection count sweep for optimal throughput discovery.
+//! Fails with non-zero exit if performance drops below minimum thresholds.
+//!
+//! Environment variables:
+//!   SWEEP_MODE=1           — connection count sweep for throughput discovery
+//!   SWEEP_REPLICATED=1     — use replicated mode for sweep (default: standalone)
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use celeriant_integration_tests::{count_events, MinioContainer, ServerConfig, TestServer};
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
+use celeriant_integration_tests::{count_events, MinioContainer, ServerConfig, TestServer};
 use celeriant_msg::request::requests::WriteRequest;
 use celeriant_msg::{process_requests::Request, request::requests::SingleAggregateWrite};
 use celeriant_wal::{
@@ -21,24 +29,36 @@ use celeriant_wal::{
 use tokio::sync::Barrier;
 use tokio::time::Instant;
 
-const DEFAULT_NUM_CONNECTIONS: usize = 24000; // 28k max source port limit ~25000;
+const THROUGHPUT_CONNECTIONS: usize = 24000;
+const LATENCY_CONNECTIONS: usize = 1000;
 const TEST_DURATION_SECS: u64 = 15;
 const NUM_AGGREGATES: usize = 1024;
 const USE_MICRO_PAYLOAD: bool = true;
 const CLIENTSIDE_TIMEOUT_S: u64 = 5;
 
-/// Enable replicated mode: spins up a leader and follower, benchmarks writes to leader
-const REPLICATED_MODE: bool = true;
+// Performance thresholds — 15% regression from README numbers is an immediate fail.
+//
+// README reference (32-core, NVMe PCIe5):
+//   Standalone  25k conn: 350k writes/s, avg 68ms, p99 170ms
+//   Replicated  25k conn: 190k writes/s, avg 125ms, p99 272ms
+//   Standalone   1k conn:  50k writes/s, avg 20ms, p99 27ms
+//   Replicated   1k conn:  15k writes/s, avg 63ms, p99 88ms
+const STANDALONE_THROUGHPUT_MIN: f64 = 297_500.0; // 350k * 0.85
+const REPLICATED_THROUGHPUT_MIN: f64 = 161_500.0; // 190k * 0.85
+const STANDALONE_LATENCY_AVG_MAX_MS: f64 = 23.0; // 20ms * 1.15
+const STANDALONE_LATENCY_P99_MAX_MS: u64 = 31; // 27ms * 1.15
+const REPLICATED_LATENCY_AVG_MAX_MS: f64 = 72.5; // 63ms * 1.15
+const REPLICATED_LATENCY_P99_MAX_MS: u64 = 101; // 88ms * 1.15
 
-// Connection counts to sweep through when SWEEP_MODE is enabled
-const CONNECTION_SWEEP: &[usize] = &[512, 1024, 2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384];
+const CONNECTION_SWEEP: &[usize] = &[
+    512, 1024, 2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384,
+];
 
 struct TaskStats {
     request_count: u64,
     latencies_us: Vec<u64>,
 }
 
-/// Holds both leader and follower servers for replicated mode
 struct ReplicatedServers {
     leader: TestServer,
     follower: TestServer,
@@ -48,13 +68,12 @@ struct ReplicatedServers {
 impl ReplicatedServers {
     async fn start(base_port: u16, log_level: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let minio_port = base_port + 10;
-
         println!("Starting MinIO on port {}...", minio_port);
         let minio = MinioContainer::start_with_bucket(minio_port, "test-batch").await?;
-        let (region, bucket, access_key, secret_key, endpoint, allow_http) = minio.s3_config_fields();
+        let (region, bucket, access_key, secret_key, endpoint, allow_http) =
+            minio.s3_config_fields();
         println!("MinIO ready at {}\n", endpoint);
 
-        // Start leader first so it wins the S3 lease election (CreateOnly — first come first served)
         let leader_config = ServerConfig {
             log_level: log_level.to_string(),
             s3_enabled: true,
@@ -66,13 +85,15 @@ impl ReplicatedServers {
             s3_allow_http: allow_http,
             ..Default::default()
         };
-        println!("Starting leader on port {} (S3 election mode)...", base_port);
+        println!(
+            "Starting leader on port {} (S3 election mode)...",
+            base_port
+        );
         let leader = TestServer::start_with_config(base_port, leader_config).await?;
 
         // Wait for leader to grab the S3 lease before starting follower
         tokio::time::sleep(Duration::from_secs(3)).await;
 
-        // Start follower — it will see the valid lease and become follower
         let follower_port = base_port + 100;
         let follower_config = ServerConfig {
             log_level: log_level.to_string(),
@@ -121,30 +142,290 @@ struct BenchmarkResult {
     max_ms: u64,
 }
 
+struct Thresholds {
+    min_throughput: Option<f64>,
+    max_avg_latency_ms: Option<f64>,
+    max_p99_latency_ms: Option<u64>,
+}
+
+struct ScenarioResult {
+    label: String,
+    result: BenchmarkResult,
+    failures: Vec<String>,
+}
+
+fn check_thresholds(result: &BenchmarkResult, thresholds: &Thresholds) -> Vec<String> {
+    let mut failures = Vec::new();
+    if let Some(min) = thresholds.min_throughput {
+        if result.throughput < min {
+            failures.push(format!(
+                "throughput {:.0} req/s < minimum {:.0} req/s",
+                result.throughput, min
+            ));
+        }
+    }
+    if let Some(max) = thresholds.max_avg_latency_ms {
+        if result.avg_latency_ms > max {
+            failures.push(format!(
+                "avg latency {:.1}ms > maximum {:.1}ms",
+                result.avg_latency_ms, max
+            ));
+        }
+    }
+    if let Some(max) = thresholds.max_p99_latency_ms {
+        if result.p99_ms > max {
+            failures.push(format!(
+                "p99 latency {}ms > maximum {}ms",
+                result.p99_ms, max
+            ));
+        }
+    }
+    failures
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let sweep_mode = std::env::var("SWEEP_MODE").is_ok();
+    if std::env::var("SWEEP_MODE").is_ok() {
+        return run_sweep_benchmark().await;
+    }
+    run_full_benchmark_suite().await
+}
 
-    if sweep_mode {
-        run_sweep_benchmark().await
-    } else {
-        let num_connections = std::env::var("NUM_CONNECTIONS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_NUM_CONNECTIONS);
-        run_single_benchmark(num_connections, true).await.map(|_| ())
+async fn run_full_benchmark_suite() -> Result<(), Box<dyn std::error::Error>> {
+    println!("=== Batch Write Performance Suite ===\n");
+    println!("Scenarios: standalone + replicated x throughput + latency\n");
+
+    let mut results: Vec<ScenarioResult> = Vec::new();
+    let base_port = 10100 + (std::process::id() % 100) as u16;
+
+    // === Standalone ===
+    {
+        println!("{}", "=".repeat(70));
+        println!("  STANDALONE MODE");
+        println!("{}\n", "=".repeat(70));
+
+        let config = ServerConfig {
+            log_level: "warn".to_string(),
+            standalone: true,
+            ..Default::default()
+        };
+        let server = TestServer::start_with_config(base_port, config).await?;
+        let addr = server.address().to_string();
+
+        // Throughput scenario
+        println!(
+            "\n--- Standalone Throughput ({} connections) ---",
+            THROUGHPUT_CONNECTIONS
+        );
+        let bench = run_benchmark_iteration(&addr, THROUGHPUT_CONNECTIONS).await?;
+        print_result(&bench);
+        results.push(ScenarioResult {
+            label: "Standalone Throughput".to_string(),
+            failures: check_thresholds(
+                &bench,
+                &Thresholds {
+                    min_throughput: Some(STANDALONE_THROUGHPUT_MIN),
+                    max_avg_latency_ms: None,
+                    max_p99_latency_ms: None,
+                },
+            ),
+            result: bench,
+        });
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Latency scenario
+        println!(
+            "\n--- Standalone Latency ({} connections) ---",
+            LATENCY_CONNECTIONS
+        );
+        let bench = run_benchmark_iteration(&addr, LATENCY_CONNECTIONS).await?;
+        print_result(&bench);
+        results.push(ScenarioResult {
+            label: "Standalone Latency".to_string(),
+            failures: check_thresholds(
+                &bench,
+                &Thresholds {
+                    min_throughput: None,
+                    max_avg_latency_ms: Some(STANDALONE_LATENCY_AVG_MAX_MS),
+                    max_p99_latency_ms: Some(STANDALONE_LATENCY_P99_MAX_MS),
+                },
+            ),
+            result: bench,
+        });
+
+        drop(server);
+    }
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // === Replicated ===
+    {
+        println!("\n{}", "=".repeat(70));
+        println!("  REPLICATED MODE");
+        println!("{}\n", "=".repeat(70));
+
+        let replicated = ReplicatedServers::start(base_port + 200, "warn").await?;
+        let addr = replicated.address().to_string();
+
+        // Throughput scenario
+        println!(
+            "\n--- Replicated Throughput ({} connections) ---",
+            THROUGHPUT_CONNECTIONS
+        );
+        let bench = run_benchmark_iteration(&addr, THROUGHPUT_CONNECTIONS).await?;
+        print_result(&bench);
+        results.push(ScenarioResult {
+            label: "Replicated Throughput".to_string(),
+            failures: check_thresholds(
+                &bench,
+                &Thresholds {
+                    min_throughput: Some(REPLICATED_THROUGHPUT_MIN),
+                    max_avg_latency_ms: None,
+                    max_p99_latency_ms: None,
+                },
+            ),
+            result: bench,
+        });
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Latency scenario
+        println!(
+            "\n--- Replicated Latency ({} connections) ---",
+            LATENCY_CONNECTIONS
+        );
+        let bench = run_benchmark_iteration(&addr, LATENCY_CONNECTIONS).await?;
+        print_result(&bench);
+        results.push(ScenarioResult {
+            label: "Replicated Latency".to_string(),
+            failures: check_thresholds(
+                &bench,
+                &Thresholds {
+                    min_throughput: None,
+                    max_avg_latency_ms: Some(REPLICATED_LATENCY_AVG_MAX_MS),
+                    max_p99_latency_ms: Some(REPLICATED_LATENCY_P99_MAX_MS),
+                },
+            ),
+            result: bench,
+        });
+
+        // Verify follower caught up
+        verify_replication(&replicated).await?;
+    }
+
+    print_suite_report(&results);
+
+    if results.iter().any(|r| !r.failures.is_empty()) {
+        return Err("Performance regression detected — thresholds breached".into());
+    }
+
+    Ok(())
+}
+
+async fn verify_replication(
+    replicated: &ReplicatedServers,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("\n=== Verifying Replication ===");
+    println!("Waiting for follower to catch up...");
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let mut leader_client = CeleriantClient::connect(replicated.address()).await?;
+    let mut follower_client = CeleriantClient::connect(replicated.follower_address()).await?;
+
+    let sample_ids: Vec<u128> = (0..10)
+        .map(|i| (i * (NUM_AGGREGATES / 10)) as u128)
+        .collect();
+    let mut total_leader = 0usize;
+    let mut total_follower = 0usize;
+
+    for &agg_id in &sample_ids {
+        let key = AggregateKey::new(1, 1, agg_id);
+        let lc = count_events(&mut leader_client, &key).await?;
+        let fc = count_events(&mut follower_client, &key).await?;
+        total_leader += lc;
+        total_follower += fc;
+        if lc != fc {
+            println!(
+                "  agg_id={}: leader={}, follower={} MISMATCH",
+                agg_id, lc, fc
+            );
+        }
+    }
+
+    println!(
+        "Sampled {} keys: leader={} events, follower={} events",
+        sample_ids.len(),
+        total_leader,
+        total_follower
+    );
+    assert_eq!(
+        total_leader, total_follower,
+        "Follower should have caught up on all sampled aggregates"
+    );
+    println!("Replication verified!");
+    Ok(())
+}
+
+fn print_result(r: &BenchmarkResult) {
+    println!(
+        "  Throughput: {:.0} req/s | Avg: {:.1}ms | P50: {}ms | P95: {}ms | P99: {}ms | P99.9: {}ms",
+        r.throughput, r.avg_latency_ms, r.p50_ms, r.p95_ms, r.p99_ms, r.p999_ms
+    );
+}
+
+fn print_suite_report(results: &[ScenarioResult]) {
+    println!("\n\n{}", "=".repeat(90));
+    println!("  BENCHMARK SUITE RESULTS");
+    println!("{}\n", "=".repeat(90));
+
+    println!(
+        "{:<25} {:>8} {:>14} {:>10} {:>8} {:>8}",
+        "Scenario", "Conns", "Throughput", "Avg (ms)", "P99 (ms)", "Result"
+    );
+    println!("{}", "-".repeat(83));
+
+    for r in results {
+        let status = if r.failures.is_empty() {
+            "PASS"
+        } else {
+            "FAIL"
+        };
+        println!(
+            "{:<25} {:>8} {:>11.0} /s {:>10.1} {:>8} {:>8}",
+            r.label, r.result.num_connections, r.result.throughput, r.result.avg_latency_ms,
+            r.result.p99_ms, status,
+        );
+        for f in &r.failures {
+            println!("  >> {}", f);
+        }
+    }
+
+    let total = results.len();
+    let passed = results.iter().filter(|r| r.failures.is_empty()).count();
+    let failed = total - passed;
+
+    println!("\n{}/{} scenarios passed", passed, total);
+    if failed > 0 {
+        println!("{} scenarios FAILED", failed);
     }
 }
 
+// --- Sweep mode (for throughput discovery, not regression testing) ---
+
 async fn run_sweep_benchmark() -> Result<(), Box<dyn std::error::Error>> {
-    let mode_str = if REPLICATED_MODE { "Replicated (Leader+Follower)" } else { "Standalone" };
-    println!("=== Batch Write Performance Sweep Test ({}) ===\n", mode_str);
+    let replicated = std::env::var("SWEEP_REPLICATED").is_ok();
+    let mode_str = if replicated {
+        "Replicated (Leader+Follower)"
+    } else {
+        "Standalone"
+    };
+    println!("=== Batch Write Performance Sweep ({}) ===\n", mode_str);
     println!("Testing connection counts: {:?}\n", CONNECTION_SWEEP);
 
     let port = 10100 + (std::process::id() % 100) as u16;
 
-    // Start server(s)
-    let (server_address, _standalone, _replicated) = if REPLICATED_MODE {
+    let (server_address, _standalone, _replicated) = if replicated {
         println!("Starting replicated cluster...");
         let replicated = ReplicatedServers::start(port, "warn").await?;
         let addr = replicated.address().to_string();
@@ -183,17 +464,15 @@ async fn run_sweep_benchmark() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Brief pause between tests to let things settle
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
-    // Print summary report
-    print_summary_report(&results);
+    print_sweep_report(&results);
 
     Ok(())
 }
 
-fn print_summary_report(results: &[BenchmarkResult]) {
+fn print_sweep_report(results: &[BenchmarkResult]) {
     println!("\n");
     println!("╔══════════════════════════════════════════════════════════════════════════════════════════════════════╗");
     println!("║                              BATCH WRITE PERFORMANCE SWEEP REPORT                                    ║");
@@ -219,37 +498,40 @@ fn print_summary_report(results: &[BenchmarkResult]) {
 
     println!("╚══════════════════════════════════════════════════════════════════════════════════════════════════════╝");
 
-    // Find optimal configuration
-    if let Some(best) = results.iter().max_by(|a, b| {
-        a.throughput.partial_cmp(&b.throughput).unwrap()
-    }) {
+    if let Some(best) = results
+        .iter()
+        .max_by(|a, b| a.throughput.partial_cmp(&b.throughput).unwrap())
+    {
         println!("\n=== OPTIMAL CONFIGURATION ===");
-        println!("Best throughput: {:.2} req/s with {} connections", best.throughput, best.num_connections);
-        println!("Latency at optimal: avg={:.2}ms, P99={}ms", best.avg_latency_ms, best.p99_ms);
-
-        let target = 400_000.0;
-        if best.throughput >= target {
-            println!("\n✓ Target of {} req/s ACHIEVED!", target as u64);
-        } else {
-            let gap = target - best.throughput;
-            let percentage = (best.throughput / target) * 100.0;
-            println!("\n✗ Target of {} req/s NOT achieved", target as u64);
-            println!("  Current: {:.2} req/s ({:.1}% of target)", best.throughput, percentage);
-            println!("  Gap: {:.2} req/s", gap);
-        }
+        println!(
+            "Best throughput: {:.2} req/s with {} connections",
+            best.throughput, best.num_connections
+        );
+        println!(
+            "Latency at optimal: avg={:.2}ms, P99={}ms",
+            best.avg_latency_ms, best.p99_ms
+        );
     }
 
-    // Throughput trend analysis
     println!("\n=== THROUGHPUT TREND ===");
     for (i, r) in results.iter().enumerate() {
         let bar_length = ((r.throughput / 500_000.0) * 50.0) as usize;
         let bar: String = "█".repeat(bar_length.min(50));
-        let marker = if i > 0 && results[i-1].throughput < r.throughput { "↑" }
-                     else if i > 0 && results[i-1].throughput > r.throughput { "↓" }
-                     else { " " };
-        println!("{:>6} conn: {:50} {:>12.0} {}", r.num_connections, bar, r.throughput, marker);
+        let marker = if i > 0 && results[i - 1].throughput < r.throughput {
+            "↑"
+        } else if i > 0 && results[i - 1].throughput > r.throughput {
+            "↓"
+        } else {
+            " "
+        };
+        println!(
+            "{:>6} conn: {:50} {:>12.0} {}",
+            r.num_connections, bar, r.throughput, marker
+        );
     }
 }
+
+// --- Benchmark execution ---
 
 async fn run_benchmark_iteration(
     server_address: &str,
@@ -257,7 +539,6 @@ async fn run_benchmark_iteration(
 ) -> Result<BenchmarkResult, Box<dyn std::error::Error>> {
     let connect_start = Instant::now();
 
-    // Establish all connections
     let mut connection_tasks = Vec::with_capacity(num_connections);
     for connection_id in 0..num_connections {
         let addr = server_address.to_string();
@@ -274,7 +555,6 @@ async fn run_benchmark_iteration(
         connection_tasks.push(task);
     }
 
-    // Collect all established connections
     let mut clients = Vec::with_capacity(num_connections);
     let mut failed_connections = 0;
     for task in connection_tasks {
@@ -304,7 +584,6 @@ async fn run_benchmark_iteration(
 
     let start_time = Instant::now();
 
-    // Spawn benchmark tasks
     let mut tasks = Vec::with_capacity(actual_connections);
     for (connection_id, client) in clients {
         let barrier = Arc::clone(&barrier);
@@ -314,7 +593,6 @@ async fn run_benchmark_iteration(
         tasks.push(task);
     }
 
-    // Wait for all tasks to complete
     let mut all_stats = Vec::with_capacity(actual_connections);
     for task in tasks {
         match task.await {
@@ -325,7 +603,6 @@ async fn run_benchmark_iteration(
 
     let total_duration = start_time.elapsed();
 
-    // Aggregate results
     let total_requests: u64 = all_stats.iter().map(|s| s.request_count).sum();
     let mut all_latencies: Vec<u64> = all_stats
         .into_iter()
@@ -336,18 +613,19 @@ async fn run_benchmark_iteration(
 
     let throughput = total_requests as f64 / total_duration.as_secs_f64();
 
-    let (avg_latency_ms, p50_ms, p95_ms, p99_ms, p999_ms, min_ms, max_ms) = if !all_latencies.is_empty() {
-        let avg = all_latencies.iter().sum::<u64>() as f64 / all_latencies.len() as f64;
-        let p50 = all_latencies[all_latencies.len() * 50 / 100];
-        let p95 = all_latencies[all_latencies.len() * 95 / 100];
-        let p99 = all_latencies[all_latencies.len() * 99 / 100];
-        let p999 = all_latencies[all_latencies.len() * 999 / 1000];
-        let max = all_latencies[all_latencies.len() - 1];
-        let min = all_latencies[0];
-        (avg, p50, p95, p99, p999, min, max)
-    } else {
-        (0.0, 0, 0, 0, 0, 0, 0)
-    };
+    let (avg_latency_ms, p50_ms, p95_ms, p99_ms, p999_ms, min_ms, max_ms) =
+        if !all_latencies.is_empty() {
+            let avg = all_latencies.iter().sum::<u64>() as f64 / all_latencies.len() as f64;
+            let p50 = all_latencies[all_latencies.len() * 50 / 100];
+            let p95 = all_latencies[all_latencies.len() * 95 / 100];
+            let p99 = all_latencies[all_latencies.len() * 99 / 100];
+            let p999 = all_latencies[all_latencies.len() * 999 / 1000];
+            let max = all_latencies[all_latencies.len() - 1];
+            let min = all_latencies[0];
+            (avg, p50, p95, p99, p999, min, max)
+        } else {
+            (0.0, 0, 0, 0, 0, 0, 0)
+        };
 
     Ok(BenchmarkResult {
         num_connections: actual_connections,
@@ -363,214 +641,6 @@ async fn run_benchmark_iteration(
     })
 }
 
-async fn run_single_benchmark(num_connections: usize, verbose: bool) -> Result<Option<BenchmarkResult>, Box<dyn std::error::Error>> {
-    let mode_str = if REPLICATED_MODE { "Replicated" } else { "Standalone" };
-    if verbose {
-        println!("=== Batch Write Performance Test ({}) ===\n", mode_str);
-    }
-
-    let port = 10100 + (std::process::id() % 100) as u16;
-
-    // Start server(s)
-    let (server_address, _standalone, _replicated) = if REPLICATED_MODE {
-        if verbose {
-            println!("Starting replicated cluster...");
-        }
-        let replicated = ReplicatedServers::start(port, "warn").await?;
-        let addr = replicated.address().to_string();
-        if verbose {
-            println!("Cluster started, leader at {}\n", addr);
-        }
-        (addr, None, Some(replicated))
-    } else {
-        if verbose {
-            println!("Starting standalone test server...");
-        }
-        let config = ServerConfig {
-            log_level: "warn".to_string(),
-            fsync_delay_us: 17000,
-            standalone: true,
-            ..Default::default()
-        };
-        let server = TestServer::start_with_config(port, config).await?;
-        let addr = server.address().to_string();
-        if verbose {
-            println!("Server started at {}\n", addr);
-        }
-        (addr, Some(server), None)
-    };
-
-    if verbose {
-        println!("Establishing {} connections...", num_connections);
-    }
-
-    let connect_start = Instant::now();
-
-    // Establish all connections first
-    let mut connection_tasks = Vec::with_capacity(num_connections);
-    for connection_id in 0..num_connections {
-        let addr = server_address.to_string();
-        let task = tokio::spawn(async move {
-            let client = CeleriantClient::connect_with_timeout(
-                &addr,
-                Some(Duration::from_secs(CLIENTSIDE_TIMEOUT_S)),
-            )
-            .await
-            .map_err(|e| format!("Connection {} error: {}", connection_id, e))?
-            .with_timeout(Duration::from_secs(CLIENTSIDE_TIMEOUT_S));
-            Ok::<_, String>((connection_id, client))
-        });
-        connection_tasks.push(task);
-    }
-
-    // Collect all established connections
-    let mut clients = Vec::with_capacity(num_connections);
-    let mut failed_connections = 0;
-    for task in connection_tasks {
-        match task.await {
-            Ok(Ok((connection_id, client))) => {
-                clients.push((connection_id, client));
-            }
-            Ok(Err(e)) => {
-                if verbose { eprintln!("{}", e); }
-                failed_connections += 1;
-            }
-            Err(e) => {
-                if verbose { eprintln!("Join error: {}", e); }
-                failed_connections += 1;
-            }
-        }
-    }
-
-    let connect_duration = connect_start.elapsed();
-    if verbose {
-        println!(
-            "Established {} connections in {:.2}s ({} failed)",
-            clients.len(),
-            connect_duration.as_secs_f64(),
-            failed_connections
-        );
-    }
-
-    if clients.is_empty() {
-        return Err("No connections established".into());
-    }
-
-    // Create a barrier to synchronize all tasks to start at the same time
-    let barrier = Arc::new(Barrier::new(clients.len()));
-
-    if verbose {
-        println!(
-            "Starting benchmark with {} concurrent connections for {} seconds...",
-            clients.len(),
-            TEST_DURATION_SECS
-        );
-    }
-
-    let start_time = Instant::now();
-
-    // Spawn benchmark tasks with pre-established connections
-    let mut tasks = Vec::with_capacity(clients.len());
-    for (connection_id, client) in clients {
-        let barrier = Arc::clone(&barrier);
-        let task =
-            tokio::spawn(
-                async move { run_connection_benchmark(connection_id, client, barrier).await },
-            );
-        tasks.push(task);
-    }
-
-    // Wait for all tasks to complete
-    let mut all_stats = Vec::with_capacity(num_connections);
-    for task in tasks {
-        match task.await {
-            Ok(Ok(stats)) => all_stats.push(stats),
-            Ok(Err(e)) => { if verbose { eprintln!("Task error: {}", e); } }
-            Err(e) => { if verbose { eprintln!("Join error: {}", e); } }
-        }
-    }
-
-    let total_duration = start_time.elapsed();
-
-    // Aggregate results
-    let total_requests: u64 = all_stats.iter().map(|s| s.request_count).sum();
-    let mut all_latencies: Vec<u64> = all_stats
-        .into_iter()
-        .flat_map(|s| s.latencies_us)
-        .collect();
-
-    all_latencies.sort_unstable();
-
-    // Calculate statistics
-    let throughput = total_requests as f64 / total_duration.as_secs_f64();
-
-    if verbose {
-        println!("\n=== Benchmark Results ===");
-        println!("Total Duration: {:.2}s", total_duration.as_secs_f64());
-        println!("Total Requests: {}", total_requests);
-        println!("Throughput: {:.2} req/s", throughput);
-    }
-
-    if !all_latencies.is_empty() && verbose {
-        let avg_latency = all_latencies.iter().sum::<u64>() as f64 / all_latencies.len() as f64;
-        let p50 = all_latencies[all_latencies.len() * 50 / 100];
-        let p95 = all_latencies[all_latencies.len() * 95 / 100];
-        let p99 = all_latencies[all_latencies.len() * 99 / 100];
-        let p999 = all_latencies[all_latencies.len() * 999 / 1000];
-        let max_latency = all_latencies[all_latencies.len() - 1];
-        let min_latency = all_latencies[0];
-
-        println!("\n=== Latency Statistics (milliseconds) ===");
-        println!("Average: {:.2}ms", avg_latency);
-        println!("P50: {}ms", p50);
-        println!("P95: {}ms", p95);
-        println!("P99: {}ms", p99);
-        println!("P99.9: {}ms", p999);
-        println!("Max: {}ms", max_latency);
-        println!("Min: {}ms", min_latency);
-    }
-
-    // Verify follower replication caught up
-    if REPLICATED_MODE {
-        if let Some(ref replicated) = _replicated {
-            println!("\n=== Verifying Replication ===");
-            println!("Waiting for follower to catch up...");
-            tokio::time::sleep(Duration::from_secs(5)).await;
-
-            let mut leader_client = CeleriantClient::connect(replicated.address()).await?;
-            let mut follower_client = CeleriantClient::connect(replicated.follower_address()).await?;
-
-            // Sample aggregate keys spread across the range used by the benchmark
-            let sample_ids: Vec<u128> = (0..10).map(|i| (i * (NUM_AGGREGATES / 10)) as u128).collect();
-            let mut total_leader = 0usize;
-            let mut total_follower = 0usize;
-
-            for &agg_id in &sample_ids {
-                let key = AggregateKey::new(1, 1, agg_id);
-                let lc = count_events(&mut leader_client, &key).await?;
-                let fc = count_events(&mut follower_client, &key).await?;
-                total_leader += lc;
-                total_follower += fc;
-                if lc != fc {
-                    println!("  agg_id={}: leader={}, follower={} MISMATCH", agg_id, lc, fc);
-                }
-            }
-
-            println!(
-                "Sampled {} keys: leader={} events, follower={} events",
-                sample_ids.len(), total_leader, total_follower
-            );
-            assert_eq!(
-                total_leader, total_follower,
-                "Follower should have caught up on all sampled aggregates"
-            );
-            println!("Replication verified!");
-        }
-    }
-
-    Ok(None)
-}
-
 async fn run_connection_benchmark(
     connection_id: usize,
     mut client: CeleriantClient,
@@ -579,12 +649,10 @@ async fn run_connection_benchmark(
     let mut request_count = 0u64;
     let mut latencies = Vec::new();
 
-    // Wait for all connections to be ready before starting the benchmark
     barrier.wait().await;
 
     let deadline = Instant::now() + Duration::from_secs(TEST_DURATION_SECS);
 
-    // Send requests until deadline
     while Instant::now() < deadline {
         let prefix = format!("[connection-{}-event-{}] ", connection_id, request_count);
 
@@ -674,7 +742,7 @@ async fn run_connection_benchmark(
                 }
                 _ => {
                     eprintln!("Connection {} Error: {}", connection_id, e);
-                    break; // Exit on connection errors
+                    break;
                 }
             },
         }
