@@ -4,12 +4,13 @@ use std::rc::Rc;
 use celeriant_distributed::node_status::NodeStatus;
 use celeriant_distributed::paths::fallback_shard_prefix;
 use celeriant_msg::request::requests::ReplicationBatchItem;
+use celeriant_rotating_log::log_segment_file::log_segment_file::{read_datablocks_carry_over_bytes, write_dual_shard_log_header};
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
 use celeriant_wal::compression_type::CompressionType;
-use celeriant_wal::constants::GENESIS_HASH;
+use celeriant_wal::constants::{FIXED_BLOCK_SIZE_BYTES, GENESIS_HASH, HEADER_BLOCK_SIZE_BYTES};
 use celeriant_wal::metablocks::datablock_storage_kind::DatablockStorageKind;
 use celeriant_wire::disk::serialised_datablock::SerialisedDatablock;
-use celeriant_wire::disk::versioned_block::deserialise_fallback_batch;
+use celeriant_wire::disk::versioned_block::{deserialise_fallback_batch, deserialise_metablock};
 
 use celeriant_memcache::shard_log_queue_item::ShardLogQueueItem;
 use celeriant_memcache::shard_mem_cache::ShardMemCache;
@@ -61,6 +62,12 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader>(
             watched_aggregates, downloader, &prefix,
         ).await?;
 
+        // After truncation, continue loop to re-apply from S3
+        if round.truncated {
+            result.bytes_downloaded += round.bytes;
+            continue;
+        }
+
         if round.batches == 0 {
             result.fully_caught_up = true;
             break;
@@ -76,6 +83,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader>(
 struct RoundApplied {
     batches: u64,
     bytes: u64,
+    truncated: bool,
 }
 
 async fn catchup_round<D: S3Downloader>(
@@ -105,7 +113,7 @@ async fn catchup_round<D: S3Downloader>(
     batches.sort_by_key(|b| b.start_wal_index);
 
     if batches.is_empty() {
-        return Ok(RoundApplied { batches: 0, bytes: 0 });
+        return Ok(RoundApplied { batches: 0, bytes: 0, truncated: false });
     }
 
     for window in batches.windows(2) {
@@ -116,7 +124,7 @@ async fn catchup_round<D: S3Downloader>(
         }
     }
 
-    let mut round = RoundApplied { batches: 0, bytes: 0 };
+    let mut round = RoundApplied { batches: 0, bytes: 0, truncated: false };
 
     for batch_ref in &batches {
         let data = downloader.download(&batch_ref.path).await?;
@@ -146,8 +154,35 @@ async fn catchup_round<D: S3Downloader>(
             continue;
         }
 
-        apply_external_batch(log_segments_cache, shard_mem_cache, items)
-            .map_err(S3CatchupError::ApplyFailed)?;
+        match apply_external_batch(log_segments_cache, shard_mem_cache, items) {
+            Ok(()) => {}
+            Err(ApplyBatchError::TipHashMismatch { current_wal_index, batch_wal_index, .. }) => {
+                // Try the fast path first: use the already-downloaded batch's overlapping
+                // entries to find the common ancestor (zero additional S3 calls).
+                // Falls back to targeted S3 search if the batch doesn't overlap local WAL.
+                let (common_ancestor_hash, divergent_wal_index, divergent_entry_position) =
+                    match find_divergence_from_batch(log_segments_cache, &all_items).await {
+                        Ok(result) => result,
+                        Err(_) => find_divergence_via_s3(
+                            log_segments_cache, downloader, prefix, current_wal_index,
+                        ).await?,
+                    };
+
+                tracing::warn!(
+                    current_wal_index,
+                    batch_wal_index,
+                    divergent_wal_index,
+                    "TipHashMismatch detected, truncating divergent WAL entries"
+                );
+                truncate_wal(
+                    log_segments_cache, shard_mem_cache, fsync_coordinator,
+                    common_ancestor_hash, divergent_wal_index, divergent_entry_position
+                ).await.map_err(S3CatchupError::TruncationFailed)?;
+
+                return Ok(RoundApplied { batches: round.batches, bytes: round.bytes, truncated: true });
+            }
+            Err(e) => return Err(S3CatchupError::ApplyFailed(e)),
+        }
 
         sync_applied_batch(
             log_segments_cache, shard_mem_cache, fsync_coordinator,
@@ -257,6 +292,202 @@ async fn sync_applied_batch(
         .await
 }
 
+/// Find the common ancestor using the already-downloaded batch from catchup_round.
+///
+/// The batch that triggered TipHashMismatch often overlaps local WAL entries
+/// (items were skipped because wal_index <= current). The earliest item's
+/// `previous_tip_hash` points to the state before any of the remote leader's
+/// writes in that range — the common ancestor. This avoids any additional S3 calls.
+async fn find_divergence_from_batch(
+    log_segments_cache: &Rc<LogSegmentsCache>,
+    batch_items: &[ReplicationBatchItem],
+) -> Result<([u8; 32], u64, u64), S3CatchupError> {
+    let candidate_hash = batch_items.first()
+        .ok_or_else(|| S3CatchupError::TruncationFailed(
+            ShardFsyncError::MetablockSerialisationError("empty batch".into())
+        ))?
+        .metablock.previous_tip_hash;
+
+    scan_local_metablocks_for_hash(log_segments_cache, candidate_hash).await
+}
+
+/// Fallback: find common ancestor by downloading earlier S3 batches one at a time.
+///
+/// Used when the triggering batch doesn't overlap local data (e.g. batch starts
+/// after the local WAL index). Downloads batches backward from the divergence
+/// point, stopping as soon as the common ancestor is found.
+async fn find_divergence_via_s3<D: S3Downloader>(
+    log_segments_cache: &Rc<LogSegmentsCache>,
+    downloader: &Rc<D>,
+    prefix: &str,
+    current_wal_index: u64,
+) -> Result<([u8; 32], u64, u64), S3CatchupError> {
+    let objects = downloader.list_objects(prefix).await?;
+
+    let mut earlier_batches: Vec<FallbackBatchRef> = objects
+        .into_iter()
+        .filter_map(|obj| {
+            let (_sid, start, end) = parse_fallback_path(&obj.path)?;
+            Some(FallbackBatchRef { path: obj.path, start_wal_index: start, end_wal_index: end })
+        })
+        .filter(|b| b.start_wal_index <= current_wal_index)
+        .collect();
+
+    earlier_batches.sort_by(|a, b| b.start_wal_index.cmp(&a.start_wal_index));
+
+    for batch_ref in &earlier_batches {
+        let data = downloader.download(&batch_ref.path).await?;
+        let fallback_batch = deserialise_fallback_batch(&data)
+            .map_err(|e| S3CatchupError::DeserializationFailed {
+                path: batch_ref.path.clone(),
+                source: e,
+            })?;
+
+        let candidate_hash = fallback_batch.items.first()
+            .ok_or_else(|| S3CatchupError::TruncationFailed(
+                ShardFsyncError::MetablockSerialisationError("empty S3 batch".into())
+            ))?
+            .metablock.previous_tip_hash;
+
+        if let Ok(result) = scan_local_metablocks_for_hash(log_segments_cache, candidate_hash).await {
+            return Ok(result);
+        }
+    }
+
+    Err(S3CatchupError::TruncationFailed(
+        ShardFsyncError::MetablockSerialisationError(
+            "no S3 batch shares common ancestor with local WAL".into()
+        )
+    ))
+}
+
+/// Scan backward through local metablocks looking for one whose `previous_tip_hash`
+/// matches the candidate. Returns (hash, divergent_wal_index, divergent_position).
+async fn scan_local_metablocks_for_hash(
+    log_segments_cache: &Rc<LogSegmentsCache>,
+    candidate_hash: [u8; 32],
+) -> Result<([u8; 32], u64, u64), S3CatchupError> {
+    let active = log_segments_cache.active();
+    let current_metablocks_position = active.metadata.borrow().write.metablocks_position;
+
+    let dma_file_reader = active.lock_reader("catchup_divergence").await
+        .map_err(|_| S3CatchupError::TruncationFailed(ShardFsyncError::WriteLockTimeout))?;
+    let dma_file_reader = dma_file_reader.as_ref()
+        .ok_or_else(|| S3CatchupError::TruncationFailed(ShardFsyncError::ActiveWriteFileUnavailable))?;
+
+    let min_position = HEADER_BLOCK_SIZE_BYTES as u64;
+    let mut position = current_metablocks_position;
+
+    while let Some(pos) = position.checked_sub(FIXED_BLOCK_SIZE_BYTES as u64)
+        .filter(|p| *p >= min_position)
+    {
+        position = pos;
+        let buf = dma_file_reader.read_at(position, FIXED_BLOCK_SIZE_BYTES).await
+            .map_err(|e| S3CatchupError::TruncationFailed(
+                ShardFsyncError::MetablockSerialisationError(format!("read_at failed: {:?}", e))
+            ))?;
+
+        let (chunks, _) = (*buf).as_chunks::<FIXED_BLOCK_SIZE_BYTES>();
+        let block = match chunks.first() {
+            Some(b) => b,
+            None => continue,
+        };
+
+        let metablock = match deserialise_metablock(block) {
+            Ok(mb) => mb,
+            Err(_) => continue,
+        };
+
+        if metablock.previous_tip_hash == candidate_hash {
+            return Ok((candidate_hash, metablock.wal_index, position));
+        }
+    }
+
+    Err(S3CatchupError::TruncationFailed(
+        ShardFsyncError::MetablockSerialisationError(
+            "candidate hash not found in local metablocks".into()
+        )
+    ))
+}
+
+/// Truncate the active WAL file to the common ancestor when divergent entries are detected.
+/// Uses the already-known divergent entry position from the caller to avoid re-scanning.
+async fn truncate_wal(
+    log_segments_cache: &Rc<LogSegmentsCache>,
+    shard_mem_cache: &Rc<RefCell<ShardMemCache>>,
+    fsync_coordinator: &Rc<Coordinator<ShardFsyncError>>,
+    common_ancestor_hash: [u8; 32],
+    divergent_wal_index: u64,
+    divergent_entry_position: u64,
+) -> Result<u64, ShardFsyncError> {
+    // Step 1: Acquire rollback lock to block concurrent writes
+    let _fsync_gate = fsync_coordinator
+        .acquire_rollback_lock()
+        .await
+        .ok_or(ShardFsyncError::WriteLockTimeout)?;
+
+    // Step 2: Clear all caches (including read snapshots and recent writes)
+    shard_mem_cache.borrow_mut().clear_all_caches();
+
+    let active = log_segments_cache.active();
+    let current_wal_index = active.metadata.borrow().write.wal_index;
+
+    // Calculate how many entries to truncate (including the divergent one)
+    let divergent_count = current_wal_index.saturating_sub(divergent_wal_index).saturating_add(1);
+    let new_wal_index = divergent_wal_index.saturating_sub(1);
+    let new_metablocks_position = divergent_entry_position;
+
+
+    // Step 3: Rewind cursors (both read and write)
+    {
+        let mut metadata = active.metadata.borrow_mut();
+        metadata.write.wal_index = new_wal_index;
+        metadata.write.tip_hash = common_ancestor_hash;
+        metadata.write.metablocks_position = new_metablocks_position;
+
+        // Also update read cursor to match
+        if let Some(ref mut read) = metadata.read {
+            read.wal_index = new_wal_index;
+            read.tip_hash = common_ancestor_hash;
+            read.metablocks_position = new_metablocks_position;
+        }
+    }
+
+    // Step 4: Write dual headers and fsync
+    let dma_file_writer = active.lock_writer("truncate_wal").await
+        .map_err(|_| ShardFsyncError::WriteLockTimeout)?;
+    let dma_file_writer = dma_file_writer.as_ref()
+        .ok_or(ShardFsyncError::ActiveWriteFileUnavailable)?;
+
+    let (header, header_end_start_pos) = {
+        let metadata = active.metadata.borrow();
+        let shard_log_header_end_pos = metadata.file_len.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64);
+        (metadata.to_shard_log_header(), shard_log_header_end_pos)
+    };
+
+    write_dual_shard_log_header(dma_file_writer, header_end_start_pos, &header).await
+        .map_err(ShardFsyncError::LogSegmentFileHeaderWriteFailure)?;
+
+    dma_file_writer.fdatasync().await
+        .map_err(|e| ShardFsyncError::FDataSyncError(format!("{:?}", e)))?;
+
+    // Step 5: Update datablocks_carry_over
+    {
+        let mut metadata = active.metadata.borrow_mut();
+        metadata.datablocks_carry_over = read_datablocks_carry_over_bytes(dma_file_writer, metadata.write.datablocks_position)
+            .await
+            .map_err(|e| ShardFsyncError::MetablockSerialisationError(format!("carry-over read failed: {:?}", e)))?;
+    }
+
+    tracing::warn!(
+        divergent_count,
+        new_wal_index,
+        "WAL truncated due to divergent entries"
+    );
+
+    Ok(divergent_count)
+}
+
 /// Parse a fallback batch path to extract shard_id, start_index, and end_index.
 /// Returns None if the path doesn't match the expected format.
 pub fn parse_fallback_path(path: &str) -> Option<(u32, u64, u64)> {
@@ -353,6 +584,7 @@ mod tests {
 
     struct MockDownloader {
         objects: RefCell<HashMap<String, Bytes>>,
+        download_log: RefCell<Vec<String>>,
         delete_log: RefCell<Vec<String>>,
         list_call_count: Cell<u32>,
         on_list_hooks: RefCell<HashMap<u32, Vec<Box<dyn Fn(&MockDownloader)>>>>,
@@ -362,6 +594,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 objects: RefCell::new(HashMap::new()),
+                download_log: RefCell::new(Vec::new()),
                 delete_log: RefCell::new(Vec::new()),
                 list_call_count: Cell::new(0),
                 on_list_hooks: RefCell::new(HashMap::new()),
@@ -372,12 +605,14 @@ mod tests {
             self.objects.borrow_mut().insert(path, data);
         }
 
+        fn downloaded_paths(&self) -> Vec<String> {
+            self.download_log.borrow().clone()
+        }
+
         fn deleted_paths(&self) -> Vec<String> {
             self.delete_log.borrow().clone()
         }
 
-        /// Register a hook that fires when `list_objects` is called for the Nth time (0-indexed).
-        /// The hook receives `&MockDownloader` so it can call `insert()`.
         fn on_list(&self, call_index: u32, hook: impl Fn(&Self) + 'static) {
             self.on_list_hooks.borrow_mut()
                 .entry(call_index)
@@ -402,6 +637,7 @@ mod tests {
         }
 
         async fn download(&self, path: &str) -> Result<Bytes, S3CatchupError> {
+            self.download_log.borrow_mut().push(path.to_string());
             self.objects.borrow().get(path).cloned().ok_or_else(|| S3CatchupError::S3GetFailed {
                 path: path.to_string(),
                 message: "not found".to_string(),
@@ -736,6 +972,238 @@ mod tests {
             tc.close().await;
         });
     }
+
+    #[test]
+    fn catchup_truncates_divergent_entries_and_retries() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+            let dl = Rc::new(MockDownloader::new());
+
+            // Step 1: Apply entries 1-5 normally
+            let (path1_5, data1_5) = make_fallback_batch(0, 1, 5, GENESIS_HASH);
+            dl.insert(path1_5, data1_5);
+            tc.catchup(&dl, 0, 10).await.unwrap();
+            assert_eq!(tc.wal_index(), 5);
+            let tip_after_5 = tc.tip_hash();
+
+            // Step 2: Apply divergent entry 6 (simulates follower receiving from old leader)
+            let (path6_divergent, data6_divergent) = make_fallback_batch(0, 6, 6, tip_after_5);
+            dl.insert(path6_divergent, data6_divergent);
+            tc.catchup(&dl, 0, 10).await.unwrap();
+            assert_eq!(tc.wal_index(), 6);
+            let tip_after_divergent_6 = tc.tip_hash();
+            assert_ne!(tip_after_5, tip_after_divergent_6, "Tip hash should change after entry 6");
+
+            // Step 3: S3 now has "correct" batch 6-8 from new leader with previous_tip = tip_after_5
+            // This will mismatch our current tip (tip_after_divergent_6), triggering truncation
+            dl.objects.borrow_mut().clear();
+            let (path6_8, data6_8) = make_fallback_batch(0, 6, 8, tip_after_5);
+            dl.insert(path6_8, data6_8);
+
+            // Step 4: Catchup detects TipHashMismatch, truncates entry 6, re-applies 6-8
+            let result = tc.catchup(&dl, 0, 10).await.unwrap();
+            assert_eq!(tc.wal_index(), 8, "Should catch up to wal_index 8 after truncation");
+            assert!(result.fully_caught_up);
+
+            tc.close().await;
+        });
+    }
+
+    #[test]
+    fn truncate_old_s3_files_not_downloaded() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+            let dl = Rc::new(MockDownloader::new());
+
+            // Apply entries 1-5
+            let (path, data) = make_fallback_batch(0, 1, 5, GENESIS_HASH);
+            dl.insert(path, data);
+            tc.catchup(&dl, 0, 10).await.unwrap();
+            let tip_after_5 = tc.tip_hash();
+
+            // Apply divergent entry 6
+            let (path, data) = make_fallback_batch(0, 6, 6, tip_after_5);
+            dl.insert(path, data);
+            tc.catchup(&dl, 0, 10).await.unwrap();
+
+            // S3 now has old batch 1-5 (stale) + correct batch 6-8 from new leader.
+            // Old batch should NOT be downloaded during divergence repair.
+            dl.objects.borrow_mut().clear();
+            dl.download_log.borrow_mut().clear();
+
+            let (old_path, old_data) = make_fallback_batch(0, 1, 5, GENESIS_HASH);
+            dl.insert(old_path.clone(), old_data);
+            let (new_path, new_data) = make_fallback_batch(0, 6, 8, tip_after_5);
+            dl.insert(new_path.clone(), new_data);
+
+            tc.catchup(&dl, 0, 10).await.unwrap();
+            assert_eq!(tc.wal_index(), 8);
+
+            // The old batch (1-5) should never have been downloaded
+            let downloads = dl.downloaded_paths();
+            assert!(!downloads.contains(&old_path), "Old batch 1-5 should not be downloaded, got: {:?}", downloads);
+
+            tc.close().await;
+        });
+    }
+
+    #[test]
+    fn truncate_multiple_divergent_local_entries() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+            let dl = Rc::new(MockDownloader::new());
+
+            // Apply entries 1-5
+            let (path, data) = make_fallback_batch(0, 1, 5, GENESIS_HASH);
+            dl.insert(path, data);
+            tc.catchup(&dl, 0, 10).await.unwrap();
+            let tip_after_5 = tc.tip_hash();
+
+            // Apply 3 divergent entries (6-8) from old leader
+            let (path, data) = make_fallback_batch(0, 6, 8, tip_after_5);
+            dl.insert(path, data);
+            tc.catchup(&dl, 0, 10).await.unwrap();
+            assert_eq!(tc.wal_index(), 8);
+
+            // New leader wrote 6-12 (overlapping batch starting before our divergence)
+            dl.objects.borrow_mut().clear();
+            let (path, data) = make_fallback_batch(0, 6, 12, tip_after_5);
+            dl.insert(path, data);
+
+            let result = tc.catchup(&dl, 0, 10).await.unwrap();
+            assert_eq!(tc.wal_index(), 12);
+            assert!(result.fully_caught_up);
+
+            tc.close().await;
+        });
+    }
+
+    #[test]
+    fn truncate_deep_divergence_both_nodes() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+            let dl = Rc::new(MockDownloader::new());
+
+            // Apply entries 1-3
+            let (path, data) = make_fallback_batch(0, 1, 3, GENESIS_HASH);
+            dl.insert(path, data);
+            tc.catchup(&dl, 0, 10).await.unwrap();
+            let tip_after_3 = tc.tip_hash();
+
+            // A diverges with entries 4-8 (5 divergent entries)
+            let (path, data) = make_fallback_batch(0, 4, 8, tip_after_3);
+            dl.insert(path, data);
+            tc.catchup(&dl, 0, 10).await.unwrap();
+            assert_eq!(tc.wal_index(), 8);
+
+            // B wrote 4-14 (5 more entries than A, starting from same common ancestor)
+            dl.objects.borrow_mut().clear();
+            let (path, data) = make_fallback_batch(0, 4, 14, tip_after_3);
+            dl.insert(path, data);
+
+            let result = tc.catchup(&dl, 0, 10).await.unwrap();
+            assert_eq!(tc.wal_index(), 14);
+            assert!(result.fully_caught_up);
+
+            tc.close().await;
+        });
+    }
+
+    #[test]
+    fn truncate_unrecoverable_divergence_errors() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+            let dl = Rc::new(MockDownloader::new());
+
+            // Apply entries 1-3
+            let (path, data) = make_fallback_batch(0, 1, 3, GENESIS_HASH);
+            dl.insert(path, data);
+            tc.catchup(&dl, 0, 10).await.unwrap();
+            let tip_after_3 = tc.tip_hash();
+
+            // Apply divergent entry 4
+            let (path, data) = make_fallback_batch(0, 4, 4, tip_after_3);
+            dl.insert(path, data);
+            tc.catchup(&dl, 0, 10).await.unwrap();
+
+            // S3 has batch 4-6 with a completely unknown previous_tip_hash.
+            // No local metablock will match — divergence is unrecoverable.
+            dl.objects.borrow_mut().clear();
+            let (path, data) = make_fallback_batch(0, 4, 6, [0xFF; 32]);
+            dl.insert(path, data);
+
+            let err = tc.catchup(&dl, 0, 10).await.unwrap_err();
+            assert!(matches!(err, S3CatchupError::TruncationFailed(_)));
+
+            tc.close().await;
+        });
+    }
+
+    #[test]
+    fn truncate_s3_fallback_finds_ancestor_from_earlier_batch() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+
+            // Apply entries 1-5, then divergent entry 6
+            let dl_setup = Rc::new(MockDownloader::new());
+            let (path, data) = make_fallback_batch(0, 1, 5, GENESIS_HASH);
+            dl_setup.insert(path, data);
+            tc.catchup(&dl_setup, 0, 10).await.unwrap();
+            let tip_after_5 = tc.tip_hash();
+
+            let (path, data) = make_fallback_batch(0, 6, 6, tip_after_5);
+            dl_setup.insert(path, data);
+            tc.catchup(&dl_setup, 0, 10).await.unwrap();
+            assert_eq!(tc.wal_index(), 6);
+
+            // Fresh downloader for the divergence scenario.
+            // S3 has batch 6-6 (filtered out by catchup_round since end=6 = current)
+            // and batch 7-9 with a B-specific hash the fast path can't resolve locally.
+            let dl = Rc::new(MockDownloader::new());
+            let (path6, data6) = make_fallback_batch(0, 6, 6, tip_after_5);
+            dl.insert(path6, data6);
+            let (path7_9, data7_9) = make_fallback_batch(0, 7, 9, [0xBB; 32]);
+            dl.insert(path7_9, data7_9);
+
+            let batch_7_9_path = fallback_batch_path(0, 7, 9);
+
+            // Call 2 (retry after truncation): remove batch 7-9 so only 6-6 applies this round
+            let p = batch_7_9_path.clone();
+            dl.on_list(2, move |dl| {
+                dl.objects.borrow_mut().remove(&p);
+            });
+
+            // Call 3 (next round): inject batch 7-9 with correct tip from newly-applied entry 6
+            let lsc = tc.log_segments_cache.clone();
+            dl.on_list(3, move |dl| {
+                let tip = lsc.active().metadata.borrow().write.tip_hash;
+                let (path, data) = make_fallback_batch(0, 7, 9, tip);
+                dl.insert(path, data);
+            });
+
+            let result = tc.catchup(&dl, 0, 10).await.unwrap();
+            assert_eq!(tc.wal_index(), 9);
+            assert!(result.fully_caught_up);
+
+            // Verify the S3 fallback downloaded batch 6-6 to find the ancestor
+            let downloads = dl.downloaded_paths();
+            let batch_6_path = fallback_batch_path(0, 6, 6);
+            assert!(
+                downloads.contains(&batch_6_path),
+                "S3 fallback should have downloaded batch 6-6 to find ancestor, got: {:?}",
+                downloads
+            );
+
+            tc.close().await;
+        });
+    }
+
     #[test]
     fn test_fallback_batch_s3_path() {
         let batch = FallbackBatch::new(5, 10, 2);

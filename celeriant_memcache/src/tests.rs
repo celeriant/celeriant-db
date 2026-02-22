@@ -1359,3 +1359,54 @@ fn many_writes_then_commit_preserves_latest() {
     assert_eq!(indexes.event_batch_index, 100);
     assert_eq!(indexes.event_index, 300);
 }
+
+#[test]
+fn clear_all_caches_clears_everything() {
+    let mut c = cache();
+    let k1 = agg(1, 1, 1);
+    let k2 = agg(1, 1, 2);
+
+    // Populate aggregate_read_snapshots
+    let snap = MemSnapshotAggregate::found(1, 512, 10, 3, 1);
+    c.put_aggregate_into_cache(k1.clone(), snap.clone(), 100, 1, false, CachePath::Read);
+
+    // Populate aggregate_write_snapshots via queue + commit
+    queue_write(&mut c, &k2, 5, 1, 200, 1);
+    sync_and_commit_leader(&mut c);
+
+    // Populate aggregate_recent_writes
+    let mb = test_metablock(k1.clone(), 1, 5, 100, 1);
+    c.cache_recent_write(k1.clone(), 1, mb, None, 64);
+
+    // Populate wal_index_positions
+    c.cache_wal_index_position(100, 1, 512);
+
+    // Populate aggregate_client_snapshots
+    let ck = client_key(&k2, 200);
+    c.put_aggregate_client_into_cache(ck.clone(), 42, false);
+
+    // Verify things are populated
+    let (loaded, _) = c.aggregate_load_status(&k1, CachePath::Read);
+    assert!(loaded);
+    let (loaded, _) = c.aggregate_load_status(&k2, CachePath::Write);
+    assert!(loaded);
+    let writes: Vec<_> = c.get_cached_writes_from(&k1, 1, u64::MAX).collect();
+    assert_eq!(writes.len(), 1);
+    assert!(c.get_wal_index_position(100).is_some());
+    let (loaded, _) = c.aggregate_client_load_status(&k2, &ck);
+    assert!(loaded);
+
+    // Execute clear_all_caches
+    c.clear_all_caches();
+
+    // Verify all caches are empty
+    let (loaded, _) = c.aggregate_load_status(&k1, CachePath::Read);
+    assert!(!loaded, "aggregate_read_snapshots should be empty");
+    let (loaded, _) = c.aggregate_load_status(&k2, CachePath::Write);
+    assert!(!loaded, "aggregate_write_snapshots should be empty");
+    let writes: Vec<_> = c.get_cached_writes_from(&k1, 1, u64::MAX).collect();
+    assert_eq!(writes.len(), 0, "aggregate_recent_writes should be empty");
+    assert!(c.get_wal_index_position(100).is_none(), "wal_index_positions should be empty");
+    let (loaded, _) = c.aggregate_client_load_status(&k2, &ck);
+    assert!(!loaded, "aggregate_client_snapshots should be empty");
+}

@@ -100,6 +100,17 @@ impl ShardMemCache {
         (false, None)
     }
 
+    /// Clear all caches including read snapshots and recent writes.
+    /// Used during WAL truncation where read cache is also invalidated.
+    pub fn clear_all_caches(&mut self) {
+        self.execute_replication_rollback();
+        self.aggregate_read_snapshots.clear();
+        self.aggregate_recent_writes.clear();
+        self.cache_eviction_queue.clear();
+        self.cache_current_bytes = 0;
+        self.wal_index_positions.clear();
+    }
+
     /// Returns (is_loaded, status)
     /// - is_loaded: true if we've already checked disk for this aggregate
     /// - status: Found/NotFound/Deleted based on cache state
