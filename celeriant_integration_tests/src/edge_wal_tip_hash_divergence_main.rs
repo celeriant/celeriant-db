@@ -1,6 +1,6 @@
-//! Edge Case: WAL Tip Hash Divergence Detection (test #2)
+//! Edge Case: WAL Tip Hash Divergence Auto-Heal (test #2)
 //!
-//! Verifies that the cluster correctly detects a WAL tip hash mismatch.
+//! Verifies that a follower with a divergent WAL tip hash auto-heals via S3 catchup.
 //!
 //! How divergence is created so that TipHashMismatch (not WalIndexMismatch) is triggered:
 //! 1. Start node A (standalone), write 5 events, stop. (wal_index = 5)
@@ -15,16 +15,9 @@
 //!    - Leader sends replication batch starting at wal_index 7.
 //!      Batch's previous_tip_hash = A's hash at 6, but B's hash at 6 is divergent
 //!      → TipHashMismatch. Leader falls back to S3.
-//!    - B attempts S3 catchup. The batch covering wal_index 7 has
-//!      previous_tip_hash = A's hash at 6 ≠ B's hash at 6
-//!      → TipHashMismatch in apply_external_batch → fatal S3 catchup error.
-//!    - B shuts down gracefully (exit status 0).
-//! 7. Verify: B has exited, A is still healthy with 8 events.
-//!
-//! WAL divergence is detected but not recovered — the divergent follower shuts down.
-//! The correct recovery path is to wipe the follower and re-sync from S3 (test #3).
-//!
-//! This is test #2 in the integration test coverage report.
+//!    - B's S3 catchup detects TipHashMismatch, truncates divergent WAL entries,
+//!      and re-applies the correct events from S3.
+//! 7. Verify: B auto-healed and caught up to 8 events, A is still healthy.
 //!
 //! Run with: cargo run --bin edge_wal_tip_hash_divergence_main
 
@@ -42,8 +35,8 @@ const PORT_BASE: u16 = 17900;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Edge Case: WAL Tip Hash Divergence Detection ===\n");
-    println!("This test verifies that WAL divergence is detected via TipHashMismatch.");
-    println!("The divergent follower shuts down. The leader remains healthy.\n");
+    println!("This test verifies that a divergent follower auto-heals via TipHashMismatch");
+    println!("detection, WAL truncation, and S3 catchup.\n");
 
     let port_a = PORT_BASE + (std::process::id() % 100) as u16;
     let port_b = port_a + 100;
@@ -204,38 +197,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     // ========================================
-    // Phase 5: Wait for TipHashMismatch to propagate and B to shut down.
+    // Phase 5: Wait for TipHashMismatch detection, WAL truncation, and S3 catchup.
     // ========================================
-    println!("\nPHASE 5: Wait for divergence detection and follower shutdown");
-    println!("-------------------------------------------------------------");
+    println!("\nPHASE 5: Wait for auto-heal: TipHashMismatch -> truncate -> S3 catchup");
+    println!("-----------------------------------------------------------------------");
 
-    println!("  Waiting 20s for replication attempt, S3 catchup, and graceful shutdown...");
+    println!("  Waiting 20s for replication attempt, divergence detection, and auto-heal...");
     tokio::time::sleep(Duration::from_secs(20)).await;
 
     // ========================================
-    // Phase 6: Assert follower shut down, leader still healthy.
+    // Phase 6: Verify follower auto-healed and caught up, leader still healthy.
     // ========================================
-    println!("\nPHASE 6: Verify divergence detected — follower shut down, leader healthy");
+    println!("\nPHASE 6: Verify auto-heal — follower alive with 8 events, leader healthy");
     println!("--------------------------------------------------------------------------");
 
-    // TipHashMismatch in S3 catchup is a fatal error. The server shuts down gracefully
-    // (exit status 0), not via a panic/crash.
-    match node_b.check_alive() {
-        Ok(()) => panic!(
-            "Follower should have exited after TipHashMismatch in S3 catchup, but it is still running"
-        ),
-        Err(e) => {
-            println!("  Follower exited as expected: {}", e);
-            assert!(
-                e.contains("exit status: 0") || e.contains("status: 0"),
-                "Follower should exit cleanly (status 0) on TipHashMismatch, got: {}",
-                e
-            );
-        }
-    }
-    println!("  Follower exited cleanly (status 0) — TipHashMismatch detected, graceful shutdown.");
+    node_b
+        .check_alive()
+        .map_err(|e| format!("Follower should have auto-healed but crashed: {}", e))?;
+    println!("  Follower is still alive (auto-heal succeeded).");
 
-    // Leader must still be healthy with all 8 events.
+    let mut client_b = CeleriantClient::connect(node_b.address()).await?;
+    let follower_count = count_events(&mut client_b, &aggregate_key).await?;
+    println!("  Follower has {} events after auto-heal", follower_count);
+    assert_eq!(
+        follower_count, 8,
+        "Follower should have 8 events after truncating divergent entry and catching up from S3, got {}",
+        follower_count
+    );
+
     let mut client_a = CeleriantClient::connect(node_a.address()).await?;
     let leader_count = count_events(&mut client_a, &aggregate_key).await?;
     println!("  Leader has {} events (unaffected by divergent follower)", leader_count);
@@ -244,13 +233,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let a_is_leader = is_leader(node_a.address()).await?;
     assert!(a_is_leader, "Node A must still be the leader");
     println!("  Node A is still the leader.");
+    println!("  Both nodes converged at 8 events.");
 
     println!("\n=== PASS ===\n");
-    println!("WAL tip hash divergence was detected (TipHashMismatch).");
-    println!("Leader fell back to S3. Follower's S3 catchup also encountered TipHashMismatch.");
-    println!("Divergent follower shut down gracefully (status 0). Leader remains healthy.");
-    println!("Note: WAL divergence is detected but not auto-recovered.");
-    println!("To recover: wipe the divergent follower and let it re-sync from S3 (see test #3).");
+    println!("WAL tip hash divergence auto-heal verified:");
+    println!("  - Follower detected TipHashMismatch during S3 catchup.");
+    println!("  - Divergent WAL entries truncated, correct events re-applied from S3.");
+    println!("  - Follower auto-healed and caught up to 8 events.");
+    println!("  - Leader remains healthy and unaffected.");
 
     Ok(())
 }

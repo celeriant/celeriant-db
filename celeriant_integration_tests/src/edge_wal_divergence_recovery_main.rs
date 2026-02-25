@@ -1,7 +1,6 @@
-//! Edge Case: WAL Divergence Recovery (test #3)
+//! Edge Case: WAL Divergence Recovery via Auto-Heal (test #3)
 //!
-//! Verifies the operational recovery path after WAL tip hash divergence:
-//! wipe the divergent node and let it re-sync from S3 as a fresh follower.
+//! Verifies that a divergent follower auto-heals and replication resumes.
 //!
 //! Setup (same divergence scenario as test #2):
 //! 1. Start node A as distributed leader (with S3), write 5 events, stop.
@@ -13,24 +12,14 @@
 //!    A: wal_index = 8, tip_hash at 6 = hash(tip_5 || small_event_6) ≠ B's
 //!    S3 fallback batches for events 6-8 also land in S3.
 //! 5. Start B as distributed follower (divergent wal_index=6).
-//!    - TipHashMismatch → follower shuts down (same as test #2).
-//!
-//! Recovery:
-//! 6. Start a FRESH follower (clean data dir, no divergent state).
-//!    - Fresh follower has no WAL data → S3 catchup applies events 1-8.
-//!    - Replication resumes normally.
-//! 7. Verify: fresh follower has all 8 events. New writes replicate correctly.
-//!
-//! The correct recovery for WAL divergence is to wipe the divergent follower
-//! and let it re-join from scratch via S3 catchup.
-//!
-//! This is test #3 in the integration test coverage report.
+//!    - TipHashMismatch detected → WAL truncated → S3 catchup → auto-healed.
+//! 6. Verify: both nodes converged at 8 events. New writes replicate correctly.
 //!
 //! Run with: cargo run --bin edge_wal_divergence_recovery_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_integration_tests::{
-    copy_shard_dirs, count_events, is_leader, s3_cluster_config, write_event, write_large_event,
+    copy_shard_dirs, count_events, s3_cluster_config, write_event, write_large_event,
     MinioContainer, RoutingRule, ServerConfig, TestServer,
 };
 use celeriant_wal::aggregate_key::AggregateKey;
@@ -47,7 +36,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let port_a = PORT_BASE + (std::process::id() % 100) as u16;
     let port_b = port_a + 100;
-    let port_fresh = port_a + 200;
     let minio_port = port_a + 10;
 
     // ========================================
@@ -95,9 +83,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut node_a = TestServer::start_with_config_labeled(
         port_a,
         leader_config,
-        "node-a-standalone".into(),
+        "node-a-leader".into(),
     )
     .await?;
+
+    // Wait for A to win election and become leader (empty S3, no contention).
+    println!("  Waiting 5s for A to win election...");
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
     let mut client_a = CeleriantClient::connect(node_a.address()).await?;
     for i in 1u64..=5 {
@@ -161,6 +153,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     node_a.restart_with_config(restart_config).await?;
     println!("  Node A restarted as distributed leader (no follower yet)");
 
+    // Wait for A to win election after restart (must wait for previous lease to expire).
+    println!("  Waiting 5s for A to win election...");
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
     let mut client_a = CeleriantClient::connect(node_a.address()).await?;
     for i in 6u64..=8 {
         write_event(&mut client_a, &aggregate_key, i, false).await?;
@@ -183,10 +179,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ========================================
     // Phase 4: Start divergent B as follower.
-    //          It will detect TipHashMismatch and shut down.
+    //          It will detect TipHashMismatch, truncate, and auto-heal via S3.
     // ========================================
-    println!("PHASE 4: Start divergent B as follower — expect TipHashMismatch + shutdown");
-    println!("----------------------------------------------------------------------------");
+    println!("PHASE 4: Start divergent B as follower — expect TipHashMismatch + auto-heal");
+    println!("-----------------------------------------------------------------------------");
 
     let fresh_b_temp = TempDir::new()?;
     copy_shard_dirs(&node_b_data_root, fresh_b_temp.path())?;
@@ -197,8 +193,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..cluster_config.clone()
     };
 
-    drop(client_a);
-
     println!("  Starting divergent node B as follower...");
     let mut node_b = TestServer::start_with_existing_dir(
         port_b,
@@ -208,113 +202,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    println!("  Waiting 20s for TipHashMismatch detection and graceful shutdown...");
-    tokio::time::sleep(Duration::from_secs(20)).await;
+    // Auto-heal is fast (truncation + S3 catchup completes in <1s), but wait for
+    // replication connection establishment and follower discovery.
+    println!("  Waiting 10s for TipHashMismatch detection, WAL truncation, and S3 catchup...");
+    tokio::time::sleep(Duration::from_secs(10)).await;
 
-    // Divergent follower must have exited with status 0.
-    match node_b.check_alive() {
-        Ok(()) => panic!(
-            "Divergent follower should have exited after TipHashMismatch, but is still running"
-        ),
-        Err(e) => {
-            println!("  Divergent follower exited as expected: {}", e);
-            assert!(
-                e.contains("exit status: 0") || e.contains("status: 0"),
-                "Divergent follower should exit cleanly (status 0), got: {}",
-                e
-            );
-        }
-    }
-    println!("  Divergent follower shut down gracefully (status 0).\n");
-
-    // ========================================
-    // Phase 5: Start a FRESH follower (clean data dir).
-    //          No divergent state → S3 catchup applies events 6-8 cleanly.
-    //          Replication resumes normally.
-    // ========================================
-    println!("PHASE 5: Start a fresh follower (clean data dir) — operational recovery");
-    println!("--------------------------------------------------------------------------");
-
-    let fresh_config = ServerConfig {
-        routing_rule: RoutingRule::AggregateTypeId,
-        ..cluster_config
-    };
-
-    println!("  Starting fresh follower on port {}...", port_fresh);
-    let mut fresh_follower = TestServer::start_with_config_labeled(
-        port_fresh,
-        fresh_config,
-        "node-fresh-follower".into(),
-    )
-    .await?;
-
-    println!("  Waiting 15s for S3 catchup and cluster formation...");
-    tokio::time::sleep(Duration::from_secs(15)).await;
-
-    // ========================================
-    // Phase 6: Verify the fresh follower has caught up and the cluster is healthy.
-    // ========================================
-    println!("\nPHASE 6: Verify fresh follower caught up and cluster is healthy");
-    println!("------------------------------------------------------------------");
-
-    let mut client_a = CeleriantClient::connect(node_a.address()).await?;
-
-    node_a
+    node_b
         .check_alive()
-        .map_err(|e| format!("Leader crashed: {}", e))?;
-    fresh_follower
-        .check_alive()
-        .map_err(|e| format!("Fresh follower crashed: {}", e))?;
+        .map_err(|e| format!("Divergent follower should have auto-healed but crashed: {}", e))?;
+    println!("  Divergent follower is still alive (auto-heal succeeded).");
 
-    let a_is_leader = is_leader(node_a.address()).await?;
-    let fresh_is_leader = is_leader(fresh_follower.address()).await?;
-    println!("  A is_leader={}, fresh_follower is_leader={}", a_is_leader, fresh_is_leader);
-    assert!(a_is_leader, "Node A must still be the leader");
-    assert!(!fresh_is_leader, "Fresh follower must be follower");
+    let mut client_b = CeleriantClient::connect(node_b.address()).await?;
+    let b_count = count_events(&mut client_b, &aggregate_key).await?;
+    println!("  Divergent follower has {} events after auto-heal", b_count);
+    assert_eq!(
+        b_count, 8,
+        "Divergent follower should have 8 events after truncation and S3 catchup, got {}",
+        b_count
+    );
+    // ========================================
+    // Phase 5: Verify replication is healthy after auto-heal.
+    //          Write new events to A, verify they replicate to B.
+    // ========================================
+    println!("\nPHASE 5: Verify replication is healthy after auto-heal");
+    println!("------------------------------------------------------");
 
     let leader_count = count_events(&mut client_a, &aggregate_key).await?;
-    let mut fresh_client = CeleriantClient::connect(fresh_follower.address()).await?;
-    let fresh_count = count_events(&mut fresh_client, &aggregate_key).await?;
-
-    println!("  Leader event count: {}", leader_count);
-    println!("  Fresh follower event count: {}", fresh_count);
-
     assert_eq!(leader_count, 8, "Leader should have 8 events, got {}", leader_count);
-    assert_eq!(
-        fresh_count, 8,
-        "Fresh follower should have 8 events after S3 catchup, got {}",
-        fresh_count
-    );
-    println!("  PASS: Fresh follower caught up to 8 events via S3 catchup.");
+    println!("  Leader has {} events, follower auto-healed to {}.", leader_count, b_count);
 
-    // Verify replication is healthy after the recovery.
-    println!("\n  Writing events 9-10 to verify healthy replication...");
+    println!("  Writing events 9-10 to verify healthy replication...");
     write_event(&mut client_a, &aggregate_key, 9, false).await?;
     write_event(&mut client_a, &aggregate_key, 10, false).await?;
 
     tokio::time::sleep(Duration::from_secs(4)).await;
 
     let leader_final = count_events(&mut client_a, &aggregate_key).await?;
-    let fresh_final = count_events(&mut fresh_client, &aggregate_key).await?;
+    drop(client_b);
+    let mut client_b = CeleriantClient::connect(node_b.address()).await?;
+    let follower_final = count_events(&mut client_b, &aggregate_key).await?;
     println!("  Leader final: {} events", leader_final);
-    println!("  Fresh follower final: {} events", fresh_final);
+    println!("  Follower final: {} events", follower_final);
 
     assert_eq!(leader_final, 10, "Leader should have 10 events, got {}", leader_final);
     assert_eq!(
-        fresh_final, 10,
-        "Fresh follower should have 10 events after replication, got {}",
-        fresh_final
+        follower_final, 10,
+        "Follower should have 10 events after replication, got {}",
+        follower_final
     );
 
-    println!("  Both nodes have {} events — replication healthy after recovery.", leader_final);
+    println!("  Both nodes have {} events — replication healthy after auto-heal.", leader_final);
 
     println!("\n=== PASS ===\n");
-    println!("WAL divergence operational recovery verified:");
+    println!("WAL divergence recovery verified:");
     println!("  - Divergent follower (wal_index=6, wrong tip_hash) detected TipHashMismatch.");
-    println!("  - Divergent follower shut down gracefully (status 0).");
-    println!("  - Fresh follower (clean data dir) joined and caught up via S3 catchup.");
-    println!("  - Replication resumed successfully after recovery.");
-    println!("  - Recovery path: wipe divergent node, let it re-sync from S3.");
+    println!("  - Divergent follower auto-healed: truncated WAL, caught up from S3.");
+    println!("  - Replication resumed successfully (events 9-10 replicated after recovery).");
 
     Ok(())
 }

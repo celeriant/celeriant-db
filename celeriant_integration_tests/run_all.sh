@@ -2,6 +2,11 @@
 set -euo pipefail
 
 TIMEOUT=${1:-60}
+
+# Per-test timeout overrides (8 benchmark scenarios need more time)
+declare -A TIMEOUT_OVERRIDE
+TIMEOUT_OVERRIDE[batch_main]=300
+
 TESTS=(
   single_main
   batch_main
@@ -89,9 +94,10 @@ failed=0
 timed_out=0
 
 for test in "${TESTS[@]}"; do
+  test_timeout=${TIMEOUT_OVERRIDE[$test]:-$TIMEOUT}
   printf "%-40s " "$test"
   start=$(date +%s%N)
-  if timeout "${TIMEOUT}s" cargo run --release --bin "$test" > /tmp/celeriant_test2_${test}.log 2>&1; then
+  if timeout "${test_timeout}s" cargo run --release --bin "$test" > /tmp/celeriant_test2_${test}.log 2>&1; then
     elapsed=$(( ($(date +%s%N) - start) / 1000000 ))
     printf "PASS  (%d.%ds)\n" $((elapsed/1000)) $((elapsed%1000/100))
     ((passed++)) || true
@@ -99,7 +105,7 @@ for test in "${TESTS[@]}"; do
     exit_code=$?
     elapsed=$(( ($(date +%s%N) - start) / 1000000 ))
     if [ $exit_code -eq 124 ]; then
-      printf "TIMEOUT  (%ds)\n" $TIMEOUT
+      printf "TIMEOUT  (%ds)\n" $test_timeout
       ((timed_out++)) || true
     else
       printf "FAIL  (exit %d, %d.%ds)\n" $exit_code $((elapsed/1000)) $((elapsed%1000/100))
