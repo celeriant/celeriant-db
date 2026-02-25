@@ -17,7 +17,7 @@ use crate::{sharded::{intrashard_messages::IntrashardMessages, shard::Shard}, si
 mod sharded;
 mod sidecar;
 
-pub use {sharded::shard_config::ShardConfig, sidecar::sidecar_config::SidecarConfig, sharded::routing_rule::RoutingRule, celeriant_wal::compression_type::CompressionType};
+pub use {sharded::shard_config::{ShardConfig, TlsCertPaths}, sidecar::sidecar_config::SidecarConfig, sharded::routing_rule::RoutingRule, celeriant_wal::compression_type::CompressionType, sharded::tls_config::{TlsConfig, TlsMode}};
 
 const MAX_SHARD_RESTARTS: u32 = 3;
 const SHARD_RESTART_DELAY: Duration = Duration::from_secs(5);
@@ -92,6 +92,8 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                     max_s3_fallback_batch_bytes: shard_config.max_s3_fallback_batch_bytes,
                 };
                 let s3_uploader = SidecarS3Uploader::new(sidecar_senders.clone());
+                let replication_client_config = shard_config.tls_config.as_ref()
+                    .map(|t| t.client_config.clone());
                 let replication_client = FollowerConnection::new(
                     None,
                     shard_config.internode_connection_timeout,
@@ -99,6 +101,7 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                     shard_config.max_request_size,
                     shard_config.max_response_size,
                     current_shard_id as u64,
+                    replication_client_config,
                     Some(s3_uploader),
                 );
                 let s3_downloader = SidecarS3Downloader::new(sidecar_senders.clone());

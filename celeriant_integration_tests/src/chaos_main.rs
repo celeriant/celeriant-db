@@ -95,6 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let writer = CeleriantClient::connect_with_timeout(
             server_addr,
             Some(Duration::from_secs(CLIENTSIDE_TIMEOUT_S)),
+            None,
         )
         .await
         .map_err(|e| format!("Writer {} connection error: {}", aggregate_id, e))?
@@ -105,6 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let reader = CeleriantClient::connect_with_timeout(
             server_addr,
             Some(Duration::from_secs(CLIENTSIDE_TIMEOUT_S)),
+            None,
         )
         .await
         .map_err(|e| format!("Reader {} connection error: {}", aggregate_id, e))?

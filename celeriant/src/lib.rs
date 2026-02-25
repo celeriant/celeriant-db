@@ -1,4 +1,5 @@
 use celeriant_crypto::Crypto;
+use celeriant_ktls::verify_ktls_support;
 use celeriant_runtimes::run_executors_and_sidecar;
 use clap::Parser;
 use dotenvy::dotenv;
@@ -8,6 +9,7 @@ use tracing_subscriber::EnvFilter;
 use crate::server_config::ServerConfig;
 
 pub mod server_config;
+pub mod cert_cmd;
 mod dio_check;
 
 pub fn startup(args: Vec<String>) -> Result<(), std::io::Error> {
@@ -61,7 +63,25 @@ pub fn startup(args: Vec<String>) -> Result<(), std::io::Error> {
     }
 
     let nbr_shards = server_config.num_shards.unwrap_or_else(num_cpus::get) as u32;
-    let shard_config = server_config.to_shard_config(node_id, nbr_shards);
+
+    // Build TLS config if enabled, and verify kernel kTLS support.
+    let tls_config = match server_config.build_tls_config() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            error!("TLS configuration error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    if tls_config.is_some() {
+        if let Err(e) = verify_ktls_support() {
+            error!("Kernel kTLS support check failed: {:?}. Ensure CONFIG_TLS=y and the tls kernel module is loaded.", e);
+            std::process::exit(1);
+        }
+        info!("Kernel kTLS support verified");
+    }
+
+    let shard_config = server_config.to_shard_config(node_id, nbr_shards, tls_config);
     let sidecar_config = server_config.to_sidecar_config(nbr_shards);
     let sidecar_store_config = server_config.to_sidecar_store_config();
 

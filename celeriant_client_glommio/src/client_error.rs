@@ -1,3 +1,4 @@
+use celeriant_ktls::KtlsError;
 use celeriant_msg::{read_wire_data_error::ReadWireDataError, response::responses::ErrorResponse};
 use celeriant_wire::network::wire_error::WireError;
 
@@ -7,6 +8,7 @@ pub enum ClientError {
     ConnectionTimeout,
     ConnectionFailed(glommio::GlommioError<()>),
     SetNoDelayError(glommio::GlommioError<()>),
+    KtlsError(KtlsError),
     RequestTimeout,
     RequestProtocolError,
     NotLeader { leader_address: Option<String>, error: ErrorResponse },

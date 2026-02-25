@@ -13,3 +13,6 @@ tokio.workspace = true
 futures-util.workspace = true
 tokio-util.workspace = true
 futures-lite.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true

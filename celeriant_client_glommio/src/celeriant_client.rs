@@ -1,3 +1,6 @@
+use std::sync::Arc;
+
+use celeriant_ktls::ktls_connect;
 use celeriant_msg::process_requests::Request;
 use celeriant_msg::process_responses::Response;
 use celeriant_wal::compression_type::CompressionType;
@@ -5,9 +8,82 @@ use celeriant_wire::network::wire_header::PROTOCOL_VERSION_V2;
 use futures_lite::future::or;
 use glommio::net::TcpStream;
 use glommio::timer::Timer;
+use rustls_pki_types::ServerName;
 use std::time::Duration;
 
 use crate::client_error::ClientError;
+
+#[derive(Clone)]
+pub struct GlommioTlsConfig {
+    pub client_config: Arc<rustls::ClientConfig>,
+    pub server_name: ServerName<'static>,
+}
+
+impl GlommioTlsConfig {
+    pub fn new(client_config: Arc<rustls::ClientConfig>, server_name: ServerName<'static>) -> Self {
+        Self { client_config, server_name }
+    }
+
+    /// Build a `GlommioTlsConfig` for a node-to-node replication connection.
+    ///
+    /// Parses the host portion of `address` (e.g. `"10.0.0.1:12000"` or
+    /// `"[::1]:12000"`) into a `ServerName`. The node certificate must have a
+    /// matching SAN.
+    pub fn from_address(
+        client_config: Arc<rustls::ClientConfig>,
+        address: &str,
+    ) -> Result<Self, String> {
+        let host = extract_host(address)?;
+
+        let server_name: ServerName<'static> = host
+            .to_string()
+            .try_into()
+            .map_err(|e| format!("invalid server name '{}': {:?}", host, e))?;
+
+        Ok(Self { client_config, server_name })
+    }
+}
+
+/// Extract the host portion from a `"host:port"` or `"[ipv6]:port"` address string.
+///
+/// IPv6 bracket notation `"[::1]:12000"` → `"::1"`
+/// IPv4 / hostname `"10.0.0.1:12000"` → `"10.0.0.1"`
+pub(crate) fn extract_host(address: &str) -> Result<&str, String> {
+    if address.starts_with('[') {
+        address
+            .get(1..)
+            .and_then(|s| s.split_once(']'))
+            .map(|(h, _)| h)
+            .ok_or_else(|| format!("invalid IPv6 address '{}'", address))
+    } else {
+        Ok(address.rsplit_once(':').map(|(h, _)| h).unwrap_or(address))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_host;
+
+    #[test]
+    fn test_ipv4_address() {
+        assert_eq!(extract_host("10.0.0.1:12000").unwrap(), "10.0.0.1");
+    }
+
+    #[test]
+    fn test_ipv6_bracket_notation() {
+        assert_eq!(extract_host("[::1]:12000").unwrap(), "::1");
+    }
+
+    #[test]
+    fn test_plain_hostname() {
+        assert_eq!(extract_host("my-node.cluster.local:12000").unwrap(), "my-node.cluster.local");
+    }
+
+    #[test]
+    fn test_ipv6_bracket_invalid() {
+        assert!(extract_host("[::1-no-bracket").is_err());
+    }
+}
 
 /// Minimal, high-performance Celeriant TCP client for Glommio
 ///
@@ -31,6 +107,16 @@ impl CeleriantClient {
         max_request_size: u64,
         max_response_size: u64,
     ) -> Result<Self, ClientError> {
+        Self::connect_with_timeout_tls(address, connection_timeout, max_request_size, max_response_size, None).await
+    }
+
+    pub async fn connect_with_timeout_tls(
+        address: &str,
+        connection_timeout: Option<Duration>,
+        max_request_size: u64,
+        max_response_size: u64,
+        tls_config: Option<GlommioTlsConfig>,
+    ) -> Result<Self, ClientError> {
         let stream = if let Some(duration) = connection_timeout {
             TcpStream::connect_timeout(address, duration)
                 .await
@@ -53,6 +139,13 @@ impl CeleriantClient {
         stream
             .set_nodelay(true)
             .map_err(ClientError::SetNoDelayError)?;
+
+        let stream = match tls_config {
+            None => stream,
+            Some(cfg) => ktls_connect(stream, cfg.client_config, cfg.server_name)
+                .await
+                .map_err(ClientError::KtlsError)?,
+        };
 
         Ok(Self {
             stream,
@@ -89,7 +182,7 @@ impl CeleriantClient {
         // Apply timeout if configured
         if let Some(duration) = self.timeout_duration {
             let request_future = self.send_request_inner(request, compression_type);
-            
+
             let result = or(
                 async { Some(request_future.await) },
                 async { Timer::new(duration).await; None }
@@ -151,7 +244,7 @@ impl CeleriantClient {
             .peer_addr()
             .map_err(|e| ClientError::ConnectionFailed(e))
     }
-    
+
     /// Close the connection explicitly
     ///
     /// Consumes the client, ensuring it cannot be used after closing.

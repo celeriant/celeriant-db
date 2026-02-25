@@ -414,7 +414,7 @@ async fn test_long_lived_connection(
     server_address: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut client =
-        CeleriantClient::connect_with_timeout(server_address, Some(Duration::from_secs(30)))
+        CeleriantClient::connect_with_timeout(server_address, Some(Duration::from_secs(30)), None)
             .await?;
 
     let num_requests = 100;

@@ -19,6 +19,11 @@ use celeriant_wal::{
 };
 pub use celeriant_lib::server_config::ServerConfig;
 pub use celeriant_runtimes::RoutingRule;
+use std::path::PathBuf;
+
+use celeriant_client_tokio::ClientTlsConfig;
+use celeriant_crypto::pki::PkiManager;
+use rustls_pki_types::ServerName;
 use tempfile::TempDir;
 use tokio::net::TcpStream;
 use tokio::time::sleep;
@@ -554,6 +559,40 @@ impl ServerConfigExt for ServerConfig {
 
         args.push("--max-clock-drift-ms".to_string());
         args.push(self.max_clock_drift_ms.to_string());
+
+        // TLS configuration (only emit non-default fields; default is disabled)
+        args.push("--tls-mode".to_string());
+        args.push(match self.tls_mode {
+            celeriant_lib::server_config::ConfigTlsMode::Disabled => "disabled",
+            celeriant_lib::server_config::ConfigTlsMode::Strict => "strict",
+        }.to_string());
+
+        if let Some(ca_cert) = &self.tls_ca_cert {
+            args.push("--tls-ca-cert".to_string());
+            args.push(ca_cert.to_str().unwrap().to_string());
+        }
+
+        if let Some(node_cert) = &self.tls_node_cert {
+            args.push("--tls-node-cert".to_string());
+            args.push(node_cert.to_str().unwrap().to_string());
+        }
+
+        if let Some(node_key) = &self.tls_node_key {
+            args.push("--tls-node-key".to_string());
+            args.push(node_key.to_str().unwrap().to_string());
+        }
+
+        args.push("--tls-client-auth".to_string());
+        args.push(match self.tls_client_auth {
+            celeriant_lib::server_config::ConfigClientAuth::Require => "require",
+            celeriant_lib::server_config::ConfigClientAuth::Optional => "optional",
+            celeriant_lib::server_config::ConfigClientAuth::None => "none",
+        }.to_string());
+
+        if self.tls_cert_reload_interval_secs > 0 {
+            args.push("--tls-cert-reload-interval-secs".to_string());
+            args.push(self.tls_cert_reload_interval_secs.to_string());
+        }
 
         args
     }
@@ -1139,6 +1178,64 @@ pub fn copy_shard_dirs(src: &std::path::Path, dst: &std::path::Path) -> Result<(
         println!("  Copied shard dir: {}", name.to_string_lossy());
     }
     Ok(())
+}
+
+/// Ephemeral PKI for tests: one CA, arbitrary node/client certs.
+///
+/// All files live in a `TempDir` that is cleaned up when `TestPki` is dropped.
+/// The CA directory is at `<temp>/ca/`, cert directories at `<temp>/<name>/`.
+pub struct TestPki {
+    temp_dir: TempDir,
+}
+
+impl TestPki {
+    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let temp_dir = TempDir::new()?;
+        PkiManager::create_ca(&temp_dir.path().join("ca"), 90)?;
+        Ok(Self { temp_dir })
+    }
+
+    pub fn ca_dir(&self) -> PathBuf {
+        self.temp_dir.path().join("ca")
+    }
+
+    pub fn ca_cert_path(&self) -> PathBuf {
+        self.ca_dir().join("ca.crt")
+    }
+
+    pub fn create_node_cert(&self, name: &str) -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
+        let cert_dir = self.temp_dir.path().join(name);
+        PkiManager::create_node_cert(
+            &self.ca_dir(),
+            &cert_dir,
+            &["127.0.0.1".to_string(), "localhost".to_string()],
+            90,
+        )?;
+        Ok((cert_dir.join("node.crt"), cert_dir.join("node.key")))
+    }
+
+    pub fn create_client_cert(&self, name: &str) -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
+        let cert_dir = self.temp_dir.path().join(name);
+        PkiManager::create_client_cert(&self.ca_dir(), &cert_dir, name, 90)?;
+        Ok((
+            cert_dir.join(format!("client-{name}.crt")),
+            cert_dir.join(format!("client-{name}.key")),
+        ))
+    }
+
+    pub fn build_client_tls_config(
+        &self,
+        client_cert_path: &std::path::Path,
+        client_key_path: &std::path::Path,
+        server_name: &str,
+    ) -> Result<ClientTlsConfig, Box<dyn std::error::Error>> {
+        let ca_bundle = PkiManager::load_ca_bundle(&self.ca_cert_path())?;
+        let (cert_chain, key) = PkiManager::load_identity(client_cert_path, client_key_path)?;
+        let client_config = PkiManager::build_client_config(&ca_bundle, cert_chain, key)?;
+        let sni = ServerName::try_from(server_name.to_string())
+            .map_err(|e| format!("Invalid server name '{}': {e}", server_name))?;
+        Ok(ClientTlsConfig::new(client_config, sni))
+    }
 }
 
 /// Probe whether a node is the leader by attempting a write.

@@ -213,7 +213,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Err(msg) = _follower.check_alive() {
             panic!("{} — check stderr ([follower] lines) for the root cause", msg);
         }
-        let mut fc = match CeleriantClient::connect_with_timeout(_follower.address(), Some(Duration::from_secs(10))).await {
+        let mut fc = match CeleriantClient::connect_with_timeout(_follower.address(), Some(Duration::from_secs(10)), None).await {
             Ok(c) => c,
             Err(e) => {
                 println!("  Follower connect failed: {} ({:.0}s elapsed)", e, start.elapsed().as_secs_f64());
@@ -311,7 +311,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let probe_shard1_key = AggregateKey::new(1, 1, 0);
     {
         let probe_timeout = Duration::from_secs(10);
-        let mut probe = CeleriantClient::connect_with_timeout(_leader.address(), Some(probe_timeout)).await?;
+        let mut probe = CeleriantClient::connect_with_timeout(_leader.address(), Some(probe_timeout), None).await?;
 
         let exists_shard0 = probe.send_request(
             &Request::AggregateDetails(AggregateDetailsRequest { correlation_id: Some(0), aggregate_key: probe_shard0.clone() }),
@@ -338,7 +338,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let write_probe_timeout = Duration::from_secs(15);
 
         println!("  Write probe shard 0 (15s timeout)...");
-        let mut probe0 = CeleriantClient::connect_with_timeout(_leader.address(), Some(write_probe_timeout)).await?
+        let mut probe0 = CeleriantClient::connect_with_timeout(_leader.address(), Some(write_probe_timeout), None).await?
             .with_timeout(write_probe_timeout);
         let t0 = std::time::Instant::now();
         match write_event(&mut probe0, &probe_shard0, 100, false).await {
@@ -347,7 +347,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         println!("  Write probe shard 1 (15s timeout)...");
-        let mut probe1 = CeleriantClient::connect_with_timeout(_leader.address(), Some(write_probe_timeout)).await?
+        let mut probe1 = CeleriantClient::connect_with_timeout(_leader.address(), Some(write_probe_timeout), None).await?
             .with_timeout(write_probe_timeout);
         let t1 = std::time::Instant::now();
         match write_event(&mut probe1, &probe_shard1_key, 100, true).await {
@@ -454,6 +454,7 @@ async fn run_pressure_writes(
             CeleriantClient::connect_with_timeout(
                 &addr,
                 Some(Duration::from_secs(CLIENTSIDE_TIMEOUT_S)),
+                None,
             )
             .await
             .map(|c| (id, c.with_timeout(Duration::from_secs(CLIENTSIDE_TIMEOUT_S))))

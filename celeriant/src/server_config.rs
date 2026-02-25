@@ -1,10 +1,12 @@
+use celeriant_crypto::pki::{ClientAuthMode, PkiManager};
 use celeriant_distributed::config::ReplicationConfig;
 use celeriant_runtimes::RoutingRule;
+use celeriant_runtimes::{TlsConfig, TlsMode};
 use celeriant_runtimes::{ShardConfig, SidecarConfig};
 use celeriant_shard::timestamp_config::{TimestampConfig, TimestampPrecision};
 use celeriant_sidecar::s3_config::S3Config;
 use clap::Parser;
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 use clap::ValueEnum;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, ValueEnum)]
@@ -24,6 +26,28 @@ pub enum ConfigCompressionType {
     Snappy,
     Brotli,
     Gzip,
+}
+
+/// TLS mode for the server listeners.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, ValueEnum)]
+pub enum ConfigTlsMode {
+    /// Plaintext only (default, backward compatible).
+    #[default]
+    Disabled,
+    /// TLS only; reject plaintext connections.
+    Strict,
+}
+
+/// Client certificate authentication mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, ValueEnum)]
+pub enum ConfigClientAuth {
+    /// Clients must present a certificate signed by the CA (full mTLS).
+    #[default]
+    Require,
+    /// Verify cert if presented; allow anonymous clients.
+    Optional,
+    /// Do not request or verify client certificates.
+    None,
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -343,6 +367,51 @@ pub struct ServerConfig {
 
     #[arg(long, default_value_t = 1024 * 1024 * 100, env = "CELERIANT_MAX_S3_FALLBACK_BATCH_BYTES", help = "Maximum batch size for S3 fallback replication uploads (100MB)")]
     pub max_s3_fallback_batch_bytes: u64,
+
+    #[arg(
+        long,
+        default_value = "disabled",
+        env = "CELERIANT_TLS_MODE",
+        help = "TLS mode: disabled (plaintext only) or strict (TLS only)"
+    )]
+    pub tls_mode: ConfigTlsMode,
+
+    #[arg(
+        long,
+        env = "CELERIANT_TLS_CA_CERT",
+        help = "Path to CA certificate (PEM, supports concatenated CA bundles)"
+    )]
+    pub tls_ca_cert: Option<PathBuf>,
+
+    #[arg(
+        long,
+        env = "CELERIANT_TLS_NODE_CERT",
+        help = "Path to node certificate (PEM)"
+    )]
+    pub tls_node_cert: Option<PathBuf>,
+
+    #[arg(
+        long,
+        env = "CELERIANT_TLS_NODE_KEY",
+        help = "Path to node private key (PEM)"
+    )]
+    pub tls_node_key: Option<PathBuf>,
+
+    #[arg(
+        long,
+        default_value = "require",
+        env = "CELERIANT_TLS_CLIENT_AUTH",
+        help = "Client certificate auth: require (mTLS), optional (verify if presented), none (server-auth TLS only)"
+    )]
+    pub tls_client_auth: ConfigClientAuth,
+
+    #[arg(
+        long,
+        default_value_t = 0,
+        env = "CELERIANT_TLS_CERT_RELOAD_INTERVAL_SECS",
+        help = "How often to check TLS cert files for changes and hot-reload (seconds). 0 = disabled."
+    )]
+    pub tls_cert_reload_interval_secs: u64,
 }
 
 impl ServerConfig {
@@ -379,8 +448,61 @@ impl ServerConfig {
         celeriant_sidecar::store_config::StoreConfig { s3 }
     }
 
-    pub fn to_shard_config(&self, node_id: u128, num_shards: u32) -> ShardConfig {
-        use celeriant_runtimes::{CompressionType};
+    /// Build a `TlsConfig` from the TLS CLI fields, or return `None` if TLS is disabled.
+    ///
+    /// Returns an error if TLS is enabled but required cert paths are missing or invalid.
+    pub fn build_tls_config(&self) -> Result<Option<Arc<TlsConfig>>, String> {
+        if self.tls_mode == ConfigTlsMode::Disabled {
+            return Ok(None);
+        }
+
+        let ca_path = self.tls_ca_cert.as_ref()
+            .ok_or("--tls-ca-cert is required when TLS is enabled")?;
+        let cert_path = self.tls_node_cert.as_ref()
+            .ok_or("--tls-node-cert is required when TLS is enabled")?;
+        let key_path = self.tls_node_key.as_ref()
+            .ok_or("--tls-node-key is required when TLS is enabled")?;
+
+        let ca_bundle = PkiManager::load_ca_bundle(ca_path)
+            .map_err(|e| format!("Failed to load CA bundle from {:?}: {:?}", ca_path, e))?;
+        let (cert_chain, node_key) = PkiManager::load_identity(cert_path, key_path)
+            .map_err(|e| format!("Failed to load node identity from {:?}/{:?}: {:?}", cert_path, key_path, e))?;
+
+        let client_auth = match self.tls_client_auth {
+            ConfigClientAuth::Require => ClientAuthMode::Require,
+            ConfigClientAuth::Optional => ClientAuthMode::Optional,
+            ConfigClientAuth::None => ClientAuthMode::None,
+        };
+
+        let mut server_config = PkiManager::build_server_config(&ca_bundle, cert_chain.clone(), node_key.clone_key(), client_auth)
+            .map_err(|e| format!("Failed to build TLS server config: {:?}", e))?;
+
+        // Required for kTLS key extraction after handshake.
+        Arc::get_mut(&mut server_config)
+            .ok_or("BUG: Arc<ServerConfig> was cloned before secret extraction could be enabled")?
+            .enable_secret_extraction = true;
+
+        // Build a client config for outbound replication connections (node → node).
+        // The node cert has serverAuth + clientAuth EKU so it works on both sides.
+        let mut client_config = PkiManager::build_client_config(&ca_bundle, cert_chain, node_key)
+            .map_err(|e| format!("Failed to build TLS client config: {:?}", e))?;
+
+        // Required for kTLS key extraction on the outbound (client) side.
+        Arc::get_mut(&mut client_config)
+            .ok_or("BUG: Arc<ClientConfig> was cloned before secret extraction could be enabled")?
+            .enable_secret_extraction = true;
+
+        let tls_mode = match self.tls_mode {
+            ConfigTlsMode::Disabled => TlsMode::Disabled,
+            ConfigTlsMode::Strict => TlsMode::Strict,
+        };
+
+        Ok(Some(Arc::new(TlsConfig { server_config, client_config, tls_mode })))
+    }
+
+    pub fn to_shard_config(&self, node_id: u128, num_shards: u32, tls_config: Option<Arc<TlsConfig>>) -> ShardConfig {
+        use celeriant_runtimes::{CompressionType, TlsCertPaths};
+        use celeriant_crypto::pki::ClientAuthMode;
 
         let replication_config = if self.standalone {
             None
@@ -449,6 +571,30 @@ impl ServerConfig {
                 ConfigCompressionType::Gzip => CompressionType::Gzip { level: self.server_compression_level.unwrap_or(6) },
             },
             max_s3_fallback_batch_bytes: self.max_s3_fallback_batch_bytes,
+            tls_config,
+            tls_cert_paths: if self.tls_cert_reload_interval_secs > 0 {
+                if let (Some(ca), Some(cert), Some(key)) = (
+                    self.tls_ca_cert.clone(),
+                    self.tls_node_cert.clone(),
+                    self.tls_node_key.clone(),
+                ) {
+                    Some(TlsCertPaths { ca_cert: ca, node_cert: cert, node_key: key })
+                } else {
+                    tracing::warn!(
+                        "tls_cert_reload_interval_secs is set but cert paths are incomplete \
+                         (tls_ca_cert, tls_node_cert, tls_node_key); cert reload will not be enabled"
+                    );
+                    None
+                }
+            } else {
+                None
+            },
+            tls_client_auth: match self.tls_client_auth {
+                ConfigClientAuth::Require => ClientAuthMode::Require,
+                ConfigClientAuth::Optional => ClientAuthMode::Optional,
+                ConfigClientAuth::None => ClientAuthMode::None,
+            },
+            tls_cert_reload_interval: std::time::Duration::from_secs(self.tls_cert_reload_interval_secs),
         }
     }
 
@@ -519,6 +665,12 @@ impl ServerConfig {
         check_field!(heartbeat_lease_duration_ms);
         check_field!(max_clock_drift_ms);
         check_field!(max_s3_fallback_batch_bytes);
+        check_field!(tls_mode);
+        check_field!(tls_ca_cert);
+        check_field!(tls_node_cert);
+        check_field!(tls_node_key);
+        check_field!(tls_client_auth);
+        check_field!(tls_cert_reload_interval_secs);
 
         entries
     }
@@ -588,6 +740,12 @@ impl Default for ServerConfig {
             heartbeat_lease_duration_ms: 1500,
             max_clock_drift_ms: 500,
             max_s3_fallback_batch_bytes: 1024 * 1024 * 100,
+            tls_mode: ConfigTlsMode::Disabled,
+            tls_ca_cert: None,
+            tls_node_cert: None,
+            tls_node_key: None,
+            tls_client_auth: ConfigClientAuth::Require,
+            tls_cert_reload_interval_secs: 0,
         }
     }
 }

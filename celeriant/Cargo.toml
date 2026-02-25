@@ -19,6 +19,7 @@ celeriant_distributed = { path = "../celeriant_distributed" }
 celeriant_runtimes = { path = "../celeriant_runtimes" }
 celeriant_sidecar = { path = "../celeriant_sidecar" }
 celeriant_shard = { path = "../celeriant_shard" }
+celeriant_ktls = { path = "../celeriant_ktls" }
 clap.workspace = true
 mimalloc.workspace = true
 libc.workspace = true
@@ -27,3 +28,4 @@ tracing .workspace = true
 tracing-subscriber.workspace = true
 glommio.workspace = true
 num_cpus.workspace = true
+x509-parser.workspace = true

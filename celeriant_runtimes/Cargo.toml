@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+celeriant_crypto = { path = "../celeriant_crypto" }
 celeriant_disk = { path = "../celeriant_disk" }
 celeriant_shard = { path = "../celeriant_shard" }
 celeriant_sidecar = { path = "../celeriant_sidecar" }
@@ -14,6 +15,7 @@ celeriant_msg = { path = "../celeriant_msg" }
 celeriant_wire = { path = "../celeriant_wire" }
 celeriant_watch = { path = "../celeriant_watch" }
 celeriant_distributed = { path = "../celeriant_distributed" }
+celeriant_ktls = { path = "../celeriant_ktls" }
 glommio.workspace = true
 tracing.workspace = true
 flume.workspace = true
@@ -21,3 +23,4 @@ bytes.workspace = true
 tokio.workspace = true
 signal-hook.workspace = true
 async-trait.workspace = true
+rustls.workspace = true

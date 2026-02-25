@@ -74,6 +74,8 @@ TESTS=(
   p3_3_sequential_cold_reads_main
   # --- Pilot Phase 4: Operational ---
   p4_1_rolling_upgrade_main
+  # --- MTLS ---
+  mtls_test_main
 )
 
 # Pre-build everything so compilation isn't counted in per-test timeout

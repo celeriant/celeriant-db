@@ -1,5 +1,5 @@
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     rc::Rc,
     sync::{Arc, atomic::{AtomicBool, Ordering}},
     time::Duration,
@@ -25,7 +25,11 @@ use crate::sharded::{
     intrashard_messages::IntrashardMessages,
     shard_config::ShardConfig,
     signal_handler::SignalHandler,
+    tls_config::{TlsConfig, TlsMode},
+    tls_reloader::TlsReloader,
 };
+
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct Shard<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static> {
     intrashard_receivers: Receivers<IntrashardMessages>,
@@ -106,16 +110,33 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
 
     async fn enter_main_loop_until_shutdown(&self) {
         info!("Shard {} entering main loop (shutdown_requested={})", self.ctx.current_shard_id, self.shutdown_requested.get());
+
+        let tls_cell: Rc<RefCell<Option<Arc<TlsConfig>>>> =
+            Rc::new(RefCell::new(self.ctx.config.tls_config.clone()));
+
         let client_listener = self.client_tcp_listener.clone();
         let client_ctx = self.ctx.clone();
         let client_shard_failed = self.shard_failed.clone();
+        let client_tls = tls_cell.clone();
         glommio::spawn_local(async move {
             loop {
                 if client_ctx.shutdown_requested.get() || client_shard_failed.load(Ordering::Relaxed) {
                     break;
                 }
+                // Read current TLS config each iteration so hot-reloads take effect
+                // for new connections without requiring a restart.
+                let tls_snapshot = client_tls.borrow().clone();
                 match glommio::timer::timeout(Duration::from_secs(1), client_listener.shared_accept()).await {
-                    Ok(stream) => handle_new_connection(stream.bind_to_executor(), client_ctx.clone(), PortType::Client),
+                    Ok(stream) => {
+                        let tcp_stream = stream.bind_to_executor();
+                        if let Err(e) = tcp_stream.set_nodelay(true) {
+                            warn!("set_nodelay failed on client connection: {e}");
+                        }
+                        match maybe_ktls_accept(tcp_stream, &tls_snapshot).await {
+                            Ok(tcp_stream) => handle_new_connection(tcp_stream, client_ctx.clone(), PortType::Client),
+                            Err(e) => warn!("TLS handshake failed on client port: {:?}", e),
+                        }
+                    }
                     Err(_) => {}
                 }
             }
@@ -125,18 +146,60 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
         let repl_listener = self.replication_tcp_listener.clone();
         let repl_ctx = self.ctx.clone();
         let repl_shard_failed = self.shard_failed.clone();
+        let repl_tls = tls_cell.clone();
         glommio::spawn_local(async move {
             loop {
                 if repl_ctx.shutdown_requested.get() || repl_shard_failed.load(Ordering::Relaxed) {
                     break;
                 }
+                let tls_snapshot = repl_tls.borrow().clone();
                 match glommio::timer::timeout(Duration::from_secs(1), repl_listener.shared_accept()).await {
-                    Ok(stream) => handle_new_connection(stream.bind_to_executor(), repl_ctx.clone(), PortType::Replication),
+                    Ok(stream) => {
+                        let tcp_stream = stream.bind_to_executor();
+                        if let Err(e) = tcp_stream.set_nodelay(true) {
+                            warn!("set_nodelay failed on replication connection: {e}");
+                        }
+                        match maybe_ktls_accept(tcp_stream, &tls_snapshot).await {
+                            Ok(tcp_stream) => handle_new_connection(tcp_stream, repl_ctx.clone(), PortType::Replication),
+                            Err(e) => warn!("TLS handshake failed on replication port: {:?}", e),
+                        }
+                    }
                     Err(_) => {}
                 }
             }
         })
         .detach();
+
+        // Spawn the cert hot-reload timer if reload is enabled and cert paths are configured.
+        let reload_interval = self.ctx.config.tls_cert_reload_interval;
+        if !reload_interval.is_zero() {
+            if let Some(paths) = &self.ctx.config.tls_cert_paths {
+                let tls_mode = self.ctx.config.tls_config
+                    .as_ref()
+                    .map(|t| t.tls_mode)
+                    .unwrap_or(TlsMode::Disabled);
+                let client_auth = self.ctx.config.tls_client_auth;
+                let reloader = TlsReloader::new(
+                    paths.ca_cert.clone(),
+                    paths.node_cert.clone(),
+                    paths.node_key.clone(),
+                    client_auth,
+                    tls_mode,
+                );
+                let reload_tls = tls_cell.clone();
+                let shard_id = self.ctx.current_shard_id;
+                glommio::spawn_local(async move {
+                    loop {
+                        glommio::timer::sleep(reload_interval).await;
+                        if let Some(new_cfg) = reloader.check_and_reload() {
+                            info!(shard_id, "TLS config hot-reloaded, new connections will use new certs");
+                            *reload_tls.borrow_mut() = Some(new_cfg);
+                        }
+                    }
+                })
+                .detach();
+            }
+        }
 
         loop {
             if self.should_shutdown() {
@@ -613,6 +676,40 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
         }
         IntrashardMessages::UpdateLeaderClientAddress { client_address } => {
             *ctx.shard_wal.leader_client_address.borrow_mut() = client_address;
+        }
+    }
+}
+
+/// Apply kTLS upgrade to a freshly accepted stream based on `tls_config`.
+///
+/// Returns the stream unchanged when no TLS config is present (disabled mode).
+/// Performs a kTLS handshake in strict mode; errors are returned to the caller
+/// which logs and continues the accept loop.
+async fn maybe_ktls_accept(
+    stream: glommio::net::TcpStream,
+    tls_config: &Option<std::sync::Arc<crate::sharded::tls_config::TlsConfig>>,
+) -> Result<glommio::net::TcpStream, celeriant_ktls::KtlsError> {
+    let tls = match tls_config {
+        Some(t) => t,
+        None => return Ok(stream),
+    };
+
+    match tls.tls_mode {
+        TlsMode::Disabled => {
+            warn!("TlsConfig present with TlsMode::Disabled; passing stream through unencrypted");
+            Ok(stream)
+        }
+        TlsMode::Strict => {
+            match glommio::timer::timeout(TLS_HANDSHAKE_TIMEOUT, async {
+                Ok::<_, glommio::GlommioError<()>>(celeriant_ktls::ktls_accept(stream, tls.server_config.clone()).await)
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(celeriant_ktls::KtlsError::Io(
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "TLS handshake timed out"),
+                )),
+            }
         }
     }
 }

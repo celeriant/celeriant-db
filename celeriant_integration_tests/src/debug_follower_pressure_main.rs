@@ -231,7 +231,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut caught_up = false;
 
     while start.elapsed() < timeout {
-        let mut fc = match CeleriantClient::connect_with_timeout(FOLLOWER_ADDRESS, Some(Duration::from_secs(10))).await {
+        let mut fc = match CeleriantClient::connect_with_timeout(FOLLOWER_ADDRESS, Some(Duration::from_secs(10)), None).await {
             Ok(c) => c,
             Err(e) => {
                 println!("  Follower connect failed: {} ({:.0}s elapsed)", e, start.elapsed().as_secs_f64());
@@ -300,6 +300,7 @@ async fn run_pressure_writes(
             CeleriantClient::connect_with_timeout(
                 &addr,
                 Some(Duration::from_secs(CLIENTSIDE_TIMEOUT_S)),
+                None,
             )
             .await
             .map(|c| (id, c.with_timeout(Duration::from_secs(CLIENTSIDE_TIMEOUT_S))))

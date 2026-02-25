@@ -1,0 +1,13 @@
+[package]
+name = "celeriant_ktls"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rustls.workspace = true
+rustls-pki-types.workspace = true
+glommio.workspace = true
+libc.workspace = true
+futures-lite.workspace = true

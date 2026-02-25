@@ -245,6 +245,10 @@ path = "src/p4_1_rolling_upgrade_main.rs"
 name = "not_leader_error_main"
 path = "src/not_leader_error_main.rs"
 
+[[bin]]
+name = "mtls_test_main"
+path = "src/mtls_test_main.rs"
+
 [dependencies]
 celeriant_lib = { package = "celeriant", path = "../celeriant" }
 celeriant_client_tokio = { path = "../celeriant_client_tokio" }
@@ -253,6 +257,8 @@ celeriant_runtimes = { path = "../celeriant_runtimes" }
 celeriant_wire = { path = "../celeriant_wire" }
 celeriant_wal = { path = "../celeriant_wal" }
 celeriant_distributed = { path = "../celeriant_distributed" }
+celeriant_crypto = { path = "../celeriant_crypto" }
+celeriant_ktls = { path = "../celeriant_ktls" }
 object_store.workspace = true
 bytes.workspace = true
 bincode.workspace = true
@@ -261,4 +267,7 @@ tokio.workspace = true
 tokio-util.workspace = true
 rand.workspace = true
 tempfile.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+tokio-rustls.workspace = true
 reqwest = { version = "0.12", features = ["blocking"] }

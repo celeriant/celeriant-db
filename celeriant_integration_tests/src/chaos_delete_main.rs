@@ -200,6 +200,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let client = CeleriantClient::connect_with_timeout(
             server_addr,
             Some(Duration::from_secs(CLIENTSIDE_TIMEOUT_S)),
+            None,
         )
         .await
         .map_err(|e| format!("Writer {} connection error: {}", i, e))?
@@ -211,6 +212,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let client = CeleriantClient::connect_with_timeout(
             server_addr,
             Some(Duration::from_secs(CLIENTSIDE_TIMEOUT_S)),
+            None,
         )
         .await
         .map_err(|e| format!("Reader {} connection error: {}", i, e))?
@@ -306,6 +308,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut verify_client = CeleriantClient::connect_with_timeout(
         server_addr,
         Some(Duration::from_secs(CLIENTSIDE_TIMEOUT_S)),
+        None,
     )
     .await
     .map_err(|e| format!("Verification connection error: {}", e))?

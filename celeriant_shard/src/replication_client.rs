@@ -1,8 +1,9 @@
 use std::cell::RefCell;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use celeriant_client_glommio::{CeleriantClient, ClientError};
+use celeriant_client_glommio::{CeleriantClient, ClientError, GlommioTlsConfig};
 use celeriant_disk::files::rwlock_timeout::write_with_timeout;
 use celeriant_distributed::paths::fallback_batch_path;
 use celeriant_msg::{
@@ -71,6 +72,7 @@ impl ConnState {
         request_timeout: Option<Duration>,
         max_request_size: u64,
         max_response_size: u64,
+        replication_client_config: Option<&Arc<rustls::ClientConfig>>,
     ) -> Result<(), ClientError> {
         if self.connected_to.as_ref() != address.as_ref() {
             self.client = None;
@@ -84,7 +86,20 @@ impl ConnState {
         }
         if self.client.is_none() {
             let addr = address.as_deref().ok_or(ClientError::NoAddress)?;
-            let client = CeleriantClient::connect_with_timeout(addr, connection_timeout, max_request_size, max_response_size).await?;
+            let tls_config = replication_client_config
+                .map(|c| GlommioTlsConfig::from_address(c.clone(), addr))
+                .transpose()
+                .map_err(|e| ClientError::ConnectionFailed(glommio::GlommioError::IoError(
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, e),
+                )))?;
+            let client = CeleriantClient::connect_with_timeout_tls(
+                addr,
+                connection_timeout,
+                max_request_size,
+                max_response_size,
+                tls_config,
+            )
+            .await?;
             self.client = Some(match request_timeout {
                 Some(t) => client.with_timeout(t),
                 None => client,
@@ -105,6 +120,7 @@ pub struct FollowerConnection<S: S3Uploader> {
     request_timeout: Option<Duration>,
     max_request_size: u64,
     max_response_size: u64,
+    replication_client_config: Option<Arc<rustls::ClientConfig>>,
     s3_uploader: Option<S>,
 }
 
@@ -116,6 +132,7 @@ impl<S: S3Uploader> FollowerConnection<S> {
         max_request_size: u64,
         max_response_size: u64,
         shard_id: u64,
+        replication_client_config: Option<Arc<rustls::ClientConfig>>,
         s3_uploader: Option<S>,
     ) -> Self {
         assert!(shard_id <= u32::MAX as u64, "shard_id {} exceeds u32::MAX", shard_id);
@@ -128,6 +145,7 @@ impl<S: S3Uploader> FollowerConnection<S> {
             request_timeout,
             max_request_size,
             max_response_size,
+            replication_client_config,
             s3_uploader,
         }
     }
@@ -149,7 +167,7 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
         let address = self.follower_address.borrow().clone();
         let shard_id = self.shard_id;
 
-        guard.ensure_connected(&address, false, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size).await?;
+        guard.ensure_connected(&address, false, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref()).await?;
 
         let mut request = Request::ReplicationBatch(ReplicationBatchRequest {
             correlation_id: None,
@@ -161,7 +179,7 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
         let response = match guard.client.as_mut().unwrap().send_request(&request, CompressionType::Snappy).await {
             Ok(r) => r,
             Err(_) => {
-                guard.ensure_connected(&address, true, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size).await?;
+                guard.ensure_connected(&address, true, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref()).await?;
                 if let Request::ReplicationBatch(ref mut req) = request {
                     req.leader_timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
                 }
@@ -230,7 +248,7 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
 
         let address = self.follower_address.borrow().clone();
 
-        guard.ensure_connected(&address, false, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size).await?;
+        guard.ensure_connected(&address, false, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref()).await?;
 
         let request = Request::Heartbeat(HeartbeatRequest {
             correlation_id: None,
@@ -241,7 +259,7 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
         let response = match guard.client.as_mut().unwrap().send_request(&request, CompressionType::None).await {
             Ok(r) => r,
             Err(_) => {
-                guard.ensure_connected(&address, true, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size).await?;
+                guard.ensure_connected(&address, true, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref()).await?;
                 guard.client.as_mut().unwrap().send_request(&request, CompressionType::None).await?
             }
         };
@@ -259,7 +277,7 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
 
         let address = self.follower_address.borrow().clone();
 
-        guard.ensure_connected(&address, false, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size).await?;
+        guard.ensure_connected(&address, false, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref()).await?;
 
         let request = Request::KickFollower(KickFollowerRequest {
             correlation_id: None,
@@ -268,7 +286,7 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
         let response = match guard.client.as_mut().unwrap().send_request(&request, CompressionType::None).await {
             Ok(r) => r,
             Err(_) => {
-                guard.ensure_connected(&address, true, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size).await?;
+                guard.ensure_connected(&address, true, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref()).await?;
                 guard.client.as_mut().unwrap().send_request(&request, CompressionType::None).await?
             }
         };
@@ -375,6 +393,7 @@ mod tests {
                 1024,
                 1024,
                 7,
+                None,
                 Some(mock_uploader),
             );
 
@@ -395,6 +414,7 @@ mod tests {
                 1024,
                 1024,
                 7,
+                None,
                 None,
             );
 
@@ -421,6 +441,7 @@ mod tests {
                 1024,
                 1024,
                 7,
+                None,
                 Some(mock_uploader),
             );
 
@@ -466,6 +487,7 @@ mod tests {
                 1024,
                 1024,
                 5,
+                None,
                 Some(mock_uploader),
             );
 
@@ -521,6 +543,7 @@ mod tests {
                 1024,
                 1024,
                 7,
+                None,
                 Some(mock_uploader),
             );
 

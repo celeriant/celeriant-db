@@ -14,6 +14,7 @@ members = [
     "celeriant_integration_tests",
     "celeriant_cli",
     "celeriant_distributed",
+    "celeriant_ktls",
 ]
 
 resolver = "2"
@@ -65,3 +66,10 @@ async-trait = "0.1.89"
 walkdir = "2.5.0"
 directories = "6.0.0"
 blake3 = "1.8.3"
+rcgen = { version = "0.14.7", features = ["x509-parser"] }
+time = "0.3.47"
+rustls = { version = "0.23.37", features = ["ring"] }
+rustls-pki-types = "1.14.0"
+rustls-pemfile = "2.2.0"
+x509-parser = "0.18.1"
+tokio-rustls = "0.26.4"
