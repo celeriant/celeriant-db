@@ -54,6 +54,10 @@ name = "s3_failover_main"
 path = "src/s3_failover_main.rs"
 
 [[bin]]
+name = "s3_failover_latency_main"
+path = "src/s3_failover_latency_main.rs"
+
+[[bin]]
 name = "s3_leader_solo_main"
 path = "src/s3_leader_solo_main.rs"
 

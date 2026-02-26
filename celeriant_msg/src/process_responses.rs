@@ -8,10 +8,12 @@ use futures_lite::{AsyncReadExt, AsyncWriteExt};
 use crate::{
     read_wire_data_error::ReadWireDataError,
     response::responses::{
-        CatchUpResponse, ErrorResponse, AggregateDetailsResponse, HeartbeatResponse, KickFollowerResponse, ListAggregateTypesResponse, ListAggregatesResponse, ListOrgsResponse, ProtocolErrorResponse,
-        ReadResponse, ReplicationBatchResponse, SuccessResponse, WatchResponse,
+        ErrorResponse, AggregateDetailsResponse, ListAggregateTypesResponse, ListAggregatesResponse, ListOrgsResponse, ProtocolErrorResponse,
+        ReadResponse, SuccessResponse, WatchResponse,
     },
 };
+#[cfg(feature = "cluster")]
+use crate::response::responses::{CatchUpResponse, HeartbeatResponse, KickFollowerResponse, ReplicationBatchResponse};
 
 // Response type discriminants
 #[repr(u32)]
@@ -28,9 +30,13 @@ pub enum ResponseType {
     ListOrgs = 9,
     ListAggregateTypes = 10,
     ListAggregates = 11,
+    #[cfg(feature = "cluster")]
     ReplicationBatch = 12,
+    #[cfg(feature = "cluster")]
     CatchUp = 13,
+    #[cfg(feature = "cluster")]
     Heartbeat = 14,
+    #[cfg(feature = "cluster")]
     KickFollower = 15,
 }
 
@@ -48,9 +54,13 @@ impl ResponseType {
             9 => Ok(ResponseType::ListOrgs),
             10 => Ok(ResponseType::ListAggregateTypes),
             11 => Ok(ResponseType::ListAggregates),
+            #[cfg(feature = "cluster")]
             12 => Ok(ResponseType::ReplicationBatch),
+            #[cfg(feature = "cluster")]
             13 => Ok(ResponseType::CatchUp),
+            #[cfg(feature = "cluster")]
             14 => Ok(ResponseType::Heartbeat),
+            #[cfg(feature = "cluster")]
             15 => Ok(ResponseType::KickFollower),
             _ => Err(ReadWireDataError::UnknownMessageType(value)),
         }
@@ -70,9 +80,13 @@ pub enum Response {
     ListOrgs(ListOrgsResponse),
     ListAggregateTypes(ListAggregateTypesResponse),
     ListAggregates(ListAggregatesResponse),
+    #[cfg(feature = "cluster")]
     ReplicationBatch(ReplicationBatchResponse),
+    #[cfg(feature = "cluster")]
     CatchUp(CatchUpResponse),
+    #[cfg(feature = "cluster")]
     Heartbeat(HeartbeatResponse),
+    #[cfg(feature = "cluster")]
     KickFollower(KickFollowerResponse),
 }
 
@@ -90,9 +104,13 @@ impl Response {
             Response::ListOrgs(_) => ResponseType::ListOrgs,
             Response::ListAggregateTypes(_) => ResponseType::ListAggregateTypes,
             Response::ListAggregates(_) => ResponseType::ListAggregates,
+            #[cfg(feature = "cluster")]
             Response::ReplicationBatch(_) => ResponseType::ReplicationBatch,
+            #[cfg(feature = "cluster")]
             Response::CatchUp(_) => ResponseType::CatchUp,
+            #[cfg(feature = "cluster")]
             Response::Heartbeat(_) => ResponseType::Heartbeat,
+            #[cfg(feature = "cluster")]
             Response::KickFollower(_) => ResponseType::KickFollower,
         }
     }
@@ -136,14 +154,18 @@ impl Response {
             ResponseType::Delete => fixed!(Delete),
             ResponseType::ProtocolError => fixed!(ProtocolError),
             ResponseType::GenericError => fixed!(GenericError),
-            ResponseType::ReplicationBatch => fixed!(ReplicationBatch),
-            ResponseType::Heartbeat => fixed!(Heartbeat),
-            ResponseType::KickFollower => fixed!(KickFollower),
             ResponseType::Read => variable!(Read),
             ResponseType::Watch => variable!(Watch),
             ResponseType::ListOrgs => variable!(ListOrgs),
             ResponseType::ListAggregateTypes => variable!(ListAggregateTypes),
             ResponseType::ListAggregates => variable!(ListAggregates),
+            #[cfg(feature = "cluster")]
+            ResponseType::ReplicationBatch => fixed!(ReplicationBatch),
+            #[cfg(feature = "cluster")]
+            ResponseType::Heartbeat => fixed!(Heartbeat),
+            #[cfg(feature = "cluster")]
+            ResponseType::KickFollower => fixed!(KickFollower),
+            #[cfg(feature = "cluster")]
             ResponseType::CatchUp => variable!(CatchUp),
         })
     }
@@ -161,9 +183,13 @@ impl Response {
             Response::ListOrgs(_) => server_compression_algorithm,
             Response::ListAggregateTypes(_) => server_compression_algorithm,
             Response::ListAggregates(_) => server_compression_algorithm,
+            #[cfg(feature = "cluster")]
             Response::ReplicationBatch(_) => CompressionType::None,
+            #[cfg(feature = "cluster")]
             Response::CatchUp(_) => server_compression_algorithm,
+            #[cfg(feature = "cluster")]
             Response::Heartbeat(_) => CompressionType::None,
+            #[cfg(feature = "cluster")]
             Response::KickFollower(_) => CompressionType::None,
         }
     }
@@ -187,14 +213,18 @@ impl Response {
             Response::Delete(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
             Response::ProtocolError(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
             Response::GenericError(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
-            Response::ReplicationBatch(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
-            Response::Heartbeat(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
-            Response::KickFollower(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
             Response::Read(res) => wire_header_write_variable_size(writer, res, response_type_id, compression_type, max_message_size, version).await,
             Response::Watch(res) => wire_header_write_variable_size(writer, res, response_type_id, compression_type, max_message_size, version).await,
             Response::ListOrgs(res) => wire_header_write_variable_size(writer, res, response_type_id, compression_type, max_message_size, version).await,
             Response::ListAggregateTypes(res) => wire_header_write_variable_size(writer, res, response_type_id, compression_type, max_message_size, version).await,
             Response::ListAggregates(res) => wire_header_write_variable_size(writer, res, response_type_id, compression_type, max_message_size, version).await,
+            #[cfg(feature = "cluster")]
+            Response::ReplicationBatch(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
+            #[cfg(feature = "cluster")]
+            Response::Heartbeat(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
+            #[cfg(feature = "cluster")]
+            Response::KickFollower(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
+            #[cfg(feature = "cluster")]
             Response::CatchUp(res) => wire_header_write_variable_size(writer, res, response_type_id, compression_type, max_message_size, version).await,
         }
     }
@@ -203,12 +233,20 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::response::responses::{AggregateListItem, AggregateTypeListItem, HeartbeatResult, OrgListItem, ReplicationResult};
+    use crate::response::responses::{AggregateListItem, AggregateTypeListItem, OrgListItem};
+    #[cfg(feature = "cluster")]
+    use crate::response::responses::{HeartbeatResult, ReplicationResult};
     use celeriant_wire::network::wire_header::{PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3};
     use futures_lite::{future::block_on, io::Cursor};
 
+    #[cfg(feature = "cluster")]
     const COUNT: usize = 15;
+    #[cfg(not(feature = "cluster"))]
+    const COUNT: usize = 11;
+    #[cfg(feature = "cluster")]
     const MAX_ID: u32 = 15;
+    #[cfg(not(feature = "cluster"))]
+    const MAX_ID: u32 = 11;
     const VERSIONS: [u32; 2] = [PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3];
 
     fn all_types() -> [ResponseType; COUNT] {
@@ -224,9 +262,13 @@ mod tests {
             ResponseType::ListOrgs,
             ResponseType::ListAggregateTypes,
             ResponseType::ListAggregates,
+            #[cfg(feature = "cluster")]
             ResponseType::ReplicationBatch,
+            #[cfg(feature = "cluster")]
             ResponseType::CatchUp,
+            #[cfg(feature = "cluster")]
             ResponseType::Heartbeat,
+            #[cfg(feature = "cluster")]
             ResponseType::KickFollower,
         ]
     }
@@ -281,23 +323,27 @@ mod tests {
                 aggregates: vec![],
                 next_cursor: Some(12345),
             }),
+            #[cfg(feature = "cluster")]
             ResponseType::ReplicationBatch => Response::ReplicationBatch(ReplicationBatchResponse {
                 correlation_id: Some(0x5555_6666_7777_8888),
                 follower_timestamp_ms: 9999999,
                 result: ReplicationResult::Success { last_follower_metablock: None },
             }),
+            #[cfg(feature = "cluster")]
             ResponseType::CatchUp => Response::CatchUp(CatchUpResponse {
                 correlation_id: Some(0x6666_7777_8888_9999),
                 batches: vec![],
                 continue_catching_up: true,
                 expected_follower_tip_hash: Some([0xAB; 32]),
             }),
+            #[cfg(feature = "cluster")]
             ResponseType::Heartbeat => Response::Heartbeat(HeartbeatResponse {
                 correlation_id: Some(0x7777_8888_9999_AAAA),
                 result: HeartbeatResult::Ack {
                     follower_timestamp_ms: 1234567890123,
                 },
             }),
+            #[cfg(feature = "cluster")]
             ResponseType::KickFollower => Response::KickFollower(KickFollowerResponse {
                 correlation_id: Some(0x8888_9999_AAAA_BBBB),
                 acknowledged: true,
@@ -306,27 +352,20 @@ mod tests {
     }
 
     fn is_variable_size(rt: ResponseType) -> bool {
-        matches!(
-            rt,
+        match rt {
             ResponseType::Read
                 | ResponseType::Watch
                 | ResponseType::ListOrgs
                 | ResponseType::ListAggregateTypes
-                | ResponseType::ListAggregates
-                | ResponseType::CatchUp
-        )
+                | ResponseType::ListAggregates => true,
+            #[cfg(feature = "cluster")]
+            ResponseType::CatchUp => true,
+            _ => false,
+        }
     }
 
     fn uses_compression(rt: ResponseType) -> bool {
-        matches!(
-            rt,
-            ResponseType::Read
-                | ResponseType::Watch
-                | ResponseType::ListOrgs
-                | ResponseType::ListAggregateTypes
-                | ResponseType::ListAggregates
-                | ResponseType::CatchUp
-        )
+        is_variable_size(rt)
     }
 
     async fn write_bytes(res: &Response, version: u32, compression: CompressionType) -> Vec<u8> {
@@ -512,6 +551,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "cluster")]
     #[test]
     fn heartbeat_rejection_variants_round_trip() {
         use crate::response::responses::HeartbeatRejection;

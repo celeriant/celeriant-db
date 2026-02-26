@@ -299,10 +299,18 @@ if request.is_replication_port_request() {
 }
 ```
 
+## Feature Flags
+
+| Feature | Default | Purpose |
+|---------|---------|---------|
+| `cluster` | off | Enables cluster-internal types: replication, heartbeat, catch-up, kick-follower. Server crates (`celeriant_shard`, `celeriant_runtimes`) enable this. Client crates use default features only. |
+
+Without `cluster`, the crate exposes only client-facing request/response types. Wire IDs are unchanged — cluster message IDs (10-13 for requests, 12-15 for responses) are simply unrecognized without the feature.
+
 ## Dependencies
 
 - `celeriant_wal` - Aggregate keys, compression types, event structures, metablocks, datablocks
 - `celeriant_wire` - Wire protocol framing and serialization
 - `futures-lite` - Async I/O traits
 - `bincode`, `serde` - Serialization
-- `deepsize` - Memory size accounting for `ReplicationBatchItem::size_bytes()`
+- `deepsize` (cluster only) - Memory size accounting for `ReplicationBatchItem::size_bytes()`

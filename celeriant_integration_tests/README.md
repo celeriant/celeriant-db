@@ -73,6 +73,7 @@ Tests for distributed consensus via S3 leases: leader election, failover, fencin
 |---|---|
 | `s3_election_main` | Leader election via S3 lease acquisition; verifies only one node holds the lease at a time |
 | `s3_failover_main` | Leader failure triggers follower promotion via lease expiry |
+| `s3_failover_latency_main` | Measures failover time from leader crash to follower accepting writes; asserts < 3 seconds |
 | `s3_leader_solo_main` | Leader operating without any follower connected; S3 writes still proceed |
 | `s3_follower_crash_main` | Follower crashes mid-replication; leader detects and recovers |
 | `s3_stale_lease_main` | Stale lease (old leader's lease still in S3); new leader correctly fences the old one |

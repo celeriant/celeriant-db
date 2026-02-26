@@ -30,12 +30,8 @@ pub fn format_response(response: &Response) -> String {
         Response::ListOrgs(r) => format!("ListOrgs: {} orgs", r.orgs.len()),
         Response::ListAggregateTypes(r) => format!("ListAggregateTypes: {} types", r.aggregate_types.len()),
         Response::ListAggregates(r) => format!("ListAggregates: {} aggregates", r.aggregates.len()),
-        Response::ReplicationBatch(_) => "ReplicationBatch: success".to_string(),
-        Response::CatchUp(_) => "CatchUp: success".to_string(),
-        Response::Heartbeat(r) => match &r.result {
-            celeriant_msg::response::responses::HeartbeatResult::Ack { .. } => "Heartbeat: ack".to_string(),
-            celeriant_msg::response::responses::HeartbeatResult::Rejected(reason) => format!("Heartbeat: rejected ({:?})", reason),
-        },
-        Response::KickFollower(r) => format!("KickFollower: acknowledged={}", r.acknowledged),
+        // Cluster-internal responses (replication, heartbeat, catch-up, kick-follower)
+        // are visible due to Cargo feature unification but never received by clients.
+        _ => unreachable!("cluster-internal response on client port"),
     }
 }

@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 celeriant_distributed = { path = "../celeriant_distributed" }
-celeriant_msg = { path = "../celeriant_msg" }
+celeriant_msg = { path = "../celeriant_msg", features = ["cluster"] }
 celeriant_wire = { path = "../celeriant_wire" }
 celeriant_wal = { path = "../celeriant_wal" }
 celeriant_disk = { path = "../celeriant_disk" }

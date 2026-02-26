@@ -8,10 +8,12 @@ use futures_lite::{AsyncReadExt, AsyncWriteExt};
 use crate::{
     read_wire_data_error::ReadWireDataError,
     request::requests::{
-        CatchUpRequest, DeleteRequest, AggregateDetailsRequest, HeartbeatRequest, KickFollowerRequest, ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest, ReadRequest,
-        ReplicationBatchRequest, TrimStartRequest, WatchRequest, WriteRequest,
+        DeleteRequest, AggregateDetailsRequest, ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest, ReadRequest,
+        TrimStartRequest, WatchRequest, WriteRequest,
     },
 };
+#[cfg(feature = "cluster")]
+use crate::request::requests::{CatchUpRequest, HeartbeatRequest, KickFollowerRequest, ReplicationBatchRequest};
 
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,9 +27,13 @@ pub enum RequestType {
     ListOrgs = 7,
     ListAggregateTypes = 8,
     ListAggregates = 9,
+    #[cfg(feature = "cluster")]
     ReplicationBatch = 10,
+    #[cfg(feature = "cluster")]
     CatchUp = 11,
+    #[cfg(feature = "cluster")]
     Heartbeat = 12,
+    #[cfg(feature = "cluster")]
     KickFollower = 13,
 }
 
@@ -43,9 +49,13 @@ impl RequestType {
             7 => Ok(RequestType::ListOrgs),
             8 => Ok(RequestType::ListAggregateTypes),
             9 => Ok(RequestType::ListAggregates),
+            #[cfg(feature = "cluster")]
             10 => Ok(RequestType::ReplicationBatch),
+            #[cfg(feature = "cluster")]
             11 => Ok(RequestType::CatchUp),
+            #[cfg(feature = "cluster")]
             12 => Ok(RequestType::Heartbeat),
+            #[cfg(feature = "cluster")]
             13 => Ok(RequestType::KickFollower),
             _ => Err(ReadWireDataError::UnknownMessageType(value)),
         }
@@ -63,9 +73,13 @@ pub enum Request {
     ListOrgs(ListOrgsRequest),
     ListAggregateTypes(ListAggregateTypesRequest),
     ListAggregates(ListAggregatesRequest),
+    #[cfg(feature = "cluster")]
     ReplicationBatch(ReplicationBatchRequest),
+    #[cfg(feature = "cluster")]
     CatchUp(CatchUpRequest),
+    #[cfg(feature = "cluster")]
     Heartbeat(HeartbeatRequest),
+    #[cfg(feature = "cluster")]
     KickFollower(KickFollowerRequest),
 }
 
@@ -81,9 +95,13 @@ impl Request {
             Request::ListOrgs(_) => RequestType::ListOrgs,
             Request::ListAggregateTypes(_) => RequestType::ListAggregateTypes,
             Request::ListAggregates(_) => RequestType::ListAggregates,
+            #[cfg(feature = "cluster")]
             Request::ReplicationBatch(_) => RequestType::ReplicationBatch,
+            #[cfg(feature = "cluster")]
             Request::CatchUp(_) => RequestType::CatchUp,
+            #[cfg(feature = "cluster")]
             Request::Heartbeat(_) => RequestType::Heartbeat,
+            #[cfg(feature = "cluster")]
             Request::KickFollower(_) => RequestType::KickFollower,
         }
     }
@@ -99,9 +117,13 @@ impl Request {
             Request::ListOrgs(req) => req.correlation_id,
             Request::ListAggregateTypes(req) => req.correlation_id,
             Request::ListAggregates(req) => req.correlation_id,
+            #[cfg(feature = "cluster")]
             Request::ReplicationBatch(req) => req.correlation_id,
+            #[cfg(feature = "cluster")]
             Request::CatchUp(req) => req.correlation_id,
+            #[cfg(feature = "cluster")]
             Request::Heartbeat(req) => req.correlation_id,
+            #[cfg(feature = "cluster")]
             Request::KickFollower(req) => req.correlation_id,
         }
     }
@@ -119,9 +141,13 @@ impl Request {
             Request::ListOrgs(_req) => 0,
             Request::ListAggregateTypes(_req) => 0,
             Request::ListAggregates(_req) => 0,
+            #[cfg(feature = "cluster")]
             Request::ReplicationBatch(_req) => 0,
+            #[cfg(feature = "cluster")]
             Request::CatchUp(_req) => 0,
+            #[cfg(feature = "cluster")]
             Request::Heartbeat(_req) => 0,
+            #[cfg(feature = "cluster")]
             Request::KickFollower(_req) => 0,
         }
     }
@@ -139,9 +165,13 @@ impl Request {
             Request::ListOrgs(_req) => 0,
             Request::ListAggregateTypes(_req) => 0,
             Request::ListAggregates(_req) => 0,
+            #[cfg(feature = "cluster")]
             Request::ReplicationBatch(_req) => 0,
+            #[cfg(feature = "cluster")]
             Request::CatchUp(_req) => 0,
+            #[cfg(feature = "cluster")]
             Request::Heartbeat(_req) => 0,
+            #[cfg(feature = "cluster")]
             Request::KickFollower(_req) => 0,
         }
     }
@@ -159,9 +189,13 @@ impl Request {
             Request::ListOrgs(_req) => 0,
             Request::ListAggregateTypes(_req) => 0,
             Request::ListAggregates(_req) => 0,
+            #[cfg(feature = "cluster")]
             Request::ReplicationBatch(_req) => 0,
+            #[cfg(feature = "cluster")]
             Request::CatchUp(_req) => 0,
+            #[cfg(feature = "cluster")]
             Request::Heartbeat(_req) => 0,
+            #[cfg(feature = "cluster")]
             Request::KickFollower(_req) => 0,
         }
     }
@@ -208,10 +242,14 @@ impl Request {
             RequestType::ListOrgs => fixed!(ListOrgs),
             RequestType::ListAggregateTypes => fixed!(ListAggregateTypes),
             RequestType::ListAggregates => fixed!(ListAggregates),
-            RequestType::Heartbeat => fixed!(Heartbeat),
-            RequestType::KickFollower => fixed!(KickFollower),
             RequestType::Write => variable!(Write),
+            #[cfg(feature = "cluster")]
+            RequestType::Heartbeat => fixed!(Heartbeat),
+            #[cfg(feature = "cluster")]
+            RequestType::KickFollower => fixed!(KickFollower),
+            #[cfg(feature = "cluster")]
             RequestType::ReplicationBatch => variable!(ReplicationBatch),
+            #[cfg(feature = "cluster")]
             RequestType::CatchUp => variable!(CatchUp),
         };
 
@@ -239,20 +277,32 @@ impl Request {
             Request::ListOrgs(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
             Request::ListAggregateTypes(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
             Request::ListAggregates(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
-            Request::Heartbeat(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
-            Request::KickFollower(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
             Request::Write(req) => wire_header_write_variable_size(writer, req, request_type_id, compression_type, max_message_size, version).await,
+            #[cfg(feature = "cluster")]
+            Request::Heartbeat(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
+            #[cfg(feature = "cluster")]
+            Request::KickFollower(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
+            #[cfg(feature = "cluster")]
             Request::ReplicationBatch(req) => wire_header_write_variable_size(writer, req, request_type_id, compression_type, max_message_size, version).await,
+            #[cfg(feature = "cluster")]
             Request::CatchUp(req) => wire_header_write_variable_size(writer, req, request_type_id, compression_type, max_message_size, version).await,
         }
     }
 
     pub fn is_client_port_request(&self) -> bool {
-        !matches!(self, Request::ReplicationBatch(_) | Request::CatchUp(_) | Request::Heartbeat(_) | Request::KickFollower(_))
+        #[cfg(feature = "cluster")]
+        if matches!(self, Request::ReplicationBatch(_) | Request::CatchUp(_) | Request::Heartbeat(_) | Request::KickFollower(_)) {
+            return false;
+        }
+        true
     }
 
     pub fn is_replication_port_request(&self) -> bool {
-        matches!(self, Request::ReplicationBatch(_) | Request::CatchUp(_) | Request::Heartbeat(_) | Request::KickFollower(_))
+        #[cfg(feature = "cluster")]
+        if matches!(self, Request::ReplicationBatch(_) | Request::CatchUp(_) | Request::Heartbeat(_) | Request::KickFollower(_)) {
+            return true;
+        }
+        false
     }
 }
 
@@ -262,10 +312,12 @@ mod tests {
     use crate::request::{
         read_filters::ReadFilters,
         requests::{
-            CatchUpRequest, ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest,
-            ReplicationBatchRequest, SingleAggregateDelete, SingleAggregateWrite,
+            ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest,
+            SingleAggregateDelete, SingleAggregateWrite,
         },
     };
+    #[cfg(feature = "cluster")]
+    use crate::request::requests::{CatchUpRequest, ReplicationBatchRequest};
     use celeriant_wal::{
         aggregate_key::AggregateKey,
         datablocks::datablock_aggregate_event::DatablockAggregateEvent,
@@ -274,8 +326,14 @@ mod tests {
     use futures_lite::{future::block_on, io::Cursor};
     use std::collections::{HashMap, HashSet};
 
+    #[cfg(feature = "cluster")]
     const REQUEST_TYPE_COUNT: usize = 13;
+    #[cfg(not(feature = "cluster"))]
+    const REQUEST_TYPE_COUNT: usize = 9;
+    #[cfg(feature = "cluster")]
     const MAX_ID: u32 = 13;
+    #[cfg(not(feature = "cluster"))]
+    const MAX_ID: u32 = 9;
     const VERSIONS: [u32; 2] = [PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3];
 
     fn all_types() -> [RequestType; REQUEST_TYPE_COUNT] {
@@ -289,9 +347,13 @@ mod tests {
             RequestType::ListOrgs,
             RequestType::ListAggregateTypes,
             RequestType::ListAggregates,
+            #[cfg(feature = "cluster")]
             RequestType::ReplicationBatch,
+            #[cfg(feature = "cluster")]
             RequestType::CatchUp,
+            #[cfg(feature = "cluster")]
             RequestType::Heartbeat,
+            #[cfg(feature = "cluster")]
             RequestType::KickFollower,
         ]
     }
@@ -391,23 +453,27 @@ mod tests {
                 aggregate_type_id: Some(0xCCCC_DDDD),
                 cursor: Some(11111),
             }),
+            #[cfg(feature = "cluster")]
             RequestType::ReplicationBatch => Request::ReplicationBatch(ReplicationBatchRequest {
                 correlation_id: Some(0x4444_5555_6666_7777),
                 shard_id: 2,
                 leader_timestamp_ms: 9999999,
                 batches: vec![],
             }),
+            #[cfg(feature = "cluster")]
             RequestType::CatchUp => Request::CatchUp(CatchUpRequest {
                 correlation_id: Some(0x5555_6666_7777_8888),
                 shard_id: 4,
                 last_follower_metablock: None,
                 follower_tip_hash: Some([0xAB; 32]),
             }),
+            #[cfg(feature = "cluster")]
             RequestType::Heartbeat => Request::Heartbeat(HeartbeatRequest {
                 correlation_id: Some(0x6666_7777_8888_9999),
                 shard_id: 0,
                 leader_timestamp_ms: 1234567890123,
             }),
+            #[cfg(feature = "cluster")]
             RequestType::KickFollower => Request::KickFollower(KickFollowerRequest {
                 correlation_id: Some(0x7777_8888_9999_AAAA),
             }),
@@ -415,7 +481,12 @@ mod tests {
     }
 
     fn is_variable_size(rt: RequestType) -> bool {
-        matches!(rt, RequestType::Write | RequestType::ReplicationBatch | RequestType::CatchUp)
+        match rt {
+            RequestType::Write => true,
+            #[cfg(feature = "cluster")]
+            RequestType::ReplicationBatch | RequestType::CatchUp => true,
+            _ => false,
+        }
     }
 
     async fn write_bytes(req: &Request, version: u32, compression: CompressionType) -> Vec<u8> {
@@ -496,7 +567,12 @@ mod tests {
     fn port_categorization() {
         for rt in all_types() {
             let req = make_request(rt);
-            let is_repl = matches!(rt, RequestType::ReplicationBatch | RequestType::CatchUp | RequestType::Heartbeat | RequestType::KickFollower);
+            let is_repl = {
+                #[cfg(feature = "cluster")]
+                { matches!(rt, RequestType::ReplicationBatch | RequestType::CatchUp | RequestType::Heartbeat | RequestType::KickFollower) }
+                #[cfg(not(feature = "cluster"))]
+                { false }
+            };
             assert_eq!(req.is_replication_port_request(), is_repl, "{:?}", rt);
             assert_eq!(req.is_client_port_request(), !is_repl, "{:?}", rt);
         }
