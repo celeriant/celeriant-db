@@ -1,6 +1,7 @@
 pub mod pki;
 
 use base64::{Engine as _, engine::general_purpose};
+use rand::RngCore;
 use rsa::{
     RsaPrivateKey, RsaPublicKey,
     pkcs1v15::Signature,
@@ -413,5 +414,68 @@ mod tests {
         let different_key = b"different_public_key";
         let identity3 = Crypto::generate_short_client_identity(different_key);
         assert_ne!(identity1, identity3);
+    }
+}
+
+pub fn generate_api_key() -> [u8; 32] {
+    let mut key = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut key);
+    key
+}
+
+pub fn hash_api_key(key: &[u8; 32]) -> [u8; 32] {
+    use sha2::Digest;
+    Sha256::digest(key).into()
+}
+
+pub fn constant_time_compare(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    use subtle::ConstantTimeEq;
+    a.ct_eq(b).into()
+}
+
+#[cfg(test)]
+mod api_key_tests {
+    use super::*;
+
+    #[test]
+    fn test_generate_api_key() {
+        let key1 = generate_api_key();
+        let key2 = generate_api_key();
+        assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn test_hash_api_key() {
+        let key = [42u8; 32];
+        let hash1 = hash_api_key(&key);
+        let hash2 = hash_api_key(&key);
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_constant_time_compare() {
+        let a = [1u8; 32];
+        let b = [1u8; 32];
+        let c = [2u8; 32];
+
+        assert!(constant_time_compare(&a, &b));
+        assert!(!constant_time_compare(&a, &c));
+    }
+
+    #[test]
+    fn test_hash_deterministic() {
+        let key = generate_api_key();
+        let hash1 = hash_api_key(&key);
+        let hash2 = hash_api_key(&key);
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_different_keys_different_hashes() {
+        let key1 = generate_api_key();
+        let key2 = generate_api_key();
+        let hash1 = hash_api_key(&key1);
+        let hash2 = hash_api_key(&key2);
+        assert_ne!(hash1, hash2);
     }
 }

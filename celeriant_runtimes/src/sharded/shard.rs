@@ -19,6 +19,7 @@ use glommio::{
 use tracing::{debug, error, info, warn};
 
 use crate::sharded::{
+    api_key_reloader::ApiKeyReloader,
     connection_handler::{
         CatchupCompletionMsg, ConnectionContext, PortType, handle_enter_s3_catchup, handle_new_connection, handle_redirected_connection,
     },
@@ -188,12 +189,35 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
                 );
                 let reload_tls = tls_cell.clone();
                 let shard_id = self.ctx.current_shard_id;
+                let shutdown = self.ctx.shutdown_requested.clone();
                 glommio::spawn_local(async move {
                     loop {
                         glommio::timer::sleep(reload_interval).await;
+                        if shutdown.get() { break; }
                         if let Some(new_cfg) = reloader.check_and_reload() {
                             info!(shard_id, "TLS config hot-reloaded, new connections will use new certs");
                             *reload_tls.borrow_mut() = Some(new_cfg);
+                        }
+                    }
+                })
+                .detach();
+            }
+        }
+
+        // Spawn the API key hot-reload timer if API keys are configured and reload is enabled.
+        if !reload_interval.is_zero() {
+            if self.ctx.config.api_key_hashes.borrow().is_some() {
+                let reloader = ApiKeyReloader::new(&self.ctx.config.data_root);
+                let api_key_hashes_cell = self.ctx.config.api_key_hashes.clone();
+                let shard_id = self.ctx.current_shard_id;
+                let shutdown = self.ctx.shutdown_requested.clone();
+                glommio::spawn_local(async move {
+                    loop {
+                        glommio::timer::sleep(reload_interval).await;
+                        if shutdown.get() { break; }
+                        if let Some(new_hashes) = reloader.check_and_reload() {
+                            info!(shard_id, "API key config hot-reloaded, new connections will use new keys");
+                            *api_key_hashes_cell.borrow_mut() = Some(new_hashes);
                         }
                     }
                 })
@@ -651,6 +675,7 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
             message_version,
             port_type,
             verified_client_id,
+            access_level,
         } => {
             handle_redirected_connection(
                 accepted_tcp_stream.bind_to_executor(),
@@ -662,6 +687,7 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
                 ctx.clone(),
                 port_type,
                 verified_client_id,
+                access_level,
             );
         }
         IntrashardMessages::EnterS3Catchup => handle_enter_s3_catchup(ctx.clone()),

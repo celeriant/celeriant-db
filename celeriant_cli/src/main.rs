@@ -14,7 +14,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Some(cmd) => {
             // CLI mode - execute command and exit
-            operations::execute_command(&cli.server, cmd).await?;
+            operations::execute_command(&cli.server, cli.api_key.as_deref(), cmd).await?;
         }
         None => {
             // Interactive TUI mode

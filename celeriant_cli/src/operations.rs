@@ -18,10 +18,13 @@ use std::{collections::HashMap, fs};
 use crate::cli::*;
 use crate::utils::{format_response, format_timestamp};
 
-pub async fn execute_command(server: &str, command: Commands) -> Result<()> {
+pub async fn execute_command(server: &str, _api_key: Option<&str>, command: Commands) -> Result<()> {
     let mut client = CeleriantClient::connect(server)
         .await
         .with_context(|| format!("Failed to connect to {}", server))?;
+
+    // Note: api_key is accepted but not yet used. It will be used when identity
+    // verification is added to the CLI (requires --public-key and --private-key flags).
 
     match command {
         Commands::AggregateDetails(args) => check_aggregatedetails(&mut client, args).await,

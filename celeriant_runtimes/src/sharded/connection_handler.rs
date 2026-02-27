@@ -1,11 +1,12 @@
 use std::{cell::Cell, fmt, rc::Rc, time::Duration};
 
+use base64::Engine;
 use celeriant_distributed::{heartbeat::now_ms, lease_manager::LeaseManager, lease_store::LeaseStore, node_status::NodeStatus, validated_node_status::ValidatedNodeStatus};
 use celeriant_msg::{
     process_requests::Request,
     process_responses::Response,
     request::requests::{HeartbeatRequest, KickFollowerRequest, WatchRequest},
-    response::responses::{ErrorResponse, HeartbeatRejection, HeartbeatResponse, HeartbeatResult, KickFollowerResponse, WatchResponse},
+    response::responses::{AccessLevel, ErrorResponse, HeartbeatRejection, HeartbeatResponse, HeartbeatResult, KickFollowerResponse, WatchResponse},
 };
 use celeriant_shard::{
     error::{s3_catchup_error::S3CatchupError, watch_session_error::WatchSessionError}, replication_client::ReplicationClient, s3_downloader::S3Downloader, shard_wal::ShardWal, shard_wal_s3_catchup::S3CatchupResult
@@ -44,9 +45,10 @@ pub struct ConnectionContext<R: ReplicationClient + 'static, D: S3Downloader + '
     pub lease_manager: Option<Rc<LeaseManager<S>>>,
 }
 
-/// Connection-level state for identity verification
+/// Connection-level state for identity verification and access control
 struct ConnectionState {
     verified_client_id: Option<u128>,
+    access_level: Option<celeriant_msg::response::responses::AccessLevel>,
 }
 
 impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static> Clone for ConnectionContext<R, D, S> {
@@ -97,6 +99,7 @@ pub fn handle_new_connection<R: ReplicationClient + 'static, D: S3Downloader + '
         // Initialize connection state (no identity verified yet)
         let mut conn_state = ConnectionState {
             verified_client_id: None,
+            access_level: None,
         };
 
         let (request, message_version) = match read_request(&mut tcp_stream, &ctx).await {
@@ -117,13 +120,14 @@ pub fn handle_new_connection<R: ReplicationClient + 'static, D: S3Downloader + '
 
         // Handle IdentifyRequest at connection level (before redirect/processing)
         if let Request::Identify(ref identify_req) = request {
-            if let Err(response) = handle_identify(identify_req, &mut conn_state) {
+            if let Err(response) = handle_identify(identify_req, &mut conn_state, &ctx.config) {
                 let _ = write_response(&mut tcp_stream, &response, ctx.config.max_response_size, ctx.config.server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
                 return; // Close connection on identity failure
             }
             let response = Response::Identify(celeriant_msg::response::responses::IdentifyResponse {
                 correlation_id: identify_req.correlation_id,
-                client_id: conn_state.verified_client_id.unwrap(),
+                client_id: conn_state.verified_client_id,
+                access_level: conn_state.access_level,
             });
             if write_response(&mut tcp_stream, &response, ctx.config.max_response_size, ctx.config.server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await.is_err() {
                 return;
@@ -164,12 +168,14 @@ pub fn handle_redirected_connection<R: ReplicationClient + 'static, D: S3Downloa
     ctx: ConnectionContext<R, D, S>,
     port_type: PortType,
     verified_client_id: Option<u128>,
+    access_level: Option<AccessLevel>,
 ) {
     let _ = tcp_stream.set_nodelay(true);
 
     glommio::spawn_local(async move {
         let conn_state = ConnectionState {
             verified_client_id,
+            access_level,
         };
         handle_pipelining(tcp_stream, request, max_request_size, max_response_size, server_compression_algorithm, message_version, ctx, port_type, conn_state).await;
     })
@@ -231,6 +237,17 @@ async fn handle_pipelining<R: ReplicationClient + 'static, D: S3Downloader + 'st
                 continue;
             }
 
+            // Enforce access level
+            if !is_valid_for_access_level(&request, conn_state.access_level) {
+                let response = Response::GenericError(ErrorResponse {
+                    correlation_id: request.correlation_id(),
+                    error_code: ErrorResponse::AUTH_INSUFFICIENT_PERMISSIONS,
+                    error_message: "Insufficient permissions for this operation".to_string(),
+                });
+                let _ = write_response(&mut tcp_stream, &response, max_response_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
+                continue;
+            }
+
             if port_type == PortType::Client {
                 if let Request::Watch(watch_request) = request {
                     handle_watch(tcp_stream, watch_request, max_response_size, server_compression_algorithm, message_version, &ctx).await;
@@ -281,31 +298,78 @@ fn is_valid_for_port(request: &Request, port_type: PortType) -> bool {
 }
 
 /// Handle IdentifyRequest during connection handshake.
-/// Validates nonce and signature, derives client_id, stores in connection state.
-fn handle_identify(req: &celeriant_msg::request::requests::IdentifyRequest, conn_state: &mut ConnectionState) -> Result<(), Response> {
+/// Validates nonce and signature, derives client_id, and validates API key if configured.
+fn handle_identify(req: &celeriant_msg::request::requests::IdentifyRequest, conn_state: &mut ConnectionState, config: &ShardConfig) -> Result<(), Response> {
     use celeriant_crypto::Crypto;
 
-    // Validate nonce and signature, derive client_id
-    let client_id = match Crypto::validate_with_public_key(&req.public_key, &req.nonce, &req.signature) {
-        Ok(id) => id,
-        Err(celeriant_crypto::CryptoError::InvalidNonce) => {
-            return Err(Response::GenericError(ErrorResponse {
-                correlation_id: req.correlation_id,
-                error_code: IDENTIFY_INVALID_NONCE,
-                error_message: "Nonce expired or too far in the future".to_string(),
-            }));
-        }
-        Err(_) => {
-            return Err(Response::GenericError(ErrorResponse {
-                correlation_id: req.correlation_id,
-                error_code: IDENTIFY_INVALID_SIGNATURE,
-                error_message: "Invalid signature".to_string(),
-            }));
-        }
-    };
+    // Validate keypair identity if provided
+    if let (Some(public_key), Some(nonce), Some(signature)) = (&req.public_key, &req.nonce, &req.signature) {
+        let client_id = match Crypto::validate_with_public_key(public_key, nonce, signature) {
+            Ok(id) => id,
+            Err(celeriant_crypto::CryptoError::InvalidNonce) => {
+                return Err(Response::GenericError(ErrorResponse {
+                    correlation_id: req.correlation_id,
+                    error_code: IDENTIFY_INVALID_NONCE,
+                    error_message: "Nonce expired or too far in the future".to_string(),
+                }));
+            }
+            Err(_) => {
+                return Err(Response::GenericError(ErrorResponse {
+                    correlation_id: req.correlation_id,
+                    error_code: IDENTIFY_INVALID_SIGNATURE,
+                    error_message: "Invalid signature".to_string(),
+                }));
+            }
+        };
+        conn_state.verified_client_id = Some(client_id);
+    }
 
-    // Store verified client_id in connection state
-    conn_state.verified_client_id = Some(client_id);
+    // API key authentication
+    if let Some(ref api_key_hashes) = *config.api_key_hashes.borrow() {
+        let api_key_str = req.api_key.as_ref().ok_or_else(|| {
+            Response::GenericError(ErrorResponse {
+                correlation_id: req.correlation_id,
+                error_code: ErrorResponse::AUTH_REQUIRED,
+                error_message: "API key required but not provided".to_string(),
+            })
+        })?;
+
+        let api_key_bytes = base64::engine::general_purpose::STANDARD
+            .decode(api_key_str)
+            .map_err(|_| {
+                Response::GenericError(ErrorResponse {
+                    correlation_id: req.correlation_id,
+                    error_code: ErrorResponse::AUTH_INVALID_KEY,
+                    error_message: "Invalid API key format".to_string(),
+                })
+            })?;
+
+        if api_key_bytes.len() != 32 {
+            return Err(Response::GenericError(ErrorResponse {
+                correlation_id: req.correlation_id,
+                error_code: ErrorResponse::AUTH_INVALID_KEY,
+                error_message: "Invalid API key length".to_string(),
+            }));
+        }
+
+        let mut key_array = [0u8; 32];
+        key_array.copy_from_slice(&api_key_bytes);
+
+        let key_hash = celeriant_crypto::hash_api_key(&key_array);
+
+        let access_level = api_key_hashes.validate(&key_hash).ok_or_else(|| {
+            Response::GenericError(ErrorResponse {
+                correlation_id: req.correlation_id,
+                error_code: ErrorResponse::AUTH_INVALID_KEY,
+                error_message: "Invalid API key".to_string(),
+            })
+        })?;
+
+        conn_state.access_level = Some(access_level);
+    } else {
+        conn_state.access_level = None;
+    }
+
     Ok(())
 }
 
@@ -339,6 +403,21 @@ fn validate_client_id(request: &Request, verified_client_id: Option<u128>) -> Re
     Ok(())
 }
 
+/// Check if a request is allowed based on the connection's access level.
+fn is_valid_for_access_level(request: &Request, access_level: Option<AccessLevel>) -> bool {
+    match access_level {
+        None => true,
+        Some(AccessLevel::ReadWrite) => true,
+        Some(AccessLevel::ReadOnly) => {
+            !matches!(request,
+                Request::Write(_) |
+                Request::TrimStart(_) |
+                Request::Delete(_)
+            )
+        }
+    }
+}
+
 async fn check_redirect<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
     mut tcp_stream: TcpStream,
     request: Request,
@@ -369,6 +448,7 @@ async fn check_redirect<R: ReplicationClient + 'static, D: S3Downloader + 'stati
             message_version,
             port_type,
             verified_client_id: conn_state.verified_client_id,
+            access_level: conn_state.access_level,
         };
         if let Err(e) = ctx.intrashard_sender.send_to(target_shard, msg).await {
             warn!("Failed to redirect connection to shard {target_shard}: {e:?}");
@@ -820,6 +900,7 @@ mod tests {
             tls_client_auth: celeriant_crypto::pki::ClientAuthMode::None,
             tls_cert_reload_interval: Duration::ZERO,
             require_client_identity: false,
+            api_key_hashes: std::cell::RefCell::new(None),
         }
     }
 

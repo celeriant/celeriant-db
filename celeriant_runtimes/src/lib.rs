@@ -17,7 +17,7 @@ use crate::{sharded::{intrashard_messages::IntrashardMessages, shard::Shard}, si
 mod sharded;
 mod sidecar;
 
-pub use {sharded::shard_config::{ShardConfig, TlsCertPaths}, sidecar::sidecar_config::SidecarConfig, sharded::routing_rule::RoutingRule, celeriant_wal::compression_type::CompressionType, sharded::tls_config::{TlsConfig, TlsMode}};
+pub use {sharded::shard_config::{ApiKeyHashes, ShardConfig, TlsCertPaths}, sidecar::sidecar_config::SidecarConfig, sharded::routing_rule::RoutingRule, celeriant_wal::compression_type::CompressionType, sharded::tls_config::{TlsConfig, TlsMode}};
 
 const MAX_SHARD_RESTARTS: u32 = 3;
 const SHARD_RESTART_DELAY: Duration = Duration::from_secs(5);

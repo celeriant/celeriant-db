@@ -257,6 +257,10 @@ path = "src/mtls_test_main.rs"
 name = "identity_test_main"
 path = "src/identity_test_main.rs"
 
+[[bin]]
+name = "api_key_test_main"
+path = "src/api_key_test_main.rs"
+
 [features]
 default = []
 small-metablock = [
@@ -291,3 +295,5 @@ rustls.workspace = true
 rustls-pki-types.workspace = true
 tokio-rustls.workspace = true
 reqwest = { version = "0.12", features = ["blocking"] }
+base64.workspace = true
+hex = "0.4"

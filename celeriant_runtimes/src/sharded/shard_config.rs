@@ -1,12 +1,41 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{cell::RefCell, path::PathBuf, sync::Arc, time::Duration};
 
 use celeriant_crypto::pki::ClientAuthMode;
+use celeriant_msg::response::responses::AccessLevel;
 use celeriant_shard::timestamp_config::TimestampConfig;
 use celeriant_distributed::config::ReplicationConfig;
 use celeriant_wal::compression_type::CompressionType;
 
 use crate::sharded::routing_rule::RoutingRule;
 use crate::sharded::tls_config::TlsConfig;
+
+/// SHA-256 hashes of the 4 API keys (primary_rw, secondary_rw, primary_ro, secondary_ro)
+#[derive(Debug, Clone)]
+pub struct ApiKeyHashes {
+    pub read_write: [[u8; 32]; 2],
+    pub read_only: [[u8; 32]; 2],
+}
+
+impl ApiKeyHashes {
+    /// Check if a key hash matches any configured key, returning the access level if found
+    pub fn validate(&self, key_hash: &[u8; 32]) -> Option<AccessLevel> {
+        use celeriant_crypto::constant_time_compare;
+
+        for rw_hash in &self.read_write {
+            if constant_time_compare(key_hash, rw_hash) {
+                return Some(AccessLevel::ReadWrite);
+            }
+        }
+
+        for ro_hash in &self.read_only {
+            if constant_time_compare(key_hash, ro_hash) {
+                return Some(AccessLevel::ReadOnly);
+            }
+        }
+
+        None
+    }
+}
 
 /// File paths for TLS certificate hot-reload.
 #[derive(Clone, Debug)]
@@ -65,4 +94,7 @@ pub struct ShardConfig {
     pub tls_cert_reload_interval: std::time::Duration,
     /// When true, clients must send IdentifyRequest as their first message.
     pub require_client_identity: bool,
+    /// API key hashes for authentication. None means no API key auth.
+    /// Wrapped in RefCell to allow hot-reload without restarting connections.
+    pub api_key_hashes: RefCell<Option<Arc<ApiKeyHashes>>>,
 }

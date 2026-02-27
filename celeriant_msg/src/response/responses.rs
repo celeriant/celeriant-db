@@ -115,6 +115,11 @@ impl ErrorResponse {
     /// Server requires client identity verification but none was provided.
     pub const IDENTIFY_REQUIRED: u32 = 10004;
 
+    /// Authentication error codes
+    pub const AUTH_REQUIRED: u32 = 1001;
+    pub const AUTH_INVALID_KEY: u32 = 1002;
+    pub const AUTH_INSUFFICIENT_PERMISSIONS: u32 = 1003;
+
     pub fn is_not_leader(&self) -> bool {
         matches!(self.error_code, Self::WRITE_NOT_LEADER | Self::TRIM_NOT_LEADER | Self::DELETE_NOT_LEADER)
     }
@@ -241,6 +246,14 @@ pub struct KickFollowerResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct IdentifyResponse {
     pub correlation_id: Option<u128>,
-    /// The server-derived client_id, sent back so the client can confirm.
-    pub client_id: u128,
+    pub client_id: Option<u128>,
+    /// Access level granted after authentication. None if auth was disabled.
+    pub access_level: Option<AccessLevel>,
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+pub enum AccessLevel {
+    ReadWrite = 1,
+    ReadOnly = 2,
 }

@@ -420,6 +420,14 @@ pub struct ServerConfig {
         help = "Require clients to send an IdentifyRequest as their first message"
     )]
     pub require_client_identity: bool,
+
+    #[arg(
+        long,
+        action = clap::ArgAction::SetTrue,
+        env = "CELERIANT_INSECURE_ALLOW_PLAINTEXT_AUTH",
+        help = "Allow API key auth without TLS (INSECURE - development only)"
+    )]
+    pub insecure_allow_plaintext_auth: bool,
 }
 
 impl ServerConfig {
@@ -508,8 +516,8 @@ impl ServerConfig {
         Ok(Some(Arc::new(TlsConfig { server_config, client_config, tls_mode })))
     }
 
-    pub fn to_shard_config(&self, node_id: u128, num_shards: u32, tls_config: Option<Arc<TlsConfig>>) -> ShardConfig {
-        use celeriant_runtimes::{CompressionType, TlsCertPaths};
+    pub fn to_shard_config(&self, node_id: u128, num_shards: u32, tls_config: Option<Arc<TlsConfig>>, api_keys: Option<crate::api_keys::ApiKeysConfig>) -> ShardConfig {
+        use celeriant_runtimes::{CompressionType, TlsCertPaths, ApiKeyHashes};
         use celeriant_crypto::pki::ClientAuthMode;
 
         let replication_config = if self.standalone {
@@ -529,6 +537,13 @@ impl ServerConfig {
                 ..Default::default()
             })
         };
+
+        let api_key_hashes = api_keys.map(|keys| {
+            Arc::new(ApiKeyHashes {
+                read_write: [keys.primary_rw, keys.secondary_rw],
+                read_only: [keys.primary_ro, keys.secondary_ro],
+            })
+        });
 
         ShardConfig {
             node_id,
@@ -604,6 +619,7 @@ impl ServerConfig {
             },
             tls_cert_reload_interval: std::time::Duration::from_secs(self.tls_cert_reload_interval_secs),
             require_client_identity: self.require_client_identity,
+            api_key_hashes: std::cell::RefCell::new(api_key_hashes),
         }
     }
 
@@ -681,6 +697,7 @@ impl ServerConfig {
         check_field!(tls_client_auth);
         check_field!(tls_cert_reload_interval_secs);
         check_field!(require_client_identity);
+        check_field!(insecure_allow_plaintext_auth);
 
         entries
     }
@@ -757,6 +774,7 @@ impl Default for ServerConfig {
             tls_client_auth: ConfigClientAuth::Require,
             tls_cert_reload_interval_secs: 0,
             require_client_identity: false,
+            insecure_allow_plaintext_auth: false,
         }
     }
 }

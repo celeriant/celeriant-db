@@ -598,6 +598,10 @@ impl ServerConfigExt for ServerConfig {
             args.push("--require-client-identity".to_string());
         }
 
+        if self.insecure_allow_plaintext_auth {
+            args.push("--insecure-allow-plaintext-auth".to_string());
+        }
+
         args
     }
 }

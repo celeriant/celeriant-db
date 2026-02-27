@@ -12,6 +12,8 @@ use crate::{
         ReadResponse, SuccessResponse, WatchResponse,
     },
 };
+#[cfg(test)]
+use crate::response::responses::AccessLevel;
 #[cfg(feature = "cluster")]
 use crate::response::responses::{CatchUpResponse, HeartbeatResponse, KickFollowerResponse, ReplicationBatchResponse};
 
@@ -358,7 +360,8 @@ mod tests {
             }),
             ResponseType::Identify => Response::Identify(IdentifyResponse {
                 correlation_id: Some(0x9999_AAAA_BBBB_CCCC),
-                client_id: 0xCCCC_DDDD_EEEE_FFFF,
+                client_id: Some(0xCCCC_DDDD_EEEE_FFFF),
+                access_level: Some(AccessLevel::ReadWrite),
             }),
         }
     }

@@ -31,6 +31,8 @@ Basic correctness, concurrency, and connection handling. No Docker required.
 | `chaos_delete_main` | Write/delete/read concurrency with final state verification across multiple orgs and types |
 | `watch_test_main` | Watch API: streaming subscriptions, aggregate filtering, heartbeats, multiple concurrent watchers |
 | `connection_test_main` | Connection handling: pipelining, cross-shard routing, connection churn, long-lived connections |
+| `identity_test_main` | Client identity verification via public key cryptography; enforcement modes, mismatch rejection |
+| `api_key_test` | API key authentication; read-write vs read-only permissions, invalid keys, backward compatibility |
 
 ```bash
 cargo run --bin single_main -p celeriant_integration_tests --release

@@ -164,10 +164,12 @@ pub struct KickFollowerRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct IdentifyRequest {
     pub correlation_id: Option<u128>,
-    /// Base64-encoded DER public key (SubjectPublicKeyInfo format).
-    pub public_key: String,
-    /// Client-generated nonce: UTC epoch milliseconds as decimal string.
-    pub nonce: String,
-    /// Base64-encoded RSASSA-PKCS1-v1_5-SHA256 signature over the nonce.
-    pub signature: String,
+    /// Base64-encoded DER public key (SubjectPublicKeyInfo format). None for API-key-only auth.
+    pub public_key: Option<String>,
+    /// Client-generated nonce: UTC epoch milliseconds as decimal string. None for API-key-only auth.
+    pub nonce: Option<String>,
+    /// Base64-encoded RSASSA-PKCS1-v1_5-SHA256 signature over the nonce. None for API-key-only auth.
+    pub signature: Option<String>,
+    /// Base64-encoded 32-byte API key. None when authentication is disabled.
+    pub api_key: Option<String>,
 }

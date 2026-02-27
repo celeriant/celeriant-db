@@ -4,6 +4,7 @@ use mimalloc::MiMalloc;
 static GLOBAL: MiMalloc = MiMalloc;
 
 use celeriant_lib::cert_cmd::run_cert;
+use celeriant_lib::keys_cmd::run_keys;
 use celeriant_lib::startup;
 
 #[deny(clippy::disallowed_methods)]
@@ -14,6 +15,15 @@ fn main() -> Result<(), std::io::Error> {
         let cert_argv: Vec<String> = args.drain(2..).collect();
         if let Err(e) = run_cert(cert_argv) {
             eprintln!("error: {e:?}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    if args.get(1).map(|s| s.as_str()) == Some("keys") {
+        let keys_argv: Vec<String> = args.drain(2..).collect();
+        if let Err(e) = run_keys(keys_argv) {
+            eprintln!("error: {}", e);
             std::process::exit(1);
         }
         return Ok(());

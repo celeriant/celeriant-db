@@ -79,16 +79,17 @@ async fn test_successful_identity_verification(
     // Generate keypair
     let keypair = Crypto::generate_keypair(None)?;
     let identity_config = ClientIdentityConfig {
-        public_key: keypair.public_key_base64.clone(),
-        private_key: keypair.private_key_base64.clone(),
+        public_key: Some(keypair.public_key_base64.clone()),
+        private_key: Some(keypair.private_key_base64.clone()),
+        api_key: None,
     };
 
     // Derive expected client_id using validate_with_public_key
     // (we can use this since we have a valid nonce and signature)
     let nonce = Crypto::generate_nonce()?;
-    let signature = Crypto::sign_nonce(&identity_config.private_key, &nonce)?;
+    let signature = Crypto::sign_nonce(identity_config.private_key.as_deref().unwrap(), &nonce)?;
     let expected_client_id = Crypto::validate_with_public_key(
-        &identity_config.public_key,
+        identity_config.public_key.as_deref().unwrap(),
         &nonce,
         &signature,
     )?;
@@ -99,10 +100,10 @@ async fn test_successful_identity_verification(
     let mut client = CeleriantClient::connect(server_address).await?;
     let verified_client_id = client.identify(&identity_config).await?;
 
-    println!("  Server verified client_id: {}", verified_client_id);
+    println!("  Server verified client_id: {:?}", verified_client_id);
 
     assert_eq!(
-        verified_client_id, expected_client_id,
+        verified_client_id.unwrap(), expected_client_id,
         "Server-returned client_id should match derived client_id"
     );
 
@@ -123,7 +124,7 @@ async fn test_successful_identity_verification(
 
     let write_req = WriteRequest {
         correlation_id: Some(1),
-        client_id: verified_client_id,
+        client_id: verified_client_id.unwrap(),
         user_id: Some(888),
         writes,
     };
@@ -154,17 +155,18 @@ async fn test_identity_mismatch_rejection(
     // Generate keypair and identify as client A
     let keypair = Crypto::generate_keypair(None)?;
     let identity_config = ClientIdentityConfig {
-        public_key: keypair.public_key_base64.clone(),
-        private_key: keypair.private_key_base64.clone(),
+        public_key: Some(keypair.public_key_base64.clone()),
+        private_key: Some(keypair.private_key_base64.clone()),
+        api_key: None,
     };
 
     let mut client = CeleriantClient::connect(server_address).await?;
     let client_id_a = client.identify(&identity_config).await?;
 
-    println!("  Verified as client_id: {}", client_id_a);
+    println!("  Verified as client_id: {:?}", client_id_a);
 
     // Generate a different client_id (client B)
-    let client_id_b = client_id_a.wrapping_add(1);
+    let client_id_b = client_id_a.unwrap().wrapping_add(1);
 
     println!("  Attempting write with different client_id: {}", client_id_b);
 
@@ -342,14 +344,15 @@ async fn test_enforcement_allows_identified(
 
     let keypair = Crypto::generate_keypair(None)?;
     let identity_config = ClientIdentityConfig {
-        public_key: keypair.public_key_base64.clone(),
-        private_key: keypair.private_key_base64.clone(),
+        public_key: Some(keypair.public_key_base64.clone()),
+        private_key: Some(keypair.private_key_base64.clone()),
+        api_key: None,
     };
 
     let mut client = CeleriantClient::connect(server_address).await?;
     let verified_client_id = client.identify(&identity_config).await?;
 
-    println!("  Identified as client_id: {}", verified_client_id);
+    println!("  Identified as client_id: {:?}", verified_client_id);
 
     // Send a write with the verified client_id — should succeed
     let aggregate_key = AggregateKey::new(1, 2, 201);
@@ -368,7 +371,7 @@ async fn test_enforcement_allows_identified(
 
     let write_req = WriteRequest {
         correlation_id: Some(5),
-        client_id: verified_client_id,
+        client_id: verified_client_id.unwrap(),
         user_id: Some(888),
         writes,
     };

@@ -84,8 +84,9 @@ impl Unpin for ClientStream {}
 
 #[derive(Clone)]
 pub struct ClientIdentityConfig {
-    pub public_key: String,
-    pub private_key: String,
+    pub public_key: Option<String>,
+    pub private_key: Option<String>,
+    pub api_key: Option<String>,
 }
 
 /// Minimal, high-performance Celeriant TCP client
@@ -230,28 +231,32 @@ impl CeleriantClient {
     /// let mut client = CeleriantClient::connect("127.0.0.1:10000").await?;
     ///
     /// let identity_config = ClientIdentityConfig {
-    ///     public_key: "MIIBIjANBg...".to_string(),  // Base64-encoded public key
-    ///     private_key: "MIIEvgIBAD...".to_string(), // Base64-encoded private key
+    ///     public_key: Some("MIIBIjANBg...".to_string()),  // Base64-encoded public key
+    ///     private_key: Some("MIIEvgIBAD...".to_string()), // Base64-encoded private key
+    ///     api_key: None, // Optional API key for authentication
     /// };
     ///
     /// let client_id = client.identify(&identity_config).await?;
-    /// println!("Verified client_id: {}", client_id);
+    /// println!("Verified client_id: {:?}", client_id);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn identify(&mut self, identity_config: &ClientIdentityConfig) -> Result<u128, ClientError> {
-        // Generate nonce
-        let nonce = Crypto::generate_nonce()?;
+    pub async fn identify(&mut self, identity_config: &ClientIdentityConfig) -> Result<Option<u128>, ClientError> {
+        let (public_key, nonce, signature) = match (&identity_config.public_key, &identity_config.private_key) {
+            (Some(pub_key), Some(priv_key)) => {
+                let nonce = Crypto::generate_nonce()?;
+                let sig = Crypto::sign_nonce(priv_key, &nonce)?;
+                (Some(pub_key.clone()), Some(nonce), Some(sig))
+            }
+            _ => (None, None, None),
+        };
 
-        // Sign the nonce
-        let signature = Crypto::sign_nonce(&identity_config.private_key, &nonce)?;
-
-        // Build IdentifyRequest
         let request = Request::Identify(IdentifyRequest {
             correlation_id: None,
-            public_key: identity_config.public_key.clone(),
+            public_key,
             nonce,
             signature,
+            api_key: identity_config.api_key.clone(),
         });
 
         // Send request using shared helper with timeout handling
@@ -265,6 +270,7 @@ impl CeleriantClient {
 
         match response {
             Response::Identify(resp) => Ok(resp.client_id),
+            Response::GenericError(err) => Err(ClientError::CeleriantError(err)),
             _ => Err(ClientError::ProtocolError),
         }
     }
@@ -279,23 +285,25 @@ mod tests {
     fn identity_config_can_be_created() {
         let keypair = Crypto::generate_keypair(None).expect("keypair generation should succeed");
         let config = ClientIdentityConfig {
-            public_key: keypair.public_key_base64.clone(),
-            private_key: keypair.private_key_base64.clone(),
+            public_key: Some(keypair.public_key_base64.clone()),
+            private_key: Some(keypair.private_key_base64.clone()),
+            api_key: None,
         };
-        assert!(!config.public_key.is_empty());
-        assert!(!config.private_key.is_empty());
+        assert!(config.public_key.as_ref().is_some_and(|k| !k.is_empty()));
+        assert!(config.private_key.as_ref().is_some_and(|k| !k.is_empty()));
     }
 
     #[test]
     fn identity_config_can_sign_nonce() {
         let keypair = Crypto::generate_keypair(None).expect("keypair generation should succeed");
         let config = ClientIdentityConfig {
-            public_key: keypair.public_key_base64.clone(),
-            private_key: keypair.private_key_base64.clone(),
+            public_key: Some(keypair.public_key_base64.clone()),
+            private_key: Some(keypair.private_key_base64.clone()),
+            api_key: None,
         };
 
         let nonce = Crypto::generate_nonce().expect("nonce generation should succeed");
-        let signature = Crypto::sign_nonce(&config.private_key, &nonce)
+        let signature = Crypto::sign_nonce(config.private_key.as_deref().unwrap(), &nonce)
             .expect("signing should succeed");
 
         assert!(!signature.is_empty());

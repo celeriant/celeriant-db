@@ -1,5 +1,5 @@
 use celeriant_distributed::validated_node_status::ValidatedNodeStatus;
-use celeriant_msg::process_requests::Request;
+use celeriant_msg::{process_requests::Request, response::responses::AccessLevel};
 use celeriant_shard::{error::s3_catchup_error::S3CatchupError, shard_wal_s3_catchup::S3CatchupResult};
 use glommio::net::AcceptedTcpStream;
 
@@ -14,6 +14,7 @@ pub enum IntrashardMessages {
         message_version: u32,
         port_type: PortType,
         verified_client_id: Option<u128>,
+        access_level: Option<AccessLevel>,
     },
     EnterS3Catchup,
     S3CatchupComplete {

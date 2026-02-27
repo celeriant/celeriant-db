@@ -10,6 +10,10 @@ pub struct Cli {
     #[arg(short, long, default_value = "127.0.0.1:10000", env = "CELERIANT_SERVER")]
     pub server: String,
 
+    /// API key for authentication (base64-encoded)
+    #[arg(long, env = "CELERIANT_API_KEY")]
+    pub api_key: Option<String>,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }

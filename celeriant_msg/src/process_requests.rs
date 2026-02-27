@@ -490,9 +490,10 @@ mod tests {
             }),
             RequestType::Identify => Request::Identify(IdentifyRequest {
                 correlation_id: Some(0x8888_9999_AAAA_BBBB),
-                public_key: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA".to_string(),
-                nonce: "1234567890000".to_string(),
-                signature: "dGVzdHNpZ25hdHVyZQ==".to_string(),
+                public_key: Some("MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA".to_string()),
+                nonce: Some("1234567890000".to_string()),
+                signature: Some("dGVzdHNpZ25hdHVyZQ==".to_string()),
+                api_key: Some("SGVsbG9Xb3JsZEhlbGxvV29ybGRIZWxsb1dvcmxkSGVsbG9Xb3JsZA==".to_string()),
             }),
         }
     }

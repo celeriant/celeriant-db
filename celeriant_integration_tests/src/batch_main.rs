@@ -17,9 +17,11 @@
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use celeriant_client_tokio::celeriant_client::CeleriantClient;
+use base64::Engine;
+use celeriant_client_tokio::celeriant_client::{CeleriantClient, ClientIdentityConfig};
 use celeriant_client_tokio::client_error::ClientError;
 use celeriant_client_tokio::ClientTlsConfig;
+use celeriant_crypto::{generate_api_key, hash_api_key, Crypto};
 use celeriant_integration_tests::{count_events, MinioContainer, ServerConfig, TestPki, TestServer};
 use celeriant_lib::server_config::{ConfigClientAuth, ConfigTlsMode};
 use celeriant_msg::request::requests::WriteRequest;
@@ -28,6 +30,8 @@ use celeriant_wal::{
     aggregate_key::AggregateKey, compression_type::CompressionType,
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
 };
+use std::fs;
+use std::path::Path;
 use tokio::sync::Barrier;
 use tokio::time::Instant;
 
@@ -56,6 +60,58 @@ const CONNECTION_SWEEP: &[usize] = &[
     512, 1024, 2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384,
 ];
 
+struct ApiKeySet {
+    primary_rw: [u8; 32],
+    primary_rw_hash: [u8; 32],
+    #[allow(dead_code)]
+    secondary_rw: [u8; 32],
+    secondary_rw_hash: [u8; 32],
+    #[allow(dead_code)]
+    primary_ro: [u8; 32],
+    primary_ro_hash: [u8; 32],
+    #[allow(dead_code)]
+    secondary_ro: [u8; 32],
+    secondary_ro_hash: [u8; 32],
+}
+
+fn generate_key_set() -> ApiKeySet {
+    let primary_rw = generate_api_key();
+    let primary_rw_hash = hash_api_key(&primary_rw);
+    let secondary_rw = generate_api_key();
+    let secondary_rw_hash = hash_api_key(&secondary_rw);
+    let primary_ro = generate_api_key();
+    let primary_ro_hash = hash_api_key(&primary_ro);
+    let secondary_ro = generate_api_key();
+    let secondary_ro_hash = hash_api_key(&secondary_ro);
+
+    ApiKeySet {
+        primary_rw,
+        primary_rw_hash,
+        secondary_rw,
+        secondary_rw_hash,
+        primary_ro,
+        primary_ro_hash,
+        secondary_ro,
+        secondary_ro_hash,
+    }
+}
+
+fn create_api_keys_file(data_root: &Path, keys: &ApiKeySet) -> std::io::Result<()> {
+    let content = format!(
+        r#"[keys]
+primary_rw = "{}"
+secondary_rw = "{}"
+primary_ro = "{}"
+secondary_ro = "{}"
+"#,
+        hex::encode(keys.primary_rw_hash),
+        hex::encode(keys.secondary_rw_hash),
+        hex::encode(keys.primary_ro_hash),
+        hex::encode(keys.secondary_ro_hash),
+    );
+    fs::write(data_root.join("api_keys.toml"), content)
+}
+
 struct TaskStats {
     request_count: u64,
     latencies_us: Vec<u64>,
@@ -69,13 +125,23 @@ struct ReplicatedServers {
 
 impl ReplicatedServers {
     async fn start(base_port: u16, log_level: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::start_with_tls(base_port, log_level, None).await
+        Self::start_with_tls_and_keys(base_port, log_level, None, None).await
     }
 
+    #[allow(dead_code)]
     async fn start_with_tls(
         base_port: u16,
         log_level: &str,
         tls: Option<&TestPki>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::start_with_tls_and_keys(base_port, log_level, tls, None).await
+    }
+
+    async fn start_with_tls_and_keys(
+        base_port: u16,
+        log_level: &str,
+        tls: Option<&TestPki>,
+        api_keys: Option<&ApiKeySet>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let minio_port = base_port + 10;
         println!("Starting MinIO on port {}...", minio_port);
@@ -103,20 +169,36 @@ impl ReplicatedServers {
             s3_allow_http: allow_http,
             ..Default::default()
         };
+
+        let has_tls = tls_fields.is_some();
         if let Some((ca, cert, key)) = &tls_fields {
             leader_config.tls_mode = ConfigTlsMode::Strict;
             leader_config.tls_ca_cert = Some(ca.clone());
             leader_config.tls_node_cert = Some(cert.clone());
             leader_config.tls_node_key = Some(key.clone());
             leader_config.tls_client_auth = ConfigClientAuth::Require;
-            // Bind to 127.0.0.1 so replication SNI matches cert SANs
             leader_config.listen_address = "127.0.0.1".to_string();
         }
+
+        if api_keys.is_some() {
+            leader_config.require_client_identity = true;
+            if !has_tls {
+                leader_config.insecure_allow_plaintext_auth = true;
+            }
+        }
+
         println!(
             "Starting leader on port {} (S3 election mode)...",
             base_port
         );
-        let leader = TestServer::start_with_config(base_port, leader_config).await?;
+
+        let leader = if let Some(keys) = api_keys {
+            let temp_dir = tempfile::TempDir::new()?;
+            create_api_keys_file(temp_dir.path(), keys)?;
+            TestServer::start_with_existing_dir(base_port, leader_config, "leader".to_string(), temp_dir).await?
+        } else {
+            TestServer::start_with_config(base_port, leader_config).await?
+        };
 
         // Wait for leader to grab the S3 lease before starting follower
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -133,6 +215,7 @@ impl ReplicatedServers {
             s3_allow_http: allow_http,
             ..Default::default()
         };
+
         if let Some((ca, cert, key)) = &tls_fields {
             follower_config.tls_mode = ConfigTlsMode::Strict;
             follower_config.tls_ca_cert = Some(ca.clone());
@@ -141,8 +224,23 @@ impl ReplicatedServers {
             follower_config.tls_client_auth = ConfigClientAuth::Require;
             follower_config.listen_address = "127.0.0.1".to_string();
         }
+
+        if api_keys.is_some() {
+            follower_config.require_client_identity = true;
+            if !has_tls {
+                follower_config.insecure_allow_plaintext_auth = true;
+            }
+        }
+
         println!("Starting follower on port {}...", follower_port);
-        let follower = TestServer::start_with_config(follower_port, follower_config).await?;
+
+        let follower = if let Some(keys) = api_keys {
+            let temp_dir = tempfile::TempDir::new()?;
+            create_api_keys_file(temp_dir.path(), keys)?;
+            TestServer::start_with_existing_dir(follower_port, follower_config, "follower".to_string(), temp_dir).await?
+        } else {
+            TestServer::start_with_config(follower_port, follower_config).await?
+        };
 
         // Wait for follower election + replication connection establishment
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -231,10 +329,19 @@ async fn run_full_benchmark_suite() -> Result<(), Box<dyn std::error::Error>> {
     println!("Scenarios: standalone + replicated x throughput + latency x plaintext + mTLS\n");
 
     let mut results: Vec<ScenarioResult> = Vec::new();
-    // Paired results for comparison: (plaintext_throughput, plaintext_latency)
     let mut plaintext_pairs: Vec<(BenchmarkResult, BenchmarkResult)> = Vec::new();
     let mut mtls_pairs: Vec<(BenchmarkResult, BenchmarkResult)> = Vec::new();
     let base_port = 10100 + (std::process::id() % 100) as u16;
+
+    // Generate API keys and client identity for all scenarios
+    let api_keys = generate_key_set();
+    let keypair = Crypto::generate_keypair(None)?;
+    let api_key_b64 = base64::engine::general_purpose::STANDARD.encode(&api_keys.primary_rw);
+    let identity_config = ClientIdentityConfig {
+        public_key: Some(keypair.public_key_base64.clone()),
+        private_key: Some(keypair.private_key_base64.clone()),
+        api_key: Some(api_key_b64),
+    };
 
     // Set up PKI once for all mTLS scenarios
     let pki = TestPki::new()?;
@@ -250,16 +357,20 @@ async fn run_full_benchmark_suite() -> Result<(), Box<dyn std::error::Error>> {
         let config = ServerConfig {
             log_level: "warn".to_string(),
             standalone: true,
+            require_client_identity: true,
+            insecure_allow_plaintext_auth: true,
             ..Default::default()
         };
-        let server = TestServer::start_with_config(base_port, config).await?;
+        let temp_dir = tempfile::TempDir::new()?;
+        create_api_keys_file(temp_dir.path(), &api_keys)?;
+        let server = TestServer::start_with_existing_dir(base_port, config, "standalone-pt".to_string(), temp_dir).await?;
         let addr = server.address().to_string();
 
         println!(
             "\n--- Standalone Plaintext Throughput ({} connections) ---",
             THROUGHPUT_CONNECTIONS
         );
-        let thru = run_benchmark_iteration(&addr, THROUGHPUT_CONNECTIONS, None).await?;
+        let thru = run_benchmark_iteration(&addr, THROUGHPUT_CONNECTIONS, None, Some(identity_config.clone())).await?;
         print_result(&thru);
         results.push(ScenarioResult {
             label: "Standalone PT Thru".to_string(),
@@ -280,7 +391,7 @@ async fn run_full_benchmark_suite() -> Result<(), Box<dyn std::error::Error>> {
             "\n--- Standalone Plaintext Latency ({} connections) ---",
             LATENCY_CONNECTIONS
         );
-        let lat = run_benchmark_iteration(&addr, LATENCY_CONNECTIONS, None).await?;
+        let lat = run_benchmark_iteration(&addr, LATENCY_CONNECTIONS, None, Some(identity_config.clone())).await?;
         print_result(&lat);
         results.push(ScenarioResult {
             label: "Standalone PT Lat".to_string(),
@@ -315,9 +426,12 @@ async fn run_full_benchmark_suite() -> Result<(), Box<dyn std::error::Error>> {
             tls_node_cert: Some(node_cert.clone()),
             tls_node_key: Some(node_key.clone()),
             tls_client_auth: ConfigClientAuth::Require,
+            require_client_identity: true,
             ..Default::default()
         };
-        let server = TestServer::start_with_config(base_port, config).await?;
+        let temp_dir = tempfile::TempDir::new()?;
+        create_api_keys_file(temp_dir.path(), &api_keys)?;
+        let server = TestServer::start_with_existing_dir(base_port, config, "standalone-mtls".to_string(), temp_dir).await?;
         let addr = server.address().to_string();
         let client_tls = pki.build_client_tls_config(&client_cert, &client_key, "localhost")?;
 
@@ -325,7 +439,7 @@ async fn run_full_benchmark_suite() -> Result<(), Box<dyn std::error::Error>> {
             "\n--- Standalone mTLS Throughput ({} connections) ---",
             THROUGHPUT_CONNECTIONS
         );
-        let thru = run_benchmark_iteration(&addr, THROUGHPUT_CONNECTIONS, Some(client_tls)).await?;
+        let thru = run_benchmark_iteration(&addr, THROUGHPUT_CONNECTIONS, Some(client_tls), Some(identity_config.clone())).await?;
         print_result(&thru);
         results.push(ScenarioResult {
             label: "Standalone mTLS Thru".to_string(),
@@ -340,7 +454,7 @@ async fn run_full_benchmark_suite() -> Result<(), Box<dyn std::error::Error>> {
             "\n--- Standalone mTLS Latency ({} connections) ---",
             LATENCY_CONNECTIONS
         );
-        let lat = run_benchmark_iteration(&addr, LATENCY_CONNECTIONS, Some(client_tls)).await?;
+        let lat = run_benchmark_iteration(&addr, LATENCY_CONNECTIONS, Some(client_tls), Some(identity_config.clone())).await?;
         print_result(&lat);
         results.push(ScenarioResult {
             label: "Standalone mTLS Lat".to_string(),
@@ -363,14 +477,14 @@ async fn run_full_benchmark_suite() -> Result<(), Box<dyn std::error::Error>> {
         println!("  REPLICATED PLAINTEXT");
         println!("{}\n", "=".repeat(70));
 
-        let replicated = ReplicatedServers::start(base_port + 200, "warn").await?;
+        let replicated = ReplicatedServers::start_with_tls_and_keys(base_port + 200, "warn", None, Some(&api_keys)).await?;
         let addr = replicated.address().to_string();
 
         println!(
             "\n--- Replicated Plaintext Throughput ({} connections) ---",
             THROUGHPUT_CONNECTIONS
         );
-        let thru = run_benchmark_iteration(&addr, THROUGHPUT_CONNECTIONS, None).await?;
+        let thru = run_benchmark_iteration(&addr, THROUGHPUT_CONNECTIONS, None, Some(identity_config.clone())).await?;
         print_result(&thru);
         results.push(ScenarioResult {
             label: "Replicated PT Thru".to_string(),
@@ -391,7 +505,7 @@ async fn run_full_benchmark_suite() -> Result<(), Box<dyn std::error::Error>> {
             "\n--- Replicated Plaintext Latency ({} connections) ---",
             LATENCY_CONNECTIONS
         );
-        let lat = run_benchmark_iteration(&addr, LATENCY_CONNECTIONS, None).await?;
+        let lat = run_benchmark_iteration(&addr, LATENCY_CONNECTIONS, None, Some(identity_config.clone())).await?;
         print_result(&lat);
         results.push(ScenarioResult {
             label: "Replicated PT Lat".to_string(),
@@ -419,7 +533,7 @@ async fn run_full_benchmark_suite() -> Result<(), Box<dyn std::error::Error>> {
         println!("{}\n", "=".repeat(70));
 
         let replicated =
-            ReplicatedServers::start_with_tls(base_port + 400, "warn", Some(&pki)).await?;
+            ReplicatedServers::start_with_tls_and_keys(base_port + 400, "warn", Some(&pki), Some(&api_keys)).await?;
         let addr = replicated.address().to_string();
         let client_tls = pki.build_client_tls_config(&client_cert, &client_key, "localhost")?;
 
@@ -427,7 +541,7 @@ async fn run_full_benchmark_suite() -> Result<(), Box<dyn std::error::Error>> {
             "\n--- Replicated mTLS Throughput ({} connections) ---",
             THROUGHPUT_CONNECTIONS
         );
-        let thru = run_benchmark_iteration(&addr, THROUGHPUT_CONNECTIONS, Some(client_tls)).await?;
+        let thru = run_benchmark_iteration(&addr, THROUGHPUT_CONNECTIONS, Some(client_tls), Some(identity_config.clone())).await?;
         print_result(&thru);
         results.push(ScenarioResult {
             label: "Replicated mTLS Thru".to_string(),
@@ -442,7 +556,7 @@ async fn run_full_benchmark_suite() -> Result<(), Box<dyn std::error::Error>> {
             "\n--- Replicated mTLS Latency ({} connections) ---",
             LATENCY_CONNECTIONS
         );
-        let lat = run_benchmark_iteration(&addr, LATENCY_CONNECTIONS, Some(client_tls)).await?;
+        let lat = run_benchmark_iteration(&addr, LATENCY_CONNECTIONS, Some(client_tls), Some(identity_config.clone())).await?;
         print_result(&lat);
         results.push(ScenarioResult {
             label: "Replicated mTLS Lat".to_string(),
@@ -452,7 +566,7 @@ async fn run_full_benchmark_suite() -> Result<(), Box<dyn std::error::Error>> {
 
         // Verify follower caught up (only once, after the last replicated scenario)
         let verify_tls = pki.build_client_tls_config(&client_cert, &client_key, "localhost")?;
-        verify_replication(&replicated, Some(verify_tls)).await?;
+        verify_replication(&replicated, Some(verify_tls), Some(identity_config.clone())).await?;
 
         (thru, lat)
     };
@@ -473,6 +587,7 @@ async fn run_full_benchmark_suite() -> Result<(), Box<dyn std::error::Error>> {
 async fn verify_replication(
     replicated: &ReplicatedServers,
     tls_config: Option<ClientTlsConfig>,
+    identity_config: Option<ClientIdentityConfig>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== Verifying Replication ===");
     println!("Waiting for follower to catch up...");
@@ -496,6 +611,11 @@ async fn verify_replication(
             tls_config.clone(),
         )
         .await?;
+
+        if let Some(ref id_config) = identity_config {
+            leader_client.identify(id_config).await?;
+            follower_client.identify(id_config).await?;
+        }
 
         let mut total_leader = 0usize;
         let mut total_follower = 0usize;
@@ -662,7 +782,7 @@ async fn run_sweep_benchmark() -> Result<(), Box<dyn std::error::Error>> {
         println!("Testing {} connections...", num_connections);
         println!("{}", "=".repeat(60));
 
-        match run_benchmark_iteration(&server_address, num_connections, None).await {
+        match run_benchmark_iteration(&server_address, num_connections, None, None).await {
             Ok(result) => {
                 println!(
                     "  Throughput: {:.2} req/s | Avg latency: {:.2}ms | P99: {}ms",
@@ -748,6 +868,7 @@ async fn run_benchmark_iteration(
     server_address: &str,
     num_connections: usize,
     tls_config: Option<ClientTlsConfig>,
+    identity_config: Option<ClientIdentityConfig>,
 ) -> Result<BenchmarkResult, Box<dyn std::error::Error>> {
     let connect_start = Instant::now();
 
@@ -755,8 +876,9 @@ async fn run_benchmark_iteration(
     for connection_id in 0..num_connections {
         let addr = server_address.to_string();
         let tls = tls_config.clone();
+        let identity = identity_config.clone();
         let task = tokio::spawn(async move {
-            let client = CeleriantClient::connect_with_timeout(
+            let mut client = CeleriantClient::connect_with_timeout(
                 &addr,
                 Some(Duration::from_secs(CLIENTSIDE_TIMEOUT_S)),
                 tls,
@@ -764,7 +886,15 @@ async fn run_benchmark_iteration(
             .await
             .map_err(|e| format!("Connection {} error: {}", connection_id, e))?
             .with_timeout(Duration::from_secs(CLIENTSIDE_TIMEOUT_S));
-            Ok::<_, String>((connection_id, client))
+
+            let verified_client_id: Option<u128> = if let Some(ref id_config) = identity {
+                client.identify(id_config).await
+                    .map_err(|e| format!("Connection {} identify error: {}", connection_id, e))?
+            } else {
+                None
+            };
+
+            Ok::<_, String>((connection_id, client, verified_client_id))
         });
         connection_tasks.push(task);
     }
@@ -773,8 +903,8 @@ async fn run_benchmark_iteration(
     let mut failed_connections = 0;
     for task in connection_tasks {
         match task.await {
-            Ok(Ok((connection_id, client))) => {
-                clients.push((connection_id, client));
+            Ok(Ok((connection_id, client, verified_client_id))) => {
+                clients.push((connection_id, client, verified_client_id));
             }
             Ok(Err(_)) => failed_connections += 1,
             Err(_) => failed_connections += 1,
@@ -799,10 +929,10 @@ async fn run_benchmark_iteration(
     let start_time = Instant::now();
 
     let mut tasks = Vec::with_capacity(actual_connections);
-    for (connection_id, client) in clients {
+    for (connection_id, client, verified_client_id) in clients {
         let barrier = Arc::clone(&barrier);
         let task = tokio::spawn(async move {
-            run_connection_benchmark(connection_id, client, barrier).await
+            run_connection_benchmark(connection_id, client, verified_client_id, barrier).await
         });
         tasks.push(task);
     }
@@ -858,6 +988,7 @@ async fn run_benchmark_iteration(
 async fn run_connection_benchmark(
     connection_id: usize,
     mut client: CeleriantClient,
+    verified_client_id: Option<u128>,
     barrier: Arc<Barrier>,
 ) -> Result<TaskStats, String> {
     let mut request_count = 0u64;
@@ -928,7 +1059,7 @@ async fn run_connection_benchmark(
 
         let request = Request::Write(WriteRequest {
             correlation_id: None,
-            client_id: connection_id as u128,
+            client_id: verified_client_id.unwrap_or(connection_id as u128),
             user_id: None,
             writes,
         });

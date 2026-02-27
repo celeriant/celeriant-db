@@ -10,6 +10,8 @@ use crate::server_config::ServerConfig;
 
 pub mod server_config;
 pub mod cert_cmd;
+pub mod keys_cmd;
+pub mod api_keys;
 mod dio_check;
 
 pub fn startup(args: Vec<String>) -> Result<(), std::io::Error> {
@@ -81,7 +83,42 @@ pub fn startup(args: Vec<String>) -> Result<(), std::io::Error> {
         info!("Kernel kTLS support verified");
     }
 
-    let shard_config = server_config.to_shard_config(node_id, nbr_shards, tls_config);
+    // Load API keys if configured
+    let api_keys = match api_keys::load_api_keys(&server_config.data_root) {
+        Ok(keys) => keys,
+        Err(e) => {
+            error!("Failed to load API keys: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Validate TLS requirement for API key auth
+    if api_keys.is_some() && tls_config.is_none() && !server_config.insecure_allow_plaintext_auth {
+        error!(
+            "API key authentication is configured (api_keys.toml exists) but TLS is not enabled.\n\
+             API keys are transmitted during connection handshake and MUST be encrypted in transit.\n\
+             \n\
+             To fix, enable TLS:\n\
+               --tls-ca-cert /path/to/ca.crt --tls-node-cert /path/to/node.crt --tls-node-key /path/to/node.key\n\
+             \n\
+             For development/testing only, you can bypass this check:\n\
+               --insecure-allow-plaintext-auth\n\
+             \n\
+             WARNING: --insecure-allow-plaintext-auth transmits API keys in cleartext.\n\
+             Never use this flag in production."
+        );
+        std::process::exit(1);
+    }
+
+    if api_keys.is_some() && tls_config.is_none() && server_config.insecure_allow_plaintext_auth {
+        tracing::warn!("API key authentication running WITHOUT TLS - keys transmitted in plaintext");
+    }
+
+    if api_keys.is_some() {
+        info!("API key authentication enabled");
+    }
+
+    let shard_config = server_config.to_shard_config(node_id, nbr_shards, tls_config, api_keys);
     let sidecar_config = server_config.to_sidecar_config(nbr_shards);
     let sidecar_store_config = server_config.to_sidecar_store_config();
 
