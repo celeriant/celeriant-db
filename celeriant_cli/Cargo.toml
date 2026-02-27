@@ -5,6 +5,10 @@ authors.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+small-metablock = ["celeriant_wal/small-metablock", "celeriant_msg/small-metablock", "celeriant_client_tokio/small-metablock"]
+
 [dependencies]
 # Workspace crates
 celeriant_client_tokio = { path = "../celeriant_client_tokio" }

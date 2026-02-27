@@ -5,6 +5,17 @@ authors.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+small-metablock = [
+    "celeriant_wal/small-metablock",
+    "celeriant_shard/small-metablock",
+    "celeriant_msg/small-metablock",
+    "celeriant_wire/small-metablock",
+    "celeriant_watch/small-metablock",
+    "celeriant_distributed/small-metablock",
+]
+
 [dependencies]
 celeriant_crypto = { path = "../celeriant_crypto" }
 celeriant_disk = { path = "../celeriant_disk" }

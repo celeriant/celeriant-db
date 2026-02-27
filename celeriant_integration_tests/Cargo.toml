@@ -257,6 +257,18 @@ path = "src/mtls_test_main.rs"
 name = "identity_test_main"
 path = "src/identity_test_main.rs"
 
+[features]
+default = []
+small-metablock = [
+    "celeriant_lib/small-metablock",
+    "celeriant_client_tokio/small-metablock",
+    "celeriant_msg/small-metablock",
+    "celeriant_runtimes/small-metablock",
+    "celeriant_wire/small-metablock",
+    "celeriant_wal/small-metablock",
+    "celeriant_distributed/small-metablock",
+]
+
 [dependencies]
 celeriant_lib = { package = "celeriant", path = "../celeriant" }
 celeriant_client_tokio = { path = "../celeriant_client_tokio" }

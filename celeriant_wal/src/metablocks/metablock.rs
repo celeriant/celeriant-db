@@ -4,10 +4,10 @@ use bincode::{Decode, Encode};
 use deepsize::DeepSizeOf;
 use serde::{Deserialize, Serialize};
 
-use crate::{aggregate_key::AggregateKey, constants::{EntryHashBytes, MINIBATCH_SIZE_BYTES}, metablocks::{datablock_inline_data::DatablockInlineData, datablock_storage_kind::DatablockStorageKind, metablock_event_batch::{EventTypesKind, MetablockEventBatch}, metablock_kind::MetablockKind}};
+use crate::{aggregate_key::AggregateKey, constants::{EntryHashBytes, FIXED_BLOCK_SIZE_BYTES, MINIBATCH_SIZE_BYTES, WIRE_SIZE_ENUM_DISCRIMINANT}, metablocks::{datablock_inline_data::DatablockInlineData, datablock_storage_kind::DatablockStorageKind, metablock_event_batch::{EventTypesKind, MetablockEventBatch}, metablock_kind::MetablockKind}};
 
-/// Metablocks are fixed size 512 byte blocks. They read fast and allow
-/// us to avoid pulling in large message payloads (stored in datablocks)
+/// Metablocks are fixed size blocks (FIXED_BLOCK_SIZE_BYTES). They read fast
+/// and allow us to avoid pulling in large message payloads (stored in datablocks)
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode, DeepSizeOf)]
 pub struct Metablock {
     /// WAL global index of this metablock
@@ -116,3 +116,16 @@ impl Metablock {
         }
     }
 }
+
+// Worst-case wire size: versioned header + common fields + EventBatchMetadata + Inline datablock
+const WORST_CASE_METABLOCK_WIRE_SIZE: usize = 8 // CRC + version header
+    + Metablock::OFFSET_WAL_METABLOCK_TYPE
+    + WIRE_SIZE_ENUM_DISCRIMINANT // MetablockKind discriminant
+    + MetablockEventBatch::OFFSET_EVENT_TYPES_DATA + WIRE_SIZE_ENUM_DISCRIMINANT + 32 // EventTypesKind
+    + WIRE_SIZE_ENUM_DISCRIMINANT // DatablockStorageKind discriminant
+    + MINIBATCH_SIZE_BYTES;
+
+const _: () = assert!(
+    WORST_CASE_METABLOCK_WIRE_SIZE <= FIXED_BLOCK_SIZE_BYTES,
+    "Metablock worst-case wire size exceeds FIXED_BLOCK_SIZE_BYTES"
+);

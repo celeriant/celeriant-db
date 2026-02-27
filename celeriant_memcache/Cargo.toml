@@ -5,6 +5,10 @@ authors.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+small-metablock = ["celeriant_wal/small-metablock", "celeriant_distributed/small-metablock", "celeriant_rotating_log/small-metablock"]
+
 [dependencies]
 celeriant_wal = { path = "../celeriant_wal" }
 celeriant_distributed = { path = "../celeriant_distributed" }

@@ -13,6 +13,14 @@ path = "src/lib.rs"
 name = "celeriant"
 path = "src/main.rs"
 
+[features]
+default = []
+small-metablock = [
+    "celeriant_distributed/small-metablock",
+    "celeriant_runtimes/small-metablock",
+    "celeriant_shard/small-metablock",
+]
+
 [dependencies]
 celeriant_crypto = { path = "../celeriant_crypto" }
 celeriant_distributed = { path = "../celeriant_distributed" }

@@ -2,9 +2,17 @@ pub const BLOOM_BYTES: usize = 32;
 pub const BLOOM_HASH_COUNT: u32 = 4;
 pub const BLOOM_HASH_SEED: u128 = 123456789012345678901234567890123456u128;
 pub const BLOOM_BITS: usize = BLOOM_BYTES * 8;
+#[cfg(not(feature = "small-metablock"))]
 pub const FIXED_BLOCK_SIZE_BYTES: usize = 1024;
+#[cfg(feature = "small-metablock")]
+pub const FIXED_BLOCK_SIZE_BYTES: usize = 512;
+
 pub const HEADER_BLOCK_SIZE_BYTES: usize = 512 * 1024;
+
+#[cfg(not(feature = "small-metablock"))]
 pub const MINIBATCH_SIZE_BYTES: usize = 512;
+#[cfg(feature = "small-metablock")]
+pub const MINIBATCH_SIZE_BYTES: usize = 128;
 pub const WIRE_VERSION_WAL_METABLOCK: u32 = 1;
 pub const WIRE_VERSION_WAL_DATABLOCK: u32 = 1;
 pub const WIRE_VERSION_WAL_SHARD_LOG_HEADER: u32 = 1;

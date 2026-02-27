@@ -20,9 +20,10 @@ where
         .decode(&s)
         .map_err(serde::de::Error::custom)?;
 
-    if bytes.len() != 12 {
+    if bytes.len() != MINIBATCH_SIZE_BYTES {
         return Err(serde::de::Error::custom(format!(
-            "Expected MINIBATCH_SIZE_BYTES bytes, got {}",
+            "Expected {} bytes, got {}",
+            MINIBATCH_SIZE_BYTES,
             bytes.len()
         )));
     }

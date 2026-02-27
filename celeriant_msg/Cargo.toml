@@ -8,6 +8,7 @@ license.workspace = true
 [features]
 default = []
 cluster = ["deepsize"]
+small-metablock = ["celeriant_wal/small-metablock", "celeriant_wire/small-metablock"]
 
 [dependencies]
 celeriant_wal = { path = "../celeriant_wal" }
