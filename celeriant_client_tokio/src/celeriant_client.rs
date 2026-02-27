@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
+use celeriant_crypto::Crypto;
 use celeriant_msg::process_requests::Request;
 use celeriant_msg::process_responses::Response;
+use celeriant_msg::request::requests::IdentifyRequest;
 use celeriant_wal::compression_type::CompressionType;
 use celeriant_wire::network::wire_header::PROTOCOL_VERSION_V2;
 use rustls_pki_types::ServerName;
@@ -79,6 +81,12 @@ impl futures_util::io::AsyncWrite for ClientStream {
 }
 
 impl Unpin for ClientStream {}
+
+#[derive(Clone)]
+pub struct ClientIdentityConfig {
+    pub public_key: String,
+    pub private_key: String,
+}
 
 /// Minimal, high-performance Celeriant TCP client
 ///
@@ -171,36 +179,125 @@ impl CeleriantClient {
         request: &Request,
         compression_type: CompressionType,
     ) -> Result<Response, ClientError> {
-        let request_future = async {
-            // Write request to server with V2 protocol
-            Request::write_request(
-                &mut self.stream,
-                request,
-                compression_type,
-                self.max_request_size,
-                PROTOCOL_VERSION_V2,
-            )
-            .await?;
-
-            // Read response from server
-            let response = Response::read_response(&mut self.stream, self.max_request_size).await?;
-
-            match response {
-                Response::ProtocolError(_) => return Err(ClientError::ProtocolError),
-                Response::GenericError(error) => return Err(ClientError::from_error_response(error)),
-                _ => {}
-            }
-
-            Ok(response)
-        };
-
         // Apply timeout if configured
         if let Some(duration) = self.timeout {
-            timeout(duration, request_future)
+            timeout(duration, self.send_request_inner(request, compression_type))
                 .await
                 .map_err(|_| ClientError::RequestTimeout)?
         } else {
-            request_future.await
+            self.send_request_inner(request, compression_type).await
         }
+    }
+
+    async fn send_request_inner(
+        &mut self,
+        request: &Request,
+        compression_type: CompressionType,
+    ) -> Result<Response, ClientError> {
+        // Write request to server with V2 protocol
+        Request::write_request(
+            &mut self.stream,
+            request,
+            compression_type,
+            self.max_request_size,
+            PROTOCOL_VERSION_V2,
+        )
+        .await?;
+
+        // Read response from server
+        let response = Response::read_response(&mut self.stream, self.max_request_size).await?;
+
+        match response {
+            Response::ProtocolError(_) => Err(ClientError::ProtocolError),
+            Response::GenericError(error) => Err(ClientError::from_error_response(error)),
+            _ => Ok(response),
+        }
+    }
+
+    /// Perform client identity verification handshake
+    ///
+    /// Generates a nonce, signs it with the private key, and sends an IdentifyRequest
+    /// to the server. Returns the server-verified client_id on success.
+    ///
+    /// This should be called after connection establishment and before any data operations
+    /// if identity verification is required.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use celeriant_client_tokio::{CeleriantClient, ClientIdentityConfig};
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut client = CeleriantClient::connect("127.0.0.1:10000").await?;
+    ///
+    /// let identity_config = ClientIdentityConfig {
+    ///     public_key: "MIIBIjANBg...".to_string(),  // Base64-encoded public key
+    ///     private_key: "MIIEvgIBAD...".to_string(), // Base64-encoded private key
+    /// };
+    ///
+    /// let client_id = client.identify(&identity_config).await?;
+    /// println!("Verified client_id: {}", client_id);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn identify(&mut self, identity_config: &ClientIdentityConfig) -> Result<u128, ClientError> {
+        // Generate nonce
+        let nonce = Crypto::generate_nonce()?;
+
+        // Sign the nonce
+        let signature = Crypto::sign_nonce(&identity_config.private_key, &nonce)?;
+
+        // Build IdentifyRequest
+        let request = Request::Identify(IdentifyRequest {
+            correlation_id: None,
+            public_key: identity_config.public_key.clone(),
+            nonce,
+            signature,
+        });
+
+        // Send request using shared helper with timeout handling
+        let response = if let Some(duration) = self.timeout {
+            timeout(duration, self.send_request_inner(&request, CompressionType::None))
+                .await
+                .map_err(|_| ClientError::RequestTimeout)??
+        } else {
+            self.send_request_inner(&request, CompressionType::None).await?
+        };
+
+        match response {
+            Response::Identify(resp) => Ok(resp.client_id),
+            _ => Err(ClientError::ProtocolError),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use celeriant_crypto::Crypto;
+
+    #[test]
+    fn identity_config_can_be_created() {
+        let keypair = Crypto::generate_keypair(None).expect("keypair generation should succeed");
+        let config = ClientIdentityConfig {
+            public_key: keypair.public_key_base64.clone(),
+            private_key: keypair.private_key_base64.clone(),
+        };
+        assert!(!config.public_key.is_empty());
+        assert!(!config.private_key.is_empty());
+    }
+
+    #[test]
+    fn identity_config_can_sign_nonce() {
+        let keypair = Crypto::generate_keypair(None).expect("keypair generation should succeed");
+        let config = ClientIdentityConfig {
+            public_key: keypair.public_key_base64.clone(),
+            private_key: keypair.private_key_base64.clone(),
+        };
+
+        let nonce = Crypto::generate_nonce().expect("nonce generation should succeed");
+        let signature = Crypto::sign_nonce(&config.private_key, &nonce)
+            .expect("signing should succeed");
+
+        assert!(!signature.is_empty());
     }
 }

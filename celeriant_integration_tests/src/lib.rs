@@ -594,6 +594,10 @@ impl ServerConfigExt for ServerConfig {
             args.push(self.tls_cert_reload_interval_secs.to_string());
         }
 
+        if self.require_client_identity {
+            args.push("--require-client-identity".to_string());
+        }
+
         args
     }
 }

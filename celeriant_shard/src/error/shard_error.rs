@@ -10,6 +10,7 @@ pub enum ShardError {
     ListAggregates(ShardListingError),
     ReplicationBatch(FollowerReplicationWriteError),
     WatchRequestInvalid,
+    IdentifyRequestInvalid,
     CatchUpRequestInvalid,
     ListOrgs(ShardListingError),
     AggregateDetails(ShardAggregateDetailsError),

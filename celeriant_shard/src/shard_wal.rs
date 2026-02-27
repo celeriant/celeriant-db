@@ -153,6 +153,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                     .map_err(ShardError::Delete)
             }
             Request::Watch(_) => Err(ShardError::WatchRequestInvalid),
+            Request::Identify(_) => Err(ShardError::IdentifyRequestInvalid),
             Request::ListOrgs(list_request) => {
                 self.list_orgs(list_request).await.map(Response::ListOrgs).map_err(ShardError::ListOrgs)
             }

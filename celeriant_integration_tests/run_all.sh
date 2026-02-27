@@ -81,6 +81,8 @@ TESTS=(
   p4_1_rolling_upgrade_main
   # --- MTLS ---
   mtls_test_main
+  # --- Client identity enforcement ---
+  identity_test_main
 )
 
 # Pre-build everything so compilation isn't counted in per-test timeout

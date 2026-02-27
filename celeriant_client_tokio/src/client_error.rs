@@ -1,3 +1,4 @@
+use celeriant_crypto::CryptoError;
 use celeriant_msg::read_wire_data_error::ReadWireDataError;
 use celeriant_msg::response::responses::ErrorResponse;
 use celeriant_wire::network::wire_error::WireError;
@@ -12,8 +13,13 @@ pub enum ClientError {
     /// `leader_address` is provided when the follower knows who the current leader is.
     NotLeader { leader_address: Option<String>, error: ErrorResponse },
     CeleriantError(ErrorResponse),
+    /// Server requires client identity verification (error 10004).
+    /// The client should call `identify()` before sending other requests.
+    IdentityRequired(ErrorResponse),
     ConnectionTimeout,
     RequestTimeout,
+    /// Identity verification error (nonce generation, signing, or verification failure)
+    IdentityError(CryptoError),
 }
 
 impl ClientError {
@@ -21,6 +27,8 @@ impl ClientError {
         if error.is_not_leader() {
             let leader_address = error.parse_leader_address();
             ClientError::NotLeader { leader_address, error }
+        } else if error.is_identity_required() {
+            ClientError::IdentityRequired(error)
         } else {
             ClientError::CeleriantError(error)
         }
@@ -37,8 +45,10 @@ impl std::fmt::Display for ClientError {
             ClientError::NotLeader { leader_address: Some(addr), .. } => write!(f, "Not leader, redirect to {}", addr),
             ClientError::NotLeader { leader_address: None, .. } => write!(f, "Not leader, leader address unknown"),
             ClientError::CeleriantError(e) => write!(f, "Server error {}: {}", e.error_code, e.error_message),
+            ClientError::IdentityRequired(_) => write!(f, "Server requires client identity verification — call identify() first"),
             ClientError::RequestTimeout => write!(f, "Request timeout"),
             ClientError::ConnectionTimeout => write!(f, "Connection timeout"),
+            ClientError::IdentityError(e) => write!(f, "Identity verification error: {}", e),
         }
     }
 }
@@ -54,5 +64,11 @@ impl From<WireError> for ClientError {
 impl From<ReadWireDataError> for ClientError {
     fn from(e: ReadWireDataError) -> Self {
         ClientError::ReadError(e)
+    }
+}
+
+impl From<CryptoError> for ClientError {
+    fn from(e: CryptoError) -> Self {
+        ClientError::IdentityError(e)
     }
 }

@@ -462,6 +462,7 @@ dependencies = [
 name = "celeriant_client_tokio"
 version = "0.1.0"
 dependencies = [
+ "celeriant_crypto",
  "celeriant_msg",
  "celeriant_wal",
  "celeriant_wire",

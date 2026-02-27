@@ -412,6 +412,14 @@ pub struct ServerConfig {
         help = "How often to check TLS cert files for changes and hot-reload (seconds). 0 = disabled."
     )]
     pub tls_cert_reload_interval_secs: u64,
+
+    #[arg(
+        long,
+        action = clap::ArgAction::SetTrue,
+        env = "CELERIANT_REQUIRE_CLIENT_IDENTITY",
+        help = "Require clients to send an IdentifyRequest as their first message"
+    )]
+    pub require_client_identity: bool,
 }
 
 impl ServerConfig {
@@ -595,6 +603,7 @@ impl ServerConfig {
                 ConfigClientAuth::None => ClientAuthMode::None,
             },
             tls_cert_reload_interval: std::time::Duration::from_secs(self.tls_cert_reload_interval_secs),
+            require_client_identity: self.require_client_identity,
         }
     }
 
@@ -671,6 +680,7 @@ impl ServerConfig {
         check_field!(tls_node_key);
         check_field!(tls_client_auth);
         check_field!(tls_cert_reload_interval_secs);
+        check_field!(require_client_identity);
 
         entries
     }
@@ -746,6 +756,7 @@ impl Default for ServerConfig {
             tls_node_key: None,
             tls_client_auth: ConfigClientAuth::Require,
             tls_cert_reload_interval_secs: 0,
+            require_client_identity: false,
         }
     }
 }

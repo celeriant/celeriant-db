@@ -63,4 +63,6 @@ pub struct ShardConfig {
     pub tls_client_auth: ClientAuthMode,
     /// How often to check TLS cert files for mtime changes. Zero means disabled.
     pub tls_cert_reload_interval: std::time::Duration,
+    /// When true, clients must send IdentifyRequest as their first message.
+    pub require_client_identity: bool,
 }

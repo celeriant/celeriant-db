@@ -650,6 +650,7 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
             request,
             message_version,
             port_type,
+            verified_client_id,
         } => {
             handle_redirected_connection(
                 accepted_tcp_stream.bind_to_executor(),
@@ -660,6 +661,7 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
                 message_version,
                 ctx.clone(),
                 port_type,
+                verified_client_id,
             );
         }
         IntrashardMessages::EnterS3Catchup => handle_enter_s3_catchup(ctx.clone()),

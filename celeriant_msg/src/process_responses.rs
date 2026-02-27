@@ -8,7 +8,7 @@ use futures_lite::{AsyncReadExt, AsyncWriteExt};
 use crate::{
     read_wire_data_error::ReadWireDataError,
     response::responses::{
-        ErrorResponse, AggregateDetailsResponse, ListAggregateTypesResponse, ListAggregatesResponse, ListOrgsResponse, ProtocolErrorResponse,
+        ErrorResponse, AggregateDetailsResponse, IdentifyResponse, ListAggregateTypesResponse, ListAggregatesResponse, ListOrgsResponse, ProtocolErrorResponse,
         ReadResponse, SuccessResponse, WatchResponse,
     },
 };
@@ -38,6 +38,7 @@ pub enum ResponseType {
     Heartbeat = 14,
     #[cfg(feature = "cluster")]
     KickFollower = 15,
+    Identify = 16,
 }
 
 impl ResponseType {
@@ -62,6 +63,7 @@ impl ResponseType {
             14 => Ok(ResponseType::Heartbeat),
             #[cfg(feature = "cluster")]
             15 => Ok(ResponseType::KickFollower),
+            16 => Ok(ResponseType::Identify),
             _ => Err(ReadWireDataError::UnknownMessageType(value)),
         }
     }
@@ -88,6 +90,7 @@ pub enum Response {
     Heartbeat(HeartbeatResponse),
     #[cfg(feature = "cluster")]
     KickFollower(KickFollowerResponse),
+    Identify(IdentifyResponse),
 }
 
 impl Response {
@@ -112,6 +115,7 @@ impl Response {
             Response::Heartbeat(_) => ResponseType::Heartbeat,
             #[cfg(feature = "cluster")]
             Response::KickFollower(_) => ResponseType::KickFollower,
+            Response::Identify(_) => ResponseType::Identify,
         }
     }
 
@@ -167,6 +171,7 @@ impl Response {
             ResponseType::KickFollower => fixed!(KickFollower),
             #[cfg(feature = "cluster")]
             ResponseType::CatchUp => variable!(CatchUp),
+            ResponseType::Identify => fixed!(Identify),
         })
     }
 
@@ -191,6 +196,7 @@ impl Response {
             Response::Heartbeat(_) => CompressionType::None,
             #[cfg(feature = "cluster")]
             Response::KickFollower(_) => CompressionType::None,
+            Response::Identify(_) => CompressionType::None,
         }
     }
 
@@ -226,6 +232,7 @@ impl Response {
             Response::KickFollower(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
             #[cfg(feature = "cluster")]
             Response::CatchUp(res) => wire_header_write_variable_size(writer, res, response_type_id, compression_type, max_message_size, version).await,
+            Response::Identify(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
         }
     }
 }
@@ -240,13 +247,13 @@ mod tests {
     use futures_lite::{future::block_on, io::Cursor};
 
     #[cfg(feature = "cluster")]
-    const COUNT: usize = 15;
+    const COUNT: usize = 16;
     #[cfg(not(feature = "cluster"))]
-    const COUNT: usize = 11;
+    const COUNT: usize = 12;
     #[cfg(feature = "cluster")]
-    const MAX_ID: u32 = 15;
+    const MAX_ID: u32 = 16;
     #[cfg(not(feature = "cluster"))]
-    const MAX_ID: u32 = 11;
+    const MAX_ID: u32 = 16;
     const VERSIONS: [u32; 2] = [PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3];
 
     fn all_types() -> [ResponseType; COUNT] {
@@ -270,6 +277,7 @@ mod tests {
             ResponseType::Heartbeat,
             #[cfg(feature = "cluster")]
             ResponseType::KickFollower,
+            ResponseType::Identify,
         ]
     }
 
@@ -348,6 +356,10 @@ mod tests {
                 correlation_id: Some(0x8888_9999_AAAA_BBBB),
                 acknowledged: true,
             }),
+            ResponseType::Identify => Response::Identify(IdentifyResponse {
+                correlation_id: Some(0x9999_AAAA_BBBB_CCCC),
+                client_id: 0xCCCC_DDDD_EEEE_FFFF,
+            }),
         }
     }
 
@@ -385,9 +397,15 @@ mod tests {
         for rt in all_types() {
             assert_eq!(ResponseType::from_u32(rt as u32).unwrap(), rt);
         }
-        for id in 1..=MAX_ID {
-            assert!(ResponseType::from_u32(id).is_ok(), "gap at id {}", id);
+        // Verify all defined types can be parsed
+        for id in 1..=11 {
+            assert!(ResponseType::from_u32(id).is_ok(), "missing id {}", id);
         }
+        #[cfg(feature = "cluster")]
+        for id in 12..=15 {
+            assert!(ResponseType::from_u32(id).is_ok(), "missing cluster id {}", id);
+        }
+        assert!(ResponseType::from_u32(16).is_ok(), "Identify response should be valid");
         assert!(ResponseType::from_u32(0).is_err());
         assert!(ResponseType::from_u32(MAX_ID + 1).is_err(), "update MAX_ID to {}", MAX_ID + 1);
     }

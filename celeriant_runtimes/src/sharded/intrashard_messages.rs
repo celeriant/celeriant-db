@@ -13,6 +13,7 @@ pub enum IntrashardMessages {
         request: Request,
         message_version: u32,
         port_type: PortType,
+        verified_client_id: Option<u128>,
     },
     EnterS3Catchup,
     S3CatchupComplete {

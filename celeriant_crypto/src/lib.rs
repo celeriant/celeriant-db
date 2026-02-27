@@ -211,7 +211,13 @@ impl Crypto {
     ) -> Result<u128, CryptoError> {
         Self::validate_nonce(nonce)?;
         Self::validate_signature(public_key, nonce, signature)?;
-        let client_identity = Self::generate_short_client_identity(public_key.as_bytes());
+
+        // Decode base64 to get raw DER bytes, then hash the DER bytes
+        let public_key_bytes = general_purpose::STANDARD
+            .decode(public_key)
+            .map_err(|e| CryptoError::KeyDecodingFailed(e.to_string()))?;
+
+        let client_identity = Self::generate_short_client_identity(&public_key_bytes);
         Ok(client_identity)
     }
 

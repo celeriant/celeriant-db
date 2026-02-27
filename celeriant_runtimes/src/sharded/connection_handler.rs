@@ -20,7 +20,7 @@ use tracing::{info, warn};
 use super::{
     intrashard_messages::IntrashardMessages,
     shard_config::ShardConfig,
-    shard_error_response::{shard_error_to_response, watch_read_error_to_response, watch_session_error_to_response},
+    shard_error_response::{shard_error_to_response, watch_read_error_to_response, watch_session_error_to_response, IDENTIFY_INVALID_NONCE, IDENTIFY_INVALID_SIGNATURE, IDENTIFY_MISMATCH, IDENTIFY_REQUIRED},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,6 +42,11 @@ pub struct ConnectionContext<R: ReplicationClient + 'static, D: S3Downloader + '
     pub shard_wal: Rc<ShardWal<R, D>>,
     pub catchup_completion_tx: Option<Rc<LocalSender<CatchupCompletionMsg>>>,
     pub lease_manager: Option<Rc<LeaseManager<S>>>,
+}
+
+/// Connection-level state for identity verification
+struct ConnectionState {
+    verified_client_id: Option<u128>,
 }
 
 impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static> Clone for ConnectionContext<R, D, S> {
@@ -89,14 +94,58 @@ pub fn handle_new_connection<R: ReplicationClient + 'static, D: S3Downloader + '
             return;
         }
 
+        // Initialize connection state (no identity verified yet)
+        let mut conn_state = ConnectionState {
+            verified_client_id: None,
+        };
+
         let (request, message_version) = match read_request(&mut tcp_stream, &ctx).await {
             Some(r) => r,
             None => return,
         };
 
-        match check_redirect(tcp_stream, request, ctx.config.max_response_size, ctx.config.server_compression_algorithm, message_version, &ctx, port_type).await {
+        // Reject non-identity first messages when identity is required
+        if ctx.config.require_client_identity && !matches!(request, Request::Identify(_)) {
+            let response = Response::GenericError(ErrorResponse {
+                correlation_id: request.correlation_id(),
+                error_code: IDENTIFY_REQUIRED,
+                error_message: "Server requires client identity verification".to_string(),
+            });
+            let _ = write_response(&mut tcp_stream, &response, ctx.config.max_response_size, ctx.config.server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
+            return;
+        }
+
+        // Handle IdentifyRequest at connection level (before redirect/processing)
+        if let Request::Identify(ref identify_req) = request {
+            if let Err(response) = handle_identify(identify_req, &mut conn_state) {
+                let _ = write_response(&mut tcp_stream, &response, ctx.config.max_response_size, ctx.config.server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
+                return; // Close connection on identity failure
+            }
+            let response = Response::Identify(celeriant_msg::response::responses::IdentifyResponse {
+                correlation_id: identify_req.correlation_id,
+                client_id: conn_state.verified_client_id.unwrap(),
+            });
+            if write_response(&mut tcp_stream, &response, ctx.config.max_response_size, ctx.config.server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await.is_err() {
+                return;
+            }
+            // Read next message after successful identity verification
+            let (next_request, next_version) = match read_request(&mut tcp_stream, &ctx).await {
+                Some(r) => r,
+                None => return,
+            };
+            match check_redirect(tcp_stream, next_request, ctx.config.max_response_size, ctx.config.server_compression_algorithm, next_version, &ctx, port_type, &conn_state).await {
+                RedirectResult::ProcessLocally(request, tcp_stream) => {
+                    handle_pipelining(tcp_stream, request, ctx.config.max_request_size, ctx.config.max_response_size, ctx.config.server_compression_algorithm, next_version, ctx, port_type, conn_state).await;
+                }
+                RedirectResult::Redirected => {}
+                RedirectResult::ErrorSentContinue(_) => {}
+            }
+            return;
+        }
+
+        match check_redirect(tcp_stream, request, ctx.config.max_response_size, ctx.config.server_compression_algorithm, message_version, &ctx, port_type, &conn_state).await {
             RedirectResult::ProcessLocally(request, tcp_stream) => {
-                handle_pipelining(tcp_stream, request, ctx.config.max_request_size, ctx.config.max_response_size, ctx.config.server_compression_algorithm, message_version, ctx, port_type).await;
+                handle_pipelining(tcp_stream, request, ctx.config.max_request_size, ctx.config.max_response_size, ctx.config.server_compression_algorithm, message_version, ctx, port_type, conn_state).await;
             }
             RedirectResult::Redirected => {}
             RedirectResult::ErrorSentContinue(_) => {}
@@ -114,11 +163,15 @@ pub fn handle_redirected_connection<R: ReplicationClient + 'static, D: S3Downloa
     message_version: u32,
     ctx: ConnectionContext<R, D, S>,
     port_type: PortType,
+    verified_client_id: Option<u128>,
 ) {
     let _ = tcp_stream.set_nodelay(true);
 
     glommio::spawn_local(async move {
-        handle_pipelining(tcp_stream, request, max_request_size, max_response_size, server_compression_algorithm, message_version, ctx, port_type).await;
+        let conn_state = ConnectionState {
+            verified_client_id,
+        };
+        handle_pipelining(tcp_stream, request, max_request_size, max_response_size, server_compression_algorithm, message_version, ctx, port_type, conn_state).await;
     })
     .detach();
 }
@@ -145,6 +198,7 @@ async fn handle_pipelining<R: ReplicationClient + 'static, D: S3Downloader + 'st
     mut message_version: u32,
     ctx: ConnectionContext<R, D, S>,
     port_type: PortType,
+    conn_state: ConnectionState,
 ) {
     let mut optional_request = Some(request);
 
@@ -167,6 +221,12 @@ async fn handle_pipelining<R: ReplicationClient + 'static, D: S3Downloader + 'st
                         }
                     ),
                 });
+                let _ = write_response(&mut tcp_stream, &response, max_response_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
+                continue;
+            }
+
+            // Validate client_id for mutating requests
+            if let Err(response) = validate_client_id(&request, conn_state.verified_client_id) {
                 let _ = write_response(&mut tcp_stream, &response, max_response_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
                 continue;
             }
@@ -198,7 +258,7 @@ async fn handle_pipelining<R: ReplicationClient + 'static, D: S3Downloader + 'st
         }
 
         if let Some(request) = optional_request.take() {
-            match check_redirect(tcp_stream, request, max_response_size, server_compression_algorithm, message_version, &ctx, port_type).await {
+            match check_redirect(tcp_stream, request, max_response_size, server_compression_algorithm, message_version, &ctx, port_type, &conn_state).await {
                 RedirectResult::ProcessLocally(req, stream) => {
                     optional_request = Some(req);
                     tcp_stream = stream;
@@ -220,6 +280,65 @@ fn is_valid_for_port(request: &Request, port_type: PortType) -> bool {
     }
 }
 
+/// Handle IdentifyRequest during connection handshake.
+/// Validates nonce and signature, derives client_id, stores in connection state.
+fn handle_identify(req: &celeriant_msg::request::requests::IdentifyRequest, conn_state: &mut ConnectionState) -> Result<(), Response> {
+    use celeriant_crypto::Crypto;
+
+    // Validate nonce and signature, derive client_id
+    let client_id = match Crypto::validate_with_public_key(&req.public_key, &req.nonce, &req.signature) {
+        Ok(id) => id,
+        Err(celeriant_crypto::CryptoError::InvalidNonce) => {
+            return Err(Response::GenericError(ErrorResponse {
+                correlation_id: req.correlation_id,
+                error_code: IDENTIFY_INVALID_NONCE,
+                error_message: "Nonce expired or too far in the future".to_string(),
+            }));
+        }
+        Err(_) => {
+            return Err(Response::GenericError(ErrorResponse {
+                correlation_id: req.correlation_id,
+                error_code: IDENTIFY_INVALID_SIGNATURE,
+                error_message: "Invalid signature".to_string(),
+            }));
+        }
+    };
+
+    // Store verified client_id in connection state
+    conn_state.verified_client_id = Some(client_id);
+    Ok(())
+}
+
+/// Validate that a request's client_id matches the connection's verified identity.
+/// Returns error response if verification failed.
+fn validate_client_id(request: &Request, verified_client_id: Option<u128>) -> Result<(), Response> {
+    let Some(verified) = verified_client_id else {
+        return Ok(()); // No identity verification on this connection
+    };
+
+    let request_client_id = match request {
+        Request::Write(req) => Some(req.client_id),
+        Request::TrimStart(req) => Some(req.client_id),
+        Request::Delete(req) => Some(req.client_id),
+        _ => None, // Read operations don't carry client_id
+    };
+
+    if let Some(claimed) = request_client_id {
+        if claimed != verified {
+            return Err(Response::GenericError(ErrorResponse {
+                correlation_id: request.correlation_id(),
+                error_code: IDENTIFY_MISMATCH,
+                error_message: format!(
+                    "client_id mismatch: request has {}, connection verified as {}",
+                    claimed, verified
+                ),
+            }));
+        }
+    }
+
+    Ok(())
+}
+
 async fn check_redirect<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
     mut tcp_stream: TcpStream,
     request: Request,
@@ -228,6 +347,7 @@ async fn check_redirect<R: ReplicationClient + 'static, D: S3Downloader + 'stati
     message_version: u32,
     ctx: &ConnectionContext<R, D, S>,
     port_type: PortType,
+    conn_state: &ConnectionState,
 ) -> RedirectResult {
     let target_shard = match determine_shard(&request, &ctx.config, port_type) {
         Ok(idx) => idx,
@@ -248,6 +368,7 @@ async fn check_redirect<R: ReplicationClient + 'static, D: S3Downloader + 'stati
             request,
             message_version,
             port_type,
+            verified_client_id: conn_state.verified_client_id,
         };
         if let Err(e) = ctx.intrashard_sender.send_to(target_shard, msg).await {
             warn!("Failed to redirect connection to shard {target_shard}: {e:?}");
@@ -698,7 +819,7 @@ mod tests {
             tls_cert_paths: None,
             tls_client_auth: celeriant_crypto::pki::ClientAuthMode::None,
             tls_cert_reload_interval: Duration::ZERO,
-
+            require_client_identity: false,
         }
     }
 
@@ -1115,5 +1236,119 @@ mod tests {
         assert!(validate_shard_id(3, 4).is_ok());
         assert!(validate_shard_id(4, 4).is_err());
         assert!(validate_shard_id(100, 4).is_err());
+    }
+
+    #[test]
+    fn validate_client_id_no_verification() {
+        // When verified_client_id is None, all requests pass
+        let key = AggregateKey::new(1, 2, 3);
+        let mut writes = HashMap::new();
+        writes.insert(key, SingleAggregateWrite {
+            expected_event_batch_index: None,
+            allow_create: true,
+            enforce_client_idempotency: false,
+            compression_type: CompressionType::None,
+            events: vec![],
+        });
+        let req = Request::Write(WriteRequest {
+            correlation_id: Some(123),
+            client_id: 999,
+            user_id: None,
+            writes,
+        });
+        assert!(super::validate_client_id(&req, None).is_ok());
+    }
+
+    #[test]
+    fn validate_client_id_match() {
+        // When verified_client_id matches request, passes
+        let key = AggregateKey::new(1, 2, 3);
+        let mut writes = HashMap::new();
+        writes.insert(key, SingleAggregateWrite {
+            expected_event_batch_index: None,
+            allow_create: true,
+            enforce_client_idempotency: false,
+            compression_type: CompressionType::None,
+            events: vec![],
+        });
+        let req = Request::Write(WriteRequest {
+            correlation_id: Some(123),
+            client_id: 999,
+            user_id: None,
+            writes,
+        });
+        assert!(super::validate_client_id(&req, Some(999)).is_ok());
+    }
+
+    #[test]
+    fn validate_client_id_mismatch() {
+        // When verified_client_id doesn't match request, fails
+        let key = AggregateKey::new(1, 2, 3);
+        let mut writes = HashMap::new();
+        writes.insert(key, SingleAggregateWrite {
+            expected_event_batch_index: None,
+            allow_create: true,
+            enforce_client_idempotency: false,
+            compression_type: CompressionType::None,
+            events: vec![],
+        });
+        let req = Request::Write(WriteRequest {
+            correlation_id: Some(123),
+            client_id: 999,
+            user_id: None,
+            writes,
+        });
+        let result = super::validate_client_id(&req, Some(888));
+        assert!(result.is_err());
+        if let Err(Response::GenericError(err)) = result {
+            assert_eq!(err.error_code, IDENTIFY_MISMATCH);
+            assert!(err.error_message.contains("999"));
+            assert!(err.error_message.contains("888"));
+        } else {
+            panic!("Expected GenericError with IDENTITY_MISMATCH");
+        }
+    }
+
+    #[test]
+    fn validate_client_id_read_always_passes() {
+        // Read requests don't carry client_id, so they always pass
+        let req = Request::Read(ReadRequest {
+            correlation_id: Some(123),
+            aggregate_key: AggregateKey::new(1, 2, 3),
+            filters: ReadFilters::default(),
+        });
+        assert!(super::validate_client_id(&req, Some(999)).is_ok());
+    }
+
+    #[test]
+    fn validate_client_id_trim_start() {
+        let req = Request::TrimStart(TrimStartRequest {
+            correlation_id: Some(123),
+            aggregate_key: AggregateKey::new(1, 2, 3),
+            keep_from_event_batch_index: 10,
+            client_id: 777,
+            user_id: None,
+        });
+        assert!(super::validate_client_id(&req, Some(777)).is_ok());
+        assert!(super::validate_client_id(&req, Some(666)).is_err());
+    }
+
+    #[test]
+    fn validate_client_id_delete() {
+        let key = AggregateKey::new(1, 2, 3);
+        let mut deletes = HashMap::new();
+        deletes.insert(key, SingleAggregateDelete {
+            allow_recreate: false,
+            allow_index_continuation: false,
+            expected_event_batch_index: None,
+        });
+        let req = Request::Delete(DeleteRequest {
+            correlation_id: Some(123),
+            client_id: 555,
+            user_id: None,
+            deletes,
+        });
+        assert!(super::validate_client_id(&req, Some(555)).is_ok());
+        assert!(super::validate_client_id(&req, Some(444)).is_err());
     }
 }

@@ -8,7 +8,7 @@ use futures_lite::{AsyncReadExt, AsyncWriteExt};
 use crate::{
     read_wire_data_error::ReadWireDataError,
     request::requests::{
-        DeleteRequest, AggregateDetailsRequest, ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest, ReadRequest,
+        DeleteRequest, AggregateDetailsRequest, IdentifyRequest, ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest, ReadRequest,
         TrimStartRequest, WatchRequest, WriteRequest,
     },
 };
@@ -35,6 +35,7 @@ pub enum RequestType {
     Heartbeat = 12,
     #[cfg(feature = "cluster")]
     KickFollower = 13,
+    Identify = 14,
 }
 
 impl RequestType {
@@ -57,6 +58,7 @@ impl RequestType {
             12 => Ok(RequestType::Heartbeat),
             #[cfg(feature = "cluster")]
             13 => Ok(RequestType::KickFollower),
+            14 => Ok(RequestType::Identify),
             _ => Err(ReadWireDataError::UnknownMessageType(value)),
         }
     }
@@ -81,6 +83,7 @@ pub enum Request {
     Heartbeat(HeartbeatRequest),
     #[cfg(feature = "cluster")]
     KickFollower(KickFollowerRequest),
+    Identify(IdentifyRequest),
 }
 
 impl Request {
@@ -103,6 +106,7 @@ impl Request {
             Request::Heartbeat(_) => RequestType::Heartbeat,
             #[cfg(feature = "cluster")]
             Request::KickFollower(_) => RequestType::KickFollower,
+            Request::Identify(_) => RequestType::Identify,
         }
     }
 
@@ -125,6 +129,7 @@ impl Request {
             Request::Heartbeat(req) => req.correlation_id,
             #[cfg(feature = "cluster")]
             Request::KickFollower(req) => req.correlation_id,
+            Request::Identify(req) => req.correlation_id,
         }
     }
 
@@ -149,6 +154,7 @@ impl Request {
             Request::Heartbeat(_req) => 0,
             #[cfg(feature = "cluster")]
             Request::KickFollower(_req) => 0,
+            Request::Identify(_req) => 0,
         }
     }
 
@@ -173,6 +179,7 @@ impl Request {
             Request::Heartbeat(_req) => 0,
             #[cfg(feature = "cluster")]
             Request::KickFollower(_req) => 0,
+            Request::Identify(_req) => 0,
         }
     }
 
@@ -197,6 +204,7 @@ impl Request {
             Request::Heartbeat(_req) => 0,
             #[cfg(feature = "cluster")]
             Request::KickFollower(_req) => 0,
+            Request::Identify(_req) => 0,
         }
     }
 
@@ -243,6 +251,7 @@ impl Request {
             RequestType::ListAggregateTypes => fixed!(ListAggregateTypes),
             RequestType::ListAggregates => fixed!(ListAggregates),
             RequestType::Write => variable!(Write),
+            RequestType::Identify => fixed!(Identify),
             #[cfg(feature = "cluster")]
             RequestType::Heartbeat => fixed!(Heartbeat),
             #[cfg(feature = "cluster")]
@@ -278,6 +287,7 @@ impl Request {
             Request::ListAggregateTypes(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
             Request::ListAggregates(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
             Request::Write(req) => wire_header_write_variable_size(writer, req, request_type_id, compression_type, max_message_size, version).await,
+            Request::Identify(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
             #[cfg(feature = "cluster")]
             Request::Heartbeat(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
             #[cfg(feature = "cluster")]
@@ -327,13 +337,13 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     #[cfg(feature = "cluster")]
-    const REQUEST_TYPE_COUNT: usize = 13;
+    const REQUEST_TYPE_COUNT: usize = 14;
     #[cfg(not(feature = "cluster"))]
-    const REQUEST_TYPE_COUNT: usize = 9;
+    const REQUEST_TYPE_COUNT: usize = 10;
     #[cfg(feature = "cluster")]
-    const MAX_ID: u32 = 13;
+    const MAX_ID: u32 = 14;
     #[cfg(not(feature = "cluster"))]
-    const MAX_ID: u32 = 9;
+    const MAX_ID: u32 = 14;
     const VERSIONS: [u32; 2] = [PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3];
 
     fn all_types() -> [RequestType; REQUEST_TYPE_COUNT] {
@@ -355,6 +365,7 @@ mod tests {
             RequestType::Heartbeat,
             #[cfg(feature = "cluster")]
             RequestType::KickFollower,
+            RequestType::Identify,
         ]
     }
 
@@ -477,6 +488,12 @@ mod tests {
             RequestType::KickFollower => Request::KickFollower(KickFollowerRequest {
                 correlation_id: Some(0x7777_8888_9999_AAAA),
             }),
+            RequestType::Identify => Request::Identify(IdentifyRequest {
+                correlation_id: Some(0x8888_9999_AAAA_BBBB),
+                public_key: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA".to_string(),
+                nonce: "1234567890000".to_string(),
+                signature: "dGVzdHNpZ25hdHVyZQ==".to_string(),
+            }),
         }
     }
 
@@ -506,9 +523,15 @@ mod tests {
         for rt in all_types() {
             assert_eq!(RequestType::from_u32(rt as u32).unwrap(), rt);
         }
-        for id in 1..=MAX_ID {
-            assert!(RequestType::from_u32(id).is_ok(), "gap at id {}", id);
+        // Verify all defined types can be parsed
+        for id in 1..=9 {
+            assert!(RequestType::from_u32(id).is_ok(), "missing id {}", id);
         }
+        #[cfg(feature = "cluster")]
+        for id in 10..=13 {
+            assert!(RequestType::from_u32(id).is_ok(), "missing cluster id {}", id);
+        }
+        assert!(RequestType::from_u32(14).is_ok(), "Identify type should be valid");
         assert!(RequestType::from_u32(0).is_err());
         assert!(RequestType::from_u32(MAX_ID + 1).is_err(), "update MAX_ID to {}", MAX_ID + 1);
     }

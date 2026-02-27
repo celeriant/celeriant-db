@@ -87,6 +87,13 @@ const WATCH_READ_OTHER: u32 = 8004;
 // Catch-up errors: 9xxx
 const CATCHUP_REQUEST_INVALID: u32 = 9000;
 
+// Identify errors: 10xxx
+const IDENTIFY_REQUEST_INVALID: u32 = 10000;
+pub const IDENTIFY_INVALID_NONCE: u32 = 10001;
+pub const IDENTIFY_INVALID_SIGNATURE: u32 = 10002;
+pub const IDENTIFY_MISMATCH: u32 = 10003;
+pub const IDENTIFY_REQUIRED: u32 = ErrorResponse::IDENTIFY_REQUIRED;
+
 pub fn shard_error_to_response(correlation_id: Option<u128>, error: ShardError) -> Response {
     let (error_code, error_message) = match error {
         ShardError::Read(e) => read_error(e),
@@ -99,6 +106,7 @@ pub fn shard_error_to_response(correlation_id: Option<u128>, error: ShardError) 
         ShardError::ReplicationBatch(e) => replication_batch_error(e),
         ShardError::AggregateDetails(e) => exists_error(e),
         ShardError::WatchRequestInvalid => (WATCH_REQUEST_INVALID, "{}".into()),
+        ShardError::IdentifyRequestInvalid => (IDENTIFY_REQUEST_INVALID, "{}".into()),
         ShardError::CatchUpRequestInvalid => (CATCHUP_REQUEST_INVALID, "{}".into()),
     };
     Response::GenericError(ErrorResponse { correlation_id, error_code, error_message })

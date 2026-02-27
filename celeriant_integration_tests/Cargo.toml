@@ -253,6 +253,10 @@ path = "src/not_leader_error_main.rs"
 name = "mtls_test_main"
 path = "src/mtls_test_main.rs"
 
+[[bin]]
+name = "identity_test_main"
+path = "src/identity_test_main.rs"
+
 [dependencies]
 celeriant_lib = { package = "celeriant", path = "../celeriant" }
 celeriant_client_tokio = { path = "../celeriant_client_tokio" }
