@@ -1,5 +1,6 @@
 use celeriant_msg::{
-    process_responses::Response,
+    process_client_responses::ClientResponse,
+    process_cluster_responses::ClusterResponse,
     response::responses::ErrorResponse,
 };
 use celeriant_shard::error::{
@@ -84,18 +85,24 @@ const WATCH_READ_IO: u32 = 8002;
 const WATCH_READ_SERIALIZATION: u32 = 8003;
 const WATCH_READ_OTHER: u32 = 8004;
 
-// Catch-up errors: 9xxx
-const CATCHUP_REQUEST_INVALID: u32 = 9000;
-
 // Identify errors: 10xxx
-const IDENTIFY_REQUEST_INVALID: u32 = 10000;
 pub const IDENTIFY_INVALID_NONCE: u32 = 10001;
 pub const IDENTIFY_INVALID_SIGNATURE: u32 = 10002;
 pub const IDENTIFY_MISMATCH: u32 = 10003;
 pub const IDENTIFY_REQUIRED: u32 = ErrorResponse::IDENTIFY_REQUIRED;
 
-pub fn shard_error_to_response(correlation_id: Option<u128>, error: ShardError) -> Response {
-    let (error_code, error_message) = match error {
+pub fn shard_error_to_client_response(correlation_id: Option<u128>, error: ShardError) -> ClientResponse {
+    let (error_code, error_message) = shard_error_to_code(error);
+    ClientResponse::GenericError(ErrorResponse { correlation_id, error_code, error_message })
+}
+
+pub fn shard_error_to_cluster_response(correlation_id: Option<u128>, error: ShardError) -> ClusterResponse {
+    let (error_code, error_message) = shard_error_to_code(error);
+    ClusterResponse::GenericError(ErrorResponse { correlation_id, error_code, error_message })
+}
+
+fn shard_error_to_code(error: ShardError) -> (u32, String) {
+    match error {
         ShardError::Read(e) => read_error(e),
         ShardError::Write(e) => write_error(e),
         ShardError::TrimStart(e) => trim_error(e),
@@ -106,29 +113,26 @@ pub fn shard_error_to_response(correlation_id: Option<u128>, error: ShardError) 
         ShardError::ReplicationBatch(e) => replication_batch_error(e),
         ShardError::AggregateDetails(e) => exists_error(e),
         ShardError::WatchRequestInvalid => (WATCH_REQUEST_INVALID, "{}".into()),
-        ShardError::IdentifyRequestInvalid => (IDENTIFY_REQUEST_INVALID, "{}".into()),
-        ShardError::CatchUpRequestInvalid => (CATCHUP_REQUEST_INVALID, "{}".into()),
-    };
-    Response::GenericError(ErrorResponse { correlation_id, error_code, error_message })
+    }
 }
 
-pub fn watch_session_error_to_response(correlation_id: Option<u128>, error: WatchSessionError) -> Response {
+pub fn watch_session_error_to_client_response(correlation_id: Option<u128>, error: WatchSessionError) -> ClientResponse {
     let (error_code, error_message) = match error {
         WatchSessionError::WatchLatencyTooHigh { latency_ms, max_latency_ms } => (
             WATCH_LATENCY_TOO_HIGH,
             format!(r#"{{"requested_ms":{},"max_ms":{}}}"#, latency_ms, max_latency_ms),
         ),
     };
-    Response::GenericError(ErrorResponse { correlation_id, error_code, error_message })
+    ClientResponse::GenericError(ErrorResponse { correlation_id, error_code, error_message })
 }
 
-pub fn watch_read_error_to_response(correlation_id: Option<u128>, error: WatchReadError) -> Response {
+pub fn watch_read_error_to_client_response(correlation_id: Option<u128>, error: WatchReadError) -> ClientResponse {
     let (error_code, error_message) = match error {
         WatchReadError::Io(msg) => (WATCH_READ_IO, format!(r#"{{"detail":{}}}"#, json_string(&msg))),
         WatchReadError::Serialization(e) => (WATCH_READ_SERIALIZATION, format!(r#"{{"detail":{}}}"#, json_string(&format!("{:?}", e)))),
         WatchReadError::Other(msg) => (WATCH_READ_OTHER, format!(r#"{{"detail":{}}}"#, json_string(&msg))),
     };
-    Response::GenericError(ErrorResponse { correlation_id, error_code, error_message })
+    ClientResponse::GenericError(ErrorResponse { correlation_id, error_code, error_message })
 }
 
 fn read_error(e: ShardReadError) -> (u32, String) {
@@ -348,9 +352,9 @@ mod tests {
 
     #[test]
     fn read_aggregate_not_exists_response() {
-        let resp = shard_error_to_response(Some(42), ShardError::Read(ShardReadError::AggregateNotExists));
+        let resp = shard_error_to_client_response(Some(42), ShardError::Read(ShardReadError::AggregateNotExists));
         match resp {
-            Response::GenericError(e) => {
+            ClientResponse::GenericError(e) => {
                 assert_eq!(e.error_code, READ_AGGREGATE_NOT_EXISTS);
                 assert_eq!(e.error_message, "{}");
                 assert_eq!(e.correlation_id, Some(42));
@@ -361,7 +365,7 @@ mod tests {
 
     #[test]
     fn write_occ_violation_response() {
-        let resp = shard_error_to_response(
+        let resp = shard_error_to_client_response(
             None,
             ShardError::Write(ShardWriteError::OptimisticConcurrencyViolation {
                 expected_event_batch_index: 5,
@@ -369,7 +373,7 @@ mod tests {
             }),
         );
         match resp {
-            Response::GenericError(e) => {
+            ClientResponse::GenericError(e) => {
                 assert_eq!(e.error_code, WRITE_OPTIMISTIC_CONCURRENCY_VIOLATION);
                 assert_eq!(
                     e.error_message,
@@ -382,7 +386,7 @@ mod tests {
 
     #[test]
     fn delete_occ_violation_response() {
-        let resp = shard_error_to_response(
+        let resp = shard_error_to_client_response(
             None,
             ShardError::Delete(ShardDeleteError::OptimisticConcurrencyViolation {
                 expected_event_batch_index: 1,
@@ -390,7 +394,7 @@ mod tests {
             }),
         );
         match resp {
-            Response::GenericError(e) => {
+            ClientResponse::GenericError(e) => {
                 assert_eq!(e.error_code, DELETE_OPTIMISTIC_CONCURRENCY_VIOLATION);
                 assert_eq!(
                     e.error_message,
@@ -403,7 +407,7 @@ mod tests {
 
     #[test]
     fn trim_out_of_range_response() {
-        let resp = shard_error_to_response(
+        let resp = shard_error_to_client_response(
             None,
             ShardError::TrimStart(ShardTrimError::TrimIndexOutOfRange {
                 requested: 100,
@@ -411,7 +415,7 @@ mod tests {
             }),
         );
         match resp {
-            Response::GenericError(e) => {
+            ClientResponse::GenericError(e) => {
                 assert_eq!(e.error_code, TRIM_INDEX_OUT_OF_RANGE);
                 assert_eq!(
                     e.error_message,
@@ -424,12 +428,12 @@ mod tests {
 
     #[test]
     fn watch_latency_too_high_response() {
-        let resp = watch_session_error_to_response(
+        let resp = watch_session_error_to_client_response(
             Some(99),
             WatchSessionError::WatchLatencyTooHigh { latency_ms: 5000, max_latency_ms: 1000 },
         );
         match resp {
-            Response::GenericError(e) => {
+            ClientResponse::GenericError(e) => {
                 assert_eq!(e.error_code, WATCH_LATENCY_TOO_HIGH);
                 assert_eq!(
                     e.error_message,
@@ -442,12 +446,12 @@ mod tests {
 
     #[test]
     fn read_unavailable_batch_index_response() {
-        let resp = shard_error_to_response(
+        let resp = shard_error_to_client_response(
             None,
             ShardError::Read(ShardReadError::UnavailableBatchIndex { minimum_available: 10, requested: 5 }),
         );
         match resp {
-            Response::GenericError(e) => {
+            ClientResponse::GenericError(e) => {
                 assert_eq!(e.error_code, READ_UNAVAILABLE_BATCH_INDEX);
                 assert_eq!(
                     e.error_message,
@@ -460,7 +464,7 @@ mod tests {
 
     #[test]
     fn write_idempotency_violation_response() {
-        let resp = shard_error_to_response(
+        let resp = shard_error_to_client_response(
             None,
             ShardError::Write(ShardWriteError::ClientIdempotencyViolation {
                 last_client_event_index: 10,
@@ -468,7 +472,7 @@ mod tests {
             }),
         );
         match resp {
-            Response::GenericError(e) => {
+            ClientResponse::GenericError(e) => {
                 assert_eq!(e.error_code, WRITE_CLIENT_IDEMPOTENCY_VIOLATION);
                 assert_eq!(
                     e.error_message,
@@ -481,9 +485,9 @@ mod tests {
 
     #[test]
     fn watch_request_invalid_response() {
-        let resp = shard_error_to_response(None, ShardError::WatchRequestInvalid);
+        let resp = shard_error_to_client_response(None, ShardError::WatchRequestInvalid);
         match resp {
-            Response::GenericError(e) => {
+            ClientResponse::GenericError(e) => {
                 assert_eq!(e.error_code, WATCH_REQUEST_INVALID);
                 assert_eq!(e.error_message, "{}");
             }
@@ -492,27 +496,15 @@ mod tests {
     }
 
     #[test]
-    fn catchup_request_invalid_response() {
-        let resp = shard_error_to_response(None, ShardError::CatchUpRequestInvalid);
-        match resp {
-            Response::GenericError(e) => {
-                assert_eq!(e.error_code, CATCHUP_REQUEST_INVALID);
-                assert_eq!(e.error_message, "{}");
-            }
-            _ => panic!("expected GenericError"),
-        }
-    }
-
-    #[test]
     fn write_cannot_accept_writes_with_leader_address() {
-        let resp = shard_error_to_response(
+        let resp = shard_error_to_client_response(
             Some(1),
             ShardError::Write(ShardWriteError::ShardCannotAcceptWrites {
                 leader_address: Some("10.0.0.1:9000".into()),
             }),
         );
         match resp {
-            Response::GenericError(e) => {
+            ClientResponse::GenericError(e) => {
                 assert_eq!(e.error_code, WRITE_CANNOT_ACCEPT_WRITES);
                 assert_eq!(e.error_message, r#"{"leader_address":"10.0.0.1:9000"}"#);
                 assert_eq!(e.correlation_id, Some(1));
@@ -523,14 +515,14 @@ mod tests {
 
     #[test]
     fn write_cannot_accept_writes_without_leader_address() {
-        let resp = shard_error_to_response(
+        let resp = shard_error_to_client_response(
             None,
             ShardError::Write(ShardWriteError::ShardCannotAcceptWrites {
                 leader_address: None,
             }),
         );
         match resp {
-            Response::GenericError(e) => {
+            ClientResponse::GenericError(e) => {
                 assert_eq!(e.error_code, WRITE_CANNOT_ACCEPT_WRITES);
                 assert_eq!(e.error_message, "{}");
             }
@@ -540,14 +532,14 @@ mod tests {
 
     #[test]
     fn delete_cannot_accept_writes_with_leader_address() {
-        let resp = shard_error_to_response(
+        let resp = shard_error_to_client_response(
             None,
             ShardError::Delete(ShardDeleteError::ShardCannotAcceptWrites {
                 leader_address: Some("10.0.0.2:9000".into()),
             }),
         );
         match resp {
-            Response::GenericError(e) => {
+            ClientResponse::GenericError(e) => {
                 assert_eq!(e.error_code, DELETE_CANNOT_ACCEPT_WRITES);
                 assert_eq!(e.error_message, r#"{"leader_address":"10.0.0.2:9000"}"#);
             }
@@ -557,14 +549,14 @@ mod tests {
 
     #[test]
     fn trim_cannot_accept_writes_with_leader_address() {
-        let resp = shard_error_to_response(
+        let resp = shard_error_to_client_response(
             None,
             ShardError::TrimStart(ShardTrimError::ShardCannotAcceptWrites {
                 leader_address: Some("10.0.0.3:9000".into()),
             }),
         );
         match resp {
-            Response::GenericError(e) => {
+            ClientResponse::GenericError(e) => {
                 assert_eq!(e.error_code, TRIM_CANNOT_ACCEPT_WRITES);
                 assert_eq!(e.error_message, r#"{"leader_address":"10.0.0.3:9000"}"#);
             }

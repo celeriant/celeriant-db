@@ -19,8 +19,8 @@ use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
 use celeriant_integration_tests::{count_events, ServerConfig, TestServer};
 use celeriant_msg::{
-    process_requests::Request,
-    process_responses::Response,
+    process_client_requests::ClientRequest,
+    process_client_responses::ClientResponse,
     request::requests::{SingleAggregateWrite, WriteRequest},
 };
 use celeriant_wal::{
@@ -93,7 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
 
-    let request = Request::Write(WriteRequest {
+    let request = ClientRequest::Write(WriteRequest {
         correlation_id: Some(1),
         client_id,
         user_id: None,
@@ -105,7 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     match response {
-        Response::Write(_) => println!("  ✓ Initial write succeeded"),
+        ClientResponse::Write(_) => println!("  ✓ Initial write succeeded"),
         _ => panic!("Initial write failed: {:?}", response),
     }
 
@@ -133,7 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
 
-    let request = Request::Write(WriteRequest {
+    let request = ClientRequest::Write(WriteRequest {
         correlation_id: Some(2),
         client_id,
         user_id: None,
@@ -145,7 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     match response {
-        Response::Write(_) => println!("  ✓ Concurrent write to B succeeded"),
+        ClientResponse::Write(_) => println!("  ✓ Concurrent write to B succeeded"),
         _ => panic!("Concurrent write to B failed: {:?}", response),
     }
 
@@ -184,7 +184,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
 
-    let request = Request::Write(WriteRequest {
+    let request = ClientRequest::Write(WriteRequest {
         correlation_id: Some(3),
         client_id,
         user_id: None,

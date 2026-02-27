@@ -17,7 +17,7 @@ use celeriant_client_tokio::list_operations::{
     ListAggregateTypesIterator, ListAggregatesIterator, ListOptions, ListOrgsIterator,
 };
 use celeriant_msg::{
-    process_requests::Request,
+    process_client_requests::ClientRequest,
     request::{
         read_filters::ReadFilters,
         requests::{
@@ -129,7 +129,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Verify nonexistent aggregates return error 7001
     println!("=== Checking nonexistent aggregates return error ===");
     for agg in [&aggregate_1, &aggregate_2] {
-        let request = Request::AggregateDetails(AggregateDetailsRequest {
+        let request = ClientRequest::AggregateDetails(AggregateDetailsRequest {
             aggregate_key: agg.clone(),
             correlation_id: None,
         });
@@ -162,7 +162,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         );
 
-        let request = Request::Write(WriteRequest {
+        let request = ClientRequest::Write(WriteRequest {
             correlation_id: Some(i as u128),
             client_id,
             user_id: None,
@@ -204,7 +204,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
 
-    let atomic_request = Request::Write(WriteRequest {
+    let atomic_request = ClientRequest::Write(WriteRequest {
         correlation_id: Some(1000),
         client_id,
         user_id: Some(42),
@@ -240,7 +240,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("(Reading from FOLLOWER)");
     }
     for (i, agg) in [&aggregate_1, &aggregate_2].iter().enumerate() {
-        let request = Request::Read(ReadRequest {
+        let request = ClientRequest::Read(ReadRequest {
             correlation_id: None,
             aggregate_key: (*agg).clone(),
             filters: ReadFilters::new(1),
@@ -332,7 +332,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             expected_event_batch_index: Some(2), // We have 2 event batches now (0 and 1)
         },
     );
-    let delete_request = Request::Delete(DeleteRequest {
+    let delete_request = ClientRequest::Delete(DeleteRequest {
         correlation_id: Some(3000),
         client_id,
         user_id: Some(42),
@@ -423,7 +423,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
 
-    let request = Request::Write(WriteRequest {
+    let request = ClientRequest::Write(WriteRequest {
         correlation_id: Some(2000),
         client_id,
         user_id: None,

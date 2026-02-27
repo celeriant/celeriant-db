@@ -2,10 +2,10 @@ use std::collections::{HashMap, HashSet};
 
 use bincode::{Decode, Encode};
 use celeriant_wal::{aggregate_key::AggregateKey, compression_type::CompressionType, datablocks::datablock_aggregate_event::DatablockAggregateEvent};
-#[cfg(feature = "cluster")]
-use celeriant_wal::{constants::{EntryHashBytes, STRUCT_TO_MEMORY_REAL_SIZE}, datablocks::datablock::Datablock, metablocks::metablock::Metablock};
+
+use celeriant_wal::{constants::STRUCT_TO_MEMORY_REAL_SIZE, datablocks::datablock::Datablock, metablocks::metablock::Metablock};
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "cluster")]
+
 use deepsize::DeepSizeOf;
 
 use crate::request::{read_filters::ReadFilters};
@@ -105,7 +105,7 @@ pub struct WatchRequest {
     pub operation_types: Option<HashSet<u8>>,
 }
 
-#[cfg(feature = "cluster")]
+
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct ReplicationBatchRequest {
     pub correlation_id: Option<u128>,
@@ -117,37 +117,21 @@ pub struct ReplicationBatchRequest {
     pub batches: Vec<ReplicationBatchItem>,
 }
 
-#[cfg(feature = "cluster")]
+
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct ReplicationBatchItem {
     pub metablock: Metablock,
     pub datablock: Option<Datablock>,
 }
 
-#[cfg(feature = "cluster")]
+
 impl ReplicationBatchItem {
     pub fn size_bytes(&self) -> u64 {
         ((self.metablock.deep_size_of() + self.datablock.deep_size_of()) * STRUCT_TO_MEMORY_REAL_SIZE) as u64
     }
 }
 
-#[cfg(feature = "cluster")]
-/// Follower-initiated protocol for pulling WAL entries during initial sync
-/// or after falling behind. Follower sends its current position and leader
-/// responds with entries up to max_entries.
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
-pub struct CatchUpRequest {
-    pub correlation_id: Option<u128>,
-    pub shard_id: u64,
-    /// Follower current position in the WAL
-    /// Leader checks this with its WAL - is the hash chain for the wal index correct?
-    /// Is the follower caught up enough?
-    pub last_follower_metablock: Option<Metablock>,
-    /// Either all 0's or the hash up and including the follower's last metablock
-    pub follower_tip_hash: Option<EntryHashBytes>,
-}
 
-#[cfg(feature = "cluster")]
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct HeartbeatRequest {
     pub correlation_id: Option<u128>,
@@ -155,7 +139,7 @@ pub struct HeartbeatRequest {
     pub leader_timestamp_ms: u64,
 }
 
-#[cfg(feature = "cluster")]
+
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct KickFollowerRequest {
     pub correlation_id: Option<u128>,

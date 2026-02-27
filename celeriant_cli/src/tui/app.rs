@@ -3,8 +3,8 @@ use std::{collections::{HashMap, HashSet}, path::Path, sync::Arc};
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_crypto::Crypto;
 use celeriant_msg::{
-    process_requests::Request,
-    process_responses::Response,
+    process_client_requests::ClientRequest,
+    process_client_responses::ClientResponse,
     request::{
         read_filters::ReadFilters,
         requests::*,
@@ -328,13 +328,13 @@ impl App {
             .map_err(|e| format!("Connection failed: {}", e))?;
         
         let key = AggregateKey::new(ctx.org_id, ctx.aggregate_type_id, ctx.aggregate_id);
-        let request = Request::AggregateDetails(AggregateDetailsRequest {
+        let request = ClientRequest::AggregateDetails(AggregateDetailsRequest {
             correlation_id: None,
             aggregate_key: key,
         });
         
         match client.send_request(&request, CompressionType::None).await {
-            Ok(Response::AggregateDetails(res)) => {
+            Ok(ClientResponse::AggregateDetails(res)) => {
                 ctx.info = Some(AggregateContextInfo {
                     min_batch: res.min_event_batch_index,
                     max_batch: res.max_event_batch_index,
@@ -344,7 +344,7 @@ impl App {
                 self.set_status("Aggregate info loaded");
                 Ok(())
             }
-            Ok(Response::GenericError(e)) => {
+            Ok(ClientResponse::GenericError(e)) => {
                 ctx.info = None;
                 Err(format!("Error {}: {}", e.error_code, e.error_message))
             }
@@ -373,14 +373,14 @@ impl App {
             filters = filters.to_event_batch_index(to_idx);
         }
         
-        let request = Request::Read(ReadRequest {
+        let request = ClientRequest::Read(ReadRequest {
             correlation_id: None,
             aggregate_key: key,
             filters,
         });
         
         match client.send_request(&request, CompressionType::None).await {
-            Ok(Response::Read(res)) => {
+            Ok(ClientResponse::Read(res)) => {
                 self.result_output.clear();
                 self.result_output.push(format!("Read {} event batches", res.event_batches.len()));
                 if let Some(next) = res.next_event_batch_index {
@@ -422,7 +422,7 @@ impl App {
                 self.set_status(&format!("Read {} batches", res.event_batches.len()));
                 Ok(())
             }
-            Ok(Response::GenericError(e)) => {
+            Ok(ClientResponse::GenericError(e)) => {
                 Err(format!("Error {}: {}", e.error_code, e.error_message))
             }
             Ok(_) => Err("Unexpected response".to_string()),
@@ -473,7 +473,7 @@ impl App {
             compression_type: CompressionType::None,
         });
         
-        let request = Request::Write(WriteRequest {
+        let request = ClientRequest::Write(WriteRequest {
             correlation_id: None,
             client_id: self.client_id,  // Use app's client_id
             user_id: None,
@@ -481,7 +481,7 @@ impl App {
         });
         
         match client.send_request(&request, CompressionType::None).await {
-            Ok(Response::Write(_res)) => {
+            Ok(ClientResponse::Write(_res)) => {
                 self.result_output.clear();
                 self.result_output.push("Write successful!".to_string());
                 
@@ -489,7 +489,7 @@ impl App {
                 self.set_status("Event written successfully");
                 Ok(())
             }
-            Ok(Response::GenericError(e)) => {
+            Ok(ClientResponse::GenericError(e)) => {
                 Err(format!("Error {}: {}", e.error_code, e.error_message))
             }
             Ok(_) => Err("Unexpected response".to_string()),
@@ -513,7 +513,7 @@ impl App {
             expected_event_batch_index: None,
         });
         
-        let request = Request::Delete(DeleteRequest {
+        let request = ClientRequest::Delete(DeleteRequest {
             correlation_id: None,
             client_id: self.client_id,  // Use app's client_id
             user_id: None,
@@ -521,12 +521,12 @@ impl App {
         });
         
         match client.send_request(&request, CompressionType::None).await {
-            Ok(Response::Delete(_)) => {
+            Ok(ClientResponse::Delete(_)) => {
                 self.set_status("Aggregate deleted");
                 self.aggregate_context = None;
                 Ok(())
             }
-            Ok(Response::GenericError(e)) => {
+            Ok(ClientResponse::GenericError(e)) => {
                 Err(format!("Error {}: {}", e.error_code, e.error_message))
             }
             Ok(_) => Err("Unexpected response".to_string()),
@@ -545,7 +545,7 @@ impl App {
             .map_err(|_| "Invalid batch index")?;
         
         let key = AggregateKey::new(ctx.org_id, ctx.aggregate_type_id, ctx.aggregate_id);
-        let request = Request::TrimStart(TrimStartRequest {
+        let request = ClientRequest::TrimStart(TrimStartRequest {
             correlation_id: None,
             aggregate_key: key,
             keep_from_event_batch_index: keep_from,
@@ -554,11 +554,11 @@ impl App {
         });
         
         match client.send_request(&request, CompressionType::None).await {
-            Ok(Response::TrimStart(_)) => {
+            Ok(ClientResponse::TrimStart(_)) => {
                 self.set_status(&format!("Trimmed events before batch {}", keep_from));
                 Ok(())
             }
-            Ok(Response::GenericError(e)) => {
+            Ok(ClientResponse::GenericError(e)) => {
                 Err(format!("Error {}: {}", e.error_code, e.error_message))
             }
             Ok(_) => Err("Unexpected response".to_string()),
@@ -959,8 +959,8 @@ async fn watch_task(
     mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
     use celeriant_client_tokio::celeriant_client::CeleriantClient;
-    use celeriant_msg::process_requests::Request;
-    use celeriant_msg::process_responses::Response;
+    use celeriant_msg::process_client_requests::ClientRequest;
+    use celeriant_msg::process_client_responses::ClientResponse;
     use celeriant_msg::request::requests::WatchRequest;
     use celeriant_wal::compression_type::CompressionType;
     
@@ -980,7 +980,7 @@ async fn watch_task(
     let mut aggregates = HashSet::new();
     aggregates.insert(aggregate_key.aggregate_id);
     
-    let request = Request::Watch(WatchRequest {
+    let request = ClientRequest::Watch(WatchRequest {
         operation_types: event_types,
         correlation_id: None,
         requested_latency_ms: latency_ms,
@@ -1001,7 +1001,7 @@ async fn watch_task(
             }
             result = client.send_request(&request, CompressionType::None) => {
                 match result {
-                    Ok(Response::Watch(watch_response)) => {
+                    Ok(ClientResponse::Watch(watch_response)) => {
                         if watch_response.events.is_none() {
                             let _ = tx.send(WatchUpdate::Heartbeat);
                         } else if let Some(events_by_aggregate) = watch_response.events {
@@ -1041,7 +1041,7 @@ async fn watch_task(
                             let _ = tx.send(WatchUpdate::Event(lines));
                         }
                     }
-                    Ok(Response::GenericError(e)) => {
+                    Ok(ClientResponse::GenericError(e)) => {
                         let _ = tx.send(WatchUpdate::Error(format!("{}: {}", e.error_code, e.error_message)));
                         break;
                     }
@@ -1070,8 +1070,8 @@ async fn org_watch_task(
     mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
     use celeriant_client_tokio::celeriant_client::CeleriantClient;
-    use celeriant_msg::process_requests::Request;
-    use celeriant_msg::process_responses::Response;
+    use celeriant_msg::process_client_requests::ClientRequest;
+    use celeriant_msg::process_client_responses::ClientResponse;
     use celeriant_msg::request::requests::WatchRequest;
     use celeriant_wal::compression_type::CompressionType;
     
@@ -1084,7 +1084,7 @@ async fn org_watch_task(
         }
     };
     
-    let request = Request::Watch(WatchRequest {
+    let request = ClientRequest::Watch(WatchRequest {
         operation_types: event_types,
         correlation_id: None,
         requested_latency_ms: latency_ms,
@@ -1103,7 +1103,7 @@ async fn org_watch_task(
             }
             result = client.send_request(&request, CompressionType::None) => {
                 match result {
-                    Ok(Response::Watch(watch_response)) => {
+                    Ok(ClientResponse::Watch(watch_response)) => {
                         if watch_response.events.is_none() {
                             let _ = tx.send(WatchUpdate::Heartbeat);
                         } else if let Some(events_by_aggregate) = watch_response.events {
@@ -1145,7 +1145,7 @@ async fn org_watch_task(
                             let _ = tx.send(WatchUpdate::Event(lines));
                         }
                     }
-                    Ok(Response::GenericError(e)) => {
+                    Ok(ClientResponse::GenericError(e)) => {
                         let _ = tx.send(WatchUpdate::Error(format!("{}: {}", e.error_code, e.error_message)));
                         break;
                     }

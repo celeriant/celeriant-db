@@ -21,7 +21,7 @@ use tracing::{debug, error, info, warn};
 use crate::sharded::{
     api_key_reloader::ApiKeyReloader,
     connection_handler::{
-        CatchupCompletionMsg, ConnectionContext, PortType, handle_enter_s3_catchup, handle_new_connection, handle_redirected_connection,
+        CatchupCompletionMsg, ConnectionContext, PortType, handle_enter_s3_catchup, handle_new_connection, handle_redirected_client_connection, handle_redirected_cluster_connection,
     },
     intrashard_messages::IntrashardMessages,
     shard_config::ShardConfig,
@@ -669,25 +669,36 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
         IntrashardMessages::Shutdown => {
             ctx.shutdown_requested.set(true);
         }
-        IntrashardMessages::ConnectionRedirect {
+        IntrashardMessages::ClientConnectionRedirect {
             accepted_tcp_stream,
             request,
             message_version,
-            port_type,
             verified_client_id,
             access_level,
         } => {
-            handle_redirected_connection(
+            handle_redirected_client_connection(
                 accepted_tcp_stream.bind_to_executor(),
                 request,
-                ctx.config.max_request_size,
                 ctx.config.max_response_size,
                 ctx.config.server_compression_algorithm,
                 message_version,
                 ctx.clone(),
-                port_type,
                 verified_client_id,
                 access_level,
+            );
+        }
+        IntrashardMessages::ClusterConnectionRedirect {
+            accepted_tcp_stream,
+            request,
+            message_version,
+        } => {
+            handle_redirected_cluster_connection(
+                accepted_tcp_stream.bind_to_executor(),
+                request,
+                ctx.config.max_response_size,
+                ctx.config.server_compression_algorithm,
+                message_version,
+                ctx.clone(),
             );
         }
         IntrashardMessages::EnterS3Catchup => handle_enter_s3_catchup(ctx.clone()),

@@ -2,12 +2,11 @@ use std::collections::HashMap;
 
 use bincode::{Decode, Encode};
 use celeriant_wal::aggregate_key::AggregateKey;
-#[cfg(feature = "cluster")]
+
 use celeriant_wal::{constants::EntryHashBytes, metablocks::metablock::Metablock};
 use serde::{Deserialize, Serialize};
 
-#[cfg(feature = "cluster")]
-use crate::request::requests::ReplicationBatchItem;
+
 use crate::response::{aggregate_event_batch::AggregateEventBatch, watch_event::WatchEvent};
 
 
@@ -139,7 +138,7 @@ impl ErrorResponse {
     }
 }
 
-#[cfg(feature = "cluster")]
+
 /// Rejection reasons when follower refuses a replication batch.
 /// These are logical errors indicating state mismatch, not network failures.
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode, PartialEq, Eq)]
@@ -174,7 +173,7 @@ pub enum FollowerRejection {
     },
 }
 
-#[cfg(feature = "cluster")]
+
 /// Rejection reasons when follower refuses a heartbeat.
 /// Lease validation is handled by the replication path (FollowerRejection::StaleLease).
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode, PartialEq, Eq)]
@@ -188,7 +187,7 @@ pub enum HeartbeatRejection {
     NotAFollower,
 }
 
-#[cfg(feature = "cluster")]
+
 /// Result of a replication batch - either success or explicit rejection.
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub enum ReplicationResult {
@@ -198,7 +197,7 @@ pub enum ReplicationResult {
     Rejected(FollowerRejection),
 }
 
-#[cfg(feature = "cluster")]
+
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct ReplicationBatchResponse {
     pub correlation_id: Option<u128>,
@@ -206,21 +205,7 @@ pub struct ReplicationBatchResponse {
     pub result: ReplicationResult,
 }
 
-#[cfg(feature = "cluster")]
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
-pub struct CatchUpResponse {
-    pub correlation_id: Option<u128>,
-    /// Leader's expected tip_hash at follower's current position.
-    /// Follower rejects batch if its tip_hash doesn't match.
-    pub expected_follower_tip_hash: Option<EntryHashBytes>,
-    /// Batches for the follower to append to its WAL for the requested shard
-    /// May not contain everything (paginated)
-    pub batches: Vec<ReplicationBatchItem>,
-    /// Leader decides if the follower has caught up enough to become live
-    pub continue_catching_up: bool,
-}
 
-#[cfg(feature = "cluster")]
 /// Result of a heartbeat - either acknowledgement or explicit rejection.
 /// The heartbeat is purely a liveness signal. Lease fencing is the replication path's job.
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
@@ -229,14 +214,14 @@ pub enum HeartbeatResult {
     Rejected(HeartbeatRejection),
 }
 
-#[cfg(feature = "cluster")]
+
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct HeartbeatResponse {
     pub correlation_id: Option<u128>,
     pub result: HeartbeatResult,
 }
 
-#[cfg(feature = "cluster")]
+
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct KickFollowerResponse {
     pub correlation_id: Option<u128>,

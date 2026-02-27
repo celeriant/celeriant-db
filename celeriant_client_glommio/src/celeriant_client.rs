@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
 use celeriant_ktls::ktls_connect;
-use celeriant_msg::process_requests::Request;
-use celeriant_msg::process_responses::Response;
+use celeriant_msg::process_client_requests::ClientRequest;
+use celeriant_msg::process_client_responses::ClientResponse;
+use celeriant_msg::process_cluster_requests::ClusterRequest;
+use celeriant_msg::process_cluster_responses::ClusterResponse;
 use celeriant_wal::compression_type::CompressionType;
 use celeriant_wire::network::wire_header::PROTOCOL_VERSION_V2;
 use futures_lite::future::or;
@@ -176,10 +178,9 @@ impl CeleriantClient {
     /// create multiple client instances (one per connection).
     pub async fn send_request(
         &mut self,
-        request: &Request,
+        request: &ClientRequest,
         compression_type: CompressionType,
-    ) -> Result<Response, ClientError> {
-        // Apply timeout if configured
+    ) -> Result<ClientResponse, ClientError> {
         if let Some(duration) = self.timeout_duration {
             let request_future = self.send_request_inner(request, compression_type);
 
@@ -199,11 +200,10 @@ impl CeleriantClient {
 
     async fn send_request_inner(
         &mut self,
-        request: &Request,
+        request: &ClientRequest,
         compression_type: CompressionType,
-    ) -> Result<Response, ClientError> {
-        // Write request to server with V2 protocol
-        Request::write_request(
+    ) -> Result<ClientResponse, ClientError> {
+        ClientRequest::write_request(
             &mut self.stream,
             request,
             compression_type,
@@ -213,13 +213,58 @@ impl CeleriantClient {
         .await
         .map_err(ClientError::WriteRequestError)?;
 
-        // Read response from server
-        let response = Response::read_response(&mut self.stream, self.max_response_size).await
+        let response = ClientResponse::read_response(&mut self.stream, self.max_response_size).await
             .map_err(ClientError::ReadResponseError)?;
 
         match response {
-            Response::ProtocolError(_) => Err(ClientError::RequestProtocolError),
-            Response::GenericError(error) => Err(ClientError::from_error_response(error)),
+            ClientResponse::ProtocolError(_) => Err(ClientError::RequestProtocolError),
+            ClientResponse::GenericError(error) => Err(ClientError::from_error_response(error)),
+            _ => Ok(response),
+        }
+    }
+
+    pub async fn send_cluster_request(
+        &mut self,
+        request: &ClusterRequest,
+        compression_type: CompressionType,
+    ) -> Result<ClusterResponse, ClientError> {
+        if let Some(duration) = self.timeout_duration {
+            let request_future = self.send_cluster_request_inner(request, compression_type);
+            let result = or(
+                async { Some(request_future.await) },
+                async { Timer::new(duration).await; None }
+            ).await;
+            match result {
+                Some(response) => response,
+                None => Err(ClientError::RequestTimeout),
+            }
+        } else {
+            self.send_cluster_request_inner(request, compression_type).await
+        }
+    }
+
+    async fn send_cluster_request_inner(
+        &mut self,
+        request: &ClusterRequest,
+        compression_type: CompressionType,
+    ) -> Result<ClusterResponse, ClientError> {
+        ClusterRequest::write_request(
+            &mut self.stream,
+            request,
+            compression_type,
+            self.max_request_size,
+            PROTOCOL_VERSION_V2,
+        )
+        .await
+        .map_err(ClientError::WriteRequestError)?;
+
+        let response = ClusterResponse::read_response(&mut self.stream, self.max_response_size)
+            .await
+            .map_err(ClientError::ReadResponseError)?;
+
+        match response {
+            ClusterResponse::ProtocolError(_) => Err(ClientError::RequestProtocolError),
+            ClusterResponse::GenericError(error) => Err(ClientError::from_error_response(error)),
             _ => Ok(response),
         }
     }

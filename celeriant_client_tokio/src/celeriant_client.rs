@@ -1,11 +1,14 @@
 use std::sync::Arc;
 
 use celeriant_crypto::Crypto;
-use celeriant_msg::process_requests::Request;
-use celeriant_msg::process_responses::Response;
+use celeriant_msg::process_identify::{
+    IDENTIFY_RESPONSE_TYPE_ID, read_identify_response, write_identify_request,
+};
+use celeriant_msg::process_client_requests::ClientRequest;
+use celeriant_msg::process_client_responses::ClientResponse;
 use celeriant_msg::request::requests::IdentifyRequest;
 use celeriant_wal::compression_type::CompressionType;
-use celeriant_wire::network::wire_header::PROTOCOL_VERSION_V2;
+use celeriant_wire::network::wire_header::{PROTOCOL_VERSION_V2, WireHeader};
 use rustls_pki_types::ServerName;
 use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
@@ -177,9 +180,9 @@ impl CeleriantClient {
     /// create multiple client instances (one per connection).
     pub async fn send_request(
         &mut self,
-        request: &Request,
+        request: &ClientRequest,
         compression_type: CompressionType,
-    ) -> Result<Response, ClientError> {
+    ) -> Result<ClientResponse, ClientError> {
         // Apply timeout if configured
         if let Some(duration) = self.timeout {
             timeout(duration, self.send_request_inner(request, compression_type))
@@ -192,11 +195,10 @@ impl CeleriantClient {
 
     async fn send_request_inner(
         &mut self,
-        request: &Request,
+        request: &ClientRequest,
         compression_type: CompressionType,
-    ) -> Result<Response, ClientError> {
-        // Write request to server with V2 protocol
-        Request::write_request(
+    ) -> Result<ClientResponse, ClientError> {
+        ClientRequest::write_request(
             &mut self.stream,
             request,
             compression_type,
@@ -205,12 +207,11 @@ impl CeleriantClient {
         )
         .await?;
 
-        // Read response from server
-        let response = Response::read_response(&mut self.stream, self.max_request_size).await?;
+        let response = ClientResponse::read_response(&mut self.stream, self.max_request_size).await?;
 
         match response {
-            Response::ProtocolError(_) => Err(ClientError::ProtocolError),
-            Response::GenericError(error) => Err(ClientError::from_error_response(error)),
+            ClientResponse::ProtocolError(_) => Err(ClientError::ProtocolError),
+            ClientResponse::GenericError(error) => Err(ClientError::from_error_response(error)),
             _ => Ok(response),
         }
     }
@@ -251,27 +252,37 @@ impl CeleriantClient {
             _ => (None, None, None),
         };
 
-        let request = Request::Identify(IdentifyRequest {
+        let req = IdentifyRequest {
             correlation_id: None,
             public_key,
             nonce,
             signature,
             api_key: identity_config.api_key.clone(),
-        });
-
-        // Send request using shared helper with timeout handling
-        let response = if let Some(duration) = self.timeout {
-            timeout(duration, self.send_request_inner(&request, CompressionType::None))
-                .await
-                .map_err(|_| ClientError::RequestTimeout)??
-        } else {
-            self.send_request_inner(&request, CompressionType::None).await?
         };
 
-        match response {
-            Response::Identify(resp) => Ok(resp.client_id),
-            Response::GenericError(err) => Err(ClientError::CeleriantError(err)),
-            _ => Err(ClientError::ProtocolError),
+        let identify_inner = async {
+            write_identify_request(&mut self.stream, &req, PROTOCOL_VERSION_V2).await?;
+
+            let header = WireHeader::from_reader(&mut self.stream, self.max_request_size).await?;
+            if header.message_type == IDENTIFY_RESPONSE_TYPE_ID {
+                let resp = read_identify_response(header, &mut self.stream).await?;
+                return Ok(resp.client_id);
+            }
+            // Server sent a non-Identify response — must be an error
+            let response = ClientResponse::read_from_header(header, &mut self.stream).await?;
+            match response {
+                ClientResponse::ProtocolError(_) => Err(ClientError::ProtocolError),
+                ClientResponse::GenericError(err) => Err(ClientError::from_error_response(err)),
+                _ => Err(ClientError::ProtocolError),
+            }
+        };
+
+        if let Some(duration) = self.timeout {
+            timeout(duration, identify_inner)
+                .await
+                .map_err(|_| ClientError::RequestTimeout)?
+        } else {
+            identify_inner.await
         }
     }
 }

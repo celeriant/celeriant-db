@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_msg::{
-    process_requests::Request,
-    process_responses::Response,
+    process_client_requests::ClientRequest,
+    process_client_responses::ClientResponse,
     request::{
         read_filters::ReadFilters,
         requests::*,
@@ -37,7 +37,7 @@ pub async fn execute_command(server: &str, _api_key: Option<&str>, command: Comm
 
 async fn check_aggregatedetails(client: &mut CeleriantClient, args: AggregateKeyArgs) -> Result<()> {
     let key = AggregateKey::new(args.org, args.aggregate_type, args.id);
-    let request = Request::AggregateDetails(AggregateDetailsRequest {
+    let request = ClientRequest::AggregateDetails(AggregateDetailsRequest {
         correlation_id: args.correlation_id,
         aggregate_key: key,
     });
@@ -45,7 +45,7 @@ async fn check_aggregatedetails(client: &mut CeleriantClient, args: AggregateKey
     let response = client.send_request(&request, CompressionType::None).await?;
 
     match &response {
-        Response::AggregateDetails(res) => {
+        ClientResponse::AggregateDetails(res) => {
             println!("Aggregate details:");
             println!("  Batch index range: {} - {}", res.min_event_batch_index, res.max_event_batch_index);
             println!("  Max event index: {}", res.max_event_index);
@@ -60,7 +60,7 @@ async fn check_aggregatedetails(client: &mut CeleriantClient, args: AggregateKey
                 println!("  Last user ID: {}", user_id);
             }
         }
-        Response::GenericError(err) => {
+        ClientResponse::GenericError(err) => {
             anyhow::bail!("Error {}: {}", err.error_code, err.error_message);
         }
         other => {
@@ -95,7 +95,7 @@ async fn read_events(client: &mut CeleriantClient, args: ReadArgs) -> Result<()>
         filters = filters.max_server_timestamp(ts);
     }
 
-    let request = Request::Read(ReadRequest {
+    let request = ClientRequest::Read(ReadRequest {
         correlation_id: args.key.correlation_id,
         aggregate_key: key,
         filters,
@@ -104,7 +104,7 @@ async fn read_events(client: &mut CeleriantClient, args: ReadArgs) -> Result<()>
     let response = client.send_request(&request, CompressionType::None).await?;
 
     match &response {
-        Response::Read(res) => {
+        ClientResponse::Read(res) => {
             match args.format {
                 OutputFormat::Json => {
                     println!("{}", serde_json::to_string_pretty(&res)?);
@@ -129,7 +129,7 @@ async fn read_events(client: &mut CeleriantClient, args: ReadArgs) -> Result<()>
                 }
             }
         }
-        Response::GenericError(err) => {
+        ClientResponse::GenericError(err) => {
             anyhow::bail!("Error {}: {}", err.error_code, err.error_message);
         }
         other => {
@@ -173,7 +173,7 @@ async fn write_event(client: &mut CeleriantClient, args: WriteArgs) -> Result<()
         compression_type: compression,
     });
     
-    let request = Request::Write(WriteRequest {
+    let request = ClientRequest::Write(WriteRequest {
         correlation_id: args.key.correlation_id,
         client_id: args.client_id,
         user_id: args.user_id,
@@ -183,10 +183,10 @@ async fn write_event(client: &mut CeleriantClient, args: WriteArgs) -> Result<()
     let response = client.send_request(&request, compression).await?;
 
     match &response {
-        Response::Write(_res) => {
+        ClientResponse::Write(_res) => {
             println!("Write successful.");
         }
-        Response::GenericError(err) => {
+        ClientResponse::GenericError(err) => {
             anyhow::bail!("Error {}: {}", err.error_code, err.error_message);
         }
         other => {
@@ -200,7 +200,7 @@ async fn write_event(client: &mut CeleriantClient, args: WriteArgs) -> Result<()
 async fn trim_start(client: &mut CeleriantClient, args: TrimArgs) -> Result<()> {
     let key = AggregateKey::new(args.key.org, args.key.aggregate_type, args.key.id);
 
-    let request = Request::TrimStart(TrimStartRequest {
+    let request = ClientRequest::TrimStart(TrimStartRequest {
         correlation_id: args.key.correlation_id,
         aggregate_key: key,
         keep_from_event_batch_index: args.keep_from,
@@ -211,13 +211,13 @@ async fn trim_start(client: &mut CeleriantClient, args: TrimArgs) -> Result<()> 
     let response = client.send_request(&request, CompressionType::None).await?;
 
     match &response {
-        Response::TrimStart(res) => {
+        ClientResponse::TrimStart(res) => {
             println!("Trim successful");
             if let Some(id) = res.correlation_id {
                 println!("  Correlation ID: {}", id);
             }
         }
-        Response::GenericError(err) => {
+        ClientResponse::GenericError(err) => {
             anyhow::bail!("Error {}: {}", err.error_code, err.error_message);
         }
         other => {
@@ -238,7 +238,7 @@ async fn delete_aggregate(client: &mut CeleriantClient, args: DeleteArgs) -> Res
         expected_event_batch_index: args.expected_index,
     });
     
-    let request = Request::Delete(DeleteRequest {
+    let request = ClientRequest::Delete(DeleteRequest {
         correlation_id: args.key.correlation_id,
         client_id: args.client_id,
         user_id: args.user_id,
@@ -248,13 +248,13 @@ async fn delete_aggregate(client: &mut CeleriantClient, args: DeleteArgs) -> Res
     let response = client.send_request(&request, CompressionType::None).await?;
 
     match &response {
-        Response::Delete(res) => {
+        ClientResponse::Delete(res) => {
             println!("Delete successful");
             if let Some(id) = res.correlation_id {
                 println!("  Correlation ID: {}", id);
             }
         }
-        Response::GenericError(err) => {
+        ClientResponse::GenericError(err) => {
             anyhow::bail!("Error {}: {}", err.error_code, err.error_message);
         }
         other => {

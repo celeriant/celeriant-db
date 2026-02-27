@@ -18,7 +18,8 @@ use celeriant_client_tokio::celeriant_client::{CeleriantClient, ClientIdentityCo
 use celeriant_client_tokio::client_error::ClientError;
 use celeriant_crypto::Crypto;
 use celeriant_msg::{
-    process_requests::Request,
+    process_client_requests::ClientRequest,
+    process_client_responses::ClientResponse,
     request::requests::{SingleAggregateWrite, WriteRequest},
 };
 use celeriant_wal::{
@@ -130,11 +131,11 @@ async fn test_successful_identity_verification(
     };
 
     let response = client
-        .send_request(&Request::Write(write_req), CompressionType::None)
+        .send_request(&ClientRequest::Write(write_req), CompressionType::None)
         .await?;
 
     match response {
-        celeriant_msg::process_responses::Response::Write(_) => {
+        ClientResponse::Write(_) => {
             println!("  ✓ Write with matching client_id succeeded");
         }
         other => {
@@ -193,7 +194,7 @@ async fn test_identity_mismatch_rejection(
     };
 
     let result = client
-        .send_request(&Request::Write(write_req), CompressionType::None)
+        .send_request(&ClientRequest::Write(write_req), CompressionType::None)
         .await;
 
     match result {
@@ -264,11 +265,11 @@ async fn test_backward_compatibility_no_identity(
     };
 
     let response = client
-        .send_request(&Request::Write(write_req), CompressionType::None)
+        .send_request(&ClientRequest::Write(write_req), CompressionType::None)
         .await?;
 
     match response {
-        celeriant_msg::process_responses::Response::Write(_) => {
+        ClientResponse::Write(_) => {
             println!("  ✓ Write succeeded without identity verification");
         }
         other => {
@@ -313,7 +314,7 @@ async fn test_enforcement_rejects_unidentified(
     };
 
     let result = client
-        .send_request(&Request::Write(write_req), CompressionType::None)
+        .send_request(&ClientRequest::Write(write_req), CompressionType::None)
         .await;
 
     match result {
@@ -377,11 +378,11 @@ async fn test_enforcement_allows_identified(
     };
 
     let response = client
-        .send_request(&Request::Write(write_req), CompressionType::None)
+        .send_request(&ClientRequest::Write(write_req), CompressionType::None)
         .await?;
 
     match response {
-        celeriant_msg::process_responses::Response::Write(_) => {
+        ClientResponse::Write(_) => {
             println!("  ✓ Write succeeded after identity verification");
         }
         other => {

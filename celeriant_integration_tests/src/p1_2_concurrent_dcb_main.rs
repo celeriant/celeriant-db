@@ -10,9 +10,9 @@
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
 use celeriant_integration_tests::{count_events, ServerConfig, TestServer};
-use celeriant_msg::process_requests::Request;
+use celeriant_msg::process_client_requests::ClientRequest;
 use celeriant_msg::request::requests::{SingleAggregateWrite, WriteRequest};
-use celeriant_msg::process_responses::Response;
+use celeriant_msg::process_client_responses::ClientResponse;
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::compression_type::CompressionType;
 use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
@@ -64,7 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 compression_type: CompressionType::None,
             },
         );
-        let request = Request::Write(WriteRequest {
+        let request = ClientRequest::Write(WriteRequest {
             correlation_id: None,
             client_id: 999,
             user_id: None,
@@ -135,7 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         );
 
-        let request = Request::Write(WriteRequest {
+        let request = ClientRequest::Write(WriteRequest {
             correlation_id: Some(1),
             client_id: 1,
             user_id: None,
@@ -143,11 +143,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
 
         match client1.send_request(&request, CompressionType::None).await {
-            Ok(Response::Write(_)) => {
+            Ok(ClientResponse::Write(_)) => {
                 won1.store(true, Ordering::Relaxed);
                 println!("  Client 1: SUCCESS");
             }
-            Ok(Response::GenericError(e)) if e.error_code == 2003 => {
+            Ok(ClientResponse::GenericError(e)) if e.error_code == 2003 => {
                 println!("  Client 1: OCC FAILURE (error {})", e.error_code);
             }
             Err(ClientError::CeleriantError(e)) if e.error_code == 2003 => {
@@ -188,7 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         );
 
-        let request = Request::Write(WriteRequest {
+        let request = ClientRequest::Write(WriteRequest {
             correlation_id: Some(2),
             client_id: 2,
             user_id: None,
@@ -196,11 +196,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
 
         match client2.send_request(&request, CompressionType::None).await {
-            Ok(Response::Write(_)) => {
+            Ok(ClientResponse::Write(_)) => {
                 won2.store(true, Ordering::Relaxed);
                 println!("  Client 2: SUCCESS");
             }
-            Ok(Response::GenericError(e)) if e.error_code == 2003 => {
+            Ok(ClientResponse::GenericError(e)) if e.error_code == 2003 => {
                 println!("  Client 2: OCC FAILURE (error {})", e.error_code);
             }
             Err(ClientError::CeleriantError(e)) if e.error_code == 2003 => {

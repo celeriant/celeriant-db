@@ -11,7 +11,7 @@ use std::sync::Arc;
 use celeriant_integration_tests::{ServerConfig, TestServer};
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_msg::{
-    process_requests::Request,
+    process_client_requests::ClientRequest,
     request::read_filters::ReadFilters,
     request::requests::{AggregateDetailsRequest, ReadRequest, SingleAggregateWrite, WriteRequest},
 };
@@ -29,7 +29,7 @@ const CLIENT_ID: u128 = 12345;
 /// Only transport/protocol errors are propagated.
 async fn send_probe(
     client: &mut CeleriantClient,
-    request: &Request,
+    request: &ClientRequest,
 ) -> Result<(), ClientError> {
     match client.send_request(request, CompressionType::None).await {
         Ok(_) | Err(ClientError::CeleriantError(_)) => Ok(()),
@@ -167,7 +167,7 @@ async fn test_single_request(server_address: &str) -> Result<(), Box<dyn std::er
     let mut client = CeleriantClient::connect(server_address).await?;
 
     let aggregate = AggregateKey::new(1, 1, 1000);
-    let request = Request::AggregateDetails(AggregateDetailsRequest {
+    let request = ClientRequest::AggregateDetails(AggregateDetailsRequest {
         aggregate_key: aggregate,
         correlation_id: Some(1),
     });
@@ -186,7 +186,7 @@ async fn test_pipelining(server_address: &str) -> Result<(), Box<dyn std::error:
     for i in 0..10 {
         // All the same shard as we route by aggregate
         let aggregate = AggregateKey::new(1, i, 2000);
-        let request = Request::AggregateDetails(AggregateDetailsRequest {
+        let request = ClientRequest::AggregateDetails(AggregateDetailsRequest {
             aggregate_key: aggregate.clone(),
             correlation_id: Some(i as u128),
         });
@@ -219,7 +219,7 @@ async fn test_cross_shard_routing(server_address: &str) -> Result<(), Box<dyn st
 
     for (agg_id, expected_shard) in shard_targets {
         let aggregate = AggregateKey::new(1, 1, agg_id);
-        let request = Request::AggregateDetails(AggregateDetailsRequest {
+        let request = ClientRequest::AggregateDetails(AggregateDetailsRequest {
             aggregate_key: aggregate.clone(),
             correlation_id: Some(agg_id as u128),
         });
@@ -255,7 +255,7 @@ async fn test_mixed_operations(server_address: &str) -> Result<(), Box<dyn std::
         },
     );
 
-    let write_request = Request::Write(WriteRequest {
+    let write_request = ClientRequest::Write(WriteRequest {
         correlation_id: Some(100),
         client_id: CLIENT_ID,
         user_id: None,
@@ -268,7 +268,7 @@ async fn test_mixed_operations(server_address: &str) -> Result<(), Box<dyn std::
     println!("  Write response: {:?}", write_response);
 
     // Check exists on same connection
-    let exists_request = Request::AggregateDetails(AggregateDetailsRequest {
+    let exists_request = ClientRequest::AggregateDetails(AggregateDetailsRequest {
         aggregate_key: aggregate.clone(),
         correlation_id: Some(101),
     });
@@ -279,7 +279,7 @@ async fn test_mixed_operations(server_address: &str) -> Result<(), Box<dyn std::
     println!("  Exists response: {:?}", exists_response);
 
     // Read on same connection
-    let read_request = Request::Read(ReadRequest {
+    let read_request = ClientRequest::Read(ReadRequest {
         correlation_id: Some(102),
         aggregate_key: aggregate.clone(),
         filters: ReadFilters::new(1),
@@ -306,7 +306,7 @@ async fn test_parallel_connections(server_address: &str) -> Result<(), Box<dyn s
 
             for req_id in 0..5 {
                 let aggregate = AggregateKey::new(1, 1, 5000 + conn_id * 100 + req_id);
-                let request = Request::AggregateDetails(AggregateDetailsRequest {
+                let request = ClientRequest::AggregateDetails(AggregateDetailsRequest {
                     aggregate_key: aggregate,
                     correlation_id: Some((conn_id * 100 + req_id) as u128),
                 });
@@ -339,7 +339,7 @@ async fn test_connection_churn(server_address: &str) -> Result<(), Box<dyn std::
         let mut client = CeleriantClient::connect(server_address).await?;
 
         let aggregate = AggregateKey::new(1, 1, 6000 + cycle);
-        let request = Request::AggregateDetails(AggregateDetailsRequest {
+        let request = ClientRequest::AggregateDetails(AggregateDetailsRequest {
             aggregate_key: aggregate,
             correlation_id: Some(cycle as u128),
         });
@@ -378,7 +378,7 @@ async fn test_shard_affinity(server_address: &str) -> Result<(), Box<dyn std::er
             },
         );
 
-        let write_request = Request::Write(WriteRequest {
+        let write_request = ClientRequest::Write(WriteRequest {
             correlation_id: Some(200 + shard),
             client_id: CLIENT_ID,
             user_id: None,
@@ -390,7 +390,7 @@ async fn test_shard_affinity(server_address: &str) -> Result<(), Box<dyn std::er
             .await?;
 
         // Read back using second connection
-        let read_request = Request::Read(ReadRequest {
+        let read_request = ClientRequest::Read(ReadRequest {
             correlation_id: Some(300 + shard),
             aggregate_key: aggregate.clone(),
             filters: ReadFilters::new(1),
@@ -421,7 +421,7 @@ async fn test_long_lived_connection(
 
     for i in 0..num_requests {
         let aggregate = AggregateKey::new(1, 1, 8000 + i);
-        let request = Request::AggregateDetails(AggregateDetailsRequest {
+        let request = ClientRequest::AggregateDetails(AggregateDetailsRequest {
             aggregate_key: aggregate,
             correlation_id: Some(i as u128),
         });

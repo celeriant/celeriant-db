@@ -19,8 +19,8 @@ use celeriant_memcache::mem_snapshot_aggregate::{AggregateStatus, MemSnapshotAgg
 use celeriant_memcache::metablock_position::MetablockPosition;
 use celeriant_memcache::shard_log_queue_item::ShardLogQueueItem;
 use celeriant_memcache::shard_mem_cache::ShardMemCache;
-use celeriant_msg::process_requests::Request;
-use celeriant_msg::process_responses::Response;
+use celeriant_msg::process_client_requests::ClientRequest;
+use celeriant_msg::process_client_responses::ClientResponse;
 use celeriant_msg::request::read_filters::ReadFilters;
 use celeriant_msg::request::requests::{DeleteRequest, AggregateDetailsRequest, ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest, ReadRequest, SingleAggregateWrite, TrimStartRequest, WriteRequest};
 use celeriant_msg::response::aggregate_event_batch::AggregateEventBatch;
@@ -130,54 +130,17 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> AggregateReader 
 }
 
 impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
-    pub async fn process_request(&self, request: Request) -> Result<Response, ShardError> {
+    pub async fn process_client_request(&self, request: ClientRequest) -> Result<ClientResponse, ShardError> {
         match request {
-            Request::AggregateDetails(exists_request) => self.exists(&exists_request).await.map(Response::AggregateDetails).map_err(ShardError::AggregateDetails),
-            Request::Read(read_request) => self.read(&read_request).await.map(Response::Read).map_err(ShardError::Read),
-            Request::Write(write_request) => {
-                self.write(write_request)
-                    .await
-                    .map(Response::Write)
-                    .map_err(ShardError::Write)
-            }
-            Request::TrimStart(trim_start_request) => {
-                self.trim_start(trim_start_request)
-                    .await
-                    .map(Response::TrimStart)
-                    .map_err(ShardError::TrimStart)
-            }
-            Request::Delete(delete_request) => {
-                self.delete(delete_request)
-                    .await
-                    .map(Response::Delete)
-                    .map_err(ShardError::Delete)
-            }
-            Request::Watch(_) => Err(ShardError::WatchRequestInvalid),
-            Request::Identify(_) => Err(ShardError::IdentifyRequestInvalid),
-            Request::ListOrgs(list_request) => {
-                self.list_orgs(list_request).await.map(Response::ListOrgs).map_err(ShardError::ListOrgs)
-            }
-            Request::ListAggregateTypes(list_request) => {
-                self.list_aggregate_types(list_request)
-                    .await
-                    .map(Response::ListAggregateTypes)
-                    .map_err(ShardError::ListAggregateTypes)
-            }
-            Request::ListAggregates(list_request) => {
-                self.list_aggregates(list_request)
-                    .await
-                    .map(Response::ListAggregates)
-                    .map_err(ShardError::ListAggregates)
-            }
-            Request::ReplicationBatch(replication_request) => {
-                self.handle_replication_batch(replication_request)
-                    .await
-                    .map(Response::ReplicationBatch)
-                    .map_err(ShardError::ReplicationBatch)
-            }
-            Request::CatchUp(_) => Err(ShardError::CatchUpRequestInvalid),
-            Request::Heartbeat(_) => Err(ShardError::CatchUpRequestInvalid),
-            Request::KickFollower(_) => Err(ShardError::CatchUpRequestInvalid),
+            ClientRequest::AggregateDetails(r) => self.exists(&r).await.map(ClientResponse::AggregateDetails).map_err(ShardError::AggregateDetails),
+            ClientRequest::Read(r) => self.read(&r).await.map(ClientResponse::Read).map_err(ShardError::Read),
+            ClientRequest::Write(r) => self.write(r).await.map(ClientResponse::Write).map_err(ShardError::Write),
+            ClientRequest::TrimStart(r) => self.trim_start(r).await.map(ClientResponse::TrimStart).map_err(ShardError::TrimStart),
+            ClientRequest::Delete(r) => self.delete(r).await.map(ClientResponse::Delete).map_err(ShardError::Delete),
+            ClientRequest::Watch(_) => Err(ShardError::WatchRequestInvalid),
+            ClientRequest::ListOrgs(r) => self.list_orgs(r).await.map(ClientResponse::ListOrgs).map_err(ShardError::ListOrgs),
+            ClientRequest::ListAggregateTypes(r) => self.list_aggregate_types(r).await.map(ClientResponse::ListAggregateTypes).map_err(ShardError::ListAggregateTypes),
+            ClientRequest::ListAggregates(r) => self.list_aggregates(r).await.map(ClientResponse::ListAggregates).map_err(ShardError::ListAggregates),
         }
     }
 
@@ -1437,7 +1400,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             .await
     }
     
-    async fn handle_replication_batch(
+    pub async fn handle_replication_batch(
         &self, request: celeriant_msg::request::requests::ReplicationBatchRequest
     ) -> Result<ReplicationBatchResponse, FollowerReplicationWriteError> {
         let follower_timestamp_ms = SystemTime::now()
@@ -1787,7 +1750,7 @@ mod tests {
     use crate::error::replication_to_s3_error::ReplicateToS3Error;
     use crate::replication_client::StubReplicationClient;
     use crate::s3_downloader::StubS3Downloader;
-    use celeriant_msg::request::requests::{CatchUpRequest, ReplicationBatchItem, SingleAggregateDelete, WatchRequest};
+    use celeriant_msg::request::requests::{ReplicationBatchItem, ReplicationBatchRequest, SingleAggregateDelete, WatchRequest};
     use celeriant_wal::compression_type::CompressionType;
     use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
     use crate::timestamp_config::TimestampConfig;
@@ -1854,7 +1817,7 @@ mod tests {
             .collect()
     }
 
-    fn write_req(agg: AggregateKey, evts: Vec<DatablockAggregateEvent>) -> Request {
+    fn write_req(agg: AggregateKey, evts: Vec<DatablockAggregateEvent>) -> ClientRequest {
         write_req_full(agg, evts, true, None, 1, false)
     }
 
@@ -1865,7 +1828,7 @@ mod tests {
         expected_batch: Option<u64>,
         client_id: u128,
         enforce_idempotency: bool,
-    ) -> Request {
+    ) -> ClientRequest {
         let mut writes = HashMap::new();
         writes.insert(
             agg,
@@ -1877,7 +1840,7 @@ mod tests {
                 compression_type: CompressionType::None,
             },
         );
-        Request::Write(WriteRequest {
+        ClientRequest::Write(WriteRequest {
             correlation_id: None,
             client_id,
             user_id: None,
@@ -1885,30 +1848,30 @@ mod tests {
         })
     }
 
-    fn read_req(agg: AggregateKey) -> Request {
-        Request::Read(ReadRequest {
+    fn read_req(agg: AggregateKey) -> ClientRequest {
+        ClientRequest::Read(ReadRequest {
             correlation_id: None,
             aggregate_key: agg,
             filters: ReadFilters::new(0),
         })
     }
 
-    fn read_req_from(agg: AggregateKey, from: u64) -> Request {
-        Request::Read(ReadRequest {
+    fn read_req_from(agg: AggregateKey, from: u64) -> ClientRequest {
+        ClientRequest::Read(ReadRequest {
             correlation_id: None,
             aggregate_key: agg,
             filters: ReadFilters::new(from),
         })
     }
 
-    fn exists_req(agg: AggregateKey) -> Request {
-        Request::AggregateDetails(AggregateDetailsRequest {
+    fn exists_req(agg: AggregateKey) -> ClientRequest {
+        ClientRequest::AggregateDetails(AggregateDetailsRequest {
             correlation_id: None,
             aggregate_key: agg,
         })
     }
 
-    fn delete_req(agg: AggregateKey) -> Request {
+    fn delete_req(agg: AggregateKey) -> ClientRequest {
         delete_req_full(agg, false, false, None)
     }
 
@@ -1917,7 +1880,7 @@ mod tests {
         allow_recreate: bool,
         allow_index_continuation: bool,
         expected: Option<u64>,
-    ) -> Request {
+    ) -> ClientRequest {
         let mut deletes = HashMap::new();
         deletes.insert(
             agg,
@@ -1927,7 +1890,7 @@ mod tests {
                 expected_event_batch_index: expected,
             },
         );
-        Request::Delete(DeleteRequest {
+        ClientRequest::Delete(DeleteRequest {
             correlation_id: None,
             client_id: 1,
             user_id: None,
@@ -1935,8 +1898,8 @@ mod tests {
         })
     }
 
-    fn trim_req(agg: AggregateKey, keep_from: u64) -> Request {
-        Request::TrimStart(TrimStartRequest {
+    fn trim_req(agg: AggregateKey, keep_from: u64) -> ClientRequest {
+        ClientRequest::TrimStart(TrimStartRequest {
             correlation_id: None,
             aggregate_key: agg,
             keep_from_event_batch_index: keep_from,
@@ -1945,16 +1908,16 @@ mod tests {
         })
     }
 
-    fn list_orgs_req() -> Request {
-        Request::ListOrgs(ListOrgsRequest {
+    fn list_orgs_req() -> ClientRequest {
+        ClientRequest::ListOrgs(ListOrgsRequest {
             correlation_id: None,
             shard_id: 0,
             cursor: None,
         })
     }
 
-    fn list_types_req(org: Option<u128>) -> Request {
-        Request::ListAggregateTypes(ListAggregateTypesRequest {
+    fn list_types_req(org: Option<u128>) -> ClientRequest {
+        ClientRequest::ListAggregateTypes(ListAggregateTypesRequest {
             correlation_id: None,
             shard_id: 0,
             org_id: org,
@@ -1962,8 +1925,8 @@ mod tests {
         })
     }
 
-    fn list_aggs_req(org: Option<u128>, atype: Option<u128>) -> Request {
-        Request::ListAggregates(ListAggregatesRequest {
+    fn list_aggs_req(org: Option<u128>, atype: Option<u128>) -> ClientRequest {
+        ClientRequest::ListAggregates(ListAggregatesRequest {
             correlation_id: None,
             shard_id: 0,
             org_id: org,
@@ -1980,51 +1943,79 @@ mod tests {
 
     async fn process<R: ReplicationClient, D: S3Downloader>(
         shard: &ShardWal<R, D>,
-        req: Request,
-    ) -> Result<Response, ShardError> {
-        shard.process_request(req).await
+        req: ClientRequest,
+    ) -> Result<ClientResponse, ShardError> {
+        shard.process_client_request(req).await
     }
 
-    async fn write_ok<R: ReplicationClient, D: S3Downloader>(shard: &ShardWal<R, D>, req: Request) {
+    async fn write_ok<R: ReplicationClient, D: S3Downloader>(shard: &ShardWal<R, D>, req: ClientRequest) {
         let result = process(shard, req).await;
         assert!(
-            matches!(result, Ok(Response::Write(_))),
+            matches!(result, Ok(ClientResponse::Write(_))),
             "write failed: {:?}",
             result.err()
         );
     }
 
-    fn unwrap_read(result: Result<Response, ShardError>) -> ReadResponse {
+    fn client_write_req(agg: AggregateKey, evts: Vec<DatablockAggregateEvent>) -> ClientRequest {
+        let mut writes = HashMap::new();
+        writes.insert(
+            agg,
+            SingleAggregateWrite {
+                events: evts,
+                allow_create: true,
+                expected_event_batch_index: None,
+                enforce_client_idempotency: false,
+                compression_type: CompressionType::None,
+            },
+        );
+        ClientRequest::Write(WriteRequest {
+            correlation_id: None,
+            client_id: 1,
+            user_id: None,
+            writes,
+        })
+    }
+
+    fn client_read_req(agg: AggregateKey) -> ClientRequest {
+        ClientRequest::Read(ReadRequest {
+            correlation_id: None,
+            aggregate_key: agg,
+            filters: ReadFilters::new(0),
+        })
+    }
+
+    fn unwrap_read(result: Result<ClientResponse, ShardError>) -> ReadResponse {
         match result.expect("read should succeed") {
-            Response::Read(r) => r,
+            ClientResponse::Read(r) => r,
             other => panic!("expected Read, got {other:?}"),
         }
     }
 
-    fn unwrap_exists(result: Result<Response, ShardError>) -> AggregateDetailsResponse {
+    fn unwrap_exists(result: Result<ClientResponse, ShardError>) -> AggregateDetailsResponse {
         match result.expect("exists should succeed") {
-            Response::AggregateDetails(r) => r,
+            ClientResponse::AggregateDetails(r) => r,
             other => panic!("expected Exists, got {other:?}"),
         }
     }
 
-    fn unwrap_list_orgs(result: Result<Response, ShardError>) -> ListOrgsResponse {
+    fn unwrap_list_orgs(result: Result<ClientResponse, ShardError>) -> ListOrgsResponse {
         match result.expect("list_orgs should succeed") {
-            Response::ListOrgs(r) => r,
+            ClientResponse::ListOrgs(r) => r,
             other => panic!("expected ListOrgs, got {other:?}"),
         }
     }
 
-    fn unwrap_list_types(result: Result<Response, ShardError>) -> ListAggregateTypesResponse {
+    fn unwrap_list_types(result: Result<ClientResponse, ShardError>) -> ListAggregateTypesResponse {
         match result.expect("list_types should succeed") {
-            Response::ListAggregateTypes(r) => r,
+            ClientResponse::ListAggregateTypes(r) => r,
             other => panic!("expected ListAggregateTypes, got {other:?}"),
         }
     }
 
-    fn unwrap_list_aggs(result: Result<Response, ShardError>) -> ListAggregatesResponse {
+    fn unwrap_list_aggs(result: Result<ClientResponse, ShardError>) -> ListAggregatesResponse {
         match result.expect("list_aggs should succeed") {
-            Response::ListAggregates(r) => r,
+            ClientResponse::ListAggregates(r) => r,
             other => panic!("expected ListAggregates, got {other:?}"),
         }
     }
@@ -2264,7 +2255,7 @@ mod tests {
             write_ok(&shard, write_req(agg.clone(), events(1))).await;
 
             let result = process(&shard, delete_req(agg.clone())).await;
-            assert!(matches!(result, Ok(Response::Delete(_))));
+            assert!(matches!(result, Ok(ClientResponse::Delete(_))));
 
             let result = process(&shard, read_req(agg)).await;
             assert!(matches!(result, Err(ShardError::Read(ShardReadError::AggregateNotExists))));
@@ -2346,7 +2337,7 @@ mod tests {
             let shard = open_shard(&dir).await;
             let agg = key(1, 1, 1);
 
-            let empty_delete = Request::Delete(DeleteRequest {
+            let empty_delete = ClientRequest::Delete(DeleteRequest {
                 correlation_id: None,
                 client_id: 1,
                 user_id: None,
@@ -2384,7 +2375,7 @@ mod tests {
             }
 
             let result = process(&shard, trim_req(agg.clone(), 3)).await;
-            assert!(matches!(result, Ok(Response::TrimStart(_))));
+            assert!(matches!(result, Ok(ClientResponse::TrimStart(_))));
 
             let result = process(&shard, read_req_from(agg.clone(), 1)).await;
             assert!(matches!(
@@ -2412,7 +2403,7 @@ mod tests {
 
             let _ = process(&shard, trim_req(agg.clone(), 2)).await.unwrap();
             let result = process(&shard, trim_req(agg, 2)).await;
-            assert!(matches!(result, Ok(Response::TrimStart(_))));
+            assert!(matches!(result, Ok(ClientResponse::TrimStart(_))));
 
             shard.close().await;
         });
@@ -2502,15 +2493,15 @@ mod tests {
         });
     }
 
-    // ── Watch and CatchUp rejected ──
+    // ── Watch rejected ──
 
     #[test]
-    fn watch_and_catchup_rejected() {
+    fn watch_rejected() {
         glommio_test!({
             let (_tmp, dir) = test_dir();
             let shard = open_shard(&dir).await;
 
-            let watch = Request::Watch(WatchRequest {
+            let watch = ClientRequest::Watch(WatchRequest {
                 correlation_id: None,
                 requested_latency_ms: None,
                 orgs: None,
@@ -2520,15 +2511,6 @@ mod tests {
             });
             let result = process(&shard, watch).await;
             assert!(matches!(result, Err(ShardError::WatchRequestInvalid)));
-
-            let catchup = Request::CatchUp(CatchUpRequest {
-                correlation_id: None,
-                shard_id: 0,
-                last_follower_metablock: None,
-                follower_tip_hash: None,
-            });
-            let result = process(&shard, catchup).await;
-            assert!(matches!(result, Err(ShardError::CatchUpRequestInvalid)));
 
             shard.close().await;
         });
@@ -2627,7 +2609,7 @@ mod tests {
             // Write 2: must succeed — stale rollback flags must not block this
             let result = process(&shard, write_req(agg.clone(), events(1))).await;
             assert!(
-                matches!(result, Ok(Response::Write(_))),
+                matches!(result, Ok(ClientResponse::Write(_))),
                 "write after rollback should succeed, got {:?}", result
             );
 
@@ -2659,7 +2641,7 @@ mod tests {
             // Write 3: should succeed
             let result = process(&shard, write_req(agg.clone(), events(1))).await;
             assert!(
-                matches!(result, Ok(Response::Write(_))),
+                matches!(result, Ok(ClientResponse::Write(_))),
                 "write after multiple rollbacks should succeed, got {:?}", result
             );
 
@@ -2689,20 +2671,17 @@ mod tests {
         mb
     }
 
-    fn replication_batch_req(batches: Vec<ReplicationBatchItem>) -> Request {
-        Request::ReplicationBatch(celeriant_msg::request::requests::ReplicationBatchRequest {
+    fn replication_batch_req(batches: Vec<ReplicationBatchItem>) -> ReplicationBatchRequest {
+        ReplicationBatchRequest {
             correlation_id: None,
             shard_id: 0,
             leader_timestamp_ms: now_ms(),
             batches,
-        })
+        }
     }
 
-    fn unwrap_replication(result: Result<Response, ShardError>) -> ReplicationBatchResponse {
-        match result.expect("replication should not error") {
-            Response::ReplicationBatch(r) => r,
-            other => panic!("expected ReplicationBatch, got {other:?}"),
-        }
+    fn unwrap_replication(result: Result<ReplicationBatchResponse, crate::error::follower_replication_write_error::FollowerReplicationWriteError>) -> ReplicationBatchResponse {
+        result.expect("replication should not error")
     }
 
     fn replication_item(wal_index: u64, tip_hash: [u8; 32]) -> ReplicationBatchItem {
@@ -2719,7 +2698,7 @@ mod tests {
             let shard = open_follower_shard(&dir).await;
 
             let resp = unwrap_replication(
-                process(&shard, replication_batch_req(vec![replication_item(1, GENESIS_HASH)])).await,
+                shard.handle_replication_batch(replication_batch_req(vec![replication_item(1, GENESIS_HASH)])).await,
             );
             assert!(matches!(resp.result, ReplicationResult::Success { .. }));
 
@@ -2734,7 +2713,7 @@ mod tests {
             let shard = open_shard(&dir).await; // Standalone
 
             let resp = unwrap_replication(
-                process(&shard, replication_batch_req(vec![replication_item(1, GENESIS_HASH)])).await,
+                shard.handle_replication_batch(replication_batch_req(vec![replication_item(1, GENESIS_HASH)])).await,
             );
             assert!(matches!(resp.result, ReplicationResult::Rejected(FollowerRejection::NotAFollower)));
 
@@ -2748,7 +2727,7 @@ mod tests {
             let (_tmp, dir) = test_dir();
             let shard = open_follower_shard(&dir).await;
 
-            let resp = unwrap_replication(process(&shard, replication_batch_req(vec![])).await);
+            let resp = unwrap_replication(shard.handle_replication_batch(replication_batch_req(vec![])).await);
             assert!(matches!(resp.result, ReplicationResult::Rejected(FollowerRejection::EmptyBatch)));
 
             shard.close().await;
@@ -2763,7 +2742,7 @@ mod tests {
 
             // Follower at wal_index=0, batch starts at 5 (expects 1)
             let resp = unwrap_replication(
-                process(&shard, replication_batch_req(vec![replication_item(5, GENESIS_HASH)])).await,
+                shard.handle_replication_batch(replication_batch_req(vec![replication_item(5, GENESIS_HASH)])).await,
             );
             match resp.result {
                 ReplicationResult::Rejected(FollowerRejection::WalIndexMismatch { max_follower_wal_index }) => {
@@ -2784,7 +2763,7 @@ mod tests {
 
             // Correct wal_index but wrong tip hash
             let resp = unwrap_replication(
-                process(&shard, replication_batch_req(vec![replication_item(1, [0xFF; 32])])).await,
+                shard.handle_replication_batch(replication_batch_req(vec![replication_item(1, [0xFF; 32])])).await,
             );
             assert!(matches!(resp.result, ReplicationResult::Rejected(FollowerRejection::TipHashMismatch { .. })));
 
@@ -2800,7 +2779,7 @@ mod tests {
 
             // Batch 1
             let resp = unwrap_replication(
-                process(&shard, replication_batch_req(vec![replication_item(1, GENESIS_HASH)])).await,
+                shard.handle_replication_batch(replication_batch_req(vec![replication_item(1, GENESIS_HASH)])).await,
             );
             assert!(matches!(resp.result, ReplicationResult::Success { .. }));
 
@@ -2810,7 +2789,7 @@ mod tests {
 
             // Batch 2 must chain from batch 1's tip
             let resp = unwrap_replication(
-                process(&shard, replication_batch_req(vec![replication_item(2, tip_after_1)])).await,
+                shard.handle_replication_batch(replication_batch_req(vec![replication_item(2, tip_after_1)])).await,
             );
             assert!(matches!(resp.result, ReplicationResult::Success { .. }));
 
@@ -2828,13 +2807,13 @@ mod tests {
             let (_tmp, dir) = test_dir();
             let shard = open_follower_shard(&dir).await;
 
-            let stale_request = Request::ReplicationBatch(celeriant_msg::request::requests::ReplicationBatchRequest {
+            let stale_request = ReplicationBatchRequest {
                 correlation_id: None,
                 shard_id: 0,
                 leader_timestamp_ms: 1000, // ancient timestamp
                 batches: vec![replication_item(1, GENESIS_HASH)],
-            });
-            let resp = unwrap_replication(process(&shard, stale_request).await);
+            };
+            let resp = unwrap_replication(shard.handle_replication_batch(stale_request).await);
             assert!(matches!(resp.result, ReplicationResult::Rejected(FollowerRejection::TimeDriftTooHigh { .. })));
 
             shard.close().await;
@@ -2843,7 +2822,7 @@ mod tests {
 
     // ── Batch 1 Test Gaps: P1-1, P1-6, P1-7 ──
 
-    fn multi_write_req(writes: Vec<(AggregateKey, Vec<DatablockAggregateEvent>, Option<u64>)>) -> Request {
+    fn multi_write_req(writes: Vec<(AggregateKey, Vec<DatablockAggregateEvent>, Option<u64>)>) -> ClientRequest {
         let mut map = HashMap::new();
         for (agg, evts, expected) in writes {
             map.insert(
@@ -2857,7 +2836,7 @@ mod tests {
                 },
             );
         }
-        Request::Write(WriteRequest {
+        ClientRequest::Write(WriteRequest {
             correlation_id: None,
             client_id: 1,
             user_id: None,
@@ -2944,6 +2923,31 @@ mod tests {
 
             let aggs = unwrap_list_aggs(process(&shard, list_aggs_req(Some(2), None)).await);
             assert!(aggs.aggregates.is_empty());
+
+            shard.close().await;
+        });
+    }
+
+    // ── process_client_request ──
+
+    #[test]
+    fn client_request_write_and_read() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 1, 1);
+
+            let write_result = shard.process_client_request(client_write_req(agg.clone(), events(3))).await;
+            assert!(matches!(write_result, Ok(ClientResponse::Write(_))));
+
+            let read_result = shard.process_client_request(client_read_req(agg)).await;
+            match read_result.expect("read should succeed") {
+                ClientResponse::Read(r) => {
+                    assert_eq!(r.event_batches.len(), 1);
+                    assert_eq!(r.event_batches[0].events.len(), 3);
+                }
+                other => panic!("expected Read, got {other:?}"),
+            }
 
             shard.close().await;
         });

@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_msg::{
-    process_requests::Request,
+    process_client_requests::ClientRequest,
+    process_client_responses::ClientResponse,
     request::requests::{ReadRequest, SingleAggregateWrite, WriteRequest},
 };
 use celeriant_wal::{
@@ -1022,11 +1023,11 @@ pub async fn write_event(
     };
 
     let response = client
-        .send_request(&Request::Write(write_req), CompressionType::None)
+        .send_request(&ClientRequest::Write(write_req), CompressionType::None)
         .await?;
 
     match response {
-        celeriant_msg::process_responses::Response::Write(_) => Ok(()),
+        ClientResponse::Write(_) => Ok(()),
         other => Err(format!("Write failed: {:?}", other).into()),
     }
 }
@@ -1075,11 +1076,11 @@ pub async fn write_large_event(
     };
 
     let response = client
-        .send_request(&Request::Write(write_req), CompressionType::None)
+        .send_request(&ClientRequest::Write(write_req), CompressionType::None)
         .await?;
 
     match response {
-        celeriant_msg::process_responses::Response::Write(_) => Ok(()),
+        ClientResponse::Write(_) => Ok(()),
         other => Err(format!("Write failed: {:?}", other).into()),
     }
 }
@@ -1102,12 +1103,12 @@ pub async fn count_events(
         };
 
         let response = client
-            .send_request(&Request::Read(read_req), CompressionType::None)
+            .send_request(&ClientRequest::Read(read_req), CompressionType::None)
             .await;
 
         match response {
             Ok(o) => match o {
-                celeriant_msg::process_responses::Response::Read(read_resp) => {
+                ClientResponse::Read(read_resp) => {
                     total += read_resp
                         .event_batches
                         .iter()

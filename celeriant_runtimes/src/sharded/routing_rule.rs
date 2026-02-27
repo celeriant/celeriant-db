@@ -46,7 +46,7 @@ impl RoutingRule {
         }
     }
 
-    pub fn routing_id_for_request(&self, request: &celeriant_msg::process_requests::Request) -> u128 {
+    pub fn routing_id_for_client_request(&self, request: &celeriant_msg::process_client_requests::ClientRequest) -> u128 {
         match self {
             RoutingRule::OrgId => request.org_id(),
             RoutingRule::AggregateTypeId => request.aggregate_type_id(),

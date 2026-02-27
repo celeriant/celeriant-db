@@ -7,8 +7,8 @@ use celeriant_client_glommio::{CeleriantClient, ClientError, GlommioTlsConfig};
 use celeriant_disk::files::rwlock_timeout::write_with_timeout;
 use celeriant_distributed::paths::fallback_batch_path;
 use celeriant_msg::{
-    process_requests::Request,
-    process_responses::Response,
+    process_cluster_requests::ClusterRequest,
+    process_cluster_responses::ClusterResponse,
     request::requests::{HeartbeatRequest, KickFollowerRequest, ReplicationBatchItem, ReplicationBatchRequest},
     response::responses::{HeartbeatResult, ReplicationResult},
 };
@@ -169,32 +169,29 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
 
         guard.ensure_connected(&address, false, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref()).await?;
 
-        let mut request = Request::ReplicationBatch(ReplicationBatchRequest {
+        let mut request = ClusterRequest::ReplicationBatch(ReplicationBatchRequest {
             correlation_id: None,
             shard_id,
             leader_timestamp_ms: SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64,
             batches,
         });
 
-        let response = match guard.client.as_mut().unwrap().send_request(&request, CompressionType::Snappy).await {
+        let response = match guard.client.as_mut().unwrap().send_cluster_request(&request, CompressionType::Snappy).await {
             Ok(r) => r,
             Err(_) => {
                 guard.ensure_connected(&address, true, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref()).await?;
-                if let Request::ReplicationBatch(ref mut req) = request {
+                if let ClusterRequest::ReplicationBatch(ref mut req) = request {
                     req.leader_timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
                 }
-                guard.client.as_mut().unwrap().send_request(&request, CompressionType::Snappy).await?
+                guard.client.as_mut().unwrap().send_cluster_request(&request, CompressionType::Snappy).await?
             }
         };
 
         match response {
-            Response::ReplicationBatch(resp) => match resp.result {
+            ClusterResponse::ReplicationBatch(resp) => match resp.result {
                 ReplicationResult::Success { .. } => Ok(()),
                 ReplicationResult::Rejected(rejection) => Err(ReplicateToFollowerError::FollowerRejected(rejection)),
             },
-            Response::GenericError(err) => {
-                Err(ReplicateToFollowerError::FollowerServerError(err.error_message))
-            }
             _ => Err(ReplicateToFollowerError::FollowerUnexpectedResponse),
         }
     }
@@ -250,23 +247,22 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
 
         guard.ensure_connected(&address, false, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref()).await?;
 
-        let request = Request::Heartbeat(HeartbeatRequest {
+        let request = ClusterRequest::Heartbeat(HeartbeatRequest {
             correlation_id: None,
             shard_id: self.shard_id,
             leader_timestamp_ms: celeriant_distributed::heartbeat::now_ms(),
         });
 
-        let response = match guard.client.as_mut().unwrap().send_request(&request, CompressionType::None).await {
+        let response = match guard.client.as_mut().unwrap().send_cluster_request(&request, CompressionType::None).await {
             Ok(r) => r,
             Err(_) => {
                 guard.ensure_connected(&address, true, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref()).await?;
-                guard.client.as_mut().unwrap().send_request(&request, CompressionType::None).await?
+                guard.client.as_mut().unwrap().send_cluster_request(&request, CompressionType::None).await?
             }
         };
 
         match response {
-            Response::Heartbeat(resp) => Ok(resp.result),
-            Response::GenericError(err) => Err(SendHeartbeatError::ServerError(err.error_message)),
+            ClusterResponse::Heartbeat(resp) => Ok(resp.result),
             _ => Err(SendHeartbeatError::UnexpectedResponse),
         }
     }
@@ -279,21 +275,20 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
 
         guard.ensure_connected(&address, false, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref()).await?;
 
-        let request = Request::KickFollower(KickFollowerRequest {
+        let request = ClusterRequest::KickFollower(KickFollowerRequest {
             correlation_id: None,
         });
 
-        let response = match guard.client.as_mut().unwrap().send_request(&request, CompressionType::None).await {
+        let response = match guard.client.as_mut().unwrap().send_cluster_request(&request, CompressionType::None).await {
             Ok(r) => r,
             Err(_) => {
                 guard.ensure_connected(&address, true, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref()).await?;
-                guard.client.as_mut().unwrap().send_request(&request, CompressionType::None).await?
+                guard.client.as_mut().unwrap().send_cluster_request(&request, CompressionType::None).await?
             }
         };
 
         match response {
-            Response::KickFollower(resp) => Ok(resp.acknowledged),
-            Response::GenericError(err) => Err(SendHeartbeatError::ServerError(err.error_message)),
+            ClusterResponse::KickFollower(resp) => Ok(resp.acknowledged),
             _ => Err(SendHeartbeatError::UnexpectedResponse),
         }
     }

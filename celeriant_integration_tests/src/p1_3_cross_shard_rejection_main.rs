@@ -11,7 +11,8 @@ use std::sync::Arc;
 use celeriant_integration_tests::{ServerConfig, TestServer};
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_msg::{
-    process_requests::Request,
+    process_client_requests::ClientRequest,
+    process_client_responses::ClientResponse,
     request::requests::{SingleAggregateWrite, WriteRequest},
 };
 use celeriant_wal::{
@@ -129,7 +130,7 @@ async fn test_cross_shard_write_rejection(
         },
     );
 
-    let write_request = Request::Write(WriteRequest {
+    let write_request = ClientRequest::Write(WriteRequest {
         correlation_id: Some(1),
         client_id: CLIENT_ID,
         user_id: None,
@@ -215,7 +216,7 @@ async fn test_same_shard_write_success(
         },
     );
 
-    let write_request = Request::Write(WriteRequest {
+    let write_request = ClientRequest::Write(WriteRequest {
         correlation_id: Some(2),
         client_id: CLIENT_ID,
         user_id: None,
@@ -227,7 +228,7 @@ async fn test_same_shard_write_success(
         .await?;
 
     match response {
-        celeriant_msg::process_responses::Response::Write(write_resp) => {
+        ClientResponse::Write(write_resp) => {
             println!("  Write response: {:?}", write_resp);
             println!("  Same-shard multi-aggregate write succeeded");
             Ok(())
@@ -250,11 +251,11 @@ async fn test_no_partial_writes(server_address: &str) -> Result<(), Box<dyn std:
     );
 
     // Verify aggregates don't exist yet (should return error 1001)
-    let exists_req_0 = Request::AggregateDetails(celeriant_msg::request::requests::AggregateDetailsRequest {
+    let exists_req_0 = ClientRequest::AggregateDetails(celeriant_msg::request::requests::AggregateDetailsRequest {
         aggregate_key: agg_shard_0.clone(),
         correlation_id: Some(10),
     });
-    let exists_req_1 = Request::AggregateDetails(celeriant_msg::request::requests::AggregateDetailsRequest {
+    let exists_req_1 = ClientRequest::AggregateDetails(celeriant_msg::request::requests::AggregateDetailsRequest {
         aggregate_key: agg_shard_1.clone(),
         correlation_id: Some(11),
     });
@@ -321,7 +322,7 @@ async fn test_no_partial_writes(server_address: &str) -> Result<(), Box<dyn std:
         },
     );
 
-    let write_request = Request::Write(WriteRequest {
+    let write_request = ClientRequest::Write(WriteRequest {
         correlation_id: Some(12),
         client_id: CLIENT_ID,
         user_id: None,

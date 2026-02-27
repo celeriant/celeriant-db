@@ -15,7 +15,7 @@ use celeriant_client_tokio::list_operations::{
 };
 use celeriant_msg::request::requests::SingleAggregateDelete;
 use celeriant_msg::{
-    process_requests::Request,
+    process_client_requests::ClientRequest,
     request::{
         read_filters::ReadFilters,
         requests::{DeleteRequest, ReadRequest, SingleAggregateWrite, WriteRequest},
@@ -508,7 +508,7 @@ async fn run_writer_task(
                 },
             );
             // Delete request (allow_recreate = true so future writes work)
-            let request = Request::Delete(DeleteRequest {
+            let request = ClientRequest::Delete(DeleteRequest {
                 correlation_id: None,
                 deletes,
                 client_id: worker_id as u128,
@@ -571,7 +571,7 @@ async fn run_writer_task(
                 },
             );
 
-            let request = Request::Write(WriteRequest {
+            let request = ClientRequest::Write(WriteRequest {
                 correlation_id: None,
                 client_id: worker_id as u128,
                 user_id: None,
@@ -629,7 +629,7 @@ async fn run_reader_task(
         let aggregate_index = rng.gen_range(0..TOTAL_AGGREGATES);
         let aggregate_key = index_to_aggregate_key(aggregate_index);
 
-        let request = Request::Read(ReadRequest {
+        let request = ClientRequest::Read(ReadRequest {
             correlation_id: None,
             aggregate_key,
             filters: ReadFilters::new(1),

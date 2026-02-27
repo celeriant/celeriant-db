@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use celeriant_msg::process_requests::Request;
-use celeriant_msg::process_responses::Response;
+use celeriant_msg::process_client_requests::ClientRequest;
+use celeriant_msg::process_client_responses::ClientResponse;
 use celeriant_msg::request::requests::{
     ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest,
 };
@@ -132,14 +132,14 @@ impl<'a> ListOrgsIterator<'a> {
 
         let cursor = self.shard_cursors.get(&shard_id).copied().flatten();
 
-        let request = Request::ListOrgs(ListOrgsRequest {
+        let request = ClientRequest::ListOrgs(ListOrgsRequest {
             correlation_id: None,
             shard_id,
             cursor,
         });
 
         match self.client.send_request(&request, self.compression).await {
-            Ok(Response::ListOrgs(response)) => {
+            Ok(ClientResponse::ListOrgs(response)) => {
                 self.buffer.extend(response.orgs);
 
                 if let Some(next_cursor) = response.next_cursor {
@@ -278,7 +278,7 @@ impl<'a> ListAggregateTypesIterator<'a> {
 
         let cursor = self.shard_cursors.get(&shard_id).copied().flatten();
 
-        let request = Request::ListAggregateTypes(ListAggregateTypesRequest {
+        let request = ClientRequest::ListAggregateTypes(ListAggregateTypesRequest {
             correlation_id: None,
             shard_id,
             org_id: self.org_id,
@@ -286,7 +286,7 @@ impl<'a> ListAggregateTypesIterator<'a> {
         });
 
         match self.client.send_request(&request, self.compression).await {
-            Ok(Response::ListAggregateTypes(response)) => {
+            Ok(ClientResponse::ListAggregateTypes(response)) => {
                 self.buffer.extend(response.aggregate_types);
 
                 if let Some(next_cursor) = response.next_cursor {
@@ -556,7 +556,7 @@ impl<'a> ListAggregatesIterator<'a> {
 
         let cursor = self.shard_cursors.get(&shard_id).copied().flatten();
 
-        let request = Request::ListAggregates(ListAggregatesRequest {
+        let request = ClientRequest::ListAggregates(ListAggregatesRequest {
             correlation_id: None,
             shard_id,
             org_id: self.org_id,
@@ -565,7 +565,7 @@ impl<'a> ListAggregatesIterator<'a> {
         });
 
         match self.client.send_request(&request, self.compression).await {
-            Ok(Response::ListAggregates(response)) => {
+            Ok(ClientResponse::ListAggregates(response)) => {
                 self.buffer.extend(response.aggregates);
 
                 if let Some(next_cursor) = response.next_cursor {

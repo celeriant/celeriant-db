@@ -6,7 +6,8 @@
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
 use celeriant_integration_tests::{count_events, write_event, ServerConfig, TestServer};
-use celeriant_msg::process_requests::Request;
+use celeriant_msg::process_client_requests::ClientRequest;
+use celeriant_msg::process_client_responses::ClientResponse;
 use celeriant_msg::request::requests::{SingleAggregateWrite, WriteRequest};
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::compression_type::CompressionType;
@@ -100,17 +101,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         compression_type: CompressionType::None,
                     },
                 );
-                let request = Request::Write(WriteRequest {
+                let request = ClientRequest::Write(WriteRequest {
                     correlation_id: None,
                     client_id: conn_id as u128,
                     user_id: None,
                     writes,
                 });
                 match client.send_request(&request, CompressionType::None).await {
-                    Ok(celeriant_msg::process_responses::Response::Write(_)) => {
+                    Ok(ClientResponse::Write(_)) => {
                         successes.fetch_add(1, Ordering::Relaxed);
                     }
-                    Ok(celeriant_msg::process_responses::Response::GenericError(_)) => {
+                    Ok(ClientResponse::GenericError(_)) => {
                         failures.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(ClientError::CeleriantError(_)) => {

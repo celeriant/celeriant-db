@@ -17,7 +17,8 @@ use celeriant_integration_tests::TestServer;
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::list_operations::{ListAggregatesIterator, ListOptions};
 use celeriant_msg::{
-    process_requests::Request,
+    process_client_requests::ClientRequest,
+    process_client_responses::ClientResponse,
     request::{
         read_filters::ReadFilters,
         requests::{ReadRequest, SingleAggregateWrite, WriteRequest},
@@ -62,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         );
 
-        let request = Request::Write(WriteRequest {
+        let request = ClientRequest::Write(WriteRequest {
             correlation_id: Some(i as u128),
             client_id,
             user_id: None,
@@ -104,7 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== Phase 4: Read org=1 aggregate using org=2 key (expect not found) ===");
     // Construct a key that has org_id=2 but same type/id as org1_agg1
     let org2_key_for_org1_data = AggregateKey::new(2, 100, 501);
-    let read_request = Request::Read(ReadRequest {
+    let read_request = ClientRequest::Read(ReadRequest {
         correlation_id: None,
         aggregate_key: org2_key_for_org1_data.clone(),
         filters: ReadFilters::new(1),
@@ -138,7 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Phase 5: Verify org=1 key can still read the data (sanity check)
     println!("\n=== Phase 5: Read org=1 aggregate using org=1 key (sanity check) ===");
-    let read_request = Request::Read(ReadRequest {
+    let read_request = ClientRequest::Read(ReadRequest {
         correlation_id: None,
         aggregate_key: org1_agg1.clone(),
         filters: ReadFilters::new(1),
@@ -148,7 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     match read_result {
-        celeriant_msg::process_responses::Response::Read(read_resp) => {
+        ClientResponse::Read(read_resp) => {
             let event_count: usize = read_resp
                 .event_batches
                 .iter()

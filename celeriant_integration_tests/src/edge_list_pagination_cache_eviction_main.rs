@@ -31,8 +31,8 @@
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_integration_tests::{write_event, write_large_event, ServerConfig, TestServer};
-use celeriant_msg::process_requests::Request;
-use celeriant_msg::process_responses::Response;
+use celeriant_msg::process_client_requests::ClientRequest;
+use celeriant_msg::process_client_responses::ClientResponse;
 use celeriant_msg::request::requests::ListAggregatesRequest;
 use celeriant_runtimes::RoutingRule;
 use celeriant_wal::aggregate_key::AggregateKey;
@@ -137,7 +137,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         page_num += 1;
 
-        let req = Request::ListAggregates(ListAggregatesRequest {
+        let req = ClientRequest::ListAggregates(ListAggregatesRequest {
             correlation_id: Some(page_num as u128),
             shard_id,
             org_id: Some(org_id),
@@ -147,7 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let response = client.send_request(&req, CompressionType::None).await?;
         let list_resp = match response {
-            Response::ListAggregates(r) => r,
+            ClientResponse::ListAggregates(r) => r,
             other => {
                 return Err(format!("Unexpected response on page {}: {:?}", page_num, other).into())
             }

@@ -18,7 +18,8 @@ use celeriant_crypto::pki::PkiManager;
 use celeriant_integration_tests::{ServerConfig, TestPki, TestServer};
 use celeriant_lib::server_config::{ConfigClientAuth, ConfigTlsMode};
 use celeriant_msg::{
-    process_requests::Request,
+    process_client_requests::ClientRequest,
+    process_client_responses::ClientResponse,
     request::requests::{AggregateDetailsRequest, ReadRequest, SingleAggregateWrite, WriteRequest},
 };
 use celeriant_wal::{
@@ -146,7 +147,7 @@ async fn test_mtls_client_server_roundtrip() -> Result<(), Box<dyn std::error::E
             }
         };
 
-        let write_req = Request::Write(WriteRequest {
+        let write_req = ClientRequest::Write(WriteRequest {
             correlation_id: Some(1),
             client_id: CLIENT_ID,
             user_id: None,
@@ -158,13 +159,13 @@ async fn test_mtls_client_server_roundtrip() -> Result<(), Box<dyn std::error::E
             continue;
         }
 
-        let read_req = Request::Read(ReadRequest {
+        let read_req = ClientRequest::Read(ReadRequest {
             correlation_id: Some(2),
             aggregate_key: aggregate.clone(),
             filters: celeriant_msg::request::read_filters::ReadFilters::new(1),
         });
         match client.send_request(&read_req, CompressionType::None).await {
-            Ok(celeriant_msg::process_responses::Response::Read(r)) => {
+            Ok(ClientResponse::Read(r)) => {
                 let total_events: usize = r.event_batches.iter().map(|b| b.events.len()).sum();
                 if total_events == 0 {
                     last_err = format!("read returned 0 events (attempt {attempt})");
@@ -214,7 +215,7 @@ async fn test_strict_mode_rejects_plaintext() -> Result<(), Box<dyn std::error::
     )
     .await?;
 
-    let request = Request::Read(ReadRequest {
+    let request = ClientRequest::Read(ReadRequest {
         correlation_id: Some(1),
         aggregate_key: AggregateKey::new(1, 1, 40002),
         filters: celeriant_msg::request::read_filters::ReadFilters::new(1),
@@ -273,7 +274,7 @@ async fn test_untrusted_cert_rejected() -> Result<(), Box<dyn std::error::Error>
             Ok(())
         }
         Ok(mut client) => {
-            let request = Request::Read(ReadRequest {
+            let request = ClientRequest::Read(ReadRequest {
                 correlation_id: Some(1),
                 aggregate_key: AggregateKey::new(1, 1, 40005),
                 filters: celeriant_msg::request::read_filters::ReadFilters::new(1),
@@ -375,7 +376,7 @@ async fn cross_shard_roundtrip(
                 compression_type: CompressionType::None,
             },
         );
-        let write_req = Request::Write(WriteRequest {
+        let write_req = ClientRequest::Write(WriteRequest {
             correlation_id: Some(500 + shard),
             client_id: CLIENT_ID,
             user_id: None,
@@ -385,7 +386,7 @@ async fn cross_shard_roundtrip(
             .send_request(&write_req, CompressionType::None)
             .await?;
 
-        let read_req = Request::Read(ReadRequest {
+        let read_req = ClientRequest::Read(ReadRequest {
             correlation_id: Some(600 + shard),
             aggregate_key: aggregate,
             filters: celeriant_msg::request::read_filters::ReadFilters::new(1),
@@ -395,7 +396,7 @@ async fn cross_shard_roundtrip(
             .await?;
 
         match response {
-            celeriant_msg::process_responses::Response::Read(r) => {
+            ClientResponse::Read(r) => {
                 let total: usize = r.event_batches.iter().map(|b| b.events.len()).sum();
                 if total == 0 {
                     return Err(format!("Shard {shard}: read returned 0 events after write").into());
@@ -411,7 +412,7 @@ async fn cross_shard_roundtrip(
     for i in 0u128..8 {
         let agg_id = 50000 + (i % 4);
         let aggregate = AggregateKey::new(1, 1, agg_id);
-        let request = Request::AggregateDetails(AggregateDetailsRequest {
+        let request = ClientRequest::AggregateDetails(AggregateDetailsRequest {
             aggregate_key: aggregate,
             correlation_id: Some(700 + i),
         });

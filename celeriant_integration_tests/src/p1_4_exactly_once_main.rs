@@ -17,8 +17,8 @@ use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
 use celeriant_integration_tests::{ServerConfig, TestServer};
 use celeriant_msg::{
-    process_requests::Request,
-    process_responses::Response,
+    process_client_requests::ClientRequest,
+    process_client_responses::ClientResponse,
     request::{
         read_filters::ReadFilters,
         requests::{ReadRequest, SingleAggregateWrite, WriteRequest},
@@ -79,7 +79,7 @@ async fn test_basic_idempotency(
         },
     );
 
-    let request = Request::Write(WriteRequest {
+    let request = ClientRequest::Write(WriteRequest {
         correlation_id: Some(1),
         client_id: CLIENT_ID,
         user_id: None,
@@ -90,7 +90,7 @@ async fn test_basic_idempotency(
     println!("  Sending first write...");
     let response = client.send_request(&request, CompressionType::None).await?;
     match response {
-        Response::Write(_) => println!("  First write: SUCCESS"),
+        ClientResponse::Write(_) => println!("  First write: SUCCESS"),
         other => panic!("Expected Write response, got {:?}", other),
     }
 
@@ -100,7 +100,7 @@ async fn test_basic_idempotency(
     // Retry same write (same client_id, same client_event_index)
     // Note: We can't reuse the exact same request object because WriteRequest takes ownership
     // So we create a new request with the same parameters
-    let retry_request = Request::Write(WriteRequest {
+    let retry_request = ClientRequest::Write(WriteRequest {
         correlation_id: Some(2), // Different correlation_id is fine for idempotency
         client_id: CLIENT_ID,
         user_id: None,
@@ -141,7 +141,7 @@ async fn test_uncertain_ack(
         },
     );
 
-    let request = Request::Write(WriteRequest {
+    let request = ClientRequest::Write(WriteRequest {
         correlation_id: Some(3),
         client_id: CLIENT_ID,
         user_id: None,
@@ -151,7 +151,7 @@ async fn test_uncertain_ack(
     println!("  Sending write on first connection...");
     let response = client1.send_request(&request, CompressionType::None).await?;
     match response {
-        Response::Write(_) => println!("  Write sent successfully"),
+        ClientResponse::Write(_) => println!("  Write sent successfully"),
         other => panic!("Expected Write response, got {:?}", other),
     }
 
@@ -164,7 +164,7 @@ async fn test_uncertain_ack(
     println!("  Reconnecting and retrying same write...");
     let mut client2 = CeleriantClient::connect(server_address).await?;
 
-    let retry_request = Request::Write(WriteRequest {
+    let retry_request = ClientRequest::Write(WriteRequest {
         correlation_id: Some(4),
         client_id: CLIENT_ID,
         user_id: None,
@@ -175,7 +175,7 @@ async fn test_uncertain_ack(
         Err(ClientError::CeleriantError(e)) if e.error_code == 2002 => {
             println!("  Retry: REJECTED with error 2002 (original succeeded) - CORRECT");
         }
-        Ok(Response::Write(_)) => {
+        Ok(ClientResponse::Write(_)) => {
             println!("  Retry: SUCCESS (original didn't reach server) - ACCEPTABLE");
             println!("  (Either way, exactly one event should exist)");
         }
@@ -197,7 +197,7 @@ async fn verify_event_count(
     expected_batch_count: usize,
     expected_event_count: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let request = Request::Read(ReadRequest {
+    let request = ClientRequest::Read(ReadRequest {
         correlation_id: None,
         aggregate_key: aggregate.clone(),
         filters: ReadFilters::new(1),
@@ -205,7 +205,7 @@ async fn verify_event_count(
 
     let response = client.send_request(&request, CompressionType::None).await?;
     match response {
-        Response::Read(r) => {
+        ClientResponse::Read(r) => {
             let batch_count = r.event_batches.len();
             let event_count: usize = r.event_batches.iter().map(|b| b.events.len()).sum();
             println!(
@@ -233,7 +233,7 @@ async fn verify_client_event_indices(
     client: &mut CeleriantClient,
     aggregate: &AggregateKey,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let request = Request::Read(ReadRequest {
+    let request = ClientRequest::Read(ReadRequest {
         correlation_id: None,
         aggregate_key: aggregate.clone(),
         filters: ReadFilters::new(1),
@@ -241,7 +241,7 @@ async fn verify_client_event_indices(
 
     let response = client.send_request(&request, CompressionType::None).await?;
     match response {
-        Response::Read(r) => {
+        ClientResponse::Read(r) => {
             let mut client_event_indices = Vec::new();
             for batch in &r.event_batches {
                 for event in &batch.events {

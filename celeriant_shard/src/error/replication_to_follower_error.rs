@@ -4,7 +4,6 @@ use celeriant_msg::response::responses::FollowerRejection;
 pub enum ReplicateToFollowerError {
     FollowerNetworkError(ClientError),
     FollowerRejected(FollowerRejection),
-    FollowerServerError(String),
     FollowerUnexpectedResponse,
     FollowerTooFarBehind,
     LockTimeout,

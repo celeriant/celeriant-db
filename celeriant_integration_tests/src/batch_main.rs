@@ -25,7 +25,7 @@ use celeriant_crypto::{generate_api_key, hash_api_key, Crypto};
 use celeriant_integration_tests::{count_events, MinioContainer, ServerConfig, TestPki, TestServer};
 use celeriant_lib::server_config::{ConfigClientAuth, ConfigTlsMode};
 use celeriant_msg::request::requests::WriteRequest;
-use celeriant_msg::{process_requests::Request, request::requests::SingleAggregateWrite};
+use celeriant_msg::{process_client_requests::ClientRequest, request::requests::SingleAggregateWrite};
 use celeriant_wal::{
     aggregate_key::AggregateKey, compression_type::CompressionType,
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
@@ -1057,7 +1057,7 @@ async fn run_connection_benchmark(
             },
         );
 
-        let request = Request::Write(WriteRequest {
+        let request = ClientRequest::Write(WriteRequest {
             correlation_id: None,
             client_id: verified_client_id.unwrap_or(connection_id as u128),
             user_id: None,

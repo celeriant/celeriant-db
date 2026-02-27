@@ -22,7 +22,7 @@ use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_integration_tests::{
     count_events, s3_cluster_config, write_event, MinioContainer, TcpProxy, TestServer,
 };
-use celeriant_msg::process_requests::Request;
+use celeriant_msg::process_client_requests::ClientRequest;
 use celeriant_msg::request::requests::{SingleAggregateWrite, WriteRequest};
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::compression_type::CompressionType;
@@ -384,7 +384,7 @@ async fn pressure_writer(
             },
         );
 
-        let request = Request::Write(WriteRequest {
+        let request = ClientRequest::Write(WriteRequest {
             correlation_id: None,
             client_id: id as u128,
             user_id: None,

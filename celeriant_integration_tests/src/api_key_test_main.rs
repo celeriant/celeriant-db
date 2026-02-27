@@ -21,7 +21,8 @@ use celeriant_client_tokio::client_error::ClientError;
 use celeriant_crypto::{generate_api_key, hash_api_key};
 use celeriant_integration_tests::{ServerConfig, TestServer};
 use celeriant_msg::{
-    process_requests::Request,
+    process_client_requests::ClientRequest,
+    process_client_responses::ClientResponse,
     request::requests::{ReadRequest, SingleAggregateWrite, WriteRequest},
 };
 use celeriant_wal::{
@@ -181,11 +182,11 @@ async fn test_read_write_key_allows_writes(
     };
 
     let response = client
-        .send_request(&Request::Write(write_req), CompressionType::None)
+        .send_request(&ClientRequest::Write(write_req), CompressionType::None)
         .await?;
 
     match response {
-        celeriant_msg::process_responses::Response::Write(_) => {
+        ClientResponse::Write(_) => {
             println!("  ✓ Write with read-write key succeeded");
         }
         other => {
@@ -225,11 +226,11 @@ async fn test_read_only_key_blocks_writes(
     };
 
     let read_response = client
-        .send_request(&Request::Read(read_req), CompressionType::None)
+        .send_request(&ClientRequest::Read(read_req), CompressionType::None)
         .await?;
 
     match read_response {
-        celeriant_msg::process_responses::Response::Read(_) => {
+        ClientResponse::Read(_) => {
             println!("  ✓ Read with read-only key succeeded");
         }
         other => {
@@ -259,7 +260,7 @@ async fn test_read_only_key_blocks_writes(
     };
 
     let result = client
-        .send_request(&Request::Write(write_req), CompressionType::None)
+        .send_request(&ClientRequest::Write(write_req), CompressionType::None)
         .await;
 
     match result {
@@ -422,11 +423,11 @@ async fn test_secondary_key_works(
     };
 
     let response = client
-        .send_request(&Request::Write(write_req), CompressionType::None)
+        .send_request(&ClientRequest::Write(write_req), CompressionType::None)
         .await?;
 
     match response {
-        celeriant_msg::process_responses::Response::Write(_) => {
+        ClientResponse::Write(_) => {
             println!("  ✓ Write with secondary key succeeded");
         }
         other => {
@@ -471,11 +472,11 @@ async fn test_no_api_keys_allows_all(
     };
 
     let response = client
-        .send_request(&Request::Write(write_req), CompressionType::None)
+        .send_request(&ClientRequest::Write(write_req), CompressionType::None)
         .await?;
 
     match response {
-        celeriant_msg::process_responses::Response::Write(_) => {
+        ClientResponse::Write(_) => {
             println!("  ✓ Write succeeded without API key (backward compatible)");
         }
         other => {

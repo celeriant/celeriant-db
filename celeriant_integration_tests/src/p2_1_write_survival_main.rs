@@ -18,7 +18,8 @@
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_integration_tests::{write_event, MinioContainer, TestServer, s3_cluster_config};
 use celeriant_msg::{
-    process_requests::Request,
+    process_client_requests::ClientRequest,
+    process_client_responses::ClientResponse,
     request::requests::ReadRequest,
 };
 use celeriant_wal::{
@@ -202,11 +203,11 @@ async fn read_event_by_client_index(
         };
 
         let response = client
-            .send_request(&Request::Read(read_req), CompressionType::None)
+            .send_request(&ClientRequest::Read(read_req), CompressionType::None)
             .await?;
 
         match response {
-            celeriant_msg::process_responses::Response::Read(read_resp) => {
+            ClientResponse::Read(read_resp) => {
                 for batch in read_resp.event_batches {
                     for event in batch.events {
                         if event.client_event_index == target_client_event_index {
@@ -246,11 +247,11 @@ async fn count_events_all(
         };
 
         let response = client
-            .send_request(&Request::Read(read_req), CompressionType::None)
+            .send_request(&ClientRequest::Read(read_req), CompressionType::None)
             .await;
 
         match response {
-            Ok(celeriant_msg::process_responses::Response::Read(read_resp)) => {
+            Ok(ClientResponse::Read(read_resp)) => {
                 total += read_resp
                     .event_batches
                     .iter()

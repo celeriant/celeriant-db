@@ -20,7 +20,7 @@ use std::sync::Arc;
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_integration_tests::{ServerConfig, TestServer};
 use celeriant_msg::{
-    process_requests::Request,
+    process_client_requests::ClientRequest,
     request::requests::{ReadRequest, SingleAggregateWrite, WriteRequest},
 };
 use celeriant_wal::{
@@ -86,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         );
 
-        let request = Request::Write(WriteRequest {
+        let request = ClientRequest::Write(WriteRequest {
             correlation_id: Some(agg_id as u128),
             client_id: 999,
             user_id: Some(888),
@@ -119,7 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         let _response = client
-            .send_request(&Request::Read(read_req), CompressionType::None)
+            .send_request(&ClientRequest::Read(read_req), CompressionType::None)
             .await;
 
         let elapsed_us = read_start.elapsed().as_micros() as u64;
@@ -156,7 +156,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         let _response = client
-            .send_request(&Request::Read(read_req), CompressionType::None)
+            .send_request(&ClientRequest::Read(read_req), CompressionType::None)
             .await?;
 
         let elapsed_us = read_start.elapsed().as_micros() as u64;

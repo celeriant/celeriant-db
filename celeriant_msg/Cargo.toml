@@ -7,7 +7,6 @@ license.workspace = true
 
 [features]
 default = []
-cluster = ["deepsize"]
 small-metablock = ["celeriant_wal/small-metablock", "celeriant_wire/small-metablock"]
 
 [dependencies]
@@ -16,4 +15,4 @@ celeriant_wire = { path = "../celeriant_wire" }
 bincode.workspace = true
 futures-lite.workspace = true
 serde.workspace = true
-deepsize = { workspace = true, optional = true }
+deepsize.workspace = true

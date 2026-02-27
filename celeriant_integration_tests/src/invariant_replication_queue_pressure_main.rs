@@ -22,7 +22,7 @@ use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_integration_tests::{
     count_events, s3_cluster_config, write_event, MinioContainer, TcpProxy, TestServer,
 };
-use celeriant_msg::process_requests::Request;
+use celeriant_msg::process_client_requests::ClientRequest;
 use celeriant_msg::request::requests::{AggregateDetailsRequest, SingleAggregateWrite, WriteRequest};
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::compression_type::CompressionType;
@@ -314,7 +314,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut probe = CeleriantClient::connect_with_timeout(_leader.address(), Some(probe_timeout), None).await?;
 
         let exists_shard0 = probe.send_request(
-            &Request::AggregateDetails(AggregateDetailsRequest { correlation_id: Some(0), aggregate_key: probe_shard0.clone() }),
+            &ClientRequest::AggregateDetails(AggregateDetailsRequest { correlation_id: Some(0), aggregate_key: probe_shard0.clone() }),
             CompressionType::None,
         ).await;
         match &exists_shard0 {
@@ -323,7 +323,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let exists_shard1 = probe.send_request(
-            &Request::AggregateDetails(AggregateDetailsRequest { correlation_id: Some(1), aggregate_key: probe_shard1_key.clone() }),
+            &ClientRequest::AggregateDetails(AggregateDetailsRequest { correlation_id: Some(1), aggregate_key: probe_shard1_key.clone() }),
             CompressionType::None,
         ).await;
         match &exists_shard1 {
@@ -539,7 +539,7 @@ async fn pressure_writer(
             },
         );
 
-        let request = Request::Write(WriteRequest {
+        let request = ClientRequest::Write(WriteRequest {
             correlation_id: None,
             client_id: id as u128,
             user_id: None,

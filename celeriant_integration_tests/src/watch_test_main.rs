@@ -13,8 +13,8 @@ use std::u64;
 use celeriant_integration_tests::TestServer;
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_msg::{
-    process_requests::Request,
-    process_responses::Response,
+    process_client_requests::ClientRequest,
+    process_client_responses::ClientResponse,
     request::requests::{SingleAggregateWrite, WatchRequest, WriteRequest},
 };
 use celeriant_wal::{
@@ -138,8 +138,8 @@ impl WatchConnection {
         &mut self,
         request: &WatchRequest,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let req = Request::Watch(request.clone());
-        Request::write_request(
+        let req = ClientRequest::Watch(request.clone());
+        ClientRequest::write_request(
             &mut self.stream,
             &req,
             CompressionType::None,
@@ -155,8 +155,8 @@ impl WatchConnection {
         &mut self,
         request: &WriteRequest,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let req = Request::Write(request.clone());
-        Request::write_request(
+        let req = ClientRequest::Write(request.clone());
+        ClientRequest::write_request(
             &mut self.stream,
             &req,
             CompressionType::None,
@@ -170,8 +170,8 @@ impl WatchConnection {
 
     async fn read_response(
         &mut self,
-    ) -> Result<Response, Box<dyn std::error::Error + Send + Sync>> {
-        let response = Response::read_response(&mut self.stream, u64::MAX)
+    ) -> Result<ClientResponse, Box<dyn std::error::Error + Send + Sync>> {
+        let response = ClientResponse::read_response(&mut self.stream, u64::MAX)
             .await
             .map_err(|e| format!("Wire error: {:?}", e))?;
         Ok(response)
@@ -180,7 +180,7 @@ impl WatchConnection {
     async fn read_response_timeout(
         &mut self,
         duration: Duration,
-    ) -> Result<Option<Response>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<ClientResponse>, Box<dyn std::error::Error + Send + Sync>> {
         match timeout(duration, self.read_response()).await {
             Ok(Ok(response)) => Ok(Some(response)),
             Ok(Err(e)) => Err(e),
@@ -214,12 +214,12 @@ async fn test_basic_watch(address: &str) -> Result<(), Box<dyn std::error::Error
         .await?;
 
     match response {
-        Some(Response::Watch(watch_response)) => {
+        Some(ClientResponse::Watch(watch_response)) => {
             println!("  Received watch response: {:?}", watch_response);
             // Heartbeat has events = None
             Ok(())
         }
-        Some(Response::GenericError(err)) => {
+        Some(ClientResponse::GenericError(err)) => {
             Err(format!("Server returned error: {}", err.error_message).into())
         }
         Some(other) => Err(format!("Unexpected response type: {:?}", other).into()),
@@ -272,7 +272,7 @@ async fn test_watch_receives_writes(
         },
     );
 
-    let write_request = Request::Write(WriteRequest {
+    let write_request = ClientRequest::Write(WriteRequest {
         correlation_id: Some(100),
         client_id: CLIENT_ID,
         user_id: None,
@@ -291,7 +291,7 @@ async fn test_watch_receives_writes(
             .read_response_timeout(Duration::from_millis(200))
             .await?
         {
-            Some(Response::Watch(watch_response)) => {
+            Some(ClientResponse::Watch(watch_response)) => {
                 println!("  Watch response: {:?}", watch_response);
                 if let Some(events) = watch_response.events {
                     if events.contains_key(&aggregate) {
@@ -301,7 +301,7 @@ async fn test_watch_receives_writes(
                     }
                 }
             }
-            Some(Response::GenericError(err)) => {
+            Some(ClientResponse::GenericError(err)) => {
                 return Err(format!("Watch error: {}", err.error_message).into());
             }
             _ => continue,
@@ -359,7 +359,7 @@ async fn test_watch_with_aggregate_filter(
 
     write_client
         .send_request(
-            &Request::Write(WriteRequest {
+            &ClientRequest::Write(WriteRequest {
                 correlation_id: Some(200),
                 client_id: CLIENT_ID,
                 user_id: None,
@@ -385,7 +385,7 @@ async fn test_watch_with_aggregate_filter(
 
     write_client
         .send_request(
-            &Request::Write(WriteRequest {
+            &ClientRequest::Write(WriteRequest {
                 correlation_id: Some(201),
                 client_id: CLIENT_ID,
                 user_id: None,
@@ -404,7 +404,7 @@ async fn test_watch_with_aggregate_filter(
             .read_response_timeout(Duration::from_millis(200))
             .await?
         {
-            Some(Response::Watch(watch_response)) => {
+            Some(ClientResponse::Watch(watch_response)) => {
                 if let Some(events) = watch_response.events {
                     if events.contains_key(&watched_aggregate) {
                         received_watched = true;
@@ -462,7 +462,7 @@ async fn test_watch_heartbeat(
             .read_response_timeout(Duration::from_secs(6))
             .await?
         {
-            Some(Response::Watch(watch_response)) => {
+            Some(ClientResponse::Watch(watch_response)) => {
                 if watch_response.events.is_none() {
                     println!("  Received heartbeat after {:?}", start.elapsed());
                     return Ok(());
@@ -470,7 +470,7 @@ async fn test_watch_heartbeat(
                     println!("  Received watch event (unexpected)");
                 }
             }
-            Some(Response::GenericError(err)) => {
+            Some(ClientResponse::GenericError(err)) => {
                 return Err(format!("Watch error: {}", err.error_message).into());
             }
             None => {
@@ -527,7 +527,7 @@ async fn test_multiple_watchers(
 
     write_client
         .send_request(
-            &Request::Write(WriteRequest {
+            &ClientRequest::Write(WriteRequest {
                 correlation_id: Some(300),
                 client_id: CLIENT_ID,
                 user_id: None,
@@ -543,7 +543,7 @@ async fn test_multiple_watchers(
 
     for _ in 0..10 {
         if !watch1_received {
-            if let Some(Response::Watch(wr)) = watch1
+            if let Some(ClientResponse::Watch(wr)) = watch1
                 .read_response_timeout(Duration::from_millis(100))
                 .await?
             {
@@ -555,7 +555,7 @@ async fn test_multiple_watchers(
         }
 
         if !watch2_received {
-            if let Some(Response::Watch(wr)) = watch2
+            if let Some(ClientResponse::Watch(wr)) = watch2
                 .read_response_timeout(Duration::from_millis(100))
                 .await?
             {
@@ -622,10 +622,10 @@ async fn test_write_then_watch_same_connection(
     // Read the write response
     let write_response = conn.read_response().await?;
     match &write_response {
-        Response::Write(wr) => {
+        ClientResponse::Write(wr) => {
             println!("  Received write response: {:?}", wr);
         }
-        Response::GenericError(err) => {
+        ClientResponse::GenericError(err) => {
             return Err(format!("Write failed: {}", err.error_message).into());
         }
         other => {
@@ -665,7 +665,7 @@ async fn test_write_then_watch_same_connection(
         },
     );
 
-    let write_request2 = Request::Write(WriteRequest {
+    let write_request2 = ClientRequest::Write(WriteRequest {
         correlation_id: Some(602),
         client_id: CLIENT_ID + 1, // Different client
         user_id: None,
@@ -684,7 +684,7 @@ async fn test_write_then_watch_same_connection(
             .read_response_timeout(Duration::from_millis(200))
             .await?
         {
-            Some(Response::Watch(watch_response)) => {
+            Some(ClientResponse::Watch(watch_response)) => {
                 println!("  Watch response: {:?}", watch_response);
                 if let Some(events) = watch_response.events {
                     if events.contains_key(&aggregate) {
@@ -694,7 +694,7 @@ async fn test_write_then_watch_same_connection(
                     }
                 }
             }
-            Some(Response::GenericError(err)) => {
+            Some(ClientResponse::GenericError(err)) => {
                 return Err(format!("Watch error: {}", err.error_message).into());
             }
             _ => continue,

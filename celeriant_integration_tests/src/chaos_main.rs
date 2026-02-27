@@ -11,7 +11,7 @@ use celeriant_integration_tests::TestServer;
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
 use celeriant_msg::{
-    process_requests::Request,
+    process_client_requests::ClientRequest,
     request::{
         read_filters::ReadFilters,
         requests::{ReadRequest, SingleAggregateWrite, WriteRequest},
@@ -287,7 +287,7 @@ async fn run_writer_task(
             },
         );
 
-        let request = Request::Write(WriteRequest {
+        let request = ClientRequest::Write(WriteRequest {
             correlation_id: None,
             client_id: aggregate_id as u128,
             user_id: None,
@@ -363,7 +363,7 @@ async fn run_reader_task(
         // Read last 3 event batches
         let from_batch = latest_batch.saturating_sub(2).max(1);
 
-        let request = Request::Read(ReadRequest {
+        let request = ClientRequest::Read(ReadRequest {
             correlation_id: None,
             aggregate_key: aggregate_key.clone(),
             filters: ReadFilters::new(from_batch).to_event_batch_index(latest_batch),

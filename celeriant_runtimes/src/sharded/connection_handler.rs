@@ -1,12 +1,15 @@
-use std::{cell::Cell, fmt, rc::Rc, time::Duration};
+use std::{cell::Cell, fmt, future::Future, rc::Rc, time::Duration};
 
 use base64::Engine;
 use celeriant_distributed::{heartbeat::now_ms, lease_manager::LeaseManager, lease_store::LeaseStore, node_status::NodeStatus, validated_node_status::ValidatedNodeStatus};
 use celeriant_msg::{
-    process_requests::Request,
-    process_responses::Response,
-    request::requests::{HeartbeatRequest, KickFollowerRequest, WatchRequest},
-    response::responses::{AccessLevel, ErrorResponse, HeartbeatRejection, HeartbeatResponse, HeartbeatResult, KickFollowerResponse, WatchResponse},
+    process_client_requests::ClientRequest,
+    process_client_responses::ClientResponse,
+    process_cluster_requests::ClusterRequest,
+    process_cluster_responses::ClusterResponse,
+    process_identify::{IDENTIFY_REQUEST_TYPE_ID, read_identify_request, write_identify_response},
+    request::requests::{HeartbeatRequest, IdentifyRequest, KickFollowerRequest, WatchRequest},
+    response::responses::{AccessLevel, ErrorResponse, HeartbeatRejection, HeartbeatResponse, HeartbeatResult, IdentifyResponse, KickFollowerResponse, WatchResponse},
 };
 use celeriant_shard::{
     error::{s3_catchup_error::S3CatchupError, watch_session_error::WatchSessionError}, replication_client::ReplicationClient, s3_downloader::S3Downloader, shard_wal::ShardWal, shard_wal_s3_catchup::S3CatchupResult
@@ -15,13 +18,14 @@ use celeriant_wal::compression_type::CompressionType;
 use celeriant_watch::{watch_output_type::WatchOutputType, watch_session::WatchSession};
 use celeriant_msg::read_wire_data_error::ReadWireDataError;
 use celeriant_wire::network::wire_error::WireError;
+use celeriant_wire::network::wire_header::WireHeader;
 use glommio::{channels::{channel_mesh::Senders, local_channel::LocalSender}, net::TcpStream};
 use tracing::{info, warn};
 
 use super::{
     intrashard_messages::IntrashardMessages,
     shard_config::ShardConfig,
-    shard_error_response::{shard_error_to_response, watch_read_error_to_response, watch_session_error_to_response, IDENTIFY_INVALID_NONCE, IDENTIFY_INVALID_SIGNATURE, IDENTIFY_MISMATCH, IDENTIFY_REQUIRED},
+    shard_error_response::{shard_error_to_client_response, shard_error_to_cluster_response, watch_read_error_to_client_response, watch_session_error_to_client_response, IDENTIFY_INVALID_NONCE, IDENTIFY_INVALID_SIGNATURE, IDENTIFY_MISMATCH, IDENTIFY_REQUIRED},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,8 +86,14 @@ impl fmt::Display for ShardRoutingError {
     }
 }
 
-enum RedirectResult {
-    ProcessLocally(Request, TcpStream),
+enum ClientRedirectResult {
+    ProcessLocally(ClientRequest, TcpStream),
+    Redirected,
+    ErrorSentContinue(TcpStream),
+}
+
+enum ClusterRedirectResult {
+    ProcessLocally(ClusterRequest, TcpStream),
     Redirected,
     ErrorSentContinue(TcpStream),
 }
@@ -96,88 +106,107 @@ pub fn handle_new_connection<R: ReplicationClient + 'static, D: S3Downloader + '
             return;
         }
 
-        // Initialize connection state (no identity verified yet)
-        let mut conn_state = ConnectionState {
-            verified_client_id: None,
-            access_level: None,
-        };
+        match port_type {
+            PortType::Client => {
+                let mut conn_state = ConnectionState {
+                    verified_client_id: None,
+                    access_level: None,
+                };
 
-        let (request, message_version) = match read_request(&mut tcp_stream, &ctx).await {
-            Some(r) => r,
-            None => return,
-        };
+                let first_message = match read_first_message(&mut tcp_stream, &ctx).await {
+                    Some(m) => m,
+                    None => return,
+                };
 
-        // Reject non-identity first messages when identity is required
-        if ctx.config.require_client_identity && !matches!(request, Request::Identify(_)) {
-            let response = Response::GenericError(ErrorResponse {
-                correlation_id: request.correlation_id(),
-                error_code: IDENTIFY_REQUIRED,
-                error_message: "Server requires client identity verification".to_string(),
-            });
-            let _ = write_response(&mut tcp_stream, &response, ctx.config.max_response_size, ctx.config.server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
-            return;
-        }
+                let (request, message_version) = match first_message {
+                    FirstMessage::Identify(identify_req, version) => {
+                        if let Err(response) = handle_identify(&identify_req, &mut conn_state, &ctx.config) {
+                            let _ = write_client_response_with_timeout(&mut tcp_stream, &response, ctx.config.max_response_size, ctx.config.server_compression_algorithm, version, ctx.config.slow_client_timeout).await;
+                            return;
+                        }
+                        let res = IdentifyResponse {
+                            correlation_id: identify_req.correlation_id,
+                            client_id: conn_state.verified_client_id,
+                            access_level: conn_state.access_level,
+                        };
+                        if write_identify_response(&mut tcp_stream, &res, version).await.is_err() {
+                            return;
+                        }
+                        match read_client_request(&mut tcp_stream, &ctx).await {
+                            Some(r) => r,
+                            None => return,
+                        }
+                    }
+                    FirstMessage::ClientRequest(request, version) => {
+                        if ctx.config.require_client_identity {
+                            let response = ClientResponse::GenericError(ErrorResponse {
+                                correlation_id: request.correlation_id(),
+                                error_code: IDENTIFY_REQUIRED,
+                                error_message: "Server requires client identity verification".to_string(),
+                            });
+                            let _ = write_client_response_with_timeout(&mut tcp_stream, &response, ctx.config.max_response_size, ctx.config.server_compression_algorithm, version, ctx.config.slow_client_timeout).await;
+                            return;
+                        }
+                        (request, version)
+                    }
+                };
 
-        // Handle IdentifyRequest at connection level (before redirect/processing)
-        if let Request::Identify(ref identify_req) = request {
-            if let Err(response) = handle_identify(identify_req, &mut conn_state, &ctx.config) {
-                let _ = write_response(&mut tcp_stream, &response, ctx.config.max_response_size, ctx.config.server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
-                return; // Close connection on identity failure
-            }
-            let response = Response::Identify(celeriant_msg::response::responses::IdentifyResponse {
-                correlation_id: identify_req.correlation_id,
-                client_id: conn_state.verified_client_id,
-                access_level: conn_state.access_level,
-            });
-            if write_response(&mut tcp_stream, &response, ctx.config.max_response_size, ctx.config.server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await.is_err() {
-                return;
-            }
-            // Read next message after successful identity verification
-            let (next_request, next_version) = match read_request(&mut tcp_stream, &ctx).await {
-                Some(r) => r,
-                None => return,
-            };
-            match check_redirect(tcp_stream, next_request, ctx.config.max_response_size, ctx.config.server_compression_algorithm, next_version, &ctx, port_type, &conn_state).await {
-                RedirectResult::ProcessLocally(request, tcp_stream) => {
-                    handle_pipelining(tcp_stream, request, ctx.config.max_request_size, ctx.config.max_response_size, ctx.config.server_compression_algorithm, next_version, ctx, port_type, conn_state).await;
+                match check_client_redirect(tcp_stream, request, ctx.config.max_response_size, ctx.config.server_compression_algorithm, message_version, &ctx, &conn_state).await {
+                    ClientRedirectResult::ProcessLocally(request, tcp_stream) => {
+                        handle_client_pipelining(tcp_stream, request, ctx.config.max_response_size, ctx.config.server_compression_algorithm, message_version, ctx, conn_state).await;
+                    }
+                    ClientRedirectResult::Redirected | ClientRedirectResult::ErrorSentContinue(_) => {}
                 }
-                RedirectResult::Redirected => {}
-                RedirectResult::ErrorSentContinue(_) => {}
             }
-            return;
-        }
+            PortType::Replication => {
+                let (request, message_version) = match read_cluster_request(&mut tcp_stream, &ctx).await {
+                    Some(r) => r,
+                    None => return,
+                };
 
-        match check_redirect(tcp_stream, request, ctx.config.max_response_size, ctx.config.server_compression_algorithm, message_version, &ctx, port_type, &conn_state).await {
-            RedirectResult::ProcessLocally(request, tcp_stream) => {
-                handle_pipelining(tcp_stream, request, ctx.config.max_request_size, ctx.config.max_response_size, ctx.config.server_compression_algorithm, message_version, ctx, port_type, conn_state).await;
+                match check_cluster_redirect(tcp_stream, request, ctx.config.max_response_size, ctx.config.server_compression_algorithm, message_version, &ctx).await {
+                    ClusterRedirectResult::ProcessLocally(request, tcp_stream) => {
+                        handle_cluster_pipelining(tcp_stream, request, ctx.config.max_response_size, ctx.config.server_compression_algorithm, message_version, ctx).await;
+                    }
+                    ClusterRedirectResult::Redirected | ClusterRedirectResult::ErrorSentContinue(_) => {}
+                }
             }
-            RedirectResult::Redirected => {}
-            RedirectResult::ErrorSentContinue(_) => {}
         }
     })
     .detach();
 }
 
-pub fn handle_redirected_connection<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
+pub fn handle_redirected_client_connection<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
     tcp_stream: TcpStream,
-    request: Request,
-    max_request_size: u64,
+    request: ClientRequest,
     max_response_size: u64,
     server_compression_algorithm: CompressionType,
     message_version: u32,
     ctx: ConnectionContext<R, D, S>,
-    port_type: PortType,
     verified_client_id: Option<u128>,
     access_level: Option<AccessLevel>,
 ) {
     let _ = tcp_stream.set_nodelay(true);
 
     glommio::spawn_local(async move {
-        let conn_state = ConnectionState {
-            verified_client_id,
-            access_level,
-        };
-        handle_pipelining(tcp_stream, request, max_request_size, max_response_size, server_compression_algorithm, message_version, ctx, port_type, conn_state).await;
+        let conn_state = ConnectionState { verified_client_id, access_level };
+        handle_client_pipelining(tcp_stream, request, max_response_size, server_compression_algorithm, message_version, ctx, conn_state).await;
+    })
+    .detach();
+}
+
+pub fn handle_redirected_cluster_connection<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
+    tcp_stream: TcpStream,
+    request: ClusterRequest,
+    max_response_size: u64,
+    server_compression_algorithm: CompressionType,
+    message_version: u32,
+    ctx: ConnectionContext<R, D, S>,
+) {
+    let _ = tcp_stream.set_nodelay(true);
+
+    glommio::spawn_local(async move {
+        handle_cluster_pipelining(tcp_stream, request, max_response_size, server_compression_algorithm, message_version, ctx).await;
     })
     .detach();
 }
@@ -185,7 +214,7 @@ pub fn handle_redirected_connection<R: ReplicationClient + 'static, D: S3Downloa
 pub fn handle_enter_s3_catchup<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
     ctx: ConnectionContext<R, D, S>,
 ) {
-    glommio::spawn_local(async move {        
+    glommio::spawn_local(async move {
         let result = ctx.shard_wal.enter_s3_catchup().await;
 
         let _ = ctx.intrashard_sender.send_to(
@@ -195,15 +224,13 @@ pub fn handle_enter_s3_catchup<R: ReplicationClient + 'static, D: S3Downloader +
     .detach();
 }
 
-async fn handle_pipelining<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
+async fn handle_client_pipelining<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
     mut tcp_stream: TcpStream,
-    request: Request,
-    max_request_size: u64,
+    request: ClientRequest,
     max_response_size: u64,
     server_compression_algorithm: CompressionType,
     mut message_version: u32,
     ctx: ConnectionContext<R, D, S>,
-    port_type: PortType,
     conn_state: ConnectionState,
 ) {
     let mut optional_request = Some(request);
@@ -214,55 +241,34 @@ async fn handle_pipelining<R: ReplicationClient + 'static, D: S3Downloader + 'st
         }
 
         if let Some(request) = optional_request.take() {
-            if !is_valid_for_port(&request, port_type) {
-                let response = Response::GenericError(ErrorResponse {
-                    correlation_id: request.correlation_id(),
-                    error_code: 400,
-                    error_message: format!(
-                        "Request type {:?} is not allowed on the {} port",
-                        request.request_type(),
-                        match port_type {
-                            PortType::Client => "client",
-                            PortType::Replication => "replication",
-                        }
-                    ),
-                });
-                let _ = write_response(&mut tcp_stream, &response, max_response_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
-                continue;
-            }
-
-            // Validate client_id for mutating requests
             if let Err(response) = validate_client_id(&request, conn_state.verified_client_id) {
-                let _ = write_response(&mut tcp_stream, &response, max_response_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
+                let _ = write_client_response_with_timeout(&mut tcp_stream, &response, max_response_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
                 continue;
             }
 
-            // Enforce access level
             if !is_valid_for_access_level(&request, conn_state.access_level) {
-                let response = Response::GenericError(ErrorResponse {
+                let response = ClientResponse::GenericError(ErrorResponse {
                     correlation_id: request.correlation_id(),
                     error_code: ErrorResponse::AUTH_INSUFFICIENT_PERMISSIONS,
                     error_message: "Insufficient permissions for this operation".to_string(),
                 });
-                let _ = write_response(&mut tcp_stream, &response, max_response_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
+                let _ = write_client_response_with_timeout(&mut tcp_stream, &response, max_response_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
                 continue;
             }
 
-            if port_type == PortType::Client {
-                if let Request::Watch(watch_request) = request {
-                    handle_watch(tcp_stream, watch_request, max_response_size, server_compression_algorithm, message_version, &ctx).await;
-                    return;
-                }
+            if let ClientRequest::Watch(watch_request) = request {
+                handle_watch(tcp_stream, watch_request, max_response_size, server_compression_algorithm, message_version, &ctx).await;
+                return;
             }
 
-            process_request(&mut tcp_stream, &ctx, request, max_request_size, server_compression_algorithm, message_version).await;
+            process_client_request(&mut tcp_stream, &ctx, request, max_response_size, server_compression_algorithm, message_version).await;
         }
 
         if ctx.shutdown_requested.get() {
             break;
         }
 
-        match read_request(&mut tcp_stream, &ctx).await {
+        match read_client_request(&mut tcp_stream, &ctx).await {
             Some((next_request, next_version)) => {
                 optional_request = Some(next_request);
                 message_version = next_version;
@@ -275,13 +281,13 @@ async fn handle_pipelining<R: ReplicationClient + 'static, D: S3Downloader + 'st
         }
 
         if let Some(request) = optional_request.take() {
-            match check_redirect(tcp_stream, request, max_response_size, server_compression_algorithm, message_version, &ctx, port_type, &conn_state).await {
-                RedirectResult::ProcessLocally(req, stream) => {
+            match check_client_redirect(tcp_stream, request, max_response_size, server_compression_algorithm, message_version, &ctx, &conn_state).await {
+                ClientRedirectResult::ProcessLocally(req, stream) => {
                     optional_request = Some(req);
                     tcp_stream = stream;
                 }
-                RedirectResult::Redirected => return,
-                RedirectResult::ErrorSentContinue(stream) => {
+                ClientRedirectResult::Redirected => return,
+                ClientRedirectResult::ErrorSentContinue(stream) => {
                     tcp_stream = stream;
                     continue;
                 }
@@ -290,31 +296,74 @@ async fn handle_pipelining<R: ReplicationClient + 'static, D: S3Downloader + 'st
     }
 }
 
-fn is_valid_for_port(request: &Request, port_type: PortType) -> bool {
-    match port_type {
-        PortType::Client => request.is_client_port_request(),
-        PortType::Replication => request.is_replication_port_request(),
+async fn handle_cluster_pipelining<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
+    mut tcp_stream: TcpStream,
+    request: ClusterRequest,
+    max_response_size: u64,
+    server_compression_algorithm: CompressionType,
+    mut message_version: u32,
+    ctx: ConnectionContext<R, D, S>,
+) {
+    let mut optional_request = Some(request);
+
+    loop {
+        if ctx.shutdown_requested.get() {
+            break;
+        }
+
+        if let Some(request) = optional_request.take() {
+            process_cluster_request(&mut tcp_stream, &ctx, request, max_response_size, server_compression_algorithm, message_version).await;
+        }
+
+        if ctx.shutdown_requested.get() {
+            break;
+        }
+
+        match read_cluster_request(&mut tcp_stream, &ctx).await {
+            Some((next_request, next_version)) => {
+                optional_request = Some(next_request);
+                message_version = next_version;
+            }
+            None => return,
+        }
+
+        if ctx.shutdown_requested.get() {
+            break;
+        }
+
+        if let Some(request) = optional_request.take() {
+            match check_cluster_redirect(tcp_stream, request, max_response_size, server_compression_algorithm, message_version, &ctx).await {
+                ClusterRedirectResult::ProcessLocally(req, stream) => {
+                    optional_request = Some(req);
+                    tcp_stream = stream;
+                }
+                ClusterRedirectResult::Redirected => return,
+                ClusterRedirectResult::ErrorSentContinue(stream) => {
+                    tcp_stream = stream;
+                    continue;
+                }
+            }
+        }
     }
 }
 
 /// Handle IdentifyRequest during connection handshake.
 /// Validates nonce and signature, derives client_id, and validates API key if configured.
-fn handle_identify(req: &celeriant_msg::request::requests::IdentifyRequest, conn_state: &mut ConnectionState, config: &ShardConfig) -> Result<(), Response> {
+fn handle_identify(req: &celeriant_msg::request::requests::IdentifyRequest, conn_state: &mut ConnectionState, config: &ShardConfig) -> Result<(), ClientResponse> {
     use celeriant_crypto::Crypto;
 
-    // Validate keypair identity if provided
     if let (Some(public_key), Some(nonce), Some(signature)) = (&req.public_key, &req.nonce, &req.signature) {
         let client_id = match Crypto::validate_with_public_key(public_key, nonce, signature) {
             Ok(id) => id,
             Err(celeriant_crypto::CryptoError::InvalidNonce) => {
-                return Err(Response::GenericError(ErrorResponse {
+                return Err(ClientResponse::GenericError(ErrorResponse {
                     correlation_id: req.correlation_id,
                     error_code: IDENTIFY_INVALID_NONCE,
                     error_message: "Nonce expired or too far in the future".to_string(),
                 }));
             }
             Err(_) => {
-                return Err(Response::GenericError(ErrorResponse {
+                return Err(ClientResponse::GenericError(ErrorResponse {
                     correlation_id: req.correlation_id,
                     error_code: IDENTIFY_INVALID_SIGNATURE,
                     error_message: "Invalid signature".to_string(),
@@ -324,10 +373,9 @@ fn handle_identify(req: &celeriant_msg::request::requests::IdentifyRequest, conn
         conn_state.verified_client_id = Some(client_id);
     }
 
-    // API key authentication
     if let Some(ref api_key_hashes) = *config.api_key_hashes.borrow() {
         let api_key_str = req.api_key.as_ref().ok_or_else(|| {
-            Response::GenericError(ErrorResponse {
+            ClientResponse::GenericError(ErrorResponse {
                 correlation_id: req.correlation_id,
                 error_code: ErrorResponse::AUTH_REQUIRED,
                 error_message: "API key required but not provided".to_string(),
@@ -337,7 +385,7 @@ fn handle_identify(req: &celeriant_msg::request::requests::IdentifyRequest, conn
         let api_key_bytes = base64::engine::general_purpose::STANDARD
             .decode(api_key_str)
             .map_err(|_| {
-                Response::GenericError(ErrorResponse {
+                ClientResponse::GenericError(ErrorResponse {
                     correlation_id: req.correlation_id,
                     error_code: ErrorResponse::AUTH_INVALID_KEY,
                     error_message: "Invalid API key format".to_string(),
@@ -345,7 +393,7 @@ fn handle_identify(req: &celeriant_msg::request::requests::IdentifyRequest, conn
             })?;
 
         if api_key_bytes.len() != 32 {
-            return Err(Response::GenericError(ErrorResponse {
+            return Err(ClientResponse::GenericError(ErrorResponse {
                 correlation_id: req.correlation_id,
                 error_code: ErrorResponse::AUTH_INVALID_KEY,
                 error_message: "Invalid API key length".to_string(),
@@ -358,7 +406,7 @@ fn handle_identify(req: &celeriant_msg::request::requests::IdentifyRequest, conn
         let key_hash = celeriant_crypto::hash_api_key(&key_array);
 
         let access_level = api_key_hashes.validate(&key_hash).ok_or_else(|| {
-            Response::GenericError(ErrorResponse {
+            ClientResponse::GenericError(ErrorResponse {
                 correlation_id: req.correlation_id,
                 error_code: ErrorResponse::AUTH_INVALID_KEY,
                 error_message: "Invalid API key".to_string(),
@@ -373,23 +421,21 @@ fn handle_identify(req: &celeriant_msg::request::requests::IdentifyRequest, conn
     Ok(())
 }
 
-/// Validate that a request's client_id matches the connection's verified identity.
-/// Returns error response if verification failed.
-fn validate_client_id(request: &Request, verified_client_id: Option<u128>) -> Result<(), Response> {
+fn validate_client_id(request: &ClientRequest, verified_client_id: Option<u128>) -> Result<(), ClientResponse> {
     let Some(verified) = verified_client_id else {
-        return Ok(()); // No identity verification on this connection
+        return Ok(());
     };
 
     let request_client_id = match request {
-        Request::Write(req) => Some(req.client_id),
-        Request::TrimStart(req) => Some(req.client_id),
-        Request::Delete(req) => Some(req.client_id),
-        _ => None, // Read operations don't carry client_id
+        ClientRequest::Write(req) => Some(req.client_id),
+        ClientRequest::TrimStart(req) => Some(req.client_id),
+        ClientRequest::Delete(req) => Some(req.client_id),
+        _ => None,
     };
 
     if let Some(claimed) = request_client_id {
         if claimed != verified {
-            return Err(Response::GenericError(ErrorResponse {
+            return Err(ClientResponse::GenericError(ErrorResponse {
                 correlation_id: request.correlation_id(),
                 error_code: IDENTIFY_MISMATCH,
                 error_message: format!(
@@ -403,85 +449,123 @@ fn validate_client_id(request: &Request, verified_client_id: Option<u128>) -> Re
     Ok(())
 }
 
-/// Check if a request is allowed based on the connection's access level.
-fn is_valid_for_access_level(request: &Request, access_level: Option<AccessLevel>) -> bool {
+fn is_valid_for_access_level(request: &ClientRequest, access_level: Option<AccessLevel>) -> bool {
     match access_level {
-        None => true,
-        Some(AccessLevel::ReadWrite) => true,
+        None | Some(AccessLevel::ReadWrite) => true,
         Some(AccessLevel::ReadOnly) => {
             !matches!(request,
-                Request::Write(_) |
-                Request::TrimStart(_) |
-                Request::Delete(_)
+                ClientRequest::Write(_) |
+                ClientRequest::TrimStart(_) |
+                ClientRequest::Delete(_)
             )
         }
     }
 }
 
-async fn check_redirect<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
+async fn check_client_redirect<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
     mut tcp_stream: TcpStream,
-    request: Request,
+    request: ClientRequest,
     max_message_size: u64,
     server_compression_algorithm: CompressionType,
     message_version: u32,
     ctx: &ConnectionContext<R, D, S>,
-    port_type: PortType,
     conn_state: &ConnectionState,
-) -> RedirectResult {
-    let target_shard = match determine_shard(&request, &ctx.config, port_type) {
+) -> ClientRedirectResult {
+    let target_shard = match determine_client_shard(&request, &ctx.config) {
         Ok(idx) => idx,
         Err(e) => {
-            let response = Response::GenericError(ErrorResponse {
+            let response = ClientResponse::GenericError(ErrorResponse {
                 correlation_id: request.correlation_id(),
                 error_code: 400,
                 error_message: format!("Shard routing error: {}", e),
             });
-            let _ = write_response(&mut tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
-            return RedirectResult::ErrorSentContinue(tcp_stream);
+            let _ = write_client_response_with_timeout(&mut tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
+            return ClientRedirectResult::ErrorSentContinue(tcp_stream);
         }
     };
 
     if target_shard != ctx.current_shard_id {
-        let msg = IntrashardMessages::ConnectionRedirect {
+        let msg = IntrashardMessages::ClientConnectionRedirect {
             accepted_tcp_stream: tcp_stream.into_accepted(),
             request,
             message_version,
-            port_type,
             verified_client_id: conn_state.verified_client_id,
             access_level: conn_state.access_level,
         };
         if let Err(e) = ctx.intrashard_sender.send_to(target_shard, msg).await {
-            warn!("Failed to redirect connection to shard {target_shard}: {e:?}");
+            warn!("Failed to redirect client connection to shard {target_shard}: {e:?}");
         }
-        return RedirectResult::Redirected;
+        return ClientRedirectResult::Redirected;
     }
 
-    RedirectResult::ProcessLocally(request, tcp_stream)
+    ClientRedirectResult::ProcessLocally(request, tcp_stream)
 }
 
-pub fn determine_shard(
-    request: &Request,
+async fn check_cluster_redirect<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
+    mut tcp_stream: TcpStream,
+    request: ClusterRequest,
+    max_message_size: u64,
+    server_compression_algorithm: CompressionType,
+    message_version: u32,
+    ctx: &ConnectionContext<R, D, S>,
+) -> ClusterRedirectResult {
+    let target_shard = match determine_cluster_shard(&request, &ctx.config) {
+        Ok(idx) => idx,
+        Err(e) => {
+            let response = ClusterResponse::GenericError(ErrorResponse {
+                correlation_id: request.correlation_id(),
+                error_code: 400,
+                error_message: format!("Shard routing error: {}", e),
+            });
+            let _ = write_cluster_response_with_timeout(&mut tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
+            return ClusterRedirectResult::ErrorSentContinue(tcp_stream);
+        }
+    };
+
+    if target_shard != ctx.current_shard_id {
+        let msg = IntrashardMessages::ClusterConnectionRedirect {
+            accepted_tcp_stream: tcp_stream.into_accepted(),
+            request,
+            message_version,
+        };
+        if let Err(e) = ctx.intrashard_sender.send_to(target_shard, msg).await {
+            warn!("Failed to redirect cluster connection to shard {target_shard}: {e:?}");
+        }
+        return ClusterRedirectResult::Redirected;
+    }
+
+    ClusterRedirectResult::ProcessLocally(request, tcp_stream)
+}
+
+pub fn determine_client_shard(
+    request: &ClientRequest,
     config: &ShardConfig,
-    port_type: PortType,
 ) -> Result<usize, ShardRoutingError> {
     let num_shards = config.num_shards as u128;
 
     match request {
-        Request::ReplicationBatch(req) => validate_shard_id(req.shard_id, num_shards),
-        Request::CatchUp(req) => validate_shard_id(req.shard_id, num_shards),
-        Request::KickFollower(_) => Ok(0),
-        Request::Watch(req) if port_type == PortType::Client => {
-            determine_shard_watch(req, config)
-        }
-        Request::Write(req) => determine_shard_write(req, config),
-        Request::Delete(req) => determine_shard_delete(req, config),
-        Request::ListOrgs(req) => validate_shard_id(req.shard_id, num_shards),
-        Request::ListAggregateTypes(req) => validate_shard_id(req.shard_id, num_shards),
-        Request::ListAggregates(req) => validate_shard_id(req.shard_id, num_shards),
+        ClientRequest::Watch(req) => determine_shard_watch(req, config),
+        ClientRequest::Write(req) => determine_shard_write(req, config),
+        ClientRequest::Delete(req) => determine_shard_delete(req, config),
+        ClientRequest::ListOrgs(req) => validate_shard_id(req.shard_id, num_shards),
+        ClientRequest::ListAggregateTypes(req) => validate_shard_id(req.shard_id, num_shards),
+        ClientRequest::ListAggregates(req) => validate_shard_id(req.shard_id, num_shards),
         other => {
-            let routing_id = config.routing_rule.routing_id_for_request(other);
+            let routing_id = config.routing_rule.routing_id_for_client_request(other);
             Ok((routing_id % num_shards) as usize)
         }
+    }
+}
+
+pub fn determine_cluster_shard(
+    request: &ClusterRequest,
+    config: &ShardConfig,
+) -> Result<usize, ShardRoutingError> {
+    let num_shards = config.num_shards as u128;
+
+    match request {
+        ClusterRequest::ReplicationBatch(req) => validate_shard_id(req.shard_id, num_shards),
+        ClusterRequest::KickFollower(_) | ClusterRequest::Heartbeat(_) => Ok(0),
     }
 }
 
@@ -606,78 +690,149 @@ fn collect_unique_shard_id(
     shard_id.ok_or(ShardRoutingError::NoRoutingKeyProvided)
 }
 
-async fn read_request<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
-    tcp_stream: &mut TcpStream,
-    ctx: &ConnectionContext<R, D, S>,
-) -> Option<(Request, u32)> {
-    match glommio::timer::timeout(ctx.config.slow_client_timeout, async {
-        let result = Request::read_request(tcp_stream, ctx.config.max_request_size).await;
-        Ok::<_, glommio::GlommioError<()>>(result)
-    })
-    .await
-    {
-        Ok(Ok(result)) => Some(result),
-        Ok(Err(ReadWireDataError::ReadHeaderFailure(WireError::NetworkError(ref e))))
-            if e.kind() == std::io::ErrorKind::UnexpectedEof => None,
-        Ok(Err(e)) => {
-            warn!(shard = ctx.current_shard_id, "Failed to read request: {e:?}");
-            None
-        }
+enum FirstMessage {
+    Identify(IdentifyRequest, u32),
+    ClientRequest(ClientRequest, u32),
+}
+
+/// Read the first message on a new client connection.
+/// Peeks at the wire header to distinguish Identify (type 14) from client requests.
+async fn read_with_timeout<T>(
+    timeout: Duration,
+    shard_id: usize,
+    label: &str,
+    fut: impl Future<Output = Result<T, ReadWireDataError>>,
+) -> Option<T> {
+    let read_result = match glommio::timer::timeout(timeout, async {
+        Ok::<_, glommio::GlommioError<()>>(fut.await)
+    }).await {
+        Ok(result) => result,
         Err(_) => {
-            warn!("Client timed out reading request");
+            warn!("Client timed out reading {label}");
+            return None;
+        }
+    };
+    match read_result {
+        Ok(result) => Some(result),
+        Err(ReadWireDataError::ReadHeaderFailure(WireError::NetworkError(ref e)))
+            if e.kind() == std::io::ErrorKind::UnexpectedEof => None,
+        Err(e) => {
+            warn!(shard = shard_id, "Failed to read {label}: {e:?}");
             None
         }
     }
 }
 
-async fn write_response(
-    tcp_stream: &mut TcpStream,
-    response: &Response,
-    max_message_size: u64,
-    server_compression_algorithm: CompressionType,
-    message_version: u32,
-    timeout_duration: Duration,
-) -> Result<(), WireError> {
-    let compression = Response::determine_compression_type(response, server_compression_algorithm);
-    match glommio::timer::timeout(timeout_duration, async {
-        let result = Response::write_response(tcp_stream, response, compression, max_message_size, message_version).await;
-        Ok::<_, glommio::GlommioError<()>>(result)
-    })
-    .await
-    {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err(WireError::NetworkError(std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out"))),
-    }
-}
-
-async fn process_request<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
+async fn read_first_message<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
     tcp_stream: &mut TcpStream,
     ctx: &ConnectionContext<R, D, S>,
-    request: Request,
+) -> Option<FirstMessage> {
+    read_with_timeout(ctx.config.slow_client_timeout, ctx.current_shard_id, "first message", async {
+        let header = WireHeader::from_reader(tcp_stream, ctx.config.max_request_size).await
+            .map_err(ReadWireDataError::ReadHeaderFailure)?;
+        let version = header.version;
+        if header.message_type == IDENTIFY_REQUEST_TYPE_ID {
+            let req = read_identify_request(header, tcp_stream).await?;
+            Ok(FirstMessage::Identify(req, version))
+        } else {
+            let req = ClientRequest::read_from_header(header, tcp_stream).await?;
+            Ok(FirstMessage::ClientRequest(req, version))
+        }
+    }).await
+}
+
+async fn read_client_request<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
+    tcp_stream: &mut TcpStream,
+    ctx: &ConnectionContext<R, D, S>,
+) -> Option<(ClientRequest, u32)> {
+    read_with_timeout(ctx.config.slow_client_timeout, ctx.current_shard_id, "client request", async {
+        let header = WireHeader::from_reader(tcp_stream, ctx.config.max_request_size).await
+            .map_err(ReadWireDataError::ReadHeaderFailure)?;
+        let version = header.version;
+        let req = ClientRequest::read_from_header(header, tcp_stream).await?;
+        Ok((req, version))
+    }).await
+}
+
+async fn read_cluster_request<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
+    tcp_stream: &mut TcpStream,
+    ctx: &ConnectionContext<R, D, S>,
+) -> Option<(ClusterRequest, u32)> {
+    read_with_timeout(ctx.config.slow_client_timeout, ctx.current_shard_id, "cluster request", async {
+        let header = WireHeader::from_reader(tcp_stream, ctx.config.max_request_size).await
+            .map_err(ReadWireDataError::ReadHeaderFailure)?;
+        let version = header.version;
+        let req = ClusterRequest::read_from_header(header, tcp_stream).await?;
+        Ok((req, version))
+    }).await
+}
+
+macro_rules! write_response_with_timeout_fn {
+    ($name:ident, $response_type:ty) => {
+        async fn $name(
+            tcp_stream: &mut TcpStream,
+            response: &$response_type,
+            max_message_size: u64,
+            server_compression_algorithm: CompressionType,
+            message_version: u32,
+            timeout_duration: Duration,
+        ) -> Result<(), WireError> {
+            let compression = <$response_type>::determine_compression_type(response, server_compression_algorithm);
+            match glommio::timer::timeout(timeout_duration, async {
+                let result = <$response_type>::write_response(tcp_stream, response, compression, max_message_size, message_version).await;
+                Ok::<_, glommio::GlommioError<()>>(result)
+            })
+            .await
+            {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err(WireError::NetworkError(std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out"))),
+            }
+        }
+    };
+}
+
+write_response_with_timeout_fn!(write_client_response_with_timeout, ClientResponse);
+write_response_with_timeout_fn!(write_cluster_response_with_timeout, ClusterResponse);
+
+// --- Request processing ---
+
+async fn process_client_request<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
+    tcp_stream: &mut TcpStream,
+    ctx: &ConnectionContext<R, D, S>,
+    request: ClientRequest,
     max_message_size: u64,
     server_compression_algorithm: CompressionType,
     message_version: u32,
 ) {
-    // Heartbeat and KickFollower are intercepted here rather than in ShardWal because
-    // they need intrashard broadcast access (TTL refresh / kick coordination).
-    if let Request::Heartbeat(ref heartbeat_req) = request {
-        let response = handle_heartbeat(heartbeat_req, ctx).await;
-        let _ = write_response(tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
-        return;
-    }
-    if let Request::KickFollower(ref kick_req) = request {
-        let response = handle_kick_follower(kick_req, ctx).await;
-        let _ = write_response(tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
-        return;
-    }
-
     let correlation_id = request.correlation_id();
-    let response = match ctx.shard_wal.process_request(request).await {
+    let response = match ctx.shard_wal.process_client_request(request).await {
         Ok(result) => result,
-        Err(error) => shard_error_to_response(correlation_id, error),
+        Err(error) => shard_error_to_client_response(correlation_id, error),
     };
-    let _ = write_response(tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
+    let _ = write_client_response_with_timeout(tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
+}
+
+async fn process_cluster_request<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
+    tcp_stream: &mut TcpStream,
+    ctx: &ConnectionContext<R, D, S>,
+    request: ClusterRequest,
+    max_message_size: u64,
+    server_compression_algorithm: CompressionType,
+    message_version: u32,
+) {
+    let response = match request {
+        ClusterRequest::Heartbeat(ref req) => handle_heartbeat(req, ctx).await,
+        ClusterRequest::KickFollower(ref req) => handle_kick_follower(req, ctx).await,
+        ClusterRequest::ReplicationBatch(req) => {
+            let correlation_id = req.correlation_id;
+            match ctx.shard_wal.handle_replication_batch(req).await {
+                Ok(result) => ClusterResponse::ReplicationBatch(result),
+                Err(error) => shard_error_to_cluster_response(correlation_id, celeriant_shard::error::shard_error::ShardError::ReplicationBatch(error)),
+            }
+        }
+    };
+    let _ = write_cluster_response_with_timeout(tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
 }
 
 /// Follower shard 0 heartbeat handler.
@@ -687,11 +842,11 @@ async fn process_request<R: ReplicationClient + 'static, D: S3Downloader + 'stat
 async fn handle_heartbeat<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
     req: &HeartbeatRequest,
     ctx: &ConnectionContext<R, D, S>,
-) -> Response {
+) -> ClusterResponse {
     let follower_ms = now_ms();
 
     if !ctx.shard_wal.node_status.get().is_any_follower_state() {
-        return Response::Heartbeat(HeartbeatResponse {
+        return ClusterResponse::Heartbeat(HeartbeatResponse {
             correlation_id: req.correlation_id,
             result: HeartbeatResult::Rejected(HeartbeatRejection::NotAFollower),
         });
@@ -706,7 +861,7 @@ async fn handle_heartbeat<R: ReplicationClient + 'static, D: S3Downloader + 'sta
         ctx.shard_wal.node_status.set(fenced);
         broadcast_status(ctx, fenced).await;
 
-        return Response::Heartbeat(HeartbeatResponse {
+        return ClusterResponse::Heartbeat(HeartbeatResponse {
             correlation_id: req.correlation_id,
             result: HeartbeatResult::Rejected(HeartbeatRejection::ClockDriftTooHigh {
                 leader_ms: req.leader_timestamp_ms,
@@ -726,7 +881,7 @@ async fn handle_heartbeat<R: ReplicationClient + 'static, D: S3Downloader + 'sta
     ctx.shard_wal.node_status.set(refreshed);
     broadcast_status(ctx, refreshed).await;
 
-    Response::Heartbeat(HeartbeatResponse {
+    ClusterResponse::Heartbeat(HeartbeatResponse {
         correlation_id: req.correlation_id,
         result: HeartbeatResult::Ack { follower_timestamp_ms: follower_ms },
     })
@@ -737,10 +892,10 @@ async fn handle_heartbeat<R: ReplicationClient + 'static, D: S3Downloader + 'sta
 async fn handle_kick_follower<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
     req: &KickFollowerRequest,
     ctx: &ConnectionContext<R, D, S>,
-) -> Response {
+) -> ClusterResponse {
     let status = ctx.shard_wal.node_status.get();
     if !status.is_any_follower_state() {
-        return Response::KickFollower(KickFollowerResponse {
+        return ClusterResponse::KickFollower(KickFollowerResponse {
             correlation_id: req.correlation_id,
             acknowledged: false,
         });
@@ -757,7 +912,7 @@ async fn handle_kick_follower<R: ReplicationClient + 'static, D: S3Downloader + 
         info!("Kicked by leader — transitioning to FollowerCatchingUp");
     }
 
-    Response::KickFollower(KickFollowerResponse {
+    ClusterResponse::KickFollower(KickFollowerResponse {
         correlation_id: req.correlation_id,
         acknowledged: true,
     })
@@ -792,8 +947,8 @@ async fn handle_watch<R: ReplicationClient + 'static, D: S3Downloader + 'static,
     let mut watch_session = match create_watch_session(&ctx.shard_wal, watch_request, ctx.config.max_requested_latency) {
         Ok(session) => session,
         Err(error) => {
-            let response = watch_session_error_to_response(correlation_id, error);
-            let _ = write_response(&mut tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
+            let response = watch_session_error_to_client_response(correlation_id, error);
+            let _ = write_client_response_with_timeout(&mut tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
             return;
         }
     };
@@ -802,21 +957,21 @@ async fn handle_watch<R: ReplicationClient + 'static, D: S3Downloader + 'static,
         match watch_session.next().await {
             Ok(WatchOutputType::Continue) => continue,
             Ok(WatchOutputType::Response(watch_response)) => {
-                let response = Response::Watch(watch_response);
-                if write_response(&mut tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await.is_err() {
+                let response = ClientResponse::Watch(watch_response);
+                if write_client_response_with_timeout(&mut tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await.is_err() {
                     break;
                 }
             }
             Ok(WatchOutputType::Heartbeat) => {
-                let response = Response::Watch(WatchResponse { events: None });
-                if write_response(&mut tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await.is_err() {
+                let response = ClientResponse::Watch(WatchResponse { events: None });
+                if write_client_response_with_timeout(&mut tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await.is_err() {
                     break;
                 }
             }
             Ok(WatchOutputType::Done) => break,
             Err(error) => {
-                let response = watch_read_error_to_response(correlation_id, error);
-                let _ = write_response(&mut tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
+                let response = watch_read_error_to_client_response(correlation_id, error);
+                let _ = write_client_response_with_timeout(&mut tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
                 break;
             }
         }
@@ -847,7 +1002,7 @@ mod tests {
     use celeriant_msg::request::{
         read_filters::ReadFilters,
         requests::{
-            CatchUpRequest, DeleteRequest, AggregateDetailsRequest, ListAggregateTypesRequest,
+            DeleteRequest, AggregateDetailsRequest, ListAggregateTypesRequest,
             ListAggregatesRequest, ListOrgsRequest, ReadRequest, ReplicationBatchRequest,
             SingleAggregateDelete, SingleAggregateWrite, TrimStartRequest, WriteRequest,
         },
@@ -904,158 +1059,108 @@ mod tests {
         }
     }
 
-    #[test]
-    fn port_validation_client_requests() {
-        let exists = Request::AggregateDetails(AggregateDetailsRequest {
-            correlation_id: None,
-            aggregate_key: AggregateKey::new(1, 1, 1),
-        });
-        assert!(is_valid_for_port(&exists, PortType::Client));
-        assert!(!is_valid_for_port(&exists, PortType::Replication));
-
-        let read = Request::Read(ReadRequest {
-            correlation_id: None,
-            aggregate_key: AggregateKey::new(1, 1, 1),
-            filters: ReadFilters::default(),
-        });
-        assert!(is_valid_for_port(&read, PortType::Client));
-        assert!(!is_valid_for_port(&read, PortType::Replication));
-    }
-
-    #[test]
-    fn port_validation_replication_requests() {
-        let repl = Request::ReplicationBatch(ReplicationBatchRequest {
-            correlation_id: None,
-            shard_id: 0,
-            batches: vec![],
-            leader_timestamp_ms: 0,
-        });
-        assert!(!is_valid_for_port(&repl, PortType::Client));
-        assert!(is_valid_for_port(&repl, PortType::Replication));
-    }
+    // --- Client shard routing ---
 
     #[test]
     fn routing_exists_request_by_aggregate_id() {
         let config = test_config(4, crate::RoutingRule::AggregateId);
-        let request = Request::AggregateDetails(AggregateDetailsRequest {
+        let request = ClientRequest::AggregateDetails(AggregateDetailsRequest {
             correlation_id: None,
             aggregate_key: AggregateKey::new(100, 200, 7),
         });
-        let shard = determine_shard(&request, &config, PortType::Client).unwrap();
+        let shard = determine_client_shard(&request, &config).unwrap();
         assert_eq!(shard, 3); // 7 % 4 = 3
     }
 
     #[test]
     fn routing_exists_request_by_org_id() {
         let config = test_config(4, crate::RoutingRule::OrgId);
-        let request = Request::AggregateDetails(AggregateDetailsRequest {
+        let request = ClientRequest::AggregateDetails(AggregateDetailsRequest {
             correlation_id: None,
             aggregate_key: AggregateKey::new(5, 200, 7),
         });
-        let shard = determine_shard(&request, &config, PortType::Client).unwrap();
+        let shard = determine_client_shard(&request, &config).unwrap();
         assert_eq!(shard, 1); // 5 % 4 = 1
     }
 
     #[test]
     fn routing_read_request_by_aggregate_type() {
         let config = test_config(3, crate::RoutingRule::AggregateTypeId);
-        let request = Request::Read(ReadRequest {
+        let request = ClientRequest::Read(ReadRequest {
             correlation_id: None,
             aggregate_key: AggregateKey::new(1, 8, 1),
             filters: ReadFilters::default(),
         });
-        let shard = determine_shard(&request, &config, PortType::Client).unwrap();
+        let shard = determine_client_shard(&request, &config).unwrap();
         assert_eq!(shard, 2); // 8 % 3 = 2
     }
+
+    // --- Cluster shard routing ---
 
     #[test]
     fn routing_replication_uses_explicit_shard_id() {
         let config = test_config(4, crate::RoutingRule::AggregateId);
-        let request = Request::ReplicationBatch(ReplicationBatchRequest {
+        let request = ClusterRequest::ReplicationBatch(ReplicationBatchRequest {
             correlation_id: None,
             shard_id: 2,
             leader_timestamp_ms: 0,
             batches: vec![],
         });
-        let shard = determine_shard(&request, &config, PortType::Replication).unwrap();
+        let shard = determine_cluster_shard(&request, &config).unwrap();
         assert_eq!(shard, 2);
     }
 
     #[test]
     fn routing_replication_invalid_shard_id() {
         let config = test_config(4, crate::RoutingRule::AggregateId);
-        let request = Request::ReplicationBatch(ReplicationBatchRequest {
+        let request = ClusterRequest::ReplicationBatch(ReplicationBatchRequest {
             correlation_id: None,
             shard_id: 10,
             leader_timestamp_ms: 0,
             batches: vec![],
         });
-        let result = determine_shard(&request, &config, PortType::Replication);
+        let result = determine_cluster_shard(&request, &config);
         assert!(matches!(result, Err(ShardRoutingError::IncompatibleFilters(_))));
     }
 
-    #[test]
-    fn routing_catchup_uses_explicit_shard_id() {
-        let config = test_config(4, crate::RoutingRule::AggregateId);
-        let request = Request::CatchUp(CatchUpRequest {
-            correlation_id: None,
-            shard_id: 2,
-            last_follower_metablock: None,
-            follower_tip_hash: None,
-        });
-        let shard = determine_shard(&request, &config, PortType::Replication).unwrap();
-        assert_eq!(shard, 2);
-    }
-
-    #[test]
-    fn routing_catchup_invalid_shard_id() {
-        let config = test_config(4, crate::RoutingRule::AggregateId);
-        let request = Request::CatchUp(CatchUpRequest {
-            correlation_id: None,
-            shard_id: 10,
-            last_follower_metablock: None,
-            follower_tip_hash: None,
-        });
-        let result = determine_shard(&request, &config, PortType::Replication);
-        assert!(matches!(result, Err(ShardRoutingError::IncompatibleFilters(_))));
-    }
+    // --- Client shard routing (list, write, delete, watch) ---
 
     #[test]
     fn routing_list_orgs_uses_explicit_shard_id() {
         let config = test_config(4, crate::RoutingRule::AggregateId);
-        let request = Request::ListOrgs(ListOrgsRequest {
+        let request = ClientRequest::ListOrgs(ListOrgsRequest {
             correlation_id: None,
             shard_id: 3,
             cursor: None,
         });
-        let shard = determine_shard(&request, &config, PortType::Client).unwrap();
+        let shard = determine_client_shard(&request, &config).unwrap();
         assert_eq!(shard, 3);
     }
 
     #[test]
     fn routing_list_aggregate_types_uses_explicit_shard_id() {
         let config = test_config(4, crate::RoutingRule::AggregateId);
-        let request = Request::ListAggregateTypes(ListAggregateTypesRequest {
+        let request = ClientRequest::ListAggregateTypes(ListAggregateTypesRequest {
             correlation_id: None,
             shard_id: 1,
             org_id: Some(100),
             cursor: None,
         });
-        let shard = determine_shard(&request, &config, PortType::Client).unwrap();
+        let shard = determine_client_shard(&request, &config).unwrap();
         assert_eq!(shard, 1);
     }
 
     #[test]
     fn routing_list_aggregates_uses_explicit_shard_id() {
         let config = test_config(4, crate::RoutingRule::AggregateId);
-        let request = Request::ListAggregates(ListAggregatesRequest {
+        let request = ClientRequest::ListAggregates(ListAggregatesRequest {
             correlation_id: None,
             shard_id: 0,
             org_id: Some(100),
             aggregate_type_id: Some(200),
             cursor: None,
         });
-        let shard = determine_shard(&request, &config, PortType::Client).unwrap();
+        let shard = determine_client_shard(&request, &config).unwrap();
         assert_eq!(shard, 0);
     }
 
@@ -1071,13 +1176,13 @@ mod tests {
             compression_type: CompressionType::None,
             events: vec![],
         });
-        let request = Request::Write(WriteRequest {
+        let request = ClientRequest::Write(WriteRequest {
             correlation_id: None,
             client_id: 1,
             user_id: None,
             writes,
         });
-        let shard = determine_shard(&request, &config, PortType::Client).unwrap();
+        let shard = determine_client_shard(&request, &config).unwrap();
         assert_eq!(shard, 3); // 11 % 4 = 3
     }
 
@@ -1105,13 +1210,13 @@ mod tests {
                 events: vec![],
             },
         );
-        let request = Request::Write(WriteRequest {
+        let request = ClientRequest::Write(WriteRequest {
             correlation_id: None,
             client_id: 1,
             user_id: None,
             writes,
         });
-        let shard = determine_shard(&request, &config, PortType::Client).unwrap();
+        let shard = determine_client_shard(&request, &config).unwrap();
         assert_eq!(shard, 0); // both 4 % 4 and 8 % 4 = 0
     }
 
@@ -1139,26 +1244,26 @@ mod tests {
                 events: vec![],
             },
         );
-        let request = Request::Write(WriteRequest {
+        let request = ClientRequest::Write(WriteRequest {
             correlation_id: None,
             client_id: 1,
             user_id: None,
             writes,
         });
-        let result = determine_shard(&request, &config, PortType::Client);
+        let result = determine_client_shard(&request, &config);
         assert!(matches!(result, Err(ShardRoutingError::IncompatibleFilters(_))));
     }
 
     #[test]
     fn routing_write_empty_writes() {
         let config = test_config(4, crate::RoutingRule::AggregateId);
-        let request = Request::Write(WriteRequest {
+        let request = ClientRequest::Write(WriteRequest {
             correlation_id: None,
             client_id: 1,
             user_id: None,
             writes: HashMap::new(),
         });
-        let result = determine_shard(&request, &config, PortType::Client);
+        let result = determine_client_shard(&request, &config);
         assert!(matches!(result, Err(ShardRoutingError::IncompatibleFilters(_))));
     }
 
@@ -1172,49 +1277,51 @@ mod tests {
             allow_index_continuation: false,
             expected_event_batch_index: None,
         });
-        let request = Request::Delete(DeleteRequest {
+        let request = ClientRequest::Delete(DeleteRequest {
             correlation_id: None,
             client_id: 1,
             user_id: None,
             deletes,
         });
-        let shard = determine_shard(&request, &config, PortType::Client).unwrap();
+        let shard = determine_client_shard(&request, &config).unwrap();
         assert_eq!(shard, 1); // 9 % 4 = 1
     }
 
     #[test]
     fn routing_delete_empty_deletes() {
         let config = test_config(4, crate::RoutingRule::AggregateId);
-        let request = Request::Delete(DeleteRequest {
+        let request = ClientRequest::Delete(DeleteRequest {
             correlation_id: None,
             client_id: 1,
             user_id: None,
             deletes: HashMap::new(),
         });
-        let result = determine_shard(&request, &config, PortType::Client);
+        let result = determine_client_shard(&request, &config);
         assert!(matches!(result, Err(ShardRoutingError::IncompatibleFilters(_))));
     }
 
     #[test]
     fn routing_trim_start() {
         let config = test_config(4, crate::RoutingRule::AggregateId);
-        let request = Request::TrimStart(TrimStartRequest {
+        let request = ClientRequest::TrimStart(TrimStartRequest {
             correlation_id: None,
             aggregate_key: AggregateKey::new(1, 2, 6),
             keep_from_event_batch_index: 10,
             client_id: 1,
             user_id: None,
         });
-        let shard = determine_shard(&request, &config, PortType::Client).unwrap();
+        let shard = determine_client_shard(&request, &config).unwrap();
         assert_eq!(shard, 2); // 6 % 4 = 2
     }
+
+    // --- Watch routing ---
 
     #[test]
     fn routing_watch_by_org_id() {
         let config = test_config(4, crate::RoutingRule::OrgId);
         let mut orgs = std::collections::HashSet::new();
         orgs.insert(5u128);
-        let request = Request::Watch(WatchRequest {
+        let request = ClientRequest::Watch(WatchRequest {
             correlation_id: None,
             orgs: Some(orgs),
             aggregate_types: None,
@@ -1222,14 +1329,14 @@ mod tests {
             operation_types: None,
             requested_latency_ms: None,
         });
-        let shard = determine_shard(&request, &config, PortType::Client).unwrap();
+        let shard = determine_client_shard(&request, &config).unwrap();
         assert_eq!(shard, 1); // 5 % 4 = 1
     }
 
     #[test]
     fn routing_watch_by_org_id_missing_org() {
         let config = test_config(4, crate::RoutingRule::OrgId);
-        let request = Request::Watch(WatchRequest {
+        let request = ClientRequest::Watch(WatchRequest {
             correlation_id: None,
             orgs: None,
             aggregate_types: None,
@@ -1237,7 +1344,7 @@ mod tests {
             operation_types: None,
             requested_latency_ms: None,
         });
-        let result = determine_shard(&request, &config, PortType::Client);
+        let result = determine_client_shard(&request, &config);
         assert!(matches!(result, Err(ShardRoutingError::IncompatibleFilters(_))));
     }
 
@@ -1246,7 +1353,7 @@ mod tests {
         let config = test_config(3, crate::RoutingRule::AggregateTypeId);
         let mut agg_types = std::collections::HashSet::new();
         agg_types.insert(7u128);
-        let request = Request::Watch(WatchRequest {
+        let request = ClientRequest::Watch(WatchRequest {
             correlation_id: None,
             orgs: None,
             aggregate_types: Some(agg_types),
@@ -1254,7 +1361,7 @@ mod tests {
             operation_types: None,
             requested_latency_ms: None,
         });
-        let shard = determine_shard(&request, &config, PortType::Client).unwrap();
+        let shard = determine_client_shard(&request, &config).unwrap();
         assert_eq!(shard, 1); // 7 % 3 = 1
     }
 
@@ -1263,7 +1370,7 @@ mod tests {
         let config = test_config(4, crate::RoutingRule::AggregateId);
         let mut aggregates = std::collections::HashSet::new();
         aggregates.insert(10u128);
-        let request = Request::Watch(WatchRequest {
+        let request = ClientRequest::Watch(WatchRequest {
             correlation_id: None,
             orgs: None,
             aggregate_types: None,
@@ -1271,7 +1378,7 @@ mod tests {
             operation_types: None,
             requested_latency_ms: None,
         });
-        let shard = determine_shard(&request, &config, PortType::Client).unwrap();
+        let shard = determine_client_shard(&request, &config).unwrap();
         assert_eq!(shard, 2); // 10 % 4 = 2
     }
 
@@ -1281,7 +1388,7 @@ mod tests {
         let mut orgs = std::collections::HashSet::new();
         orgs.insert(4u128);
         orgs.insert(8u128);
-        let request = Request::Watch(WatchRequest {
+        let request = ClientRequest::Watch(WatchRequest {
             correlation_id: None,
             orgs: Some(orgs),
             aggregate_types: None,
@@ -1289,7 +1396,7 @@ mod tests {
             operation_types: None,
             requested_latency_ms: None,
         });
-        let shard = determine_shard(&request, &config, PortType::Client).unwrap();
+        let shard = determine_client_shard(&request, &config).unwrap();
         assert_eq!(shard, 0); // both 4 % 4 and 8 % 4 = 0
     }
 
@@ -1299,7 +1406,7 @@ mod tests {
         let mut orgs = std::collections::HashSet::new();
         orgs.insert(4u128);
         orgs.insert(5u128);
-        let request = Request::Watch(WatchRequest {
+        let request = ClientRequest::Watch(WatchRequest {
             correlation_id: None,
             orgs: Some(orgs),
             aggregate_types: None,
@@ -1307,9 +1414,11 @@ mod tests {
             operation_types: None,
             requested_latency_ms: None,
         });
-        let result = determine_shard(&request, &config, PortType::Client);
+        let result = determine_client_shard(&request, &config);
         assert!(matches!(result, Err(ShardRoutingError::MultipleShardRoutes)));
     }
+
+    // --- Shard ID validation ---
 
     #[test]
     fn shard_id_validation_boundary() {
@@ -1319,9 +1428,10 @@ mod tests {
         assert!(validate_shard_id(100, 4).is_err());
     }
 
+    // --- Client identity validation ---
+
     #[test]
     fn validate_client_id_no_verification() {
-        // When verified_client_id is None, all requests pass
         let key = AggregateKey::new(1, 2, 3);
         let mut writes = HashMap::new();
         writes.insert(key, SingleAggregateWrite {
@@ -1331,7 +1441,7 @@ mod tests {
             compression_type: CompressionType::None,
             events: vec![],
         });
-        let req = Request::Write(WriteRequest {
+        let req = ClientRequest::Write(WriteRequest {
             correlation_id: Some(123),
             client_id: 999,
             user_id: None,
@@ -1342,7 +1452,6 @@ mod tests {
 
     #[test]
     fn validate_client_id_match() {
-        // When verified_client_id matches request, passes
         let key = AggregateKey::new(1, 2, 3);
         let mut writes = HashMap::new();
         writes.insert(key, SingleAggregateWrite {
@@ -1352,7 +1461,7 @@ mod tests {
             compression_type: CompressionType::None,
             events: vec![],
         });
-        let req = Request::Write(WriteRequest {
+        let req = ClientRequest::Write(WriteRequest {
             correlation_id: Some(123),
             client_id: 999,
             user_id: None,
@@ -1363,7 +1472,6 @@ mod tests {
 
     #[test]
     fn validate_client_id_mismatch() {
-        // When verified_client_id doesn't match request, fails
         let key = AggregateKey::new(1, 2, 3);
         let mut writes = HashMap::new();
         writes.insert(key, SingleAggregateWrite {
@@ -1373,7 +1481,7 @@ mod tests {
             compression_type: CompressionType::None,
             events: vec![],
         });
-        let req = Request::Write(WriteRequest {
+        let req = ClientRequest::Write(WriteRequest {
             correlation_id: Some(123),
             client_id: 999,
             user_id: None,
@@ -1381,7 +1489,7 @@ mod tests {
         });
         let result = super::validate_client_id(&req, Some(888));
         assert!(result.is_err());
-        if let Err(Response::GenericError(err)) = result {
+        if let Err(ClientResponse::GenericError(err)) = result {
             assert_eq!(err.error_code, IDENTIFY_MISMATCH);
             assert!(err.error_message.contains("999"));
             assert!(err.error_message.contains("888"));
@@ -1392,8 +1500,7 @@ mod tests {
 
     #[test]
     fn validate_client_id_read_always_passes() {
-        // Read requests don't carry client_id, so they always pass
-        let req = Request::Read(ReadRequest {
+        let req = ClientRequest::Read(ReadRequest {
             correlation_id: Some(123),
             aggregate_key: AggregateKey::new(1, 2, 3),
             filters: ReadFilters::default(),
@@ -1403,7 +1510,7 @@ mod tests {
 
     #[test]
     fn validate_client_id_trim_start() {
-        let req = Request::TrimStart(TrimStartRequest {
+        let req = ClientRequest::TrimStart(TrimStartRequest {
             correlation_id: Some(123),
             aggregate_key: AggregateKey::new(1, 2, 3),
             keep_from_event_batch_index: 10,
@@ -1423,7 +1530,7 @@ mod tests {
             allow_index_continuation: false,
             expected_event_batch_index: None,
         });
-        let req = Request::Delete(DeleteRequest {
+        let req = ClientRequest::Delete(DeleteRequest {
             correlation_id: Some(123),
             client_id: 555,
             user_id: None,
