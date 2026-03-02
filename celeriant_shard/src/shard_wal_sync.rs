@@ -6,6 +6,9 @@ use celeriant_memcache::cache_path::CachePath;
 use celeriant_memcache::pending_cache_item::PendingCacheItem;
 use celeriant_memcache::pending_commit_data::PendingCommitData;
 use celeriant_memcache::shard_mem_cache::ShardMemCache;
+use crate::schema_validator::CompiledValidator;
+
+type MemCache = ShardMemCache<CompiledValidator>;
 use celeriant_memcache::sync_positions_snapshot::SyncPositionsSnapshot;
 use celeriant_rotating_log::log_segment_file::log_segment_file::{LogSegmentFile, write_dual_shard_log_header};
 use celeriant_rotating_log::log_segment_file::log_segment_file_metadata::LogSegmentFileMetadata;
@@ -27,7 +30,7 @@ pub(crate) struct FsyncCapturedData {
     pub sync_positions_snapshot: SyncPositionsSnapshot,
 }
 
-pub(crate) fn capture_fsync_snapshot(shard_mem_cache: &Rc<RefCell<ShardMemCache>>) -> CaptureResult<FsyncCapturedData, ShardFsyncError> {
+pub(crate) fn capture_fsync_snapshot(shard_mem_cache: &Rc<RefCell<MemCache>>) -> CaptureResult<FsyncCapturedData, ShardFsyncError> {
     let mut cache = shard_mem_cache.borrow_mut();
 
     if cache.take_fsync_rollback_flag() {
@@ -50,7 +53,7 @@ pub(crate) fn capture_fsync_snapshot(shard_mem_cache: &Rc<RefCell<ShardMemCache>
 pub(crate) async fn commit_fsync_with_rollback(
     node_status: NodeStatus,
     log_segments_cache: Rc<LogSegmentsCache>,
-    shard_mem_cache: Rc<RefCell<ShardMemCache>>,
+    shard_mem_cache: Rc<RefCell<MemCache>>,
     watched_aggregates: Rc<AggregateWatchers>,
     mut captured: FsyncCapturedData, // Mutable because we set the datablocks_position while writing in metablocks
 ) -> Result<(), ShardFsyncError> {
@@ -97,7 +100,7 @@ pub(crate) async fn commit_fsync_with_rollback(
 /// Commits a successful sync by updating caches and broadcasting watch events.
 fn commit_sync(
     node_status: NodeStatus,
-    shard_mem_cache: Rc<RefCell<ShardMemCache>>,
+    shard_mem_cache: Rc<RefCell<MemCache>>,
     watched_aggregates: Rc<AggregateWatchers>,
     mut sync_positions_snapshot: SyncPositionsSnapshot,
     log_segment_file: Rc<LogSegmentFile>,
@@ -215,7 +218,7 @@ fn commit_sync(
     }
 }
 
-fn rollback_sync(shard_mem_cache: Rc<RefCell<ShardMemCache>>) {
+fn rollback_sync(shard_mem_cache: Rc<RefCell<MemCache>>) {
     shard_mem_cache.borrow_mut().execute_fsync_rollback();
 }
 
@@ -343,10 +346,16 @@ pub(crate) async fn sync(
         .await
         .map_err(|e| ShardFsyncError::WriteMetablocksError(e.to_string()))?;
 
-    // Update bloom filter with aggregate keys from this batch
+    // Update bloom filter with aggregate keys and schema keys from this batch
     for item in &sync_positions_snapshot.pending_append_queue {
-        if let MetablockKind::EventBatchMetadata(event_batch) = &item.metablock.wal_metablock_type {
-            log_segment_file_metadata.write.aggregate_key_bloom.insert(&event_batch.aggregate_key);
+        match &item.metablock.wal_metablock_type {
+            MetablockKind::EventBatchMetadata(event_batch) => {
+                log_segment_file_metadata.write.aggregate_key_bloom.insert(&event_batch.aggregate_key);
+            }
+            MetablockKind::SchemaRegistration(schema_reg) => {
+                log_segment_file_metadata.write.aggregate_key_bloom.insert_hash(&schema_reg.schema_key.hash_bytes());
+            }
+            _ => {}
         }
     }
 

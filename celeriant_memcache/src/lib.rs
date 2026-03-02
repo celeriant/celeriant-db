@@ -1,5 +1,6 @@
 pub mod aggregate_recent_write;
 pub mod cache_path;
+pub mod cached_schema;
 pub mod mem_snapshot_aggregate;
 pub mod metablock_position;
 pub mod queue_aggregate_positions;

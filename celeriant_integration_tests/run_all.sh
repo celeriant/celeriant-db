@@ -83,6 +83,12 @@ TESTS=(
   mtls_test_main
   # --- Client identity enforcement ---
   identity_test_main
+  # --- Schema validation ---
+  schema_validation_main
+  schema_zero_cache_main
+  schema_failover_main
+  schema_follower_crash_main
+  schema_old_leader_recovery_main
 )
 
 # Pre-build everything so compilation isn't counted in per-test timeout

@@ -66,6 +66,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
             shutdown_requested: shutdown_requested.clone(),
             shard_wal: shard_wal.clone(),
             catchup_completion_tx: None,
+            schema_registration_pending: None,
             lease_manager: lease_manager.map(Rc::new),
         };
 
@@ -91,6 +92,10 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
         } else {
             None
         };
+
+        if self.ctx.current_shard_id == 0 && self.ctx.config.num_shards > 1 {
+            self.ctx.schema_registration_pending = Some(Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())));
+        }
 
         for (_src_shard, stream) in self.intrashard_receivers.streams() {
             spawn_intrashard_message_handler(stream, self.ctx.clone());
@@ -715,6 +720,26 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
         }
         IntrashardMessages::UpdateLeaderClientAddress { client_address } => {
             *ctx.shard_wal.leader_client_address.borrow_mut() = client_address;
+        }
+        IntrashardMessages::SchemaRegistration { request, request_id } => {
+            let result = ctx.shard_wal.register_schema(request).await
+                .map(|_| ())
+                .map_err(|e| e);
+
+            let completion_msg = IntrashardMessages::SchemaRegistrationComplete {
+                request_id,
+                result,
+            };
+            let _ = ctx.intrashard_sender.send_to(0, completion_msg).await;
+        }
+        IntrashardMessages::SchemaRegistrationComplete { request_id, result } => {
+            if let Some(pending_map) = &ctx.schema_registration_pending {
+                if let Some(tx) = pending_map.borrow().get(&request_id) {
+                    let _ = tx.try_send(crate::sharded::connection_handler::SchemaRegistrationCompletionMsg {
+                        result,
+                    });
+                }
+            }
         }
     }
 }

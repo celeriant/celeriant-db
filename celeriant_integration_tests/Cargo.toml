@@ -261,6 +261,30 @@ path = "src/identity_test_main.rs"
 name = "api_key_test_main"
 path = "src/api_key_test_main.rs"
 
+[[bin]]
+name = "schema_validation_main"
+path = "src/schema_validation_main.rs"
+
+[[bin]]
+name = "schema_failover_main"
+path = "src/schema_failover_main.rs"
+
+[[bin]]
+name = "schema_follower_crash_main"
+path = "src/schema_follower_crash_main.rs"
+
+[[bin]]
+name = "schema_old_leader_recovery_main"
+path = "src/schema_old_leader_recovery_main.rs"
+
+[[bin]]
+name = "schema_zero_cache_main"
+path = "src/schema_zero_cache_main.rs"
+
+[[bin]]
+name = "schema_bank_bench_main"
+path = "src/schema_bank_bench_main.rs"
+
 [features]
 default = []
 small-metablock = [

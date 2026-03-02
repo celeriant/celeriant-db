@@ -14,6 +14,9 @@ use celeriant_wire::disk::versioned_block::{deserialise_fallback_batch, deserial
 
 use celeriant_memcache::shard_log_queue_item::ShardLogQueueItem;
 use celeriant_memcache::shard_mem_cache::ShardMemCache;
+use crate::schema_validator::CompiledValidator;
+
+type MemCache = ShardMemCache<CompiledValidator>;
 use celeriant_watch::aggregate_watchers::AggregateWatchers;
 
 use crate::amortisation::coordinator::Coordinator;
@@ -39,7 +42,7 @@ struct FallbackBatchRef {
 
 pub(crate) async fn catchup_from_s3<D: S3Downloader>(
     log_segments_cache: &Rc<LogSegmentsCache>,
-    shard_mem_cache: &Rc<RefCell<ShardMemCache>>,
+    shard_mem_cache: &Rc<RefCell<MemCache>>,
     fsync_coordinator: &Rc<Coordinator<ShardFsyncError>>,
     watched_aggregates: &Rc<AggregateWatchers>,
     downloader: &Rc<D>,
@@ -88,7 +91,7 @@ struct RoundApplied {
 
 async fn catchup_round<D: S3Downloader>(
     log_segments_cache: &Rc<LogSegmentsCache>,
-    shard_mem_cache: &Rc<RefCell<ShardMemCache>>,
+    shard_mem_cache: &Rc<RefCell<MemCache>>,
     fsync_coordinator: &Rc<Coordinator<ShardFsyncError>>,
     watched_aggregates: &Rc<AggregateWatchers>,
     downloader: &Rc<D>,
@@ -199,7 +202,7 @@ async fn catchup_round<D: S3Downloader>(
 /// Validate WAL continuity and queue entries. Does not fsync.
 pub(crate) fn apply_external_batch(
     log_segments_cache: &Rc<LogSegmentsCache>,
-    shard_mem_cache: &Rc<RefCell<ShardMemCache>>,
+    shard_mem_cache: &Rc<RefCell<MemCache>>,
     items: &[ReplicationBatchItem],
 ) -> Result<(), ApplyBatchError> {
     let (current_tip_hash, current_wal_index) = {
@@ -231,7 +234,7 @@ pub(crate) fn apply_external_batch(
 }
 
 fn queue_replicated_entries(
-    shard_mem_cache: &Rc<RefCell<ShardMemCache>>,
+    shard_mem_cache: &Rc<RefCell<MemCache>>,
     items: &[ReplicationBatchItem],
 ) -> Result<(), ApplyBatchError> {
     for (i, w) in items.windows(2).enumerate() {
@@ -272,7 +275,7 @@ fn queue_replicated_entries(
 /// Fsync via the coordinator (immediate, no amortisation delay).
 async fn sync_applied_batch(
     log_segments_cache: &Rc<LogSegmentsCache>,
-    shard_mem_cache: &Rc<RefCell<ShardMemCache>>,
+    shard_mem_cache: &Rc<RefCell<MemCache>>,
     fsync_coordinator: &Rc<Coordinator<ShardFsyncError>>,
     watched_aggregates: &Rc<AggregateWatchers>,
 ) -> Result<(), ShardFsyncError> {
@@ -414,7 +417,7 @@ async fn scan_local_metablocks_for_hash(
 /// Uses the already-known divergent entry position from the caller to avoid re-scanning.
 async fn truncate_wal(
     log_segments_cache: &Rc<LogSegmentsCache>,
-    shard_mem_cache: &Rc<RefCell<ShardMemCache>>,
+    shard_mem_cache: &Rc<RefCell<MemCache>>,
     fsync_coordinator: &Rc<Coordinator<ShardFsyncError>>,
     common_ancestor_hash: [u8; 32],
     divergent_wal_index: u64,
@@ -655,7 +658,7 @@ mod tests {
 
     struct TestComponents {
         log_segments_cache: Rc<LogSegmentsCache>,
-        shard_mem_cache: Rc<RefCell<ShardMemCache>>,
+        shard_mem_cache: Rc<RefCell<MemCache>>,
         fsync_coordinator: Rc<Coordinator<ShardFsyncError>>,
         watched_aggregates: Rc<AggregateWatchers>,
     }
@@ -667,7 +670,7 @@ mod tests {
                 .unwrap();
             Self {
                 log_segments_cache: Rc::new(log_segments_cache),
-                shard_mem_cache: Rc::new(RefCell::new(ShardMemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 1024 * 1024, 64 * 1024 * 1024))),
+                shard_mem_cache: Rc::new(RefCell::new(MemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 1024 * 1024, 4 * 1024 * 1024, 64 * 1024 * 1024))),
                 fsync_coordinator: Rc::new(Coordinator::new()),
                 watched_aggregates: Rc::new(AggregateWatchers::new()),
             }

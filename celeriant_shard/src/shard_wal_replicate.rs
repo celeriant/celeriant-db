@@ -13,6 +13,9 @@ use celeriant_wire::disk::versioned_block::deserialise_metablock;
 use celeriant_memcache::cache_path::CachePath;
 use celeriant_memcache::pending_commit_data::PendingCommitData;
 use celeriant_memcache::shard_mem_cache::ShardMemCache;
+use crate::schema_validator::CompiledValidator;
+
+type MemCache = ShardMemCache<CompiledValidator>;
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
 use celeriant_wal::constants::{FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, GENESIS_HASH, HEADER_BLOCK_SIZE_BYTES};
 use celeriant_wal::metablocks::metablock_kind::MetablockKind;
@@ -50,7 +53,7 @@ pub(crate) struct ReplicationCapturedData {
 
 /// Capture phase: take replication snapshot from memcache.
 /// Must be called while the coordinator still holds the orchestrator event.
-pub(crate) fn capture_replication_snapshot(shard_mem_cache: &Rc<RefCell<ShardMemCache>>) -> CaptureResult<ReplicationCapturedData, ReplicationError> {
+pub(crate) fn capture_replication_snapshot(shard_mem_cache: &Rc<RefCell<MemCache>>) -> CaptureResult<ReplicationCapturedData, ReplicationError> {
     let mut cache = shard_mem_cache.borrow_mut();
 
     let follower_falling_behind = cache.is_replication_queue_pressured();
@@ -80,7 +83,7 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
     replication_client: Rc<R>,
     fsync_coordinator: Rc<Coordinator<ShardFsyncError>>,
     log_segments_cache: Rc<LogSegmentsCache>,
-    shard_mem_cache: Rc<RefCell<ShardMemCache>>,
+    shard_mem_cache: Rc<RefCell<MemCache>>,
     watched_aggregates: Rc<AggregateWatchers>,
     replication_captured_data: ReplicationCapturedData,
     max_catchup_gap_bytes: u64,
@@ -259,7 +262,7 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
 /// No failures here, all in-memory operations
 fn commit_replication(
     log_segments_cache: &Rc<LogSegmentsCache>,
-    shard_mem_cache: &Rc<RefCell<ShardMemCache>>,
+    shard_mem_cache: &Rc<RefCell<MemCache>>,
     watched_aggregates: &Rc<AggregateWatchers>,
     replication_snapshot: Vec<PendingCommitData>,
 ) {
@@ -331,7 +334,7 @@ fn commit_replication(
 async fn rollback_replicate(
     fsync_coordinator: &Rc<Coordinator<ShardFsyncError>>,
     log_segments_cache: &Rc<LogSegmentsCache>,
-    shard_mem_cache: &Rc<RefCell<ShardMemCache>>,
+    shard_mem_cache: &Rc<RefCell<MemCache>>,
     replication_snapshot: Vec<PendingCommitData>,
 ) -> Result<(), ReplicationRollbackFailure> {
     // In replication rollback, we modify the write positions in the file header
@@ -612,7 +615,7 @@ mod tests {
                 LogSegmentsCache::ready_up(dir, 4 * 1024 * 1024, 4).await.unwrap()
             );
             let smc = Rc::new(RefCell::new(
-                ShardMemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 1024 * 1024, 64 * 1024 * 1024)
+                MemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 1024 * 1024, 4 * 1024 * 1024, 64 * 1024 * 1024)
             ));
 
             let (client, s3_counts) = RecordingReplicationClient::new();

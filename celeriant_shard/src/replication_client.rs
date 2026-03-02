@@ -14,7 +14,7 @@ use celeriant_msg::{
 };
 use celeriant_wal::{compression_type::CompressionType, s3::fallback_batch::{FallbackBatch, FallbackItem}};
 use glommio::sync::RwLock;
-use tracing::warn;
+use tracing::{debug};
 
 use crate::error::{replication_to_follower_error::ReplicateToFollowerError, replication_to_s3_error::ReplicateToS3Error, send_heartbeat_error::SendHeartbeatError};
 use crate::s3_uploader::S3Uploader;
@@ -231,7 +231,7 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
         let total_bytes = serialized.len();
         let path = fallback_batch_path(shard_id, fallback_index, end_wal_index);
 
-        warn!(
+        debug!(
             "S3 fallback triggered: shard_id={}, batch_count={}, bytes={}, fallback_index={}, end_wal_index={}, path={}",
             shard_id, batch_count, total_bytes, fallback_index, end_wal_index, path
         );

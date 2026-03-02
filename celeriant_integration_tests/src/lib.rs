@@ -473,6 +473,12 @@ impl ServerConfigExt for ServerConfig {
         args.push("--list-wal-index-cache-bytes".to_string());
         args.push(self.list_wal_index_cache_bytes.to_string());
 
+        args.push("--schema-cache-bytes".to_string());
+        args.push(self.schema_cache_bytes.to_string());
+
+        args.push("--max-schema-size-bytes".to_string());
+        args.push(self.max_schema_size_bytes.to_string());
+
         // Cluster mode configuration
         if self.standalone {
             args.push("--standalone".to_string());

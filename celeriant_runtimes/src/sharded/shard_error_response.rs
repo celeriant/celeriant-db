@@ -15,6 +15,7 @@ use celeriant_shard::error::{
     shard_fsync_error::ShardFsyncError,
     shard_listing_error::ShardListingError,
     shard_read_error::ShardReadError,
+    shard_schema_error::ShardSchemaError,
     shard_trim_error::ShardTrimError,
     shard_write_error::ShardWriteError,
     watch_session_error::WatchSessionError,
@@ -45,6 +46,16 @@ const WRITE_FSYNC_ERROR: u32 = 2008;
 const WRITE_CACHE_AGGREGATE_CLIENT_ERROR: u32 = 2009;
 const WRITE_AGGREGATE_EXISTS_CACHE_ERROR: u32 = 2010;
 const WRITE_CANNOT_ACCEPT_WRITES: u32 = 2011;
+const REGISTER_SCHEMA_ALREADY_EXISTS: u32 = 2020;
+const REGISTER_SCHEMA_INVALID: u32 = 2021;
+const WRITE_SCHEMA_VALIDATION_FAILED: u32 = 2022;
+const WRITE_SCHEMA_COMPILATION_FAILED: u32 = 2023;
+const REGISTER_SCHEMA_UNSUPPORTED_TYPE: u32 = 2024;
+const REGISTER_SCHEMA_CACHE_LOAD_ERROR: u32 = 2025;
+const REGISTER_SCHEMA_FSYNC_ERROR: u32 = 2026;
+const REGISTER_SCHEMA_CANNOT_ACCEPT_WRITES: u32 = 2027;
+const REGISTER_SCHEMA_REPLICATION_ERROR: u32 = 2028;
+const REGISTER_SCHEMA_COORDINATION_FAILED: u32 = 2029;
 
 // Trim errors: 3xxx
 const TRIM_AGGREGATE_NOT_EXISTS: u32 = 3000;
@@ -113,6 +124,7 @@ fn shard_error_to_code(error: ShardError) -> (u32, String) {
         ShardError::ReplicationBatch(e) => replication_batch_error(e),
         ShardError::AggregateDetails(e) => exists_error(e),
         ShardError::WatchRequestInvalid => (WATCH_REQUEST_INVALID, "{}".into()),
+        ShardError::RegisterSchema(e) => register_schema_error(e),
     }
 }
 
@@ -174,6 +186,26 @@ fn write_error(e: ShardWriteError) -> (u32, String) {
         ShardWriteError::CacheAggregateClientError(e) => cache_load_error(WRITE_CACHE_AGGREGATE_CLIENT_ERROR, WRITE_CACHE_AGGREGATE_CLIENT_ERROR, e),
         ShardWriteError::AggregateExistsAndCacheError(e) => cache_load_error(WRITE_AGGREGATE_EXISTS_CACHE_ERROR, WRITE_AGGREGATE_EXISTS_CACHE_ERROR, e),
         ShardWriteError::ShardCannotAcceptWrites { leader_address } => (WRITE_CANNOT_ACCEPT_WRITES, cannot_accept_writes_message(leader_address)),
+        ShardWriteError::SchemaValidationFailed { event_type_major, event_type_minor, client_event_index, validation_error } => (
+            WRITE_SCHEMA_VALIDATION_FAILED,
+            format!(
+                r#"{{"event_type_major":{},"event_type_minor":{},"client_event_index":{},"validation_error":{}}}"#,
+                event_type_major,
+                event_type_minor,
+                client_event_index,
+                json_string(&validation_error)
+            ),
+        ),
+        ShardWriteError::SchemaCompilationFailed { event_type_major, event_type_minor, client_event_index, compilation_error } => (
+            WRITE_SCHEMA_COMPILATION_FAILED,
+            format!(
+                r#"{{"event_type_major":{},"event_type_minor":{},"client_event_index":{},"compilation_error":{}}}"#,
+                event_type_major,
+                event_type_minor,
+                client_event_index,
+                json_string(&compilation_error)
+            ),
+        ),
     }
 }
 
@@ -203,6 +235,34 @@ fn delete_error(e: ShardDeleteError) -> (u32, String) {
         ShardDeleteError::ReplicationError(e) => (DELETE_REPLICATION_ERROR, replication_message(e)),
         ShardDeleteError::ShardFsyncError(e) => (DELETE_FSYNC_ERROR, fsync_message(e)),
         ShardDeleteError::ShardCannotAcceptWrites { leader_address } => (DELETE_CANNOT_ACCEPT_WRITES, cannot_accept_writes_message(leader_address)),
+    }
+}
+
+fn register_schema_error(e: ShardSchemaError) -> (u32, String) {
+    match e {
+        ShardSchemaError::SchemaAlreadyExists { event_type_major, event_type_minor } => (
+            REGISTER_SCHEMA_ALREADY_EXISTS,
+            format!(r#"{{"event_type_major":{},"event_type_minor":{}}}"#, event_type_major, event_type_minor),
+        ),
+        ShardSchemaError::InvalidSchema { schema_type, parse_error } => (
+            REGISTER_SCHEMA_INVALID,
+            format!(r#"{{"schema_type":{},"parse_error":{}}}"#, schema_type, json_string(&parse_error)),
+        ),
+        ShardSchemaError::UnsupportedSchemaType { schema_type } => (
+            REGISTER_SCHEMA_UNSUPPORTED_TYPE,
+            format!(r#"{{"schema_type":{}}}"#, schema_type),
+        ),
+        ShardSchemaError::ShardCannotAcceptWrites { leader_address } => (
+            REGISTER_SCHEMA_CANNOT_ACCEPT_WRITES,
+            cannot_accept_writes_message(leader_address),
+        ),
+        ShardSchemaError::CacheLoadError(e) => cache_load_error(REGISTER_SCHEMA_CACHE_LOAD_ERROR, REGISTER_SCHEMA_CACHE_LOAD_ERROR, e),
+        ShardSchemaError::FsyncError(e) => (REGISTER_SCHEMA_FSYNC_ERROR, fsync_message(e)),
+        ShardSchemaError::ReplicationError(e) => (REGISTER_SCHEMA_REPLICATION_ERROR, replication_message(e)),
+        ShardSchemaError::SchemaCoordinationFailed { failed_shard_count, total_shards } => (
+            REGISTER_SCHEMA_COORDINATION_FAILED,
+            format!(r#"{{"failed_shard_count":{},"total_shards":{}}}"#, failed_shard_count, total_shards),
+        ),
     }
 }
 
@@ -561,6 +621,105 @@ mod tests {
                 assert_eq!(e.error_message, r#"{"leader_address":"10.0.0.3:9000"}"#);
             }
             _ => panic!("expected GenericError"),
+        }
+    }
+
+    fn assert_schema_error(error: ShardSchemaError, expected_code: u32, expected_json_fragment: &str) {
+        let resp = shard_error_to_client_response(None, ShardError::RegisterSchema(error));
+        match resp {
+            ClientResponse::GenericError(e) => {
+                assert_eq!(e.error_code, expected_code, "wrong error code");
+                assert!(
+                    e.error_message.contains(expected_json_fragment),
+                    "error_message {:?} missing {:?}", e.error_message, expected_json_fragment,
+                );
+            }
+            other => panic!("expected GenericError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn schema_already_exists_response() {
+        assert_schema_error(
+            ShardSchemaError::SchemaAlreadyExists { event_type_major: 5, event_type_minor: 2 },
+            REGISTER_SCHEMA_ALREADY_EXISTS,
+            r#""event_type_major":5,"event_type_minor":2"#,
+        );
+    }
+
+    #[test]
+    fn schema_invalid_response() {
+        assert_schema_error(
+            ShardSchemaError::InvalidSchema { schema_type: 0, parse_error: "bad parse".into() },
+            REGISTER_SCHEMA_INVALID,
+            r#""schema_type":0"#,
+        );
+    }
+
+    #[test]
+    fn schema_unsupported_type_response() {
+        assert_schema_error(
+            ShardSchemaError::UnsupportedSchemaType { schema_type: 1 },
+            REGISTER_SCHEMA_UNSUPPORTED_TYPE,
+            r#""schema_type":1"#,
+        );
+    }
+
+    #[test]
+    fn schema_cannot_accept_writes_response() {
+        assert_schema_error(
+            ShardSchemaError::ShardCannotAcceptWrites { leader_address: Some("10.0.0.1:9000".into()) },
+            REGISTER_SCHEMA_CANNOT_ACCEPT_WRITES,
+            r#""leader_address":"10.0.0.1:9000""#,
+        );
+    }
+
+    #[test]
+    fn schema_coordination_failed_response() {
+        assert_schema_error(
+            ShardSchemaError::SchemaCoordinationFailed { failed_shard_count: 2, total_shards: 4 },
+            REGISTER_SCHEMA_COORDINATION_FAILED,
+            r#""failed_shard_count":2,"total_shards":4"#,
+        );
+    }
+
+    #[test]
+    fn write_schema_validation_failed_response() {
+        let resp = shard_error_to_client_response(
+            None,
+            ShardError::Write(ShardWriteError::SchemaValidationFailed {
+                event_type_major: 1,
+                event_type_minor: 0,
+                client_event_index: 7,
+                validation_error: "missing field".into(),
+            }),
+        );
+        match resp {
+            ClientResponse::GenericError(e) => {
+                assert_eq!(e.error_code, WRITE_SCHEMA_VALIDATION_FAILED);
+                assert!(e.error_message.contains(r#""client_event_index":7"#));
+            }
+            other => panic!("expected GenericError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_schema_compilation_failed_response() {
+        let resp = shard_error_to_client_response(
+            None,
+            ShardError::Write(ShardWriteError::SchemaCompilationFailed {
+                event_type_major: 1,
+                event_type_minor: 0,
+                client_event_index: 3,
+                compilation_error: "bad schema".into(),
+            }),
+        );
+        match resp {
+            ClientResponse::GenericError(e) => {
+                assert_eq!(e.error_code, WRITE_SCHEMA_COMPILATION_FAILED);
+                assert!(e.error_message.contains(r#""client_event_index":3"#));
+            }
+            other => panic!("expected GenericError, got {other:?}"),
         }
     }
 }

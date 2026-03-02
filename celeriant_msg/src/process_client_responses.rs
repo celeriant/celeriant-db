@@ -27,6 +27,7 @@ pub enum ClientResponseType {
     ListOrgs = 9,
     ListAggregateTypes = 10,
     ListAggregates = 11,
+    RegisterSchema = 12,
 }
 
 impl ClientResponseType {
@@ -43,6 +44,7 @@ impl ClientResponseType {
             9 => Ok(ClientResponseType::ListOrgs),
             10 => Ok(ClientResponseType::ListAggregateTypes),
             11 => Ok(ClientResponseType::ListAggregates),
+            12 => Ok(ClientResponseType::RegisterSchema),
             _ => Err(ReadWireDataError::UnknownMessageType(value)),
         }
     }
@@ -61,6 +63,7 @@ pub enum ClientResponse {
     ListOrgs(ListOrgsResponse),
     ListAggregateTypes(ListAggregateTypesResponse),
     ListAggregates(ListAggregatesResponse),
+    RegisterSchema(SuccessResponse),
 }
 
 impl ClientResponse {
@@ -77,6 +80,7 @@ impl ClientResponse {
             ClientResponse::ListOrgs(_) => ClientResponseType::ListOrgs,
             ClientResponse::ListAggregateTypes(_) => ClientResponseType::ListAggregateTypes,
             ClientResponse::ListAggregates(_) => ClientResponseType::ListAggregates,
+            ClientResponse::RegisterSchema(_) => ClientResponseType::RegisterSchema,
         }
     }
 
@@ -125,6 +129,7 @@ impl ClientResponse {
             ClientResponseType::Delete => fixed!(Delete),
             ClientResponseType::ProtocolError => fixed!(ProtocolError),
             ClientResponseType::GenericError => fixed!(GenericError),
+            ClientResponseType::RegisterSchema => fixed!(RegisterSchema),
             ClientResponseType::Read => variable!(Read),
             ClientResponseType::Watch => variable!(Watch),
             ClientResponseType::ListOrgs => variable!(ListOrgs),
@@ -146,6 +151,7 @@ impl ClientResponse {
             ClientResponse::ListOrgs(_) => server_compression_algorithm,
             ClientResponse::ListAggregateTypes(_) => server_compression_algorithm,
             ClientResponse::ListAggregates(_) => server_compression_algorithm,
+            ClientResponse::RegisterSchema(_) => CompressionType::None,
         }
     }
 
@@ -168,6 +174,7 @@ impl ClientResponse {
             ClientResponse::Delete(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
             ClientResponse::ProtocolError(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
             ClientResponse::GenericError(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
+            ClientResponse::RegisterSchema(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
             ClientResponse::Read(res) => wire_header_write_variable_size(writer, res, response_type_id, compression_type, max_message_size, version).await,
             ClientResponse::Watch(res) => wire_header_write_variable_size(writer, res, response_type_id, compression_type, max_message_size, version).await,
             ClientResponse::ListOrgs(res) => wire_header_write_variable_size(writer, res, response_type_id, compression_type, max_message_size, version).await,
@@ -184,8 +191,8 @@ mod tests {
     use celeriant_wire::network::wire_header::{PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3, WIRE_HEADER_SIZE};
     use futures_lite::{future::block_on, io::Cursor};
 
-    const COUNT: usize = 11;
-    const MAX_ID: u32 = 11;
+    const COUNT: usize = 12;
+    const MAX_ID: u32 = 12;
     const VERSIONS: [u32; 2] = [PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3];
 
     fn all_types() -> [ClientResponseType; COUNT] {
@@ -201,6 +208,7 @@ mod tests {
             ClientResponseType::ListOrgs,
             ClientResponseType::ListAggregateTypes,
             ClientResponseType::ListAggregates,
+            ClientResponseType::RegisterSchema,
         ]
     }
 
@@ -254,6 +262,9 @@ mod tests {
                 aggregates: vec![],
                 next_cursor: Some(12345),
             }),
+            ClientResponseType::RegisterSchema => ClientResponse::RegisterSchema(SuccessResponse {
+                correlation_id: Some(0x5555_6666_7777_8888),
+            }),
         }
     }
 
@@ -288,12 +299,13 @@ mod tests {
         for rt in all_types() {
             assert_eq!(ClientResponseType::from_u32(rt as u32).unwrap(), rt);
         }
-        for id in 1..=11 {
+        for id in 1..=12 {
             assert!(ClientResponseType::from_u32(id).is_ok(), "missing id {}", id);
         }
-        // Cluster IDs (12-14) should be rejected
-        for id in 12..=14 {
-            assert!(ClientResponseType::from_u32(id).is_err(), "cluster id {} should not parse as ClientResponseType", id);
+        // IDs 13-99 reserved for future client responses
+        // Cluster response IDs start at 100+
+        for id in 13..=20 {
+            assert!(ClientResponseType::from_u32(id).is_err(), "id {} should not parse as ClientResponseType yet", id);
         }
         assert!(ClientResponseType::from_u32(0).is_err());
         assert!(ClientResponseType::from_u32(MAX_ID + 1).is_err());

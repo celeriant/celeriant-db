@@ -1,4 +1,4 @@
-use std::{cell::Cell, fmt, future::Future, rc::Rc, time::Duration};
+use std::{cell::{Cell, RefCell}, collections::HashMap, fmt, future::Future, rc::Rc, time::Duration};
 
 use base64::Engine;
 use celeriant_distributed::{heartbeat::now_ms, lease_manager::LeaseManager, lease_store::LeaseStore, node_status::NodeStatus, validated_node_status::ValidatedNodeStatus};
@@ -39,6 +39,10 @@ pub struct CatchupCompletionMsg {
     pub result: Result<S3CatchupResult, S3CatchupError>,
 }
 
+pub struct SchemaRegistrationCompletionMsg {
+    pub result: Result<(), celeriant_shard::error::shard_schema_error::ShardSchemaError>,
+}
+
 pub struct ConnectionContext<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static> {
     pub config: Rc<ShardConfig>,
     pub current_shard_id: usize,
@@ -46,6 +50,7 @@ pub struct ConnectionContext<R: ReplicationClient + 'static, D: S3Downloader + '
     pub shutdown_requested: Rc<Cell<bool>>,
     pub shard_wal: Rc<ShardWal<R, D>>,
     pub catchup_completion_tx: Option<Rc<LocalSender<CatchupCompletionMsg>>>,
+    pub schema_registration_pending: Option<Rc<RefCell<HashMap<u64, LocalSender<SchemaRegistrationCompletionMsg>>>>>,
     pub lease_manager: Option<Rc<LeaseManager<S>>>,
 }
 
@@ -64,6 +69,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
             shutdown_requested: self.shutdown_requested.clone(),
             shard_wal: self.shard_wal.clone(),
             catchup_completion_tx: self.catchup_completion_tx.clone(),
+            schema_registration_pending: self.schema_registration_pending.clone(),
             lease_manager: self.lease_manager.clone(),
         }
     }
@@ -430,6 +436,7 @@ fn validate_client_id(request: &ClientRequest, verified_client_id: Option<u128>)
         ClientRequest::Write(req) => Some(req.client_id),
         ClientRequest::TrimStart(req) => Some(req.client_id),
         ClientRequest::Delete(req) => Some(req.client_id),
+        ClientRequest::RegisterSchema(req) => Some(req.client_id),
         _ => None,
     };
 
@@ -456,7 +463,8 @@ fn is_valid_for_access_level(request: &ClientRequest, access_level: Option<Acces
             !matches!(request,
                 ClientRequest::Write(_) |
                 ClientRequest::TrimStart(_) |
-                ClientRequest::Delete(_)
+                ClientRequest::Delete(_) | 
+                ClientRequest::RegisterSchema(_)
             )
         }
     }
@@ -544,6 +552,7 @@ pub fn determine_client_shard(
     let num_shards = config.num_shards as u128;
 
     match request {
+        ClientRequest::RegisterSchema(_) => Ok(0),
         ClientRequest::Watch(req) => determine_shard_watch(req, config),
         ClientRequest::Write(req) => determine_shard_write(req, config),
         ClientRequest::Delete(req) => determine_shard_delete(req, config),
@@ -795,7 +804,90 @@ macro_rules! write_response_with_timeout_fn {
 write_response_with_timeout_fn!(write_client_response_with_timeout, ClientResponse);
 write_response_with_timeout_fn!(write_cluster_response_with_timeout, ClusterResponse);
 
-// --- Request processing ---
+async fn handle_schema_registration_coordination<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
+    ctx: &ConnectionContext<R, D, S>,
+    request: celeriant_msg::request::requests::RegisterSchemaRequest,
+) -> Result<celeriant_msg::response::responses::SuccessResponse, celeriant_shard::error::shard_schema_error::ShardSchemaError> {
+    use celeriant_shard::error::shard_schema_error::ShardSchemaError;
+    use glommio::channels::local_channel;
+
+    let shard_0_result = ctx.shard_wal.register_schema(request.clone()).await?;
+
+    let num_shards = ctx.config.num_shards as usize;
+    if num_shards == 1 {
+        return Ok(shard_0_result);
+    }
+
+    let request_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+
+    let (result_tx, result_rx) = local_channel::new_unbounded();
+
+    let pending_map = ctx.schema_registration_pending.as_ref()
+        .ok_or_else(|| ShardSchemaError::SchemaCoordinationFailed {
+            failed_shard_count: num_shards - 1,
+            total_shards: num_shards,
+        })?;
+
+    pending_map.borrow_mut().insert(request_id, result_tx);
+
+    for shard_id in 1..num_shards {
+        let msg = IntrashardMessages::SchemaRegistration {
+            request: request.clone(),
+            request_id,
+        };
+
+        if ctx.intrashard_sender.send_to(shard_id, msg).await.is_err() {
+            return Err(ShardSchemaError::SchemaCoordinationFailed {
+                failed_shard_count: num_shards - shard_id,
+                total_shards: num_shards,
+            });
+        }
+    }
+
+    let mut failed_count = 0;
+    let mut received_count = 0;
+    let expected_count = num_shards - 1;
+    let coordination_timeout = Duration::from_secs(10);
+
+    while received_count < expected_count {
+        let recv_result = glommio::timer::timeout(coordination_timeout, async {
+            Ok::<_, glommio::GlommioError<()>>(result_rx.recv().await)
+        }).await;
+
+        match recv_result {
+            Ok(Some(completion_msg)) => {
+                received_count += 1;
+                if completion_msg.result.is_err() {
+                    failed_count += 1;
+                }
+            }
+            Ok(None) => {
+                failed_count += expected_count - received_count;
+                break;
+            }
+            Err(_) => {
+                return Err(ShardSchemaError::SchemaCoordinationFailed {
+                    failed_shard_count: expected_count - received_count,
+                    total_shards: num_shards,
+                });
+            }
+        }
+    }
+
+    pending_map.borrow_mut().remove(&request_id);
+
+    if failed_count > 0 {
+        return Err(ShardSchemaError::SchemaCoordinationFailed {
+            failed_shard_count: failed_count,
+            total_shards: num_shards,
+        });
+    }
+
+    Ok(shard_0_result)
+}
 
 async fn process_client_request<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
     tcp_stream: &mut TcpStream,
@@ -806,10 +898,19 @@ async fn process_client_request<R: ReplicationClient + 'static, D: S3Downloader 
     message_version: u32,
 ) {
     let correlation_id = request.correlation_id();
-    let response = match ctx.shard_wal.process_client_request(request).await {
-        Ok(result) => result,
-        Err(error) => shard_error_to_client_response(correlation_id, error),
+
+    let response = if let ClientRequest::RegisterSchema(ref schema_request) = request {
+        match handle_schema_registration_coordination(ctx, schema_request.clone()).await {
+            Ok(success) => ClientResponse::RegisterSchema(success),
+            Err(error) => shard_error_to_client_response(correlation_id, celeriant_shard::error::shard_error::ShardError::RegisterSchema(error)),
+        }
+    } else {
+        match ctx.shard_wal.process_client_request(request).await {
+            Ok(result) => result,
+            Err(error) => shard_error_to_client_response(correlation_id, error),
+        }
     };
+
     let _ = write_client_response_with_timeout(tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
 }
 
@@ -1043,6 +1144,8 @@ mod tests {
             list_max_duration: Duration::from_secs(10),
             list_page_size: 100,
             list_wal_index_cache_bytes: 1024,
+            schema_cache_bytes: 4_194_304, // 4MB
+            max_schema_size_bytes: 16384,
             pending_replication_high_water_bytes: 67_108_864, // 64MB
             replication_delay: Duration::from_millis(20),
             max_cluster_time_drift_ms: 5000,

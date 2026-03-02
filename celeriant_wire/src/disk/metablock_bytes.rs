@@ -5,10 +5,12 @@ use celeriant_wal::buffer_read::{read_u64_le, read_u128_le};
 use celeriant_wal::constants::{WIRE_SIZE_ENUM_DISCRIMINANT};
 use celeriant_wal::metablocks::{metablock::Metablock, metablock_event_batch::MetablockEventBatch};
 use celeriant_wal::aggregate_key::AggregateKey;
+use celeriant_wal::schema_key::SchemaKey;
 
 use crate::disk::versioned_block::HEADER_SIZE;
 
 const DISCRIMINANT_EVENT_BATCH_METADATA: u8 = 0;
+const DISCRIMINANT_SCHEMA_REGISTRATION: u8 = 2;
 const DISCRIMINANT_SOFT_DELETE: u8 = 4;
 const DISCRIMINANT_SOFT_TRIM: u8 = 5;
 
@@ -237,6 +239,64 @@ pub fn read_event_batch_aggregate_key(bytes: &[u8]) -> AggregateKey {
     AggregateKey::new(read_event_batch_org_id(bytes), read_event_batch_aggregate_type_id(bytes), read_event_batch_aggregate_id(bytes))
 }
 
+// --- SchemaRegistration helpers ---
+
+#[inline]
+pub fn is_metablock_kind_schema_registration(bytes: &[u8]) -> bool {
+    read_metablock_kind_discriminant(bytes) == DISCRIMINANT_SCHEMA_REGISTRATION
+}
+
+#[inline]
+pub fn is_schema_registration_for_key(bytes: &[u8], target: &SchemaKey) -> bool {
+    if read_metablock_kind_discriminant(bytes) != DISCRIMINANT_SCHEMA_REGISTRATION {
+        return false;
+    }
+
+    let org_id = read_schema_registration_org_id(bytes);
+    let type_id = read_schema_registration_aggregate_type_id(bytes);
+    let major = read_schema_registration_event_type_major(bytes);
+    let minor = read_schema_registration_event_type_minor(bytes);
+
+    org_id == target.org_id
+        && type_id == target.aggregate_type_id
+        && major == target.event_type_major
+        && minor == target.event_type_minor
+}
+
+#[inline]
+pub fn read_schema_registration_org_id(bytes: &[u8]) -> u128 {
+    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + SchemaKey::OFFSET_ORG_ID;
+    read_u128_le(bytes, offset)
+}
+
+#[inline]
+pub fn read_schema_registration_aggregate_type_id(bytes: &[u8]) -> u128 {
+    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + SchemaKey::OFFSET_AGGREGATE_TYPE_ID;
+    read_u128_le(bytes, offset)
+}
+
+#[inline]
+pub fn read_schema_registration_event_type_major(bytes: &[u8]) -> u64 {
+    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + SchemaKey::OFFSET_EVENT_TYPE_MAJOR;
+    read_u64_le(bytes, offset)
+}
+
+#[inline]
+pub fn read_schema_registration_event_type_minor(bytes: &[u8]) -> u64 {
+    let offset = METABLOCK_TYPE_PAYLOAD_OFFSET + SchemaKey::OFFSET_EVENT_TYPE_MINOR;
+    read_u64_le(bytes, offset)
+}
+
+#[inline]
+pub fn read_schema_registration_key(bytes: &[u8]) -> SchemaKey {
+    SchemaKey::new(
+        read_schema_registration_org_id(bytes),
+        read_schema_registration_aggregate_type_id(bytes),
+        read_schema_registration_event_type_major(bytes),
+        read_schema_registration_event_type_minor(bytes),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use crate::disk::versioned_block::serialize_versioned_message;
@@ -249,6 +309,7 @@ mod tests {
     use celeriant_wal::metablocks::metablock_kind::MetablockKind;
     use celeriant_wal::metablocks::metablock_snapshot_org::MetablockSnapshotOrg;
     use celeriant_wal::metablocks::metablock_snapshot_aggregate::MetablockSnapshotAggregate;
+    use celeriant_wal::metablocks::metablock_schema_registration::MetablockSchemaRegistration;
     use celeriant_wal::metablocks::metablock_soft_delete::MetablockSoftDelete;
     use celeriant_wal::metablocks::metablock_soft_trim::MetablockSoftTrim;
     
@@ -965,12 +1026,16 @@ mod tests {
         // SoftDelete
         let soft_delete_bytes = serialize_metablock(&make_soft_delete_metablock(1, 1000, key.clone(), 0, 0));
 
+        // SchemaRegistration
+        let schema_reg_bytes = serialize_metablock(&make_schema_registration_metablock(1, 1000, SchemaKey::new(1, 2, 3, 4), 100, None));
+
         // SoftTrim
         let soft_trim_bytes = serialize_metablock(&make_soft_trim_metablock(1, 1000, key.clone(), 50, 0, 0));
 
         let discriminants = [
             read_metablock_kind_discriminant(&event_batch_bytes),
             read_metablock_kind_discriminant(&snapshot_org_bytes),
+            read_metablock_kind_discriminant(&schema_reg_bytes),
             read_metablock_kind_discriminant(&snapshot_agg_bytes),
             read_metablock_kind_discriminant(&soft_delete_bytes),
             read_metablock_kind_discriminant(&soft_trim_bytes),
@@ -979,9 +1044,10 @@ mod tests {
         // Verify expected values match MetablockKind enum
         assert_eq!(discriminants[0], 0); // EventBatchMetadata
         assert_eq!(discriminants[1], 1); // SnapshotOrg
-        assert_eq!(discriminants[2], 3); // SnapshotAggregate
-        assert_eq!(discriminants[3], 4); // SoftDelete
-        assert_eq!(discriminants[4], 5); // SoftTrim
+        assert_eq!(discriminants[2], 2); // SchemaRegistration
+        assert_eq!(discriminants[3], 3); // SnapshotAggregate
+        assert_eq!(discriminants[4], 4); // SoftDelete
+        assert_eq!(discriminants[5], 5); // SoftTrim
 
         // Verify all are unique
         let mut unique = discriminants.to_vec();
@@ -1062,5 +1128,121 @@ mod tests {
         assert_eq!(read_server_timestamp(&event_batch_bytes), server_timestamp);
         assert_eq!(read_server_timestamp(&soft_delete_bytes), server_timestamp);
         assert_eq!(read_server_timestamp(&soft_trim_bytes), server_timestamp);
+    }
+
+    // ==================== SchemaRegistration helpers ====================
+
+    fn make_schema_registration_metablock(
+        wal_index: u64,
+        server_timestamp: u64,
+        schema_key: SchemaKey,
+        client_id: u128,
+        user_id: Option<u128>,
+    ) -> Metablock {
+        Metablock {
+            wal_index,
+            server_timestamp,
+            lease_index: 1,
+            node_id: 0x5C4E3A,
+            compressed_size: 0,
+            uncompressed_size: 0,
+            datablock_version: 0,
+            datablock_compression_type: 0,
+            wal_metablock_type: MetablockKind::SchemaRegistration(MetablockSchemaRegistration {
+                schema_key,
+                client_id,
+                user_id,
+            }),
+            datablock: DatablockStorageKind::None,
+            previous_tip_hash: GENESIS_HASH,
+            datablock_position: 0,
+        }
+    }
+
+    #[test]
+    fn read_discriminant_schema_registration() {
+        let key = SchemaKey::new(1, 2, 3, 4);
+        let bytes = serialize_metablock(&make_schema_registration_metablock(1, 1000, key, 100, None));
+
+        assert_eq!(read_metablock_kind_discriminant(&bytes), DISCRIMINANT_SCHEMA_REGISTRATION);
+        assert!(is_metablock_kind_schema_registration(&bytes));
+        assert!(!is_metablock_kind_event_batch_metadata(&bytes));
+        assert!(!is_metablock_kind_soft_delete(&bytes));
+        assert!(!is_metablock_kind_soft_trim(&bytes));
+    }
+
+    #[test]
+    fn read_schema_registration_key_fields() {
+        let key = SchemaKey::new(
+            0x1111_2222_3333_4444_5555_6666_7777_8888,
+            0xAAAA_BBBB_CCCC_DDDD_EEEE_FFFF_0000_1111,
+            0x9999_8888_7777_6666,
+            0x5555_4444_3333_2222,
+        );
+        let bytes = serialize_metablock(&make_schema_registration_metablock(1, 1000, key.clone(), 100, None));
+
+        assert_eq!(read_schema_registration_org_id(&bytes), 0x1111_2222_3333_4444_5555_6666_7777_8888);
+        assert_eq!(read_schema_registration_aggregate_type_id(&bytes), 0xAAAA_BBBB_CCCC_DDDD_EEEE_FFFF_0000_1111);
+        assert_eq!(read_schema_registration_event_type_major(&bytes), 0x9999_8888_7777_6666);
+        assert_eq!(read_schema_registration_event_type_minor(&bytes), 0x5555_4444_3333_2222);
+
+        let read_key = read_schema_registration_key(&bytes);
+        assert_eq!(read_key, key);
+    }
+
+    #[test]
+    fn is_schema_registration_for_key_returns_true_for_matching() {
+        let key = SchemaKey::new(100, 200, 10, 20);
+        let bytes = serialize_metablock(&make_schema_registration_metablock(1, 1000, key.clone(), 0xA, None));
+
+        assert!(is_schema_registration_for_key(&bytes, &key));
+    }
+
+    #[test]
+    fn is_schema_registration_for_key_returns_false_for_different_key() {
+        let key = SchemaKey::new(100, 200, 10, 20);
+        let bytes = serialize_metablock(&make_schema_registration_metablock(1, 1000, key, 0xA, None));
+
+        assert!(!is_schema_registration_for_key(&bytes, &SchemaKey::new(100, 200, 10, 99)));
+        assert!(!is_schema_registration_for_key(&bytes, &SchemaKey::new(100, 200, 99, 20)));
+        assert!(!is_schema_registration_for_key(&bytes, &SchemaKey::new(100, 99, 10, 20)));
+        assert!(!is_schema_registration_for_key(&bytes, &SchemaKey::new(99, 200, 10, 20)));
+    }
+
+    #[test]
+    fn is_schema_registration_for_key_returns_false_for_non_schema_registration() {
+        let key = AggregateKey::new(100, 200, 300);
+        let batch = MetablockEventBatch {
+            aggregate_key: key.clone(),
+            event_batch_index: 1,
+            min_event_batch_index: 1,
+            min_client_event_index: 0,
+            max_client_event_index: 10,
+            min_event_timestamp: 1000,
+            max_event_timestamp: 2000,
+            min_event_index: 0,
+            max_event_index: 5,
+            client_id: 100,
+            user_id: None,
+            event_types_data: EventTypesKind::Direct([0; 4]),
+        };
+        let bytes = serialize_metablock(&make_event_batch_metablock(1, 1000, key, batch, DatablockStorageKind::None, 0, 0));
+
+        let schema_key = SchemaKey::new(100, 200, 10, 20);
+        assert!(!is_schema_registration_for_key(&bytes, &schema_key));
+    }
+
+    #[test]
+    fn schema_registration_with_max_values() {
+        let key = SchemaKey::new(u128::MAX, u128::MAX, u64::MAX, u64::MAX);
+        let bytes = serialize_metablock(&make_schema_registration_metablock(u64::MAX, u64::MAX, key.clone(), u128::MAX, Some(u128::MAX)));
+
+        assert_eq!(read_wal_index(&bytes), u64::MAX);
+        assert_eq!(read_server_timestamp(&bytes), u64::MAX);
+        assert_eq!(read_schema_registration_org_id(&bytes), u128::MAX);
+        assert_eq!(read_schema_registration_aggregate_type_id(&bytes), u128::MAX);
+        assert_eq!(read_schema_registration_event_type_major(&bytes), u64::MAX);
+        assert_eq!(read_schema_registration_event_type_minor(&bytes), u64::MAX);
+        assert!(is_schema_registration_for_key(&bytes, &key));
     }
 }

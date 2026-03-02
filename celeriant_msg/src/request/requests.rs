@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use bincode::{Decode, Encode};
-use celeriant_wal::{aggregate_key::AggregateKey, compression_type::CompressionType, datablocks::datablock_aggregate_event::DatablockAggregateEvent};
+use celeriant_wal::{aggregate_key::AggregateKey, compression_type::CompressionType, datablocks::datablock_aggregate_event::DatablockAggregateEvent, schema_key::SchemaKey};
 
 use celeriant_wal::{constants::STRUCT_TO_MEMORY_REAL_SIZE, datablocks::datablock::Datablock, metablocks::metablock::Metablock};
 use serde::{Deserialize, Serialize};
@@ -103,6 +103,16 @@ pub struct WatchRequest {
     pub aggregate_types: Option<HashSet<u128>>,
     pub aggregates: Option<HashSet<u128>>,
     pub operation_types: Option<HashSet<u8>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub struct RegisterSchemaRequest {
+    pub correlation_id: Option<u128>,
+    pub client_id: u128,
+    pub user_id: Option<u128>,
+    pub schema_key: SchemaKey,
+    pub schema_type: u8,
+    pub schema: String,
 }
 
 

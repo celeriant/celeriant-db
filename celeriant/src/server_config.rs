@@ -195,6 +195,22 @@ pub struct ServerConfig {
 
     #[arg(
         long,
+        default_value_t = 64 * 1024 * 1024,
+        env = "CELERIANT_SCHEMA_CACHE_BYTES",
+        help = "Memory to use for schema cache (64MB)"
+    )]
+    pub schema_cache_bytes: u64,
+
+    #[arg(
+        long,
+        default_value_t = 16384,
+        env = "CELERIANT_MAX_SCHEMA_SIZE_BYTES",
+        help = "Maximum size of a single schema definition in bytes (16KB)"
+    )]
+    pub max_schema_size_bytes: u64,
+
+    #[arg(
+        long,
         default_value_t = 30000,
         env = "CELERIANT_CLIENT_CONNECTION_TIMEOUT_MS",
         help = "Maximum time a client has to pull down server messages over tcp (30s)"
@@ -581,6 +597,8 @@ impl ServerConfig {
             list_max_duration: Duration::from_millis(self.list_max_duration_ms),
             list_page_size: self.list_page_size as usize,
             list_wal_index_cache_bytes: self.list_wal_index_cache_bytes,
+            schema_cache_bytes: self.schema_cache_bytes,
+            max_schema_size_bytes: self.max_schema_size_bytes,
             pending_replication_high_water_bytes: self.pending_replication_high_water_bytes,
             max_cluster_time_drift_ms: self.max_cluster_time_drift_ms,
             max_catchup_gap_bytes: self.max_catchup_gap_bytes,
@@ -661,6 +679,8 @@ impl ServerConfig {
         check_field!(list_max_duration_ms);
         check_field!(list_page_size);
         check_field!(list_wal_index_cache_bytes);
+        check_field!(schema_cache_bytes);
+        check_field!(max_schema_size_bytes);
         check_field!(client_connection_timeout_ms);
         check_field!(shard_log_preallocate_bytes);
         check_field!(recent_write_cache_bytes);
@@ -755,6 +775,8 @@ impl Default for ServerConfig {
             list_max_duration_ms: 2000,
             list_page_size: 20000,
             list_wal_index_cache_bytes: 12 * 1024 * 1024,
+            schema_cache_bytes: 4 * 1024 * 1024,
+            max_schema_size_bytes: 16384,
             s3_endpoint_override: None,
             s3_skip_signature: false,
             s3_allow_http: false,

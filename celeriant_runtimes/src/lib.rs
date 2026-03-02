@@ -86,6 +86,8 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                     list_max_duration: shard_config.list_max_duration,
                     list_page_size: shard_config.list_page_size,
                     list_wal_index_cache_bytes: shard_config.list_wal_index_cache_bytes,
+                    schema_cache_bytes: shard_config.schema_cache_bytes,
+                    max_schema_size_bytes: shard_config.max_schema_size_bytes,
                     pending_replication_high_water_bytes: shard_config.pending_replication_high_water_bytes,
                     max_cluster_time_drift_ms: shard_config.max_cluster_time_drift_ms,
                     max_catchup_gap_bytes: shard_config.max_catchup_gap_bytes,

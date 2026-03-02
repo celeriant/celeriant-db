@@ -63,6 +63,19 @@ impl AggregateKeyBloom {
         self.bloom_filter.contains(&aggregate_key.hash_bytes())
     }
 
+    /// Insert a hash directly into the bloom filter.
+    /// Used for non-AggregateKey types (e.g., SchemaKey) that have pre-computed hashes.
+    pub fn insert_hash(&mut self, hash_bytes: &[u8; 8]) {
+        self.bloom_filter.insert(hash_bytes);
+    }
+
+    /// Check if a hash might be in the set.
+    /// Returns `false` if definitely not in set, `true` if possibly in set.
+    #[must_use]
+    pub fn may_contain_hash(&self, hash_bytes: &[u8; 8]) -> bool {
+        self.bloom_filter.contains(hash_bytes)
+    }
+
     /// Export the bloom filter as bytes for storage in header.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u64> {

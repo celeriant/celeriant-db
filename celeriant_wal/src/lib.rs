@@ -9,3 +9,7 @@ pub mod aggregate_type_key;
 pub mod aggregate_client_key;
 pub mod buffer_read;
 pub mod s3;
+pub mod schema_key;
+pub mod schema_type;
+
+pub use schema_type::SchemaType;

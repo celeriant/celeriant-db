@@ -16,21 +16,21 @@ use crate::{
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClusterResponseType {
-    ProtocolError = 6,
-    GenericError = 7,
-    ReplicationBatch = 12,
-    Heartbeat = 13,
-    KickFollower = 14,
+    ReplicationBatch = 100,
+    Heartbeat = 101,
+    KickFollower = 102,
+    ProtocolError = 106,
+    GenericError = 107,
 }
 
 impl ClusterResponseType {
     pub fn from_u32(value: u32) -> Result<Self, ReadWireDataError> {
         match value {
-            6 => Ok(ClusterResponseType::ProtocolError),
-            7 => Ok(ClusterResponseType::GenericError),
-            12 => Ok(ClusterResponseType::ReplicationBatch),
-            13 => Ok(ClusterResponseType::Heartbeat),
-            14 => Ok(ClusterResponseType::KickFollower),
+            100 => Ok(ClusterResponseType::ReplicationBatch),
+            101 => Ok(ClusterResponseType::Heartbeat),
+            102 => Ok(ClusterResponseType::KickFollower),
+            106 => Ok(ClusterResponseType::ProtocolError),
+            107 => Ok(ClusterResponseType::GenericError),
             _ => Err(ReadWireDataError::UnknownMessageType(value)),
         }
     }
@@ -130,11 +130,11 @@ mod tests {
 
     fn all_types() -> [ClusterResponseType; COUNT] {
         [
-            ClusterResponseType::ProtocolError,
-            ClusterResponseType::GenericError,
             ClusterResponseType::ReplicationBatch,
             ClusterResponseType::Heartbeat,
             ClusterResponseType::KickFollower,
+            ClusterResponseType::ProtocolError,
+            ClusterResponseType::GenericError,
         ]
     }
 
@@ -184,17 +184,15 @@ mod tests {
         for rt in all_types() {
             assert_eq!(ClusterResponseType::from_u32(rt as u32).unwrap(), rt);
         }
-        // ProtocolError and GenericError are shared
-        assert!(ClusterResponseType::from_u32(6).is_ok());
-        assert!(ClusterResponseType::from_u32(7).is_ok());
-        for id in [12, 13, 14] {
+        for id in [100, 101, 102, 106, 107] {
             assert!(ClusterResponseType::from_u32(id).is_ok(), "missing cluster id {}", id);
         }
-        for id in [1, 2, 3, 4, 5, 8, 9, 10, 11] {
+        // Client IDs should not parse as cluster responses
+        for id in 1..=12 {
             assert!(ClusterResponseType::from_u32(id).is_err(), "client id {} should not parse as ClusterResponseType", id);
         }
         assert!(ClusterResponseType::from_u32(0).is_err());
-        assert!(ClusterResponseType::from_u32(15).is_err());
+        assert!(ClusterResponseType::from_u32(108).is_err());
     }
 
     #[test]

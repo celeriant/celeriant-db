@@ -13,17 +13,17 @@ use crate::{
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClusterRequestType {
-    ReplicationBatch = 10,
-    Heartbeat = 11,
-    KickFollower = 12,
+    ReplicationBatch = 100,
+    Heartbeat = 101,
+    KickFollower = 102,
 }
 
 impl ClusterRequestType {
     pub fn from_u32(value: u32) -> Result<Self, ReadWireDataError> {
         match value {
-            10 => Ok(ClusterRequestType::ReplicationBatch),
-            11 => Ok(ClusterRequestType::Heartbeat),
-            12 => Ok(ClusterRequestType::KickFollower),
+            100 => Ok(ClusterRequestType::ReplicationBatch),
+            101 => Ok(ClusterRequestType::Heartbeat),
+            102 => Ok(ClusterRequestType::KickFollower),
             _ => Err(ReadWireDataError::UnknownMessageType(value)),
         }
     }
@@ -169,14 +169,14 @@ mod tests {
         for rt in all_types() {
             assert_eq!(ClusterRequestType::from_u32(rt as u32).unwrap(), rt);
         }
-        for id in 10..=12 {
+        for id in 100..=102 {
             assert!(ClusterRequestType::from_u32(id).is_ok(), "missing cluster id {}", id);
         }
-        for id in 1..=9 {
+        for id in 1..=10 {
             assert!(ClusterRequestType::from_u32(id).is_err(), "client id {} should not parse as ClusterRequestType", id);
         }
         assert!(ClusterRequestType::from_u32(0).is_err());
-        assert!(ClusterRequestType::from_u32(13).is_err());
+        assert!(ClusterRequestType::from_u32(103).is_err());
     }
 
     #[test]

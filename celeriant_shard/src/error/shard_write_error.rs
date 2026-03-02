@@ -40,6 +40,22 @@ pub enum ShardWriteError {
 
     AggregateExistsAndCacheError(ShardCacheLoadError),
     ShardCannotAcceptWrites { leader_address: Option<String> },
+
+    /// Event payload failed schema validation.
+    SchemaValidationFailed {
+        event_type_major: u64,
+        event_type_minor: u64,
+        client_event_index: u64,
+        validation_error: String,
+    },
+
+    /// Schema compilation failed when loading from WAL.
+    SchemaCompilationFailed {
+        event_type_major: u64,
+        event_type_minor: u64,
+        client_event_index: u64,
+        compilation_error: String,
+    },
 }
 
 impl From<ShardFsyncError> for ShardWriteError {

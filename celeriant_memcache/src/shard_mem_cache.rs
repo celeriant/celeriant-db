@@ -1,4 +1,5 @@
 use crate::cache_path::CachePath;
+use crate::cached_schema::{CachedSchema, Validate};
 use crate::mem_snapshot_aggregate::AggregateStatus;
 use crate::metablock_position::MetablockPosition;
 use crate::pending_commit_data::PendingCommitData;
@@ -8,6 +9,7 @@ use crate::{
 };
 use celeriant_distributed::node_status::NodeStatus;
 use celeriant_wal::metablocks::metablock_event_batch::MetablockEventBatch;
+use celeriant_wal::schema_key::SchemaKey;
 use celeriant_wal::{
     aggregate_client_key::AggregateClientKey, aggregate_key::AggregateKey, constants::FIXED_BLOCK_SIZE_BYTES, datablocks::datablock::Datablock,
     metablocks::metablock::Metablock,
@@ -15,11 +17,11 @@ use celeriant_wal::{
 use lru::LruCache;
 use std::hash::Hash;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     num::NonZeroUsize,
 };
 
-pub struct ShardMemCache {
+pub struct ShardMemCache<V: Validate> {
     recent_write_cache_bytes: u64,
 
     /// Cache of recent writes indexed by aggregate key.
@@ -57,6 +59,18 @@ pub struct ShardMemCache {
     /// Used to optimize list pagination by avoiding full scans
     wal_index_positions: LruCache<u64, WalIndexPosition>,
 
+    /// LRU cache of compiled schemas (Validated/CompilationFailed only).
+    schema_cache: LruCache<SchemaKey, CachedSchema<V>>,
+
+    /// LRU cache of keys confirmed to have no schema in WAL.
+    /// Separated from schema_cache so large validators can't evict these tiny entries.
+    no_schema_cache: LruCache<SchemaKey, ()>,
+
+    /// Pending schema registrations not yet fsynced (D4)
+    /// Checked alongside schema_cache to prevent concurrent duplicate registrations.
+    /// Cleared on fsync rollback.
+    pending_schema_registrations: HashSet<SchemaKey>,
+
     /// Batches awaiting replication (post-fsync, pre-commit)
     /// Intentionally unbounded (like pending_append_queue) - high water mark triggers
     /// S3 fallback at ReplicationCoordinator level rather than eviction here.
@@ -78,7 +92,7 @@ pub struct ShardMemCache {
     replication_rollback_occurred: bool,
 }
 
-impl ShardMemCache {
+impl<V: Validate> ShardMemCache<V> {
     /// Returns (is_loaded, last_client_event_index)
     /// - is_loaded: true if we've already checked disk for this aggregate+client
     /// - last_client_event_index: Some(idx) if client has written, None if not found
@@ -351,10 +365,14 @@ impl ShardMemCache {
         let mut pending_append_queue = vec![];
         std::mem::swap(&mut pending_append_queue, &mut self.pending_append_queue);
 
-        // We need the aggregate_queue_positions to
+        // Drain pending schemas — schema_cache is the primary duplicate guard from here
+        let mut pending_schema_registrations = HashSet::new();
+        std::mem::swap(&mut pending_schema_registrations, &mut self.pending_schema_registrations);
+
         SyncPositionsSnapshot {
             aggregate_queue_positions,
             pending_append_queue,
+            pending_schema_registrations,
         }
     }
 
@@ -382,6 +400,9 @@ impl ShardMemCache {
     /// situation, it's not worth the extra logic... just go scorched earth
     pub fn execute_fsync_rollback(&mut self) {
         self.aggregate_queue_positions.clear();
+        self.pending_schema_registrations.clear();
+        self.schema_cache.clear();
+        self.no_schema_cache.clear();
         if !self.pending_append_queue.is_empty() {
             self.pending_append_queue.clear();
             self.fsync_rollback_occurred = true;
@@ -719,6 +740,43 @@ impl ShardMemCache {
         best
     }
 
+    /// Get cached schema (Validated/CompilationFailed) for a schema key.
+    pub fn schema_cache_get(&mut self, key: &SchemaKey) -> Option<&CachedSchema<V>> {
+        self.schema_cache.get(key)
+    }
+
+    /// Insert a Validated/CompilationFailed schema. Removes from no_schema_cache
+    /// since a schema was just registered for a previously-empty key.
+    pub fn schema_cache_insert(&mut self, key: SchemaKey, value: CachedSchema<V>) {
+        self.no_schema_cache.pop(&key);
+        self.schema_cache.put(key, value);
+    }
+
+    /// Insert a key into the no-schema cache.
+    pub fn no_schema_cache_insert(&mut self, key: SchemaKey) {
+        self.no_schema_cache.put(key, ());
+    }
+
+    /// Check if either cache contains a specific key. Promotes on hit.
+    pub fn schema_cache_contains(&mut self, key: &SchemaKey) -> bool {
+        self.schema_cache.get(key).is_some() || self.no_schema_cache.get(key).is_some()
+    }
+
+    /// Check if a real schema (Validated or CompilationFailed) exists for this key.
+    pub fn schema_cache_has_schema(&self, key: &SchemaKey) -> bool {
+        self.schema_cache.contains(key)
+    }
+
+    /// Check if a schema registration is pending fsync (D4)
+    pub fn schema_is_pending(&self, key: &SchemaKey) -> bool {
+        self.pending_schema_registrations.contains(key)
+    }
+
+    /// Mark a schema as pending fsync (D4)
+    pub fn schema_mark_pending(&mut self, key: SchemaKey) {
+        self.pending_schema_registrations.insert(key);
+    }
+
     /// Add a batch to the pending replication queue
     /// Returns true if high water mark exceeded
     pub fn push_pending_replication(&mut self, batch: PendingCommitData) -> bool {
@@ -773,11 +831,17 @@ impl ShardMemCache {
         aggregate_write_snapshots_cache_bytes: u64,
         aggregate_client_snapshots_cache_bytes: u64,
         list_wal_index_cache_bytes: u64,
+        schema_cache_bytes: u64,
         pending_replication_high_water_bytes: u64,
     ) -> Self {
         let aggregate_cap = NonZeroUsize::new((aggregate_write_snapshots_cache_bytes / 112) as usize).unwrap_or(NonZeroUsize::new(10_000).unwrap());
         let client_cap = NonZeroUsize::new((aggregate_client_snapshots_cache_bytes / 128) as usize).unwrap_or(NonZeroUsize::new(100_000).unwrap());
         let wal_index_cap = NonZeroUsize::new((list_wal_index_cache_bytes / 24) as usize).unwrap_or(NonZeroUsize::new(1_000).unwrap());
+        let schema_half = schema_cache_bytes / 2;
+        // Validated/CompilationFailed entries: ~100 bytes each (SchemaKey 56 + validator ref + LRU overhead)
+        let schema_cap = NonZeroUsize::new((schema_half / 100) as usize).unwrap_or(NonZeroUsize::new(1_000).unwrap());
+        // NoSchema entries: ~80 bytes each (SchemaKey 56 + unit + LRU overhead)
+        let no_schema_cap = NonZeroUsize::new((schema_half / 80) as usize).unwrap_or(NonZeroUsize::new(1_000).unwrap());
 
         Self {
             recent_write_cache_bytes,
@@ -790,6 +854,9 @@ impl ShardMemCache {
             aggregate_read_snapshots: LruCache::new(aggregate_cap),
             aggregate_write_client_snapshots: LruCache::new(client_cap),
             wal_index_positions: LruCache::new(wal_index_cap),
+            schema_cache: LruCache::new(schema_cap),
+            no_schema_cache: LruCache::new(no_schema_cap),
+            pending_schema_registrations: HashSet::new(),
             pending_replication_batches: Vec::new(),
             pending_replication_bytes: 0,
             pending_replication_high_water_bytes,

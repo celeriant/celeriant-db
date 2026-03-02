@@ -30,5 +30,6 @@ pub fn format_response(response: &ClientResponse) -> String {
         ClientResponse::ListOrgs(r) => format!("ListOrgs: {} orgs", r.orgs.len()),
         ClientResponse::ListAggregateTypes(r) => format!("ListAggregateTypes: {} types", r.aggregate_types.len()),
         ClientResponse::ListAggregates(r) => format!("ListAggregates: {} aggregates", r.aggregates.len()),
+        ClientResponse::RegisterSchema(_) => "RegisterSchema: success".to_string(),
     }
 }

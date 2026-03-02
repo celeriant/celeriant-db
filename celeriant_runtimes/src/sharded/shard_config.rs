@@ -79,6 +79,8 @@ pub struct ShardConfig {
     pub list_max_duration: Duration,
     pub list_page_size: usize,
     pub list_wal_index_cache_bytes: u64,
+    pub schema_cache_bytes: u64,
+    pub max_schema_size_bytes: u64,
     pub pending_replication_high_water_bytes: u64,
     pub max_cluster_time_drift_ms: u64,
     pub max_catchup_gap_bytes: u64,

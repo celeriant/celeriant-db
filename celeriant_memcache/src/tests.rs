@@ -1,7 +1,9 @@
 use crate::cache_path::CachePath;
+use crate::cached_schema::{CachedSchema, CachedValidator, UniqueSchemaKeys};
 use crate::mem_snapshot_aggregate::{AggregateStatus, MemSnapshotAggregate};
 use crate::pending_commit_data::PendingCommitData;
 use crate::shard_log_queue_item::ShardLogQueueItem;
+use crate::cached_schema::Validate;
 use crate::shard_mem_cache::ShardMemCache;
 use celeriant_distributed::node_status::NodeStatus;
 use celeriant_rotating_log::log_segment_file::log_segment_file_metadata::LogSegmentFileMetadata;
@@ -13,11 +15,17 @@ use celeriant_wal::metablocks::datablock_storage_kind::DatablockStorageKind;
 use celeriant_wal::metablocks::metablock::Metablock;
 use celeriant_wal::metablocks::metablock_event_batch::{EventTypesKind, MetablockEventBatch};
 use celeriant_wal::metablocks::metablock_kind::MetablockKind;
+use celeriant_wal::schema_key::SchemaKey;
 use celeriant_wal::shard_log_header::ShardLogHeader;
 
 // ── Helpers ──
 
-fn cache() -> ShardMemCache {
+struct StubValidator;
+impl Validate for StubValidator {
+    fn validate(&self, _: &[u8]) -> Result<(), String> { Ok(()) }
+}
+
+fn cache() -> ShardMemCache<StubValidator> {
     cache_with(64 * 1024, 64 * 1024, 64 * 1024, 64 * 1024, 1024 * 1024)
 }
 
@@ -27,12 +35,13 @@ fn cache_with(
     agg_client_snap_bytes: u64,
     list_wal_index_bytes: u64,
     replication_high_water: u64,
-) -> ShardMemCache {
+) -> ShardMemCache<StubValidator> {
     ShardMemCache::new(
         recent_write_bytes,
         agg_write_snap_bytes,
         agg_client_snap_bytes,
         list_wal_index_bytes,
+        4 * 1024 * 1024, // schema_cache_bytes
         replication_high_water,
     )
 }
@@ -100,7 +109,7 @@ fn test_event_batch(aggregate_key: AggregateKey, event_batch_index: u64, max_eve
 }
 
 /// Add a write to the queue and return the queue item's event indexes for assertions
-fn queue_write(cache: &mut ShardMemCache, key: &AggregateKey, event_index: u64, event_batch_index: u64, client_id: u128, client_event_index: u64) {
+fn queue_write(cache: &mut ShardMemCache<StubValidator>, key: &AggregateKey, event_index: u64, event_batch_index: u64, client_id: u128, client_event_index: u64) {
     let item = test_queue_item(key.clone(), event_batch_index, event_index, client_id);
     cache.add_to_pending_append_queue(key, event_index, event_batch_index, 1, client_id, client_event_index, item);
 }
@@ -120,13 +129,13 @@ fn test_pending_commit_data() -> PendingCommitData {
 }
 
 /// Take a sync snapshot and commit it as standalone (both read+write caches updated)
-fn sync_and_commit_standalone(cache: &mut ShardMemCache) {
+fn sync_and_commit_standalone(cache: &mut ShardMemCache<StubValidator>) {
     let snapshot = cache.take_sync_positions_snapshot();
     cache.commit_sync_positions_snapshot(NodeStatus::Standalone, snapshot);
 }
 
 /// Take a sync snapshot and commit it as leader (only write cache updated)
-fn sync_and_commit_leader(cache: &mut ShardMemCache) {
+fn sync_and_commit_leader(cache: &mut ShardMemCache<StubValidator>) {
     let snapshot = cache.take_sync_positions_snapshot();
     cache.commit_sync_positions_snapshot(NodeStatus::Leader { lease_index: 1 }, snapshot);
 }
@@ -1409,4 +1418,152 @@ fn clear_all_caches_clears_everything() {
     assert!(c.get_wal_index_position(100).is_none(), "wal_index_positions should be empty");
     let (loaded, _) = c.aggregate_client_load_status(&k2, &ck);
     assert!(!loaded, "aggregate_client_snapshots should be empty");
+}
+
+// ── UniqueSchemaKeys ──
+
+fn sk(major: u64, minor: u64) -> SchemaKey {
+    SchemaKey::new(1, 1, major, minor)
+}
+
+#[test]
+fn unique_schema_keys_empty() {
+    let keys = UniqueSchemaKeys::new();
+    assert_eq!(keys.iter().count(), 0);
+}
+
+#[test]
+fn unique_schema_keys_one() {
+    let mut keys = UniqueSchemaKeys::new();
+    assert!(keys.try_insert(sk(1, 0)));
+    assert_eq!(keys.iter().count(), 1);
+}
+
+#[test]
+fn unique_schema_keys_two() {
+    let mut keys = UniqueSchemaKeys::new();
+    assert!(keys.try_insert(sk(1, 0)));
+    assert!(keys.try_insert(sk(2, 0)));
+    assert_eq!(keys.iter().count(), 2);
+}
+
+#[test]
+fn unique_schema_keys_duplicate() {
+    let mut keys = UniqueSchemaKeys::new();
+    assert!(keys.try_insert(sk(1, 0)));
+    assert!(!keys.try_insert(sk(1, 0)));
+    assert_eq!(keys.iter().count(), 1);
+}
+
+#[test]
+fn unique_schema_keys_overflow() {
+    let mut keys = UniqueSchemaKeys::new();
+    assert!(keys.try_insert(sk(1, 0)));
+    assert!(keys.try_insert(sk(2, 0)));
+    assert!(keys.try_insert(sk(3, 0)));
+    assert_eq!(keys.iter().count(), 3);
+}
+
+#[test]
+fn unique_schema_keys_mixed_duplicates() {
+    let mut keys = UniqueSchemaKeys::new();
+    assert!(keys.try_insert(sk(1, 0)));
+    assert!(keys.try_insert(sk(2, 0)));
+    assert!(!keys.try_insert(sk(1, 0)));
+    assert!(keys.try_insert(sk(3, 0)));
+    assert!(!keys.try_insert(sk(2, 0)));
+    assert!(!keys.try_insert(sk(3, 0)));
+    assert_eq!(keys.iter().count(), 3);
+}
+
+// ── Schema Cache ──
+
+fn stub_cached_schema() -> CachedSchema<StubValidator> {
+    CachedSchema::Validated(CachedValidator::new(std::rc::Rc::new(StubValidator), 100))
+}
+
+#[test]
+fn schema_cache_insert_and_get() {
+    let mut c = cache();
+    let key = sk(1, 0);
+    c.schema_cache_insert(key.clone(), stub_cached_schema());
+    assert!(c.schema_cache_get(&key).is_some());
+    assert!(c.schema_cache_get(&sk(1, 1)).is_none());
+}
+
+#[test]
+fn no_schema_cache_insert() {
+    let mut c = cache();
+    let key = sk(1, 0);
+    c.no_schema_cache_insert(key.clone());
+    assert!(c.schema_cache_contains(&key));
+    assert!(!c.schema_cache_has_schema(&key));
+}
+
+#[test]
+fn schema_insert_evicts_no_schema() {
+    let mut c = cache();
+    let key = sk(1, 0);
+    c.no_schema_cache_insert(key.clone());
+    assert!(c.schema_cache_contains(&key));
+
+    c.schema_cache_insert(key.clone(), stub_cached_schema());
+    assert!(c.schema_cache_has_schema(&key));
+    assert!(c.schema_cache_contains(&key));
+}
+
+#[test]
+fn schema_has_schema_false_for_no_schema() {
+    let mut c = cache();
+    let key = sk(1, 0);
+    c.no_schema_cache_insert(key.clone());
+    assert!(!c.schema_cache_has_schema(&key));
+}
+
+#[test]
+fn schema_pending_roundtrip() {
+    let mut c = cache();
+    let key = sk(1, 0);
+    assert!(!c.schema_is_pending(&key));
+    c.schema_mark_pending(key.clone());
+    assert!(c.schema_is_pending(&key));
+    assert!(!c.schema_is_pending(&sk(2, 0)));
+}
+
+#[test]
+fn take_snapshot_drains_pending_schemas() {
+    let mut c = cache();
+    c.schema_mark_pending(sk(1, 0));
+    c.schema_mark_pending(sk(2, 0));
+
+    let snapshot = c.take_sync_positions_snapshot();
+    assert_eq!(snapshot.pending_schema_registrations.len(), 2);
+    assert!(snapshot.pending_schema_registrations.contains(&sk(1, 0)));
+    assert!(snapshot.pending_schema_registrations.contains(&sk(2, 0)));
+
+    assert!(!c.schema_is_pending(&sk(1, 0)));
+    assert!(!c.schema_is_pending(&sk(2, 0)));
+}
+
+#[test]
+fn fsync_rollback_clears_all_schema_state() {
+    let mut c = cache();
+    c.schema_cache_insert(sk(1, 0), stub_cached_schema());
+    c.no_schema_cache_insert(sk(2, 0));
+    c.schema_mark_pending(sk(3, 0));
+
+    c.execute_fsync_rollback();
+
+    assert!(!c.schema_cache_has_schema(&sk(1, 0)));
+    assert!(!c.schema_cache_contains(&sk(2, 0)));
+    assert!(!c.schema_is_pending(&sk(3, 0)));
+}
+
+#[test]
+fn schema_compilation_failed_counts_as_has_schema() {
+    let mut c = cache();
+    let key = sk(1, 0);
+    c.schema_cache_insert(key.clone(), CachedSchema::CompilationFailed("bad".into()));
+    assert!(c.schema_cache_has_schema(&key));
+    assert!(c.schema_cache_contains(&key));
 }

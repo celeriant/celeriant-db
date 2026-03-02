@@ -12,9 +12,9 @@ pub struct ReverseMetablockScanner<'a> {
     current_log_id: u64,
     chunk_size: u64,
     start_from_position: Option<u64>,
-    /// Optional aggregate key for bloom filter optimization.
+    /// Optional hash for bloom filter optimization.
     /// When set, log segments where the bloom filter says "definitely not present" are skipped.
-    bloom_filter_key: Option<&'a AggregateKey>,
+    bloom_filter_hash: Option<[u8; 8]>,
 }
 
 impl<'a> ReverseMetablockScanner<'a> {
@@ -24,15 +24,23 @@ impl<'a> ReverseMetablockScanner<'a> {
             current_log_id: starting_log_id,
             chunk_size,
             start_from_position,
-            bloom_filter_key: None,
+            bloom_filter_hash: None,
         }
     }
 
     /// Enable bloom filter optimization for a specific aggregate key.
     /// Log segments where the bloom filter says "definitely not present" will be skipped entirely.
     #[must_use]
-    pub fn with_bloom_filter(mut self, aggregate_key: &'a AggregateKey) -> Self {
-        self.bloom_filter_key = Some(aggregate_key);
+    pub fn with_bloom_filter(mut self, aggregate_key: &AggregateKey) -> Self {
+        self.bloom_filter_hash = Some(aggregate_key.hash_bytes());
+        self
+    }
+
+    /// Enable bloom filter optimization using a pre-computed hash.
+    /// Log segments where the bloom filter says "definitely not present" will be skipped entirely.
+    #[must_use]
+    pub fn with_bloom_filter_hash(mut self, hash_bytes: [u8; 8]) -> Self {
+        self.bloom_filter_hash = Some(hash_bytes);
         self
     }
 
@@ -80,9 +88,9 @@ impl<'a> ReverseMetablockScanner<'a> {
                 None => return Ok(None),
             };
 
-            // Check bloom filter - skip entire log segment if aggregate definitely not present
-            if let Some(key) = self.bloom_filter_key {
-                if !read.aggregate_key_bloom.may_contain(key) {
+            // Check bloom filter - skip entire log segment if key definitely not present
+            if let Some(hash) = &self.bloom_filter_hash {
+                if !read.aggregate_key_bloom.may_contain_hash(hash) {
                     return Ok(None);
                 }
             }

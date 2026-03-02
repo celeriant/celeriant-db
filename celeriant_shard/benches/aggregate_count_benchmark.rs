@@ -75,6 +75,8 @@ fn create_config(shard_dir: PathBuf) -> InternalShardConfig {
         list_max_duration: Duration::from_millis(2000),
         list_page_size: 20000,
         list_wal_index_cache_bytes: 12 * 1024 * 1024,
+        schema_cache_bytes: 4 * 1024 * 1024,
+        max_schema_size_bytes: 16384,
         pending_replication_high_water_bytes: 67_108_864, // 64MB
         max_cluster_time_drift_ms: 5000,
         max_catchup_gap_bytes: 104_857_600,

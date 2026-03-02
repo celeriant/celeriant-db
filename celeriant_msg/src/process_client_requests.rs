@@ -9,7 +9,7 @@ use crate::{
     read_wire_data_error::ReadWireDataError,
     request::requests::{
         AggregateDetailsRequest, DeleteRequest, ListAggregateTypesRequest, ListAggregatesRequest,
-        ListOrgsRequest, ReadRequest, TrimStartRequest, WatchRequest, WriteRequest,
+        ListOrgsRequest, ReadRequest, RegisterSchemaRequest, TrimStartRequest, WatchRequest, WriteRequest,
     },
 };
 
@@ -25,6 +25,7 @@ pub enum ClientRequestType {
     ListOrgs = 7,
     ListAggregateTypes = 8,
     ListAggregates = 9,
+    RegisterSchema = 10,
 }
 
 impl ClientRequestType {
@@ -39,6 +40,7 @@ impl ClientRequestType {
             7 => Ok(ClientRequestType::ListOrgs),
             8 => Ok(ClientRequestType::ListAggregateTypes),
             9 => Ok(ClientRequestType::ListAggregates),
+            10 => Ok(ClientRequestType::RegisterSchema),
             _ => Err(ReadWireDataError::UnknownMessageType(value)),
         }
     }
@@ -55,6 +57,7 @@ pub enum ClientRequest {
     ListOrgs(ListOrgsRequest),
     ListAggregateTypes(ListAggregateTypesRequest),
     ListAggregates(ListAggregatesRequest),
+    RegisterSchema(RegisterSchemaRequest),
 }
 
 impl ClientRequest {
@@ -69,6 +72,7 @@ impl ClientRequest {
             ClientRequest::ListOrgs(_) => ClientRequestType::ListOrgs,
             ClientRequest::ListAggregateTypes(_) => ClientRequestType::ListAggregateTypes,
             ClientRequest::ListAggregates(_) => ClientRequestType::ListAggregates,
+            ClientRequest::RegisterSchema(_) => ClientRequestType::RegisterSchema,
         }
     }
 
@@ -83,6 +87,7 @@ impl ClientRequest {
             ClientRequest::ListOrgs(req) => req.correlation_id,
             ClientRequest::ListAggregateTypes(req) => req.correlation_id,
             ClientRequest::ListAggregates(req) => req.correlation_id,
+            ClientRequest::RegisterSchema(req) => req.correlation_id,
         }
     }
 
@@ -151,6 +156,7 @@ impl ClientRequest {
             ClientRequestType::ListAggregateTypes => fixed!(ListAggregateTypes),
             ClientRequestType::ListAggregates => fixed!(ListAggregates),
             ClientRequestType::Write => variable!(Write),
+            ClientRequestType::RegisterSchema => variable!(RegisterSchema),
         })
     }
 
@@ -176,6 +182,7 @@ impl ClientRequest {
             ClientRequest::ListAggregateTypes(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
             ClientRequest::ListAggregates(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
             ClientRequest::Write(req) => wire_header_write_variable_size(writer, req, request_type_id, compression_type, max_message_size, version).await,
+            ClientRequest::RegisterSchema(req) => wire_header_write_variable_size(writer, req, request_type_id, compression_type, max_message_size, version).await,
         }
     }
 }
@@ -193,13 +200,14 @@ mod tests {
     use celeriant_wal::{
         aggregate_key::AggregateKey,
         datablocks::datablock_aggregate_event::DatablockAggregateEvent,
+        schema_key::SchemaKey,
     };
     use celeriant_wire::network::wire_header::{PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3};
     use futures_lite::{future::block_on, io::Cursor};
     use std::collections::{HashMap, HashSet};
 
-    const REQUEST_TYPE_COUNT: usize = 9;
-    const MAX_ID: u32 = 9;
+    const REQUEST_TYPE_COUNT: usize = 10;
+    const MAX_ID: u32 = 10;
     const VERSIONS: [u32; 2] = [PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3];
 
     fn all_types() -> [ClientRequestType; REQUEST_TYPE_COUNT] {
@@ -213,6 +221,7 @@ mod tests {
             ClientRequestType::ListOrgs,
             ClientRequestType::ListAggregateTypes,
             ClientRequestType::ListAggregates,
+            ClientRequestType::RegisterSchema,
         ]
     }
 
@@ -311,11 +320,19 @@ mod tests {
                 aggregate_type_id: Some(0xCCCC_DDDD),
                 cursor: Some(11111),
             }),
+            ClientRequestType::RegisterSchema => ClientRequest::RegisterSchema(RegisterSchemaRequest {
+                correlation_id: Some(0x4444_5555_6666_7777),
+                client_id: 0x8888_9999_AAAA_BBBB,
+                user_id: Some(0xCCCC_DDDD_EEEE_FFFF),
+                schema_key: SchemaKey::new(0x1111_1111_1111_1111, 0x2222_2222_2222_2222, 1, 0),
+                schema_type: 0,
+                schema: r#"{"type":"object","properties":{"name":{"type":"string"}}}"#.to_string(),
+            }),
         }
     }
 
     fn is_variable_size(rt: ClientRequestType) -> bool {
-        matches!(rt, ClientRequestType::Write)
+        matches!(rt, ClientRequestType::Write | ClientRequestType::RegisterSchema)
     }
 
     async fn write_bytes(req: &ClientRequest, version: u32, compression: CompressionType) -> Vec<u8> {
@@ -338,12 +355,13 @@ mod tests {
         for rt in all_types() {
             assert_eq!(ClientRequestType::from_u32(rt as u32).unwrap(), rt);
         }
-        for id in 1..=9 {
+        for id in 1..=10 {
             assert!(ClientRequestType::from_u32(id).is_ok(), "missing id {}", id);
         }
-        // Cluster IDs (10-12) should be rejected
-        for id in 10..=12 {
-            assert!(ClientRequestType::from_u32(id).is_err(), "cluster id {} should not parse as ClientRequestType", id);
+        // IDs 11-99 are reserved for future client requests
+        // Cluster IDs start at 100+ (will be renumbered)
+        for id in 11..=20 {
+            assert!(ClientRequestType::from_u32(id).is_err(), "id {} should not parse as ClientRequestType yet", id);
         }
         assert!(ClientRequestType::from_u32(0).is_err());
         assert!(ClientRequestType::from_u32(MAX_ID + 1).is_err());
@@ -357,7 +375,7 @@ mod tests {
     }
 
     fn has_deterministic_order(rt: ClientRequestType) -> bool {
-        !matches!(rt, ClientRequestType::Watch | ClientRequestType::Write | ClientRequestType::Delete)
+        !matches!(rt, ClientRequestType::Watch | ClientRequestType::Write | ClientRequestType::Delete | ClientRequestType::RegisterSchema)
     }
 
     #[test]
