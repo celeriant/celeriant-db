@@ -13,6 +13,7 @@ pub mod cert_cmd;
 pub mod keys_cmd;
 pub mod api_keys;
 mod dio_check;
+mod fs_check;
 
 pub fn startup(args: Vec<String>) -> Result<(), std::io::Error> {
     install_crash_handler();
@@ -42,6 +43,14 @@ pub fn startup(args: Vec<String>) -> Result<(), std::io::Error> {
         std::process::exit(1);
     }
     info!("Direct I/O verification passed");
+
+    if let Some(ref temp_dir) = server_config.compaction_temp_dir {
+        if let Err(e) = fs_check::verify_same_filesystem(&server_config.data_root, temp_dir) {
+            error!("Compaction temp directory check failed: {}", e);
+            std::process::exit(1);
+        }
+        info!("Compaction temp directory filesystem check passed");
+    }
 
     // Load or generate a persistent node ID
     let node_id = match Crypto::load_or_generate_node_id(&server_config.data_root) {
