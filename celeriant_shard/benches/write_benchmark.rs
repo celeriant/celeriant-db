@@ -102,6 +102,9 @@ fn create_config(
         s3_download_max_rounds: 3,
         shard_id: 1,
         max_s3_fallback_batch_bytes: 100 * 1024 * 1024,
+        compaction_check_interval: Duration::from_secs(600),
+        compaction_min_reclaimable_ratio: 0.20,
+        compaction_temp_dir: std::path::PathBuf::from("/tmp/test_compaction"),
     }
 }
 
