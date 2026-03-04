@@ -285,6 +285,18 @@ path = "src/schema_zero_cache_main.rs"
 name = "schema_bank_bench_main"
 path = "src/schema_bank_bench_main.rs"
 
+[[bin]]
+name = "compaction_standalone_main"
+path = "src/compaction_standalone_main.rs"
+
+[[bin]]
+name = "compaction_restart_main"
+path = "src/compaction_restart_main.rs"
+
+[[bin]]
+name = "compaction_replicated_main"
+path = "src/compaction_replicated_main.rs"
+
 [features]
 default = []
 small-metablock = [

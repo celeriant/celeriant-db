@@ -1159,6 +1159,9 @@ mod tests {
             tls_cert_reload_interval: Duration::ZERO,
             require_client_identity: false,
             api_key_hashes: std::cell::RefCell::new(None),
+            compaction_check_interval: Duration::from_secs(600),
+            compaction_min_reclaimable_ratio: 0.20,
+            compaction_temp_dir: None,
         }
     }
 

@@ -73,6 +73,8 @@ use crate::internal_shard_config::InternalShardConfig;
 use crate::loading_coordinator::LoadingCoordinator;
 use crate::replication_client::ReplicationClient;
 use crate::s3_downloader::S3Downloader;
+use crate::shard_wal_compact::{CompactionResult, compact_segment};
+use crate::error::compaction_error::CompactionError;
 use crate::shard_wal_replicate::{capture_replication_snapshot, commit_replication_with_rollback};
 use crate::shard_wal_s3_catchup::{self, S3CatchupResult, catchup_from_s3};
 use crate::shard_wal_sync::{capture_fsync_snapshot, commit_fsync_with_rollback};
@@ -1002,6 +1004,53 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     /// Close the shard WAL, flushing any pending writes.
     pub async fn close(&self) {
         self.log_segments_cache.close().await
+    }
+
+    /// Scan sealed segments oldest-first and compact the first eligible one.
+    ///
+    /// A segment is eligible if it is sealed (not the active segment) and fully
+    /// replicated (`!is_pending_advance()`). Compaction is skipped if the reclaimable
+    /// fraction is below `compaction_min_reclaimable_ratio`.
+    ///
+    /// Returns `Some(CompactionResult)` if a segment was compacted, `None` if no
+    /// eligible segment was found or all eligible segments were below the threshold.
+    pub async fn compact_oldest_eligible_segment(&self) -> Result<Option<CompactionResult>, CompactionError> {
+        let active_log_id = self.log_segments_cache.active_log_id();
+
+        // No sealed segments when active is the first log.
+        if active_log_id <= 1 {
+            return Ok(None);
+        }
+
+        let min_ratio = self.config.compaction_min_reclaimable_ratio;
+        let temp_dir = &self.config.compaction_temp_dir;
+
+        for log_id in 1..active_log_id {
+            let result = compact_segment(
+                log_id,
+                &self.log_segments_cache,
+                &self.shard_mem_cache,
+                min_ratio,
+                temp_dir,
+            )
+            .await;
+
+            match result {
+                // Segment compacted — return immediately (one per cycle).
+                Ok(Some(r)) => return Ok(Some(r)),
+                // Below threshold or pending advance — yield then try next segment.
+                Ok(None) => {
+                    glommio::yield_if_needed().await;
+                    continue;
+                }
+                // Non-existent segment (e.g. gap in log_ids) — skip gracefully.
+                Err(CompactionError::OpenSegment(_)) => continue,
+                // Other error — surface to caller for logging.
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(None)
     }
 
     /// Get the watched aggregates registry for this shard.
@@ -2023,8 +2072,11 @@ mod tests {
     use crate::s3_downloader::StubS3Downloader;
     use celeriant_msg::request::requests::{ReplicationBatchItem, ReplicationBatchRequest, SingleAggregateDelete, WatchRequest};
     use celeriant_wal::compression_type::CompressionType;
+    use celeriant_wal::constants::HEADER_BLOCK_SIZE_BYTES;
     use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
     use crate::timestamp_config::TimestampConfig;
+    use celeriant_disk::files::read_fixed_records_visit_const::{read_fixed_records_visit_const, ReadVisitError};
+    use crate::shard_wal_compact::SCAN_CHUNK_SIZE;
     use glommio::{LocalExecutorBuilder, Placement};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -2072,6 +2124,9 @@ mod tests {
             max_cluster_time_drift_ms: 5000,
             max_catchup_gap_bytes: 100 * 1024 * 1024,
             max_s3_fallback_batch_bytes: 1024 * 1024 * 100,
+            compaction_check_interval: Duration::from_secs(600),
+            compaction_min_reclaimable_ratio: 0.20,
+            compaction_temp_dir: std::path::PathBuf::from("/tmp/test_compaction"),
         }
     }
 
@@ -3532,4 +3587,1411 @@ mod tests {
             shard.close().await;
         });
     }
+
+    // ── Compaction ──
+
+    /// Config for compaction tests: small segment size to trigger rotation quickly.
+    ///
+    /// Minimum valid preallocate_bytes is 3 * HEADER_BLOCK_SIZE_BYTES (3 * 512KB = 1.5MB).
+    /// This leaves 512KB usable per segment. Each fat write (~9KB) fills it in ~57 writes.
+    fn compact_config(dir: &std::path::Path) -> InternalShardConfig {
+        let temp_dir = dir.join("compaction_temp");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        InternalShardConfig {
+            shard_log_preallocate_bytes: 3 * 512 * 1024, // 1.5MB — smallest valid segment size
+            compaction_min_reclaimable_ratio: 0.20,
+            compaction_temp_dir: temp_dir,
+            ..test_config(dir)
+        }
+    }
+
+    async fn open_compact_shard(dir: &std::path::Path) -> ShardWal<StubReplicationClient, StubS3Downloader> {
+        ShardWal::open(compact_config(dir), ValidatedNodeStatus::standalone(), StubReplicationClient, StubS3Downloader)
+            .await
+            .unwrap()
+    }
+
+    /// Write one event with an 8KB payload to consume ~9KB of segment space.
+    fn fat_event(index: u64) -> Vec<DatablockAggregateEvent> {
+        vec![DatablockAggregateEvent {
+            client_event_index: index,
+            event_type_major: 1,
+            event_value: Arc::new(vec![index as u8; 8192]),
+            ..Default::default()
+        }]
+    }
+
+    /// Write `n` fat events to `agg` in the current segment (without triggering rotation).
+    /// Each write consumes ~9KB of segment space.
+    async fn write_fat<R: ReplicationClient, D: S3Downloader>(
+        shard: &ShardWal<R, D>,
+        agg: &AggregateKey,
+        n: u64,
+    ) {
+        for i in 1..=n {
+            write_ok(shard, write_req(agg.clone(), fat_event(i))).await;
+        }
+    }
+
+    /// Trigger segment rotation and delete the sentinel to minimize its impact on compaction ratios.
+    ///
+    /// Fat writes to the sentinel may land in the current segment (before rotation triggers).
+    /// Deleting the sentinel afterwards marks those writes as dead, so compaction tests
+    /// can still verify that `compacted_size < original_size`.
+    async fn trigger_rotation<R: ReplicationClient, D: S3Downloader>(shard: &ShardWal<R, D>) {
+        let sentinel = key(99, 99, 99);
+        let old_log_id = shard.log_segments_cache.active_log_id();
+        // Keep writing until we actually rotate (available space may vary slightly).
+        let mut i = 1u64;
+        while shard.log_segments_cache.active_log_id() == old_log_id {
+            write_ok(shard, write_req(sentinel.clone(), fat_event(i))).await;
+            i += 1;
+        }
+        // Delete the sentinel so any sentinel writes that landed in the sealed segment
+        // are also treated as dead data during compaction, preserving high dead ratios.
+        // allow_recreate=true so trigger_rotation can be called multiple times in a test.
+        let _ = process(shard, delete_req_full(sentinel, true, false, None)).await;
+    }
+
+    #[test]
+    fn compact_deleted_aggregates_removes_dead_data() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_compact_shard(&dir).await;
+
+            let agg_a = key(1, 1, 1);
+            let agg_b = key(1, 1, 2);
+
+            // Fill most of segment 1 with A's data (50 × 9KB ≈ 450KB of the 512KB usable).
+            // This ensures A dominates the segment and the dead ratio is well above 20%.
+            write_fat(&shard, &agg_a, 50).await;
+
+            // Write a small amount of B data into segment 1.
+            write_ok(&shard, write_req(agg_b.clone(), events(3))).await;
+
+            // Soft-delete A — tombstone goes into segment 1 (within-segment tombstone).
+            let result = process(&shard, delete_req(agg_a.clone())).await;
+            assert!(matches!(result, Ok(ClientResponse::Delete(_))));
+
+            // Trigger rotation: next fat write exceeds remaining space, landing in segment 2.
+            trigger_rotation(&shard).await;
+            assert!(shard.log_segments_cache.active_log_id() >= 2);
+
+            let seg1_id = 1u64;
+            let original_size = shard.log_segments_cache.get(seg1_id).await.unwrap().metadata.borrow().file_len;
+
+            let result = shard.compact_oldest_eligible_segment().await.unwrap();
+            assert!(result.is_some(), "expected compaction to run (A's fat data dominates dead ratio)");
+            let cr = result.unwrap();
+            assert_eq!(cr.log_id, seg1_id);
+            assert!(cr.compacted_size < cr.original_size, "compacted file should be smaller");
+            assert_eq!(cr.original_size, original_size);
+
+            // B still readable with all events (B's data preserved in compacted segment).
+            let read_b = unwrap_read(process(&shard, read_req(agg_b.clone())).await);
+            assert_eq!(read_b.event_batches.len(), 1);
+            assert_eq!(read_b.event_batches[0].events.len(), 3);
+
+            // A is deleted.
+            let result = process(&shard, read_req(agg_a.clone())).await;
+            assert!(matches!(result, Err(ShardError::Read(ShardReadError::AggregateNotExists))));
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn compact_trimmed_batches_preserves_above_floor() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_compact_shard(&dir).await;
+            let agg = key(1, 1, 1);
+
+            // Write 2 fat events (to be trimmed away) + 3 fat events above the trim floor.
+            // 50 total fat events ensures the trimmed-away data dominates the segment.
+            // Fat writes: events 1–30 will be trimmed, events 31–50 will be kept.
+            // We write 50 fat batches total, then trim to keep from batch 31.
+            write_fat(&shard, &agg, 50).await;
+
+            // Trim: keep from batch 31 (30 batches become dead = 60% of total).
+            let result = process(&shard, trim_req(agg.clone(), 31)).await;
+            assert!(matches!(result, Ok(ClientResponse::TrimStart(_))));
+
+            // Trigger rotation.
+            trigger_rotation(&shard).await;
+
+            let seg1_id = 1u64;
+            let original_size = shard.log_segments_cache.get(seg1_id).await.unwrap().metadata.borrow().file_len;
+
+            let result = shard.compact_oldest_eligible_segment().await.unwrap();
+            assert!(result.is_some(), "expected compaction to run (30/50 batches trimmed = 60% dead)");
+            let cr = result.unwrap();
+            assert!(cr.compacted_size < original_size, "compacted file should be smaller");
+
+            // Reading from batch 1 should fail (below trim floor of 31).
+            let result = process(&shard, read_req_from(agg.clone(), 1)).await;
+            assert!(matches!(result, Err(ShardError::Read(ShardReadError::UnavailableBatchIndex { .. }))));
+
+            // Reading from batch 31 should succeed.
+            let read = unwrap_read(process(&shard, read_req_from(agg.clone(), 31)).await);
+            assert!(!read.event_batches.is_empty());
+            assert!(read.event_batches.iter().all(|b| b.event_batch_index >= 31));
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn compact_100_percent_dead_segment() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_compact_shard(&dir).await;
+
+            // Write fat events to 3 aggregates (10 each = 30 total, ~270KB).
+            let agg_a = key(1, 1, 1);
+            let agg_b = key(1, 1, 2);
+            let agg_c = key(1, 1, 3);
+
+            write_fat(&shard, &agg_a, 10).await;
+            write_fat(&shard, &agg_b, 10).await;
+            write_fat(&shard, &agg_c, 10).await;
+
+            // Delete ALL aggregates — all 30 event batches become dead.
+            for agg in &[&agg_a, &agg_b, &agg_c] {
+                let result = process(&shard, delete_req((*agg).clone())).await;
+                assert!(matches!(result, Ok(ClientResponse::Delete(_))));
+            }
+
+            // Trigger rotation.
+            trigger_rotation(&shard).await;
+
+            let result = shard.compact_oldest_eligible_segment().await.unwrap();
+            assert!(result.is_some(), "expected compaction to run on fully dead segment");
+            let cr = result.unwrap();
+
+            // Compacted file should be smaller (only tombstones remain — no event datablocks).
+            // The theoretical minimum is 2 × HEADER_BLOCK_SIZE_BYTES + tombstone metablocks.
+            // We verify the compacted size is strictly less than the original preallocated size.
+            assert!(cr.compacted_size < cr.original_size, "compacted should be smaller than original 1.5MB segment");
+
+            // All aggregates still appear deleted.
+            for agg in &[&agg_a, &agg_b, &agg_c] {
+                let result = process(&shard, read_req((*agg).clone())).await;
+                assert!(matches!(result, Err(ShardError::Read(ShardReadError::AggregateNotExists))));
+            }
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn compact_below_threshold_skipped() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_compact_shard(&dir).await;
+
+            // Write 50 fat events to a live aggregate (will remain alive).
+            let live_agg = key(1, 1, 1);
+            write_fat(&shard, &live_agg, 50).await;
+
+            // Write 1 fat event to a separate aggregate and delete it.
+            // 1 dead out of 51+ total = ~2% dead — well below the 20% threshold.
+            let dead_agg = key(1, 1, 2);
+            write_ok(&shard, write_req(dead_agg.clone(), fat_event(1))).await;
+            let result = process(&shard, delete_req(dead_agg.clone())).await;
+            assert!(matches!(result, Ok(ClientResponse::Delete(_))));
+
+            // Trigger rotation.
+            trigger_rotation(&shard).await;
+
+            let seg1_id = 1u64;
+            let size_before = shard.log_segments_cache.get(seg1_id).await.unwrap().metadata.borrow().file_len;
+
+            // Compaction should not run (1 dead / 51+ total ≈ 2% < 20% threshold).
+            let result = shard.compact_oldest_eligible_segment().await.unwrap();
+            assert!(result.is_none(), "expected no compaction below threshold");
+
+            // File size unchanged.
+            let size_after = shard.log_segments_cache.get(seg1_id).await.unwrap().metadata.borrow().file_len;
+            assert_eq!(size_before, size_after);
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn compact_active_segment_not_eligible() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_compact_shard(&dir).await;
+            let agg = key(1, 1, 1);
+
+            // Write to the active segment (no rotation — still segment 1).
+            write_ok(&shard, write_req(agg.clone(), events(3))).await;
+
+            // Delete it — but the active segment is never compacted.
+            let result = process(&shard, delete_req(agg.clone())).await;
+            assert!(matches!(result, Ok(ClientResponse::Delete(_))));
+
+            // Active log_id should still be 1 (we never rotated).
+            assert_eq!(shard.log_segments_cache.active_log_id(), 1);
+
+            // compact_oldest_eligible_segment: active_log_id is 1, so there are no sealed segments.
+            let result = shard.compact_oldest_eligible_segment().await.unwrap();
+            assert!(result.is_none(), "active segment should not be compacted");
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn compact_preserves_read_after_compact() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_compact_shard(&dir).await;
+
+            let dead_agg = key(1, 1, 0);
+            let agg_b = key(1, 1, 2);
+            let agg_c = key(1, 1, 3);
+            let agg_d = key(1, 1, 4);
+
+            // Fill most of segment 1 with dead_agg's data.
+            write_fat(&shard, &dead_agg, 40).await;
+
+            // Write alive aggregates: B gets 1 batch, C gets 2 batches, D gets 3 batches.
+            write_ok(&shard, write_req(agg_b.clone(), events(2))).await;
+            write_ok(&shard, write_req(agg_c.clone(), events(2))).await;
+            write_ok(&shard, write_req(agg_c.clone(), events(2))).await;
+            write_ok(&shard, write_req(agg_d.clone(), events(2))).await;
+            write_ok(&shard, write_req(agg_d.clone(), events(2))).await;
+            write_ok(&shard, write_req(agg_d.clone(), events(2))).await;
+
+            // Delete dead_agg — 40 fat batches become dead (dominates segment).
+            let result = process(&shard, delete_req(dead_agg.clone())).await;
+            assert!(matches!(result, Ok(ClientResponse::Delete(_))));
+
+            // Trigger rotation.
+            trigger_rotation(&shard).await;
+
+            // Compact.
+            let result = shard.compact_oldest_eligible_segment().await.unwrap();
+            assert!(result.is_some(), "expected compaction to run");
+
+            // Verify B (1 batch), C (2 batches), D (3 batches) fully readable after compaction.
+            let read_b = unwrap_read(process(&shard, read_req(agg_b.clone())).await);
+            assert_eq!(read_b.event_batches.len(), 1);
+            assert_eq!(read_b.event_batches[0].events.len(), 2);
+
+            let read_c = unwrap_read(process(&shard, read_req(agg_c.clone())).await);
+            assert_eq!(read_c.event_batches.len(), 2);
+            for batch in &read_c.event_batches {
+                assert_eq!(batch.events.len(), 2);
+            }
+
+            let read_d = unwrap_read(process(&shard, read_req(agg_d.clone())).await);
+            assert_eq!(read_d.event_batches.len(), 3);
+            for batch in &read_d.event_batches {
+                assert_eq!(batch.events.len(), 2);
+            }
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn compact_multiple_rounds() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_compact_shard(&dir).await;
+
+            let agg_a = key(1, 1, 1);
+            let agg_b = key(1, 1, 2);
+            let agg_c = key(1, 1, 3);
+            let agg_d = key(1, 1, 4);
+
+            // Write events to A, B, C, D in segment 1 with enough data so each
+            // compaction round has >20% dead fraction:
+            //   A: 15 fat batches (deleted in round 1 → 30% dead of ~50 total)
+            //   B: 15 fat batches (8 trimmed in round 2 → ~22% dead of ~35 remaining)
+            //   C: 15 fat batches (deleted in round 3 → ~55% dead of ~27 remaining)
+            //   D:  5 fat batches (always kept)
+            write_fat(&shard, &agg_a, 15).await;
+            write_fat(&shard, &agg_b, 15).await;
+            write_fat(&shard, &agg_c, 15).await;
+            write_fat(&shard, &agg_d, 5).await;
+
+            // Trigger rotation to seal segment 1.
+            trigger_rotation(&shard).await;
+            assert!(shard.log_segments_cache.active_log_id() >= 2);
+
+            let seg1_original_size = shard.log_segments_cache.get(1).await.unwrap().metadata.borrow().file_len;
+
+            // Delete A — tombstone written to current active segment (cross-segment).
+            let result = process(&shard, delete_req(agg_a.clone())).await;
+            assert!(matches!(result, Ok(ClientResponse::Delete(_))));
+
+            // Round 1: compact segment 1 — removes A's 15 event batches, keeps B, C, D.
+            let cr1 = shard.compact_oldest_eligible_segment().await.unwrap()
+                .expect("round 1: A's 15 batches dead (>20%), compaction should run");
+            assert_eq!(cr1.log_id, 1);
+            assert!(cr1.compacted_size < seg1_original_size, "round 1 should shrink file");
+            let size_after_round1 = cr1.compacted_size;
+
+            // B (15 batches), C (15 batches), D (5 batches) still fully readable.
+            let read_b = unwrap_read(process(&shard, read_req(agg_b.clone())).await);
+            assert_eq!(read_b.event_batches.len(), 15);
+            let read_c = unwrap_read(process(&shard, read_req(agg_c.clone())).await);
+            assert_eq!(read_c.event_batches.len(), 15);
+            let read_d = unwrap_read(process(&shard, read_req(agg_d.clone())).await);
+            assert_eq!(read_d.event_batches.len(), 5);
+
+            // A is deleted.
+            let result = process(&shard, read_req(agg_a.clone())).await;
+            assert!(matches!(result, Err(ShardError::Read(ShardReadError::AggregateNotExists))));
+
+            // Trim B: keep from batch 9 (removes 8 batches = 8/35 remaining ≈ 22.8% dead).
+            let result = process(&shard, trim_req(agg_b.clone(), 9)).await;
+            assert!(matches!(result, Ok(ClientResponse::TrimStart(_))));
+
+            // Round 2: compact segment 1 again — removes B's 8 trimmed batches.
+            let cr2 = shard.compact_oldest_eligible_segment().await.unwrap()
+                .expect("round 2: 8 of B's batches dead (~22%), compaction should run");
+            assert_eq!(cr2.log_id, 1);
+            assert!(cr2.compacted_size < size_after_round1, "round 2 should shrink further");
+            let size_after_round2 = cr2.compacted_size;
+
+            // B readable (only batches 9+).
+            let read_b = unwrap_read(process(&shard, read_req_from(agg_b.clone(), 9)).await);
+            assert!(!read_b.event_batches.is_empty());
+            assert!(read_b.event_batches.iter().all(|b| b.event_batch_index >= 9));
+
+            // B's early batches unavailable.
+            let result = process(&shard, read_req_from(agg_b.clone(), 1)).await;
+            assert!(matches!(result, Err(ShardError::Read(ShardReadError::UnavailableBatchIndex { .. }))));
+
+            // C (15 batches) and D (5 batches) fully intact.
+            let read_c = unwrap_read(process(&shard, read_req(agg_c.clone())).await);
+            assert_eq!(read_c.event_batches.len(), 15);
+            let read_d = unwrap_read(process(&shard, read_req(agg_d.clone())).await);
+            assert_eq!(read_d.event_batches.len(), 5);
+
+            // Delete C — tombstone goes into current active segment.
+            let result = process(&shard, delete_req(agg_c.clone())).await;
+            assert!(matches!(result, Ok(ClientResponse::Delete(_))));
+
+            // Round 3: compact segment 1 again — removes C's 15 event batches.
+            let cr3 = shard.compact_oldest_eligible_segment().await.unwrap()
+                .expect("round 3: C's 15 batches dead (~55%), compaction should run");
+            assert_eq!(cr3.log_id, 1);
+            assert!(cr3.compacted_size < size_after_round2, "round 3 should shrink further");
+
+            // D (5 batches) still fully intact.
+            let read_d = unwrap_read(process(&shard, read_req(agg_d.clone())).await);
+            assert_eq!(read_d.event_batches.len(), 5);
+
+            // C is deleted.
+            let result = process(&shard, read_req(agg_c.clone())).await;
+            assert!(matches!(result, Err(ShardError::Read(ShardReadError::AggregateNotExists))));
+
+            // A still deleted (tombstone preserved).
+            let result = process(&shard, read_req(agg_a.clone())).await;
+            assert!(matches!(result, Err(ShardError::Read(ShardReadError::AggregateNotExists))));
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn compact_cross_segment_tombstone_resolves() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_compact_shard(&dir).await;
+
+            let agg_a = key(1, 1, 1);
+            let agg_b = key(1, 1, 2);
+
+            // Fill most of segment 1 with A's fat data (dominant dead data after deletion).
+            write_fat(&shard, &agg_a, 45).await;
+
+            // Write a small amount of B data into segment 1 as a live control.
+            write_ok(&shard, write_req(agg_b.clone(), events(2))).await;
+
+            // Trigger rotation — A and B remain in segment 1, tombstones go to segment 2.
+            trigger_rotation(&shard).await;
+            assert!(shard.log_segments_cache.active_log_id() >= 2);
+
+            // Write SoftDelete for A in segment 2 (CROSS-SEGMENT tombstone).
+            // A's event batches are in segment 1; the delete tombstone is in segment 2.
+            let result = process(&shard, delete_req(agg_a.clone())).await;
+            assert!(matches!(result, Ok(ClientResponse::Delete(_))));
+
+            // Compact segment 1: must do cross-segment reverse scan to find A's tombstone
+            // in segment 2, then mark A's event batches in segment 1 as dead.
+            let cr = shard.compact_oldest_eligible_segment().await.unwrap()
+                .expect("cross-segment compaction should run (A's ~45 fat batches dead)");
+            assert_eq!(cr.log_id, 1);
+            assert!(cr.compacted_size < cr.original_size);
+
+            // A is still shown as deleted after compaction.
+            let result = process(&shard, read_req(agg_a.clone())).await;
+            assert!(matches!(result, Err(ShardError::Read(ShardReadError::AggregateNotExists))));
+
+            // B is fully intact (its data preserved in compacted segment).
+            let read_b = unwrap_read(process(&shard, read_req(agg_b.clone())).await);
+            assert_eq!(read_b.event_batches.len(), 1);
+            assert_eq!(read_b.event_batches[0].events.len(), 2);
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn compact_preserves_hash_chain() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_compact_shard(&dir).await;
+
+            let agg_a = key(1, 1, 1);
+            let agg_b = key(1, 1, 2);
+
+            // Fill most of segment 1 with A's fat data (will be deleted, becoming dead).
+            write_fat(&shard, &agg_a, 45).await;
+
+            // Write B data (will survive compaction).
+            write_ok(&shard, write_req(agg_b.clone(), events(2))).await;
+
+            // Delete A so compaction removes its data.
+            let result = process(&shard, delete_req(agg_a.clone())).await;
+            assert!(matches!(result, Ok(ClientResponse::Delete(_))));
+
+            // Trigger rotation.
+            trigger_rotation(&shard).await;
+
+            // Compact.
+            let cr = shard.compact_oldest_eligible_segment().await.unwrap()
+                .expect("compaction should run (A's 45 batches dead)");
+            assert_eq!(cr.log_id, 1);
+
+            // The compacted segment must be readable — proving the hash chain is consistent
+            // and the header was written correctly. If the hash chain were broken, the WAL
+            // would detect corruption on the next open.
+            let read_b = unwrap_read(process(&shard, read_req(agg_b.clone())).await);
+            assert_eq!(read_b.event_batches.len(), 1);
+            assert_eq!(read_b.event_batches[0].events.len(), 2);
+
+            // Verify the compacted segment's header is loaded correctly by checking the tip_hash.
+            // The segment now has metablocks (B's event batch + A's tombstone), so the tip_hash
+            // must differ from GENESIS_HASH.
+            let seg = shard.log_segments_cache.get(cr.log_id).await.unwrap();
+            let meta = seg.metadata.borrow();
+            assert_ne!(meta.write.tip_hash, GENESIS_HASH, "compacted segment should have non-genesis tip hash");
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn compact_preserves_bloom_filter() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_compact_shard(&dir).await;
+
+            let agg_a = key(1, 1, 1);
+            let agg_b = key(1, 1, 2);
+            let agg_c = key(1, 1, 3);
+
+            // Fill most of segment 1 with A's fat data (will be deleted).
+            write_fat(&shard, &agg_a, 45).await;
+
+            // Write B and C (small, will survive compaction).
+            write_ok(&shard, write_req(agg_b.clone(), events(1))).await;
+            write_ok(&shard, write_req(agg_c.clone(), events(1))).await;
+
+            // Delete A — within-segment tombstone.
+            let result = process(&shard, delete_req(agg_a.clone())).await;
+            assert!(matches!(result, Ok(ClientResponse::Delete(_))));
+
+            // Trigger rotation.
+            trigger_rotation(&shard).await;
+
+            // Compact.
+            let cr = shard.compact_oldest_eligible_segment().await.unwrap()
+                .expect("compaction should run (A's 45 batches dead)");
+            assert_eq!(cr.log_id, 1);
+
+            // After compaction, the segment header includes a rebuilt bloom filter.
+            // We verify the bloom filter works correctly by confirming:
+            // - B and C are readable (their data survived; bloom must contain them)
+            // - A is deleted (tombstone preserved; bloom may contain A — false positives ok)
+            let read_b = unwrap_read(process(&shard, read_req(agg_b.clone())).await);
+            assert_eq!(read_b.event_batches.len(), 1);
+
+            let read_c = unwrap_read(process(&shard, read_req(agg_c.clone())).await);
+            assert_eq!(read_c.event_batches.len(), 1);
+
+            // A remains deleted.
+            let result = process(&shard, read_req(agg_a.clone())).await;
+            assert!(matches!(result, Err(ShardError::Read(ShardReadError::AggregateNotExists))));
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn compact_softtrim_survives_compaction() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_compact_shard(&dir).await;
+
+            let agg_b = key(1, 1, 2);
+            let filler = key(1, 1, 99);
+
+            // Three batches to B, then trim to keep from batch 2 (drops batch 1).
+            write_ok(&shard, write_req(agg_b.clone(), events(2))).await;
+            write_ok(&shard, write_req(agg_b.clone(), events(2))).await;
+            write_ok(&shard, write_req(agg_b.clone(), events(2))).await;
+            let result = process(&shard, trim_req(agg_b.clone(), 2)).await;
+            assert!(matches!(result, Ok(ClientResponse::TrimStart(_))));
+
+            // Fat filler to push dead ratio above the compaction threshold.
+            write_fat(&shard, &filler, 40).await;
+            let result = process(&shard, delete_req(filler.clone())).await;
+            assert!(matches!(result, Ok(ClientResponse::Delete(_))));
+
+            trigger_rotation(&shard).await;
+            let cr = shard.compact_oldest_eligible_segment().await.unwrap()
+                .expect("compaction should run (filler dominates dead data)");
+            assert_eq!(cr.log_id, 1);
+
+            // SoftTrim must survive in the compacted segment and still be applied.
+            let result = process(&shard, read_req_from(agg_b.clone(), 1)).await;
+            assert!(
+                matches!(result, Err(ShardError::Read(ShardReadError::UnavailableBatchIndex { .. }))),
+                "batch 1 must be unavailable (trimmed after compaction); got {result:?}"
+            );
+            let read_b = unwrap_read(process(&shard, read_req_from(agg_b.clone(), 2)).await);
+            assert_eq!(read_b.event_batches.len(), 2, "batches 2 and 3 must survive compaction");
+
+            // Direct bloom check: SoftTrim key must appear in the rebuilt bloom.
+            let seg = shard.log_segments_cache.get(cr.log_id).await.unwrap();
+            let bloom_has_b = seg.metadata.borrow()
+                .read.as_ref().unwrap()
+                .aggregate_key_bloom.may_contain(&agg_b);
+            assert!(bloom_has_b, "compacted bloom must include the SoftTrim aggregate key");
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn compact_schema_registration_bloom_survives_restart() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+
+            // Round 1: register schema, write valid event, compact, close.
+            {
+                let shard = open_compact_shard(&dir).await;
+                let agg_b = key(1, 1, 2);
+                let filler = key(2, 2, 99); // org=2 type=2 — not subject to the org=1 type=1 schema
+
+                process(&shard, schema_req(1, 1, 1, 0, NAME_AGE_SCHEMA)).await.unwrap();
+                write_ok(&shard, write_req(agg_b.clone(), json_events(&[br#"{"name":"alice","age":30}"#], 1, 0))).await;
+
+                // Filler must be a different org/type so fat (non-JSON) writes bypass the schema.
+                write_fat(&shard, &filler, 40).await;
+                process(&shard, delete_req(filler)).await.unwrap();
+
+                trigger_rotation(&shard).await;
+                shard.compact_oldest_eligible_segment().await.unwrap()
+                    .expect("compaction should run (schema+event in segment with dead filler)");
+
+                shard.close().await;
+            }
+
+            // Round 2: cold restart — schema cache is empty, bloom must locate the schema.
+            // If the compacted bloom were wrong, schema lookup would fail, the write would
+            // bypass validation, and the assertion would catch the silent correctness failure.
+            {
+                let shard = open_compact_shard(&dir).await;
+                let agg_b = key(1, 1, 2);
+
+                let bad_evts = json_events(&[br#"{"name":"bob"}"#], 1, 0); // missing required "age"
+                let result = process(&shard, write_req(agg_b.clone(), bad_evts)).await;
+                assert!(
+                    matches!(result, Err(ShardError::Write(ShardWriteError::SchemaValidationFailed { .. }))),
+                    "schema must still be enforced after compaction + restart; got {result:?}"
+                );
+
+                shard.close().await;
+            }
+        });
+    }
+
+    // ── Additional compaction tests: list operations, restart, datablock positions, WAL index gaps ──
+
+    fn list_aggs_req_with_cursor(org: Option<u128>, atype: Option<u128>, cursor: Option<u64>) -> ClientRequest {
+        ClientRequest::ListAggregates(ListAggregatesRequest {
+            correlation_id: None,
+            shard_id: 0,
+            org_id: org,
+            aggregate_type_id: atype,
+            cursor,
+        })
+    }
+
+    fn compact_config_small_page(dir: &std::path::Path, list_page_size: usize) -> InternalShardConfig {
+        InternalShardConfig {
+            list_page_size,
+            ..compact_config(dir)
+        }
+    }
+
+    #[test]
+    fn compact_list_operations_correct_after_compaction() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_compact_shard(&dir).await;
+
+            // Four aggregates across two orgs and two types.
+            let agg_a = key(1, 1, 1); // org=1, type=1, id=1 — will be deleted
+            let agg_b = key(1, 1, 2); // org=1, type=1, id=2 — survives
+            let agg_c = key(1, 2, 1); // org=1, type=2, id=1 — survives
+            let agg_d = key(2, 1, 1); // org=2, type=1, id=1 — survives
+
+            // Fill segment 1 with agg_a fat data (dominates the dead ratio after deletion).
+            write_fat(&shard, &agg_a, 40).await;
+
+            // Write small amounts to the surviving aggregates.
+            write_ok(&shard, write_req(agg_b.clone(), events(2))).await;
+            write_ok(&shard, write_req(agg_c.clone(), events(2))).await;
+            write_ok(&shard, write_req(agg_d.clone(), events(2))).await;
+
+            // Delete agg_a — dead ratio well above 20%.
+            let result = process(&shard, delete_req(agg_a.clone())).await;
+            assert!(matches!(result, Ok(ClientResponse::Delete(_))));
+
+            // Seal segment 1.
+            trigger_rotation(&shard).await;
+
+            // Compact.
+            let cr = shard.compact_oldest_eligible_segment().await.unwrap()
+                .expect("compaction should run (agg_a's 40 fat batches dead)");
+            assert_eq!(cr.log_id, 1);
+            assert!(cr.compacted_size < cr.original_size);
+
+            // list_orgs: must return both org=1 and org=2.
+            let orgs = unwrap_list_orgs(process(&shard, list_orgs_req()).await);
+            let org_ids: Vec<u128> = orgs.orgs.iter().map(|o| o.org_id).collect();
+            assert!(org_ids.contains(&1), "org=1 should be present; got {org_ids:?}");
+            assert!(org_ids.contains(&2), "org=2 should be present; got {org_ids:?}");
+
+            // list_types for org=1: should return type=1 and type=2.
+            let types_org1 = unwrap_list_types(process(&shard, list_types_req(Some(1))).await);
+            let type_ids_org1: Vec<u128> = types_org1.aggregate_types.iter().map(|t| t.aggregate_type_id).collect();
+            assert!(type_ids_org1.contains(&1), "org=1 type=1 should be present; got {type_ids_org1:?}");
+            assert!(type_ids_org1.contains(&2), "org=1 type=2 should be present; got {type_ids_org1:?}");
+            assert!(types_org1.aggregate_types.iter().all(|t| t.org_id == 1));
+
+            // list_types for org=2: should return type=1 only.
+            let types_org2 = unwrap_list_types(process(&shard, list_types_req(Some(2))).await);
+            assert_eq!(types_org2.aggregate_types.len(), 1);
+            assert_eq!(types_org2.aggregate_types[0].aggregate_type_id, 1);
+
+            // list_aggs for org=1, type=1: must return agg_b (alive) and show agg_a as deleted.
+            // Tombstones (SoftDelete metablocks) are preserved during compaction for cross-segment
+            // safety, so agg_a still appears in list results — but marked is_deleted=true.
+            let aggs_1_1 = unwrap_list_aggs(process(&shard, list_aggs_req(Some(1), Some(1))).await);
+            let live_ids: Vec<u128> = aggs_1_1.aggregates.iter().filter(|a| !a.is_deleted).map(|a| a.aggregate_id).collect();
+            let deleted_ids: Vec<u128> = aggs_1_1.aggregates.iter().filter(|a| a.is_deleted).map(|a| a.aggregate_id).collect();
+            assert!(live_ids.contains(&2), "agg_b (id=2) should be live; live_ids={live_ids:?}");
+            assert!(!live_ids.contains(&1), "agg_a (id=1) should NOT be live (was deleted); live_ids={live_ids:?}");
+            assert!(deleted_ids.contains(&1), "agg_a (id=1) tombstone should still appear as deleted; deleted_ids={deleted_ids:?}");
+
+            // list_aggs for org=1, type=2: must return agg_c.
+            let aggs_1_2 = unwrap_list_aggs(process(&shard, list_aggs_req(Some(1), Some(2))).await);
+            assert_eq!(aggs_1_2.aggregates.len(), 1);
+            assert_eq!(aggs_1_2.aggregates[0].aggregate_id, 1);
+
+            // list_aggs for org=2, type=1: must return agg_d.
+            let aggs_2_1 = unwrap_list_aggs(process(&shard, list_aggs_req(Some(2), Some(1))).await);
+            assert_eq!(aggs_2_1.aggregates.len(), 1);
+            assert_eq!(aggs_2_1.aggregates[0].aggregate_id, 1);
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn compact_restart_preserves_data() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+
+            // Round 1: write, delete filler, compact, verify — then close.
+            {
+                let shard = open_compact_shard(&dir).await;
+
+                let agg_a = key(1, 1, 1);
+                let agg_b = key(1, 1, 2);
+                let filler = key(1, 1, 99);
+
+                // Small writes to A and B (will survive).
+                write_ok(&shard, write_req(agg_a.clone(), events(3))).await;
+                write_ok(&shard, write_req(agg_b.clone(), events(2))).await;
+
+                // Fill segment with filler fat data so dead ratio > 20% after deletion.
+                write_fat(&shard, &filler, 40).await;
+
+                // Delete filler.
+                let result = process(&shard, delete_req(filler.clone())).await;
+                assert!(matches!(result, Ok(ClientResponse::Delete(_))));
+
+                // Seal segment and compact.
+                trigger_rotation(&shard).await;
+                let cr = shard.compact_oldest_eligible_segment().await.unwrap()
+                    .expect("compaction should run (filler dominates dead data)");
+                assert_eq!(cr.log_id, 1);
+                assert!(cr.compacted_size < cr.original_size);
+
+                // Verify reads before close.
+                let read_a = unwrap_read(process(&shard, read_req(agg_a.clone())).await);
+                assert_eq!(read_a.event_batches.len(), 1);
+                assert_eq!(read_a.event_batches[0].events.len(), 3);
+
+                let read_b = unwrap_read(process(&shard, read_req(agg_b.clone())).await);
+                assert_eq!(read_b.event_batches.len(), 1);
+                assert_eq!(read_b.event_batches[0].events.len(), 2);
+
+                let result = process(&shard, read_req(filler.clone())).await;
+                assert!(matches!(result, Err(ShardError::Read(ShardReadError::AggregateNotExists))));
+
+                shard.close().await;
+            }
+
+            // Round 2: reopen from disk, verify everything survives cold-cache reload.
+            {
+                let shard = open_compact_shard(&dir).await;
+
+                let agg_a = key(1, 1, 1);
+                let agg_b = key(1, 1, 2);
+                let filler = key(1, 1, 99);
+
+                // A must be readable with correct event data.
+                let read_a = unwrap_read(process(&shard, read_req(agg_a.clone())).await);
+                assert_eq!(read_a.event_batches.len(), 1, "A: expected 1 batch after restart");
+                assert_eq!(read_a.event_batches[0].events.len(), 3, "A: expected 3 events after restart");
+
+                // B must be readable with correct event data.
+                let read_b = unwrap_read(process(&shard, read_req(agg_b.clone())).await);
+                assert_eq!(read_b.event_batches.len(), 1, "B: expected 1 batch after restart");
+                assert_eq!(read_b.event_batches[0].events.len(), 2, "B: expected 2 events after restart");
+
+                // Filler must still be deleted.
+                let result = process(&shard, read_req(filler.clone())).await;
+                assert!(matches!(result, Err(ShardError::Read(ShardReadError::AggregateNotExists))),
+                    "filler should still be deleted after restart; got {result:?}");
+
+                // List operations must still work.
+                let orgs = unwrap_list_orgs(process(&shard, list_orgs_req()).await);
+                let org_ids: Vec<u128> = orgs.orgs.iter().map(|o| o.org_id).collect();
+                assert!(org_ids.contains(&1), "org=1 should still be listed after restart; got {org_ids:?}");
+
+                let aggs = unwrap_list_aggs(process(&shard, list_aggs_req(Some(1), Some(1))).await);
+                let agg_ids: Vec<u128> = aggs.aggregates.iter()
+                    .filter(|a| !a.is_deleted)
+                    .map(|a| a.aggregate_id)
+                    .collect();
+                assert!(agg_ids.contains(&1), "agg_a should be listed after restart; got {agg_ids:?}");
+                assert!(agg_ids.contains(&2), "agg_b should be listed after restart; got {agg_ids:?}");
+
+                shard.close().await;
+            }
+        });
+    }
+
+    #[test]
+    fn compact_datablock_positions_updated_correctly() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_compact_shard(&dir).await;
+
+            let agg_a = key(1, 1, 1); // many fat events — deleted, so removed by compaction
+            let agg_b = key(1, 1, 2); // some events — kept
+
+            // Fill segment with A's fat data (dominates the dead ratio after deletion).
+            write_fat(&shard, &agg_a, 35).await;
+
+            // Write fat batches to B — fat events produce Block-type datablocks (not inline).
+            // These will survive compaction, and their datablock_position fields must be updated.
+            write_fat(&shard, &agg_b, 3).await;
+
+            // Delete A so its data becomes dead (>20% of segment).
+            let result = process(&shard, delete_req(agg_a.clone())).await;
+            assert!(matches!(result, Ok(ClientResponse::Delete(_))));
+
+            // Seal and compact.
+            trigger_rotation(&shard).await;
+            let cr = shard.compact_oldest_eligible_segment().await.unwrap()
+                .expect("compaction should run (A's 35 batches dead)");
+            assert_eq!(cr.log_id, 1);
+            assert!(cr.compacted_size < cr.original_size);
+
+            // Open the compacted segment and validate datablock positions.
+            let seg = shard.log_segments_cache.get(cr.log_id).await.unwrap();
+            let (metablocks_start, metablocks_end, file_len) = {
+                let meta = seg.metadata.borrow();
+                (
+                    HEADER_BLOCK_SIZE_BYTES as u64,
+                    meta.readable_metablocks_end(),
+                    meta.file_len,
+                )
+            };
+
+            let guard = seg.lock_reader("test_datablock_positions").await.unwrap();
+            let dma_file = guard.as_ref().unwrap();
+
+            let tail_header_start = file_len - HEADER_BLOCK_SIZE_BYTES as u64;
+
+            let mut datablock_refs: Vec<(u64, u64, u64)> = Vec::new();
+            let result = read_fixed_records_visit_const::<FIXED_BLOCK_SIZE_BYTES, String>(
+                dma_file,
+                false,
+                metablocks_start,
+                metablocks_end,
+                SCAN_CHUNK_SIZE,
+                |_pos, block| {
+                    let mb = deserialise_metablock(block).map_err(|e| format!("deser error: {e:?}"))?;
+
+                    if let DatablockStorageKind::Block(_) = &mb.datablock {
+                        // datablock_position must be after the metablock region.
+                        assert!(
+                            mb.datablock_position >= metablocks_end,
+                            "datablock_position ({}) must be >= metablocks_end ({}) for wal_index {}",
+                            mb.datablock_position, metablocks_end, mb.wal_index
+                        );
+
+                        // datablock_position + compressed_size must be <= tail header start.
+                        assert!(
+                            mb.datablock_position + mb.compressed_size <= tail_header_start,
+                            "datablock at {} + {} = {} exceeds tail header start {} for wal_index {}",
+                            mb.datablock_position, mb.compressed_size,
+                            mb.datablock_position + mb.compressed_size,
+                            tail_header_start, mb.wal_index
+                        );
+
+                        datablock_refs.push((mb.datablock_position, mb.compressed_size, mb.wal_index));
+                    }
+
+                    Ok::<bool, String>(false)
+                },
+            )
+            .await;
+
+            match result {
+                Ok(_) => {}
+                Err(ReadVisitError::Visitor(e)) => {
+                    panic!("metablock validation failed: {e}");
+                }
+                Err(ReadVisitError::Io(e)) => {
+                    panic!("io error during metablock scan: {e:?}");
+                }
+            }
+
+            assert!(!datablock_refs.is_empty(), "expected at least one Block-type datablock after compaction");
+
+            for (pos, size, wal_idx) in &datablock_refs {
+                let buf = dma_file.read_at(*pos, *size as usize).await
+                    .unwrap_or_else(|e| panic!("failed to read datablock at pos={pos} size={size} wal_index={wal_idx}: {e:?}"));
+                assert_eq!(
+                    buf.len(), *size as usize,
+                    "read {} bytes but expected {} for wal_index={wal_idx} at pos={pos}",
+                    buf.len(), size
+                );
+                assert!(
+                    !buf.iter().all(|&b| b == 0),
+                    "datablock at pos={pos} size={size} wal_index={wal_idx} is all zeros — compaction did not write payload"
+                );
+            }
+
+            // Verify datablocks do not overlap each other.
+            datablock_refs.sort_by_key(|(pos, _, _)| *pos);
+            for i in 1..datablock_refs.len() {
+                let (prev_pos, prev_size, prev_idx) = datablock_refs[i - 1];
+                let (cur_pos, _, cur_idx) = datablock_refs[i];
+                assert!(
+                    prev_pos + prev_size <= cur_pos,
+                    "datablocks overlap: [{prev_pos}, {}) and [{cur_pos}, ...) for wal_indices {prev_idx} and {cur_idx}",
+                    prev_pos + prev_size
+                );
+            }
+
+            drop(guard); // release reader lock before process() needs it
+            let read_b = unwrap_read(process(&shard, read_req(agg_b.clone())).await);
+            assert_eq!(read_b.event_batches.len(), 3, "B should have 3 fat batches after compaction");
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn compact_wal_index_gaps_transparent_to_reads() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_compact_shard(&dir).await;
+
+            let agg_a = key(1, 1, 1); // 5 sequential batches — all kept
+            let filler = key(1, 1, 99); // fat data — deleted, creates WAL index gaps
+
+            // Write 5 batches to A first, then bulk filler so filler is interleaved or after.
+            // The key is that after compaction, A's 5 metablocks remain but filler's are gone,
+            // leaving wal_index gaps in the compacted file.
+            write_ok(&shard, write_req(agg_a.clone(), events(2))).await; // batch 1
+            write_ok(&shard, write_req(agg_a.clone(), events(2))).await; // batch 2
+            write_fat(&shard, &filler, 10).await;                        // filler interleaved
+            write_ok(&shard, write_req(agg_a.clone(), events(2))).await; // batch 3
+            write_ok(&shard, write_req(agg_a.clone(), events(2))).await; // batch 4
+            write_fat(&shard, &filler, 20).await;                        // more filler
+            write_ok(&shard, write_req(agg_a.clone(), events(2))).await; // batch 5
+
+            // Delete filler — creates wal_index gaps when filler's metablocks are removed.
+            let result = process(&shard, delete_req(filler.clone())).await;
+            assert!(matches!(result, Ok(ClientResponse::Delete(_))));
+
+            // Seal and compact.
+            trigger_rotation(&shard).await;
+            let cr = shard.compact_oldest_eligible_segment().await.unwrap()
+                .expect("compaction should run (filler dominates dead data)");
+            assert_eq!(cr.log_id, 1);
+            assert!(cr.compacted_size < cr.original_size);
+
+            // Walk the compacted segment and prove wal_index values have gaps.
+            // agg_a's metablocks and filler's SoftDelete tombstone survive; filler's
+            // EventBatchMetadata entries are removed, leaving wal_index gaps.
+            {
+                let seg = shard.log_segments_cache.get(cr.log_id).await.unwrap();
+                let (metablocks_start, metablocks_end) = {
+                    let meta = seg.metadata.borrow();
+                    (HEADER_BLOCK_SIZE_BYTES as u64, meta.readable_metablocks_end())
+                };
+                let guard = seg.lock_reader("test_wal_index_gaps").await.unwrap();
+                let dma_file = guard.as_ref().unwrap();
+
+                let mut wal_indices: Vec<u64> = Vec::new();
+                let scan = read_fixed_records_visit_const::<FIXED_BLOCK_SIZE_BYTES, String>(
+                    dma_file,
+                    false,
+                    metablocks_start,
+                    metablocks_end,
+                    SCAN_CHUNK_SIZE,
+                    |_pos, block| {
+                        let mb = deserialise_metablock(block).map_err(|e| format!("deser error: {e:?}"))?;
+                        wal_indices.push(mb.wal_index);
+                        Ok::<bool, String>(false)
+                    },
+                )
+                .await;
+                match scan {
+                    Ok(_) => {}
+                    Err(ReadVisitError::Visitor(e)) => {
+                        panic!("wal_index scan failed: {e}");
+                    }
+                    Err(ReadVisitError::Io(e)) => {
+                        panic!("io error during wal_index scan: {e:?}");
+                    }
+                }
+
+                // Indices must be strictly ascending.
+                assert!(
+                    wal_indices.windows(2).all(|w| w[1] > w[0]),
+                    "wal_indices in compacted file are not strictly ascending: {wal_indices:?}"
+                );
+
+                // There must be at least one gap (filler metablocks were removed).
+                let has_gap = wal_indices.windows(2).any(|w| w[1] != w[0] + 1);
+                assert!(
+                    has_gap,
+                    "compacted file should have wal_index gaps but indices are contiguous: {wal_indices:?}"
+                );
+            }
+
+            // Read A from batch 0 — should return all 5 batches.
+            let read_all = unwrap_read(process(&shard, read_req_from(agg_a.clone(), 0)).await);
+            assert_eq!(read_all.event_batches.len(), 5, "expected all 5 batches; got {:?}",
+                read_all.event_batches.iter().map(|b| b.event_batch_index).collect::<Vec<_>>());
+            for (i, batch) in read_all.event_batches.iter().enumerate() {
+                assert_eq!(batch.event_batch_index, (i + 1) as u64,
+                    "batch {} should have index {}", i, i + 1);
+                assert_eq!(batch.events.len(), 2, "batch {} should have 2 events", i + 1);
+            }
+
+            // Read A from batch 3 onwards — should return batches 3, 4, 5.
+            let read_from_3 = unwrap_read(process(&shard, read_req_from(agg_a.clone(), 3)).await);
+            assert_eq!(read_from_3.event_batches.len(), 3,
+                "expected batches 3, 4, 5; got {:?}",
+                read_from_3.event_batches.iter().map(|b| b.event_batch_index).collect::<Vec<_>>());
+            assert!(read_from_3.event_batches.iter().all(|b| b.event_batch_index >= 3),
+                "all returned batches should have index >= 3");
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn compact_wal_index_gaps_list_pagination() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            // Use a small page size (3) to force pagination across WAL index gaps.
+            let config = compact_config_small_page(&dir, 3);
+            let shard = ShardWal::open(config, ValidatedNodeStatus::standalone(), StubReplicationClient, StubS3Downloader)
+                .await
+                .unwrap();
+
+            // Create 10 live aggregates.
+            let live_aggs: Vec<AggregateKey> = (1..=10u128).map(|i| key(1, 1, i)).collect();
+            for agg in &live_aggs {
+                write_ok(&shard, write_req(agg.clone(), events(1))).await;
+            }
+
+            // Interleave fat filler aggregates that will be deleted (creates wal_index gaps).
+            let filler_a = key(1, 2, 1);
+            let filler_b = key(1, 2, 2);
+            write_fat(&shard, &filler_a, 15).await;
+            write_fat(&shard, &filler_b, 15).await;
+
+            // Delete filler — dead data now dominates.
+            let result = process(&shard, delete_req(filler_a.clone())).await;
+            assert!(matches!(result, Ok(ClientResponse::Delete(_))));
+            let result = process(&shard, delete_req(filler_b.clone())).await;
+            assert!(matches!(result, Ok(ClientResponse::Delete(_))));
+
+            // Seal and compact.
+            trigger_rotation(&shard).await;
+            let cr = shard.compact_oldest_eligible_segment().await.unwrap()
+                .expect("compaction should run (filler dead data dominates)");
+            assert_eq!(cr.log_id, 1);
+            assert!(cr.compacted_size < cr.original_size);
+
+            // Paginated list_aggs for org=1, type=1 — must find all 10 live aggregates.
+            // With page_size=3, we need up to 4 pages.
+            let mut all_found: Vec<u128> = Vec::new();
+            let mut cursor: Option<u64> = None;
+
+            loop {
+                let resp = unwrap_list_aggs(process(&shard, list_aggs_req_with_cursor(Some(1), Some(1), cursor)).await);
+
+                // Collect non-deleted aggregates.
+                for agg in &resp.aggregates {
+                    if !agg.is_deleted {
+                        all_found.push(agg.aggregate_id);
+                    }
+                }
+
+                cursor = resp.next_cursor;
+                if cursor.is_none() {
+                    break;
+                }
+            }
+
+            // All 10 live aggregates must be found across all pages.
+            all_found.sort_unstable();
+            let expected: Vec<u128> = (1..=10).collect();
+            assert_eq!(all_found, expected,
+                "pagination should find all 10 live aggregates across WAL index gaps; found {all_found:?}");
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn compact_recreated_aggregate_preserves_post_tombstone_data() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+
+            {
+                let shard = open_compact_shard(&dir).await;
+
+                let agg_a = key(1, 1, 1);
+
+                // Segment 1: fill with A's fat data and small B data.
+                write_fat(&shard, &agg_a, 45).await;
+
+                // Keep writing until we actually rotate (available space may vary slightly).
+                let mut i = 1u64;
+                while shard.log_segments_cache.active_log_id() == 1 {
+                    write_ok(&shard, write_req(agg_a.clone(), fat_event(i))).await;
+                    i += 1;
+                }
+                assert!(shard.log_segments_cache.active_log_id() == 2);
+
+                // Segment 2: soft-delete A (allow_recreate=true), then re-create with new events.
+                // Fill segment 2 with extra events pre-delete (compacted later)
+                write_fat(&shard, &agg_a, 40).await;
+                assert_eq!(shard.log_segments_cache.active_log_id(), 2);
+
+                let result = process(&shard, delete_req_full(agg_a.clone(), true, true, None)).await;
+                assert!(matches!(result, Ok(ClientResponse::Delete(_))));
+                write_ok(&shard, write_req(agg_a.clone(), events(3))).await;
+
+                // Seal segment 2.
+                let mut i = 1u64;
+                while shard.log_segments_cache.active_log_id() == 2 {
+                    write_ok(&shard, write_req(agg_a.clone(), fat_event(i))).await;
+                    i += 1;
+                }
+                assert_eq!(shard.log_segments_cache.active_log_id(), 3);
+
+                // Compact segment 1: A's 45 pre-deletion metablocks are dead (tombstone in seg 2).
+                let cr = shard.compact_oldest_eligible_segment().await.unwrap()
+                    .expect("compaction should run (A's 45 fat batches in seg 1 are dead)");
+                assert_eq!(cr.log_id, 1);
+                assert!(cr.compacted_size < cr.original_size);
+
+                // Compact segment 2: 
+                let cr = shard.compact_oldest_eligible_segment().await.unwrap()
+                    .expect("compaction should run for segment file 2");
+                assert_eq!(cr.log_id, 2);
+                assert!(cr.compacted_size < cr.original_size);
+
+                // A's post-recreation events (in seg 2, untouched) are still accessible.
+                let read_a = unwrap_read(process(&shard, read_req(agg_a.clone())).await);
+                assert!(read_a.event_batches.len() > 1);
+                assert!(read_a.event_batches[0].event_batch_index > 1); //continuation of indexing
+                assert_eq!(read_a.event_batches[0].events.len(), 3);
+
+                shard.close().await;
+            }
+
+            // Reopen from disk (empty cache) and re-verify: compacted layout must be durable.
+            {
+                let shard = open_compact_shard(&dir).await;
+
+                let agg_a = key(1, 1, 1);
+
+                let read_a = unwrap_read(process(&shard, read_req(agg_a.clone())).await);
+                assert!(read_a.event_batches.len() > 1);
+                assert!(read_a.event_batches[0].event_batch_index > 1);
+                assert_eq!(read_a.event_batches[0].events.len(), 3);
+
+                shard.close().await;
+            }
+        });
+    }
+
+    /// Two aggregates (A and B) each deleted and recreated twice across multiple log segments.
+    /// After compacting every segment and reopening, both aggregates must return only their
+    /// post-second-recreation events with correct index continuation.
+    #[test]
+    fn compact_multi_delete_recreate_two_aggregates() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+
+            // Helper: seal to the next segment.
+            async fn next_seg<R: ReplicationClient, D: S3Downloader>(
+                shard: &ShardWal<R, D>,
+                filler: &AggregateKey,
+                current: u64,
+            ) {
+                while shard.log_segments_cache.active_log_id() == current {
+                    write_ok(shard, write_req(filler.clone(), fat_event(1))).await;
+                }
+            }
+
+            {
+                let shard = open_compact_shard(&dir).await;
+
+                let agg_a = key(1, 1, 1);
+                let agg_b = key(1, 1, 2);
+                // filler is used purely to drive segment rotation; it will be deleted.
+                let filler = key(9, 9, 9);
+
+                // ── Segment 1 ──────────────────────────────────────────────────────────
+                // Pre-deletion data for A (life 1) and B (life 1).
+                write_fat(&shard, &agg_a, 20).await;
+                write_fat(&shard, &agg_b, 20).await;
+                assert_eq!(shard.log_segments_cache.active_log_id(), 1);
+                next_seg(&shard, &filler, 1).await;
+                assert_eq!(shard.log_segments_cache.active_log_id(), 2);
+
+                // ── Segment 2 ──────────────────────────────────────────────────────────
+                // First delete+recreate for A and B.
+                let r = process(&shard, delete_req_full(agg_a.clone(), true, true, None)).await;
+                assert!(matches!(r, Ok(ClientResponse::Delete(_))));
+                write_ok(&shard, write_req(agg_a.clone(), events(2))).await; // A life 2, batch index continues
+
+                let r = process(&shard, delete_req_full(agg_b.clone(), true, true, None)).await;
+                assert!(matches!(r, Ok(ClientResponse::Delete(_))));
+                write_ok(&shard, write_req(agg_b.clone(), events(4))).await; // B life 2
+
+                // More post-recreation data to also sit in seg 2.
+                write_fat(&shard, &agg_a, 10).await;
+                write_fat(&shard, &agg_b, 10).await;
+                assert_eq!(shard.log_segments_cache.active_log_id(), 2);
+                next_seg(&shard, &filler, 2).await;
+                assert_eq!(shard.log_segments_cache.active_log_id(), 3);
+
+                // ── Segment 3 ──────────────────────────────────────────────────────────
+                // Second delete+recreate for A and B.
+                let r = process(&shard, delete_req_full(agg_a.clone(), true, true, None)).await;
+                assert!(matches!(r, Ok(ClientResponse::Delete(_))));
+                write_ok(&shard, write_req(agg_a.clone(), events(5))).await; // A life 3
+
+                let r = process(&shard, delete_req_full(agg_b.clone(), true, true, None)).await;
+                assert!(matches!(r, Ok(ClientResponse::Delete(_))));
+                write_ok(&shard, write_req(agg_b.clone(), events(7))).await; // B life 3
+
+                next_seg(&shard, &filler, 3).await;
+                assert_eq!(shard.log_segments_cache.active_log_id(), 4);
+
+                // Delete filler so it doesn't interfere with final reads.
+                let r = process(&shard, delete_req_full(filler.clone(), false, false, None)).await;
+                assert!(matches!(r, Ok(ClientResponse::Delete(_))));
+
+                // ── Compact segments 1, 2, 3 ───────────────────────────────────────────
+                // Seg 1: all A and B pre-deletion data is dead (tombstones in seg 2).
+                let cr = shard.compact_oldest_eligible_segment().await.unwrap()
+                    .expect("seg 1 should compact (A+B pre-deletion data is dead)");
+                assert_eq!(cr.log_id, 1);
+                assert!(cr.compacted_size < cr.original_size);
+
+                // Seg 2: A and B life-2 post-recreation data survives; fat batches + tombstones
+                // for second deletion are dead.
+                let cr = shard.compact_oldest_eligible_segment().await.unwrap()
+                    .expect("seg 2 should compact");
+                assert_eq!(cr.log_id, 2);
+                assert!(cr.compacted_size < cr.original_size);
+
+                // Seg 3: filler deletion tombstone + A/B life-3 events survive.
+                let cr = shard.compact_oldest_eligible_segment().await.unwrap()
+                    .expect("seg 3 should compact");
+                assert_eq!(cr.log_id, 3);
+                assert!(cr.compacted_size < cr.original_size);
+
+                // Verify A: only life-3 data visible; index must be > 1 (continuation).
+                let read_a = unwrap_read(process(&shard, read_req(agg_a.clone())).await);
+                assert_eq!(read_a.event_batches[0].events.len(), 5, "A life-3 batch should have 5 events");
+                assert!(read_a.event_batches[0].event_batch_index > 1, "A index must continue past earlier lives");
+
+                // Verify B: only life-3 data visible; index must be > 1 (continuation).
+                let read_b = unwrap_read(process(&shard, read_req(agg_b.clone())).await);
+                assert_eq!(read_b.event_batches[0].events.len(), 7, "B life-3 batch should have 7 events");
+                assert!(read_b.event_batches[0].event_batch_index > 1, "B index must continue past earlier lives");
+
+                shard.close().await;
+            }
+
+            // Reopen and re-verify durability.
+            {
+                let shard = open_compact_shard(&dir).await;
+
+                let agg_a = key(1, 1, 1);
+                let agg_b = key(1, 1, 2);
+
+                let read_a = unwrap_read(process(&shard, read_req(agg_a.clone())).await);
+                assert_eq!(read_a.event_batches[0].events.len(), 5);
+                assert!(read_a.event_batches[0].event_batch_index > 1);
+
+                let read_b = unwrap_read(process(&shard, read_req(agg_b.clone())).await);
+                assert_eq!(read_b.event_batches[0].events.len(), 7);
+                assert!(read_b.event_batches[0].event_batch_index > 1);
+
+                shard.close().await;
+            }
+        });
+    }
+
+    #[test]
+    fn compact_restart_multiple_rounds() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+
+            // Round 1: write data, delete some, seal, compact, close.
+            {
+                let shard = open_compact_shard(&dir).await;
+
+                let agg_keep = key(1, 1, 1);
+                let agg_del = key(2, 2, 2);
+
+                // Fill segment 1 with agg_del fat data (dominates dead ratio after deletion).
+                write_fat(&shard, &agg_del, 40).await;
+
+                // Small write to the keeper.
+                write_ok(&shard, write_req(agg_keep.clone(), events(3))).await;
+
+                // Delete agg_del — creates dead data in segment 1.
+                let result = process(&shard, delete_req(agg_del.clone())).await;
+                assert!(matches!(result, Ok(ClientResponse::Delete(_))));
+
+                // Seal segment 1 by triggering rotation.
+                trigger_rotation(&shard).await;
+                let cr = shard.compact_oldest_eligible_segment().await.unwrap()
+                    .expect("round 1 compaction should run");
+                assert_eq!(cr.log_id, 1);
+                assert!(cr.compacted_size < cr.original_size);
+
+                let read_keep = unwrap_read(process(&shard, read_req(agg_keep.clone())).await);
+                assert_eq!(read_keep.event_batches.len(), 1);
+
+                shard.close().await;
+            }
+
+            // Round 2: reopen, fill a new segment with dead data, compact that, close.
+            // This tests that segment 1 (already compacted) loads correctly on restart,
+            // and that further compaction of other segments doesn't corrupt the state.
+            {
+                let shard = open_compact_shard(&dir).await;
+
+                let agg_keep = key(1, 1, 1);
+                let agg_new = key(3, 3, 3);  // fresh key, never deleted
+                let agg_filler = key(4, 4, 4); // fat filler, will be deleted
+
+                // agg_keep must be readable from the compacted segment 1.
+                let read_keep = unwrap_read(process(&shard, read_req(agg_keep.clone())).await);
+                assert_eq!(read_keep.event_batches.len(), 1, "keeper must survive restart");
+
+                // Write to agg_keep to add another batch.
+                write_ok(&shard, write_req(agg_keep.clone(), events(2))).await;
+
+                // Write new aggregate.
+                write_ok(&shard, write_req(agg_new.clone(), events(1))).await;
+
+                // Fill the current segment with filler fat data, then delete to create dead data.
+                write_fat(&shard, &agg_filler, 40).await;
+                let result = process(&shard, delete_req(agg_filler.clone())).await;
+                assert!(matches!(result, Ok(ClientResponse::Delete(_))));
+
+                // Seal the current segment and compact it.
+                let active_before = shard.log_segments_cache.active_log_id();
+                // Write to a fresh key to trigger rotation without reusing deleted keys.
+                let rotation_filler = key(5, 5, 5);
+                while shard.log_segments_cache.active_log_id() == active_before {
+                    write_ok(&shard, write_req(rotation_filler.clone(), fat_event(1))).await;
+                }
+
+                // Try compacting the newly sealed segment.
+                let _ = shard.compact_oldest_eligible_segment().await.unwrap();
+
+                shard.close().await;
+            }
+
+            // Round 3: reopen from doubly-processed state and verify correctness.
+            {
+                let shard = open_compact_shard(&dir).await;
+
+                let agg_keep = key(1, 1, 1);
+                let agg_del = key(2, 2, 2);
+
+                // Original keeper must still be readable (it had 2 batches by end of round 2).
+                let read_keep = unwrap_read(process(&shard, read_req(agg_keep.clone())).await);
+                assert!(!read_keep.event_batches.is_empty(),
+                    "keeper should still have events after doubly-processed reload");
+
+                // Round 1's deleted aggregate must still be gone.
+                let result = process(&shard, read_req(agg_del.clone())).await;
+                assert!(matches!(result, Err(ShardError::Read(ShardReadError::AggregateNotExists))),
+                    "agg_del should still be deleted; got {result:?}");
+
+                shard.close().await;
+            }
+        });
+    }
 }
+

@@ -6,6 +6,9 @@ TIMEOUT=${1:-60}
 # Per-test timeout overrides (8 benchmark scenarios need more time)
 declare -A TIMEOUT_OVERRIDE
 TIMEOUT_OVERRIDE[batch_main]=300
+TIMEOUT_OVERRIDE[compaction_standalone_main]=120
+TIMEOUT_OVERRIDE[compaction_restart_main]=120
+TIMEOUT_OVERRIDE[compaction_replicated_main]=120
 
 TESTS=(
   single_main
@@ -89,6 +92,10 @@ TESTS=(
   schema_failover_main
   schema_follower_crash_main
   schema_old_leader_recovery_main
+  # --- Compaction ---
+  compaction_standalone_main
+  compaction_restart_main
+  compaction_replicated_main
 )
 
 # Pre-build everything so compilation isn't counted in per-test timeout

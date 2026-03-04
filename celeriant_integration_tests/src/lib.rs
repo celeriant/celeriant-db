@@ -609,6 +609,12 @@ impl ServerConfigExt for ServerConfig {
             args.push("--insecure-allow-plaintext-auth".to_string());
         }
 
+        args.push("--compaction-check-interval-secs".to_string());
+        args.push(self.compaction_check_interval_secs.to_string());
+
+        args.push("--compaction-min-reclaimable-ratio".to_string());
+        args.push(self.compaction_min_reclaimable_ratio.to_string());
+
         args
     }
 }
@@ -1251,6 +1257,78 @@ impl TestPki {
             .map_err(|e| format!("Invalid server name '{}': {e}", server_name))?;
         Ok(ClientTlsConfig::new(client_config, sni))
     }
+}
+
+/// Verify segment file sizes after compaction.
+///
+/// For each `shard_*/` directory under `data_root`:
+/// - Active segment (highest log_id): must be exactly `preallocate_bytes`.
+/// - Sealed segments: at least one must be < `preallocate_bytes` (proof compaction ran).
+///   Segments that didn't meet the reclaimable ratio are left at full size — that is fine.
+///
+/// Panics if no sealed segments are found, or if none of them were compacted.
+pub fn verify_compacted_segment_sizes(
+    data_root: &std::path::Path,
+    label: &str,
+    preallocate_bytes: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for entry in std::fs::read_dir(data_root)? {
+        let entry = entry?;
+        if !entry.file_name().to_string_lossy().starts_with("shard_")
+            || !entry.file_type()?.is_dir()
+        {
+            continue;
+        }
+        let shard_dir = entry.path();
+        let mut segments: Vec<(u64, std::path::PathBuf)> = Vec::new();
+        for file in std::fs::read_dir(&shard_dir)? {
+            let file = file?;
+            let name = file.file_name();
+            let name_str = name.to_string_lossy();
+            if let Some(id_str) = name_str
+                .strip_prefix("log_")
+                .and_then(|s| s.strip_suffix(".wal"))
+            {
+                if let Ok(log_id) = id_str.parse::<u64>() {
+                    segments.push((log_id, file.path()));
+                }
+            }
+        }
+        assert!(!segments.is_empty(), "{}: no .wal files found in {:?}", label, shard_dir);
+        let active_id = segments.iter().map(|(id, _)| *id).max().unwrap();
+        let sealed: Vec<_> = segments.iter().filter(|(id, _)| *id != active_id).collect();
+        assert!(
+            !sealed.is_empty(),
+            "{}: no sealed segments found in {:?} — compaction could not have run",
+            label,
+            shard_dir
+        );
+        let (_, active_path) = segments.iter().find(|(id, _)| *id == active_id).unwrap();
+        let active_size = std::fs::metadata(active_path)?.len();
+        println!("  {}: log_{}.wal (active) = {} bytes", label, active_id, active_size);
+        assert_eq!(
+            active_size,
+            preallocate_bytes,
+            "{}: active segment log_{}.wal is {} bytes, expected {}",
+            label, active_id, active_size, preallocate_bytes
+        );
+        let mut any_compacted = false;
+        for (log_id, path) in &sealed {
+            let size = std::fs::metadata(path)?.len();
+            if size < preallocate_bytes {
+                any_compacted = true;
+                println!("  {}: log_{}.wal (sealed, compacted) = {} bytes", label, log_id, size);
+            } else {
+                println!("  {}: log_{}.wal (sealed, uncompacted) = {} bytes", label, log_id, size);
+            }
+        }
+        assert!(
+            any_compacted,
+            "{}: no sealed segment was compacted in {:?} — compaction did not run",
+            label, shard_dir
+        );
+    }
+    Ok(())
 }
 
 /// Probe whether a node is the leader by attempting a write.

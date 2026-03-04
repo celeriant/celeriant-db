@@ -1,6 +1,6 @@
 use celeriant_wal::constants::HEADER_BLOCK_SIZE_BYTES;
 use lru::LruCache;
-use std::{cell::RefCell, num::NonZeroUsize, path::PathBuf, rc::Rc};
+use std::{cell::RefCell, num::NonZeroUsize, path::{Path, PathBuf}, rc::Rc};
 
 use crate::{errors::{open_or_create_error::OpenOrCreateError, ready_up_error::ReadyUpError}, log_segment_file::{log_segment_cursor::LogSegmentCursor, log_segment_file::LogSegmentFile}};
 
@@ -209,6 +209,23 @@ impl LogSegmentsCache {
             return Some(self.active());
         }
         self.lru_cache.borrow_mut().get(&log_id).cloned()
+    }
+
+    /// Evict a sealed segment from the LRU cache. No-op if not cached or if it's the active file.
+    ///
+    /// Drops the cache's `Rc<LogSegmentFile>` reference. File handles are closed when the last
+    /// `Rc` drops (i.e., when any in-flight reads also release their references).
+    pub fn evict_from_lru(&self, log_id: u64) {
+        // Never evict the active file — it receives writes.
+        if log_id == self.active_log_id() {
+            return;
+        }
+        self.lru_cache.borrow_mut().pop(&log_id);
+    }
+
+    /// Returns the shard data directory path.
+    pub fn shard_dir(&self) -> &Path {
+        &self.shard_dir
     }
 }
 

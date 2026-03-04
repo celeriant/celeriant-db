@@ -230,6 +230,41 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
             }
         }
 
+        // Spawn background compaction timer.
+        {
+            let compaction_interval = self.ctx.config.compaction_check_interval;
+            let shard_id = self.ctx.current_shard_id;
+            let shutdown = self.ctx.shutdown_requested.clone();
+            let shard_wal = self.shard_wal.clone();
+            glommio::spawn_local(async move {
+                loop {
+                    glommio::timer::sleep(compaction_interval).await;
+                    if shutdown.get() { break; }
+                    let started_at = std::time::Instant::now();
+                    match shard_wal.compact_oldest_eligible_segment().await {
+                        Ok(Some(result)) => {
+                            info!(
+                                shard_id,
+                                log_id = result.log_id,
+                                original_size = result.original_size,
+                                compacted_size = result.compacted_size,
+                                bytes_reclaimed = result.original_size.saturating_sub(result.compacted_size),
+                                duration_ms = started_at.elapsed().as_millis(),
+                                "Compaction complete"
+                            );
+                        }
+                        Ok(None) => {
+                            info!(shard_id, "Compaction no-op");
+                        }
+                        Err(e) => {
+                            warn!(shard_id, error = ?e, "Compaction failed");
+                        }
+                    }
+                }
+            })
+            .detach();
+        }
+
         loop {
             if self.should_shutdown() {
                 self.shutdown_requested.set(true);

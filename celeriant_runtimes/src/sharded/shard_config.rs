@@ -85,18 +85,13 @@ pub struct ShardConfig {
     pub max_cluster_time_drift_ms: u64,
     pub max_catchup_gap_bytes: u64,
     pub max_s3_fallback_batch_bytes: u64,
-    /// TLS configuration for both the client and replication listeners.
-    /// `None` means TLS is disabled (plaintext only).
     pub tls_config: Option<Arc<TlsConfig>>,
-    /// Paths for hot-reloading TLS certificates (required when tls_cert_reload_interval > 0).
     pub tls_cert_paths: Option<TlsCertPaths>,
-    /// Client auth mode, stored for use by TlsReloader when rebuilding configs.
     pub tls_client_auth: ClientAuthMode,
-    /// How often to check TLS cert files for mtime changes. Zero means disabled.
     pub tls_cert_reload_interval: std::time::Duration,
-    /// When true, clients must send IdentifyRequest as their first message.
     pub require_client_identity: bool,
-    /// API key hashes for authentication. None means no API key auth.
-    /// Wrapped in RefCell to allow hot-reload without restarting connections.
     pub api_key_hashes: RefCell<Option<Arc<ApiKeyHashes>>>,
+    pub compaction_check_interval: Duration,
+    pub compaction_min_reclaimable_ratio: f64,
+    pub compaction_temp_dir: Option<std::path::PathBuf>,
 }

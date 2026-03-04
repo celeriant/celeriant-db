@@ -444,6 +444,29 @@ pub struct ServerConfig {
         help = "Allow API key auth without TLS (INSECURE - development only)"
     )]
     pub insecure_allow_plaintext_auth: bool,
+
+    #[arg(
+        long,
+        default_value_t = 7200,
+        env = "CELERIANT_COMPACTION_CHECK_INTERVAL_SECS",
+        help = "How often to scan for compaction-eligible segments (seconds). Default: 7200 (2 hours)."
+    )]
+    pub compaction_check_interval_secs: u64,
+
+    #[arg(
+        long,
+        default_value_t = 0.20,
+        env = "CELERIANT_COMPACTION_MIN_RECLAIMABLE_RATIO",
+        help = "Minimum fraction of reclaimable bytes in a segment to trigger compaction. Default: 0.20 (20%)."
+    )]
+    pub compaction_min_reclaimable_ratio: f64,
+
+    #[arg(
+        long,
+        env = "CELERIANT_COMPACTION_TEMP_DIR",
+        help = "Temp directory for in-progress compaction files. Must be on the same filesystem as data_root. Defaults to {shard_dir}/.compaction_tmp/."
+    )]
+    pub compaction_temp_dir: Option<PathBuf>,
 }
 
 impl ServerConfig {
@@ -638,6 +661,9 @@ impl ServerConfig {
             tls_cert_reload_interval: std::time::Duration::from_secs(self.tls_cert_reload_interval_secs),
             require_client_identity: self.require_client_identity,
             api_key_hashes: std::cell::RefCell::new(api_key_hashes),
+            compaction_check_interval: Duration::from_secs(self.compaction_check_interval_secs),
+            compaction_min_reclaimable_ratio: self.compaction_min_reclaimable_ratio,
+            compaction_temp_dir: self.compaction_temp_dir.clone(),
         }
     }
 
@@ -718,6 +744,9 @@ impl ServerConfig {
         check_field!(tls_cert_reload_interval_secs);
         check_field!(require_client_identity);
         check_field!(insecure_allow_plaintext_auth);
+        check_field!(compaction_check_interval_secs);
+        check_field!(compaction_min_reclaimable_ratio);
+        check_field!(compaction_temp_dir);
 
         entries
     }
@@ -797,6 +826,9 @@ impl Default for ServerConfig {
             tls_cert_reload_interval_secs: 0,
             require_client_identity: false,
             insecure_allow_plaintext_auth: false,
+            compaction_check_interval_secs: 7200,
+            compaction_min_reclaimable_ratio: 0.20,
+            compaction_temp_dir: None,
         }
     }
 }

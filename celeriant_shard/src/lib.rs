@@ -15,3 +15,4 @@ pub mod shard_wal_sync;
 pub mod s3_uploader;
 pub mod s3_downloader;
 pub mod shard_wal_s3_catchup;
+pub mod shard_wal_compact;

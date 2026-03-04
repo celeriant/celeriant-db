@@ -46,6 +46,17 @@ impl LogSegmentFileMetadata {
     pub fn is_pending_advance(&self) -> bool {
         self.read.is_none() || self.write.wal_index > self.read.as_ref().unwrap().wal_index
     }
+
+    /// Returns the end of the readable metablock region.
+    /// Uses the read cursor if available (fully replicated), otherwise falls back to the write
+    /// cursor (segment opened but not yet advanced). This is the correct upper bound for any
+    /// forward or reverse scan of committed data.
+    pub fn readable_metablocks_end(&self) -> u64 {
+        match &self.read {
+            Some(r) => r.metablocks_position,
+            None => self.write.metablocks_position,
+        }
+    }
 }
 
 #[cfg(test)]

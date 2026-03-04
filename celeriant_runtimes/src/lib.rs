@@ -3,14 +3,14 @@ use std::time::Duration;
 
 use celeriant_distributed::lease_manager::LeaseManager;
 use celeriant_distributed::validated_node_status::ValidatedNodeStatus;
-use celeriant_shard::{internal_shard_config::InternalShardConfig, replication_client::FollowerConnection, shard_wal::ShardWal};
+use celeriant_shard::{internal_shard_config::InternalShardConfig, replication_client::FollowerConnection, shard_wal::ShardWal, shard_wal_compact::cleanup_orphaned_compacting_files};
 use celeriant_sidecar::store::SidecarStoreTrait;
 use glommio::{
     CpuSet, LocalExecutorPoolBuilder, PoolPlacement,
     channels::channel_mesh::{Full, MeshBuilder},
     enclose, net::TcpListener,
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{sharded::{intrashard_messages::IntrashardMessages, shard::Shard}, sidecar::{sidecar_channels::{SidecarSenders, create_sidecar_channel}, sidecar_lease_storage::SidecarLeaseStorage, sidecar_runtime::SidecarRuntime, sidecar_s3_downloader::SidecarS3Downloader, sidecar_s3_uploader::SidecarS3Uploader}};
 
@@ -67,6 +67,9 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                     .expect(&format!("Failed to bind replication TCP listener to {} - cannot initialize shard", replication_bind_address));
 
                 let shard_dir = shard_config.data_root.join(format!("shard_{current_shard_id}"));
+                let compaction_temp_dir = shard_config.compaction_temp_dir
+                    .clone()
+                    .unwrap_or_else(|| shard_dir.join(".compaction_tmp"));
                 let internal_shard_config = InternalShardConfig {
                     shard_log_preallocate_bytes: shard_config.shard_log_preallocate_bytes,
                     node_id,
@@ -92,6 +95,9 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                     max_cluster_time_drift_ms: shard_config.max_cluster_time_drift_ms,
                     max_catchup_gap_bytes: shard_config.max_catchup_gap_bytes,
                     max_s3_fallback_batch_bytes: shard_config.max_s3_fallback_batch_bytes,
+                    compaction_check_interval: shard_config.compaction_check_interval,
+                    compaction_min_reclaimable_ratio: shard_config.compaction_min_reclaimable_ratio,
+                    compaction_temp_dir,
                 };
                 let s3_uploader = SidecarS3Uploader::new(sidecar_senders.clone());
                 let replication_client_config = shard_config.tls_config.as_ref()
@@ -113,6 +119,16 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                 } else {
                     ValidatedNodeStatus::standalone()
                 };
+                // Create compaction temp dir and clean up any orphaned .compacting files
+                // from a previous crashed compaction before opening the WAL.
+                if let Err(e) = std::fs::create_dir_all(&internal_shard_config.compaction_temp_dir) {
+                    error!(shard_id = current_shard_id, error = ?e, "Failed to create compaction temp dir");
+                    panic!("Cannot start shard without compaction temp dir: {:?}", e);
+                }
+                if let Err(e) = cleanup_orphaned_compacting_files(&internal_shard_config.compaction_temp_dir) {
+                    warn!(shard_id = current_shard_id, error = ?e, "Failed to clean up orphaned compaction temp files");
+                }
+
                 info!(shard_id = current_shard_id, "Opening WAL");
                 let filesystem = match ShardWal::open(internal_shard_config, validated_node_status, replication_client, s3_downloader).await {
                     Ok(wal) => {
