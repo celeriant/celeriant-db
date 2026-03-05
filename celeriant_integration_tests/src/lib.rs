@@ -24,7 +24,6 @@ use std::path::PathBuf;
 
 use celeriant_client_tokio::ClientTlsConfig;
 use celeriant_crypto::pki::PkiManager;
-use celeriant_lib::server_config::ConfigTlsMode;
 use rustls_pki_types::ServerName;
 use tempfile::TempDir;
 use tokio::net::TcpStream;
@@ -318,37 +317,27 @@ impl TestServer {
 
     /// Poll until the server is accepting connections.
     ///
-    /// For plaintext servers, uses a bare TCP connect probe.
-    /// For TLS-strict servers, avoids TCP probing (which triggers spurious
-    /// "TLS handshake failed" errors) and instead waits for the process to
-    /// start listening by checking process liveness + a port probe via /proc/net.
+    /// Uses a TCP connect probe to confirm the server's accept loop is running.
+    /// For TLS-strict servers this triggers a one-time "TLS handshake failed"
+    /// warning in the server log — this is harmless. A passive /proc/net/tcp
+    /// LISTEN check is insufficient because it fires as soon as listen() is
+    /// called, before the Glommio event loop starts accepting.
     async fn poll_ready(
         address: &str,
         child: &mut Child,
-        config: &ServerConfig,
+        _config: &ServerConfig,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let start = std::time::Instant::now();
         let max_wait = Duration::from_secs(30);
-        let tls_strict = matches!(config.tls_mode, ConfigTlsMode::Strict);
 
         while start.elapsed() < max_wait {
             if let Ok(Some(status)) = child.try_wait() {
                 return Err(format!("Server exited during startup: {}", status).into());
             }
 
-            if tls_strict {
-                // For TLS servers, probe whether the port is in LISTEN state
-                // without completing a TCP handshake (which would cause the server
-                // to start a TLS handshake we can't complete without client certs).
-                if port_is_listening(config.client_port) {
-                    return Ok(());
-                }
-                sleep(Duration::from_millis(100)).await;
-            } else {
-                match TcpStream::connect(address).await {
-                    Ok(_) => return Ok(()),
-                    Err(_) => sleep(Duration::from_millis(100)).await,
-                }
+            match TcpStream::connect(address).await {
+                Ok(_) => return Ok(()),
+                Err(_) => sleep(Duration::from_millis(100)).await,
             }
         }
 
@@ -363,23 +352,6 @@ impl Drop for TestServer {
         let _ = self.child.wait();
         println!("  Test server shut down");
     }
-}
-
-/// Check if a port is in LISTEN state by probing /proc/net/tcp.
-/// This avoids completing a TCP handshake, which is important for TLS servers
-/// where a bare TCP connect + drop triggers spurious TLS errors.
-fn port_is_listening(port: u16) -> bool {
-    let hex_port = format!("{:04X}", port);
-    let Ok(contents) = std::fs::read_to_string("/proc/net/tcp") else {
-        return false;
-    };
-    // /proc/net/tcp format: local_address (hex IP:PORT) state (0A = LISTEN)
-    contents.lines().skip(1).any(|line| {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        parts.len() >= 4
-            && parts[1].ends_with(&format!(":{}", hex_port))
-            && parts[3] == "0A"
-    })
 }
 
 /// Take stdout from a child process and spawn a thread that prints each line with a label prefix.
