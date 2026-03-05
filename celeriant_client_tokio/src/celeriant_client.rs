@@ -32,7 +32,7 @@ impl ClientTlsConfig {
     }
 }
 
-enum ClientStream {
+pub(crate) enum ClientStream {
     Plain(Compat<TcpStream>),
     Tls(Compat<tokio_rustls::client::TlsStream<TcpStream>>),
 }
@@ -85,6 +85,41 @@ impl futures_util::io::AsyncWrite for ClientStream {
 
 impl Unpin for ClientStream {}
 
+/// Establish a TCP/TLS connection, returning a raw ClientStream.
+/// Shared by CeleriantClient and WatchConnection.
+pub(crate) async fn connect_stream(
+    address: &str,
+    connection_timeout: Option<Duration>,
+    tls_config: Option<&ClientTlsConfig>,
+) -> Result<ClientStream, ClientError> {
+    let connect_future = TcpStream::connect(address);
+
+    let tcp = if let Some(duration) = connection_timeout {
+        timeout(duration, connect_future)
+            .await
+            .map_err(|_| ClientError::ConnectionTimeout)?
+            .map_err(ClientError::ConnectionFailed)?
+    } else {
+        connect_future
+            .await
+            .map_err(ClientError::ConnectionFailed)?
+    };
+
+    tcp.set_nodelay(true).map_err(ClientError::ConnectionFailed)?;
+
+    match tls_config {
+        None => Ok(ClientStream::Plain(tcp.compat())),
+        Some(cfg) => {
+            let tls = cfg
+                .connector
+                .connect(cfg.server_name.clone(), tcp)
+                .await
+                .map_err(ClientError::ConnectionFailed)?;
+            Ok(ClientStream::Tls(tls.compat()))
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ClientIdentityConfig {
     pub public_key: Option<String>,
@@ -124,33 +159,7 @@ impl CeleriantClient {
         connection_timeout: Option<Duration>,
         tls_config: Option<ClientTlsConfig>,
     ) -> Result<Self, ClientError> {
-        let connect_future = TcpStream::connect(address);
-
-        let tcp = if let Some(duration) = connection_timeout {
-            timeout(duration, connect_future)
-                .await
-                .map_err(|_| ClientError::ConnectionTimeout)?
-                .map_err(ClientError::ConnectionFailed)?
-        } else {
-            connect_future
-                .await
-                .map_err(ClientError::ConnectionFailed)?
-        };
-
-        // Set TCP_NODELAY to disable Nagle's algorithm
-        tcp.set_nodelay(true).map_err(ClientError::ConnectionFailed)?;
-
-        let stream = match tls_config {
-            None => ClientStream::Plain(tcp.compat()),
-            Some(cfg) => {
-                let tls = cfg
-                    .connector
-                    .connect(cfg.server_name, tcp)
-                    .await
-                    .map_err(ClientError::ConnectionFailed)?;
-                ClientStream::Tls(tls.compat())
-            }
-        };
+        let stream = connect_stream(address, connection_timeout, tls_config.as_ref()).await?;
 
         Ok(Self {
             stream,

@@ -30,6 +30,10 @@ name = "watch_test_main"
 path = "src/watch_test_main.rs"
 
 [[bin]]
+name = "multi_shard_watch_test_main"
+path = "src/multi_shard_watch_test_main.rs"
+
+[[bin]]
 name = "s3_fallback_main"
 path = "src/s3_fallback_main.rs"
 

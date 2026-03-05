@@ -22,6 +22,8 @@ use celeriant_shard::error::{
 };
 use celeriant_watch::aggregate_reader::WatchReadError;
 
+use super::connection_handler::ShardRoutingError;
+
 // Error codes as a cross-language u32 enum.
 // Each ShardError leaf variant gets a unique code.
 
@@ -96,6 +98,11 @@ const WATCH_READ_IO: u32 = 8002;
 const WATCH_READ_SERIALIZATION: u32 = 8003;
 const WATCH_READ_OTHER: u32 = 8004;
 
+// Shard routing errors: 9xxx
+pub const SHARD_ROUTING_NO_KEY: u32 = 9000;
+pub const SHARD_ROUTING_MULTIPLE_SHARDS: u32 = 9001;
+pub const SHARD_ROUTING_INCOMPATIBLE_FILTERS: u32 = 9002;
+
 // Identify errors: 10xxx
 pub const IDENTIFY_INVALID_NONCE: u32 = 10001;
 pub const IDENTIFY_INVALID_SIGNATURE: u32 = 10002;
@@ -145,6 +152,20 @@ pub fn watch_read_error_to_client_response(correlation_id: Option<u128>, error: 
         WatchReadError::Other(msg) => (WATCH_READ_OTHER, format!(r#"{{"detail":{}}}"#, json_string(&msg))),
     };
     ClientResponse::GenericError(ErrorResponse { correlation_id, error_code, error_message })
+}
+
+pub fn shard_routing_error_to_code(error: ShardRoutingError) -> (u32, String) {
+    match error {
+        ShardRoutingError::NoRoutingKeyProvided => (SHARD_ROUTING_NO_KEY, "{}".into()),
+        ShardRoutingError::MultipleShardRoutes { num_shards } => (
+            SHARD_ROUTING_MULTIPLE_SHARDS,
+            format!(r#"{{"num_shards":{}}}"#, num_shards),
+        ),
+        ShardRoutingError::IncompatibleFilters { detail, num_shards } => (
+            SHARD_ROUTING_INCOMPATIBLE_FILTERS,
+            format!(r#"{{"detail":{},"num_shards":{}}}"#, json_string(&detail), num_shards),
+        ),
+    }
 }
 
 fn read_error(e: ShardReadError) -> (u32, String) {

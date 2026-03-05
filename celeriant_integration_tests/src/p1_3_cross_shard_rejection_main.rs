@@ -87,7 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Test that writing to aggregates on different shards is rejected with error code 400
+/// Test that writing to aggregates on different shards is rejected with error code 9002
 async fn test_cross_shard_write_rejection(
     server_address: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -146,21 +146,15 @@ async fn test_cross_shard_write_rejection(
             println!("  Received error code: {}", err_resp.error_code);
             println!("  Error message: {}", err_resp.error_message);
 
-            if err_resp.error_code != 400 {
+            if err_resp.error_code != 9002 {
                 return Err(format!(
-                    "Expected error code 400, got {}",
+                    "Expected error code 9002 (SHARD_ROUTING_INCOMPATIBLE_FILTERS), got {}",
                     err_resp.error_code
                 )
                 .into());
             }
 
-            if !err_resp
-                .error_message
-                .contains("Shard routing error")
-                || !err_resp
-                    .error_message
-                    .contains("spans multiple shards")
-            {
+            if !err_resp.error_message.contains("spans multiple shards") {
                 return Err(format!(
                     "Error message doesn't match expected pattern. Got: {}",
                     err_resp.error_message

@@ -99,6 +99,7 @@ pub struct SingleAggregateDelete {
 pub struct WatchRequest {
     pub correlation_id: Option<u128>,
     pub requested_latency_ms: Option<u64>,
+    pub shard_id: Option<u64>,
     pub orgs: Option<HashSet<u128>>,
     pub aggregate_types: Option<HashSet<u128>>,
     pub aggregates: Option<HashSet<u128>>,

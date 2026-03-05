@@ -291,6 +291,7 @@ mod tests {
                 let watch_request = WatchRequest {
                     correlation_id: None,
                     requested_latency_ms: None,
+                    shard_id: None,
                     orgs: None,
                     aggregate_types: None,
                     aggregates: None,
@@ -361,6 +362,7 @@ mod tests {
                 let watch_request = WatchRequest {
                     correlation_id: None,
                     requested_latency_ms: None,
+                    shard_id: None,
                     orgs: None,
                     aggregate_types: None,
                     aggregates: None,
@@ -401,6 +403,7 @@ mod tests {
                 let watch_request = WatchRequest {
                     correlation_id: None,
                     requested_latency_ms: None,
+                    shard_id: None,
                     orgs: None,
                     aggregate_types: None,
                     aggregates: None,

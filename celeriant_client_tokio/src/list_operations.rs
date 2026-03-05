@@ -29,7 +29,7 @@ pub struct ListOptions {
 /// Helper to detect shard routing errors (indicates invalid shard_id)
 fn is_shard_routing_error(error: &ClientError) -> bool {
     if let ClientError::CeleriantError(e) = error {
-        e.error_message.to_lowercase().contains("shard routing error")
+        e.error_code == 9001 || e.error_code == 9002
     } else {
         false
     }

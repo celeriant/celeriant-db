@@ -30,6 +30,7 @@ mod tests {
         WatchRequest {
             correlation_id: Some(1),
             requested_latency_ms: None,
+            shard_id: None,
             orgs: None,
             aggregate_types: None,
             aggregates: None,

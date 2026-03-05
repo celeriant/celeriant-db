@@ -25,7 +25,7 @@ use tracing::{info, warn};
 use super::{
     intrashard_messages::IntrashardMessages,
     shard_config::ShardConfig,
-    shard_error_response::{shard_error_to_client_response, shard_error_to_cluster_response, watch_read_error_to_client_response, watch_session_error_to_client_response, IDENTIFY_INVALID_NONCE, IDENTIFY_INVALID_SIGNATURE, IDENTIFY_MISMATCH, IDENTIFY_REQUIRED},
+    shard_error_response::{shard_error_to_client_response, shard_error_to_cluster_response, shard_routing_error_to_code, watch_read_error_to_client_response, watch_session_error_to_client_response, IDENTIFY_INVALID_NONCE, IDENTIFY_INVALID_SIGNATURE, IDENTIFY_MISMATCH, IDENTIFY_REQUIRED},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,16 +78,16 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
 #[derive(Debug)]
 pub enum ShardRoutingError {
     NoRoutingKeyProvided,
-    MultipleShardRoutes,
-    IncompatibleFilters(String),
+    MultipleShardRoutes { num_shards: u64 },
+    IncompatibleFilters { detail: String, num_shards: u64 },
 }
 
 impl fmt::Display for ShardRoutingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ShardRoutingError::NoRoutingKeyProvided => write!(f, "no routing key provided"),
-            ShardRoutingError::MultipleShardRoutes => write!(f, "request routes to multiple shards"),
-            ShardRoutingError::IncompatibleFilters(details) => write!(f, "incompatible filters: {}", details),
+            ShardRoutingError::MultipleShardRoutes { num_shards } => write!(f, "request routes to multiple shards (num_shards={})", num_shards),
+            ShardRoutingError::IncompatibleFilters { detail, num_shards } => write!(f, "incompatible filters: {} (num_shards={})", detail, num_shards),
         }
     }
 }
@@ -159,9 +159,12 @@ pub fn handle_new_connection<R: ReplicationClient + 'static, D: S3Downloader + '
 
                 match check_client_redirect(tcp_stream, request, ctx.config.max_response_size, ctx.config.server_compression_algorithm, message_version, &ctx, &conn_state).await {
                     ClientRedirectResult::ProcessLocally(request, tcp_stream) => {
-                        handle_client_pipelining(tcp_stream, request, ctx.config.max_response_size, ctx.config.server_compression_algorithm, message_version, ctx, conn_state).await;
+                        handle_client_pipelining(tcp_stream, Some(request), ctx.config.max_response_size, ctx.config.server_compression_algorithm, message_version, ctx, conn_state).await;
                     }
-                    ClientRedirectResult::Redirected | ClientRedirectResult::ErrorSentContinue(_) => {}
+                    ClientRedirectResult::Redirected => {}
+                    ClientRedirectResult::ErrorSentContinue(tcp_stream) => {
+                        handle_client_pipelining(tcp_stream, None, ctx.config.max_response_size, ctx.config.server_compression_algorithm, message_version, ctx, conn_state).await;
+                    }
                 }
             }
             PortType::Replication => {
@@ -172,9 +175,12 @@ pub fn handle_new_connection<R: ReplicationClient + 'static, D: S3Downloader + '
 
                 match check_cluster_redirect(tcp_stream, request, ctx.config.max_response_size, ctx.config.server_compression_algorithm, message_version, &ctx).await {
                     ClusterRedirectResult::ProcessLocally(request, tcp_stream) => {
-                        handle_cluster_pipelining(tcp_stream, request, ctx.config.max_response_size, ctx.config.server_compression_algorithm, message_version, ctx).await;
+                        handle_cluster_pipelining(tcp_stream, Some(request), ctx.config.max_response_size, ctx.config.server_compression_algorithm, message_version, ctx).await;
                     }
-                    ClusterRedirectResult::Redirected | ClusterRedirectResult::ErrorSentContinue(_) => {}
+                    ClusterRedirectResult::Redirected => {}
+                    ClusterRedirectResult::ErrorSentContinue(tcp_stream) => {
+                        handle_cluster_pipelining(tcp_stream, None, ctx.config.max_response_size, ctx.config.server_compression_algorithm, message_version, ctx).await;
+                    }
                 }
             }
         }
@@ -196,7 +202,7 @@ pub fn handle_redirected_client_connection<R: ReplicationClient + 'static, D: S3
 
     glommio::spawn_local(async move {
         let conn_state = ConnectionState { verified_client_id, access_level };
-        handle_client_pipelining(tcp_stream, request, max_response_size, server_compression_algorithm, message_version, ctx, conn_state).await;
+        handle_client_pipelining(tcp_stream, Some(request), max_response_size, server_compression_algorithm, message_version, ctx, conn_state).await;
     })
     .detach();
 }
@@ -212,7 +218,7 @@ pub fn handle_redirected_cluster_connection<R: ReplicationClient + 'static, D: S
     let _ = tcp_stream.set_nodelay(true);
 
     glommio::spawn_local(async move {
-        handle_cluster_pipelining(tcp_stream, request, max_response_size, server_compression_algorithm, message_version, ctx).await;
+        handle_cluster_pipelining(tcp_stream, Some(request), max_response_size, server_compression_algorithm, message_version, ctx).await;
     })
     .detach();
 }
@@ -232,14 +238,14 @@ pub fn handle_enter_s3_catchup<R: ReplicationClient + 'static, D: S3Downloader +
 
 async fn handle_client_pipelining<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
     mut tcp_stream: TcpStream,
-    request: ClientRequest,
+    request: Option<ClientRequest>,
     max_response_size: u64,
     server_compression_algorithm: CompressionType,
     mut message_version: u32,
     ctx: ConnectionContext<R, D, S>,
     conn_state: ConnectionState,
 ) {
-    let mut optional_request = Some(request);
+    let mut optional_request = request;
 
     loop {
         if ctx.shutdown_requested.get() {
@@ -304,13 +310,13 @@ async fn handle_client_pipelining<R: ReplicationClient + 'static, D: S3Downloade
 
 async fn handle_cluster_pipelining<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
     mut tcp_stream: TcpStream,
-    request: ClusterRequest,
+    request: Option<ClusterRequest>,
     max_response_size: u64,
     server_compression_algorithm: CompressionType,
     mut message_version: u32,
     ctx: ConnectionContext<R, D, S>,
 ) {
-    let mut optional_request = Some(request);
+    let mut optional_request = request;
 
     loop {
         if ctx.shutdown_requested.get() {
@@ -352,6 +358,8 @@ async fn handle_cluster_pipelining<R: ReplicationClient + 'static, D: S3Download
         }
     }
 }
+
+
 
 /// Handle IdentifyRequest during connection handshake.
 /// Validates nonce and signature, derives client_id, and validates API key if configured.
@@ -482,10 +490,11 @@ async fn check_client_redirect<R: ReplicationClient + 'static, D: S3Downloader +
     let target_shard = match determine_client_shard(&request, &ctx.config) {
         Ok(idx) => idx,
         Err(e) => {
+            let (error_code, error_message) = shard_routing_error_to_code(e);
             let response = ClientResponse::GenericError(ErrorResponse {
                 correlation_id: request.correlation_id(),
-                error_code: 400,
-                error_message: format!("Shard routing error: {}", e),
+                error_code,
+                error_message,
             });
             let _ = write_client_response_with_timeout(&mut tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
             return ClientRedirectResult::ErrorSentContinue(tcp_stream);
@@ -520,10 +529,11 @@ async fn check_cluster_redirect<R: ReplicationClient + 'static, D: S3Downloader 
     let target_shard = match determine_cluster_shard(&request, &ctx.config) {
         Ok(idx) => idx,
         Err(e) => {
+            let (error_code, error_message) = shard_routing_error_to_code(e);
             let response = ClusterResponse::GenericError(ErrorResponse {
                 correlation_id: request.correlation_id(),
-                error_code: 400,
-                error_message: format!("Shard routing error: {}", e),
+                error_code,
+                error_message,
             });
             let _ = write_cluster_response_with_timeout(&mut tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
             return ClusterRedirectResult::ErrorSentContinue(tcp_stream);
@@ -580,10 +590,13 @@ pub fn determine_cluster_shard(
 
 fn validate_shard_id(shard_id: u64, num_shards: u128) -> Result<usize, ShardRoutingError> {
     if (shard_id as u128) >= num_shards {
-        return Err(ShardRoutingError::IncompatibleFilters(format!(
-            "Invalid shard_id {}. Must be less than {} (total number of shards).",
-            shard_id, num_shards
-        )));
+        return Err(ShardRoutingError::IncompatibleFilters {
+            detail: format!(
+                "Invalid shard_id {}. Must be less than {} (total number of shards).",
+                shard_id, num_shards
+            ),
+            num_shards: num_shards as u64,
+        });
     }
     Ok(shard_id as usize)
 }
@@ -595,9 +608,10 @@ fn determine_shard_write(
     let num_shards = config.num_shards as u128;
 
     if req.writes.is_empty() {
-        return Err(ShardRoutingError::IncompatibleFilters(
-            "Write request must contain at least one write operation.".into(),
-        ));
+        return Err(ShardRoutingError::IncompatibleFilters {
+            detail: "Write request must contain at least one write operation.".into(),
+            num_shards: num_shards as u64,
+        });
     }
 
     let mut shard_ids: std::collections::HashSet<usize> = std::collections::HashSet::new();
@@ -607,10 +621,13 @@ fn determine_shard_write(
     }
 
     if shard_ids.len() > 1 {
-        return Err(ShardRoutingError::IncompatibleFilters(format!(
-            "Write request spans multiple shards. All writes must route to the same shard when using {} routing.",
-            config.routing_rule
-        )));
+        return Err(ShardRoutingError::IncompatibleFilters {
+            detail: format!(
+                "Write request spans multiple shards. All writes must route to the same shard when using {} routing.",
+                config.routing_rule
+            ),
+            num_shards: num_shards as u64,
+        });
     }
 
     Ok(shard_ids.into_iter().next().unwrap())
@@ -623,9 +640,10 @@ fn determine_shard_delete(
     let num_shards = config.num_shards as u128;
 
     if req.deletes.is_empty() {
-        return Err(ShardRoutingError::IncompatibleFilters(
-            "Delete request must contain at least one delete operation.".into(),
-        ));
+        return Err(ShardRoutingError::IncompatibleFilters {
+            detail: "Delete request must contain at least one delete operation.".into(),
+            num_shards: num_shards as u64,
+        });
     }
 
     let mut shard_ids: std::collections::HashSet<usize> = std::collections::HashSet::new();
@@ -635,10 +653,13 @@ fn determine_shard_delete(
     }
 
     if shard_ids.len() > 1 {
-        return Err(ShardRoutingError::IncompatibleFilters(format!(
-            "Delete request spans multiple shards. All delete must route to the same shard when using {} routing.",
-            config.routing_rule
-        )));
+        return Err(ShardRoutingError::IncompatibleFilters {
+            detail: format!(
+                "Delete request spans multiple shards. All delete must route to the same shard when using {} routing.",
+                config.routing_rule
+            ),
+            num_shards: num_shards as u64,
+        });
     }
 
     Ok(shard_ids.into_iter().next().unwrap())
@@ -648,30 +669,37 @@ fn determine_shard_watch(
     req: &WatchRequest,
     config: &ShardConfig,
 ) -> Result<usize, ShardRoutingError> {
+    if let Some(shard_id) = req.shard_id {
+        return validate_shard_id(shard_id, config.num_shards as u128);
+    }
+
     let num_shards = config.num_shards as u128;
 
     match config.routing_rule {
         crate::RoutingRule::OrgId => {
             if req.orgs.is_none() || req.orgs.as_ref().unwrap().is_empty() {
-                return Err(ShardRoutingError::IncompatibleFilters(
-                    "Must specify at least one organisation. Server is setup to shard by organisation.".into()
-                ));
+                return Err(ShardRoutingError::IncompatibleFilters {
+                    detail: "Must specify at least one organisation. Server is setup to shard by organisation.".into(),
+                    num_shards: num_shards as u64,
+                });
             }
             collect_unique_shard_id(num_shards, &req.orgs)
         }
         crate::RoutingRule::AggregateTypeId => {
             if req.aggregate_types.is_none() || req.aggregate_types.as_ref().unwrap().is_empty() {
-                return Err(ShardRoutingError::IncompatibleFilters(
-                    "Must specify at least one aggregate type. Server is setup to shard by aggregate type.".into()
-                ));
+                return Err(ShardRoutingError::IncompatibleFilters {
+                    detail: "Must specify at least one aggregate type. Server is setup to shard by aggregate type.".into(),
+                    num_shards: num_shards as u64,
+                });
             }
             collect_unique_shard_id(num_shards, &req.aggregate_types)
         }
         crate::RoutingRule::AggregateId => {
             if req.aggregates.is_none() || req.aggregates.as_ref().unwrap().is_empty() {
-                return Err(ShardRoutingError::IncompatibleFilters(
-                    "Must specify at least one aggregate. Server is setup to shard by aggregate.".into()
-                ));
+                return Err(ShardRoutingError::IncompatibleFilters {
+                    detail: "Must specify at least one aggregate. Server is setup to shard by aggregate.".into(),
+                    num_shards: num_shards as u64,
+                });
             }
             collect_unique_shard_id(num_shards, &req.aggregates)
         }
@@ -690,7 +718,7 @@ fn collect_unique_shard_id(
         match shard_id {
             None => shard_id = Some(computed_shard),
             Some(existing) if existing != computed_shard => {
-                return Err(ShardRoutingError::MultipleShardRoutes);
+                return Err(ShardRoutingError::MultipleShardRoutes { num_shards: num_shards as u64 });
             }
             Some(_) => {}
         }
@@ -1226,7 +1254,7 @@ mod tests {
             batches: vec![],
         });
         let result = determine_cluster_shard(&request, &config);
-        assert!(matches!(result, Err(ShardRoutingError::IncompatibleFilters(_))));
+        assert!(matches!(result, Err(ShardRoutingError::IncompatibleFilters { .. })));
     }
 
     // --- Client shard routing (list, write, delete, watch) ---
@@ -1357,7 +1385,7 @@ mod tests {
             writes,
         });
         let result = determine_client_shard(&request, &config);
-        assert!(matches!(result, Err(ShardRoutingError::IncompatibleFilters(_))));
+        assert!(matches!(result, Err(ShardRoutingError::IncompatibleFilters { .. })));
     }
 
     #[test]
@@ -1370,7 +1398,7 @@ mod tests {
             writes: HashMap::new(),
         });
         let result = determine_client_shard(&request, &config);
-        assert!(matches!(result, Err(ShardRoutingError::IncompatibleFilters(_))));
+        assert!(matches!(result, Err(ShardRoutingError::IncompatibleFilters { .. })));
     }
 
     #[test]
@@ -1403,7 +1431,7 @@ mod tests {
             deletes: HashMap::new(),
         });
         let result = determine_client_shard(&request, &config);
-        assert!(matches!(result, Err(ShardRoutingError::IncompatibleFilters(_))));
+        assert!(matches!(result, Err(ShardRoutingError::IncompatibleFilters { .. })));
     }
 
     #[test]
@@ -1429,11 +1457,12 @@ mod tests {
         orgs.insert(5u128);
         let request = ClientRequest::Watch(WatchRequest {
             correlation_id: None,
+            requested_latency_ms: None,
+            shard_id: None,
             orgs: Some(orgs),
             aggregate_types: None,
             aggregates: None,
             operation_types: None,
-            requested_latency_ms: None,
         });
         let shard = determine_client_shard(&request, &config).unwrap();
         assert_eq!(shard, 1); // 5 % 4 = 1
@@ -1444,14 +1473,15 @@ mod tests {
         let config = test_config(4, crate::RoutingRule::OrgId);
         let request = ClientRequest::Watch(WatchRequest {
             correlation_id: None,
+            requested_latency_ms: None,
+            shard_id: None,
             orgs: None,
             aggregate_types: None,
             aggregates: None,
             operation_types: None,
-            requested_latency_ms: None,
         });
         let result = determine_client_shard(&request, &config);
-        assert!(matches!(result, Err(ShardRoutingError::IncompatibleFilters(_))));
+        assert!(matches!(result, Err(ShardRoutingError::IncompatibleFilters { .. })));
     }
 
     #[test]
@@ -1461,11 +1491,12 @@ mod tests {
         agg_types.insert(7u128);
         let request = ClientRequest::Watch(WatchRequest {
             correlation_id: None,
+            requested_latency_ms: None,
+            shard_id: None,
             orgs: None,
             aggregate_types: Some(agg_types),
             aggregates: None,
             operation_types: None,
-            requested_latency_ms: None,
         });
         let shard = determine_client_shard(&request, &config).unwrap();
         assert_eq!(shard, 1); // 7 % 3 = 1
@@ -1478,11 +1509,12 @@ mod tests {
         aggregates.insert(10u128);
         let request = ClientRequest::Watch(WatchRequest {
             correlation_id: None,
+            requested_latency_ms: None,
+            shard_id: None,
             orgs: None,
             aggregate_types: None,
             aggregates: Some(aggregates),
             operation_types: None,
-            requested_latency_ms: None,
         });
         let shard = determine_client_shard(&request, &config).unwrap();
         assert_eq!(shard, 2); // 10 % 4 = 2
@@ -1496,11 +1528,12 @@ mod tests {
         orgs.insert(8u128);
         let request = ClientRequest::Watch(WatchRequest {
             correlation_id: None,
+            requested_latency_ms: None,
+            shard_id: None,
             orgs: Some(orgs),
             aggregate_types: None,
             aggregates: None,
             operation_types: None,
-            requested_latency_ms: None,
         });
         let shard = determine_client_shard(&request, &config).unwrap();
         assert_eq!(shard, 0); // both 4 % 4 and 8 % 4 = 0
@@ -1514,14 +1547,65 @@ mod tests {
         orgs.insert(5u128);
         let request = ClientRequest::Watch(WatchRequest {
             correlation_id: None,
+            requested_latency_ms: None,
+            shard_id: None,
             orgs: Some(orgs),
             aggregate_types: None,
             aggregates: None,
             operation_types: None,
-            requested_latency_ms: None,
         });
         let result = determine_client_shard(&request, &config);
-        assert!(matches!(result, Err(ShardRoutingError::MultipleShardRoutes)));
+        assert!(matches!(result, Err(ShardRoutingError::MultipleShardRoutes { num_shards: 4 })));
+    }
+
+    #[test]
+    fn routing_watch_with_explicit_shard_id() {
+        let config = test_config(4, crate::RoutingRule::OrgId);
+        let request = ClientRequest::Watch(WatchRequest {
+            correlation_id: None,
+            requested_latency_ms: None,
+            shard_id: Some(2),
+            orgs: None,
+            aggregate_types: None,
+            aggregates: None,
+            operation_types: None,
+        });
+        let shard = determine_client_shard(&request, &config).unwrap();
+        assert_eq!(shard, 2);
+    }
+
+    #[test]
+    fn routing_watch_shard_id_overrides_filters() {
+        let config = test_config(4, crate::RoutingRule::OrgId);
+        let mut orgs = std::collections::HashSet::new();
+        orgs.insert(5u128);
+        let request = ClientRequest::Watch(WatchRequest {
+            correlation_id: None,
+            requested_latency_ms: None,
+            shard_id: Some(3),
+            orgs: Some(orgs),
+            aggregate_types: None,
+            aggregates: None,
+            operation_types: None,
+        });
+        let shard = determine_client_shard(&request, &config).unwrap();
+        assert_eq!(shard, 3);
+    }
+
+    #[test]
+    fn routing_watch_invalid_shard_id() {
+        let config = test_config(4, crate::RoutingRule::OrgId);
+        let request = ClientRequest::Watch(WatchRequest {
+            correlation_id: None,
+            requested_latency_ms: None,
+            shard_id: Some(4),
+            orgs: None,
+            aggregate_types: None,
+            aggregates: None,
+            operation_types: None,
+        });
+        let result = determine_client_shard(&request, &config);
+        assert!(matches!(result, Err(ShardRoutingError::IncompatibleFilters { .. })));
     }
 
     // --- Shard ID validation ---

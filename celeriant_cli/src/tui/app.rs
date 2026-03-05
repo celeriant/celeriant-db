@@ -768,24 +768,27 @@ impl App {
                 .filter_map(|s| s.trim().parse::<u8>().ok())
                 .filter(|&t| t <= 5)
                 .collect();
-            
+
             if types.is_empty() {
                 None  // None means all event types
             } else {
                 Some(types)
             }
         };
-        
+
+        let request = WatchRequest {
+            correlation_id: None,
+            requested_latency_ms: latency_ms,
+            shard_id: None,
+            orgs: Some(HashSet::from([key.org_id])),
+            aggregate_types: Some(HashSet::from([key.aggregate_type_id])),
+            aggregates: Some(HashSet::from([key.aggregate_id])),
+            operation_types: event_types,
+        };
+
         // Spawn the watch task
         tokio::spawn(async move {
-            watch_task(
-                server_address,
-                key,
-                event_types,
-                latency_ms,
-                tx,
-                cancel_rx,
-            ).await;
+            watch_task(server_address, request, tx, cancel_rx).await;
         });
         
         self.set_status("Watch started");
@@ -922,26 +925,21 @@ impl App {
         self.watch_events.push(format!("Event types: {:?}", event_types));
         self.watch_events.push(String::new());
         
-        let orgs = match org_id {
-            Some(id) => {
-                let mut set = HashSet::new();
-                set.insert(id);
-                Some(set)
-            }
-            None => None,
+        let orgs = org_id.map(|id| HashSet::from([id]));
+
+        let request = WatchRequest {
+            correlation_id: None,
+            requested_latency_ms: latency_ms,
+            shard_id: None,
+            orgs,
+            aggregate_types,
+            aggregates: None,
+            operation_types: event_types,
         };
-        
+
         // Spawn the watch task
         tokio::spawn(async move {
-            org_watch_task(
-                server_address,
-                orgs,
-                aggregate_types,
-                event_types,
-                latency_ms,
-                tx,
-                cancel_rx,
-            ).await;
+            watch_task(server_address, request, tx, cancel_rx).await;
         });
         
         self.set_status("Organisation watch started");
@@ -950,216 +948,101 @@ impl App {
 
 }
 
-async fn watch_task(
-    server_address: String,
-    aggregate_key: AggregateKey,
-    event_types: Option<std::collections::HashSet<u8>>,
-    latency_ms: Option<u64>,
-    tx: tokio::sync::mpsc::UnboundedSender<WatchUpdate>,
-    mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
-) {
-    use celeriant_client_tokio::celeriant_client::CeleriantClient;
-    use celeriant_msg::process_client_requests::ClientRequest;
-    use celeriant_msg::process_client_responses::ClientResponse;
-    use celeriant_msg::request::requests::WatchRequest;
-    use celeriant_wal::compression_type::CompressionType;
-    
-    // Connect to server
-    let mut client = match CeleriantClient::connect(&server_address).await {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = tx.send(WatchUpdate::Error(format!("Connection failed: {}", e)));
-            return;
-        }
-    };
-    
-    let mut orgs = HashSet::new();
-    orgs.insert(aggregate_key.org_id);
-    let mut types = HashSet::new();
-    types.insert(aggregate_key.aggregate_type_id);
-    let mut aggregates = HashSet::new();
-    aggregates.insert(aggregate_key.aggregate_id);
-    
-    let request = ClientRequest::Watch(WatchRequest {
-        operation_types: event_types,
-        correlation_id: None,
-        requested_latency_ms: latency_ms,
-        orgs: Some(orgs),
-        aggregate_types: Some(types),
-        aggregates: Some(aggregates),
-    });
-    
-    let _ = tx.send(WatchUpdate::Event(vec!["Sending watch request...".to_string()]));
-    
-    // Send initial watch request - the server will keep the connection open
-    // and send responses as events occur
-    loop {
-        tokio::select! {
-            _ = &mut cancel_rx => {
-                let _ = tx.send(WatchUpdate::Event(vec!["Watch cancelled by user".to_string()]));
-                break;
-            }
-            result = client.send_request(&request, CompressionType::None) => {
-                match result {
-                    Ok(ClientResponse::Watch(watch_response)) => {
-                        if watch_response.events.is_none() {
-                            let _ = tx.send(WatchUpdate::Heartbeat);
-                        } else if let Some(events_by_aggregate) = watch_response.events {
-                            let mut lines = Vec::new();
-                            
-                            for (aggregate_key, events_by_type) in events_by_aggregate {
-                                lines.push(format!("━━━ Aggregate: {}:{} ━━━", 
-                                    aggregate_key.aggregate_type_id, aggregate_key.aggregate_id));
-                                
-                                for (event_type, maybe_event) in events_by_type {
-                                    let event_type_name = match event_type {
-                                        0 => "DELETE",
-                                        1 => "WRITE",
-                                        2 => "READ",
-                                        3 => "TRIM_START",
-                                        4 => "DETAILS",
-                                        5 => "CREATE",
-                                        _ => "UNKNOWN",
-                                    };
-                                    
-                                    lines.push(format!("  Event: {} ({})", event_type_name, event_type));
-                                    
-                                    if let Some(event) = maybe_event {
-                                        if let Some(from) = event.from_event_batch_index {
-                                            lines.push(format!("    From batch: {}", from));
-                                        }
-                                        if let Some(to) = event.to_event_batch_index {
-                                            lines.push(format!("    To batch: {}", to));
-                                        }
-                                        if let Some(keep_from) = event.keep_from_event_batch_index {
-                                            lines.push(format!("    Keep from batch: {}", keep_from));
-                                        }
-                                    }
-                                }
-                                lines.push(String::new());
-                            }
-                            let _ = tx.send(WatchUpdate::Event(lines));
-                        }
-                    }
-                    Ok(ClientResponse::GenericError(e)) => {
-                        let _ = tx.send(WatchUpdate::Error(format!("{}: {}", e.error_code, e.error_message)));
-                        break;
-                    }
-                    Ok(_) => {
-                        let _ = tx.send(WatchUpdate::Error("Unexpected response type".to_string()));
-                    }
-                    Err(e) => {
-                        let _ = tx.send(WatchUpdate::Error(format!("Request error: {}", e)));
-                        break;
-                    }
-                }
-            }
-        }
+fn event_type_name(event_type: u8) -> &'static str {
+    match event_type {
+        0 => "DELETE",
+        1 => "WRITE",
+        2 => "READ",
+        3 => "TRIM_START",
+        4 => "DETAILS",
+        5 => "CREATE",
+        _ => "UNKNOWN",
     }
-    
-    let _ = tx.send(WatchUpdate::Disconnected);
 }
 
-async fn org_watch_task(
+fn format_watch_events(
+    watch_response: celeriant_msg::response::responses::WatchResponse,
+) -> Option<Vec<String>> {
+    let events_by_aggregate = watch_response.events?;
+    let mut lines = Vec::new();
+
+    for (key, events_by_type) in events_by_aggregate {
+        lines.push(format!(
+            "━━━ Org: {} | Type: {} | Agg: {} ━━━",
+            key.org_id, key.aggregate_type_id, key.aggregate_id
+        ));
+
+        for (event_type, maybe_event) in events_by_type {
+            lines.push(format!(
+                "  Event: {} ({})",
+                event_type_name(event_type),
+                event_type
+            ));
+
+            if let Some(event) = maybe_event {
+                if let Some(from) = event.from_event_batch_index {
+                    lines.push(format!("    From batch: {}", from));
+                }
+                if let Some(to) = event.to_event_batch_index {
+                    lines.push(format!("    To batch: {}", to));
+                }
+                if let Some(keep_from) = event.keep_from_event_batch_index {
+                    lines.push(format!("    Keep from batch: {}", keep_from));
+                }
+            }
+        }
+        lines.push(String::new());
+    }
+    Some(lines)
+}
+
+async fn watch_task(
     server_address: String,
-    orgs: Option<HashSet<u128>>,
-    aggregate_types: Option<HashSet<u128>>,
-    event_types: Option<HashSet<u8>>,
-    latency_ms: Option<u64>,
+    request: celeriant_msg::request::requests::WatchRequest,
     tx: tokio::sync::mpsc::UnboundedSender<WatchUpdate>,
     mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
-    use celeriant_client_tokio::celeriant_client::CeleriantClient;
-    use celeriant_msg::process_client_requests::ClientRequest;
-    use celeriant_msg::process_client_responses::ClientResponse;
-    use celeriant_msg::request::requests::WatchRequest;
-    use celeriant_wal::compression_type::CompressionType;
-    
-    // Connect to server
-    let mut client = match CeleriantClient::connect(&server_address).await {
+    use celeriant_client_tokio::{WatchConnection, WatchOptions};
+
+    let _ = tx.send(WatchUpdate::Event(vec!["Connecting...".to_string()]));
+
+    let mut conn = match WatchConnection::connect(
+        &server_address,
+        request,
+        WatchOptions::default(),
+    )
+    .await
+    {
         Ok(c) => c,
         Err(e) => {
             let _ = tx.send(WatchUpdate::Error(format!("Connection failed: {}", e)));
+            let _ = tx.send(WatchUpdate::Disconnected);
             return;
         }
     };
-    
-    let request = ClientRequest::Watch(WatchRequest {
-        operation_types: event_types,
-        correlation_id: None,
-        requested_latency_ms: latency_ms,
-        orgs: orgs,
-        aggregate_types: aggregate_types,
-        aggregates: None,
-    });
-    
-    let _ = tx.send(WatchUpdate::Event(vec!["Sending watch request...".to_string()]));
-    
+
+    let _ = tx.send(WatchUpdate::Event(vec!["Watch started".to_string()]));
+
     loop {
         tokio::select! {
             _ = &mut cancel_rx => {
                 let _ = tx.send(WatchUpdate::Event(vec!["Watch cancelled by user".to_string()]));
                 break;
             }
-            result = client.send_request(&request, CompressionType::None) => {
+            result = conn.next() => {
                 match result {
-                    Ok(ClientResponse::Watch(watch_response)) => {
-                        if watch_response.events.is_none() {
-                            let _ = tx.send(WatchUpdate::Heartbeat);
-                        } else if let Some(events_by_aggregate) = watch_response.events {
-                            let mut lines = Vec::new();
-                            
-                            for (aggregate_key, events_by_type) in events_by_aggregate {
-                                lines.push(format!("━━━ Org: {} | Type: {} | Agg: {} ━━━", 
-                                    aggregate_key.org_id,
-                                    aggregate_key.aggregate_type_id, 
-                                    aggregate_key.aggregate_id));
-                                
-                                for (event_type, maybe_event) in events_by_type {
-                                    let event_type_name = match event_type {
-                                        0 => "DELETE",
-                                        1 => "WRITE",
-                                        2 => "READ",
-                                        3 => "TRIM_START",
-                                        4 => "DETAILS",
-                                        5 => "CREATE",
-                                        _ => "UNKNOWN",
-                                    };
-                                    
-                                    lines.push(format!("  Event: {} ({})", event_type_name, event_type));
-                                    
-                                    if let Some(event) = maybe_event {
-                                        if let Some(from) = event.from_event_batch_index {
-                                            lines.push(format!("    From batch: {}", from));
-                                        }
-                                        if let Some(to) = event.to_event_batch_index {
-                                            lines.push(format!("    To batch: {}", to));
-                                        }
-                                        if let Some(keep_from) = event.keep_from_event_batch_index {
-                                            lines.push(format!("    Keep from batch: {}", keep_from));
-                                        }
-                                    }
-                                }
-                                lines.push(String::new());
-                            }
-                            let _ = tx.send(WatchUpdate::Event(lines));
-                        }
-                    }
-                    Ok(ClientResponse::GenericError(e)) => {
-                        let _ = tx.send(WatchUpdate::Error(format!("{}: {}", e.error_code, e.error_message)));
-                        break;
-                    }
-                    Ok(_) => {
-                        let _ = tx.send(WatchUpdate::Error("Unexpected response type".to_string()));
-                    }
+                    Ok(response) => match format_watch_events(response) {
+                        Some(lines) => { let _ = tx.send(WatchUpdate::Event(lines)); }
+                        None => { let _ = tx.send(WatchUpdate::Heartbeat); }
+                    },
                     Err(e) => {
-                        let _ = tx.send(WatchUpdate::Error(format!("Request error: {}", e)));
+                        let _ = tx.send(WatchUpdate::Error(format!("Watch error: {}", e)));
                         break;
                     }
                 }
             }
         }
     }
-    
+
     let _ = tx.send(WatchUpdate::Disconnected);
 }

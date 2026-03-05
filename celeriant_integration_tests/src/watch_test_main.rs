@@ -199,6 +199,7 @@ async fn test_basic_watch(address: &str) -> Result<(), Box<dyn std::error::Error
     let watch_request = WatchRequest {
         correlation_id: Some(1),
         requested_latency_ms: Some(100),
+        shard_id: None,
         orgs: None,
         aggregate_types: None,
         aggregates: Some(HashSet::from([1000])), // Watch aggregate 1000
@@ -244,6 +245,7 @@ async fn test_watch_receives_writes(
     let watch_request = WatchRequest {
         correlation_id: Some(2),
         requested_latency_ms: Some(100),
+        shard_id: None,
         orgs: None,
         aggregate_types: None,
         aggregates: Some(HashSet::from([aggregate_id])),
@@ -331,6 +333,7 @@ async fn test_watch_with_aggregate_filter(
     let watch_request = WatchRequest {
         correlation_id: Some(3),
         requested_latency_ms: Some(100),
+        shard_id: None,
         orgs: None,
         aggregate_types: None,
         aggregates: Some(HashSet::from([watched_aggregate_id])),
@@ -443,6 +446,7 @@ async fn test_watch_heartbeat(
     let watch_request = WatchRequest {
         correlation_id: Some(4),
         requested_latency_ms: Some(100),
+        shard_id: None,
         orgs: None,
         aggregate_types: None,
         aggregates: Some(HashSet::from([4000])), // Watch an aggregate that won't have events
@@ -497,6 +501,7 @@ async fn test_multiple_watchers(
     let watch_request = WatchRequest {
         correlation_id: Some(5),
         requested_latency_ms: Some(100),
+        shard_id: None,
         orgs: None,
         aggregate_types: None,
         aggregates: Some(HashSet::from([aggregate_id])),
@@ -637,6 +642,7 @@ async fn test_write_then_watch_same_connection(
     let watch_request = WatchRequest {
         correlation_id: Some(601),
         requested_latency_ms: Some(100),
+        shard_id: None,
         orgs: None,
         aggregate_types: None,
         aggregates: Some(HashSet::from([aggregate_id])),

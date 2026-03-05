@@ -17,6 +17,7 @@ TESTS=(
   chaos_delete_main
   connection_test_main
   watch_test_main
+  multi_shard_watch_test_main
   s3_fallback_main
   s3_fallback_catchup_main
   s3_fallback_s3_down_main

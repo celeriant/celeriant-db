@@ -2832,6 +2832,7 @@ mod tests {
             let watch = ClientRequest::Watch(WatchRequest {
                 correlation_id: None,
                 requested_latency_ms: None,
+                shard_id: None,
                 orgs: None,
                 aggregate_types: None,
                 aggregates: None,

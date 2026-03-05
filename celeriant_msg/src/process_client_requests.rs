@@ -297,6 +297,7 @@ mod tests {
             ClientRequestType::Watch => ClientRequest::Watch(WatchRequest {
                 correlation_id: Some(0xAAAA_BBBB_CCCC_DDDD),
                 requested_latency_ms: Some(500),
+                shard_id: None,
                 orgs: Some(HashSet::from([1, 2, 3])),
                 aggregate_types: Some(HashSet::from([10, 20])),
                 aggregates: Some(HashSet::from([100, 200, 300])),
