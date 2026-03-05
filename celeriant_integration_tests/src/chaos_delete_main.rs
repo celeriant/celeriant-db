@@ -523,8 +523,9 @@ async fn run_writer_task(
                     state.record_delete(aggregate_index);
                 }
                 Err(ClientError::CeleriantError(err_resp)) => {
-                    // "not found" errors are expected for aggregates never written
-                    if !err_resp.error_message.to_lowercase().contains("not found") {
+                    // Error codes 1001 (read) and 4000 (delete) = AggregateNotExists,
+                    // expected for aggregates never written or already deleted.
+                    if err_resp.error_code != 1001 && err_resp.error_code != 4000 {
                         eprintln!(
                             "[Writer {}] Delete error: {} ({})",
                             worker_id, err_resp.error_message, err_resp.error_code
@@ -643,9 +644,9 @@ async fn run_reader_task(
                 state.total_reads.fetch_add(1, Ordering::Relaxed);
             }
             Err(ClientError::CeleriantError(err_resp)) => {
-                // "not found" and "deleted" errors are expected
-                let msg = err_resp.error_message.to_lowercase();
-                if !msg.contains("not found") && !msg.contains("deleted") {
+                // Error codes 1001 (read) and 4000 (delete) = AggregateNotExists,
+                // expected for aggregates not yet written or already deleted.
+                if err_resp.error_code != 1001 && err_resp.error_code != 4000 {
                     state.read_errors.fetch_add(1, Ordering::Relaxed);
                 }
             }

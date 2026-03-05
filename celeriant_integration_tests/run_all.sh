@@ -9,6 +9,7 @@ TIMEOUT_OVERRIDE[batch_main]=300
 TIMEOUT_OVERRIDE[compaction_standalone_main]=120
 TIMEOUT_OVERRIDE[compaction_restart_main]=120
 TIMEOUT_OVERRIDE[compaction_replicated_main]=120
+TIMEOUT_OVERRIDE[edge_leader_crash_divergent_wal_main]=120
 
 TESTS=(
   single_main

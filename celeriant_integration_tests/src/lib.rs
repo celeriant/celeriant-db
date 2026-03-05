@@ -24,6 +24,7 @@ use std::path::PathBuf;
 
 use celeriant_client_tokio::ClientTlsConfig;
 use celeriant_crypto::pki::PkiManager;
+use celeriant_lib::server_config::ConfigTlsMode;
 use rustls_pki_types::ServerName;
 use tempfile::TempDir;
 use tokio::net::TcpStream;
@@ -163,30 +164,17 @@ impl TestServer {
 
         let log_thread = spawn_log_reader(&label, &mut child);
 
-        // Wait for server to start by polling the port
-        let start = std::time::Instant::now();
-        let max_wait = Duration::from_secs(30);
-
-        while start.elapsed() < max_wait {
-            match TcpStream::connect(&address).await {
-                Ok(_) => {
-                    println!("  Server is ready (took {:?})", start.elapsed());
-                    return Ok(Self {
-                        _temp_dir: temp_dir,
-                        address,
-                        child,
-                        config,
-                        label,
-                        _log_thread: log_thread,
-                    });
-                }
-                Err(_) => {
-                    sleep(Duration::from_millis(100)).await;
-                }
-            }
-        }
-
-        Err("Server failed to start within timeout".into())
+        let ready_start = std::time::Instant::now();
+        Self::poll_ready(&address, &mut child, &config).await?;
+        println!("  Server is ready (took {:?})", ready_start.elapsed());
+        Ok(Self {
+            _temp_dir: temp_dir,
+            address,
+            child,
+            config,
+            label,
+            _log_thread: log_thread,
+        })
     }
 
     /// Get the server address (host:port).
@@ -240,23 +228,10 @@ impl TestServer {
 
         self._log_thread = spawn_log_reader(&self.label, &mut self.child);
 
-        // Wait for server to start
-        let start = std::time::Instant::now();
-        let max_wait = Duration::from_secs(30);
-
-        while start.elapsed() < max_wait {
-            match TcpStream::connect(&self.address).await {
-                Ok(_) => {
-                    println!("  Server restarted on port {} (took {:?})", self.config.client_port, start.elapsed());
-                    return Ok(());
-                }
-                Err(_) => {
-                    sleep(Duration::from_millis(100)).await;
-                }
-            }
-        }
-
-        Err("Server failed to restart within timeout".into())
+        let ready_start = std::time::Instant::now();
+        Self::poll_ready(&self.address, &mut self.child, &self.config).await?;
+        println!("  Server restarted on port {} (took {:?})", self.config.client_port, ready_start.elapsed());
+        Ok(())
     }
 
     /// Restart the server with a new configuration.
@@ -284,26 +259,14 @@ impl TestServer {
 
         self._log_thread = spawn_log_reader(&self.label, &mut self.child);
 
-        let start = std::time::Instant::now();
-        let max_wait = Duration::from_secs(30);
-
-        while start.elapsed() < max_wait {
-            match TcpStream::connect(&self.address).await {
-                Ok(_) => {
-                    println!(
-                        "  Server restarted with new config on port {} (took {:?})",
-                        self.config.client_port,
-                        start.elapsed()
-                    );
-                    return Ok(());
-                }
-                Err(_) => {
-                    sleep(Duration::from_millis(100)).await;
-                }
-            }
-        }
-
-        Err("Server failed to restart within timeout".into())
+        let ready_start = std::time::Instant::now();
+        Self::poll_ready(&self.address, &mut self.child, &self.config).await?;
+        println!(
+            "  Server restarted with new config on port {} (took {:?})",
+            self.config.client_port,
+            ready_start.elapsed()
+        );
+        Ok(())
     }
 
     /// Start a test server using a caller-provided TempDir.
@@ -340,24 +303,51 @@ impl TestServer {
 
         let log_thread = spawn_log_reader(&label, &mut child);
 
+        let ready_start = std::time::Instant::now();
+        Self::poll_ready(&address, &mut child, &config).await?;
+        println!("  Server is ready (took {:?})", ready_start.elapsed());
+        Ok(Self {
+            _temp_dir: temp_dir,
+            address,
+            child,
+            config,
+            label,
+            _log_thread: log_thread,
+        })
+    }
+
+    /// Poll until the server is accepting connections.
+    ///
+    /// For plaintext servers, uses a bare TCP connect probe.
+    /// For TLS-strict servers, avoids TCP probing (which triggers spurious
+    /// "TLS handshake failed" errors) and instead waits for the process to
+    /// start listening by checking process liveness + a port probe via /proc/net.
+    async fn poll_ready(
+        address: &str,
+        child: &mut Child,
+        config: &ServerConfig,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let start = std::time::Instant::now();
         let max_wait = Duration::from_secs(30);
+        let tls_strict = matches!(config.tls_mode, ConfigTlsMode::Strict);
 
         while start.elapsed() < max_wait {
-            match TcpStream::connect(&address).await {
-                Ok(_) => {
-                    println!("  Server is ready (took {:?})", start.elapsed());
-                    return Ok(Self {
-                        _temp_dir: temp_dir,
-                        address,
-                        child,
-                        config,
-                        label,
-                        _log_thread: log_thread,
-                    });
+            if let Ok(Some(status)) = child.try_wait() {
+                return Err(format!("Server exited during startup: {}", status).into());
+            }
+
+            if tls_strict {
+                // For TLS servers, probe whether the port is in LISTEN state
+                // without completing a TCP handshake (which would cause the server
+                // to start a TLS handshake we can't complete without client certs).
+                if port_is_listening(config.client_port) {
+                    return Ok(());
                 }
-                Err(_) => {
-                    sleep(Duration::from_millis(100)).await;
+                sleep(Duration::from_millis(100)).await;
+            } else {
+                match TcpStream::connect(address).await {
+                    Ok(_) => return Ok(()),
+                    Err(_) => sleep(Duration::from_millis(100)).await,
                 }
             }
         }
@@ -373,6 +363,23 @@ impl Drop for TestServer {
         let _ = self.child.wait();
         println!("  Test server shut down");
     }
+}
+
+/// Check if a port is in LISTEN state by probing /proc/net/tcp.
+/// This avoids completing a TCP handshake, which is important for TLS servers
+/// where a bare TCP connect + drop triggers spurious TLS errors.
+fn port_is_listening(port: u16) -> bool {
+    let hex_port = format!("{:04X}", port);
+    let Ok(contents) = std::fs::read_to_string("/proc/net/tcp") else {
+        return false;
+    };
+    // /proc/net/tcp format: local_address (hex IP:PORT) state (0A = LISTEN)
+    contents.lines().skip(1).any(|line| {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        parts.len() >= 4
+            && parts[1].ends_with(&format!(":{}", hex_port))
+            && parts[3] == "0A"
+    })
 }
 
 /// Take stdout from a child process and spawn a thread that prints each line with a label prefix.
