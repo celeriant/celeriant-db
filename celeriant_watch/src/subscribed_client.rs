@@ -2,7 +2,7 @@ use celeriant_msg::response::responses::WatchResponse;
 use glommio::channels::local_channel::LocalSender;
 use std::time::{Duration, Instant};
 
-use crate::aggregate_watch_event::AggregateWatchEvent;
+use crate::aggregate_watch_event::{AggregateWatchEvent, WatchEventAccumulator};
 
 /// Represents a single client, actively listening to a single aggregate on a shard
 pub struct SubscribedClient {
@@ -15,9 +15,8 @@ pub struct SubscribedClient {
     /// Allows us to listen to aggregate changes in the Shard WAL
     pub receiver: glommio::channels::local_channel::LocalReceiver<AggregateWatchEvent>,
 
-    /// Events accumulate here as other clients perform operations
-    /// They come from the local_channel, and after a certain amount of time they are sent to the client
-    pub watch_response: Option<WatchResponse>,
+    /// Events accumulate here via hashmap merging, then flatten to vec on take
+    pub accumulator: Option<WatchEventAccumulator>,
 }
 pub const MAX_PENDING_EVENTS: usize = 10000;
 
@@ -29,41 +28,28 @@ impl SubscribedClient {
             requested_latency: requested_latency_ms.map(Duration::from_millis),
             receiver,
             last_send_time: Instant::now(),
-            watch_response: None,
+            accumulator: None,
         };
         (client, sender)
     }
 
     pub fn accumulate_watch_event(&mut self, watch_event: AggregateWatchEvent) {
-        watch_event.add_to_response(&mut self.watch_response);
+        self.accumulator.get_or_insert_default().accumulate(watch_event);
     }
 
     pub async fn should_wait_and_flush(&self) -> bool {
-        // No events? No need to wait, no need to flush
-        if self.watch_response.is_none() {
+        if self.accumulator.is_none() {
             return false;
         }
 
-        let latency_wait_time = self.additional_latency_wait_time();
-
-        // No need to wait? Just flush
-        if latency_wait_time == Duration::ZERO {
-            return true;
-        }
-
-        false
+        self.additional_latency_wait_time() == Duration::ZERO
     }
 
     pub fn take_response(&mut self) -> Option<WatchResponse> {
         self.last_send_time = Instant::now();
-        if self.watch_response.is_none() {
-            return None;
-        }
-        Some(self.watch_response.take().unwrap())
+        self.accumulator.take().map(|acc| acc.into_response())
     }
 
-    /// How much time is left before we are 'green' to send the client
-    /// Need to check last_send_time and if there is a latency requirement
     fn additional_latency_wait_time(&self) -> Duration {
         let Some(latency) = self.requested_latency else {
             return Duration::ZERO;
@@ -78,7 +64,7 @@ impl SubscribedClient {
             return None;
         };
 
-        if self.watch_response.is_none() {
+        if self.accumulator.is_none() {
             return None;
         }
 
@@ -138,17 +124,7 @@ mod test_subscribed_client {
                             crate::aggregate_watch_event::AggregateWatchEventOperation::Delete {},
                     });
 
-                    assert_eq!(
-                        client
-                            .watch_response
-                            .as_ref()
-                            .unwrap()
-                            .events
-                            .as_ref()
-                            .unwrap()
-                            .len(),
-                        1
-                    );
+                    assert!(!client.accumulator.as_ref().unwrap().is_empty());
                     assert!(client.last_send_time.elapsed().as_millis() <= 50);
                     assert!(!client.should_wait_and_flush().await);
 
@@ -161,17 +137,7 @@ mod test_subscribed_client {
                             },
                     });
 
-                    assert_eq!(
-                        client
-                            .watch_response
-                            .as_ref()
-                            .unwrap()
-                            .events
-                            .as_ref()
-                            .unwrap()
-                            .len(),
-                        2
-                    );
+                    assert!(!client.accumulator.as_ref().unwrap().is_empty());
                     assert!(client.last_send_time.elapsed().as_millis() <= 50);
                     assert!(!client.should_wait_and_flush().await);
 
@@ -184,47 +150,23 @@ mod test_subscribed_client {
                         "elapsed_ms was {elapsed_ms}, expected 10-100"
                     );
 
-                    let watch_response = client.take_response();
-                    assert!(client.watch_response.as_ref().is_none());
+                    let watch_response = client.take_response().unwrap();
+                    assert!(client.accumulator.is_none());
                     assert!(client.last_send_time.elapsed().as_millis() <= 50);
 
-                    assert_eq!(
-                        watch_response
-                            .as_ref()
-                            .unwrap()
-                            .events
-                            .as_ref()
-                            .unwrap()
-                            .len(),
-                        2
-                    );
+                    // 2 events: Delete for (1,2,3) and Read for (1,2,4)
+                    assert_eq!(watch_response.events.len(), 2);
 
-                    assert!(
-                        watch_response
-                            .as_ref()
-                            .unwrap()
-                            .events
-                            .as_ref()
-                            .unwrap()
-                            .get(&AggregateKey::new(1, 2, 3))
-                            .unwrap()
-                            .get(&AggregateWatchEvent::DELETE)
-                            .unwrap()
-                            .is_none()
-                    );
-                    assert!(
-                        watch_response
-                            .as_ref()
-                            .unwrap()
-                            .events
-                            .as_ref()
-                            .unwrap()
-                            .get(&AggregateKey::new(1, 2, 4))
-                            .unwrap()
-                            .get(&AggregateWatchEvent::READ)
-                            .unwrap()
-                            .is_some()
-                    );
+                    let delete = watch_response.events.iter()
+                        .find(|e| e.aggregate_id == 3 && e.operation == AggregateWatchEvent::DELETE)
+                        .expect("expected delete event");
+                    assert!(delete.from_event_batch_index.is_none());
+
+                    let read = watch_response.events.iter()
+                        .find(|e| e.aggregate_id == 4 && e.operation == AggregateWatchEvent::READ)
+                        .expect("expected read event");
+                    assert_eq!(read.from_event_batch_index, Some(44));
+                    assert_eq!(read.to_event_batch_index, Some(46));
                 })
                 .unwrap();
 

@@ -295,12 +295,10 @@ async fn test_watch_receives_writes(
         {
             Some(ClientResponse::Watch(watch_response)) => {
                 println!("  Watch response: {:?}", watch_response);
-                if let Some(events) = watch_response.events {
-                    if events.contains_key(&aggregate) {
-                        received_write_event = true;
-                        println!("  Received write event for aggregate!");
-                        break;
-                    }
+                if watch_response.events.iter().any(|e| e.org_id == aggregate.org_id && e.aggregate_type_id == aggregate.aggregate_type_id && e.aggregate_id == aggregate.aggregate_id) {
+                    received_write_event = true;
+                    println!("  Received write event for aggregate!");
+                    break;
                 }
             }
             Some(ClientResponse::GenericError(err)) => {
@@ -408,12 +406,12 @@ async fn test_watch_with_aggregate_filter(
             .await?
         {
             Some(ClientResponse::Watch(watch_response)) => {
-                if let Some(events) = watch_response.events {
-                    if events.contains_key(&watched_aggregate) {
+                {
+                    if watch_response.events.iter().any(|e| e.org_id == watched_aggregate.org_id && e.aggregate_type_id == watched_aggregate.aggregate_type_id && e.aggregate_id == watched_aggregate.aggregate_id) {
                         received_watched = true;
                         println!("  Received event for watched aggregate (expected)");
                     }
-                    if events.contains_key(&unwatched_aggregate) {
+                    if watch_response.events.iter().any(|e| e.org_id == unwatched_aggregate.org_id && e.aggregate_type_id == unwatched_aggregate.aggregate_type_id && e.aggregate_id == unwatched_aggregate.aggregate_id) {
                         received_unwatched = true;
                         println!("  Received event for unwatched aggregate (unexpected!)");
                     }
@@ -467,7 +465,7 @@ async fn test_watch_heartbeat(
             .await?
         {
             Some(ClientResponse::Watch(watch_response)) => {
-                if watch_response.events.is_none() {
+                if watch_response.events.is_empty() {
                     println!("  Received heartbeat after {:?}", start.elapsed());
                     return Ok(());
                 } else {
@@ -552,7 +550,7 @@ async fn test_multiple_watchers(
                 .read_response_timeout(Duration::from_millis(100))
                 .await?
             {
-                if wr.events.is_some() {
+                if !wr.events.is_empty() {
                     watch1_received = true;
                     println!("  Watcher 1 received event");
                 }
@@ -564,7 +562,7 @@ async fn test_multiple_watchers(
                 .read_response_timeout(Duration::from_millis(100))
                 .await?
             {
-                if wr.events.is_some() {
+                if !wr.events.is_empty() {
                     watch2_received = true;
                     println!("  Watcher 2 received event");
                 }
@@ -692,12 +690,10 @@ async fn test_write_then_watch_same_connection(
         {
             Some(ClientResponse::Watch(watch_response)) => {
                 println!("  Watch response: {:?}", watch_response);
-                if let Some(events) = watch_response.events {
-                    if events.contains_key(&aggregate) {
-                        received_notification = true;
-                        println!("  Watch received notification for write from other connection!");
-                        break;
-                    }
+                if watch_response.events.iter().any(|e| e.org_id == aggregate.org_id && e.aggregate_type_id == aggregate.aggregate_type_id && e.aggregate_id == aggregate.aggregate_id) {
+                    received_notification = true;
+                    println!("  Watch received notification for write from other connection!");
+                    break;
                 }
             }
             Some(ClientResponse::GenericError(err)) => {

@@ -248,7 +248,7 @@ mod tests {
                 error_code: 0xFFFF,
                 error_message: "test error".into(),
             }),
-            ClientResponseType::Watch => ClientResponse::Watch(WatchResponse { events: None }),
+            ClientResponseType::Watch => ClientResponse::Watch(WatchResponse::default()),
             ClientResponseType::ListOrgs => ClientResponse::ListOrgs(ListOrgsResponse {
                 correlation_id: Some(0x2222_3333_4444_5555),
                 orgs: vec![],

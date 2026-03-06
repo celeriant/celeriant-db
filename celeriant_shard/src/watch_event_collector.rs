@@ -5,6 +5,7 @@ use celeriant_wal::metablocks::metablock_event_batch::MetablockEventBatch;
 use celeriant_watch::aggregate_watch_event::{AggregateWatchEvent, AggregateWatchEventOperation};
 use celeriant_watch::aggregate_watchers::AggregateWatchers;
 
+
 #[derive(Default)]
 pub(crate) struct WatchEventCollector {
     create_events: HashMap<AggregateKey, AggregateWatchEventOperation>,

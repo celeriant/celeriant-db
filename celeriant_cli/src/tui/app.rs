@@ -963,33 +963,31 @@ fn event_type_name(event_type: u8) -> &'static str {
 fn format_watch_events(
     watch_response: celeriant_msg::response::responses::WatchResponse,
 ) -> Option<Vec<String>> {
-    let events_by_aggregate = watch_response.events?;
+    if watch_response.events.is_empty() {
+        return None;
+    }
     let mut lines = Vec::new();
 
-    for (key, events_by_type) in events_by_aggregate {
+    for event in &watch_response.events {
         lines.push(format!(
             "━━━ Org: {} | Type: {} | Agg: {} ━━━",
-            key.org_id, key.aggregate_type_id, key.aggregate_id
+            event.org_id, event.aggregate_type_id, event.aggregate_id
         ));
 
-        for (event_type, maybe_event) in events_by_type {
-            lines.push(format!(
-                "  Event: {} ({})",
-                event_type_name(event_type),
-                event_type
-            ));
+        lines.push(format!(
+            "  Event: {} ({})",
+            event_type_name(event.operation),
+            event.operation
+        ));
 
-            if let Some(event) = maybe_event {
-                if let Some(from) = event.from_event_batch_index {
-                    lines.push(format!("    From batch: {}", from));
-                }
-                if let Some(to) = event.to_event_batch_index {
-                    lines.push(format!("    To batch: {}", to));
-                }
-                if let Some(keep_from) = event.keep_from_event_batch_index {
-                    lines.push(format!("    Keep from batch: {}", keep_from));
-                }
-            }
+        if let Some(from) = event.from_event_batch_index {
+            lines.push(format!("    From batch: {}", from));
+        }
+        if let Some(to) = event.to_event_batch_index {
+            lines.push(format!("    To batch: {}", to));
+        }
+        if let Some(keep_from) = event.keep_from_event_batch_index {
+            lines.push(format!("    Keep from batch: {}", keep_from));
         }
         lines.push(String::new());
     }

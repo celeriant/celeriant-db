@@ -1098,7 +1098,7 @@ async fn handle_watch<R: ReplicationClient + 'static, D: S3Downloader + 'static,
                 }
             }
             Ok(WatchOutputType::Heartbeat) => {
-                let response = ClientResponse::Watch(WatchResponse { events: None });
+                let response = ClientResponse::Watch(WatchResponse::default());
                 if write_client_response_with_timeout(&mut tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await.is_err() {
                     break;
                 }

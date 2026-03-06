@@ -1,13 +1,9 @@
-use std::collections::HashMap;
-
 use bincode::{Decode, Encode};
-use celeriant_wal::aggregate_key::AggregateKey;
 
 use celeriant_wal::{constants::EntryHashBytes, metablocks::metablock::Metablock};
 use serde::{Deserialize, Serialize};
 
-
-use crate::response::{aggregate_event_batch::AggregateEventBatch, watch_event::WatchEvent};
+use crate::response::{aggregate_event_batch::AggregateEventBatch, watch_event::WatchResponseEvent};
 
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
@@ -84,7 +80,7 @@ pub struct ReadResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode, Default)]
 pub struct WatchResponse {
-    pub events: Option<HashMap<AggregateKey, HashMap<u8, Option<WatchEvent>>>>,
+    pub events: Vec<WatchResponseEvent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]

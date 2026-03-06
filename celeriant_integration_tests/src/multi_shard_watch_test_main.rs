@@ -162,8 +162,8 @@ async fn test_single_shard_watch(
     let mut received = false;
     for _ in 0..10 {
         match watch.next_timeout(Duration::from_millis(200)).await? {
-            Some(response) if response.events.is_some() => {
-                if response.events.unwrap().contains_key(&aggregate) {
+            Some(response) if !response.events.is_empty() => {
+                if response.events.iter().any(|e| e.org_id == aggregate.org_id && e.aggregate_type_id == aggregate.aggregate_type_id && e.aggregate_id == aggregate.aggregate_id) {
                     received = true;
                     println!("  Received event (single-shard path worked)");
                     break;
@@ -255,11 +255,10 @@ async fn test_multi_shard_watch_receives_events(
 
     for _ in 0..30 {
         match watch.next_timeout(Duration::from_millis(200)).await? {
-            Some(response) if response.events.is_some() => {
-                let events = response.events.unwrap();
-                for key in events.keys() {
-                    received_shards.insert(key.org_id);
-                    println!("  Received event from shard {}", key.org_id);
+            Some(response) if !response.events.is_empty() => {
+                for event in &response.events {
+                    received_shards.insert(event.org_id);
+                    println!("  Received event from shard {}", event.org_id);
                 }
             }
             Some(_) => continue, // Heartbeat
@@ -309,7 +308,7 @@ async fn test_multi_shard_watch_heartbeats(
 
     while start.elapsed() < max_wait {
         match watch.next_timeout(Duration::from_secs(6)).await? {
-            Some(response) if response.events.is_none() => {
+            Some(response) if response.events.is_empty() => {
                 println!("  Received heartbeat from a shard");
                 return Ok(());
             }
@@ -357,8 +356,8 @@ async fn test_explicit_shard_id_routing(
     let mut received = false;
     for _ in 0..10 {
         match watch.next_timeout(Duration::from_millis(200)).await? {
-            Some(response) if response.events.is_some() => {
-                if response.events.unwrap().contains_key(&aggregate) {
+            Some(response) if !response.events.is_empty() => {
+                if response.events.iter().any(|e| e.org_id == aggregate.org_id && e.aggregate_type_id == aggregate.aggregate_type_id && e.aggregate_id == aggregate.aggregate_id) {
                     received = true;
                     println!("  Received event on explicit shard 0 watch");
                     break;

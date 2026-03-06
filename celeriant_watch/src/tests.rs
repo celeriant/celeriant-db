@@ -9,7 +9,7 @@ mod tests {
 
     use crate::{
         aggregate_reader::AggregateReader,
-        aggregate_watch_event::{AggregateWatchEvent, AggregateWatchEventOperation},
+        aggregate_watch_event::{AggregateWatchEvent, AggregateWatchEventOperation, WatchEventAccumulator},
         aggregate_watchers::AggregateWatchers,
         subscribed_client::{SubscribedClient, MAX_PENDING_EVENTS},
         watch_output_type::WatchOutputType,
@@ -277,15 +277,16 @@ mod tests {
     #[test]
     fn write_events_merge_ranges() {
         glommio_test!({
-            let mut response = None;
+            let mut acc = WatchEventAccumulator::default();
 
-            write_event(1, 2, 3, 5).add_to_response(&mut response);
-            write_event(1, 2, 3, 10).add_to_response(&mut response);
-            write_event(1, 2, 3, 2).add_to_response(&mut response);
+            acc.accumulate(write_event(1, 2, 3, 5));
+            acc.accumulate(write_event(1, 2, 3, 10));
+            acc.accumulate(write_event(1, 2, 3, 2));
 
-            let k = AggregateKey::new(1, 2, 3);
-            let events = response.unwrap().events.unwrap();
-            let write = events[&k][&AggregateWatchEvent::WRITE].as_ref().unwrap();
+            let response = acc.into_response();
+            assert_eq!(response.events.len(), 1);
+            let write = &response.events[0];
+            assert_eq!(write.operation, AggregateWatchEvent::WRITE);
             assert_eq!(write.from_event_batch_index, Some(2));
             assert_eq!(write.to_event_batch_index, Some(10));
         })
@@ -294,29 +295,27 @@ mod tests {
     #[test]
     fn read_events_merge_ranges_with_none() {
         glommio_test!({
-            let mut response = None;
-            let k = AggregateKey::new(1, 2, 3);
+            let mut acc = WatchEventAccumulator::default();
 
-            AggregateWatchEvent {
-                aggregate_key: k.clone(),
+            acc.accumulate(AggregateWatchEvent {
+                aggregate_key: AggregateKey::new(1, 2, 3),
                 operation: AggregateWatchEventOperation::Read {
                     from_event_batch_index: 5,
                     to_event_batch_index: Some(10),
                 },
-            }
-            .add_to_response(&mut response);
+            });
 
-            AggregateWatchEvent {
-                aggregate_key: k.clone(),
+            acc.accumulate(AggregateWatchEvent {
+                aggregate_key: AggregateKey::new(1, 2, 3),
                 operation: AggregateWatchEventOperation::Read {
                     from_event_batch_index: 3,
                     to_event_batch_index: None,
                 },
-            }
-            .add_to_response(&mut response);
+            });
 
-            let events = response.unwrap().events.unwrap();
-            let read = events[&k][&AggregateWatchEvent::READ].as_ref().unwrap();
+            let response = acc.into_response();
+            let read = &response.events[0];
+            assert_eq!(read.operation, AggregateWatchEvent::READ);
             assert_eq!(read.from_event_batch_index, Some(3));
             assert_eq!(read.to_event_batch_index, Some(10));
         })
@@ -325,27 +324,25 @@ mod tests {
     #[test]
     fn trim_start_replaces_previous() {
         glommio_test!({
-            let mut response = None;
-            let k = AggregateKey::new(1, 2, 3);
+            let mut acc = WatchEventAccumulator::default();
 
-            AggregateWatchEvent {
-                aggregate_key: k.clone(),
+            acc.accumulate(AggregateWatchEvent {
+                aggregate_key: AggregateKey::new(1, 2, 3),
                 operation: AggregateWatchEventOperation::TrimStart {
                     keep_from_event_batch_index: 5,
                 },
-            }
-            .add_to_response(&mut response);
+            });
 
-            AggregateWatchEvent {
-                aggregate_key: k.clone(),
+            acc.accumulate(AggregateWatchEvent {
+                aggregate_key: AggregateKey::new(1, 2, 3),
                 operation: AggregateWatchEventOperation::TrimStart {
                     keep_from_event_batch_index: 10,
                 },
-            }
-            .add_to_response(&mut response);
+            });
 
-            let events = response.unwrap().events.unwrap();
-            let trim = events[&k][&AggregateWatchEvent::TRIM_START].as_ref().unwrap();
+            let response = acc.into_response();
+            let trim = &response.events[0];
+            assert_eq!(trim.operation, AggregateWatchEvent::TRIM_START);
             assert_eq!(trim.keep_from_event_batch_index, Some(10));
         })
     }
@@ -353,41 +350,40 @@ mod tests {
     #[test]
     fn delete_and_exists_deduplicate() {
         glommio_test!({
-            let mut response = None;
-            let k = AggregateKey::new(1, 2, 3);
+            let mut acc = WatchEventAccumulator::default();
 
             for _ in 0..5 {
-                delete_event(1, 2, 3).add_to_response(&mut response);
-                exists_event(1, 2, 3).add_to_response(&mut response);
+                acc.accumulate(delete_event(1, 2, 3));
+                acc.accumulate(exists_event(1, 2, 3));
             }
 
-            let events = &response.unwrap().events.unwrap()[&k];
-            assert_eq!(events.len(), 2);
-            assert!(events[&AggregateWatchEvent::DELETE].is_none());
-            assert!(events[&AggregateWatchEvent::DETAILS].is_none());
+            let response = acc.into_response();
+            // One aggregate with 2 operation types (DELETE + DETAILS)
+            assert_eq!(response.events.len(), 2);
+            assert!(response.events.iter().any(|e| e.operation == AggregateWatchEvent::DELETE));
+            assert!(response.events.iter().any(|e| e.operation == AggregateWatchEvent::DETAILS));
         })
     }
 
     #[test]
     fn multiple_aggregates_in_response() {
         glommio_test!({
-            let mut response = None;
+            let mut acc = WatchEventAccumulator::default();
 
-            write_event(1, 1, 1, 1).add_to_response(&mut response);
-            delete_event(2, 2, 2).add_to_response(&mut response);
-            AggregateWatchEvent {
+            acc.accumulate(write_event(1, 1, 1, 1));
+            acc.accumulate(delete_event(2, 2, 2));
+            acc.accumulate(AggregateWatchEvent {
                 aggregate_key: AggregateKey::new(3, 3, 3),
                 operation: AggregateWatchEventOperation::TrimStart {
                     keep_from_event_batch_index: 50,
                 },
-            }
-            .add_to_response(&mut response);
+            });
 
-            let events = response.unwrap().events.unwrap();
-            assert_eq!(events.len(), 3);
-            assert!(events.contains_key(&AggregateKey::new(1, 1, 1)));
-            assert!(events.contains_key(&AggregateKey::new(2, 2, 2)));
-            assert!(events.contains_key(&AggregateKey::new(3, 3, 3)));
+            let response = acc.into_response();
+            assert_eq!(response.events.len(), 3);
+            assert!(response.events.iter().any(|e| e.aggregate_id == 1));
+            assert!(response.events.iter().any(|e| e.aggregate_id == 2));
+            assert!(response.events.iter().any(|e| e.aggregate_id == 3));
         })
     }
 
@@ -471,7 +467,7 @@ mod tests {
 
             match session.next().await.unwrap() {
                 WatchOutputType::Response(r) => {
-                    assert_eq!(r.events.unwrap().len(), 1);
+                    assert_eq!(r.events.len(), 1);
                 }
                 other => panic!("Expected Response, got {:?}", other),
             }
@@ -523,9 +519,10 @@ mod tests {
 
             match session.next().await.unwrap() {
                 WatchOutputType::Response(r) => {
-                    let k = AggregateKey::new(1, 2, 3);
-                    let events = r.events.unwrap();
-                    let write = events[&k][&AggregateWatchEvent::WRITE].as_ref().unwrap();
+                    // Single aggregate, single write operation (merged range 1..2)
+                    assert_eq!(r.events.len(), 1);
+                    let write = &r.events[0];
+                    assert_eq!(write.operation, AggregateWatchEvent::WRITE);
                     assert_eq!(write.from_event_batch_index, Some(1));
                     assert_eq!(write.to_event_batch_index, Some(2));
                 }
@@ -623,17 +620,16 @@ mod tests {
     #[test]
     fn high_volume_event_accumulation() {
         glommio_test!({
-            let mut response = None;
+            let mut acc = WatchEventAccumulator::default();
 
             for i in 0..1000u64 {
-                write_event(1, 1, 1, i).add_to_response(&mut response);
+                acc.accumulate(write_event(1, 1, 1, i));
             }
 
-            let k = AggregateKey::new(1, 1, 1);
-            let events = response.unwrap().events.unwrap();
-            assert_eq!(events.len(), 1);
+            let response = acc.into_response();
+            assert_eq!(response.events.len(), 1);
 
-            let write = events[&k][&AggregateWatchEvent::WRITE].as_ref().unwrap();
+            let write = &response.events[0];
             assert_eq!(write.from_event_batch_index, Some(0));
             assert_eq!(write.to_event_batch_index, Some(999));
         })
