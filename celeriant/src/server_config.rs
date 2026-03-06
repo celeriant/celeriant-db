@@ -112,6 +112,13 @@ pub struct ServerConfig {
 
     #[arg(
         long,
+        env = "CELERIANT_ADVERTISED_CLIENT_ADDRESS",
+        help = "Override the client address advertised in S3 membership and returned in NotLeader errors. If not set, defaults to {listen_address}:{client_port}. Set this when clients connect through a load balancer or reverse proxy."
+    )]
+    pub advertised_client_address: Option<String>,
+
+    #[arg(
+        long,
         action = clap::ArgAction::SetTrue,
         env = "CELERIANT_STANDALONE",
         help = "Run in standalone mode (no replication, no S3 election)"
@@ -187,22 +194,6 @@ pub struct ServerConfig {
 
     #[arg(
         long,
-        default_value_t = 12 * 1024 * 1024,
-        env = "CELERIANT_LIST_WAL_INDEX_CACHE_BYTES",
-        help = "Memory to use to keep wal_index positions for listings paging optimisation (12MB)"
-    )]
-    pub list_wal_index_cache_bytes: u64,
-
-    #[arg(
-        long,
-        default_value_t = 64 * 1024 * 1024,
-        env = "CELERIANT_SCHEMA_CACHE_BYTES",
-        help = "Memory to use for schema cache (64MB)"
-    )]
-    pub schema_cache_bytes: u64,
-
-    #[arg(
-        long,
         default_value_t = 16384,
         env = "CELERIANT_MAX_SCHEMA_SIZE_BYTES",
         help = "Maximum size of a single schema definition in bytes (16KB)"
@@ -219,15 +210,6 @@ pub struct ServerConfig {
 
     #[arg(long, default_value_t = 1024 * 1024 * 1024, env = "CELERIANT_SHARD_LOG_PREALLOCATE_BYTES", help = "Size of each individual log file on disk (1GB)")]
     pub shard_log_preallocate_bytes: u64,
-
-    #[arg(long, default_value_t = 512 * 1024 * 1024, env = "CELERIANT_RECENT_WRITE_CACHE_BYTES", help = "Amount of recent write data to keep in memory for each shard (512MB)")]
-    pub recent_write_cache_bytes: u64,
-
-    #[arg(long, default_value_t = 64 * 1024 * 1024, env = "CELERIANT_AGGREGATE_CLIENT_SNAPSHOTS_CACHE_BYTES", help = "Amount of recent client idempotency data to keep in memory for each shard (64MB)")]
-    pub aggregate_client_snapshots_cache_bytes: u64,
-
-    #[arg(long, default_value_t = 64 * 1024 * 1024, env = "CELERIANT_AGGREGATE_SNAPSHOTS_CACHE_BYTES", help = "Amount of recent aggregate metadata to keep in memory for each shard (64MB)")]
-    pub aggregate_snapshots_cache_bytes: u64,
 
     #[arg(long, default_value_t = 64 * 1024 * 1024, env = "CELERIANT_PENDING_REPLICATION_HIGH_WATER_BYTES", help = "High water mark for pending replication queue before triggering S3 fallback (64MB)")]
     pub pending_replication_high_water_bytes: u64,
@@ -467,9 +449,56 @@ pub struct ServerConfig {
         help = "Temp directory for in-progress compaction files. Must be on the same filesystem as data_root. Defaults to {shard_dir}/.compaction_tmp/."
     )]
     pub compaction_temp_dir: Option<PathBuf>,
+
+    #[arg(
+        long,
+        default_value_t = 80,
+        env = "CELERIANT_MEMORY_CONSUMPTION_PERCENT",
+        help = "Percentage of detected available memory to use for caches (1-95, default: 80)"
+    )]
+    pub memory_consumption_percent: u8,
+
+    #[arg(
+        long,
+        env = "CELERIANT_MEMORY_BUDGET_BYTES",
+        help = "Explicit total memory budget in bytes (overrides system detection)"
+    )]
+    pub memory_budget_bytes: Option<u64>,
 }
 
 impl ServerConfig {
+    /// Computes memory budget and validates configuration.
+    /// Returns ShardMemoryBudget or error message.
+    pub fn compute_memory_budget(&self, num_shards: u32) -> Result<crate::memory_budget::ShardMemoryBudget, String> {
+        // Validate memory_consumption_percent
+        if self.memory_consumption_percent < 1 || self.memory_consumption_percent > 95 {
+            return Err(format!(
+                "memory_consumption_percent must be in range 1-95, got {}",
+                self.memory_consumption_percent
+            ));
+        }
+
+        let total_budget = if let Some(explicit_budget) = self.memory_budget_bytes {
+            explicit_budget
+        } else {
+            let detected = crate::memory_budget::detect_available_memory()?;
+            (detected as f64 * (self.memory_consumption_percent as f64 / 100.0)) as u64
+        };
+
+        let per_shard_budget = total_budget / num_shards as u64;
+
+        // Warn if per-shard budget is very small
+        const MIN_RECOMMENDED_BUDGET: u64 = 100 * 1024 * 1024; // 100 MB
+        if per_shard_budget < MIN_RECOMMENDED_BUDGET {
+            tracing::warn!(
+                "Per-shard memory budget is only {} MB (< 100 MB) - caches will be very small",
+                per_shard_budget / (1024 * 1024)
+            );
+        }
+
+        Ok(crate::memory_budget::compute_shard_budgets(total_budget, num_shards))
+    }
+
     pub fn to_sidecar_config(&self, num_shards: u32) -> SidecarConfig {
         SidecarConfig {
             worker_threads: std::cmp::max(2, num_shards as usize / 2),
@@ -555,14 +584,22 @@ impl ServerConfig {
         Ok(Some(Arc::new(TlsConfig { server_config, client_config, tls_mode })))
     }
 
-    pub fn to_shard_config(&self, node_id: u128, num_shards: u32, tls_config: Option<Arc<TlsConfig>>, api_keys: Option<crate::api_keys::ApiKeysConfig>) -> ShardConfig {
+    pub fn to_shard_config(
+        &self,
+        node_id: u128,
+        num_shards: u32,
+        tls_config: Option<Arc<TlsConfig>>,
+        api_keys: Option<crate::api_keys::ApiKeysConfig>,
+        memory_budget: crate::memory_budget::ShardMemoryBudget,
+    ) -> ShardConfig {
         use celeriant_runtimes::{CompressionType, TlsCertPaths, ApiKeyHashes};
         use celeriant_crypto::pki::ClientAuthMode;
 
         let replication_config = if self.standalone {
             None
         } else {
-            let client_address = format!("{}:{}", self.listen_address, self.client_port);
+            let client_address = self.advertised_client_address.clone()
+                .unwrap_or_else(|| format!("{}:{}", self.listen_address, self.client_port));
             let replication_address = self.advertised_replication_address.clone()
                 .unwrap_or_else(|| format!("{}:{}", self.listen_address, self.replication_port));
             Some(ReplicationConfig {
@@ -601,14 +638,14 @@ impl ServerConfig {
             max_request_size: self.max_request_size,
             max_response_size: self.max_response_size,
             shard_log_preallocate_bytes: self.shard_log_preallocate_bytes,
-            recent_write_cache_bytes: self.recent_write_cache_bytes,
+            recent_write_cache_bytes: memory_budget.recent_write_cache_bytes,
             slow_client_timeout: Duration::from_millis(self.client_connection_timeout_ms),
             max_requested_latency: Duration::from_millis(self.max_requested_latency_ms),
             fsync_delay: Duration::from_micros(self.fsync_delay_us),
             replication_delay: Duration::from_micros(self.replication_delay_us),
             routing_rule: self.routing_rule,
-            aggregate_client_snapshots_cache_bytes: self.aggregate_client_snapshots_cache_bytes,
-            aggregate_snapshots_cache_bytes: self.aggregate_snapshots_cache_bytes,
+            aggregate_client_snapshots_cache_bytes: memory_budget.aggregate_client_snapshots_cache_bytes,
+            aggregate_snapshots_cache_bytes: memory_budget.aggregate_snapshots_cache_bytes,
             timestamp_config: TimestampConfig {
                 precision: match self.timestamp_precision {
                     ConfigTimestampPrecision::Milliseconds => TimestampPrecision::Milliseconds,
@@ -619,8 +656,8 @@ impl ServerConfig {
             },
             list_max_duration: Duration::from_millis(self.list_max_duration_ms),
             list_page_size: self.list_page_size as usize,
-            list_wal_index_cache_bytes: self.list_wal_index_cache_bytes,
-            schema_cache_bytes: self.schema_cache_bytes,
+            list_wal_index_cache_bytes: memory_budget.list_wal_index_cache_bytes,
+            schema_cache_bytes: memory_budget.schema_cache_bytes,
             max_schema_size_bytes: self.max_schema_size_bytes,
             pending_replication_high_water_bytes: self.pending_replication_high_water_bytes,
             max_cluster_time_drift_ms: self.max_cluster_time_drift_ms,
@@ -704,14 +741,9 @@ impl ServerConfig {
         check_field!(max_requested_latency_ms);
         check_field!(list_max_duration_ms);
         check_field!(list_page_size);
-        check_field!(list_wal_index_cache_bytes);
-        check_field!(schema_cache_bytes);
         check_field!(max_schema_size_bytes);
         check_field!(client_connection_timeout_ms);
         check_field!(shard_log_preallocate_bytes);
-        check_field!(recent_write_cache_bytes);
-        check_field!(aggregate_client_snapshots_cache_bytes);
-        check_field!(aggregate_snapshots_cache_bytes);
         check_field!(pending_replication_high_water_bytes);
         check_field!(max_cluster_time_drift_ms);
         check_field!(max_catchup_gap_bytes);
@@ -747,6 +779,8 @@ impl ServerConfig {
         check_field!(compaction_check_interval_secs);
         check_field!(compaction_min_reclaimable_ratio);
         check_field!(compaction_temp_dir);
+        check_field!(memory_consumption_percent);
+        check_field!(memory_budget_bytes);
 
         entries
     }
@@ -772,6 +806,7 @@ impl Default for ServerConfig {
             client_port: 10000,
             replication_port: 10001,
             advertised_replication_address: None,
+            advertised_client_address: None,
             standalone: false,
             mesh_channel_size: 1024,
             num_shards: None,
@@ -791,11 +826,8 @@ impl Default for ServerConfig {
             shard_log_preallocate_bytes: 1024 * 1024 * 1024,
             fsync_delay_us: 17000,
             replication_delay_us: 17000,
-            recent_write_cache_bytes: 512 * 1024 * 1024,
             client_connection_timeout_ms: 30000,
             routing_rule: RoutingRule::AggregateId,
-            aggregate_client_snapshots_cache_bytes: 64 * 1024 * 1024,
-            aggregate_snapshots_cache_bytes: 64 * 1024 * 1024,
             pending_replication_high_water_bytes: 64 * 1024 * 1024,
             max_cluster_time_drift_ms: 5000,
             max_catchup_gap_bytes: 104_857_600,
@@ -803,8 +835,6 @@ impl Default for ServerConfig {
             timestamp_epoch_offset_secs: 0,
             list_max_duration_ms: 2000,
             list_page_size: 20000,
-            list_wal_index_cache_bytes: 12 * 1024 * 1024,
-            schema_cache_bytes: 4 * 1024 * 1024,
             max_schema_size_bytes: 16384,
             s3_endpoint_override: None,
             s3_skip_signature: false,
@@ -829,6 +859,8 @@ impl Default for ServerConfig {
             compaction_check_interval_secs: 7200,
             compaction_min_reclaimable_ratio: 0.20,
             compaction_temp_dir: None,
+            memory_consumption_percent: 80,
+            memory_budget_bytes: None,
         }
     }
 }

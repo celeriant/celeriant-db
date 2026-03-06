@@ -16,21 +16,19 @@ impl SerialisedDatablock {
         datablock: &Datablock,
         compression_type: CompressionType,
     ) -> Result<Self, CodecError> {
-        // First serialize without compression to check size
-        let uncompressed = codec::bincode::fixed_serialise_heap(datablock)?;
-        let uncompressed_size = uncompressed.len();
-
         let (compression_type_id, _) = compression_type.to_tuple();
 
-        // If it fits in a minibatch, store inline (with optional compression)
-        if uncompressed_size <= MINIBATCH_SIZE_BYTES {
+        // Try serialising directly to a stack buffer to avoid a heap allocation.
+        // This covers the common case where uncompressed data fits in a minibatch.
+        let mut stack_buf = [0u8; MINIBATCH_SIZE_BYTES];
+        if let Ok(uncompressed_size) = codec::bincode::fixed_serialise_stack(datablock, &mut stack_buf) {
             let mut minibatch = [0u8; MINIBATCH_SIZE_BYTES];
 
             let compressed_size = if compression_type == CompressionType::None {
-                minibatch[..uncompressed_size].copy_from_slice(&uncompressed);
+                minibatch[..uncompressed_size].copy_from_slice(&stack_buf[..uncompressed_size]);
                 uncompressed_size
             } else {
-                let compressed = compression::compress(&uncompressed, compression_type)?;
+                let compressed = compression::compress(&stack_buf[..uncompressed_size], compression_type)?;
                 minibatch[..compressed.len()].copy_from_slice(&compressed);
                 compressed.len()
             };
@@ -45,13 +43,29 @@ impl SerialisedDatablock {
             });
         }
 
-        // Otherwise, compress and create a block reference
+        // Uncompressed data exceeds minibatch — heap-serialise, but compression
+        // may still shrink it enough for inline storage
+        let uncompressed = codec::bincode::fixed_serialise_heap(datablock)?;
+        let uncompressed_size = uncompressed.len();
+
         let compressed = compression::compress(&uncompressed, compression_type)?;
         let compressed_size = compressed.len();
 
-        // Calculate CRC over the compressed data
-        let crc32c = crc32c::crc32c(&compressed);
+        if compressed_size <= MINIBATCH_SIZE_BYTES {
+            let mut minibatch = [0u8; MINIBATCH_SIZE_BYTES];
+            minibatch[..compressed_size].copy_from_slice(&compressed);
 
+            return Ok(Self {
+                uncompressed_size: uncompressed_size as u64,
+                compressed_size: compressed_size as u64,
+                datablock_version: WIRE_VERSION_WAL_DATABLOCK,
+                compression_type: compression_type_id,
+                storage_kind: DatablockStorageKind::Inline(DatablockInlineData { minibatch }),
+                external_data: None,
+            });
+        }
+
+        let crc32c = crc32c::crc32c(&compressed);
         let block_ref = DatablockBlockRef { crc32c };
 
         Ok(Self {
@@ -177,6 +191,34 @@ mod tests {
                     event_type_major: 1,
                     event_type_minor: 0,
                     event_value: Arc::new(large_payload),
+                    iv: None,
+                }],
+            }),
+        }
+    }
+
+    fn create_incompressible_large_datablock() -> Datablock {
+        // High-entropy data that won't compress below MINIBATCH_SIZE_BYTES.
+        // Use a simple xorshift to generate pseudo-random bytes.
+        let mut payload = vec![0u8; 2048];
+        let mut state: u64 = 0xDEAD_BEEF_CAFE_BABE;
+        for byte in payload.iter_mut() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = state as u8;
+        }
+        Datablock {
+            datablock_kind: DatablockKind::EventBatchItem(DatablockAggregateEventBatch {
+                event_batch_index: 1,
+                events: vec![DatablockAggregateEvent {
+                    client_event_index: 1,
+                    event_index: 1,
+                    event_id: Some(12345),
+                    event_timestamp: 1000,
+                    event_type_major: 1,
+                    event_type_minor: 0,
+                    event_value: Arc::new(payload),
                     iv: None,
                 }],
             }),
@@ -318,13 +360,13 @@ mod tests {
     }
 
     #[test]
-    fn block_roundtrip_with_zstd_compression() {
+    fn large_datablock_compressed_to_inline_with_zstd() {
         let original = create_large_datablock();
 
         let serialized = SerialisedDatablock::new(&original, CompressionType::Zstd { level: 3 }).unwrap();
 
-        // Verify compression was applied
-        assert!(matches!(serialized.storage_kind, DatablockStorageKind::Block(_)));
+        // Compressible data that exceeds minibatch uncompressed should inline when compressed
+        assert!(matches!(serialized.storage_kind, DatablockStorageKind::Inline(_)));
         assert_eq!(serialized.compression_type, 1); // Zstd
 
         let deserialized = roundtrip_deserialise(&serialized).unwrap();
@@ -341,10 +383,33 @@ mod tests {
     }
 
     #[test]
-    fn block_roundtrip_with_snappy_compression() {
+    fn large_datablock_compressed_to_inline_with_snappy() {
         let original = create_large_datablock();
 
         let serialized = SerialisedDatablock::new(&original, CompressionType::Snappy).unwrap();
+
+        assert!(matches!(serialized.storage_kind, DatablockStorageKind::Inline(_)));
+
+        let deserialized = roundtrip_deserialise(&serialized).unwrap();
+
+        match (&original.datablock_kind, &deserialized.datablock_kind) {
+            (
+                DatablockKind::EventBatchItem(orig_batch),
+                DatablockKind::EventBatchItem(deser_batch),
+            ) => {
+                assert_eq!(orig_batch.event_batch_index, deser_batch.event_batch_index);
+            }
+            _ => panic!("Unexpected datablock kind"),
+        }
+    }
+
+    #[test]
+    fn incompressible_large_datablock_stays_block() {
+        let original = create_incompressible_large_datablock();
+
+        let serialized = SerialisedDatablock::new(&original, CompressionType::Zstd { level: 3 }).unwrap();
+
+        assert!(matches!(serialized.storage_kind, DatablockStorageKind::Block(_)));
 
         let deserialized = roundtrip_deserialise(&serialized).unwrap();
 
@@ -423,13 +488,12 @@ mod tests {
 
     #[test]
     fn block_ref_contains_correct_sizes() {
-        let original = create_large_datablock();
+        let original = create_incompressible_large_datablock();
 
         let serialized = SerialisedDatablock::new(&original, CompressionType::Zstd { level: 3 }).unwrap();
 
         if let DatablockStorageKind::Block(ref _block_ref) = serialized.storage_kind {
             assert!(serialized.uncompressed_size > 0);
-            // With compression, compressed should typically be smaller or equal
             assert!(serialized.external_data.as_ref().unwrap().len() <= serialized.uncompressed_size as usize);
         } else {
             panic!("Expected Block storage");
@@ -438,7 +502,7 @@ mod tests {
 
     #[test]
     fn crc_is_calculated_over_compressed_data() {
-        let original = create_large_datablock();
+        let original = create_incompressible_large_datablock();
 
         let serialized = SerialisedDatablock::new(&original, CompressionType::None).unwrap();
 

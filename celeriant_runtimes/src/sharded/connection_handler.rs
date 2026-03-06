@@ -614,23 +614,26 @@ fn determine_shard_write(
         });
     }
 
-    let mut shard_ids: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut shard_id: Option<usize> = None;
     for aggregate_key in req.writes.keys() {
         let routing_id = config.routing_rule.routing_id_for_rule(aggregate_key);
-        shard_ids.insert((routing_id % num_shards) as usize);
+        let id = (routing_id % num_shards) as usize;
+        match shard_id {
+            None => shard_id = Some(id),
+            Some(first) if first != id => {
+                return Err(ShardRoutingError::IncompatibleFilters {
+                    detail: format!(
+                        "Write request spans multiple shards. All writes must route to the same shard when using {} routing.",
+                        config.routing_rule
+                    ),
+                    num_shards: num_shards as u64,
+                });
+            }
+            _ => {}
+        }
     }
 
-    if shard_ids.len() > 1 {
-        return Err(ShardRoutingError::IncompatibleFilters {
-            detail: format!(
-                "Write request spans multiple shards. All writes must route to the same shard when using {} routing.",
-                config.routing_rule
-            ),
-            num_shards: num_shards as u64,
-        });
-    }
-
-    Ok(shard_ids.into_iter().next().unwrap())
+    Ok(shard_id.unwrap())
 }
 
 fn determine_shard_delete(
@@ -646,23 +649,26 @@ fn determine_shard_delete(
         });
     }
 
-    let mut shard_ids: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut shard_id: Option<usize> = None;
     for aggregate_key in req.deletes.keys() {
         let routing_id = config.routing_rule.routing_id_for_rule(aggregate_key);
-        shard_ids.insert((routing_id % num_shards) as usize);
+        let id = (routing_id % num_shards) as usize;
+        match shard_id {
+            None => shard_id = Some(id),
+            Some(first) if first != id => {
+                return Err(ShardRoutingError::IncompatibleFilters {
+                    detail: format!(
+                        "Delete request spans multiple shards. All delete must route to the same shard when using {} routing.",
+                        config.routing_rule
+                    ),
+                    num_shards: num_shards as u64,
+                });
+            }
+            _ => {}
+        }
     }
 
-    if shard_ids.len() > 1 {
-        return Err(ShardRoutingError::IncompatibleFilters {
-            detail: format!(
-                "Delete request spans multiple shards. All delete must route to the same shard when using {} routing.",
-                config.routing_rule
-            ),
-            num_shards: num_shards as u64,
-        });
-    }
-
-    Ok(shard_ids.into_iter().next().unwrap())
+    Ok(shard_id.unwrap())
 }
 
 fn determine_shard_watch(

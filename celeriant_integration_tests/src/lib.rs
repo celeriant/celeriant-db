@@ -24,6 +24,7 @@ use std::path::PathBuf;
 
 use celeriant_client_tokio::ClientTlsConfig;
 use celeriant_crypto::pki::PkiManager;
+use celeriant_lib::server_config::ConfigTlsMode;
 use rustls_pki_types::ServerName;
 use tempfile::TempDir;
 use tokio::net::TcpStream;
@@ -317,27 +318,37 @@ impl TestServer {
 
     /// Poll until the server is accepting connections.
     ///
-    /// Uses a TCP connect probe to confirm the server's accept loop is running.
-    /// For TLS-strict servers this triggers a one-time "TLS handshake failed"
-    /// warning in the server log — this is harmless. A passive /proc/net/tcp
-    /// LISTEN check is insufficient because it fires as soon as listen() is
-    /// called, before the Glommio event loop starts accepting.
+    /// For plaintext servers, uses a bare TCP connect probe.
+    /// For TLS-strict servers, avoids TCP probing (which triggers spurious
+    /// "TLS handshake failed" errors) and instead waits for the process to
+    /// start listening by checking process liveness + a port probe via /proc/net.
     async fn poll_ready(
         address: &str,
         child: &mut Child,
-        _config: &ServerConfig,
+        config: &ServerConfig,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let start = std::time::Instant::now();
         let max_wait = Duration::from_secs(30);
+        let tls_strict = matches!(config.tls_mode, ConfigTlsMode::Strict);
 
         while start.elapsed() < max_wait {
             if let Ok(Some(status)) = child.try_wait() {
                 return Err(format!("Server exited during startup: {}", status).into());
             }
 
-            match TcpStream::connect(address).await {
-                Ok(_) => return Ok(()),
-                Err(_) => sleep(Duration::from_millis(100)).await,
+            if tls_strict {
+                // For TLS servers, probe whether the port is in LISTEN state
+                // without completing a TCP handshake (which would cause the server
+                // to start a TLS handshake we can't complete without client certs).
+                if port_is_listening(config.client_port) {
+                    return Ok(());
+                }
+                sleep(Duration::from_millis(100)).await;
+            } else {
+                match TcpStream::connect(address).await {
+                    Ok(_) => return Ok(()),
+                    Err(_) => sleep(Duration::from_millis(100)).await,
+                }
             }
         }
 
@@ -352,6 +363,23 @@ impl Drop for TestServer {
         let _ = self.child.wait();
         println!("  Test server shut down");
     }
+}
+
+/// Check if a port is in LISTEN state by probing /proc/net/tcp.
+/// This avoids completing a TCP handshake, which is important for TLS servers
+/// where a bare TCP connect + drop triggers spurious TLS errors.
+fn port_is_listening(port: u16) -> bool {
+    let hex_port = format!("{:04X}", port);
+    let Ok(contents) = std::fs::read_to_string("/proc/net/tcp") else {
+        return false;
+    };
+    // /proc/net/tcp format: local_address (hex IP:PORT) state (0A = LISTEN)
+    contents.lines().skip(1).any(|line| {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        parts.len() >= 4
+            && parts[1].ends_with(&format!(":{}", hex_port))
+            && parts[3] == "0A"
+    })
 }
 
 /// Take stdout from a child process and spawn a thread that prints each line with a label prefix.
@@ -428,15 +456,6 @@ impl ServerConfigExt for ServerConfig {
         args.push("--shard-log-preallocate-bytes".to_string());
         args.push(self.shard_log_preallocate_bytes.to_string());
 
-        args.push("--recent-write-cache-bytes".to_string());
-        args.push(self.recent_write_cache_bytes.to_string());
-
-        args.push("--aggregate-client-snapshots-cache-bytes".to_string());
-        args.push(self.aggregate_client_snapshots_cache_bytes.to_string());
-
-        args.push("--aggregate-snapshots-cache-bytes".to_string());
-        args.push(self.aggregate_snapshots_cache_bytes.to_string());
-
         args.push("--fsync-delay-us".to_string());
         args.push(self.fsync_delay_us.to_string());
 
@@ -449,14 +468,16 @@ impl ServerConfigExt for ServerConfig {
         args.push("--list-page-size".to_string());
         args.push(self.list_page_size.to_string());
 
-        args.push("--list-wal-index-cache-bytes".to_string());
-        args.push(self.list_wal_index_cache_bytes.to_string());
-
-        args.push("--schema-cache-bytes".to_string());
-        args.push(self.schema_cache_bytes.to_string());
-
         args.push("--max-schema-size-bytes".to_string());
         args.push(self.max_schema_size_bytes.to_string());
+
+        args.push("--memory-consumption-percent".to_string());
+        args.push(self.memory_consumption_percent.to_string());
+
+        if let Some(budget) = self.memory_budget_bytes {
+            args.push("--memory-budget-bytes".to_string());
+            args.push(budget.to_string());
+        }
 
         // Cluster mode configuration
         if self.standalone {

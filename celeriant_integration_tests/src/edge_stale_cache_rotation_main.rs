@@ -62,7 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (region, bucket, access_key, secret_key, endpoint, allow_http) = minio.s3_config_fields();
     println!("MinIO ready at {}\n", endpoint);
 
-    // Build config: small snapshot cache (forces LRU eviction) + small log preallocate (forces rotation).
+    // Build config: small memory budget (forces LRU eviction) + small log preallocate (forces rotation).
     let base_config = s3_cluster_config(
         2,
         &region,
@@ -75,8 +75,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = celeriant_integration_tests::ServerConfig {
         // 2MB log preallocate — 50 × 32KB events (~1.6MB) cause rotation.
         shard_log_preallocate_bytes: 2 * 1024 * 1024,
-        // 64KB snapshot cache — forces eviction after fewer aggregates.
-        aggregate_snapshots_cache_bytes: 64 * 1024,
+        // Small memory budget per shard — forces cache eviction
+        memory_budget_bytes: Some(512 * 1024),
         routing_rule: RoutingRule::AggregateTypeId,
         // Very high water mark: this test is NOT about S3 fallback. Prevent the
         // replication queue from triggering S3 during the rapid Phase B writes.

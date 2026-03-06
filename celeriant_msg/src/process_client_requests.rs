@@ -29,6 +29,7 @@ pub enum ClientRequestType {
 }
 
 impl ClientRequestType {
+    #[inline]
     pub fn from_u32(value: u32) -> Result<Self, ReadWireDataError> {
         match value {
             1 => Ok(ClientRequestType::AggregateDetails),
@@ -61,6 +62,7 @@ pub enum ClientRequest {
 }
 
 impl ClientRequest {
+    #[inline]
     pub fn request_type(&self) -> ClientRequestType {
         match self {
             ClientRequest::AggregateDetails(_) => ClientRequestType::AggregateDetails,
@@ -76,6 +78,7 @@ impl ClientRequest {
         }
     }
 
+    #[inline]
     pub fn correlation_id(&self) -> Option<u128> {
         match self {
             ClientRequest::AggregateDetails(req) => req.correlation_id,
@@ -91,6 +94,7 @@ impl ClientRequest {
         }
     }
 
+    #[inline]
     pub fn aggregate_id(&self) -> u128 {
         match self {
             ClientRequest::AggregateDetails(req) => req.aggregate_key.aggregate_id,
@@ -100,6 +104,7 @@ impl ClientRequest {
         }
     }
 
+    #[inline]
     pub fn org_id(&self) -> u128 {
         match self {
             ClientRequest::AggregateDetails(req) => req.aggregate_key.org_id,
@@ -109,6 +114,7 @@ impl ClientRequest {
         }
     }
 
+    #[inline]
     pub fn aggregate_type_id(&self) -> u128 {
         match self {
             ClientRequest::AggregateDetails(req) => req.aggregate_key.aggregate_type_id,

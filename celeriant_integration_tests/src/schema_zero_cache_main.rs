@@ -113,11 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         num_shards: Some(4),
         log_level: "warn".to_string(),
         standalone: true,
-        recent_write_cache_bytes: 0,
-        aggregate_client_snapshots_cache_bytes: 0,
-        aggregate_snapshots_cache_bytes: 0,
-        list_wal_index_cache_bytes: 0,
-        schema_cache_bytes: 0,
+        memory_budget_bytes: Some(1024),
         ..Default::default()
     };
 

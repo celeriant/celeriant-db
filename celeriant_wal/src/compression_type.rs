@@ -13,6 +13,7 @@ pub enum CompressionType {
 }
 
 impl CompressionType {
+    #[inline]
     pub fn to_tuple(self) -> (u8, Option<i32>) {
         match self {
             CompressionType::None => (0, None),
@@ -23,6 +24,7 @@ impl CompressionType {
         }
     }
 
+    #[inline]
     pub fn from_tuple(type_id: u8, level: Option<i32>) -> Self {
         match type_id {
             0 => CompressionType::None,

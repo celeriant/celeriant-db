@@ -75,8 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = ServerConfig {
         log_level: "warn".to_string(),
         standalone: true,
-        recent_write_cache_bytes: 1024, // tiny
-        aggregate_snapshots_cache_bytes: 11200, // ~100 entries (112 bytes each)
+        memory_budget_bytes: Some(256 * 1024), // ~256KB total — tiny cache
         num_shards: Some(1),
         ..Default::default()
     };

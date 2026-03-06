@@ -67,6 +67,7 @@ pub enum ClientResponse {
 }
 
 impl ClientResponse {
+    #[inline]
     pub fn response_type(&self) -> ClientResponseType {
         match self {
             ClientResponse::AggregateDetails(_) => ClientResponseType::AggregateDetails,
@@ -138,6 +139,7 @@ impl ClientResponse {
         })
     }
 
+    #[inline]
     pub fn determine_compression_type(response: &ClientResponse, server_compression_algorithm: CompressionType) -> CompressionType {
         match response {
             ClientResponse::AggregateDetails(_) => CompressionType::None,

@@ -12,6 +12,7 @@ pub mod server_config;
 pub mod cert_cmd;
 pub mod keys_cmd;
 pub mod api_keys;
+pub mod memory_budget;
 mod dio_check;
 mod fs_check;
 
@@ -75,6 +76,107 @@ pub fn startup(args: Vec<String>) -> Result<(), std::io::Error> {
 
     let nbr_shards = server_config.num_shards.unwrap_or_else(num_cpus::get) as u32;
 
+    // Detect available memory and compute budget
+    let (detected_memory, cgroup_limit, total_budget, memory_budget) = {
+        let detected = memory_budget::detect_available_memory();
+
+        // Warn if detected memory is suspiciously low
+        if let Ok(mem) = detected {
+            const MIN_RECOMMENDED_MEMORY: u64 = 512 * 1024 * 1024; // 512 MB
+            if mem < MIN_RECOMMENDED_MEMORY {
+                tracing::warn!(
+                    "Detected system memory is only {} MB (< 512 MB) - this may be too low for production use",
+                    mem / (1024 * 1024)
+                );
+            }
+        }
+
+        let budget_result = server_config.compute_memory_budget(nbr_shards);
+        let budget = match budget_result {
+            Ok(b) => b,
+            Err(e) => {
+                error!("Memory budget calculation failed: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+        // Get detection details for logging
+        let physical_ram = std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|content| {
+                content.lines()
+                    .find(|line| line.starts_with("MemTotal:"))
+                    .and_then(|line| {
+                        line.strip_prefix("MemTotal:")
+                            .and_then(|rest| rest.trim().split_whitespace().next())
+                            .and_then(|kb| kb.parse::<u64>().ok())
+                            .map(|kb| kb * 1024)
+                    })
+            });
+
+        let cgroup = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
+            .ok()
+            .and_then(|content| {
+                let trimmed = content.trim();
+                if trimmed == "max" { None } else { trimmed.parse().ok() }
+            });
+
+        let detected_mem = detected.unwrap_or(0);
+        let total = if let Some(explicit) = server_config.memory_budget_bytes {
+            explicit
+        } else {
+            (detected_mem as f64 * (server_config.memory_consumption_percent as f64 / 100.0)) as u64
+        };
+
+        (physical_ram, cgroup, total, budget)
+    };
+
+    // Log memory plan
+    if server_config.memory_budget_bytes.is_some() {
+        info!("Using explicit memory budget (override)");
+    } else if let Some(physical) = detected_memory {
+        if let Some(cgroup) = cgroup_limit {
+            let used = std::cmp::min(physical, cgroup);
+            info!(
+                "Detected memory: {:.1} GB (physical: {:.1} GB, cgroup limit: {:.1} GB, using: {:.1} GB)",
+                physical as f64 / (1024.0 * 1024.0 * 1024.0),
+                physical as f64 / (1024.0 * 1024.0 * 1024.0),
+                cgroup as f64 / (1024.0 * 1024.0 * 1024.0),
+                used as f64 / (1024.0 * 1024.0 * 1024.0)
+            );
+        } else {
+            info!(
+                "Detected memory: {:.1} GB (physical RAM)",
+                physical as f64 / (1024.0 * 1024.0 * 1024.0)
+            );
+        }
+    }
+
+    let per_shard_budget = total_budget / nbr_shards as u64;
+    if server_config.memory_budget_bytes.is_some() {
+        info!(
+            "Memory budget: {:.1} GB (explicit), {} shards -> {:.1} GB/shard",
+            total_budget as f64 / (1024.0 * 1024.0 * 1024.0),
+            nbr_shards,
+            per_shard_budget as f64 / (1024.0 * 1024.0 * 1024.0)
+        );
+    } else {
+        info!(
+            "Memory budget: {:.1} GB ({}% of detected), {} shards -> {:.1} GB/shard",
+            total_budget as f64 / (1024.0 * 1024.0 * 1024.0),
+            server_config.memory_consumption_percent,
+            nbr_shards,
+            per_shard_budget as f64 / (1024.0 * 1024.0 * 1024.0)
+        );
+    }
+
+    info!("Per-shard allocation:");
+    info!("  recent_write_cache:          {:4} MB (71.5%)", memory_budget.recent_write_cache_bytes / (1024 * 1024));
+    info!("  aggregate_snapshots:         {:4} MB  (9.0%)", memory_budget.aggregate_snapshots_cache_bytes / (1024 * 1024));
+    info!("  client_idempotency_snapshots:{:4} MB  (9.0%)", memory_budget.aggregate_client_snapshots_cache_bytes / (1024 * 1024));
+    info!("  schema_cache:                {:4} MB  (9.0%)", memory_budget.schema_cache_bytes / (1024 * 1024));
+    info!("  wal_index_positions:         {:4} MB  (1.5%)", memory_budget.list_wal_index_cache_bytes / (1024 * 1024));
+
     // Build TLS config if enabled, and verify kernel kTLS support.
     let tls_config = match server_config.build_tls_config() {
         Ok(cfg) => cfg,
@@ -127,7 +229,7 @@ pub fn startup(args: Vec<String>) -> Result<(), std::io::Error> {
         info!("API key authentication enabled");
     }
 
-    let shard_config = server_config.to_shard_config(node_id, nbr_shards, tls_config, api_keys);
+    let shard_config = server_config.to_shard_config(node_id, nbr_shards, tls_config, api_keys, memory_budget);
     let sidecar_config = server_config.to_sidecar_config(nbr_shards);
     let sidecar_store_config = server_config.to_sidecar_store_config();
 

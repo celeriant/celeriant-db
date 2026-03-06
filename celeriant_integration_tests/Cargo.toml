@@ -301,6 +301,10 @@ path = "src/compaction_restart_main.rs"
 name = "compaction_replicated_main"
 path = "src/compaction_replicated_main.rs"
 
+[[bin]]
+name = "batch_standalone_cleartext_main"
+path = "src/batch_standalone_cleartext_main.rs"
+
 [features]
 default = []
 small-metablock = [

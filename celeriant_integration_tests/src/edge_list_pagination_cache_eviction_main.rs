@@ -47,16 +47,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let port_base = 17500 + (std::process::id() % 100) as u16;
     let server_port = port_base;
 
-    // list_wal_index_cache_bytes=24 → capacity = 24 / 24 = 1 entry.
-    // Every second page fetch causes a cache miss and falls back to full log scan.
+    // Very small memory budget forces minimal caches.
     // list_page_size=20 → forces many pages across 200 aggregates.
     let config = ServerConfig {
         num_shards: Some(1),
         log_level: "warn".to_string(),
         standalone: true,
         routing_rule: RoutingRule::AggregateTypeId,
-        // 1 entry LRU — maximum cache pressure
-        list_wal_index_cache_bytes: 24,
+        // Tiny memory budget — maximum cache pressure
+        memory_budget_bytes: Some(256 * 1024),
         // Small page size — forces many page fetches
         list_page_size: 20,
         // 2MB log — forces rotation after ~200 × small events
