@@ -9,14 +9,32 @@ use deepsize::DeepSizeOf;
 use serde::{Deserialize, Serialize};
 
 /// Schema lookup key (cache key, WAL lookup key)
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
+#[derive(Clone, PartialEq, Eq, Serialize, DeepSizeOf)]
 pub struct SchemaKey {
     pub org_id: u128,
     pub aggregate_type_id: u128,
     pub event_type_major: u64,
     pub event_type_minor: u64,
-    // Pre-computed hash (not serialized)
+    // Pre-computed hash for better performance — skipped in serde, recomputed on deserialize
+    #[serde(skip)]
     hash: u64,
+}
+
+impl<'de> serde::Deserialize<'de> for SchemaKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct SchemaKeyFields {
+            org_id: u128,
+            aggregate_type_id: u128,
+            event_type_major: u64,
+            event_type_minor: u64,
+        }
+        let fields = SchemaKeyFields::deserialize(deserializer)?;
+        Ok(Self::new(fields.org_id, fields.aggregate_type_id, fields.event_type_major, fields.event_type_minor))
+    }
 }
 
 impl SchemaKey {

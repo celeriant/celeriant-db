@@ -23,11 +23,7 @@ pub struct AggregateEventBatch {
     pub client_id: u128,
 
     /// Optional user ID
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        with = "serde_option_u128_base64",
-        rename = "ui"
-    )]
+    #[serde(with = "serde_option_u128_base64", rename = "ui")]
     pub user_id: Option<u128>,
 
     /// Server timestamp when batch was processed

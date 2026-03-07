@@ -10,13 +10,30 @@ use serde::{Deserialize, Serialize};
 
 /// High-performance composite key for aggregate tracking
 /// Optimized for hashing and comparison operations
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
+#[derive(Clone, PartialEq, Eq, Serialize, DeepSizeOf)]
 pub struct AggregateKey {
     pub org_id: u128,
     pub aggregate_type_id: u128,
     pub aggregate_id: u128,
-    // Pre-computed hash for better performance
+    // Pre-computed hash for better performance — skipped in serde, recomputed on deserialize
+    #[serde(skip)]
     hash: u64,
+}
+
+impl<'de> serde::Deserialize<'de> for AggregateKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct AggregateKeyFields {
+            org_id: u128,
+            aggregate_type_id: u128,
+            aggregate_id: u128,
+        }
+        let fields = AggregateKeyFields::deserialize(deserializer)?;
+        Ok(Self::new(fields.org_id, fields.aggregate_type_id, fields.aggregate_id))
+    }
 }
 
 impl AggregateKey {

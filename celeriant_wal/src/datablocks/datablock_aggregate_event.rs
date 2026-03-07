@@ -21,11 +21,7 @@ pub struct DatablockAggregateEvent {
     pub event_index: u64,
 
     /// Optional unique identifier for the event assigned by the client
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        with = "serde_option_u128_base64",
-        rename = "id"
-    )]
+    #[serde(with = "serde_option_u128_base64", rename = "id")]
     pub event_id: Option<u128>,
 
     /// Client derived Unix timestamp in milliseconds when the event occurred
@@ -46,11 +42,6 @@ pub struct DatablockAggregateEvent {
     pub event_value: Arc<Vec<u8>>,
 
     /// Initialization vector for encrypted event_value (12 bytes for AES-GCM)
-    #[serde(
-        with = "serde_fixed_u8_array_base64",
-        rename = "iv",
-        skip_serializing_if = "Option::is_none",
-        default
-    )]
+    #[serde(with = "serde_fixed_u8_array_base64", rename = "iv", default)]
     pub iv: Option<[u8; 12]>,
 }
