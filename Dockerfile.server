@@ -1,0 +1,16 @@
+FROM rust:latest AS builder
+WORKDIR /build
+COPY . .
+RUN cargo build --release -p celeriant
+
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y libssl3t64 && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /build/target/release/celeriant /usr/local/bin/celeriant
+EXPOSE 10000
+CMD ["celeriant", \
+     "--standalone", \
+     "--data-root", "/var/lib/celeriant", \
+     "--client-port", "10000", \
+     "--num-shards", "1", \
+     "--shard-log-preallocate-bytes", "67108864", \
+     "--log-level", "warn"]
