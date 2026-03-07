@@ -10,7 +10,7 @@ default = []
 small-metablock = []
 
 [dependencies]
-base64.workspace = true
 bincode.workspace = true
 serde.workspace = true
+serde_bytes.workspace = true
 deepsize.workspace = true

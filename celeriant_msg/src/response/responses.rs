@@ -234,7 +234,25 @@ pub struct IdentifyResponse {
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+#[serde(into = "u8", try_from = "u8")]
 pub enum AccessLevel {
     ReadWrite = 1,
     ReadOnly = 2,
+}
+
+impl From<AccessLevel> for u8 {
+    fn from(level: AccessLevel) -> u8 {
+        level as u8
+    }
+}
+
+impl TryFrom<u8> for AccessLevel {
+    type Error = u8;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(AccessLevel::ReadWrite),
+            2 => Ok(AccessLevel::ReadOnly),
+            _ => Err(value),
+        }
+    }
 }

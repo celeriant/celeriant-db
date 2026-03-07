@@ -356,7 +356,8 @@ async fn setup_schema_and_accounts(
                 allow_create: true,
                 expected_event_batch_index: None,
                 enforce_client_idempotency: false,
-                compression_type: CompressionType::None,
+                compression_type_id: 0,
+                compression_level: None,
             },
         );
 
@@ -418,7 +419,8 @@ fn build_prebuilt_requests(connection_id: usize, client_id: u128) -> Vec<ClientR
                 allow_create: false,
                 expected_event_batch_index: None,
                 enforce_client_idempotency: false,
-                compression_type: CompressionType::None,
+                compression_type_id: 0,
+                compression_level: None,
             },
         );
         writes.insert(
@@ -428,7 +430,8 @@ fn build_prebuilt_requests(connection_id: usize, client_id: u128) -> Vec<ClientR
                 allow_create: false,
                 expected_event_batch_index: None,
                 enforce_client_idempotency: false,
-                compression_type: CompressionType::None,
+                compression_type_id: 0,
+                compression_level: None,
             },
         );
 

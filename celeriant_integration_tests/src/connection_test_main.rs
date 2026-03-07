@@ -251,7 +251,8 @@ async fn test_mixed_operations(server_address: &str) -> Result<(), Box<dyn std::
             allow_create: true,
             expected_event_batch_index: None, // Don't enforce version
             enforce_client_idempotency: false,
-            compression_type: CompressionType::None,
+            compression_type_id: 0,
+            compression_level: None,
         },
     );
 
@@ -374,7 +375,8 @@ async fn test_shard_affinity(server_address: &str) -> Result<(), Box<dyn std::er
                 allow_create: true,
                 expected_event_batch_index: None,
                 enforce_client_idempotency: false,
-                compression_type: CompressionType::None,
+                compression_type_id: 0,
+                compression_level: None,
             },
         );
 

@@ -29,6 +29,7 @@ license = "Apache-2.0"
 object_store = { version = "0.13.0", features = ["aws"] }
 deepsize = "0.2.0"
 serde = { version = "1.0.228", features = ["derive", "rc"] }
+serde_bytes = "0.11"
 base64 = "0.22.1"
 bincode = "2.0.1"
 snap = "1.1.1"

@@ -1313,7 +1313,8 @@ mod tests {
             expected_event_batch_index: None,
             allow_create: true,
             enforce_client_idempotency: false,
-            compression_type: CompressionType::None,
+            compression_type_id: 0,
+            compression_level: None,
             events: vec![],
         });
         let request = ClientRequest::Write(WriteRequest {
@@ -1336,7 +1337,8 @@ mod tests {
                 expected_event_batch_index: None,
                 allow_create: true,
                 enforce_client_idempotency: false,
-                compression_type: CompressionType::None,
+                compression_type_id: 0,
+            compression_level: None,
                 events: vec![],
             },
         );
@@ -1346,7 +1348,8 @@ mod tests {
                 expected_event_batch_index: None,
                 allow_create: true,
                 enforce_client_idempotency: false,
-                compression_type: CompressionType::None,
+                compression_type_id: 0,
+            compression_level: None,
                 events: vec![],
             },
         );
@@ -1370,7 +1373,8 @@ mod tests {
                 expected_event_batch_index: None,
                 allow_create: true,
                 enforce_client_idempotency: false,
-                compression_type: CompressionType::None,
+                compression_type_id: 0,
+            compression_level: None,
                 events: vec![],
             },
         );
@@ -1380,7 +1384,8 @@ mod tests {
                 expected_event_batch_index: None,
                 allow_create: true,
                 enforce_client_idempotency: false,
-                compression_type: CompressionType::None,
+                compression_type_id: 0,
+            compression_level: None,
                 events: vec![],
             },
         );
@@ -1634,7 +1639,8 @@ mod tests {
             expected_event_batch_index: None,
             allow_create: true,
             enforce_client_idempotency: false,
-            compression_type: CompressionType::None,
+            compression_type_id: 0,
+            compression_level: None,
             events: vec![],
         });
         let req = ClientRequest::Write(WriteRequest {
@@ -1654,7 +1660,8 @@ mod tests {
             expected_event_batch_index: None,
             allow_create: true,
             enforce_client_idempotency: false,
-            compression_type: CompressionType::None,
+            compression_type_id: 0,
+            compression_level: None,
             events: vec![],
         });
         let req = ClientRequest::Write(WriteRequest {
@@ -1674,7 +1681,8 @@ mod tests {
             expected_event_batch_index: None,
             allow_create: true,
             enforce_client_idempotency: false,
-            compression_type: CompressionType::None,
+            compression_type_id: 0,
+            compression_level: None,
             events: vec![],
         });
         let req = ClientRequest::Write(WriteRequest {

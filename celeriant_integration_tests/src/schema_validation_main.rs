@@ -74,7 +74,8 @@ fn write_event(
             allow_create,
             expected_event_batch_index: Some(batch_index),
             enforce_client_idempotency: false,
-            compression_type: CompressionType::None,
+            compression_type_id: 0,
+            compression_level: None,
         },
     );
 

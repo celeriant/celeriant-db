@@ -117,7 +117,8 @@ fn create_write_request(
             allow_create: true,
             expected_event_batch_index: None,
             enforce_client_idempotency: false,
-            compression_type: CompressionType::None,
+            compression_type_id: 0,
+            compression_level: None,
         },
     );
 

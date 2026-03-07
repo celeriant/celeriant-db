@@ -1023,7 +1023,8 @@ pub async fn write_event(
             allow_create,
             expected_event_batch_index: if event_num == 1 { Some(0) } else { None },
             enforce_client_idempotency: false,
-            compression_type: CompressionType::None,
+            compression_type_id: 0,
+            compression_level: None,
         },
     );
 
@@ -1076,7 +1077,8 @@ pub async fn write_large_event(
             allow_create: false,
             expected_event_batch_index: None,
             enforce_client_idempotency: false,
-            compression_type: CompressionType::None,
+            compression_type_id: 0,
+            compression_level: None,
         },
     );
 

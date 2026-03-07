@@ -116,7 +116,8 @@ async fn test_cross_shard_write_rejection(
             allow_create: true,
             expected_event_batch_index: None,
             enforce_client_idempotency: false,
-            compression_type: CompressionType::None,
+            compression_type_id: 0,
+            compression_level: None,
         },
     );
     writes.insert(
@@ -126,7 +127,8 @@ async fn test_cross_shard_write_rejection(
             allow_create: true,
             expected_event_batch_index: None,
             enforce_client_idempotency: false,
-            compression_type: CompressionType::None,
+            compression_type_id: 0,
+            compression_level: None,
         },
     );
 
@@ -196,7 +198,8 @@ async fn test_same_shard_write_success(
             allow_create: true,
             expected_event_batch_index: None,
             enforce_client_idempotency: false,
-            compression_type: CompressionType::None,
+            compression_type_id: 0,
+            compression_level: None,
         },
     );
     writes.insert(
@@ -206,7 +209,8 @@ async fn test_same_shard_write_success(
             allow_create: true,
             expected_event_batch_index: None,
             enforce_client_idempotency: false,
-            compression_type: CompressionType::None,
+            compression_type_id: 0,
+            compression_level: None,
         },
     );
 
@@ -302,7 +306,8 @@ async fn test_no_partial_writes(server_address: &str) -> Result<(), Box<dyn std:
             allow_create: true,
             expected_event_batch_index: None,
             enforce_client_idempotency: false,
-            compression_type: CompressionType::None,
+            compression_type_id: 0,
+            compression_level: None,
         },
     );
     writes.insert(
@@ -312,7 +317,8 @@ async fn test_no_partial_writes(server_address: &str) -> Result<(), Box<dyn std:
             allow_create: true,
             expected_event_batch_index: None,
             enforce_client_idempotency: false,
-            compression_type: CompressionType::None,
+            compression_type_id: 0,
+            compression_level: None,
         },
     );
 

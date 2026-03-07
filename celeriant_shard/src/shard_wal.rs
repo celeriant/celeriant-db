@@ -30,6 +30,7 @@ use celeriant_msg::response::aggregate_event_batch::AggregateEventBatch;
 use celeriant_msg::response::responses::{AggregateListItem, AggregateTypeListItem, AggregateDetailsResponse, FollowerRejection, ListAggregateTypesResponse, ListAggregatesResponse, ListOrgsResponse, OrgListItem, ReadResponse, ReplicationBatchResponse, ReplicationResult, SuccessResponse};
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
 use celeriant_rotating_log::reverse_metablock_scanner::ReverseMetablockScanner;
+use celeriant_wal::compression_type::CompressionType;
 use celeriant_wal::aggregate_client_key::AggregateClientKey;
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::aggregate_type_key::AggregateTypeKey;
@@ -1496,7 +1497,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         };
 
         // Serialize datablock - this can fail
-        let serialized_datablock = SerialisedDatablock::new(&datablock, write_request.compression_type)
+        let serialized_datablock = SerialisedDatablock::new(&datablock, CompressionType::from_tuple(write_request.compression_type_id, write_request.compression_level))
             .map_err(ShardWriteError::FailedToSerialiseDatablocks)?;
 
         let server_timestamp = self.config.timestamp_config.now();
@@ -2165,7 +2166,8 @@ mod tests {
                 allow_create,
                 expected_event_batch_index: expected_batch,
                 enforce_client_idempotency: enforce_idempotency,
-                compression_type: CompressionType::None,
+                compression_type_id: 0,
+                compression_level: None,
             },
         );
         ClientRequest::Write(WriteRequest {
@@ -2294,7 +2296,8 @@ mod tests {
                 allow_create: true,
                 expected_event_batch_index: None,
                 enforce_client_idempotency: false,
-                compression_type: CompressionType::None,
+                compression_type_id: 0,
+                compression_level: None,
             },
         );
         ClientRequest::Write(WriteRequest {
@@ -3161,7 +3164,8 @@ mod tests {
                     allow_create: true,
                     expected_event_batch_index: expected,
                     enforce_client_idempotency: false,
-                    compression_type: CompressionType::None,
+                    compression_type_id: 0,
+                compression_level: None,
                 },
             );
         }

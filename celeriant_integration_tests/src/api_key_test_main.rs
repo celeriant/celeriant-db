@@ -170,7 +170,8 @@ async fn test_read_write_key_allows_writes(
             allow_create: true,
             expected_event_batch_index: Some(0),
             enforce_client_idempotency: false,
-            compression_type: CompressionType::None,
+            compression_type_id: 0,
+            compression_level: None,
         },
     );
 
@@ -248,7 +249,8 @@ async fn test_read_only_key_blocks_writes(
             allow_create: false,
             expected_event_batch_index: None,
             enforce_client_idempotency: false,
-            compression_type: CompressionType::None,
+            compression_type_id: 0,
+            compression_level: None,
         },
     );
 
@@ -411,7 +413,8 @@ async fn test_secondary_key_works(
             allow_create: true,
             expected_event_batch_index: Some(0),
             enforce_client_idempotency: false,
-            compression_type: CompressionType::None,
+            compression_type_id: 0,
+            compression_level: None,
         },
     );
 
@@ -460,7 +463,8 @@ async fn test_no_api_keys_allows_all(
             allow_create: true,
             expected_event_batch_index: Some(0),
             enforce_client_idempotency: false,
-            compression_type: CompressionType::None,
+            compression_type_id: 0,
+            compression_level: None,
         },
     );
 

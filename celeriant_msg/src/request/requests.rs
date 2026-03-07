@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use bincode::{Decode, Encode};
-use celeriant_wal::{aggregate_key::AggregateKey, compression_type::CompressionType, datablocks::datablock_aggregate_event::DatablockAggregateEvent, schema_key::SchemaKey};
+use celeriant_wal::{aggregate_key::AggregateKey, datablocks::datablock_aggregate_event::DatablockAggregateEvent, schema_key::SchemaKey};
 
 use celeriant_wal::{constants::STRUCT_TO_MEMORY_REAL_SIZE, datablocks::datablock::Datablock, metablocks::metablock::Metablock};
 use serde::{Deserialize, Serialize};
@@ -67,7 +67,8 @@ pub struct SingleAggregateWrite {
     pub allow_create: bool,
     pub expected_event_batch_index: Option<u64>,
     pub enforce_client_idempotency: bool,
-    pub compression_type: CompressionType,
+    pub compression_type_id: u8,
+    pub compression_level: Option<i32>,
 }
 
 

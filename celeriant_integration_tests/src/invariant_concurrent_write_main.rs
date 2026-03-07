@@ -98,7 +98,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         allow_create: false,
                         expected_event_batch_index: None,
                         enforce_client_idempotency: false,
-                        compression_type: CompressionType::None,
+                        compression_type_id: 0,
+                        compression_level: None,
                     },
                 );
                 let request = ClientRequest::Write(WriteRequest {

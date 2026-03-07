@@ -75,7 +75,8 @@ async fn test_basic_idempotency(
             allow_create: true,
             expected_event_batch_index: None, // Don't use OCC for this test
             enforce_client_idempotency: true,
-            compression_type: CompressionType::None,
+            compression_type_id: 0,
+            compression_level: None,
         },
     );
 
@@ -137,7 +138,8 @@ async fn test_uncertain_ack(
             allow_create: false,
             expected_event_batch_index: None, // Don't use OCC - rely on idempotency
             enforce_client_idempotency: true,
-            compression_type: CompressionType::None,
+            compression_type_id: 0,
+            compression_level: None,
         },
     );
 

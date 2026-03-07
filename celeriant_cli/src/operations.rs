@@ -163,6 +163,7 @@ async fn write_event(client: &mut CeleriantClient, args: WriteArgs) -> Result<()
     };
 
     let compression: CompressionType = args.compression.into();
+    let (compression_type_id, compression_level) = compression.to_tuple();
 
     let mut writes = HashMap::new();
     writes.insert(key, SingleAggregateWrite {
@@ -170,7 +171,8 @@ async fn write_event(client: &mut CeleriantClient, args: WriteArgs) -> Result<()
         allow_create: args.allow_create,
         expected_event_batch_index: args.expected_index,
         enforce_client_idempotency: args.enforce_idempotency,
-        compression_type: compression,
+        compression_type_id,
+        compression_level,
     });
     
     let request = ClientRequest::Write(WriteRequest {

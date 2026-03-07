@@ -123,7 +123,8 @@ async fn test_mtls_client_server_roundtrip() -> Result<(), Box<dyn std::error::E
             allow_create: true,
             expected_event_batch_index: None,
             enforce_client_idempotency: false,
-            compression_type: CompressionType::None,
+            compression_type_id: 0,
+            compression_level: None,
         },
     );
 
@@ -373,7 +374,8 @@ async fn cross_shard_roundtrip(
                 allow_create: true,
                 expected_event_batch_index: None,
                 enforce_client_idempotency: false,
-                compression_type: CompressionType::None,
+                compression_type_id: 0,
+                compression_level: None,
             },
         );
         let write_req = ClientRequest::Write(WriteRequest {

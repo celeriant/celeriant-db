@@ -59,7 +59,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 allow_create: true,
                 expected_event_batch_index: Some(0),
                 enforce_client_idempotency: true,
-                compression_type: CompressionType::None,
+                compression_type_id: 0,
+                compression_level: None,
             },
         );
 

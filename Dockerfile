@@ -1,3 +1,5 @@
+# Celeriant uses io_uring via Glommio, which requires seccomp=unconfined:
+#   docker run --security-opt seccomp=unconfined ...
 FROM rust:latest AS builder
 WORKDIR /build
 COPY . .
@@ -9,8 +11,4 @@ COPY --from=builder /build/target/release/celeriant /usr/local/bin/celeriant
 EXPOSE 10000
 CMD ["celeriant", \
      "--standalone", \
-     "--data-root", "/var/lib/celeriant", \
-     "--client-port", "10000", \
-     "--num-shards", "1", \
-     "--shard-log-preallocate-bytes", "67108864", \
-     "--log-level", "warn"]
+     "--data-root", "/var/lib/celeriant"]
