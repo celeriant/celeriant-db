@@ -10,9 +10,9 @@ use celeriant_wal::schema_key::SchemaKey;
 use crate::disk::versioned_block::HEADER_SIZE;
 
 const DISCRIMINANT_EVENT_BATCH_METADATA: u8 = 0;
-const DISCRIMINANT_SCHEMA_REGISTRATION: u8 = 2;
-const DISCRIMINANT_SOFT_DELETE: u8 = 4;
-const DISCRIMINANT_SOFT_TRIM: u8 = 5;
+const DISCRIMINANT_SCHEMA_REGISTRATION: u8 = 1;
+const DISCRIMINANT_SOFT_DELETE: u8 = 2;
+const DISCRIMINANT_SOFT_TRIM: u8 = 3;
 
 const METABLOCK_TYPE_PAYLOAD_OFFSET: usize = 
     HEADER_SIZE + Metablock::OFFSET_WAL_METABLOCK_TYPE + WIRE_SIZE_ENUM_DISCRIMINANT;
@@ -307,8 +307,6 @@ mod tests {
     use celeriant_wal::metablocks::metablock::Metablock;
     use celeriant_wal::metablocks::metablock_event_batch::{EventTypesKind, MetablockEventBatch};
     use celeriant_wal::metablocks::metablock_kind::MetablockKind;
-    use celeriant_wal::metablocks::metablock_snapshot_org::MetablockSnapshotOrg;
-    use celeriant_wal::metablocks::metablock_snapshot_aggregate::MetablockSnapshotAggregate;
     use celeriant_wal::metablocks::metablock_schema_registration::MetablockSchemaRegistration;
     use celeriant_wal::metablocks::metablock_soft_delete::MetablockSoftDelete;
     use celeriant_wal::metablocks::metablock_soft_trim::MetablockSoftTrim;
@@ -404,56 +402,6 @@ mod tests {
         }
     }
 
-    fn make_snapshot_org_metablock(wal_index: u64, org_id: u128,
-        compressed_size: u64,
-        uncompressed_size: u64,) -> Metablock {
-        Metablock {
-            wal_index,
-            server_timestamp: 12345,
-            lease_index: 1,
-            node_id: 0x1234,
-            compressed_size,
-            uncompressed_size,
-            datablock_version: 0,
-            datablock_compression_type: 0,
-            wal_metablock_type: MetablockKind::SnapshotOrg(MetablockSnapshotOrg { org_id }),
-            datablock: DatablockStorageKind::None,
-            previous_tip_hash: GENESIS_HASH,
-            datablock_position: 0,
-        }
-    }
-
-    fn make_snapshot_aggregate_metablock(wal_index: u64, aggregate_key: AggregateKey,
-        compressed_size: u64,
-        uncompressed_size: u64,) -> Metablock {
-        Metablock {
-            wal_index,
-            server_timestamp: 99999,
-            lease_index: 2,
-            node_id: 0x5678,
-            compressed_size,
-            uncompressed_size,
-            datablock_version: 0,
-            datablock_compression_type: 0,
-            wal_metablock_type: MetablockKind::SnapshotAggregate(MetablockSnapshotAggregate {
-                aggregate_key,
-                last_wal_index: 100,
-                last_event_index: 200,
-                last_event_batch_index: 50,
-                min_available_event_index: 10,
-                min_available_event_batch_index: 5,
-                compressed_size_bytes: 1024,
-                uncompressed_size_bytes: 4096,
-                created_at: 1000,
-                created_by_client_id: 2000,
-                created_by_user_id: Some(3000),
-            }),
-            datablock: DatablockStorageKind::None,
-            previous_tip_hash: GENESIS_HASH,
-            datablock_position: 0,
-        }
-    }
-
     // ==================== Discriminant Tests ====================
 
     #[test]
@@ -480,26 +428,6 @@ mod tests {
         assert!(is_metablock_kind_event_batch_metadata(&bytes));
         assert!(!is_metablock_kind_soft_delete(&bytes));
         assert!(!is_metablock_kind_soft_trim(&bytes));
-    }
-
-    #[test]
-    fn read_discriminant_snapshot_org() {
-        let metablock = make_snapshot_org_metablock(5, 12345, 0, 0);
-        let bytes = serialize_metablock(&metablock);
-
-        assert_eq!(read_metablock_kind_discriminant(&bytes), 1); // SnapshotOrg = 1
-        assert!(!is_metablock_kind_event_batch_metadata(&bytes));
-        assert!(!is_metablock_kind_soft_delete(&bytes));
-        assert!(!is_metablock_kind_soft_trim(&bytes));
-    }
-
-    #[test]
-    fn read_discriminant_snapshot_aggregate() {
-        let key = AggregateKey::new(100, 200, 300);
-        let metablock = make_snapshot_aggregate_metablock(10, key, 0, 0);
-        let bytes = serialize_metablock(&metablock);
-
-        assert_eq!(read_metablock_kind_discriminant(&bytes), 3); // SnapshotAggregate = 3
     }
 
     #[test]
@@ -1017,12 +945,6 @@ mod tests {
         };
         let event_batch_bytes = serialize_metablock(&make_event_batch_metablock(1, 1000, key.clone(), batch, DatablockStorageKind::None, 0, 0));
 
-        // SnapshotOrg
-        let snapshot_org_bytes = serialize_metablock(&make_snapshot_org_metablock(1, 123, 0, 0));
-
-        // SnapshotAggregate
-        let snapshot_agg_bytes = serialize_metablock(&make_snapshot_aggregate_metablock(1, key.clone(), 0, 0));
-
         // SoftDelete
         let soft_delete_bytes = serialize_metablock(&make_soft_delete_metablock(1, 1000, key.clone(), 0, 0));
 
@@ -1034,20 +956,16 @@ mod tests {
 
         let discriminants = [
             read_metablock_kind_discriminant(&event_batch_bytes),
-            read_metablock_kind_discriminant(&snapshot_org_bytes),
             read_metablock_kind_discriminant(&schema_reg_bytes),
-            read_metablock_kind_discriminant(&snapshot_agg_bytes),
             read_metablock_kind_discriminant(&soft_delete_bytes),
             read_metablock_kind_discriminant(&soft_trim_bytes),
         ];
 
-        // Verify expected values match MetablockKind enum
+        // Verify expected values match MetablockKind enum (bincode uses positional encoding)
         assert_eq!(discriminants[0], 0); // EventBatchMetadata
-        assert_eq!(discriminants[1], 1); // SnapshotOrg
-        assert_eq!(discriminants[2], 2); // SchemaRegistration
-        assert_eq!(discriminants[3], 3); // SnapshotAggregate
-        assert_eq!(discriminants[4], 4); // SoftDelete
-        assert_eq!(discriminants[5], 5); // SoftTrim
+        assert_eq!(discriminants[1], 1); // SchemaRegistration
+        assert_eq!(discriminants[2], 2); // SoftDelete
+        assert_eq!(discriminants[3], 3); // SoftTrim
 
         // Verify all are unique
         let mut unique = discriminants.to_vec();

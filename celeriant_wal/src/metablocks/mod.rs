@@ -1,8 +1,6 @@
-pub mod metablock_snapshot_aggregate;
 pub mod metablock_event_batch;
 pub mod metablock;
 pub mod metablock_schema_registration;
-pub mod metablock_snapshot_org;
 pub mod datablock_storage_kind;
 pub mod datablock_block_ref;
 pub mod datablock_inline_data;

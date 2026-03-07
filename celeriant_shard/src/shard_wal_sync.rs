@@ -361,7 +361,6 @@ pub(crate) async fn sync(
             MetablockKind::SoftTrim(soft_trim) => {
                 log_segment_file_metadata.write.aggregate_key_bloom.insert(&soft_trim.aggregate_key);
             }
-            _ => {}
         }
     }
 

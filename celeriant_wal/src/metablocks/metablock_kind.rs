@@ -3,20 +3,17 @@ use deepsize::DeepSizeOf;
 use serde::{Deserialize, Serialize};
 
 use crate::metablocks::{
-    metablock_event_batch::MetablockEventBatch, metablock_snapshot_aggregate::MetablockSnapshotAggregate,
-    metablock_schema_registration::MetablockSchemaRegistration, metablock_snapshot_org::MetablockSnapshotOrg,
+    metablock_event_batch::MetablockEventBatch,
+    metablock_schema_registration::MetablockSchemaRegistration,
     metablock_soft_delete::MetablockSoftDelete, metablock_soft_trim::MetablockSoftTrim,
 };
 
-/// Different kinds of WAL metablocks, snapshots and event batch metadata
+/// Different kinds of WAL metablocks
 /// All metablocks are fixed size 512 byte blocks
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode, DeepSizeOf)]
-#[repr(u32)]
 pub enum MetablockKind {
-    EventBatchMetadata(MetablockEventBatch) = 0,
-    SnapshotOrg(MetablockSnapshotOrg) = 1,
-    SchemaRegistration(MetablockSchemaRegistration) = 2,
-    SnapshotAggregate(MetablockSnapshotAggregate) = 3,
-    SoftDelete(MetablockSoftDelete) = 4,
-    SoftTrim(MetablockSoftTrim) = 5,
+    EventBatchMetadata(MetablockEventBatch),
+    SchemaRegistration(MetablockSchemaRegistration),
+    SoftDelete(MetablockSoftDelete),
+    SoftTrim(MetablockSoftTrim),
 }
