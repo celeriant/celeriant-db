@@ -15,6 +15,7 @@ pub mod api_keys;
 pub mod memory_budget;
 mod dio_check;
 mod fs_check;
+mod server_meta;
 
 pub fn startup(args: Vec<String>) -> Result<(), std::io::Error> {
     install_crash_handler();
@@ -75,6 +76,22 @@ pub fn startup(args: Vec<String>) -> Result<(), std::io::Error> {
     }
 
     let nbr_shards = server_config.num_shards.unwrap_or_else(num_cpus::get) as u32;
+
+    // Validate immutable config hasn't changed since initial setup
+    let current_meta = server_meta::ServerMeta {
+        num_shards: nbr_shards,
+        timestamp_precision: match server_config.timestamp_precision {
+            server_config::ConfigTimestampPrecision::Milliseconds => "milliseconds",
+            server_config::ConfigTimestampPrecision::Microseconds => "microseconds",
+            server_config::ConfigTimestampPrecision::Nanoseconds => "nanoseconds",
+        }.to_string(),
+        timestamp_epoch_offset_secs: server_config.timestamp_epoch_offset_secs,
+        routing_rule: server_config.routing_rule.to_string(),
+    };
+    if let Err(e) = server_meta::validate_or_create(&server_config.data_root, &current_meta) {
+        error!("{}", e);
+        std::process::exit(1);
+    }
 
     // Detect available memory and compute budget
     let (detected_memory, cgroup_limit, total_budget, memory_budget) = {
