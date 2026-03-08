@@ -264,7 +264,6 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
     metrics::histogram!("celeriant_replication_batch_size", &shard_label).record(initial_batch_count as f64);
 
     Ok(())
-    //TODO: Propogate decision making back to clients Ok(replication_details)
 }
 
 /// Commits successful replication by updating read path, recent write cache, and broadcasting events.

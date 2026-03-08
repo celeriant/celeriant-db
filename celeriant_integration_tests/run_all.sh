@@ -14,6 +14,7 @@ TIMEOUT_OVERRIDE[edge_leader_crash_divergent_wal_main]=120
 TESTS=(
   single_main
   batch_main
+  read_list_benchmark_main
   chaos_main
   chaos_delete_main
   connection_test_main

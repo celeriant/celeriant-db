@@ -1691,7 +1691,6 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             })));
         }
 
-        //TODO: How to handle the scenario where we have compacted the log but yet to replicate? 
         //It would be a rare scenario, maybe an invariant we can enforce during compaction
         match shard_wal_s3_catchup::apply_external_batch(
             &self.log_segments_cache, &self.shard_mem_cache, &request.batches,

@@ -305,6 +305,10 @@ path = "src/compaction_replicated_main.rs"
 name = "batch_standalone_cleartext_main"
 path = "src/batch_standalone_cleartext_main.rs"
 
+[[bin]]
+name = "read_list_benchmark_main"
+path = "src/read_list_benchmark_main.rs"
+
 [features]
 default = []
 small-metablock = [
