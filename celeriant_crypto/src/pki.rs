@@ -253,7 +253,7 @@ impl PkiManager {
         Ok(Arc::new(config))
     }
 
-    /// Build a rustls `ClientConfig` for TLS 1.3.
+    /// Build a rustls `ClientConfig` for TLS 1.3 with mutual TLS (client certificate).
     pub fn build_client_config(
         ca_bundle: &[CertificateDer<'static>],
         client_cert_chain: Vec<CertificateDer<'static>>,
@@ -266,6 +266,21 @@ impl PkiManager {
             .with_protocol_versions(&[&rustls::version::TLS13])?
             .with_root_certificates(root_store)
             .with_client_auth_cert(client_cert_chain, client_key)?;
+
+        Ok(Arc::new(config))
+    }
+
+    /// Build a rustls `ClientConfig` for TLS 1.3 without client authentication.
+    pub fn build_client_config_no_auth(
+        ca_bundle: &[CertificateDer<'static>],
+    ) -> Result<Arc<rustls::ClientConfig>, PkiError> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let root_store = build_root_store(ca_bundle)?;
+
+        let config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])?
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
 
         Ok(Arc::new(config))
     }

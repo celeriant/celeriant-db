@@ -11,13 +11,11 @@ use cli::Cli;
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    match cli.command {
+    match cli.command.clone() {
         Some(cmd) => {
-            // CLI mode - execute command and exit
-            operations::execute_command(&cli.server, cli.api_key.as_deref(), cmd).await?;
+            operations::execute_command(&cli, cmd).await?;
         }
         None => {
-            // Interactive TUI mode
             tui::run(&cli.server).await?;
         }
     }

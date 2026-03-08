@@ -12,6 +12,26 @@ pub struct Cli {
     #[arg(short, long, default_value = "127.0.0.1:10000", env = "CELERIANT_SERVER")]
     pub server: String,
 
+    /// Enable TLS
+    #[arg(long, env = "CELERIANT_TLS")]
+    pub tls: bool,
+
+    /// CA certificate PEM file for server verification
+    #[arg(long, env = "CELERIANT_CA_CERT")]
+    pub ca_cert: Option<PathBuf>,
+
+    /// Client certificate PEM file (enables mTLS)
+    #[arg(long, env = "CELERIANT_CLIENT_CERT", requires = "client_key")]
+    pub client_cert: Option<PathBuf>,
+
+    /// Client private key PEM file (required with --client-cert)
+    #[arg(long, env = "CELERIANT_CLIENT_KEY", requires = "client_cert")]
+    pub client_key: Option<PathBuf>,
+
+    /// TLS SNI server name (default: extracted from --server address)
+    #[arg(long, env = "CELERIANT_SERVER_NAME")]
+    pub server_name: Option<String>,
+
     /// API key for authentication (base64-encoded)
     #[arg(long, env = "CELERIANT_API_KEY")]
     pub api_key: Option<String>,

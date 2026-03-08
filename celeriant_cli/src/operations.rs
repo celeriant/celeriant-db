@@ -1,5 +1,6 @@
-use anyhow::{Context, Result};
-use celeriant_client_tokio::celeriant_client::CeleriantClient;
+use anyhow::{Context, Result, bail};
+use celeriant_client_tokio::{CeleriantClient, ClientTlsConfig};
+use celeriant_crypto::pki::PkiManager;
 use celeriant_msg::{
     process_client_requests::ClientRequest,
     process_client_responses::ClientResponse,
@@ -13,18 +14,51 @@ use celeriant_wal::{
     compression_type::CompressionType,
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
 };
+use rustls::pki_types::ServerName;
 use std::{collections::HashMap, fs};
 
 use crate::cli::*;
 use crate::utils::{format_response, format_timestamp, format_u128_uuid};
 
-pub async fn execute_command(server: &str, _api_key: Option<&str>, command: Commands) -> Result<()> {
-    let mut client = CeleriantClient::connect(server)
-        .await
-        .with_context(|| format!("Failed to connect to {}", server))?;
+fn extract_host(address: &str) -> &str {
+    address.split(':').next().unwrap_or(address)
+}
 
-    // Note: api_key is accepted but not yet used. It will be used when identity
-    // verification is added to the CLI (requires --public-key and --private-key flags).
+fn build_tls_config(cli: &Cli) -> Result<Option<ClientTlsConfig>> {
+    if !cli.tls {
+        if cli.ca_cert.is_some() || cli.client_cert.is_some() || cli.client_key.is_some() {
+            bail!("TLS certificate flags require --tls");
+        }
+        return Ok(None);
+    }
+
+    let ca_path = cli.ca_cert.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("--ca-cert is required when --tls is enabled"))?;
+    let ca_bundle = PkiManager::load_ca_bundle(ca_path)
+        .with_context(|| format!("Failed to load CA certificate: {}", ca_path.display()))?;
+
+    let client_config = if let Some(cert_path) = &cli.client_cert {
+        let key_path = cli.client_key.as_ref().unwrap(); // clap `requires` guarantees this
+        let (chain, key) = PkiManager::load_identity(cert_path, key_path)
+            .with_context(|| format!("Failed to load client identity: {}", cert_path.display()))?;
+        PkiManager::build_client_config(&ca_bundle, chain, key)?
+    } else {
+        PkiManager::build_client_config_no_auth(&ca_bundle)?
+    };
+
+    let host = cli.server_name.as_deref().unwrap_or_else(|| extract_host(&cli.server));
+    let server_name = ServerName::try_from(host.to_owned())
+        .map_err(|_| anyhow::anyhow!("Invalid server name for TLS SNI: {host}"))?;
+
+    Ok(Some(ClientTlsConfig::new(client_config, server_name)))
+}
+
+pub async fn execute_command(cli: &Cli, command: Commands) -> Result<()> {
+    let tls_config = build_tls_config(cli)?;
+
+    let mut client = CeleriantClient::connect_with_timeout(&cli.server, None, tls_config)
+        .await
+        .with_context(|| format!("Failed to connect to {}", cli.server))?;
 
     match command {
         Commands::AggregateDetails(args) => check_aggregatedetails(&mut client, args).await,
