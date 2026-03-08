@@ -65,6 +65,15 @@ pub enum Commands {
 
     /// Delete an aggregate
     Delete(DeleteArgs),
+
+    /// List organisations
+    ListOrgs(ListOrgsArgs),
+
+    /// List aggregate types
+    ListTypes(ListTypesArgs),
+
+    /// List aggregates
+    ListAggregates(ListAggregatesArgs),
 }
 
 #[derive(Args, Clone)]
@@ -111,13 +120,45 @@ pub struct ReadArgs {
     #[arg(long, value_parser = parse_u128)]
     pub include_client: Option<u128>,
 
-    /// Minimum server timestamp
+    /// Minimum server timestamp (unix millis)
     #[arg(long)]
     pub min_timestamp: Option<u64>,
 
-    /// Maximum server timestamp
+    /// Maximum server timestamp (unix millis)
     #[arg(long)]
     pub max_timestamp: Option<u64>,
+
+    /// Only include batches from this user (UUID, numeric, or base64)
+    #[arg(long, value_parser = parse_u128)]
+    pub include_user: Option<u128>,
+
+    /// Exclude batches from this user (UUID, numeric, or base64)
+    #[arg(long, value_parser = parse_u128)]
+    pub exclude_user: Option<u128>,
+
+    /// Minimum client-side event timestamp (unix millis)
+    #[arg(long)]
+    pub min_event_timestamp: Option<u64>,
+
+    /// Maximum client-side event timestamp (unix millis)
+    #[arg(long)]
+    pub max_event_timestamp: Option<u64>,
+
+    /// Minimum event index
+    #[arg(long)]
+    pub min_event_index: Option<u64>,
+
+    /// Maximum event index
+    #[arg(long)]
+    pub max_event_index: Option<u64>,
+
+    /// Minimum client event index
+    #[arg(long)]
+    pub min_client_event_index: Option<u64>,
+
+    /// Maximum client event index
+    #[arg(long)]
+    pub max_client_event_index: Option<u64>,
 
     /// Output format
     #[arg(long, value_enum, default_value = "json")]
@@ -208,6 +249,67 @@ pub struct TrimArgs {
     /// Keep events from this batch index onwards
     #[arg(long)]
     pub keep_from: u64,
+}
+
+#[derive(Args, Clone)]
+pub struct ListOrgsArgs {
+    /// Starting shard ID (default: 0, auto-discovers all shards)
+    #[arg(long, default_value = "0")]
+    pub shard: u64,
+
+    /// Correlation ID for tracking (UUID, numeric, or base64)
+    #[arg(long, value_parser = parse_u128)]
+    pub correlation_id: Option<u128>,
+
+    /// Output format
+    #[arg(long, value_enum, default_value = "table")]
+    pub format: OutputFormat,
+}
+
+#[derive(Args, Clone)]
+pub struct ListTypesArgs {
+    /// Starting shard ID (default: 0, auto-discovers all shards)
+    #[arg(long, default_value = "0")]
+    pub shard: u64,
+
+    /// Filter by organisation (UUID, numeric, or base64)
+    #[arg(long, value_parser = parse_u128)]
+    pub org: Option<u128>,
+
+    /// Correlation ID for tracking (UUID, numeric, or base64)
+    #[arg(long, value_parser = parse_u128)]
+    pub correlation_id: Option<u128>,
+
+    /// Output format
+    #[arg(long, value_enum, default_value = "table")]
+    pub format: OutputFormat,
+}
+
+#[derive(Args, Clone)]
+pub struct ListAggregatesArgs {
+    /// Starting shard ID (default: 0, auto-discovers all shards)
+    #[arg(long, default_value = "0")]
+    pub shard: u64,
+
+    /// Filter by organisation (UUID, numeric, or base64)
+    #[arg(long, value_parser = parse_u128)]
+    pub org: Option<u128>,
+
+    /// Filter by aggregate type (UUID, numeric, or base64). Requires --org.
+    #[arg(long, long = "type", value_parser = parse_u128, requires = "org")]
+    pub aggregate_type: Option<u128>,
+
+    /// Include deleted aggregates
+    #[arg(long)]
+    pub include_deleted: bool,
+
+    /// Correlation ID for tracking (UUID, numeric, or base64)
+    #[arg(long, value_parser = parse_u128)]
+    pub correlation_id: Option<u128>,
+
+    /// Output format
+    #[arg(long, value_enum, default_value = "table")]
+    pub format: OutputFormat,
 }
 
 #[derive(ValueEnum, Clone, Copy, Default)]

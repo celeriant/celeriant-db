@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, bail};
 use celeriant_client_tokio::{CeleriantClient, ClientIdentityConfig, ClientTlsConfig};
+use celeriant_client_tokio::list_operations::*;
 use celeriant_crypto::pki::PkiManager;
+use humansize::{format_size, BINARY};
 use celeriant_msg::{
     process_client_requests::ClientRequest,
     process_client_responses::ClientResponse,
@@ -119,6 +121,9 @@ pub async fn execute_command(cli: &Cli, command: Commands) -> Result<()> {
         Commands::Write(args) => write_event(&mut client, args, identity_client_id).await,
         Commands::Trim(args) => trim_start(&mut client, args, identity_client_id).await,
         Commands::Delete(args) => delete_aggregate(&mut client, args, identity_client_id).await,
+        Commands::ListOrgs(args) => list_orgs(&mut client, args).await,
+        Commands::ListTypes(args) => list_types(&mut client, args).await,
+        Commands::ListAggregates(args) => list_aggregates(&mut client, args).await,
     }
 }
 
@@ -180,6 +185,30 @@ async fn read_events(client: &mut CeleriantClient, args: ReadArgs) -> Result<()>
     }
     if let Some(ts) = args.max_timestamp {
         filters = filters.max_server_timestamp(ts);
+    }
+    if let Some(user_id) = args.include_user {
+        filters = filters.include_user_id(user_id);
+    }
+    if let Some(user_id) = args.exclude_user {
+        filters = filters.exclude_user_id(user_id);
+    }
+    if let Some(ts) = args.min_event_timestamp {
+        filters = filters.min_event_timestamp(ts);
+    }
+    if let Some(ts) = args.max_event_timestamp {
+        filters = filters.max_event_timestamp(ts);
+    }
+    if let Some(idx) = args.min_event_index {
+        filters = filters.min_event_index(idx);
+    }
+    if let Some(idx) = args.max_event_index {
+        filters = filters.max_event_index(idx);
+    }
+    if let Some(idx) = args.min_client_event_index {
+        filters = filters.min_client_event_index(idx);
+    }
+    if let Some(idx) = args.max_client_event_index {
+        filters = filters.max_client_event_index(idx);
     }
 
     let request = ClientRequest::Read(ReadRequest {
@@ -354,5 +383,133 @@ async fn delete_aggregate(client: &mut CeleriantClient, args: DeleteArgs, identi
         }
     }
 
+    Ok(())
+}
+
+fn short_uuid(val: u128) -> String {
+    let full = format_u128_uuid(val);
+    format!("{}..{}", &full[..4], &full[full.len()-2..])
+}
+
+async fn list_orgs(client: &mut CeleriantClient, args: ListOrgsArgs) -> Result<()> {
+    let options = ListOptions {
+        start_shard: args.shard,
+        ..Default::default()
+    };
+    let items = ListOrgsIterator::new(client, options).collect().await?;
+
+    match args.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(
+            &items.iter().map(|i| format_u128_uuid(i.org_id)).collect::<Vec<_>>()
+        )?),
+        OutputFormat::Table | OutputFormat::Compact => {
+            if items.is_empty() {
+                println!("No organisations found.");
+            } else {
+                println!("{:<38}", "Org ID");
+                println!("{}", "─".repeat(38));
+                for item in &items {
+                    println!("{}", format_u128_uuid(item.org_id));
+                }
+                println!("\n{} organisation(s)", items.len());
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn list_types(client: &mut CeleriantClient, args: ListTypesArgs) -> Result<()> {
+    let options = ListOptions {
+        start_shard: args.shard,
+        ..Default::default()
+    };
+    let items = ListAggregateTypesIterator::new(client, args.org, options).collect().await?;
+
+    match args.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(
+            &items.iter().map(|i| serde_json::json!({
+                "org_id": format_u128_uuid(i.org_id),
+                "aggregate_type_id": format_u128_uuid(i.aggregate_type_id),
+            })).collect::<Vec<_>>()
+        )?),
+        OutputFormat::Table | OutputFormat::Compact => {
+            if items.is_empty() {
+                println!("No aggregate types found.");
+            } else {
+                println!("{:<38} {:<38}", "Org ID", "Aggregate Type ID");
+                println!("{} {}", "─".repeat(38), "─".repeat(38));
+                for item in &items {
+                    println!("{} {}", format_u128_uuid(item.org_id), format_u128_uuid(item.aggregate_type_id));
+                }
+                println!("\n{} aggregate type(s)", items.len());
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn list_aggregates(client: &mut CeleriantClient, args: ListAggregatesArgs) -> Result<()> {
+    let options = ListOptions {
+        start_shard: args.shard,
+        include_deleted: args.include_deleted,
+        ..Default::default()
+    };
+    let items = ListAggregatesIterator::new(client, args.org, args.aggregate_type, options)
+        .collect().await?;
+
+    match args.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(
+            &items.iter().map(|i| serde_json::json!({
+                "org_id": format_u128_uuid(i.org_id),
+                "aggregate_type_id": format_u128_uuid(i.aggregate_type_id),
+                "aggregate_id": format_u128_uuid(i.aggregate_id),
+                "is_deleted": i.is_deleted,
+                "event_batch_count": i.event_batch_count,
+                "min_event_batch_index": i.min_event_batch_index,
+                "max_event_batch_index": i.max_event_batch_index,
+                "min_event_index": i.min_event_index,
+                "max_event_index": i.max_event_index,
+                "compressed_size": i.compressed_size,
+                "uncompressed_size": i.uncompressed_size,
+                "min_server_timestamp": i.min_server_timestamp,
+                "max_server_timestamp": i.max_server_timestamp,
+            })).collect::<Vec<_>>()
+        )?),
+        OutputFormat::Table | OutputFormat::Compact => {
+            if items.is_empty() {
+                println!("No aggregates found.");
+            } else {
+                println!("{:<8} {:<8} {:<10} {:<8} {:<12} {:<28} {:>10}",
+                    "Org", "Type", "Aggregate", "Batches", "Events", "Server Time Range", "Size");
+                println!("{} {} {} {} {} {} {}",
+                    "─".repeat(8), "─".repeat(8), "─".repeat(10), "─".repeat(8),
+                    "─".repeat(12), "─".repeat(28), "─".repeat(10));
+                for item in &items {
+                    let del = if item.is_deleted { "[DEL] " } else { "" };
+                    let time_range = if item.min_server_timestamp > 0 {
+                        format!("{} .. {}", format_timestamp(item.min_server_timestamp), format_timestamp(item.max_server_timestamp))
+                    } else {
+                        "-".to_string()
+                    };
+                    let events = if item.min_event_batch_index > 0 {
+                        format!("{}-{}", item.min_event_batch_index, item.max_event_batch_index)
+                    } else {
+                        "-".to_string()
+                    };
+                    println!("{}{:<8} {:<8} {:<10} {:<8} {:<12} {:<28} {:>10}",
+                        del,
+                        short_uuid(item.org_id),
+                        short_uuid(item.aggregate_type_id),
+                        short_uuid(item.aggregate_id),
+                        item.event_batch_count,
+                        events,
+                        time_range,
+                        format_size(item.uncompressed_size, BINARY),
+                    );
+                }
+                println!("\n{} aggregate(s)", items.len());
+            }
+        }
+    }
     Ok(())
 }
