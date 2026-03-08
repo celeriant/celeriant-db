@@ -45,6 +45,7 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
     }));
 
     loop {
+        metrics::counter!("celeriant_node_starts_total").increment(1);
         shard_failed.store(false, Ordering::SeqCst);
         let started_at = std::time::Instant::now();
         let mesh = MeshBuilder::<IntrashardMessages, Full>::full(num_shards, mesh_channel_size);
@@ -168,6 +169,8 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
             }
         }
 
+        metrics::counter!("celeriant_shard_panics_total").increment(1);
+
         if started_at.elapsed() > RESTART_BUDGET_RESET {
             restart_count = 0;
         }
@@ -177,6 +180,7 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
             std::process::exit(1);
         }
 
+        metrics::counter!("celeriant_shard_restarts_total").increment(1);
         error!("Shard executor panic detected. Restarting all shards (attempt {}/{})", restart_count, MAX_SHARD_RESTARTS);
         std::thread::sleep(SHARD_RESTART_DELAY);
     }

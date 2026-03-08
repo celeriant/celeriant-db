@@ -100,4 +100,9 @@ fn register_metric_descriptions() {
     describe_counter!("celeriant_heartbeat_failures_total", "Failed heartbeats");
     describe_counter!("celeriant_leader_elections_total", "Leadership transitions");
     describe_gauge!("celeriant_clock_drift_ms", "Observed clock drift between nodes");
+
+    // Stability
+    describe_counter!("celeriant_node_starts_total", "Node boot and restart cycles");
+    describe_counter!("celeriant_shard_panics_total", "Shard executor panics");
+    describe_counter!("celeriant_shard_restarts_total", "Shard executor restart attempts");
 }
