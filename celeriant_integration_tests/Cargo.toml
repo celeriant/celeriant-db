@@ -343,5 +343,6 @@ rustls.workspace = true
 rustls-pki-types.workspace = true
 tokio-rustls.workspace = true
 reqwest = { version = "0.12", features = ["blocking"] }
+apache-avro.workspace = true
 base64.workspace = true
 hex = "0.4"

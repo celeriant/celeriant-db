@@ -39,6 +39,7 @@ tracing.workspace = true
 metrics.workspace = true
 blake3.workspace = true
 rustls.workspace = true
+apache-avro.workspace = true
 jsonschema.workspace = true
 serde_json.workspace = true
 

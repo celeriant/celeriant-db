@@ -173,14 +173,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     expect_error_code(result, 2021);
     println!("  PASS\n");
 
-    // Test 9: Unsupported schema type (Avro=1) — error 2024
-    println!("Test 9: Unsupported schema type rejected (error 2024)");
+    // Test 9: Register an Avro schema
+    println!("Test 9: Register Avro schema");
+    let avro_schema = r#"{"type":"record","name":"Event","fields":[{"name":"id","type":"int"},{"name":"label","type":"string"}]}"#.to_string();
     let req = ClientRequest::RegisterSchema(RegisterSchemaRequest {
         correlation_id: Some(rand::random()),
         client_id: CLIENT_ID,
         user_id: None,
         schema_key: SchemaKey::new(1, 100, 3, 0),
         schema_type: 1, // Avro
+        schema: avro_schema.clone(),
+    });
+    client.send_request(&req, CompressionType::None).await?;
+    println!("  PASS\n");
+
+    // Test 9a: Write valid Avro-encoded event
+    println!("Test 9a: Write valid Avro event against Avro schema");
+    let avro_parsed = apache_avro::Schema::parse_str(&avro_schema).unwrap();
+    let valid_avro = apache_avro::to_avro_datum(
+        &avro_parsed,
+        apache_avro::types::Value::Record(vec![
+            ("id".to_string(), apache_avro::types::Value::Int(42)),
+            ("label".to_string(), apache_avro::types::Value::String("hello".to_string())),
+        ]),
+    ).unwrap();
+    let agg3 = AggregateKey::new(1, 100, 3);
+    let req = write_event(&agg3, 3, 0, &valid_avro, 0, true);
+    client.send_request(&req, CompressionType::None).await?;
+    println!("  PASS\n");
+
+    // Test 9b: Write invalid bytes against Avro schema — should fail
+    println!("Test 9b: Write invalid bytes against Avro schema rejected (error 2022)");
+    let req = write_event(&agg3, 3, 0, b"not avro data", 1, false);
+    let result = client.send_request(&req, CompressionType::None).await;
+    expect_error_code(result, 2022);
+    println!("  PASS\n");
+
+    // Test 9c: Unsupported schema type (Protobuf=2) — error 2024
+    println!("Test 9c: Unsupported schema type rejected (error 2024)");
+    let req = ClientRequest::RegisterSchema(RegisterSchemaRequest {
+        correlation_id: Some(rand::random()),
+        client_id: CLIENT_ID,
+        user_id: None,
+        schema_key: SchemaKey::new(1, 100, 4, 0),
+        schema_type: 2, // Protobuf
         schema: "{}".to_string(),
     });
     let result = client.send_request(&req, CompressionType::None).await;

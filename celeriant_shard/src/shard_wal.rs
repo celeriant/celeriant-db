@@ -2024,7 +2024,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let schema_type = SchemaType::try_from(request.schema_type)
             .map_err(|_| ShardSchemaError::UnsupportedSchemaType { schema_type: request.schema_type })?;
 
-        if schema_type != SchemaType::Json {
+        if !matches!(schema_type, SchemaType::Json | SchemaType::Avro) {
             return Err(ShardSchemaError::UnsupportedSchemaType { schema_type: request.schema_type });
         }
 
@@ -3489,13 +3489,57 @@ mod tests {
             let (_tmp, dir) = test_dir();
             let shard = open_shard(&dir).await;
 
-            // schema_type 1 = Avro, 2 = Protobuf
-            for schema_type in [1, 2] {
-                let result = process(&shard, schema_req_with_type(1, 1, 1, 0, schema_type, NAME_AGE_SCHEMA)).await;
-                assert!(matches!(result, Err(ShardError::RegisterSchema(
-                    crate::error::shard_schema_error::ShardSchemaError::UnsupportedSchemaType { .. }
-                ))), "expected UnsupportedSchemaType for type {schema_type}, got {:?}", result);
-            }
+            // schema_type 2 = Protobuf (unsupported)
+            let result = process(&shard, schema_req_with_type(1, 1, 1, 0, 2, NAME_AGE_SCHEMA)).await;
+            assert!(matches!(result, Err(ShardError::RegisterSchema(
+                crate::error::shard_schema_error::ShardSchemaError::UnsupportedSchemaType { .. }
+            ))), "expected UnsupportedSchemaType, got {:?}", result);
+
+            shard.close().await;
+        });
+    }
+
+    const AVRO_PERSON_SCHEMA: &str = r#"{"type":"record","name":"Person","fields":[{"name":"name","type":"string"},{"name":"age","type":"int"}]}"#;
+
+    fn avro_events(payloads: &[&[u8]], major: u64, minor: u64) -> Vec<DatablockAggregateEvent> {
+        payloads.iter().enumerate().map(|(i, payload)| DatablockAggregateEvent {
+            client_event_index: (i + 1) as u64,
+            event_type_major: major,
+            event_type_minor: minor,
+            event_value: Arc::new(payload.to_vec()),
+            ..Default::default()
+        }).collect()
+    }
+
+    fn avro_encode_person(name: &str, age: i32) -> Vec<u8> {
+        let schema = apache_avro::Schema::parse_str(AVRO_PERSON_SCHEMA).unwrap();
+        apache_avro::to_avro_datum(
+            &schema,
+            apache_avro::types::Value::Record(vec![
+                ("name".to_string(), apache_avro::types::Value::String(name.to_string())),
+                ("age".to_string(), apache_avro::types::Value::Int(age)),
+            ]),
+        ).unwrap()
+    }
+
+    #[test]
+    fn schema_avro_register_and_validate() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+
+            // Register Avro schema (type 1)
+            process(&shard, schema_req_with_type(1, 1, 1, 0, 1, AVRO_PERSON_SCHEMA)).await.unwrap();
+
+            // Write valid Avro event
+            let valid = avro_encode_person("alice", 30);
+            write_ok(&shard, write_req(key(1, 1, 1), avro_events(&[&valid], 1, 0))).await;
+
+            // Write invalid bytes — should be rejected
+            let bad = avro_events(&[b"not avro"], 1, 0);
+            let result = process(&shard, write_req(key(1, 1, 1), bad)).await;
+            assert!(matches!(result, Err(ShardError::Write(ShardWriteError::SchemaValidationFailed { .. }))),
+                "expected SchemaValidationFailed, got {:?}", result);
 
             shard.close().await;
         });
