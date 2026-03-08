@@ -144,18 +144,59 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> AggregateReader 
 
 impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     pub async fn process_client_request(&self, request: ClientRequest) -> Result<ClientResponse, ShardError> {
-        match request {
-            ClientRequest::AggregateDetails(r) => self.exists(&r).await.map(ClientResponse::AggregateDetails).map_err(ShardError::AggregateDetails),
-            ClientRequest::Read(r) => self.read(&r).await.map(ClientResponse::Read).map_err(ShardError::Read),
-            ClientRequest::Write(r) => self.write(r).await.map(ClientResponse::Write).map_err(ShardError::Write),
-            ClientRequest::TrimStart(r) => self.trim_start(r).await.map(ClientResponse::TrimStart).map_err(ShardError::TrimStart),
-            ClientRequest::Delete(r) => self.delete(r).await.map(ClientResponse::Delete).map_err(ShardError::Delete),
-            ClientRequest::Watch(_) => Err(ShardError::WatchRequestInvalid),
-            ClientRequest::ListOrgs(r) => self.list_orgs(r).await.map(ClientResponse::ListOrgs).map_err(ShardError::ListOrgs),
-            ClientRequest::ListAggregateTypes(r) => self.list_aggregate_types(r).await.map(ClientResponse::ListAggregateTypes).map_err(ShardError::ListAggregateTypes),
-            ClientRequest::ListAggregates(r) => self.list_aggregates(r).await.map(ClientResponse::ListAggregates).map_err(ShardError::ListAggregates),
-            ClientRequest::RegisterSchema(r) => self.register_schema(r).await.map(ClientResponse::RegisterSchema).map_err(ShardError::RegisterSchema),
+        let shard_label = self.shard_id_label();
+        let start = Instant::now();
+
+        let (op_name, result) = match request {
+            ClientRequest::Write(r) => ("write", self.write(r).await.map(ClientResponse::Write).map_err(ShardError::Write)),
+            ClientRequest::Read(r) => ("read", self.read(&r).await.map(ClientResponse::Read).map_err(ShardError::Read)),
+            ClientRequest::Delete(r) => ("delete", self.delete(r).await.map(ClientResponse::Delete).map_err(ShardError::Delete)),
+            ClientRequest::TrimStart(r) => ("trim", self.trim_start(r).await.map(ClientResponse::TrimStart).map_err(ShardError::TrimStart)),
+            ClientRequest::AggregateDetails(r) => ("exists", self.exists(&r).await.map(ClientResponse::AggregateDetails).map_err(ShardError::AggregateDetails)),
+            ClientRequest::Watch(_) => return Err(ShardError::WatchRequestInvalid),
+            ClientRequest::ListOrgs(r) => ("list_orgs", self.list_orgs(r).await.map(ClientResponse::ListOrgs).map_err(ShardError::ListOrgs)),
+            ClientRequest::ListAggregateTypes(r) => ("list_aggregate_types", self.list_aggregate_types(r).await.map(ClientResponse::ListAggregateTypes).map_err(ShardError::ListAggregateTypes)),
+            ClientRequest::ListAggregates(r) => ("list_aggregates", self.list_aggregates(r).await.map(ClientResponse::ListAggregates).map_err(ShardError::ListAggregates)),
+            ClientRequest::RegisterSchema(r) => ("register_schema", self.register_schema(r).await.map(ClientResponse::RegisterSchema).map_err(ShardError::RegisterSchema)),
+        };
+
+        let duration = start.elapsed().as_secs_f64();
+
+        match &result {
+            Ok(_) => {
+                let counter_name = match op_name {
+                    "write" => "celeriant_writes_total",
+                    "read" => "celeriant_reads_total",
+                    "delete" => "celeriant_deletes_total",
+                    "trim" => "celeriant_trims_total",
+                    _ => "celeriant_reads_total",
+                };
+                metrics::counter!(counter_name, &shard_label).increment(1);
+
+                let duration_name = match op_name {
+                    "write" => Some("celeriant_write_duration_seconds"),
+                    "read" => Some("celeriant_read_duration_seconds"),
+                    _ => None,
+                };
+                if let Some(name) = duration_name {
+                    metrics::histogram!(name, &shard_label).record(duration);
+                }
+            }
+            Err(_) => {
+                let error_counter = match op_name {
+                    "write" => "celeriant_write_errors_total",
+                    "read" => "celeriant_read_errors_total",
+                    _ => "celeriant_write_errors_total",
+                };
+                metrics::counter!(error_counter, &shard_label).increment(1);
+            }
         }
+
+        result
+    }
+
+    fn shard_id_label(&self) -> [(&'static str, String); 1] {
+        [("shard_id", self.config.shard_id.to_string())]
     }
 
     /// Open or create a shard WAL.
@@ -176,6 +217,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             config.shard_dir.clone(),
             config.shard_log_preallocate_bytes,
             config.max_open_files as usize,
+            config.shard_id,
         )
         .await?;
 
@@ -891,6 +933,11 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
         // Phase 1: Validation and preparation - all checks that can fail happen here
         // No mutations to shard_mem_cache until all validations pass
+        let total_events: usize = write_request.writes.values().map(|w| w.events.len()).sum();
+        let total_payload_bytes: usize = write_request.writes.values()
+            .flat_map(|w| w.events.iter())
+            .map(|e| e.event_value.len())
+            .sum();
         let mut prepared_writes = Vec::with_capacity(write_request.writes.len());
 
         for (aggregate_key, single_write) in write_request.writes {
@@ -955,9 +1002,13 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         // Wait on disk write, it's batched for performance
         self.sync_durable().await?;
 
-        // Same deal for replication, if we are the leader, 
+        // Same deal for replication, if we are the leader,
         // wait on durable replication, also batched
         self.replicate_durable().await?;
+
+        let shard_label = self.shard_id_label();
+        metrics::counter!("celeriant_write_events_total", &shard_label).increment(total_events as u64);
+        metrics::counter!("celeriant_write_bytes_total", &shard_label).increment(total_payload_bytes as u64);
 
         Ok(SuccessResponse {
             correlation_id: write_request.correlation_id,
@@ -994,6 +1045,10 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
         // 5. Deserialize and apply event-level filters
         let event_batches = self.build_filtered_response(collection.kept_metablocks, filters);
+
+        let read_bytes: u64 = event_batches.iter().map(|b| b.events.iter().map(|e| e.event_value.len() as u64).sum::<u64>()).sum();
+        let shard_label = self.shard_id_label();
+        metrics::counter!("celeriant_read_bytes_total", &shard_label).increment(read_bytes);
 
         Ok(ReadResponse {
             correlation_id: request.correlation_id,
@@ -1555,6 +1610,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let rotating_log_cache = self.log_segments_cache.clone();
         let shard_mem_cache = self.shard_mem_cache.clone();
         let watched_aggregates = self.watched_aggregates.clone();
+        let shard_id = self.config.shard_id;
 
         // Node status goes into fsync because we need to know if we should advance read position (standalone or follower mode)
         // We already pass lease status checks so can use raw()
@@ -1565,7 +1621,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             .request_sync_two_phase(
                 Some(self.config.fsync_delay),
                 move || async move { capture_fsync_snapshot(&mc_capture) },
-                move |captured| commit_fsync_with_rollback(node_status, rotating_log_cache, shard_mem_cache, watched_aggregates, captured),
+                move |captured| commit_fsync_with_rollback(node_status, rotating_log_cache, shard_mem_cache, watched_aggregates, captured, shard_id),
             )
             .await
     }
@@ -1580,6 +1636,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let max_request_size = self.config.max_request_size;
         let read_max_chunk_size = self.config.read_max_chunk_size;
         let max_s3_fallback_batch_bytes = self.config.max_s3_fallback_batch_bytes;
+        let shard_id = self.config.shard_id;
 
         if !self.node_status.get().raw().is_leader() {
             return Ok(());
@@ -1590,7 +1647,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             .request_sync_two_phase(
                 Some(self.config.replication_delay),
                 move || async move { capture_replication_snapshot(&mc_capture) },
-                move |captured| commit_replication_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates, captured, max_catchup_gap_bytes, max_request_size, max_s3_fallback_batch_bytes, read_max_chunk_size),
+                move |captured| commit_replication_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates, captured, max_catchup_gap_bytes, max_request_size, max_s3_fallback_batch_bytes, read_max_chunk_size, shard_id),
             )
             .await
     }
@@ -1669,6 +1726,11 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
         self.sync_durable().await
             .map_err(FollowerReplicationWriteError::ShardFSyncError)?;
+
+        let shard_label = self.shard_id_label();
+        let applied_bytes: u64 = request.batches.iter().map(|b| b.metablock.uncompressed_size).sum();
+        metrics::counter!("celeriant_replication_applied_events_total", &shard_label).increment(request.batches.len() as u64);
+        metrics::counter!("celeriant_replication_applied_bytes_total", &shard_label).increment(applied_bytes);
 
         Ok(response(ReplicationResult::Success {
             last_follower_metablock: None,
@@ -1762,6 +1824,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     ) {
         let shard_mem_cache = self.shard_mem_cache.borrow();
         let log_segments_cache = self.log_segments_cache.get_latest_read_cursor();
+        let kept_before = kept.len();
 
         // Cache iterates forward (ascending batch index) from from_event_batch_index
         for (batch_idx, write) in shard_mem_cache.get_cached_writes_from(aggregate_key, filters.from_event_batch_index, log_segments_cache.wal_index) {
@@ -1790,6 +1853,13 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                 metablock: write.metablock.clone(),
                 datablock: write.datablock.clone(),
             });
+        }
+
+        let cache_hits = (kept.len() - kept_before) as u64;
+        if cache_hits > 0 {
+            metrics::counter!("celeriant_cache_recent_write_hits_total").increment(cache_hits);
+        } else {
+            metrics::counter!("celeriant_cache_recent_write_misses_total").increment(1);
         }
     }
 

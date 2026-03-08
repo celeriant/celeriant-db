@@ -132,6 +132,7 @@ impl<V: Validate> ShardMemCache<V> {
         // Check if in queue (being created/modified) - only for write path
         if cache_path == CachePath::Write {
             if let Some(queue_pos) = self.aggregate_queue_positions.get(aggregate_key) {
+                metrics::counter!("celeriant_cache_aggregate_snapshot_hits_total").increment(1);
                 if queue_pos.pending_delete {
                     return (true, AggregateStatus::Deleted);
                 }
@@ -145,9 +146,11 @@ impl<V: Validate> ShardMemCache<V> {
             CachePath::Write => &mut self.aggregate_write_snapshots,
         };
         if let Some(snapshot) = cache.get(aggregate_key) {
+            metrics::counter!("celeriant_cache_aggregate_snapshot_hits_total").increment(1);
             return (true, snapshot.status);
         }
 
+        metrics::counter!("celeriant_cache_aggregate_snapshot_misses_total").increment(1);
         (false, AggregateStatus::NotFound)
     }
 
@@ -186,6 +189,7 @@ impl<V: Validate> ShardMemCache<V> {
 
         self.cache_current_bytes = self.cache_current_bytes.saturating_add(size_bytes);
         self.cache_eviction_queue.push_back((aggregate_key, batch_index, size_bytes));
+        metrics::gauge!("celeriant_cache_recent_write_bytes").set(self.cache_current_bytes as f64);
     }
 
     fn evict_oldest_cache_entry(&mut self) -> bool {
@@ -794,6 +798,10 @@ impl<V: Validate> ShardMemCache<V> {
     /// Peek at oldest batch (for timeout checking)
     pub fn peek_pending_replication(&self) -> Option<&PendingCommitData> {
         self.pending_replication_batches.first()
+    }
+
+    pub fn pending_replication_bytes(&self) -> u64 {
+        self.pending_replication_bytes
     }
 
     /// Check if high water mark exceeded

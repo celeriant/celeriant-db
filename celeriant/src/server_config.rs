@@ -464,6 +464,22 @@ pub struct ServerConfig {
         help = "Explicit total memory budget in bytes (overrides system detection)"
     )]
     pub memory_budget_bytes: Option<u64>,
+
+    #[arg(
+        long,
+        default_value_t = true,
+        env = "CELERIANT_METRICS_ENABLED",
+        help = "Enable Prometheus metrics and health HTTP endpoint"
+    )]
+    pub metrics_enabled: bool,
+
+    #[arg(
+        long,
+        default_value_t = 9090,
+        env = "CELERIANT_METRICS_PORT",
+        help = "Port for Prometheus /metrics and /health HTTP server"
+    )]
+    pub metrics_port: u16,
 }
 
 impl ServerConfig {
@@ -499,11 +515,15 @@ impl ServerConfig {
         Ok(crate::memory_budget::compute_shard_budgets(total_budget, num_shards))
     }
 
-    pub fn to_sidecar_config(&self, num_shards: u32) -> SidecarConfig {
+    pub fn to_sidecar_config(&self, num_shards: u32, node_id: u128) -> SidecarConfig {
         SidecarConfig {
             worker_threads: std::cmp::max(2, num_shards as usize / 2),
             control_lane_capacity: 256,
             data_lane_capacity: 1024,
+            metrics_enabled: self.metrics_enabled,
+            metrics_port: self.metrics_port,
+            num_shards,
+            node_id,
         }
     }
 
@@ -781,6 +801,8 @@ impl ServerConfig {
         check_field!(compaction_temp_dir);
         check_field!(memory_consumption_percent);
         check_field!(memory_budget_bytes);
+        check_field!(metrics_enabled);
+        check_field!(metrics_port);
 
         entries
     }
@@ -861,6 +883,8 @@ impl Default for ServerConfig {
             compaction_temp_dir: None,
             memory_consumption_percent: 80,
             memory_budget_bytes: None,
+            metrics_enabled: true,
+            metrics_port: 9090,
         }
     }
 }

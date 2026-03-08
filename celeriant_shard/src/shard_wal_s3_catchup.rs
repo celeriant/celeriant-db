@@ -62,7 +62,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader>(
 
         let round = catchup_round(
             log_segments_cache, shard_mem_cache, fsync_coordinator,
-            watched_aggregates, downloader, &prefix,
+            watched_aggregates, downloader, &prefix, shard_id,
         ).await?;
 
         // After truncation, continue loop to re-apply from S3
@@ -80,6 +80,9 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader>(
         result.bytes_downloaded += round.bytes;
     }
 
+    if result.rounds > 0 {
+        metrics::counter!("celeriant_s3_catchup_rounds_total").increment(result.rounds as u64);
+    }
     Ok(result)
 }
 
@@ -96,6 +99,7 @@ async fn catchup_round<D: S3Downloader>(
     watched_aggregates: &Rc<AggregateWatchers>,
     downloader: &Rc<D>,
     prefix: &str,
+    shard_id: u32,
 ) -> Result<RoundApplied, S3CatchupError> {
     let objects = downloader.list_objects(prefix).await?;
 
@@ -189,8 +193,13 @@ async fn catchup_round<D: S3Downloader>(
 
         sync_applied_batch(
             log_segments_cache, shard_mem_cache, fsync_coordinator,
-            watched_aggregates,
+            watched_aggregates, shard_id,
         ).await.map_err(S3CatchupError::FsyncFailed)?;
+
+        let shard_label = [("shard_id", shard_id.to_string())];
+        let applied_bytes: u64 = items.iter().map(|i| i.metablock.uncompressed_size).sum();
+        metrics::counter!("celeriant_replication_applied_events_total", &shard_label).increment(items.len() as u64);
+        metrics::counter!("celeriant_replication_applied_bytes_total", &shard_label).increment(applied_bytes);
 
         downloader.delete(&batch_ref.path).await?;
         round.batches += 1;
@@ -278,6 +287,7 @@ async fn sync_applied_batch(
     shard_mem_cache: &Rc<RefCell<MemCache>>,
     fsync_coordinator: &Rc<Coordinator<ShardFsyncError>>,
     watched_aggregates: &Rc<AggregateWatchers>,
+    shard_id: u32,
 ) -> Result<(), ShardFsyncError> {
     let lsc = log_segments_cache.clone();
     let smc = shard_mem_cache.clone();
@@ -290,7 +300,7 @@ async fn sync_applied_batch(
         .request_sync_two_phase(
             None,
             move || async move { capture_fsync_snapshot(&mc_capture) },
-            move |captured| commit_fsync_with_rollback(NodeStatus::Standalone, lsc, smc, wa, captured),
+            move |captured| commit_fsync_with_rollback(NodeStatus::Standalone, lsc, smc, wa, captured, shard_id),
         )
         .await
 }
@@ -665,7 +675,7 @@ mod tests {
 
     impl TestComponents {
         async fn new(dir: &std::path::Path) -> Self {
-            let log_segments_cache = LogSegmentsCache::ready_up(dir.to_path_buf(), PREALLOCATE, 4)
+            let log_segments_cache = LogSegmentsCache::ready_up(dir.to_path_buf(), PREALLOCATE, 4, 0)
                 .await
                 .unwrap();
             Self {

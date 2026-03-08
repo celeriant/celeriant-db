@@ -247,7 +247,7 @@ pub fn startup(args: Vec<String>) -> Result<(), std::io::Error> {
     }
 
     let shard_config = server_config.to_shard_config(node_id, nbr_shards, tls_config, api_keys, memory_budget);
-    let sidecar_config = server_config.to_sidecar_config(nbr_shards);
+    let sidecar_config = server_config.to_sidecar_config(nbr_shards, node_id);
     let sidecar_store_config = server_config.to_sidecar_store_config();
 
     let sidecar_store = match celeriant_sidecar::store::SidecarStore::new(sidecar_store_config) {

@@ -15,3 +15,4 @@ celeriant_distributed = { path = "../celeriant_distributed" }
 celeriant_rotating_log = { path = "../celeriant_rotating_log" }
 lru.workspace = true
 deepsize.workspace = true
+metrics.workspace = true

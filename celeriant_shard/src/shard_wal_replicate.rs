@@ -56,6 +56,7 @@ pub(crate) struct ReplicationCapturedData {
 pub(crate) fn capture_replication_snapshot(shard_mem_cache: &Rc<RefCell<MemCache>>) -> CaptureResult<ReplicationCapturedData, ReplicationError> {
     let mut cache = shard_mem_cache.borrow_mut();
 
+    metrics::gauge!("celeriant_replication_pending_bytes").set(cache.pending_replication_bytes() as f64);
     let follower_falling_behind = cache.is_replication_queue_pressured();
     let replication_snapshot = cache.take_pending_replication();
 
@@ -90,7 +91,10 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
     max_request_size: u64,
     max_s3_fallback_batch_bytes: u64,
     read_max_chunk_size: u64,
+    shard_id: u32,
 ) -> Result<(), ReplicationError> {
+    let start = std::time::Instant::now();
+    let shard_label = [("shard_id", shard_id.to_string())];
 
     // Because we are paginating data to the follower, we have a loop
     // At any point we might have to fallback to s3. Also the follower
@@ -112,6 +116,7 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
             datablock: item.datablock.clone(), //Maybe we could optimise this further later, serialisation technincally only needs a ref
         })
         .collect();
+    let initial_batch_count = batches.len();
 
     // Loop until we run out of batches to replicate, or an unrecoverable error occurs.
     // We must split batches into batches that are less than max_request_size (bytes)
@@ -128,6 +133,7 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
         // Either the follower is too slow to keep up, or it has been offline for a while
         // and needs to catch up itself first, or the follower is completely offline
         if follower_falling_behind_or_offline {
+            metrics::counter!("celeriant_replication_s3_fallbacks_total", &shard_label).increment(1);
             let end_idx = batch_end_index(&batches, max_s3_fallback_batch_bytes);
             match replication_client.replicate_to_s3(batches[..end_idx].to_vec()).await {
                 Ok(()) => {
@@ -254,6 +260,9 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
         replication_captured_data.replication_snapshot,
     );
 
+    metrics::histogram!("celeriant_replication_duration_seconds", &shard_label).record(start.elapsed().as_secs_f64());
+    metrics::histogram!("celeriant_replication_batch_size", &shard_label).record(initial_batch_count as f64);
+
     Ok(())
     //TODO: Propogate decision making back to clients Ok(replication_details)
 }
@@ -337,6 +346,7 @@ async fn rollback_replicate(
     shard_mem_cache: &Rc<RefCell<MemCache>>,
     replication_snapshot: Vec<PendingCommitData>,
 ) -> Result<(), ReplicationRollbackFailure> {
+    metrics::counter!("celeriant_replication_rollbacks_total").increment(1);
     // In replication rollback, we modify the write positions in the file header
     // So we must drain and block any more writes to disk until rollback completes
     let _fsync_gate = fsync_coordinator
@@ -612,7 +622,7 @@ mod tests {
         glommio_test!({
             let (_tmp, dir) = test_dir();
             let lsc = Rc::new(
-                LogSegmentsCache::ready_up(dir, 4 * 1024 * 1024, 4).await.unwrap()
+                LogSegmentsCache::ready_up(dir, 4 * 1024 * 1024, 4, 0).await.unwrap()
             );
             let smc = Rc::new(RefCell::new(
                 MemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 1024 * 1024, 4 * 1024 * 1024, 64 * 1024 * 1024)
@@ -634,6 +644,7 @@ mod tests {
                 u64::MAX,   // max_request_size (irrelevant, S3 path)
                 sz * 2,     // max_s3_fallback_batch_bytes: 2 items per chunk
                 64 * 1024,  // read_max_chunk_size
+                0,          // shard_id
             ).await.unwrap();
 
             // 5 items, 2 per chunk: [2, 2, 1]

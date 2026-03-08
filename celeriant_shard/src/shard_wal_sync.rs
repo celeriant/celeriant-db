@@ -56,7 +56,12 @@ pub(crate) async fn commit_fsync_with_rollback(
     shard_mem_cache: Rc<RefCell<MemCache>>,
     watched_aggregates: Rc<AggregateWatchers>,
     mut captured: FsyncCapturedData, // Mutable because we set the datablocks_position while writing in metablocks
+    shard_id: u32,
 ) -> Result<(), ShardFsyncError> {
+    let start = std::time::Instant::now();
+    let batch_size = captured.sync_positions_snapshot.pending_append_queue.len();
+    let shard_label = [("shard_id", shard_id.to_string())];
+
     let available_space = log_segments_cache.active_log_available_space();
     if available_space < captured.required_disk_space {
         if log_segments_cache
@@ -80,6 +85,7 @@ pub(crate) async fn commit_fsync_with_rollback(
 
     match sync(active_log_segment.clone(), &mut captured.sync_positions_snapshot).await {
         Ok(updated_log_segment_file_metadata) => {
+            let wal_index = updated_log_segment_file_metadata.write.wal_index;
             commit_sync(
                 node_status,
                 shard_mem_cache,
@@ -88,6 +94,9 @@ pub(crate) async fn commit_fsync_with_rollback(
                 active_log_segment,
                 updated_log_segment_file_metadata,
             );
+            metrics::histogram!("celeriant_fsync_duration_seconds", &shard_label).record(start.elapsed().as_secs_f64());
+            metrics::histogram!("celeriant_fsync_batch_size", &shard_label).record(batch_size as f64);
+            metrics::gauge!("celeriant_wal_index", &shard_label).set(wal_index as f64);
             Ok(())
         }
         Err(e) => {

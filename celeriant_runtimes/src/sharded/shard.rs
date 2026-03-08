@@ -103,6 +103,9 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
 
         if let Some(rx) = rx {
             spawn_boot_orchestrator(self.ctx.clone(), rx);
+        } else {
+            // Standalone mode — no election, always leader
+            metrics::gauge!("celeriant_node_role").set(1.0);
         }
 
         self.enter_main_loop_until_shutdown().await;
@@ -454,6 +457,7 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
             }
         };
 
+        metrics::counter!("celeriant_leader_elections_total").increment(1);
         info!(status = ?outcome.status, peer = ?outcome.peer_info, "Election complete. Starting post-election S3 catchup");
 
         if !run_s3_catchup(&ctx, &rx).await {
@@ -461,6 +465,7 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
         }
 
         ctx.shard_wal.node_status.set(outcome.status);
+        metrics::gauge!("celeriant_node_role").set(if outcome.status.raw().is_leader() { 1.0 } else { 0.0 });
         broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::StatusUpdate { status: outcome.status }, ctx.intrashard_sender.clone()).await;
 
         let leader_addr = if outcome.status.is_any_follower_state() {
@@ -566,9 +571,12 @@ async fn run_leader_loop<R: ReplicationClient + 'static, D: S3Downloader + 'stat
                 continue;
             }
 
+            metrics::counter!("celeriant_heartbeat_failures_total").increment(1);
             warn!(result = ?result, "Heartbeat unsuccessful, renewing lease via S3");
             match renew_s3_lease_and_broadcast(lease_manager, ctx).await {
                 Ok(renewal) if !renewal.status.raw().is_leader() => {
+                    metrics::counter!("celeriant_leader_elections_total").increment(1);
+                    metrics::gauge!("celeriant_node_role").set(0.0);
                     info!("Lost leadership after S3 CAS race");
                     update_leader_client_address(ctx, renewal.peer_info.as_ref().map(|p| p.client_address.clone())).await;
                     return;
@@ -632,6 +640,8 @@ async fn run_follower_watchdog<R: ReplicationClient + 'static, D: S3Downloader +
 
         match renew_s3_lease_and_broadcast(lease_manager, ctx).await {
             Ok(outcome) if outcome.status.raw().is_leader() => {
+                metrics::counter!("celeriant_leader_elections_total").increment(1);
+                metrics::gauge!("celeriant_node_role").set(1.0);
                 info!("Won S3 CAS race, becoming leader");
                 update_leader_client_address(ctx, None).await;
                 return;

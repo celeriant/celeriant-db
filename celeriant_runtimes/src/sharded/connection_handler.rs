@@ -28,6 +28,14 @@ use super::{
     shard_error_response::{shard_error_to_client_response, shard_error_to_cluster_response, shard_routing_error_to_code, watch_read_error_to_client_response, watch_session_error_to_client_response, IDENTIFY_INVALID_NONCE, IDENTIFY_INVALID_SIGNATURE, IDENTIFY_MISMATCH, IDENTIFY_REQUIRED},
 };
 
+struct ConnectionGuard<'a>(&'a [(&'static str, String); 1]);
+
+impl Drop for ConnectionGuard<'_> {
+    fn drop(&mut self) {
+        metrics::gauge!("celeriant_client_connections_active", self.0).decrement(1.0);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PortType {
     Client,
@@ -111,6 +119,10 @@ pub fn handle_new_connection<R: ReplicationClient + 'static, D: S3Downloader + '
         if ctx.shutdown_requested.get() {
             return;
         }
+
+        let shard_label = [("shard_id", ctx.current_shard_id.to_string())];
+        metrics::gauge!("celeriant_client_connections_active", &shard_label).increment(1.0);
+        let _guard = ConnectionGuard(&shard_label);
 
         match port_type {
             PortType::Client => {
@@ -502,6 +514,7 @@ async fn check_client_redirect<R: ReplicationClient + 'static, D: S3Downloader +
     };
 
     if target_shard != ctx.current_shard_id {
+        metrics::counter!("celeriant_connection_redirects_total").increment(1);
         let msg = IntrashardMessages::ClientConnectionRedirect {
             accepted_tcp_stream: tcp_stream.into_accepted(),
             request,
@@ -991,6 +1004,7 @@ async fn handle_heartbeat<R: ReplicationClient + 'static, D: S3Downloader + 'sta
     // shards immediately rather than waiting for TTL expiry, because we can't trust
     // any time-based decisions with skewed clocks.
     let drift = follower_ms.abs_diff(req.leader_timestamp_ms);
+    metrics::gauge!("celeriant_clock_drift_ms").set(drift as f64);
     if drift > ctx.config.max_cluster_time_drift_ms {
         let fenced = ValidatedNodeStatus::fenced();
         ctx.shard_wal.node_status.set(fenced);
@@ -1088,6 +1102,8 @@ async fn handle_watch<R: ReplicationClient + 'static, D: S3Downloader + 'static,
         }
     };
 
+    metrics::gauge!("celeriant_watch_subscribers_active").increment(1.0);
+
     loop {
         match watch_session.next().await {
             Ok(WatchOutputType::Continue) => continue,
@@ -1111,6 +1127,8 @@ async fn handle_watch<R: ReplicationClient + 'static, D: S3Downloader + 'static,
             }
         }
     }
+
+    metrics::gauge!("celeriant_watch_subscribers_active").decrement(1.0);
 }
 
 fn create_watch_session<R: ReplicationClient + 'static, D: S3Downloader + 'static>(

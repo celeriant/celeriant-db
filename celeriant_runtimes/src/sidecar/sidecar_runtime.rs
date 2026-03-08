@@ -3,7 +3,7 @@ use std::sync::Arc;
 use celeriant_sidecar::store::SidecarStoreTrait;
 use tokio::runtime::Builder;
 
-use crate::{SidecarConfig, sidecar::{error::SidecarError, sidecar_messages::{SidecarRequest}, sidecar_channels::SidecarReceivers}};
+use crate::{SidecarConfig, sidecar::{error::SidecarError, sidecar_messages::{SidecarRequest}, sidecar_channels::SidecarReceivers, metrics_server}};
 
 pub struct SidecarRuntime {
     _runtime: tokio::runtime::Runtime,
@@ -22,6 +22,12 @@ impl SidecarRuntime {
             .enable_all()
             .build()
             .map_err(|e| SidecarError::tokio_runtime_failure(format!("Failed to build Tokio runtime: {}", e)))?;
+
+        if sidecar_config.metrics_enabled {
+            let handle = metrics_server::install_recorder();
+            runtime.spawn(metrics_server::run_metrics_server(sidecar_config.clone(), handle));
+        }
+
         runtime.spawn(run_sidecar(sidecar_receivers, store));
         Ok(Self { _runtime: runtime })
     }
