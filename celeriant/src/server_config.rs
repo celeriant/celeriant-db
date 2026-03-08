@@ -186,11 +186,19 @@ pub struct ServerConfig {
 
     #[arg(
         long,
-        default_value_t = 20000,
+        default_value_t = 2000,
         env = "CELERIANT_LIST_PAGE_SIZE",
-        help = "Maximum number of entities to collate for listings per page (20000)"
+        help = "Maximum number of entities to collate for listings per page (2000)"
     )]
     pub list_page_size: u64,
+
+    #[arg(
+        long,
+        default_value_t = 16,
+        env = "CELERIANT_LIST_MAX_CONCURRENT",
+        help = "Maximum concurrent list operations per shard (16)"
+    )]
+    pub list_max_concurrent: u64,
 
     #[arg(
         long,
@@ -676,6 +684,7 @@ impl ServerConfig {
             },
             list_max_duration: Duration::from_millis(self.list_max_duration_ms),
             list_page_size: self.list_page_size as usize,
+            list_max_concurrent: self.list_max_concurrent,
             list_wal_index_cache_bytes: memory_budget.list_wal_index_cache_bytes,
             schema_cache_bytes: memory_budget.schema_cache_bytes,
             max_schema_size_bytes: self.max_schema_size_bytes,
@@ -761,6 +770,7 @@ impl ServerConfig {
         check_field!(max_requested_latency_ms);
         check_field!(list_max_duration_ms);
         check_field!(list_page_size);
+        check_field!(list_max_concurrent);
         check_field!(max_schema_size_bytes);
         check_field!(client_connection_timeout_ms);
         check_field!(shard_log_preallocate_bytes);
@@ -856,7 +866,8 @@ impl Default for ServerConfig {
             timestamp_precision: ConfigTimestampPrecision::Milliseconds,
             timestamp_epoch_offset_secs: 0,
             list_max_duration_ms: 2000,
-            list_page_size: 20000,
+            list_page_size: 2000,
+            list_max_concurrent: 16,
             max_schema_size_bytes: 16384,
             s3_endpoint_override: None,
             s3_skip_signature: false,

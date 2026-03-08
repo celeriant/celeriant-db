@@ -1195,6 +1195,7 @@ mod tests {
             },
             list_max_duration: Duration::from_secs(10),
             list_page_size: 100,
+            list_max_concurrent: 16,
             list_wal_index_cache_bytes: 1024,
             schema_cache_bytes: 4_194_304, // 4MB
             max_schema_size_bytes: 16384,

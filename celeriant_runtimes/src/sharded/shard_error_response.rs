@@ -293,6 +293,10 @@ fn listing_error(code: u32, e: ShardListingError) -> (u32, String) {
             code,
             format!(r#"{{"detail":{}}}"#, json_string(&format!("{:?}", scan))),
         ),
+        ShardListingError::ListSemaphoreClosed => (
+            code,
+            r#"{"detail":"list semaphore closed"}"#.to_string(),
+        ),
     }
 }
 

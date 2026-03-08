@@ -33,7 +33,6 @@ futures-lite.workspace = true
 fastbloom.workspace = true
 crc32c.workspace = true
 deepsize.workspace = true
-lru.workspace = true
 bytes.workspace = true
 tracing.workspace = true
 metrics.workspace = true

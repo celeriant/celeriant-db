@@ -78,6 +78,7 @@ pub struct ShardConfig {
     pub timestamp_config: TimestampConfig,
     pub list_max_duration: Duration,
     pub list_page_size: usize,
+    pub list_max_concurrent: u64,
     pub list_wal_index_cache_bytes: u64,
     pub schema_cache_bytes: u64,
     pub max_schema_size_bytes: u64,

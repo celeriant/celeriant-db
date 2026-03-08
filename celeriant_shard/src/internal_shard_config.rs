@@ -21,6 +21,7 @@ pub struct InternalShardConfig {
     pub max_s3_fallback_batch_bytes: u64,
     pub timestamp_config: TimestampConfig,
     pub list_page_size: usize,
+    pub list_max_concurrent: u64,
     pub list_max_duration: Duration,
     pub list_wal_index_cache_bytes: u64,
     pub schema_cache_bytes: u64,

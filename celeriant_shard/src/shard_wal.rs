@@ -1,8 +1,8 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{VecDeque};
-use std::num::NonZeroUsize;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use glommio::sync::Semaphore;
 use tracing::warn;
 
 use celeriant_disk::files::rwlock_timeout::write_with_timeout;
@@ -49,7 +49,6 @@ use celeriant_wal::metablocks::metablock_soft_delete::MetablockSoftDelete;
 use celeriant_wal::metablocks::metablock_soft_trim::MetablockSoftTrim;
 use celeriant_watch::aggregate_reader::AggregateReader;
 use celeriant_watch::aggregate_watchers::AggregateWatchers;
-use lru::LruCache;
 
 use crate::amortisation::coordinator::Coordinator;
 use crate::bloom::bloom_filter_cache::BloomFilterCache;
@@ -126,6 +125,9 @@ pub struct ShardWal<R: ReplicationClient + 'static, D: S3Downloader + 'static> {
 
     /// Serializes concurrent schema loading from disk
     schema_loading: LoadingCoordinator<SchemaKey>,
+
+    /// Limits concurrent list operations to bound unbudgeted per-request memory
+    list_semaphore: Rc<Semaphore>,
 
     /// Client for replicating data to followers or S3.
     /// Interior mutability — FollowerConnection manages its own split locks.
@@ -221,6 +223,8 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         )
         .await?;
 
+        let list_semaphore = Rc::new(Semaphore::new(config.list_max_concurrent));
+
         Ok(Self {
             s3_downloader: Rc::new(s3_downloader),
             shard_mem_cache: Rc::new(RefCell::new(shard_mem_cache)),
@@ -234,6 +238,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             aggregate_loading: LoadingCoordinator::new(),
             aggregate_client_loading: LoadingCoordinator::new(),
             schema_loading: LoadingCoordinator::new(),
+            list_semaphore,
             replication_client: Rc::new(replication_client),
             leader_client_address: RefCell::new(None),
         })
@@ -244,15 +249,14 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     /// Scans WAL in reverse order, returning orgs with most recent activity first.
     /// Uses bounded LRU for deduplication within a page.
     pub async fn list_orgs(&self, request: ListOrgsRequest) -> Result<ListOrgsResponse, ShardListingError> {
+        let _permit = self.list_semaphore.acquire_permit(1).await
+            .map_err(|_| ShardListingError::ListSemaphoreClosed)?;
         let start_time = Instant::now();
         let max_duration = self.config.list_max_duration;
         let page_size = self.config.list_page_size;
         let start_wal_index = request.cursor.unwrap_or(u64::MAX);
 
-        // Bounded deduplication: org_id -> ()
-        let mut seen: LruCache<u128, ()> = LruCache::new(
-            NonZeroUsize::new(page_size.saturating_mul(4).max(100)).unwrap()
-        );
+        let mut seen: HashSet<u128> = HashSet::with_capacity(page_size);
         let mut results: Vec<OrgListItem> = Vec::with_capacity(page_size);
         let mut last_wal_index: Option<u64> = None;
         let mut reached_end = false;
@@ -293,8 +297,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
                 let org_id = metablock_bytes::read_event_batch_org_id(bytes);
 
-                if !seen.contains(&org_id) {
-                    seen.put(org_id, ());
+                if seen.insert(org_id) {
                     results.push(OrgListItem { org_id });
                     last_wal_index = Some(wal_index);
 
@@ -330,16 +333,15 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     ///
     /// Scans WAL in reverse order, returning types with most recent activity first.
     pub async fn list_aggregate_types(&self, request: ListAggregateTypesRequest) -> Result<ListAggregateTypesResponse, ShardListingError> {
+        let _permit = self.list_semaphore.acquire_permit(1).await
+            .map_err(|_| ShardListingError::ListSemaphoreClosed)?;
         let start_time = Instant::now();
         let max_duration = self.config.list_max_duration;
         let page_size = self.config.list_page_size;
         let start_wal_index = request.cursor.unwrap_or(u64::MAX);
         let filter_org_id = request.org_id;
 
-        // Bounded deduplication: (org_id, aggregate_type_id) -> ()
-        let mut seen: LruCache<AggregateTypeKey, ()> = LruCache::new(
-            NonZeroUsize::new(page_size.saturating_mul(4).max(100)).unwrap()
-        );
+        let mut seen: HashSet<AggregateTypeKey> = HashSet::with_capacity(page_size);
         let mut results: Vec<AggregateTypeListItem> = Vec::with_capacity(page_size);
         let mut last_wal_index: Option<u64> = None;
         let mut reached_end = false;
@@ -385,8 +387,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                 let aggregate_type_id = metablock_bytes::read_event_batch_aggregate_type_id(bytes);
                 let type_key = AggregateTypeKey::new(org_id, aggregate_type_id);
 
-                if !seen.contains(&type_key) {
-                    seen.put(type_key, ());
+                if seen.insert(type_key) {
                     results.push(AggregateTypeListItem { org_id, aggregate_type_id });
                     last_wal_index = Some(wal_index);
 
@@ -422,6 +423,8 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     /// Scans WAL in reverse order. Returns aggregates with accumulated statistics
     /// from batches seen within this page. Client must merge stats across pages.
     pub async fn list_aggregates(&self, request: ListAggregatesRequest) -> Result<ListAggregatesResponse, ShardListingError> {
+        let _permit = self.list_semaphore.acquire_permit(1).await
+            .map_err(|_| ShardListingError::ListSemaphoreClosed)?;
         let start_time = Instant::now();
         let max_duration = self.config.list_max_duration;
         let page_size = self.config.list_page_size;
@@ -446,10 +449,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             uncompressed_size: u64,
         }
 
-        // TODO: LRU behaviour here needs more testing & optimisation
-        let mut seen: LruCache<AggregateKey, AggregatePageStats> = LruCache::new(
-            NonZeroUsize::new(page_size.saturating_mul(4).max(100)).unwrap()
-        );
+        let mut seen: HashMap<AggregateKey, AggregatePageStats> = HashMap::with_capacity(page_size);
         let mut result_order: Vec<AggregateKey> = Vec::with_capacity(page_size);
         let mut last_wal_index: Option<u64> = None;
         let mut reached_end = false;
@@ -495,14 +495,14 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                         }
                     }
 
-                    if !seen.contains(&aggregate_key) {
+                    if !seen.contains_key(&aggregate_key) {
                         // First time seeing this aggregate (as deleted)
                         if unique_count >= page_size {
                             return Ok(Some(false)); // Page full
                         }
-                        
+
                         result_order.push(aggregate_key.clone());
-                        seen.put(aggregate_key, AggregatePageStats {
+                        seen.insert(aggregate_key, AggregatePageStats {
                             is_deleted: true,
                             event_batch_count: 0,
                             min_event_timestamp: u64::MAX,
@@ -570,7 +570,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                     }
 
                     result_order.push(aggregate_key.clone());
-                    seen.put(aggregate_key, AggregatePageStats {
+                    seen.insert(aggregate_key, AggregatePageStats {
                         is_deleted: false,
                         event_batch_count: 1,
                         min_event_timestamp: min_event_ts,
@@ -2186,6 +2186,7 @@ mod tests {
             read_max_chunk_size: 32 * 1024,
             timestamp_config: TimestampConfig::default(),
             list_page_size: 100,
+            list_max_concurrent: 16,
             list_max_duration: Duration::from_secs(2),
             list_wal_index_cache_bytes: 1024 * 1024,
             schema_cache_bytes: 4 * 1024 * 1024,

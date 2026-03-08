@@ -72,6 +72,7 @@ fn create_config(shard_dir: PathBuf) -> InternalShardConfig {
         timestamp_config: TimestampConfig::default(),
         list_max_duration: Duration::from_millis(2000),
         list_page_size: 20000,
+        list_max_concurrent: 16,
         list_wal_index_cache_bytes: 12 * 1024 * 1024,
         schema_cache_bytes: 4 * 1024 * 1024,
         max_schema_size_bytes: 16384,

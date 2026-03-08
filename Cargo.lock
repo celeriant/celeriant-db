@@ -816,7 +816,6 @@ dependencies = [
  "futures-lite",
  "glommio",
  "jsonschema",
- "lru 0.16.2",
  "metrics",
  "num_cpus",
  "rustls",
