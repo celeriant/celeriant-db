@@ -587,6 +587,7 @@ name = "celeriant_cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "celeriant_client_tokio",
  "celeriant_crypto",
  "celeriant_msg",
@@ -603,6 +604,7 @@ dependencies = [
  "tokio",
  "tui-textarea",
  "unicode-width",
+ "uuid",
 ]
 
 [[package]]

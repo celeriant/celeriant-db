@@ -1,6 +1,8 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
+use crate::utils::parse_u128;
+
 #[derive(Parser)]
 #[command(name = "celeriant")]
 #[command(author, version, about = "Celeriant Event Store CLI & TUI Client")]
@@ -20,7 +22,7 @@ pub struct Cli {
 
 #[derive(Subcommand, Clone)]
 pub enum Commands {
-    
+
     /// Check if an aggregate exists
     AggregateDetails(AggregateKeyArgs),
 
@@ -39,67 +41,21 @@ pub enum Commands {
 
 #[derive(Args, Clone)]
 pub struct AggregateKeyArgs {
-    /// Organisation ID
-    #[arg(long)]
+    /// Organisation ID (UUID, numeric, or base64)
+    #[arg(long, value_parser = parse_u128)]
     pub org: u128,
 
-    /// Aggregate type ID
-    #[arg(long, long = "type")]
+    /// Aggregate type ID (UUID, numeric, or base64)
+    #[arg(long, long = "type", value_parser = parse_u128)]
     pub aggregate_type: u128,
 
-    /// Aggregate ID
-    #[arg(long)]
+    /// Aggregate ID (UUID, numeric, or base64)
+    #[arg(long, value_parser = parse_u128)]
     pub id: u128,
 
-    /// Correlation ID for tracking
-    #[arg(long)]
+    /// Correlation ID for tracking (UUID, numeric, or base64)
+    #[arg(long, value_parser = parse_u128)]
     pub correlation_id: Option<u128>,
-}
-
-#[derive(Args, Clone)]
-pub struct ListOrgsArgs {
-    /// Filter: created after timestamp (unix millis)
-    #[arg(long)]
-    pub created_after: Option<u64>,
-
-    /// Filter: created before timestamp (unix millis)
-    #[arg(long)]
-    pub created_before: Option<u64>,
-
-    /// Filter: modified after timestamp (unix millis)
-    #[arg(long)]
-    pub modified_after: Option<u64>,
-
-    /// Filter: modified before timestamp (unix millis)
-    #[arg(long)]
-    pub modified_before: Option<u64>,
-
-    /// Output format
-    #[arg(long, value_enum, default_value = "table")]
-    pub format: OutputFormat,
-}
-
-#[derive(Args, Clone)]
-pub struct ListAggregatesArgs {
-    /// Organisation ID
-    #[arg(long)]
-    pub org: u128,
-
-    /// Aggregate type ID (optional filter)
-    #[arg(long, name = "type")]
-    pub aggregate_type: Option<u128>,
-
-    /// Filter: created after timestamp
-    #[arg(long)]
-    pub created_after: Option<u64>,
-
-    /// Filter: created before timestamp
-    #[arg(long)]
-    pub created_before: Option<u64>,
-
-    /// Output format
-    #[arg(long, value_enum, default_value = "table")]
-    pub format: OutputFormat,
 }
 
 #[derive(Args, Clone)]
@@ -119,12 +75,12 @@ pub struct ReadArgs {
     #[arg(long, value_delimiter = ',')]
     pub event_types: Option<Vec<u64>>,
 
-    /// Exclude events from this client
-    #[arg(long)]
+    /// Exclude events from this client (UUID, numeric, or base64)
+    #[arg(long, value_parser = parse_u128)]
     pub exclude_client: Option<u128>,
 
-    /// Include only events from this client
-    #[arg(long)]
+    /// Include only events from this client (UUID, numeric, or base64)
+    #[arg(long, value_parser = parse_u128)]
     pub include_client: Option<u128>,
 
     /// Minimum server timestamp
@@ -145,12 +101,12 @@ pub struct DeleteArgs {
     #[command(flatten)]
     pub key: AggregateKeyArgs,
 
-    /// Client ID for the write
-    #[arg(long)]
+    /// Client ID for the write (UUID, numeric, or base64)
+    #[arg(long, value_parser = parse_u128)]
     pub client_id: u128,
 
-    /// User ID (optional)
-    #[arg(long)]
+    /// User ID (UUID, numeric, or base64)
+    #[arg(long, value_parser = parse_u128)]
     pub user_id: Option<u128>,
 
     /// Allow re-creating the aggregate after delete
@@ -171,12 +127,12 @@ pub struct WriteArgs {
     #[command(flatten)]
     pub key: AggregateKeyArgs,
 
-    /// Client ID for the write
-    #[arg(long)]
+    /// Client ID for the write (UUID, numeric, or base64)
+    #[arg(long, value_parser = parse_u128)]
     pub client_id: u128,
 
-    /// User ID (optional)
-    #[arg(long)]
+    /// User ID (UUID, numeric, or base64)
+    #[arg(long, value_parser = parse_u128)]
     pub user_id: Option<u128>,
 
     /// Event type ID
@@ -213,24 +169,17 @@ pub struct TrimArgs {
     #[command(flatten)]
     pub key: AggregateKeyArgs,
 
-    /// Client ID for the write
-    #[arg(long)]
+    /// Client ID for the write (UUID, numeric, or base64)
+    #[arg(long, value_parser = parse_u128)]
     pub client_id: u128,
 
-    /// User ID (optional)
-    #[arg(long)]
+    /// User ID (UUID, numeric, or base64)
+    #[arg(long, value_parser = parse_u128)]
     pub user_id: Option<u128>,
 
     /// Keep events from this batch index onwards
     #[arg(long)]
     pub keep_from: u64,
-}
-
-#[derive(Args, Clone)]
-pub struct UpdateCacheArgs {
-    /// Maximum data cache size in bytes
-    #[arg(long)]
-    pub max_size: u64,
 }
 
 #[derive(ValueEnum, Clone, Copy, Default)]

@@ -27,6 +27,7 @@ ratatui = "0.28"
 crossterm = { version = "0.28", features = ["event-stream"] }
 
 # Utilities
+base64 = "0.22"
 anyhow = "1"
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
@@ -36,4 +37,5 @@ humansize = "2"
 tui-textarea = "0.6"
 unicode-width = "0.1"
 
+uuid.workspace = true
 directories.workspace = true

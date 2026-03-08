@@ -16,7 +16,7 @@ use celeriant_wal::{
 use std::{collections::HashMap, fs};
 
 use crate::cli::*;
-use crate::utils::{format_response, format_timestamp};
+use crate::utils::{format_response, format_timestamp, format_u128_uuid};
 
 pub async fn execute_command(server: &str, _api_key: Option<&str>, command: Commands) -> Result<()> {
     let mut client = CeleriantClient::connect(server)
@@ -55,9 +55,9 @@ async fn check_aggregatedetails(client: &mut CeleriantClient, args: AggregateKey
                 println!("  Allow index continuation: {}", res.allow_index_continuation);
             }
             println!("  Last server timestamp: {}", format_timestamp(res.last_server_timestamp));
-            println!("  Last client ID: {}", res.last_client_id);
+            println!("  Last client ID: {}", format_u128_uuid(res.last_client_id));
             if let Some(user_id) = res.last_user_id {
-                println!("  Last user ID: {}", user_id);
+                println!("  Last user ID: {}", format_u128_uuid(user_id));
             }
         }
         ClientResponse::GenericError(err) => {
@@ -117,7 +117,7 @@ async fn read_events(client: &mut CeleriantClient, args: ReadArgs) -> Result<()>
                     println!();
                     for batch in &res.event_batches {
                         println!("Batch {} ({})", batch.event_batch_index, format_timestamp(batch.server_timestamp));
-                        println!("  Client: {}, Events: {}", batch.client_id, batch.events.len());
+                        println!("  Client: {}, Events: {}", format_u128_uuid(batch.client_id), batch.events.len());
                         for event in &batch.events {
                             let data_preview: String = String::from_utf8_lossy(&event.event_value)
                                 .chars()
@@ -216,7 +216,7 @@ async fn trim_start(client: &mut CeleriantClient, args: TrimArgs) -> Result<()> 
         ClientResponse::TrimStart(res) => {
             println!("Trim successful");
             if let Some(id) = res.correlation_id {
-                println!("  Correlation ID: {}", id);
+                println!("  Correlation ID: {}", format_u128_uuid(id));
             }
         }
         ClientResponse::GenericError(err) => {
@@ -253,7 +253,7 @@ async fn delete_aggregate(client: &mut CeleriantClient, args: DeleteArgs) -> Res
         ClientResponse::Delete(res) => {
             println!("Delete successful");
             if let Some(id) = res.correlation_id {
-                println!("  Correlation ID: {}", id);
+                println!("  Correlation ID: {}", format_u128_uuid(id));
             }
         }
         ClientResponse::GenericError(err) => {
