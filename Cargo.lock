@@ -598,6 +598,7 @@ dependencies = [
  "directories",
  "humansize",
  "ratatui",
+ "rustls",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

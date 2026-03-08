@@ -36,6 +36,14 @@ pub struct Cli {
     #[arg(long, env = "CELERIANT_API_KEY")]
     pub api_key: Option<String>,
 
+    /// RSA public key file (base64-encoded DER)
+    #[arg(long, env = "CELERIANT_PUBLIC_KEY", requires = "private_key")]
+    pub public_key: Option<PathBuf>,
+
+    /// RSA private key file (base64-encoded DER)
+    #[arg(long, env = "CELERIANT_PRIVATE_KEY", requires = "public_key")]
+    pub private_key: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -121,9 +129,9 @@ pub struct DeleteArgs {
     #[command(flatten)]
     pub key: AggregateKeyArgs,
 
-    /// Client ID for the write (UUID, numeric, or base64)
+    /// Client ID (UUID, numeric, or base64). Optional if using identity verification.
     #[arg(long, value_parser = parse_u128)]
-    pub client_id: u128,
+    pub client_id: Option<u128>,
 
     /// User ID (UUID, numeric, or base64)
     #[arg(long, value_parser = parse_u128)]
@@ -147,9 +155,9 @@ pub struct WriteArgs {
     #[command(flatten)]
     pub key: AggregateKeyArgs,
 
-    /// Client ID for the write (UUID, numeric, or base64)
+    /// Client ID (UUID, numeric, or base64). Optional if using identity verification.
     #[arg(long, value_parser = parse_u128)]
-    pub client_id: u128,
+    pub client_id: Option<u128>,
 
     /// User ID (UUID, numeric, or base64)
     #[arg(long, value_parser = parse_u128)]
@@ -189,9 +197,9 @@ pub struct TrimArgs {
     #[command(flatten)]
     pub key: AggregateKeyArgs,
 
-    /// Client ID for the write (UUID, numeric, or base64)
+    /// Client ID (UUID, numeric, or base64). Optional if using identity verification.
     #[arg(long, value_parser = parse_u128)]
-    pub client_id: u128,
+    pub client_id: Option<u128>,
 
     /// User ID (UUID, numeric, or base64)
     #[arg(long, value_parser = parse_u128)]

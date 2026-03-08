@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use celeriant_client_tokio::{CeleriantClient, ClientTlsConfig};
+use celeriant_client_tokio::{CeleriantClient, ClientIdentityConfig, ClientTlsConfig};
 use celeriant_crypto::pki::PkiManager;
 use celeriant_msg::{
     process_client_requests::ClientRequest,
@@ -53,6 +53,57 @@ fn build_tls_config(cli: &Cli) -> Result<Option<ClientTlsConfig>> {
     Ok(Some(ClientTlsConfig::new(client_config, server_name)))
 }
 
+async fn identify_client(cli: &Cli, client: &mut CeleriantClient) -> Result<Option<u128>> {
+    let has_keys = cli.public_key.is_some();
+    let has_api_key = cli.api_key.is_some();
+    if !has_keys && !has_api_key {
+        return Ok(None);
+    }
+
+    let (public_key, private_key) = if has_keys {
+        let pub_path = cli.public_key.as_ref().unwrap();
+        let priv_path = cli.private_key.as_ref().unwrap();
+        let pub_key = fs::read_to_string(pub_path)
+            .with_context(|| format!("Failed to read public key: {}", pub_path.display()))?;
+        let priv_key = fs::read_to_string(priv_path)
+            .with_context(|| format!("Failed to read private key: {}", priv_path.display()))?;
+        (Some(pub_key.trim().to_owned()), Some(priv_key.trim().to_owned()))
+    } else {
+        (None, None)
+    };
+
+    let identity_config = ClientIdentityConfig {
+        public_key,
+        private_key,
+        api_key: cli.api_key.clone(),
+    };
+
+    let identity_client_id = client.identify(&identity_config).await
+        .context("Identity verification failed")?;
+
+    Ok(identity_client_id)
+}
+
+/// Resolve client_id for write/delete/trim operations.
+/// Priority: identity-derived > explicit --client-id > error.
+fn resolve_client_id(identity_client_id: Option<u128>, explicit_client_id: Option<u128>) -> Result<u128> {
+    match (identity_client_id, explicit_client_id) {
+        (Some(identity_id), Some(explicit_id)) => {
+            if identity_id != explicit_id {
+                bail!(
+                    "--client-id {} does not match identity-derived client ID {}",
+                    format_u128_uuid(explicit_id),
+                    format_u128_uuid(identity_id),
+                );
+            }
+            Ok(identity_id)
+        }
+        (Some(id), None) => Ok(id),
+        (None, Some(id)) => Ok(id),
+        (None, None) => bail!("No client ID available. Provide --client-id or use --public-key/--private-key for identity verification"),
+    }
+}
+
 pub async fn execute_command(cli: &Cli, command: Commands) -> Result<()> {
     let tls_config = build_tls_config(cli)?;
 
@@ -60,12 +111,14 @@ pub async fn execute_command(cli: &Cli, command: Commands) -> Result<()> {
         .await
         .with_context(|| format!("Failed to connect to {}", cli.server))?;
 
+    let identity_client_id = identify_client(cli, &mut client).await?;
+
     match command {
         Commands::AggregateDetails(args) => check_aggregatedetails(&mut client, args).await,
         Commands::Read(args) => read_events(&mut client, args).await,
-        Commands::Write(args) => write_event(&mut client, args).await,
-        Commands::Trim(args) => trim_start(&mut client, args).await,
-        Commands::Delete(args) => delete_aggregate(&mut client, args).await,
+        Commands::Write(args) => write_event(&mut client, args, identity_client_id).await,
+        Commands::Trim(args) => trim_start(&mut client, args, identity_client_id).await,
+        Commands::Delete(args) => delete_aggregate(&mut client, args, identity_client_id).await,
     }
 }
 
@@ -174,7 +227,8 @@ async fn read_events(client: &mut CeleriantClient, args: ReadArgs) -> Result<()>
     Ok(())
 }
 
-async fn write_event(client: &mut CeleriantClient, args: WriteArgs) -> Result<()> {
+async fn write_event(client: &mut CeleriantClient, args: WriteArgs, identity_client_id: Option<u128>) -> Result<()> {
+    let client_id = resolve_client_id(identity_client_id, args.client_id)?;
     let key = AggregateKey::new(args.key.org, args.key.aggregate_type, args.key.id);
 
     let data = if let Some(data_str) = args.data {
@@ -208,10 +262,10 @@ async fn write_event(client: &mut CeleriantClient, args: WriteArgs) -> Result<()
         compression_type_id,
         compression_level,
     });
-    
+
     let request = ClientRequest::Write(WriteRequest {
         correlation_id: args.key.correlation_id,
-        client_id: args.client_id,
+        client_id,
         user_id: args.user_id,
         writes,
     });
@@ -233,14 +287,15 @@ async fn write_event(client: &mut CeleriantClient, args: WriteArgs) -> Result<()
     Ok(())
 }
 
-async fn trim_start(client: &mut CeleriantClient, args: TrimArgs) -> Result<()> {
+async fn trim_start(client: &mut CeleriantClient, args: TrimArgs, identity_client_id: Option<u128>) -> Result<()> {
+    let client_id = resolve_client_id(identity_client_id, args.client_id)?;
     let key = AggregateKey::new(args.key.org, args.key.aggregate_type, args.key.id);
 
     let request = ClientRequest::TrimStart(TrimStartRequest {
         correlation_id: args.key.correlation_id,
         aggregate_key: key,
         keep_from_event_batch_index: args.keep_from,
-        client_id: args.client_id,
+        client_id,
         user_id: args.user_id,
     });
 
@@ -264,7 +319,8 @@ async fn trim_start(client: &mut CeleriantClient, args: TrimArgs) -> Result<()> 
     Ok(())
 }
 
-async fn delete_aggregate(client: &mut CeleriantClient, args: DeleteArgs) -> Result<()> {
+async fn delete_aggregate(client: &mut CeleriantClient, args: DeleteArgs, identity_client_id: Option<u128>) -> Result<()> {
+    let client_id = resolve_client_id(identity_client_id, args.client_id)?;
     let key = AggregateKey::new(args.key.org, args.key.aggregate_type, args.key.id);
 
     let mut deletes = HashMap::new();
@@ -273,10 +329,10 @@ async fn delete_aggregate(client: &mut CeleriantClient, args: DeleteArgs) -> Res
         allow_index_continuation: args.allow_index_continuation,
         expected_event_batch_index: args.expected_index,
     });
-    
+
     let request = ClientRequest::Delete(DeleteRequest {
         correlation_id: args.key.correlation_id,
-        client_id: args.client_id,
+        client_id,
         user_id: args.user_id,
         deletes,
     });
