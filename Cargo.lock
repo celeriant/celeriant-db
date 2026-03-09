@@ -705,6 +705,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rustls",
  "rustls-pki-types",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-rustls",

@@ -2141,7 +2141,6 @@ mod tests {
     use crate::replication_client::StubReplicationClient;
     use crate::s3_downloader::StubS3Downloader;
     use celeriant_msg::request::requests::{ReplicationBatchItem, ReplicationBatchRequest, SingleAggregateDelete, WatchRequest};
-    use celeriant_wal::compression_type::CompressionType;
     use celeriant_wal::constants::HEADER_BLOCK_SIZE_BYTES;
     use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
     use crate::timestamp_config::TimestampConfig;

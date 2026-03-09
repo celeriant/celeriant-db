@@ -306,6 +306,14 @@ name = "batch_standalone_cleartext_main"
 path = "src/batch_standalone_cleartext_main.rs"
 
 [[bin]]
+name = "follower_read_snapshot_main"
+path = "src/follower_read_snapshot_main.rs"
+
+[[bin]]
+name = "leader_read_visibility_main"
+path = "src/leader_read_visibility_main.rs"
+
+[[bin]]
 name = "read_list_benchmark_main"
 path = "src/read_list_benchmark_main.rs"
 
@@ -345,4 +353,5 @@ tokio-rustls.workspace = true
 reqwest = { version = "0.12", features = ["blocking"] }
 apache-avro.workspace = true
 base64.workspace = true
+serde_json.workspace = true
 hex = "0.4"

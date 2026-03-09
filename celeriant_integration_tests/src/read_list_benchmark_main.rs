@@ -154,8 +154,8 @@ fn compute_result(
 
 fn print_result(r: &BenchmarkResult) {
     println!(
-        "  Throughput: {:.0} req/s | Avg: {:.1}ms | P50: {}ms | P95: {}ms | P99: {}ms | P99.9: {}ms | Errors: {}",
-        r.throughput, r.avg_latency_ms, r.p50_ms, r.p95_ms, r.p99_ms, r.p999_ms, r.total_errors
+        "  Requests: {} | Throughput: {:.0} req/s | Avg: {:.1}ms | P50: {}ms | P95: {}ms | P99: {}ms | P99.9: {}ms | Errors: {}",
+        r.total_requests, r.throughput, r.avg_latency_ms, r.p50_ms, r.p95_ms, r.p99_ms, r.p999_ms, r.total_errors
     );
 }
 
@@ -414,10 +414,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{}\n", "=".repeat(100));
 
     println!(
-        "{:<25} {:>6} {:>14} {:>10} {:>8} {:>8} {:>8} {:>8}",
-        "Scenario", "Conns", "Throughput", "Avg (ms)", "P50", "P95", "P99", "Errors"
+        "{:<25} {:>6} {:>10} {:>14} {:>10} {:>8} {:>8} {:>8} {:>8}",
+        "Scenario", "Conns", "Requests", "Throughput", "Avg (ms)", "P50", "P95", "P99", "Errors"
     );
-    println!("{}", "-".repeat(100));
+    println!("{}", "-".repeat(110));
 
     let all_results: Vec<&BenchmarkResult> = [
         &read_result, &list_result, &pressure_result,
@@ -425,8 +425,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for r in &all_results {
         println!(
-            "{:<25} {:>6} {:>11.0} /s {:>10.1} {:>8} {:>8} {:>8} {:>8}",
-            r.label, r.num_connections, r.throughput, r.avg_latency_ms,
+            "{:<25} {:>6} {:>10} {:>11.0} /s {:>10.1} {:>8} {:>8} {:>8} {:>8}",
+            r.label, r.num_connections, r.total_requests, r.throughput, r.avg_latency_ms,
             r.p50_ms, r.p95_ms, r.p99_ms, r.total_errors,
         );
     }

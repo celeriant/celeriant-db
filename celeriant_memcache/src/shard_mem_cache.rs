@@ -508,8 +508,12 @@ impl<V: Validate> ShardMemCache<V> {
         }
     }
 
-    pub fn commit_read_position_snapshot(&mut self, event_batch: &MetablockEventBatch, log_id: u64, metablock_absolute_pos: u64) {
-        if let Some(existing) = self.aggregate_read_snapshots.get_mut(&event_batch.aggregate_key)
+    pub fn commit_position_snapshot(&mut self, event_batch: &MetablockEventBatch, log_id: u64, metablock_absolute_pos: u64, cache_path: CachePath) {
+        let cache = match cache_path {
+            CachePath::Read => &mut self.aggregate_read_snapshots,
+            CachePath::Write => &mut self.aggregate_write_snapshots,
+        };
+        if let Some(existing) = cache.get_mut(&event_batch.aggregate_key)
             && existing.status != AggregateStatus::NotFound {
             existing.status = AggregateStatus::Found;
             if event_batch.event_batch_index > existing.event_batch_index {
@@ -521,9 +525,9 @@ impl<V: Validate> ShardMemCache<V> {
             existing.log_id = log_id;
             existing.metablock_absolute_pos = metablock_absolute_pos;
         } else {
-            self.aggregate_read_snapshots.put(event_batch.aggregate_key.clone(), MemSnapshotAggregate {
-                log_id: log_id,
-                metablock_absolute_pos: metablock_absolute_pos,
+            cache.put(event_batch.aggregate_key.clone(), MemSnapshotAggregate {
+                log_id,
+                metablock_absolute_pos,
                 event_index: event_batch.max_event_index,
                 event_batch_index: event_batch.event_batch_index,
                 min_event_batch_index: 0,
@@ -575,7 +579,8 @@ impl<V: Validate> ShardMemCache<V> {
             }
 
             if !node_status.is_leader() {
-                // Single-node or follower: update read cache immediately.
+                // Single-node: update read cache immediately.
+                // Follower does not enter here as aggregate_queue_positions is not populated during replication
                 if let Some(existing) = self.aggregate_read_snapshots.get_mut(&key)
                 && existing.status != AggregateStatus::NotFound {
                     existing.status = AggregateStatus::Found;

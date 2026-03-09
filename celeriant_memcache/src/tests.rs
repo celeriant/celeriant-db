@@ -446,12 +446,12 @@ fn commit_updates_client_event_indexes() {
 }
 
 #[test]
-fn commit_read_position_snapshot_updates_read_cache() {
+fn commit_position_snapshot_updates_read_cache() {
     let mut c = cache();
     let k = agg(1, 1, 1);
     let event_batch = test_event_batch(k.clone(), 3, 10);
 
-    c.commit_read_position_snapshot(&event_batch, 1, 512);
+    c.commit_position_snapshot(&event_batch, 1, 512, CachePath::Read);
 
     let (loaded, status) = c.aggregate_load_status(&k, CachePath::Read);
     assert!(loaded);
@@ -465,17 +465,17 @@ fn commit_read_position_snapshot_updates_read_cache() {
 }
 
 #[test]
-fn commit_read_position_snapshot_advances_existing_entry() {
+fn commit_position_snapshot_advances_existing_entry() {
     let mut c = cache();
     let k = agg(1, 1, 1);
 
     // First commit
     let batch1 = test_event_batch(k.clone(), 1, 5);
-    c.commit_read_position_snapshot(&batch1, 1, 100);
+    c.commit_position_snapshot(&batch1, 1, 100, CachePath::Read);
 
     // Second commit with higher indexes on a new log segment
     let batch2 = test_event_batch(k.clone(), 3, 15);
-    c.commit_read_position_snapshot(&batch2, 2, 200);
+    c.commit_position_snapshot(&batch2, 2, 200, CachePath::Read);
 
     let pos = c.get_aggregate_last_metablock_pos(&k, CachePath::Read);
     assert_eq!(pos.event_batch_index, 3);
@@ -490,11 +490,11 @@ fn commit_read_position_does_not_regress_indexes() {
     let k = agg(1, 1, 1);
 
     let batch_high = test_event_batch(k.clone(), 10, 50);
-    c.commit_read_position_snapshot(&batch_high, 1, 100);
+    c.commit_position_snapshot(&batch_high, 1, 100, CachePath::Read);
 
     // Lower indexes should not overwrite, but position still advances
     let batch_low = test_event_batch(k.clone(), 2, 5);
-    c.commit_read_position_snapshot(&batch_low, 2, 50);
+    c.commit_position_snapshot(&batch_low, 2, 50, CachePath::Read);
 
     let pos = c.get_aggregate_last_metablock_pos(&k, CachePath::Read);
     assert_eq!(pos.event_batch_index, 10);
@@ -1566,4 +1566,88 @@ fn schema_compilation_failed_counts_as_has_schema() {
     c.schema_cache_insert(key.clone(), CachedSchema::CompilationFailed("bad".into()));
     assert!(c.schema_cache_has_schema(&key));
     assert!(c.schema_cache_contains(&key));
+}
+
+// ── Follower Replication Path (add_to_pending_queue) ──
+// These simulate the follower path where replicated items arrive via
+// add_to_pending_queue (no aggregate position tracking), then fsync + commit.
+
+/// Simulate the follower's commit_sync flow at the memcache level:
+/// commit_sync_positions_snapshot processes aggregate_queue_positions (empty for replicated items),
+/// then commit_sync calls commit_position_snapshot for each EventBatch.
+fn follower_commit_with_position_snapshots(cache: &mut ShardMemCache<StubValidator>, log_id: u64) {
+    let mut snapshot = cache.take_sync_positions_snapshot();
+    let pending_items = std::mem::take(&mut snapshot.pending_append_queue);
+    cache.commit_sync_positions_snapshot(NodeStatus::Follower { leader_lease_index: 1 }, snapshot);
+
+    // This is what commit_sync does after commit_sync_positions_snapshot
+    for item in &pending_items {
+        if let MetablockKind::EventBatchMetadata(eb) = &item.metablock.wal_metablock_type {
+            cache.commit_position_snapshot(eb, log_id, item.metablock_absolute_pos, CachePath::Read);
+            cache.commit_position_snapshot(eb, log_id, item.metablock_absolute_pos, CachePath::Write);
+        }
+    }
+}
+
+#[test]
+fn follower_event_batch_via_pending_queue_updates_read_snapshot() {
+    let mut c = cache();
+    let k = agg(1, 1, 1);
+
+    let items = vec![
+        test_queue_item(k.clone(), 1, 5, 100),
+        test_queue_item(k.clone(), 2, 10, 100),
+    ];
+    c.add_to_pending_queue(items);
+    follower_commit_with_position_snapshots(&mut c, 1);
+
+    let (loaded, status) = c.aggregate_load_status(&k, CachePath::Read);
+    assert!(loaded, "follower read snapshot should be populated after commit");
+    assert_eq!(status, AggregateStatus::Found);
+
+    let pos = c.get_aggregate_last_metablock_pos(&k, CachePath::Read);
+    assert_eq!(pos.event_batch_index, 2);
+    assert_eq!(pos.event_index, 10);
+}
+
+#[test]
+fn follower_event_batch_via_pending_queue_updates_write_snapshot() {
+    let mut c = cache();
+    let k = agg(1, 1, 1);
+
+    let items = vec![test_queue_item(k.clone(), 1, 5, 100)];
+    c.add_to_pending_queue(items);
+    follower_commit_with_position_snapshots(&mut c, 1);
+
+    let (loaded, status) = c.aggregate_load_status(&k, CachePath::Write);
+    assert!(loaded, "follower write snapshot should be populated after commit");
+    assert_eq!(status, AggregateStatus::Found);
+}
+
+#[test]
+fn follower_soft_trim_after_events_updates_min_event_batch_index() {
+    let mut c = cache();
+    let k = agg(1, 1, 1);
+
+    // Write events first so aggregate exists in cache
+    let items = vec![
+        test_queue_item(k.clone(), 1, 5, 100),
+        test_queue_item(k.clone(), 2, 10, 100),
+        test_queue_item(k.clone(), 3, 15, 100),
+    ];
+    c.add_to_pending_queue(items);
+    follower_commit_with_position_snapshots(&mut c, 1);
+
+    // Aggregate is now in cache — trim can update min_event_batch_index
+    let (loaded, _) = c.aggregate_load_status(&k, CachePath::Read);
+    assert!(loaded);
+
+    // Apply trim
+    c.update_aggregate_min_event_batch_index(&k, 2, CachePath::Read);
+    c.update_aggregate_min_event_batch_index(&k, 2, CachePath::Write);
+
+    for path in [CachePath::Read, CachePath::Write] {
+        let pos = c.get_aggregate_last_metablock_pos(&k, path);
+        assert_eq!(pos.min_event_batch_index, 2, "min_event_batch_index should be 2 on {:?}", path);
+    }
 }

@@ -1139,6 +1139,15 @@ pub async fn count_events(
                 celeriant_client_tokio::client_error::ClientError::CeleriantError(error_response) => {
                     if error_response.error_code == 1001 {
                         return Ok(total);
+                    } else if error_response.error_code == 1000 {
+                        // UnavailableBatchIndex — trimmed data, retry from minimum_available
+                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&error_response.error_message) {
+                            if let Some(min) = parsed["minimum_available"].as_u64() {
+                                from_batch = min;
+                                continue;
+                            }
+                        }
+                        return Err(Box::new(e));
                     } else {
                         return Err(Box::new(e));
                     }

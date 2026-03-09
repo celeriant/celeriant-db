@@ -122,13 +122,17 @@ fn commit_sync(
     }
 
     *log_segment_file.metadata.borrow_mut() = new_metadata;
+    let log_id = log_segment_file.metadata.borrow().log_id;
 
     let mut shard_mem_cache = shard_mem_cache.borrow_mut();
 
     // Take the queue before committing the snapshot since commit consumes it
     let pending_append_queue = std::mem::take(&mut sync_positions_snapshot.pending_append_queue);
 
-    // Extract disk positions for deleted aggregates before commit consumes the snapshot
+    // Extract disk positions for deleted aggregates before commit consumes the snapshot.
+    // On the follower replication path, aggregate_queue_positions is empty (items arrive
+    // via add_to_pending_queue which skips position tracking), so we fall back to the
+    // queue item's own metablock_absolute_pos set during sync().
     let deleted_positions: std::collections::HashMap<_, _> = sync_positions_snapshot
         .aggregate_queue_positions
         .iter()
@@ -155,6 +159,17 @@ fn commit_sync(
                     if event_batch_metadata.event_batch_index == FIRST_EVENT_BATCH_INDEX {
                         event_collector.add_create_event(event_batch_metadata.aggregate_key.clone());
                     }
+
+                    // Update read and write snapshots so the aggregate is visible.
+                    // On the follower replication path, aggregate_queue_positions is empty
+                    // so commit_sync_positions_snapshot won't update these.
+                    shard_mem_cache.commit_position_snapshot(
+                        event_batch_metadata, log_id, queue_item.metablock_absolute_pos, CachePath::Read,
+                    );
+                    shard_mem_cache.commit_position_snapshot(
+                        event_batch_metadata, log_id, queue_item.metablock_absolute_pos, CachePath::Write,
+                    );
+
                     let size_bytes = queue_item.size_bytes();
                     shard_mem_cache.cache_recent_write(
                         event_batch_metadata.aggregate_key.clone(),
@@ -186,10 +201,12 @@ fn commit_sync(
                 }
             }
             MetablockKind::SoftDelete(soft_delete) => {
+                // Use position from aggregate_queue_positions if available (leader write path),
+                // otherwise fall back to the queue item's position set during sync() (follower replication path)
                 let (del_log_id, del_pos) = deleted_positions
                     .get(&soft_delete.aggregate_key)
                     .copied()
-                    .unwrap_or((0, 0));
+                    .unwrap_or((log_id, queue_item.metablock_absolute_pos));
                 shard_mem_cache.put_aggregate_into_cache_as_deleted(
                     soft_delete.aggregate_key.clone(),
                     del_log_id, del_pos,
@@ -402,4 +419,322 @@ fn compute_entry_hash(previous_hash: &EntryHashBytes, content: &[u8]) -> EntryHa
     hasher.update(&content[CRC_END..SKIP_START]);
     hasher.update(&content[SKIP_END..]);
     *hasher.finalize().as_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    use glommio::{LocalExecutorBuilder, Placement};
+
+    use celeriant_memcache::shard_log_queue_item::ShardLogQueueItem;
+    use celeriant_wal::aggregate_key::AggregateKey;
+    use celeriant_wal::constants::{GENESIS_HASH, MINIBATCH_SIZE_BYTES};
+    use celeriant_wal::metablocks::datablock_inline_data::DatablockInlineData;
+    use celeriant_wal::metablocks::datablock_storage_kind::DatablockStorageKind;
+    use celeriant_wal::metablocks::metablock_event_batch::{EventTypesKind, MetablockEventBatch};
+    use celeriant_wal::metablocks::metablock_soft_delete::MetablockSoftDelete;
+    use celeriant_wal::metablocks::metablock_soft_trim::MetablockSoftTrim;
+
+    macro_rules! glommio_test {
+        ($body:expr) => {
+            LocalExecutorBuilder::new(Placement::Fixed(0))
+                .spawn(|| async move { $body })
+                .unwrap()
+                .join()
+                .unwrap()
+        };
+    }
+
+    fn test_dir() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("shard");
+        (tmp, dir)
+    }
+
+    fn event_batch_metablock(aggregate_key: AggregateKey, event_batch_index: u64, max_event_index: u64) -> Metablock {
+        Metablock {
+            wal_index: 0,
+            server_timestamp: 1000,
+            lease_index: 1,
+            node_id: 1,
+            uncompressed_size: 128,
+            compressed_size: 64,
+            datablock_version: 1,
+            datablock_compression_type: 0,
+            previous_tip_hash: GENESIS_HASH,
+            datablock_position: 0,
+            wal_metablock_type: MetablockKind::EventBatchMetadata(MetablockEventBatch {
+                aggregate_key,
+                event_batch_index,
+                min_event_batch_index: 1,
+                min_client_event_index: 1,
+                max_client_event_index: max_event_index,
+                min_event_timestamp: 100,
+                max_event_timestamp: 200,
+                min_event_index: 1,
+                max_event_index,
+                client_id: 1,
+                user_id: None,
+                event_types_data: EventTypesKind::Direct([1, 0, 0, 0]),
+            }),
+            datablock: DatablockStorageKind::Inline(DatablockInlineData {
+                minibatch: [0u8; MINIBATCH_SIZE_BYTES],
+            }),
+        }
+    }
+
+    fn soft_delete_metablock(aggregate_key: AggregateKey, event_batch_index: u64, event_index: u64) -> Metablock {
+        Metablock {
+            wal_index: 0,
+            server_timestamp: 1000,
+            lease_index: 1,
+            node_id: 1,
+            uncompressed_size: 0,
+            compressed_size: 0,
+            datablock_version: 0,
+            datablock_compression_type: 0,
+            previous_tip_hash: GENESIS_HASH,
+            datablock_position: 0,
+            wal_metablock_type: MetablockKind::SoftDelete(MetablockSoftDelete {
+                aggregate_key,
+                allow_recreate: false,
+                allow_index_continuation: false,
+                event_batch_index,
+                event_index,
+                client_id: 1,
+                user_id: None,
+            }),
+            datablock: DatablockStorageKind::Inline(DatablockInlineData {
+                minibatch: [0u8; MINIBATCH_SIZE_BYTES],
+            }),
+        }
+    }
+
+    fn soft_trim_metablock(aggregate_key: AggregateKey, keep_from: u64) -> Metablock {
+        Metablock {
+            wal_index: 0,
+            server_timestamp: 1000,
+            lease_index: 1,
+            node_id: 1,
+            uncompressed_size: 0,
+            compressed_size: 0,
+            datablock_version: 0,
+            datablock_compression_type: 0,
+            previous_tip_hash: GENESIS_HASH,
+            datablock_position: 0,
+            wal_metablock_type: MetablockKind::SoftTrim(MetablockSoftTrim {
+                aggregate_key,
+                keep_from_event_batch_index: keep_from,
+                client_id: 1,
+                user_id: None,
+            }),
+            datablock: DatablockStorageKind::Inline(DatablockInlineData {
+                minibatch: [0u8; MINIBATCH_SIZE_BYTES],
+            }),
+        }
+    }
+
+    fn queue_item(metablock: Metablock) -> ShardLogQueueItem {
+        ShardLogQueueItem::new(None, None, metablock)
+    }
+
+    /// Simulates the non-leader commit path: add_to_pending_queue → sync → commit_sync.
+    fn non_leader_commit_sync(
+        node_status: NodeStatus,
+        shard_mem_cache: &Rc<RefCell<MemCache>>,
+        watched_aggregates: &Rc<AggregateWatchers>,
+        log_segment_file: &Rc<LogSegmentFile>,
+    ) {
+        let sync_positions_snapshot = shard_mem_cache.borrow_mut().take_sync_positions_snapshot();
+        let new_metadata = log_segment_file.metadata.borrow().clone();
+        commit_sync(
+            node_status,
+            shard_mem_cache.clone(),
+            watched_aggregates.clone(),
+            sync_positions_snapshot,
+            log_segment_file.clone(),
+            new_metadata,
+        );
+    }
+
+    fn non_leader_statuses() -> [NodeStatus; 2] {
+        [NodeStatus::Follower { leader_lease_index: 1 }, NodeStatus::Standalone]
+    }
+
+    #[test]
+    fn non_leader_event_batch_via_pending_queue_populates_read_snapshot() {
+        glommio_test!({
+            for node_status in non_leader_statuses() {
+                let (_tmp, dir) = test_dir();
+                let lsc = Rc::new(
+                    LogSegmentsCache::ready_up(dir, 4 * 1024 * 1024, 4, 0).await.unwrap()
+                );
+                let smc = Rc::new(RefCell::new(
+                    MemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 1024 * 1024, 4 * 1024 * 1024, 64 * 1024 * 1024)
+                ));
+                let watched = Rc::new(AggregateWatchers::new());
+                let log_segment = lsc.active();
+
+                let k = AggregateKey::new(1, 1, 1);
+
+                smc.borrow_mut().add_to_pending_queue(vec![
+                    queue_item(event_batch_metablock(k.clone(), 1, 5)),
+                    queue_item(event_batch_metablock(k.clone(), 2, 10)),
+                ]);
+
+                non_leader_commit_sync(node_status, &smc, &watched, &log_segment);
+
+                let (loaded, status) = smc.borrow_mut().aggregate_load_status(&k, CachePath::Read);
+                assert!(loaded, "{:?} read snapshot should be populated after commit_sync", node_status);
+                assert_eq!(status, celeriant_memcache::mem_snapshot_aggregate::AggregateStatus::Found);
+
+                let pos = smc.borrow_mut().get_aggregate_last_metablock_pos(&k, CachePath::Read);
+                assert_eq!(pos.event_batch_index, 2, "should have latest event_batch_index");
+                assert_eq!(pos.event_index, 10, "should have latest event_index");
+
+                let (loaded, status) = smc.borrow_mut().aggregate_load_status(&k, CachePath::Write);
+                assert!(loaded, "{:?} write snapshot should be populated after commit_sync", node_status);
+                assert_eq!(status, celeriant_memcache::mem_snapshot_aggregate::AggregateStatus::Found);
+
+                lsc.close().await;
+            }
+        });
+    }
+
+    #[test]
+    fn non_leader_soft_delete_via_pending_queue_marks_deleted_with_position() {
+        glommio_test!({
+            for node_status in non_leader_statuses() {
+                let (_tmp, dir) = test_dir();
+                let lsc = Rc::new(
+                    LogSegmentsCache::ready_up(dir, 4 * 1024 * 1024, 4, 0).await.unwrap()
+                );
+                let smc = Rc::new(RefCell::new(
+                    MemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 1024 * 1024, 4 * 1024 * 1024, 64 * 1024 * 1024)
+                ));
+                let watched = Rc::new(AggregateWatchers::new());
+                let log_segment = lsc.active();
+
+                let k = AggregateKey::new(1, 1, 1);
+
+                smc.borrow_mut().add_to_pending_queue(vec![
+                    queue_item(event_batch_metablock(k.clone(), 1, 5)),
+                ]);
+                non_leader_commit_sync(node_status, &smc, &watched, &log_segment);
+
+                let mut delete_item = queue_item(soft_delete_metablock(k.clone(), 1, 5));
+                delete_item.metablock_absolute_pos = 4096;
+                smc.borrow_mut().add_to_pending_queue(vec![delete_item]);
+                non_leader_commit_sync(node_status, &smc, &watched, &log_segment);
+
+                for path in [CachePath::Read, CachePath::Write] {
+                    let (loaded, status) = smc.borrow_mut().aggregate_load_status(&k, path);
+                    assert!(loaded, "{:?} should be loaded on {:?}", node_status, path);
+                    assert_eq!(
+                        status,
+                        celeriant_memcache::mem_snapshot_aggregate::AggregateStatus::Deleted,
+                        "{:?} should be Deleted on {:?}", node_status, path
+                    );
+                }
+
+                let snap = smc.borrow_mut().get_aggregate_snapshot(&k, CachePath::Read).unwrap();
+                assert_ne!(snap.metablock_absolute_pos, 0,
+                    "{:?} deleted aggregate should have real disk position", node_status);
+
+                lsc.close().await;
+            }
+        });
+    }
+
+    #[test]
+    fn non_leader_soft_trim_via_pending_queue_updates_min_batch_index() {
+        glommio_test!({
+            for node_status in non_leader_statuses() {
+                let (_tmp, dir) = test_dir();
+                let lsc = Rc::new(
+                    LogSegmentsCache::ready_up(dir, 4 * 1024 * 1024, 4, 0).await.unwrap()
+                );
+                let smc = Rc::new(RefCell::new(
+                    MemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 1024 * 1024, 4 * 1024 * 1024, 64 * 1024 * 1024)
+                ));
+                let watched = Rc::new(AggregateWatchers::new());
+                let log_segment = lsc.active();
+
+                let k = AggregateKey::new(1, 1, 1);
+
+                smc.borrow_mut().add_to_pending_queue(vec![
+                    queue_item(event_batch_metablock(k.clone(), 1, 5)),
+                    queue_item(event_batch_metablock(k.clone(), 2, 10)),
+                    queue_item(event_batch_metablock(k.clone(), 3, 15)),
+                ]);
+                non_leader_commit_sync(node_status, &smc, &watched, &log_segment);
+
+                smc.borrow_mut().add_to_pending_queue(vec![
+                    queue_item(soft_trim_metablock(k.clone(), 2)),
+                ]);
+                non_leader_commit_sync(node_status, &smc, &watched, &log_segment);
+
+                for path in [CachePath::Read, CachePath::Write] {
+                    let pos = smc.borrow_mut().get_aggregate_last_metablock_pos(&k, path);
+                    assert_eq!(pos.min_event_batch_index, 2,
+                        "{:?} min_event_batch_index should be 2 on {:?}", node_status, path);
+                }
+
+                lsc.close().await;
+            }
+        });
+    }
+
+    fn leader_commit_sync(
+        shard_mem_cache: &Rc<RefCell<MemCache>>,
+        watched_aggregates: &Rc<AggregateWatchers>,
+        log_segment_file: &Rc<LogSegmentFile>,
+    ) {
+        let sync_positions_snapshot = shard_mem_cache.borrow_mut().take_sync_positions_snapshot();
+        let new_metadata = log_segment_file.metadata.borrow().clone();
+        commit_sync(
+            NodeStatus::Leader { lease_index: 1 },
+            shard_mem_cache.clone(),
+            watched_aggregates.clone(),
+            sync_positions_snapshot,
+            log_segment_file.clone(),
+            new_metadata,
+        );
+    }
+
+    #[test]
+    fn leader_event_batch_does_not_advance_read_snapshot() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let lsc = Rc::new(
+                LogSegmentsCache::ready_up(dir, 4 * 1024 * 1024, 4, 0).await.unwrap()
+            );
+            let smc = Rc::new(RefCell::new(
+                MemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 1024 * 1024, 4 * 1024 * 1024, 64 * 1024 * 1024)
+            ));
+            let watched = Rc::new(AggregateWatchers::new());
+            let log_segment = lsc.active();
+
+            let k = AggregateKey::new(1, 1, 1);
+
+            // Leader writes via the normal write path (not add_to_pending_queue)
+            smc.borrow_mut().add_to_pending_queue(vec![
+                queue_item(event_batch_metablock(k.clone(), 1, 5)),
+            ]);
+            leader_commit_sync(&smc, &watched, &log_segment);
+
+            // Read snapshot must NOT be populated — leader defers to replication
+            let (loaded, _) = smc.borrow_mut().aggregate_load_status(&k, CachePath::Read);
+            assert!(!loaded, "leader must not advance read snapshot before replication");
+
+            // Data should be in pending replication queue instead
+            let pending = smc.borrow_mut().take_pending_replication();
+            assert_eq!(pending.len(), 1, "leader should have queued data for replication");
+            assert!(!pending[0].pending_queue.is_empty());
+
+            lsc.close().await;
+        });
+    }
 }

@@ -289,7 +289,7 @@ fn commit_replication(
         for item in commit_data.pending_queue {
             match &item.metablock.wal_metablock_type {
                 MetablockKind::EventBatchMetadata(event_batch) => {
-                    shard_mem_cache.commit_read_position_snapshot(&event_batch, log_id, item.metablock_absolute_pos);
+                    shard_mem_cache.commit_position_snapshot(&event_batch, log_id, item.metablock_absolute_pos, CachePath::Read);
 
                     event_collector.add_write_event(event_batch);
 

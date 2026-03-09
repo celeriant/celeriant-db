@@ -45,7 +45,7 @@ TESTS=(
   invariant_replication_convergence_main
   invariant_s3_fallback_dedup_main
   invariant_replication_queue_pressure_main
-  # --- Follower-kick ---
+    # --- Follower-kick ---
   s3_follower_kick_main
   # --- Mode transition ---
   standalone_to_distributed_main
@@ -99,6 +99,9 @@ TESTS=(
   compaction_standalone_main
   compaction_restart_main
   compaction_replicated_main
+  # -- Read/Write Visibility ---
+  follower_read_snapshot_main
+  leader_read_visibility_main
 )
 
 # Pre-build everything so compilation isn't counted in per-test timeout
