@@ -120,13 +120,25 @@ impl Hash for AggregateKey {
     }
 }
 
+/// Formats a u128 as a UUID string (8-4-4-4-12 hex).
+fn format_uuid(val: u128) -> String {
+    let b = val.to_be_bytes();
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
+    )
+}
+
+impl fmt::Display for AggregateKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}/{}", format_uuid(self.org_id), format_uuid(self.aggregate_type_id), format_uuid(self.aggregate_id))
+    }
+}
+
 impl fmt::Debug for AggregateKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AggregateKey")
-            .field("org_id", &self.org_id)
-            .field("aggregate_type_id", &self.aggregate_type_id)
-            .field("aggregate_id", &self.aggregate_id)
-            .finish()
+        write!(f, "AggregateKey({})", self)
     }
 }
 

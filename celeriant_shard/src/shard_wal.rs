@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use glommio::sync::Semaphore;
-use tracing::warn;
+use tracing::debug;
 
 use celeriant_disk::files::rwlock_timeout::write_with_timeout;
 use celeriant_distributed::node_status::NodeStatus;
@@ -927,7 +927,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             NodeStatus::Leader { lease_index } => lease_index,
             NodeStatus::Standalone => 0,
             other => {
-                warn!(effective = ?other, raw = ?status.raw(), expires_at_ms = status.expires_at_ms(), now_ms = celeriant_distributed::heartbeat::now_ms(), "Write rejected: not Leader/Standalone");
+                debug!(effective = ?other, raw = ?status.raw(), expires_at_ms = status.expires_at_ms(), now_ms = celeriant_distributed::heartbeat::now_ms(), "Write rejected: not Leader/Standalone");
                 return Err(ShardWriteError::ShardCannotAcceptWrites { leader_address: self.leader_client_address.borrow().clone() });
             }
         };
@@ -1030,6 +1030,13 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
         // 1. Ensure aggregate exists and is cached
         if !self.aggregate_exists_and_cache(aggregate_key, CachePath::Read).await? {
+            let visible_wal_index = self.log_segments_cache.get_latest_read_cursor().wal_index;
+            debug!(
+                shard_id = self.config.shard_id,
+                aggregate_key = %aggregate_key,
+                visible_wal_index,
+                "Read: aggregate not found after disk scan"
+            );
             return Err(ShardReadError::AggregateNotExists);
         }
 

@@ -342,8 +342,10 @@ async fn run_s3_catchup<R: ReplicationClient + 'static, D: S3Downloader + 'stati
     rx: &LocalReceiver<CatchupCompletionMsg>,
 ) -> bool {
     let shard_count = ctx.config.num_shards as usize;
+    let mut attempt = 0u32;
 
     loop {
+        attempt += 1;
         for peer in 1..shard_count {
             let _ = ctx.intrashard_sender.send_to(peer, IntrashardMessages::EnterS3Catchup).await;
         }
@@ -370,7 +372,16 @@ async fn run_s3_catchup<R: ReplicationClient + 'static, D: S3Downloader + 'stati
 
         for msg in &results {
             match &msg.result {
-                Ok(_) => {}
+                Ok(r) => {
+                    debug!(
+                        shard_id = msg.shard_id,
+                        batches_applied = r.batches_applied,
+                        bytes_downloaded = r.bytes_downloaded,
+                        rounds = r.rounds,
+                        fully_caught_up = r.fully_caught_up,
+                        "S3 catchup complete for shard"
+                    );
+                }
                 Err(e) if e.is_retriable() => {
                     warn!(shard_id = msg.shard_id, error = ?e, "S3 catchup retriable error, will retry");
                     has_retriable = true;
@@ -392,6 +403,7 @@ async fn run_s3_catchup<R: ReplicationClient + 'static, D: S3Downloader + 'stati
             return true;
         }
 
+        warn!(attempt, "S3 catchup has retriable errors, retrying in 5s");
         glommio::timer::sleep(Duration::from_secs(5)).await;
     }
 }
@@ -776,6 +788,16 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
             }
         }
         IntrashardMessages::StatusUpdate { status } => {
+            let previous = ctx.shard_wal.node_status.get();
+            if !previous.raw().same_role(&status.raw()) {
+                warn!(
+                    shard_id = ctx.current_shard_id,
+                    previous = ?previous.raw(),
+                    new = ?status.raw(),
+                    expires_at_ms = status.expires_at_ms(),
+                    "Node status transition"
+                );
+            }
             ctx.shard_wal.node_status.set(status);
         }
         IntrashardMessages::UpdateFollower { replication_address } => {

@@ -1,6 +1,8 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use tracing::error;
+
 use celeriant_distributed::node_status::NodeStatus;
 use celeriant_memcache::cache_path::CachePath;
 use celeriant_memcache::pending_cache_item::PendingCacheItem;
@@ -100,6 +102,7 @@ pub(crate) async fn commit_fsync_with_rollback(
             Ok(())
         }
         Err(e) => {
+            error!(shard_id, error = ?e, "Fsync failed, rolling back batch");
             rollback_sync(shard_mem_cache);
             Err(e)
         }

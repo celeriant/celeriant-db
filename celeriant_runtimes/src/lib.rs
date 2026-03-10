@@ -138,8 +138,8 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                         wal
                     }
                     Err(e) => {
-                        error!(shard_id = current_shard_id, error = ?e, "Failed to open WAL");
-                        panic!("Failed to initialize filesystem at {:?}: {:?}", shard_config.data_root, e);
+                        error!(shard_id = current_shard_id, error = %e, "Failed to open WAL");
+                        panic!("Failed to initialize filesystem at {}: {}", shard_config.data_root.display(), e);
                     }
                 };
 

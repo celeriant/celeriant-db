@@ -1,3 +1,5 @@
+use std::fmt;
+
 use celeriant_wire::disk::disk_format_error::DiskFormatError;
 
 use crate::errors::write_dual_header_error::WriteDualHeaderError;
@@ -43,4 +45,35 @@ pub enum OpenOrCreateError {
         path: String,
         step: String,
     },
+}
+
+impl fmt::Display for OpenOrCreateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnableToCreateLogSegmentFile { log_id, path, preallocate_bytes, source } => {
+                write!(f, "Unable to create log segment file: log_id={log_id}, path={path}, preallocate_bytes={preallocate_bytes}, source={source}")
+            }
+            Self::UnableToOpenExistingFile { log_id, path, source } => {
+                write!(f, "Unable to open existing log file: log_id={log_id}, path={path}, source={source}")
+            }
+            Self::UnableToDuplicateWriterFD { log_id, path, source } => {
+                write!(f, "Unable to duplicate writer FD: log_id={log_id}, path={path}, source={source}")
+            }
+            Self::LogSegmentFileReadError { log_id, source, step } => {
+                write!(f, "Log segment read error: log_id={log_id}, step={step}, source={source}")
+            }
+            Self::LogSegmentFileCorrupted { log_id, source } => {
+                write!(f, "Log segment corrupted: log_id={log_id}, source={source:?}")
+            }
+            Self::LogSegmentFileHeaderWriteFailure { log_id, source } => {
+                write!(f, "Log segment header write failure: log_id={log_id}, source={source:?}")
+            }
+            Self::FSyncErrorOnNewFile { log_id, source } => {
+                write!(f, "Fsync error on new file: log_id={log_id}, source={source}")
+            }
+            Self::DirectoryFSyncErrorOnNewFile { log_id, source, path, step } => {
+                write!(f, "Directory fsync error on new file: log_id={log_id}, path={path}, step={step}, source={source}")
+            }
+        }
+    }
 }

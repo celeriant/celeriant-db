@@ -12,6 +12,10 @@ pub enum NodeStatus {
 }
 
 impl NodeStatus {
+    pub fn same_role(&self, other: &NodeStatus) -> bool {
+        std::mem::discriminant(self) == std::mem::discriminant(other)
+    }
+
     pub fn is_leader(&self) -> bool {
         matches!(self, NodeStatus::Leader { .. })
     }

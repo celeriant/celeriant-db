@@ -2,6 +2,8 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
 
+use tracing::error;
+
 use celeriant_msg::request::requests::ReplicationBatchItem;
 use celeriant_rotating_log::log_segment_file::aggregate_key_bloom::AggregateKeyBloom;
 use celeriant_rotating_log::log_segment_file::log_segment_file::{read_datablocks_carry_over_bytes, write_dual_shard_log_header};
@@ -152,11 +154,15 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
                         &log_segments_cache,
                         &shard_mem_cache,
                         replication_captured_data.replication_snapshot,
+                        shard_id,
                     )
                     .await
                     {
                         Ok(()) => Err(ReplicationError::ReplicateToS3Error(replication_err)),
-                        Err(rollback_err) => Err(ReplicationError::RollbackFailed(rollback_err)),
+                        Err(rollback_err) => {
+                            error!(shard_id, error = ?rollback_err, "Replication rollback itself failed — node is in inconsistent state");
+                            Err(ReplicationError::RollbackFailed(rollback_err))
+                        }
                     };
                 }
             }
@@ -216,11 +222,15 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
                                                     &log_segments_cache,
                                                     &shard_mem_cache,
                                                     replication_captured_data.replication_snapshot,
+                                                    shard_id,
                                                 )
                                                 .await
                                                 {
                                                     Ok(()) => Err(ReplicationError::ExtendedCatchupFailure(e)),
-                                                    Err(rollback_err) => Err(ReplicationError::RollbackFailed(rollback_err)),
+                                                    Err(rollback_err) => {
+                                                        error!(shard_id, error = ?rollback_err, "Replication rollback itself failed — node is in inconsistent state");
+                                                        Err(ReplicationError::RollbackFailed(rollback_err))
+                                                    }
                                                 };
                                             }
                                         }
@@ -345,7 +355,10 @@ async fn rollback_replicate(
     log_segments_cache: &Rc<LogSegmentsCache>,
     shard_mem_cache: &Rc<RefCell<MemCache>>,
     replication_snapshot: Vec<PendingCommitData>,
+    shard_id: u32,
 ) -> Result<(), ReplicationRollbackFailure> {
+    let batches_to_rollback = replication_snapshot.len();
+    error!(shard_id, batches_to_rollback, "Replication failed to both follower and S3, rolling back");
     metrics::counter!("celeriant_replication_rollbacks_total").increment(1);
     // In replication rollback, we modify the write positions in the file header
     // So we must drain and block any more writes to disk until rollback completes
