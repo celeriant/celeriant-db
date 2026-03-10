@@ -9,3 +9,14 @@ pub enum FollowerReplicationWriteError {
     BlockBecameInline,
     BatchWalIndexGap { index: usize, expected: u64, actual: u64 },
 }
+
+impl FollowerReplicationWriteError {
+    pub fn error_code(&self) -> &'static str {
+        match self {
+            Self::ShardFSyncError(_) => "fsync_error",
+            Self::FailedToSerialiseDatablocks(_) => "serialise_datablocks_failed",
+            Self::BlockBecameInline => "block_became_inline",
+            Self::BatchWalIndexGap { .. } => "batch_wal_index_gap",
+        }
+    }
+}

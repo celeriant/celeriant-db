@@ -142,6 +142,21 @@ impl CeleriantClient {
             .set_nodelay(true)
             .map_err(ClientError::SetNoDelayError)?;
 
+        // Enable TCP keepalive so idle connections (e.g. replication between
+        // write bursts) are not silently dropped by the remote end.
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = stream.as_raw_fd();
+            let enabled: libc::c_int = 1;
+            let idle_secs: libc::c_int = 10;
+            let interval_secs: libc::c_int = 3;
+            unsafe {
+                libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, &enabled as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+                libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, &idle_secs as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+                libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, &interval_secs as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+            }
+        }
+
         let stream = match tls_config {
             None => stream,
             Some(cfg) => ktls_connect(stream, cfg.client_config, cfg.server_name)

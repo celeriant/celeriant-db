@@ -58,6 +58,27 @@ pub enum ShardWriteError {
     },
 }
 
+impl ShardWriteError {
+    pub fn error_code(&self) -> &'static str {
+        match self {
+            Self::EmptyEventsList => "empty_events_list",
+            Self::ZeroEventType { .. } => "zero_event_type",
+            Self::ClientIdempotencyViolation { .. } => "client_idempotency_violation",
+            Self::OptimisticConcurrencyViolation { .. } => "optimistic_concurrency_violation",
+            Self::FailedToSerialiseDatablocks(_) => "serialise_datablocks_failed",
+            Self::AggregateNotExists => "aggregate_not_exists",
+            Self::AggregateRecreateNotAllowed => "aggregate_recreate_not_allowed",
+            Self::ReplicationError(_) => "replication_error",
+            Self::ShardFsyncError(_) => "fsync_error",
+            Self::CacheAggregateClientError(_) => "cache_load_error",
+            Self::AggregateExistsAndCacheError(_) => "cache_load_error",
+            Self::ShardCannotAcceptWrites { .. } => "shard_cannot_accept_writes",
+            Self::SchemaValidationFailed { .. } => "schema_validation_failed",
+            Self::SchemaCompilationFailed { .. } => "schema_compilation_failed",
+        }
+    }
+}
+
 impl From<ShardFsyncError> for ShardWriteError {
     fn from(e: ShardFsyncError) -> Self {
         Self::ShardFsyncError(e)

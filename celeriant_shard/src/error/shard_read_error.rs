@@ -15,6 +15,18 @@ pub enum ShardReadError {
     FetchMetablocksError(ScanError<DiskFormatError>),
 }
 
+impl ShardReadError {
+    pub fn error_code(&self) -> &'static str {
+        match self {
+            Self::UnavailableBatchIndex { .. } => "unavailable_batch_index",
+            Self::AggregateNotExists => "aggregate_not_exists",
+            Self::ShardCacheLoadError(_) => "cache_load_error",
+            Self::FetchDatablocksError(_) => "fetch_datablocks_error",
+            Self::FetchMetablocksError(_) => "fetch_metablocks_error",
+        }
+    }
+}
+
 impl From<ScanError<DiskFormatError>> for ShardReadError {
     fn from(e: ScanError<DiskFormatError>) -> Self {
         Self::FetchMetablocksError(e)

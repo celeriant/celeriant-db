@@ -32,6 +32,23 @@ use crate::sharded::{
 
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Enable TCP keepalive on a socket to detect dead peers at the OS level.
+/// Uses a 10-second idle time and 3-second probe interval — if a peer is
+/// unreachable, the kernel will close the connection after ~30 seconds
+/// (10s idle + 3 × 3s probes with default retry count).
+fn set_tcp_keepalive(stream: &glommio::net::TcpStream) {
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let enabled: libc::c_int = 1;
+    let idle_secs: libc::c_int = 10;
+    let interval_secs: libc::c_int = 3;
+    unsafe {
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, &enabled as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+        libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, &idle_secs as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+        libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, &interval_secs as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+    }
+}
+
 pub struct Shard<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static> {
     intrashard_receivers: Receivers<IntrashardMessages>,
     client_tcp_listener: Rc<TcpListener>,
@@ -168,6 +185,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
                         if let Err(e) = tcp_stream.set_nodelay(true) {
                             warn!("set_nodelay failed on replication connection: {e}");
                         }
+                        set_tcp_keepalive(&tcp_stream);
                         match maybe_ktls_accept(tcp_stream, &tls_snapshot).await {
                             Ok(tcp_stream) => handle_new_connection(tcp_stream, repl_ctx.clone(), PortType::Replication),
                             Err(e) => warn!("TLS handshake failed on replication port: {:?}", e),

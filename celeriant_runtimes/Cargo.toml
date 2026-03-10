@@ -28,6 +28,7 @@ celeriant_watch = { path = "../celeriant_watch" }
 celeriant_distributed = { path = "../celeriant_distributed" }
 celeriant_ktls = { path = "../celeriant_ktls" }
 glommio.workspace = true
+libc.workspace = true
 tracing.workspace = true
 flume.workspace = true
 bytes.workspace = true

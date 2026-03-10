@@ -814,13 +814,26 @@ async fn read_cluster_request<R: ReplicationClient + 'static, D: S3Downloader + 
     tcp_stream: &mut TcpStream,
     ctx: &ConnectionContext<R, D, S>,
 ) -> Option<(ClusterRequest, u32)> {
-    read_with_timeout(ctx.config.slow_client_timeout, ctx.current_shard_id, "cluster request", async {
+    // No application-level timeout for cluster (replication) connections.
+    // Liveness is handled by the heartbeat TTL mechanism and TCP keepalive
+    // detects dead peers at the OS level. An idle replication connection is
+    // normal between write bursts and should not be closed.
+    let result: Result<(ClusterRequest, u32), ReadWireDataError> = async {
         let header = WireHeader::from_reader(tcp_stream, ctx.config.max_request_size).await
             .map_err(ReadWireDataError::ReadHeaderFailure)?;
         let version = header.version;
         let req = ClusterRequest::read_from_header(header, tcp_stream).await?;
         Ok((req, version))
-    }).await
+    }.await;
+    match result {
+        Ok(r) => Some(r),
+        Err(ReadWireDataError::ReadHeaderFailure(WireError::NetworkError(ref e)))
+            if e.kind() == std::io::ErrorKind::UnexpectedEof => None,
+        Err(e) => {
+            warn!(shard = ctx.current_shard_id, "Failed to read cluster request: {e:?}");
+            None
+        }
+    }
 }
 
 macro_rules! write_response_with_timeout_fn {

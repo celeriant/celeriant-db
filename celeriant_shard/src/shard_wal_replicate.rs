@@ -56,8 +56,9 @@ pub(crate) struct ReplicationCapturedData {
 pub(crate) fn capture_replication_snapshot(shard_mem_cache: &Rc<RefCell<MemCache>>) -> CaptureResult<ReplicationCapturedData, ReplicationError> {
     let mut cache = shard_mem_cache.borrow_mut();
 
-    metrics::gauge!("celeriant_replication_pending_bytes").set(cache.pending_replication_bytes() as f64);
+    metrics::gauge!("celeriant_replication_queue_bytes").set(cache.pending_replication_bytes() as f64);
     let follower_falling_behind = cache.is_replication_queue_pressured();
+    metrics::gauge!("celeriant_replication_follower_pressured").set(if follower_falling_behind { 1.0 } else { 0.0 });
     let replication_snapshot = cache.take_pending_replication();
 
     if cache.take_replication_rollback_flag() {

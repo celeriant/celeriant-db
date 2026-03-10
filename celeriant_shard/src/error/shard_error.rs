@@ -14,3 +14,21 @@ pub enum ShardError {
     AggregateDetails(ShardAggregateDetailsError),
     RegisterSchema(ShardSchemaError),
 }
+
+impl ShardError {
+    pub fn error_code(&self) -> &'static str {
+        match self {
+            Self::Read(e) => e.error_code(),
+            Self::Write(e) => e.error_code(),
+            Self::TrimStart(e) => e.error_code(),
+            Self::Delete(e) => e.error_code(),
+            Self::ListAggregateTypes(e) => e.error_code(),
+            Self::ListAggregates(e) => e.error_code(),
+            Self::ReplicationBatch(e) => e.error_code(),
+            Self::WatchRequestInvalid => "watch_request_invalid",
+            Self::ListOrgs(e) => e.error_code(),
+            Self::AggregateDetails(e) => e.error_code(),
+            Self::RegisterSchema(e) => e.error_code(),
+        }
+    }
+}

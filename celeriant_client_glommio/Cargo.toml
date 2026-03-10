@@ -15,6 +15,7 @@ celeriant_wire = { path = "../celeriant_wire" }
 celeriant_wal = { path = "../celeriant_wal" }
 celeriant_ktls = { path = "../celeriant_ktls" }
 glommio.workspace = true
+libc.workspace = true
 futures-lite.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true

@@ -1,0 +1,206 @@
+# Celeriant 2-Node Cluster — LOCAL DEVELOPMENT ONLY
+#
+# This compose file is designed for localhost testing. Clients connect from
+# the host machine; NotLeader redirects point to localhost:{host_port}.
+# Inter-node replication uses Docker-internal DNS. Do not deploy this to
+# a remote server without changing the advertised client addresses.
+#
+# Usage:
+#   docker compose up -d --build    # build (release) and start everything
+#   docker compose up -d --build celeriant-node-1 celeriant-node-2
+#                                   # rebuild + redeploy server only (keep observability running)
+#   docker compose down             # stop everything (data preserved)
+#   docker compose down -v          # stop everything AND wipe all data (fresh cluster)
+#   docker compose logs -f celeriant-node-1 celeriant-node-2   # tail server logs
+#
+# Log level:
+#   CELERIANT_LOG_LEVEL=debug docker compose up -d --build
+#   Or edit the CELERIANT_LOG_LEVEL value below (trace, debug, info, warn, error)
+#
+# ┌──────────────────────────────────────────────────────────────────┐
+# │  LOCALHOST ENDPOINTS                                             │
+# ├──────────────────────────────────────────────────────────────────┤
+# │  Celeriant Node 1 (client)   http://localhost:10000              │
+# │  Celeriant Node 1 (metrics)  http://localhost:19090/metrics      │
+# │  Celeriant Node 2 (client)   http://localhost:10002              │
+# │  Celeriant Node 2 (metrics)  http://localhost:29090/metrics      │
+# │  MinIO Console               http://localhost:9001               │
+# │  MinIO S3 API                http://localhost:9000               │
+# │  Grafana                     http://localhost:3000               │
+# │    └─ Cluster Dashboard      http://localhost:3000/d/celeriant-cluster  │
+# │    └─ Explore Logs           http://localhost:3000/explore       │
+# │  Prometheus                  http://localhost:9090               │
+# │    └─ Targets                http://localhost:9090/targets       │
+# │  Loki                        http://localhost:3100               │
+# ├──────────────────────────────────────────────────────────────────┤
+# │  Grafana login: admin / admin (skip password change)             │
+# │  MinIO login:   minioadmin / minioadmin                          │
+# └──────────────────────────────────────────────────────────────────┘
+#
+# Celeriant nodes use all available CPU cores by default (num_shards = CPU count).
+# To override: add CELERIANT_NUM_SHARDS=N to the node's environment block.
+
+x-celeriant-common: &celeriant-common
+  build:
+    context: ../..
+    dockerfile: Dockerfile
+  security_opt:
+    - seccomp=unconfined
+  ulimits:
+    memlock:
+      soft: -1
+      hard: -1
+  depends_on:
+    minio-setup:
+      condition: service_completed_successfully
+  environment: &celeriant-env
+    CELERIANT_DATA_ROOT: /var/lib/celeriant
+    CELERIANT_LISTEN_ADDRESS: "0.0.0.0"
+    CELERIANT_CLIENT_PORT: "10000"
+    CELERIANT_REPLICATION_PORT: "10001"
+    CELERIANT_LOG_LEVEL: info
+    CELERIANT_METRICS_ENABLED: "true"
+    CELERIANT_METRICS_PORT: "9090"
+    # S3 / MinIO — leader election and replication fallback
+    CELERIANT_S3_ENABLED: "true"
+    CELERIANT_S3_REGION: us-east-1
+    CELERIANT_S3_BUCKET: celeriant-cluster
+    CELERIANT_S3_ACCESS_KEY_ID: minioadmin
+    CELERIANT_S3_SECRET_ACCESS_KEY: minioadmin
+    CELERIANT_S3_ENDPOINT_OVERRIDE: http://minio:9000
+    CELERIANT_S3_ALLOW_HTTP: "true"
+    CELERIANT_S3_SKIP_SIGNATURE: "true"
+    # ── Security (disabled for local dev — uncomment to enable) ────────
+    # CELERIANT_TLS_MODE: strict
+    # CELERIANT_TLS_CA_CERT: /certs/ca.pem
+    # CELERIANT_TLS_NODE_CERT: /certs/node.pem
+    # CELERIANT_TLS_NODE_KEY: /certs/node-key.pem
+    # CELERIANT_TLS_CLIENT_AUTH: none          # or "optional" / "require"
+    # CELERIANT_REQUIRE_CLIENT_IDENTITY: "true"
+    # ── Resource limits (tuned for local dev — 20% memory per node, 4 cores only) ────
+    CELERIANT_SHARD_LOG_PREALLOCATE_BYTES: "134217728"   # 128 MB log segments
+    CELERIANT_MEMORY_CONSUMPTION_PERCENT: "20"
+    CELERIANT_NUM_SHARDS: "4"
+
+services:
+  # ── MinIO (S3-compatible object storage) ─────────────────────────────
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  minio-setup:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin;
+      mc mb local/celeriant-cluster --ignore-existing;
+      mc anonymous set public local/celeriant-cluster;
+      "
+
+  # ── Celeriant Node 1 ────────────────────────────────────────────────
+  celeriant-node-1:
+    <<: *celeriant-common
+    hostname: celeriant-node-1
+    ports:
+      - "10000:10000"   # client
+      - "19090:9090"    # metrics
+    environment:
+      <<: *celeriant-env
+      # Client address: localhost with host-mapped port (for NotLeader redirects to host clients)
+      # Replication address: docker-internal DNS (for inter-node traffic)
+      CELERIANT_ADVERTISED_CLIENT_ADDRESS: localhost:10000
+      CELERIANT_ADVERTISED_REPLICATION_ADDRESS: celeriant-node-1:10001
+    volumes:
+      - node1-data:/var/lib/celeriant
+      # Uncomment for TLS:
+      # - ./certs:/certs:ro
+
+  # ── Celeriant Node 2 ────────────────────────────────────────────────
+  celeriant-node-2:
+    <<: *celeriant-common
+    hostname: celeriant-node-2
+    ports:
+      - "10002:10000"   # client (mapped to different host port)
+      - "29090:9090"    # metrics
+    environment:
+      <<: *celeriant-env
+      # Client address: localhost with host-mapped port (for NotLeader redirects to host clients)
+      # Replication address: docker-internal DNS (for inter-node traffic)
+      CELERIANT_ADVERTISED_CLIENT_ADDRESS: localhost:10002
+      CELERIANT_ADVERTISED_REPLICATION_ADDRESS: celeriant-node-2:10001
+    volumes:
+      - node2-data:/var/lib/celeriant
+      # Uncomment for TLS:
+      # - ./certs:/certs:ro
+
+  # ── Prometheus ───────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-lifecycle
+
+  # ── Loki (log aggregation) ──────────────────────────────────────────
+  loki:
+    image: grafana/loki:3.0.0
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+    volumes:
+      - loki-data:/loki
+
+  # ── Promtail (ships container logs to Loki) ─────────────────────────
+  promtail:
+    image: grafana/promtail:3.0.0
+    volumes:
+      - ./promtail/promtail.yml:/etc/promtail/config.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: -config.file=/etc/promtail/config.yml
+    depends_on:
+      - loki
+
+  # ── Grafana ─────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana-oss:latest
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/celeriant-cluster.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - loki
+
+volumes:
+  node1-data:
+  node2-data:
+  prometheus-data:
+  loki-data:
+  grafana-data:

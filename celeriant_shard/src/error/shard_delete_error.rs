@@ -14,6 +14,20 @@ pub enum ShardDeleteError {
     ShardCannotAcceptWrites { leader_address: Option<String> },
 }
 
+impl ShardDeleteError {
+    pub fn error_code(&self) -> &'static str {
+        match self {
+            Self::AggregateNotExists => "aggregate_not_exists",
+            Self::EmptyDeleteList => "empty_delete_list",
+            Self::OptimisticConcurrencyViolation { .. } => "optimistic_concurrency_violation",
+            Self::AggregateExistsAndCacheError(_) => "cache_load_error",
+            Self::ReplicationError(_) => "replication_error",
+            Self::ShardFsyncError(_) => "fsync_error",
+            Self::ShardCannotAcceptWrites { .. } => "shard_cannot_accept_writes",
+        }
+    }
+}
+
 impl From<ShardFsyncError> for ShardDeleteError {
     fn from(e: ShardFsyncError) -> Self {
         Self::ShardFsyncError(e)

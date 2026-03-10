@@ -184,13 +184,17 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                     metrics::histogram!(name, &shard_label).record(duration);
                 }
             }
-            Err(_) => {
+            Err(e) => {
                 let error_counter = match op_name {
                     "write" => "celeriant_write_errors_total",
                     "read" => "celeriant_read_errors_total",
                     _ => "celeriant_write_errors_total",
                 };
-                metrics::counter!(error_counter, &shard_label).increment(1);
+                let error_label = [
+                    ("shard_id", shard_label[0].1.clone()),
+                    ("error_code", e.error_code().to_owned()),
+                ];
+                metrics::counter!(error_counter, &error_label).increment(1);
             }
         }
 
@@ -224,6 +228,8 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         .await?;
 
         let list_semaphore = Rc::new(Semaphore::new(config.list_max_concurrent));
+
+        metrics::gauge!("celeriant_replication_queue_high_water_bytes").set(config.pending_replication_high_water_bytes as f64);
 
         Ok(Self {
             s3_downloader: Rc::new(s3_downloader),

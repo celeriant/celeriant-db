@@ -6,6 +6,8 @@ use super::sidecar_config::SidecarConfig;
 
 pub fn install_recorder() -> PrometheusHandle {
     let handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .set_buckets(&[0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0])
+        .expect("invalid bucket configuration")
         .install_recorder()
         .expect("Failed to install Prometheus metrics recorder");
     register_metric_descriptions();
@@ -69,7 +71,9 @@ fn register_metric_descriptions() {
     // Durability and replication
     describe_histogram!("celeriant_fsync_batch_size", "Writers per fsync batch");
     describe_histogram!("celeriant_replication_batch_size", "Writers per replication batch");
-    describe_gauge!("celeriant_replication_pending_bytes", "Pending replication queue bytes");
+    describe_gauge!("celeriant_replication_queue_bytes", "Replication queue bytes awaiting send");
+    describe_gauge!("celeriant_replication_queue_high_water_bytes", "Replication queue threshold for S3 fallback");
+    describe_gauge!("celeriant_replication_follower_pressured", "1 when follower is falling behind (S3 fallback imminent)");
     describe_counter!("celeriant_replication_s3_fallbacks_total", "Replication S3 fallbacks");
     describe_counter!("celeriant_replication_rollbacks_total", "Replication rollbacks");
     describe_counter!("celeriant_s3_catchup_rounds_total", "S3 catchup rounds executed");

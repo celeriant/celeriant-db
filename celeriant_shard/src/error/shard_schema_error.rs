@@ -32,6 +32,21 @@ pub enum ShardSchemaError {
     ReplicationError(ReplicationError),
 }
 
+impl ShardSchemaError {
+    pub fn error_code(&self) -> &'static str {
+        match self {
+            Self::SchemaAlreadyExists { .. } => "schema_already_exists",
+            Self::InvalidSchema { .. } => "invalid_schema",
+            Self::UnsupportedSchemaType { .. } => "unsupported_schema_type",
+            Self::ShardCannotAcceptWrites { .. } => "shard_cannot_accept_writes",
+            Self::SchemaCoordinationFailed { .. } => "schema_coordination_failed",
+            Self::CacheLoadError(_) => "cache_load_error",
+            Self::FsyncError(_) => "fsync_error",
+            Self::ReplicationError(_) => "replication_error",
+        }
+    }
+}
+
 impl From<ShardCacheLoadError> for ShardSchemaError {
     fn from(e: ShardCacheLoadError) -> Self {
         Self::CacheLoadError(e)

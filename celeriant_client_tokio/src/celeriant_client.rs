@@ -136,6 +136,7 @@ pub struct ClientIdentityConfig {
 pub struct CeleriantClient {
     stream: ClientStream,
     max_request_size: u64,
+    max_response_size: u64,
     timeout: Option<Duration>,
 }
 
@@ -163,14 +164,21 @@ impl CeleriantClient {
 
         Ok(Self {
             stream,
-            max_request_size: 10_000_000, // 10MB default
+            max_request_size: 10_000_000,      // 10 MB default
+            max_response_size: 64 * 1024 * 1024, // 64 MB — matches server default
             timeout: connection_timeout,
         })
     }
 
-    /// Set maximum request size in bytes (default: 10MB)
+    /// Set maximum request size in bytes (default: 10 MB)
     pub fn with_max_request_size(mut self, max_request_size: u64) -> Self {
         self.max_request_size = max_request_size;
+        self
+    }
+
+    /// Set maximum response size in bytes (default: 64 MB)
+    pub fn with_max_response_size(mut self, max_response_size: u64) -> Self {
+        self.max_response_size = max_response_size;
         self
     }
 
@@ -216,7 +224,7 @@ impl CeleriantClient {
         )
         .await?;
 
-        let response = ClientResponse::read_response(&mut self.stream, self.max_request_size).await?;
+        let response = ClientResponse::read_response(&mut self.stream, self.max_response_size).await?;
 
         match response {
             ClientResponse::ProtocolError(_) => Err(ClientError::ProtocolError),
@@ -272,7 +280,7 @@ impl CeleriantClient {
         let identify_inner = async {
             write_identify_request(&mut self.stream, &req, PROTOCOL_VERSION_V2).await?;
 
-            let header = WireHeader::from_reader(&mut self.stream, self.max_request_size).await?;
+            let header = WireHeader::from_reader(&mut self.stream, self.max_response_size).await?;
             if header.message_type == IDENTIFY_RESPONSE_TYPE_ID {
                 let resp = read_identify_response(header, &mut self.stream).await?;
                 return Ok(resp.client_id);
