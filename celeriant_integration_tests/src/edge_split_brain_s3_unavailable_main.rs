@@ -119,7 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(follower_count, 3, "Follower should have 3 events");
     println!("  Cluster healthy: follower has {} events", follower_count);
 
-    let initial_lease_bytes = minio.get_object("cluster/lease.bin").await?;
+    let initial_lease_bytes = minio.get_object("cluster/lease.json").await?;
     let initial_lease = deserialise_lease(&initial_lease_bytes)
         .map_err(|e| format!("Failed to deserialise initial lease: {:?}", e))?;
     let initial_lease_index = initial_lease.lease_index;
@@ -268,7 +268,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Both nodes accept writes after S3 returned — split-brain not resolved!"
     );
 
-    let final_lease_bytes = minio.get_object("cluster/lease.bin").await?;
+    let final_lease_bytes = minio.get_object("cluster/lease.json").await?;
     let final_lease = deserialise_lease(&final_lease_bytes)
         .map_err(|e| format!("Failed to deserialise final lease: {:?}", e))?;
     assert!(

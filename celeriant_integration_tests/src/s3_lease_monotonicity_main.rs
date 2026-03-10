@@ -100,7 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(follower_b_count, 3, "Follower B should have 3 events");
     println!("  ✓ Cluster healthy: follower B has {} events", follower_b_count);
 
-    let lease_1_bytes = minio.get_object("cluster/lease.bin").await?;
+    let lease_1_bytes = minio.get_object("cluster/lease.json").await?;
     let lease_1 = deserialise_lease(&lease_1_bytes)
         .map_err(|e| format!("Failed to deserialise lease: {:?}", e))?;
 
@@ -131,7 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nPHASE 3: Verify follower B is now leader (lease_index=2)");
     println!("--------------------------------------------------------");
 
-    let lease_2_bytes = minio.get_object("cluster/lease.bin").await?;
+    let lease_2_bytes = minio.get_object("cluster/lease.json").await?;
     let lease_2 = deserialise_lease(&lease_2_bytes)
         .map_err(|e| format!("Failed to deserialise lease: {:?}", e))?;
 
@@ -199,7 +199,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nPHASE 6: Verify A is now leader again (lease_index=3)");
     println!("-----------------------------------------------------");
 
-    let lease_3_bytes = minio.get_object("cluster/lease.bin").await?;
+    let lease_3_bytes = minio.get_object("cluster/lease.json").await?;
     let lease_3 = deserialise_lease(&lease_3_bytes)
         .map_err(|e| format!("Failed to deserialise lease: {:?}", e))?;
 

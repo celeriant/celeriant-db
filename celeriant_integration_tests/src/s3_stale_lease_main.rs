@@ -113,7 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Leader should have self-healed via S3 race
-    let self_heal_lease_bytes = minio.get_object("cluster/lease.bin").await?;
+    let self_heal_lease_bytes = minio.get_object("cluster/lease.json").await?;
     let self_heal_lease = deserialise_lease(&self_heal_lease_bytes)
         .map_err(|e| format!("Failed to deserialise lease: {:?}", e))?;
 
@@ -163,7 +163,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nPHASE 4: Verify follower did NOT takeover");
     println!("-----------------------------------------");
 
-    let post_restart_lease_bytes = minio.get_object("cluster/lease.bin").await?;
+    let post_restart_lease_bytes = minio.get_object("cluster/lease.json").await?;
     let post_restart_lease = deserialise_lease(&post_restart_lease_bytes)
         .map_err(|e| format!("Failed to deserialise post-restart lease: {:?}", e))?;
 

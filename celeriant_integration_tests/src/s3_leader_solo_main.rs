@@ -96,7 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nPHASE 4: Verify lease extended during discovery loop");
     println!("----------------------------------------------------");
 
-    let lease_bytes = minio.get_object("cluster/lease.bin").await?;
+    let lease_bytes = minio.get_object("cluster/lease.json").await?;
     let lease = deserialise_lease(&lease_bytes)
         .map_err(|e| format!("Failed to deserialise lease: {:?}", e))?;
 

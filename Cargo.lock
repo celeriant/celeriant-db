@@ -854,6 +854,8 @@ dependencies = [
  "deepsize",
  "serde",
  "serde_bytes",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]
@@ -885,6 +887,7 @@ dependencies = [
  "futures-lite",
  "rmp-serde",
  "serde",
+ "serde_json",
  "snap",
  "zstd",
 ]

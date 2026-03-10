@@ -1,5 +1,5 @@
 use crate::codec::bincode::{fixed_serialise_stack, fixed_serialise_heap};
-use celeriant_wal::{constants::{FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_METABLOCK, WIRE_VERSION_WAL_SHARD_LOG_HEADER, WIRE_VERSION_S3_FALLBACK_BATCH, WIRE_VERSION_S3_LEASE, WIRE_VERSION_S3_MEMBERSHIP}, metablocks::metablock::Metablock, s3::{fallback_batch::FallbackBatch, lease::Lease, membership::Membership}, shard_log_header::ShardLogHeader};
+use celeriant_wal::{constants::{FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_METABLOCK, WIRE_VERSION_WAL_SHARD_LOG_HEADER, WIRE_VERSION_S3_FALLBACK_BATCH}, metablocks::metablock::Metablock, s3::{fallback_batch::FallbackBatch, lease::Lease, membership::Membership}, shard_log_header::ShardLogHeader};
 use crate::{codec, disk::{disk_format_error::DiskFormatError}};
 
 const VERSION_SIZE: usize = 4;
@@ -87,20 +87,20 @@ pub fn deserialise_fallback_batch(
     }
 }
 
+pub fn serialize_lease_json(lease: &Lease) -> Result<Vec<u8>, DiskFormatError> {
+    serde_json::to_vec_pretty(lease).map_err(|e| DiskFormatError::JsonSerialize(e.to_string()))
+}
+
 pub fn deserialise_lease(data: &[u8]) -> Result<Lease, DiskFormatError> {
-    let version = validate_header(data)?;
-    match version {
-        WIRE_VERSION_S3_LEASE => Ok(codec::bincode::fixed_deserialise(&data[HEADER_SIZE..])?),
-        _ => Err(DiskFormatError::UnsupportedVersion(version)),
-    }
+    serde_json::from_slice(data).map_err(|e| DiskFormatError::JsonDeserialize(e.to_string()))
+}
+
+pub fn serialize_membership_json(membership: &Membership) -> Result<Vec<u8>, DiskFormatError> {
+    serde_json::to_vec_pretty(membership).map_err(|e| DiskFormatError::JsonSerialize(e.to_string()))
 }
 
 pub fn deserialise_membership(data: &[u8]) -> Result<Membership, DiskFormatError> {
-    let version = validate_header(data)?;
-    match version {
-        WIRE_VERSION_S3_MEMBERSHIP => Ok(codec::bincode::fixed_deserialise(&data[HEADER_SIZE..])?),
-        _ => Err(DiskFormatError::UnsupportedVersion(version)),
-    }
+    serde_json::from_slice(data).map_err(|e| DiskFormatError::JsonDeserialize(e.to_string()))
 }
 
 pub fn deserialise_metablock(
@@ -412,7 +412,7 @@ mod tests {
     }
 
     #[test]
-    fn lease_roundtrip_through_versioned_format() {
+    fn lease_json_roundtrip() {
         let lease = Lease {
             leader_node_id: 42,
             lease_index: 5,
@@ -420,83 +420,49 @@ mod tests {
             expires_at_ms: 6000,
         };
 
-        let serialized = serialize_versioned_message_heap(&lease, WIRE_VERSION_S3_LEASE).unwrap();
+        let serialized = serialize_lease_json(&lease).unwrap();
         let deserialized = deserialise_lease(&serialized).unwrap();
-
-        assert_eq!(deserialized.leader_node_id, lease.leader_node_id);
-        assert_eq!(deserialized.lease_index, lease.lease_index);
-        assert_eq!(deserialized.acquired_at_ms, lease.acquired_at_ms);
-        assert_eq!(deserialized.expires_at_ms, lease.expires_at_ms);
+        assert_eq!(deserialized, lease);
     }
 
     #[test]
-    fn membership_roundtrip_through_versioned_format() {
-        let leader_info = celeriant_wal::s3::membership::NodeInfo {
-            node_id: 1,
-            client_address: "10.0.0.1:10000".into(),
-            replication_address: "10.0.0.1:10001".into(),
+    fn lease_json_contains_uuid_string() {
+        let lease = Lease {
+            leader_node_id: 0x550e8400_e29b_41d4_a716_446655440000u128,
+            lease_index: 5,
+            acquired_at_ms: 1710000000000,
+            expires_at_ms: 1710000005000,
         };
-        let follower_info = celeriant_wal::s3::membership::NodeInfo {
-            node_id: 2,
-            client_address: "10.0.0.2:10000".into(),
-            replication_address: "10.0.0.2:10001".into(),
-        };
+
+        let serialized = serialize_lease_json(&lease).unwrap();
+        let json_str = std::str::from_utf8(&serialized).unwrap();
+        assert!(json_str.contains("550e8400-e29b-41d4-a716-446655440000"));
+    }
+
+    #[test]
+    fn membership_json_roundtrip() {
         let membership = Membership {
-            nodes: [Some(leader_info.clone()), Some(follower_info.clone())],
+            nodes: [
+                Some(celeriant_wal::s3::membership::NodeInfo {
+                    node_id: 1,
+                    client_address: "10.0.0.1:10000".into(),
+                    replication_address: "10.0.0.1:10001".into(),
+                }),
+                Some(celeriant_wal::s3::membership::NodeInfo {
+                    node_id: 2,
+                    client_address: "10.0.0.2:10000".into(),
+                    replication_address: "10.0.0.2:10001".into(),
+                }),
+            ],
         };
 
-        let serialized = serialize_versioned_message_heap(&membership, WIRE_VERSION_S3_MEMBERSHIP).unwrap();
+        let serialized = serialize_membership_json(&membership).unwrap();
         let deserialized = deserialise_membership(&serialized).unwrap();
-
-        assert_eq!(deserialized.nodes[0].as_ref().unwrap().node_id, 1);
-        assert_eq!(deserialized.nodes[1].as_ref().unwrap().node_id, 2);
-        assert_eq!(deserialized.nodes[0].as_ref().unwrap().client_address, "10.0.0.1:10000");
-        assert_eq!(deserialized.nodes[1].as_ref().unwrap().replication_address, "10.0.0.2:10001");
+        assert_eq!(deserialized, membership);
     }
 
     #[test]
-    fn lease_crc_corruption_detected() {
-        let lease = Lease {
-            leader_node_id: 99,
-            lease_index: 1,
-            acquired_at_ms: 2000,
-            expires_at_ms: 7000,
-        };
-
-        let mut serialized = serialize_versioned_message_heap(&lease, WIRE_VERSION_S3_LEASE).unwrap();
-
-        // Corrupt a byte in the payload
-        serialized[HEADER_SIZE + 10] ^= 0xFF;
-
-        let result = deserialise_lease(&serialized);
-        assert!(matches!(result, Err(DiskFormatError::ChecksumMismatch { .. })));
-    }
-
-    #[test]
-    fn lease_version_mismatch_rejected() {
-        let lease = Lease {
-            leader_node_id: 123,
-            lease_index: 7,
-            acquired_at_ms: 3000,
-            expires_at_ms: 8000,
-        };
-
-        let mut serialized = serialize_versioned_message_heap(&lease, WIRE_VERSION_S3_LEASE).unwrap();
-
-        // Overwrite version with unsupported value
-        let bad_version: u32 = 9999;
-        serialized[CRC_SIZE..HEADER_SIZE].copy_from_slice(&bad_version.to_le_bytes());
-
-        // Recalculate CRC so checksum passes but version fails
-        let new_crc = crc32c::crc32c(&serialized[CRC_SIZE..]);
-        serialized[..CRC_SIZE].copy_from_slice(&new_crc.to_le_bytes());
-
-        let result = deserialise_lease(&serialized);
-        assert!(matches!(result, Err(DiskFormatError::UnsupportedVersion(9999))));
-    }
-
-    #[test]
-    fn membership_crc_corruption_detected() {
+    fn membership_json_with_null_slot() {
         let membership = Membership {
             nodes: [
                 Some(celeriant_wal::s3::membership::NodeInfo {
@@ -508,39 +474,23 @@ mod tests {
             ],
         };
 
-        let mut serialized = serialize_versioned_message_heap(&membership, WIRE_VERSION_S3_MEMBERSHIP).unwrap();
+        let serialized = serialize_membership_json(&membership).unwrap();
+        let json_str = std::str::from_utf8(&serialized).unwrap();
+        assert!(json_str.contains("null"));
 
-        // Corrupt a byte in the payload
-        serialized[HEADER_SIZE + 5] ^= 0x42;
-
-        let result = deserialise_membership(&serialized);
-        assert!(matches!(result, Err(DiskFormatError::ChecksumMismatch { .. })));
+        let deserialized = deserialise_membership(&serialized).unwrap();
+        assert_eq!(deserialized, membership);
     }
 
     #[test]
-    fn membership_version_mismatch_rejected() {
-        let membership = Membership {
-            nodes: [
-                None,
-                Some(celeriant_wal::s3::membership::NodeInfo {
-                    node_id: 22,
-                    client_address: "node2:10000".into(),
-                    replication_address: "node2:10001".into(),
-                }),
-            ],
-        };
+    fn lease_json_invalid_data_returns_error() {
+        let result = deserialise_lease(b"not valid json");
+        assert!(matches!(result, Err(DiskFormatError::JsonDeserialize(_))));
+    }
 
-        let mut serialized = serialize_versioned_message_heap(&membership, WIRE_VERSION_S3_MEMBERSHIP).unwrap();
-
-        // Overwrite version with unsupported value
-        let bad_version: u32 = 7777;
-        serialized[CRC_SIZE..HEADER_SIZE].copy_from_slice(&bad_version.to_le_bytes());
-
-        // Recalculate CRC
-        let new_crc = crc32c::crc32c(&serialized[CRC_SIZE..]);
-        serialized[..CRC_SIZE].copy_from_slice(&new_crc.to_le_bytes());
-
-        let result = deserialise_membership(&serialized);
-        assert!(matches!(result, Err(DiskFormatError::UnsupportedVersion(7777))));
+    #[test]
+    fn membership_json_invalid_data_returns_error() {
+        let result = deserialise_membership(b"not valid json");
+        assert!(matches!(result, Err(DiskFormatError::JsonDeserialize(_))));
     }
 }

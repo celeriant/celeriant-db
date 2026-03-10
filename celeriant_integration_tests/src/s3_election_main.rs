@@ -8,7 +8,7 @@
 //! 3. Verify exactly one leader (split-brain prevention via S3 CreateOnly)
 //! 4. Write events via leader to multiple shards, verify follower has them
 //! 5. Verify follower rejects writes
-//! 6. Verify lease.bin and membership.bin in S3
+//! 6. Verify lease.json and membership.json in S3
 //! 7. Verify NO S3 fallback data (follower is active, TCP replication only)
 //!
 //! Run with: cargo run --bin s3_election_main
@@ -128,7 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nPHASE 5: Verify S3 control plane state");
     println!("---------------------------------------");
 
-    let lease_bytes = minio.get_object("cluster/lease.bin").await?;
+    let lease_bytes = minio.get_object("cluster/lease.json").await?;
     let lease = deserialise_lease(&lease_bytes)
         .map_err(|e| format!("Failed to deserialise lease: {:?}", e))?;
 
@@ -136,7 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(lease.lease_index >= 1, "Election should produce lease_index >= 1 (got {})", lease.lease_index);
     assert_ne!(lease.leader_node_id, 0, "leader_node_id must be set");
 
-    let membership_bytes = minio.get_object("cluster/membership.bin").await?;
+    let membership_bytes = minio.get_object("cluster/membership.json").await?;
     let membership = deserialise_membership(&membership_bytes)
         .map_err(|e| format!("Failed to deserialise membership: {:?}", e))?;
 

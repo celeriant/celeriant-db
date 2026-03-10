@@ -1,7 +1,6 @@
 use bytes::Bytes;
 use celeriant_distributed::lease_store::{LeaseStore, LeaseStoreError, LeaseWithEtag, MembershipWithEtag};
 use celeriant_distributed::paths::{LEASE_PATH, MEMBERSHIP_PATH};
-use celeriant_wal::constants::{WIRE_VERSION_S3_LEASE, WIRE_VERSION_S3_MEMBERSHIP};
 use celeriant_wal::s3::lease::Lease;
 use celeriant_wal::s3::membership::Membership;
 use crate::sidecar::sidecar_channels::SidecarSenders;
@@ -58,9 +57,9 @@ impl LeaseStore for SidecarLeaseStorage {
     }
 
     async fn put_lease_create_only(&self, lease: &Lease) -> Result<String, LeaseStoreError> {
-        let data = celeriant_wire::disk::versioned_block::serialize_versioned_message_heap(lease, WIRE_VERSION_S3_LEASE)
+        let data = celeriant_wire::disk::versioned_block::serialize_lease_json(lease)
             .map_err(|e| LeaseStoreError::Unavailable {
-                message: format!("Failed to serialize lease: {}", e),
+                message: format!("Failed to serialize lease: {:?}", e),
             })?;
 
         let request = celeriant_sidecar::request::Request::ObjectPut {
@@ -100,9 +99,9 @@ impl LeaseStore for SidecarLeaseStorage {
         lease: &Lease,
         etag: &str,
     ) -> Result<String, LeaseStoreError> {
-        let data = celeriant_wire::disk::versioned_block::serialize_versioned_message_heap(lease, WIRE_VERSION_S3_LEASE)
+        let data = celeriant_wire::disk::versioned_block::serialize_lease_json(lease)
             .map_err(|e| LeaseStoreError::Unavailable {
-                message: format!("Failed to serialize lease: {}", e),
+                message: format!("Failed to serialize lease: {:?}", e),
             })?;
 
         let request = celeriant_sidecar::request::Request::ObjectPut {
@@ -180,9 +179,9 @@ impl LeaseStore for SidecarLeaseStorage {
         membership: &Membership,
         etag: Option<&str>,
     ) -> Result<(), LeaseStoreError> {
-        let data = celeriant_wire::disk::versioned_block::serialize_versioned_message_heap(membership, WIRE_VERSION_S3_MEMBERSHIP)
+        let data = celeriant_wire::disk::versioned_block::serialize_membership_json(membership)
             .map_err(|e| LeaseStoreError::Unavailable {
-                message: format!("Failed to serialize membership: {}", e),
+                message: format!("Failed to serialize membership: {:?}", e),
             })?;
 
         let condition = match etag {

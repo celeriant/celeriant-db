@@ -1233,7 +1233,7 @@ mod tests {
             parse_fallback_path("cluster/fallback/shard_015/batch_123456789_123456799.bin"),
             Some((15, 123456789, 123456799))
         );
-        assert_eq!(parse_fallback_path("cluster/lease.bin"), None);
+        assert_eq!(parse_fallback_path("cluster/lease.json"), None);
         assert_eq!(parse_fallback_path("invalid"), None);
         assert_eq!(parse_fallback_path("cluster/fallback/shard_002/batch_000000005.bin"), None);
     }

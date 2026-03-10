@@ -100,7 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nPHASE 2: Capture initial lease state");
     println!("-------------------------------------");
 
-    let initial_lease_bytes = minio.get_object("cluster/lease.bin").await?;
+    let initial_lease_bytes = minio.get_object("cluster/lease.json").await?;
     let initial_lease = deserialise_lease(&initial_lease_bytes)
         .map_err(|e| format!("Failed to deserialise lease: {:?}", e))?;
     let initial_lease_index = initial_lease.lease_index;
@@ -147,7 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Waiting for S3 race to complete...");
     tokio::time::sleep(Duration::from_secs(5)).await;
 
-    let post_race_lease_bytes = minio.get_object("cluster/lease.bin").await?;
+    let post_race_lease_bytes = minio.get_object("cluster/lease.json").await?;
     let post_race_lease = deserialise_lease(&post_race_lease_bytes)
         .map_err(|e| format!("Failed to deserialise lease: {:?}", e))?;
     let post_race_lease_index = post_race_lease.lease_index;

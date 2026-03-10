@@ -43,7 +43,7 @@ Versioned Block (WAL/S3 persistence)
 | `WireHeader` | Network frame header: version, message type, lengths, compression |
 | `SerialisedDatablock` | Result of datablock serialization (inline or external block) |
 | `WireError` | Network-level errors |
-| `DiskFormatError` | Disk format errors (CRC, version, codec) |
+| `DiskFormatError` | Disk format errors (CRC, version, codec, JSON) |
 | `CodecError` | Unified serialization/compression error |
 
 ## Key Functions
@@ -57,11 +57,13 @@ Versioned Block (WAL/S3 persistence)
 | `WireHeader::read_fixed_size` | Read and deserialize fixed-size payload into stack buffer |
 | `serialize_versioned_message` | Serialize into fixed buffer with CRC+version header |
 | `serialize_versioned_message_heap` | Serialize to heap-allocated Vec with CRC+version header |
+| `serialize_lease_json` | Serialize lease to pretty-printed JSON |
+| `serialize_membership_json` | Serialize membership to pretty-printed JSON |
 | `deserialise_metablock` | Deserialize a WAL metablock from a fixed-size buffer |
 | `deserialise_shard_log_header` | Deserialize a shard log header |
 | `deserialise_fallback_batch` | Deserialize an S3 fallback batch |
-| `deserialise_lease` | Deserialize an S3 lease |
-| `deserialise_membership` | Deserialize an S3 membership record |
+| `deserialise_lease` | Deserialize an S3 lease from JSON |
+| `deserialise_membership` | Deserialize an S3 membership record from JSON |
 | `SerialisedDatablock::new` | Auto-choose inline (<=512B) or block storage for a datablock |
 | `deserialise_datablock` | Deserialize a datablock from inline or external block storage |
 
@@ -104,6 +106,7 @@ pub enum DiskFormatError {
     ChecksumMismatch { expected: u32, actual: u32 },
     UnsupportedVersion(u32),
     HeaderSizeMismatch { expected: usize, actual: usize },
+    JsonDeserialize(String),
     Codec(CodecError),
 }
 ```
@@ -186,10 +189,10 @@ The versioned block format is used for S3 coordination objects in addition to WA
 | Type | Version Constant | Description |
 |------|-----------------|-------------|
 | `FallbackBatch` | `WIRE_VERSION_S3_FALLBACK_BATCH` | Batched writes for S3 fallback path |
-| `Lease` | `WIRE_VERSION_S3_LEASE` | Distributed lease for leader election |
-| `Membership` | `WIRE_VERSION_S3_MEMBERSHIP` | Cluster node membership |
+| `Lease` | — | Distributed lease for leader election (JSON) |
+| `Membership` | — | Cluster node membership (JSON) |
 
-All use the same `[CRC32C][Version][Payload]` framing with type-specific version constants.
+`Lease` and `Membership` are serialized as pretty-printed JSON (no CRC/version envelope). `FallbackBatch` uses the versioned block framing.
 
 ## Zero-Copy Metablock Scanning (disk/metablock_bytes.rs)
 

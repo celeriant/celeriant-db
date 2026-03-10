@@ -99,7 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(node_b_count, 5, "Node B should have 5 events");
     println!("  ✓ Cluster healthy: node B has {} events", node_b_count);
 
-    let lease_initial_bytes = minio.get_object("cluster/lease.bin").await?;
+    let lease_initial_bytes = minio.get_object("cluster/lease.json").await?;
     let lease_initial = deserialise_lease(&lease_initial_bytes)
         .map_err(|e| format!("Failed to deserialise initial lease: {:?}", e))?;
 
@@ -173,7 +173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("PHASE 5: Verify lease_index incremented in S3");
     println!("-----------------------------------------------");
 
-    let lease_final_bytes = minio.get_object("cluster/lease.bin").await?;
+    let lease_final_bytes = minio.get_object("cluster/lease.json").await?;
     let lease_final = deserialise_lease(&lease_final_bytes)
         .map_err(|e| format!("Failed to deserialise final lease: {:?}", e))?;
 

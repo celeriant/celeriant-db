@@ -103,7 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(follower_count, 3, "Follower should have 3 events");
     println!("  ✓ Cluster healthy: follower has {} events", follower_count);
 
-    let initial_lease_bytes = minio.get_object("cluster/lease.bin").await?;
+    let initial_lease_bytes = minio.get_object("cluster/lease.json").await?;
     let initial_lease = deserialise_lease(&initial_lease_bytes)
         .map_err(|e| format!("Failed to deserialise initial lease: {:?}", e))?;
     println!("  ✓ Initial lease: leader_node_id={:x}, lease_index={}\n",
@@ -185,7 +185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     write_event(&mut follower_client, &aggregate_key, 6, false).await?;
     println!("  ✓ Follower recovered and became leader (S3 retry works!)");
 
-    let final_lease_bytes = minio.get_object("cluster/lease.bin").await?;
+    let final_lease_bytes = minio.get_object("cluster/lease.json").await?;
     let final_lease = deserialise_lease(&final_lease_bytes)
         .map_err(|e| format!("Failed to deserialise final lease: {:?}", e))?;
 

@@ -120,7 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("PHASE 3: Block proxy (simulate network partition)");
     println!("--------------------------------------------------");
 
-    let initial_lease_bytes = minio.get_object("cluster/lease.bin").await?;
+    let initial_lease_bytes = minio.get_object("cluster/lease.json").await?;
     let initial_lease = deserialise_lease(&initial_lease_bytes)
         .map_err(|e| format!("Failed to deserialise lease: {:?}", e))?;
     let initial_lease_index = initial_lease.lease_index;
@@ -202,7 +202,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Waiting for S3 race and reconvergence...");
     tokio::time::sleep(Duration::from_secs(8)).await;
 
-    let post_race_lease_bytes = minio.get_object("cluster/lease.bin").await?;
+    let post_race_lease_bytes = minio.get_object("cluster/lease.json").await?;
     let post_race_lease = deserialise_lease(&post_race_lease_bytes)
         .map_err(|e| format!("Failed to deserialise lease: {:?}", e))?;
 

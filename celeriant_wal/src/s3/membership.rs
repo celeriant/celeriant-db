@@ -1,8 +1,10 @@
 use bincode::{Decode, Encode};
+use serde::{Serialize, Deserialize};
 
 /// Information about a single node in the cluster.
-#[derive(Debug, Clone, Encode, Decode, PartialEq, Eq)]
+#[derive(Debug, Clone, Encode, Decode, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NodeInfo {
+    #[serde(with = "super::serde_uuid")]
     pub node_id: u128,
     pub client_address: String,
     pub replication_address: String,
@@ -22,8 +24,8 @@ impl NodeInfo {
     }
 }
 
-/// Cluster membership state stored in S3 at `cluster/membership.bin`.
-#[derive(Debug, Clone, Encode, Decode, PartialEq, Eq)]
+/// Cluster membership state stored in S3 at `cluster/membership.json`.
+#[derive(Debug, Clone, Encode, Decode, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Membership {
     pub nodes: [Option<NodeInfo>; 2],
 }

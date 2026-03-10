@@ -4,10 +4,10 @@
 pub const CLUSTER_PREFIX: &str = "cluster";
 
 /// Path to the lease file.
-pub const LEASE_PATH: &str = "cluster/lease.bin";
+pub const LEASE_PATH: &str = "cluster/lease.json";
 
 /// Path to the membership file.
-pub const MEMBERSHIP_PATH: &str = "cluster/membership.bin";
+pub const MEMBERSHIP_PATH: &str = "cluster/membership.json";
 
 /// Prefix for S3 fallback replication data.
 pub const FALLBACK_PREFIX: &str = "cluster/fallback";

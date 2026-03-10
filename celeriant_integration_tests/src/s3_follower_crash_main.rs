@@ -80,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("PHASE 2: Record initial lease state");
     println!("-----------------------------------");
 
-    let initial_lease_bytes = minio.get_object("cluster/lease.bin").await?;
+    let initial_lease_bytes = minio.get_object("cluster/lease.json").await?;
     let initial_lease = deserialise_lease(&initial_lease_bytes)
         .map_err(|e| format!("Failed to deserialise initial lease: {:?}", e))?;
 
@@ -122,7 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     write_event(&mut leader_client, &aggregate_key, 5, false).await?;
     println!("  Leader accepted writes after self-heal");
 
-    let new_lease_bytes = minio.get_object("cluster/lease.bin").await?;
+    let new_lease_bytes = minio.get_object("cluster/lease.json").await?;
     let new_lease = deserialise_lease(&new_lease_bytes)
         .map_err(|e| format!("Failed to deserialise new lease: {:?}", e))?;
 

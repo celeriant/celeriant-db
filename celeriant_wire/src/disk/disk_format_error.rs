@@ -8,6 +8,8 @@ pub enum DiskFormatError {
     UnsupportedVersion(u32),
     Codec(CodecError),
     HeaderSizeMismatch { expected: usize, actual: usize },
+    JsonSerialize(String),
+    JsonDeserialize(String),
 }
 
 impl From<CodecError> for DiskFormatError {

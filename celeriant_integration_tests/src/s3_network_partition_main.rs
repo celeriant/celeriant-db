@@ -113,7 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("PHASE 2: Verify pre-partition state");
     println!("------------------------------------");
 
-    let initial_lease_bytes = minio.get_object("cluster/lease.bin").await?;
+    let initial_lease_bytes = minio.get_object("cluster/lease.json").await?;
     let initial_lease = deserialise_lease(&initial_lease_bytes)
         .map_err(|e| format!("Failed to deserialise lease: {:?}", e))?;
     let initial_lease_index = initial_lease.lease_index;
@@ -148,7 +148,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // After partition, both nodes should eventually fence and race to S3.
     // During the race, writes may be briefly accepted by the winner.
     // We verify the lease_index increased, proving the S3 race occurred.
-    let post_race_lease_bytes = minio.get_object("cluster/lease.bin").await?;
+    let post_race_lease_bytes = minio.get_object("cluster/lease.json").await?;
     let post_race_lease = deserialise_lease(&post_race_lease_bytes)
         .map_err(|e| format!("Failed to deserialise lease: {:?}", e))?;
 

@@ -7,8 +7,8 @@ Distributed replication coordination for leader/follower HA. Provides S3-based l
 ```
          ┌─────────────────────────────────────────────┐
          │              S3 Bucket                       │
-         │  cluster/lease.bin      (Lease, CAS-guarded) │
-         │  cluster/membership.bin (NodeInfo per node)  │
+         │  cluster/lease.json      (Lease, CAS-guarded) │
+         │  cluster/membership.json (NodeInfo per node)  │
          │  cluster/fallback/...   (S3 replication)     │
          └────────────┬────────────────────┬────────────┘
                       │                    │
@@ -129,8 +129,8 @@ pub trait LeaseStore {
 
 | Constant / Function | Path |
 |---------------------|------|
-| `LEASE_PATH` | `cluster/lease.bin` |
-| `MEMBERSHIP_PATH` | `cluster/membership.bin` |
+| `LEASE_PATH` | `cluster/lease.json` |
+| `MEMBERSHIP_PATH` | `cluster/membership.json` |
 | `FALLBACK_PREFIX` | `cluster/fallback` |
 | `fallback_batch_path(s, lo, hi)` | `cluster/fallback/shard_SSS/batch_LLLLLLLLL_HHHHHHHHH.bin` |
 | `fallback_shard_prefix(s)` | `cluster/fallback/shard_SSS/` |
@@ -141,7 +141,7 @@ Fallback batch filenames are zero-padded so lexicographic order equals temporal 
 
 ### S3 as consensus medium
 
-No Raft, no Paxos, no coordinator process. A single CAS-protected S3 object (`cluster/lease.bin`) provides mutual exclusion. The S3 API's conditional write (`IfMatchETag`) guarantees exactly one winner per CAS round.
+No Raft, no Paxos, no coordinator process. A single CAS-protected S3 object (`cluster/lease.json`) provides mutual exclusion. The S3 API's conditional write (`IfMatchETag`) guarantees exactly one winner per CAS round.
 
 Trade-off: S3 round-trip (~50–200ms) determines election latency. Acceptable for HA failover where second-scale recovery is fine.
 

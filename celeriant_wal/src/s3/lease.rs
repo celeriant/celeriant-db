@@ -1,8 +1,10 @@
 use bincode::{Decode, Encode};
+use serde::{Serialize, Deserialize};
 
-/// Lease state stored in S3 at `cluster/lease.bin`.
-#[derive(Debug, Clone, Encode, Decode, PartialEq, Eq)]
+/// Lease state stored in S3 at `cluster/lease.json`.
+#[derive(Debug, Clone, Encode, Decode, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Lease {
+    #[serde(with = "super::serde_uuid")]
     pub leader_node_id: u128,
     pub lease_index: u64,
     pub acquired_at_ms: u64,

@@ -13,4 +13,6 @@ small-metablock = []
 bincode.workspace = true
 serde.workspace = true
 serde_bytes.workspace = true
+serde_json.workspace = true
 deepsize.workspace = true
+uuid.workspace = true

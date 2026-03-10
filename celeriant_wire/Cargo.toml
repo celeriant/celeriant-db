@@ -13,6 +13,7 @@ small-metablock = ["celeriant_wal/small-metablock"]
 celeriant_wal = { path = "../celeriant_wal" }
 bincode.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 snap.workspace = true
 rmp-serde.workspace = true
 zstd.workspace = true

@@ -76,8 +76,8 @@ Stored in the `s3` module. Used for leader election and replication fallback.
 
 | Type | S3 Path | Purpose |
 |------|---------|---------|
-| `Lease` | `cluster/lease.bin` | Leader election state: leader_node_id, lease_index, acquired_at_ms, expires_at_ms |
-| `Membership` | `cluster/membership.bin` | Two-node cluster state: array of 2 `Option<NodeInfo>` |
+| `Lease` | `cluster/lease.json` | Leader election state: leader_node_id, lease_index, acquired_at_ms, expires_at_ms |
+| `Membership` | `cluster/membership.json` | Two-node cluster state: array of 2 `Option<NodeInfo>` |
 | `NodeInfo` | — | Single node: node_id, client_address, replication_address |
 | `FallbackBatch` | — | S3 replication fallback: fallback_index, end_wal_index, shard_id, items |
 | `FallbackItem` | — | One entry in a FallbackBatch: metablock + optional datablock |
