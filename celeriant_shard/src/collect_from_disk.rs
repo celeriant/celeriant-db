@@ -103,7 +103,10 @@ pub async fn fetch_datablocks_for_metablocks(
 
             read_objects_absolute(dma, file_len, &log_fetches.datablock_positions, read_max_chunk_size)
                 .await
-                .map_err(|e| FetchDatablockError::DatablockReadError(e.to_string()))?
+                .map_err(|e| {
+                    tracing::error!(log_id, error = %e, datablock_count = log_fetches.datablock_positions.len(), "DMA read failed fetching datablocks");
+                    FetchDatablockError::DatablockReadError(e.to_string())
+                })?
         };
 
         if blobs.len() != log_fetches.metablock_indexes.len() {

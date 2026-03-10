@@ -15,6 +15,7 @@ pub mod api_keys;
 pub mod memory_budget;
 mod dio_check;
 mod fs_check;
+mod ntp_check;
 mod server_meta;
 
 pub fn startup(args: Vec<String>) -> Result<(), std::io::Error> {
@@ -45,6 +46,12 @@ pub fn startup(args: Vec<String>) -> Result<(), std::io::Error> {
         std::process::exit(1);
     }
     info!("Direct I/O verification passed");
+
+    // Warn if system clock is not NTP-synchronized (cluster requires synced clocks)
+    match ntp_check::check_clock_synchronized() {
+        Ok(()) => info!("Clock synchronization verified (kernel NTP-disciplined)"),
+        Err(e) => tracing::warn!("{}", e),
+    }
 
     if let Some(ref temp_dir) = server_config.compaction_temp_dir {
         if let Err(e) = fs_check::verify_same_filesystem(&server_config.data_root, temp_dir) {
@@ -91,6 +98,8 @@ pub fn startup(args: Vec<String>) -> Result<(), std::io::Error> {
     if let Err(e) = server_meta::validate_or_create(&server_config.data_root, &current_meta) {
         error!("{}", e);
         std::process::exit(1);
+    } else {
+        info!("No breaking configuration changes detected");
     }
 
     // Detect available memory and compute budget

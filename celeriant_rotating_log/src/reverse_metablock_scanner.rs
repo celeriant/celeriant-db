@@ -130,7 +130,10 @@ impl<'a> ReverseMetablockScanner<'a> {
 
         match result {
             Ok(_) => Ok(found),
-            Err(ReadVisitError::Io(source)) => Err(ScanError::Io { log_id, source: source.to_string() }),
+            Err(ReadVisitError::Io(source)) => {
+                tracing::error!(log_id, error = %source, "DMA read failed during metablock scan");
+                Err(ScanError::Io { log_id, source: source.to_string() })
+            }
             Err(ReadVisitError::Visitor(scan_err)) => Err(scan_err),
         }
     }

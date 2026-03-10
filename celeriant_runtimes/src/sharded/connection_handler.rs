@@ -1019,6 +1019,13 @@ async fn handle_heartbeat<R: ReplicationClient + 'static, D: S3Downloader + 'sta
     let drift = follower_ms.abs_diff(req.leader_timestamp_ms);
     metrics::gauge!("celeriant_clock_drift_ms").set(drift as f64);
     if drift > ctx.config.max_cluster_time_drift_ms {
+        tracing::error!(
+            leader_ms = req.leader_timestamp_ms,
+            follower_ms,
+            drift_ms = drift,
+            max_allowed_ms = ctx.config.max_cluster_time_drift_ms,
+            "Clock drift too high, fencing all shards"
+        );
         let fenced = ValidatedNodeStatus::fenced();
         ctx.shard_wal.node_status.set(fenced);
         broadcast_status(ctx, fenced).await;

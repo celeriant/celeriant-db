@@ -18,6 +18,7 @@ futures-lite.workspace = true
 lru.workspace = true
 fastbloom.workspace = true
 metrics.workspace = true
+tracing.workspace = true
 bincode.workspace = true
 
 [dev-dependencies]

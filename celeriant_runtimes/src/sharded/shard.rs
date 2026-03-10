@@ -71,7 +71,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
         lease_manager: Option<LeaseManager<S>>,
         shard_failed: Arc<AtomicBool>,
     ) -> Self {
-        info!("Initializing shard {current_shard_id}");
+        debug!("Initializing shard {current_shard_id}");
 
         let shutdown_requested = Rc::new(Cell::new(false));
         let shard_wal = Rc::new(shard_wal);
@@ -99,7 +99,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
     }
 
     pub async fn run(&mut self) {
-        info!("Shard {} entering run loop", self.ctx.current_shard_id);
+        debug!("Shard {} entering run loop", self.ctx.current_shard_id);
         spawn_shard_zero_shutdown_handler(self.ctx.clone());
 
         let rx = if self.ctx.lease_manager.is_some() {
@@ -135,7 +135,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
     }
 
     async fn enter_main_loop_until_shutdown(&self) {
-        info!("Shard {} entering main loop (shutdown_requested={})", self.ctx.current_shard_id, self.shutdown_requested.get());
+        debug!("Shard {} entering main loop (shutdown_requested={})", self.ctx.current_shard_id, self.shutdown_requested.get());
 
         let tls_cell: Rc<RefCell<Option<Arc<TlsConfig>>>> =
             Rc::new(RefCell::new(self.ctx.config.tls_config.clone()));
@@ -373,7 +373,7 @@ async fn run_s3_catchup<R: ReplicationClient + 'static, D: S3Downloader + 'stati
         for msg in &results {
             match &msg.result {
                 Ok(r) => {
-                    debug!(
+                    info!(
                         shard_id = msg.shard_id,
                         batches_applied = r.batches_applied,
                         bytes_downloaded = r.bytes_downloaded,
@@ -471,7 +471,7 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
         info!("All shards caught up, running election");
 
         if let Err(e) = lease_manager.register_self().await {
-            error!(error = ?e, "Failed to register node in membership, shutting down");
+            error!(error = %e, "Failed to register node in membership, shutting down");
             ctx.shutdown_requested.set(true);
             broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::Shutdown, ctx.intrashard_sender.clone()).await;
             return;
@@ -480,7 +480,7 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
         let outcome = match lease_manager.run_election().await {
             Ok(outcome) => outcome,
             Err(e) => {
-                error!(error = ?e, "Election failed, shutting down");
+                error!(error = %e, "Election failed, shutting down");
                 ctx.shutdown_requested.set(true);
                 broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::Shutdown, ctx.intrashard_sender.clone()).await;
                 return;
@@ -642,9 +642,11 @@ async fn run_follower_watchdog<R: ReplicationClient + 'static, D: S3Downloader +
         // the TTL during our sleep, we wake at the old deadline, re-check,
         // and sleep the delta to the new deadline.
         // For TTL-exempt catchup states, poll every 500ms to detect kicks.
+        let expired_lease_index;
         loop {
             let status = ctx.shard_wal.node_status.get();
             if !status.is_any_follower_state() {
+                expired_lease_index = status.raw().lease_index_for_logging();
                 break;
             }
             // Kick received — return to role-flip loop for catchup orchestration
@@ -659,7 +661,7 @@ async fn run_follower_watchdog<R: ReplicationClient + 'static, D: S3Downloader +
         // TTL expired — leader presumed dead.
         // Self-fencing via TTL already rejects writes/replication.
         // Explicit broadcast updates raw() for observability.
-        info!("Leader heartbeat expired, racing to S3");
+        info!(expired_lease_index, "Leader heartbeat expired, racing to S3");
         let fenced = ValidatedNodeStatus::fenced();
         ctx.shard_wal.node_status.set(fenced);
         broadcast_message_to_other_shards(
@@ -672,12 +674,12 @@ async fn run_follower_watchdog<R: ReplicationClient + 'static, D: S3Downloader +
             Ok(outcome) if outcome.status.raw().is_leader() => {
                 metrics::counter!("celeriant_leader_elections_total").increment(1);
                 metrics::gauge!("celeriant_node_role").set(1.0);
-                info!("Won S3 CAS race, becoming leader");
+                info!(lease_index = outcome.status.raw().lease_index_for_logging(), "Won S3 CAS race, becoming leader");
                 update_leader_client_address(ctx, None).await;
                 return;
             }
             Ok(outcome) => {
-                info!("Lost S3 CAS race, resuming watchdog");
+                info!(lease_index = outcome.status.raw().lease_index_for_logging(), "Lost S3 CAS race, resuming watchdog");
                 update_leader_client_address(ctx, outcome.peer_info.as_ref().map(|p| p.client_address.clone())).await;
                 // Status already set to Follower with fresh TTL by
                 // renew_s3_lease_and_broadcast. Inner loop will sleep

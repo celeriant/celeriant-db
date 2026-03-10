@@ -669,6 +669,7 @@ dependencies = [
  "glommio",
  "num_cpus",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -764,6 +765,7 @@ dependencies = [
  "metrics",
  "num_cpus",
  "tempfile",
+ "tracing",
  "uuid",
 ]
 

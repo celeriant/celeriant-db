@@ -10,7 +10,7 @@ use glommio::{
     channels::channel_mesh::{Full, MeshBuilder},
     enclose, net::TcpListener,
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{sharded::{intrashard_messages::IntrashardMessages, shard::Shard}, sidecar::{sidecar_channels::{SidecarSenders, create_sidecar_channel}, sidecar_lease_storage::SidecarLeaseStorage, sidecar_runtime::SidecarRuntime, sidecar_s3_downloader::SidecarS3Downloader, sidecar_s3_uploader::SidecarS3Uploader}};
 
@@ -57,7 +57,7 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                     .expect("Failed to join mesh - cannot initialize shard");
 
                 let current_shard_id = sender.peer_id();
-                info!(shard_id = current_shard_id, "Shard executor started, binding listeners");
+                debug!(shard_id = current_shard_id, "Shard executor started, binding listeners");
 
                 let client_bind_address = format!("{}:{}", shard_config.listen_address, shard_config.client_port);
                 let client_tcp_listener = TcpListener::bind(&client_bind_address)
@@ -131,10 +131,10 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                     warn!(shard_id = current_shard_id, error = ?e, "Failed to clean up orphaned compaction temp files");
                 }
 
-                info!(shard_id = current_shard_id, "Opening WAL");
+                debug!(shard_id = current_shard_id, "Opening WAL");
                 let filesystem = match ShardWal::open(internal_shard_config, validated_node_status, replication_client, s3_downloader).await {
                     Ok(wal) => {
-                        info!(shard_id = current_shard_id, "WAL opened successfully");
+                        debug!(shard_id = current_shard_id, "WAL opened successfully");
                         wal
                     }
                     Err(e) => {

@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use tracing::error;
+use tracing::{debug, error};
 
 use celeriant_distributed::node_status::NodeStatus;
 use celeriant_memcache::cache_path::CachePath;
@@ -63,6 +63,13 @@ pub(crate) async fn commit_fsync_with_rollback(
     let start = std::time::Instant::now();
     let batch_size = captured.sync_positions_snapshot.pending_append_queue.len();
     let shard_label = [("shard_id", shard_id.to_string())];
+
+    debug!(
+        shard_id,
+        batch_count = batch_size,
+        required_disk_bytes = captured.required_disk_space,
+        "Fsync batch captured"
+    );
 
     let available_space = log_segments_cache.active_log_available_space();
     if available_space < captured.required_disk_space {

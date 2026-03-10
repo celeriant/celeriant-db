@@ -2,6 +2,7 @@ use std::time::Duration;
 use glommio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use glommio::timer::Timer;
 use futures_lite::future::or;
+use tracing::warn;
 
 const DEADLOCK_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -39,11 +40,14 @@ pub async fn read_with_timeout<'a, T>(
     match result {
         Some(Ok(guard)) => Ok(guard),
         Some(Err(e)) => Err(LockTimeoutError::LockError(e.to_string())),
-        None => Err(LockTimeoutError::PotentialDeadlock {
-            duration: DEADLOCK_TIMEOUT,
-            operation: "read",
-            location,
-        }),
+        None => {
+            warn!(location, duration_ms = DEADLOCK_TIMEOUT.as_millis() as u64, "RwLock read acquisition timed out — potential deadlock");
+            Err(LockTimeoutError::PotentialDeadlock {
+                duration: DEADLOCK_TIMEOUT,
+                operation: "read",
+                location,
+            })
+        }
     }
 }
 
@@ -63,10 +67,13 @@ pub async fn write_with_timeout<'a, T>(
     match result {
         Some(Ok(guard)) => Ok(guard),
         Some(Err(e)) => Err(LockTimeoutError::LockError(e.to_string())),
-        None => Err(LockTimeoutError::PotentialDeadlock {
-            duration: DEADLOCK_TIMEOUT,
-            operation: "write",
-            location,
-        }),
+        None => {
+            warn!(location, duration_ms = DEADLOCK_TIMEOUT.as_millis() as u64, "RwLock write acquisition timed out — potential deadlock");
+            Err(LockTimeoutError::PotentialDeadlock {
+                duration: DEADLOCK_TIMEOUT,
+                operation: "write",
+                location,
+            })
+        }
     }
 }

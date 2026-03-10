@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
 
-use tracing::error;
+use tracing::{debug, error};
 
 use celeriant_msg::request::requests::ReplicationBatchItem;
 use celeriant_rotating_log::log_segment_file::aggregate_key_bloom::AggregateKeyBloom;
@@ -149,6 +149,7 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
                     continue;
                 }
                 Err(replication_err) => {
+                    error!(shard_id, error = ?replication_err, "S3 fallback upload failed — triggering replication rollback");
                     return match rollback_replicate(
                         &fsync_coordinator,
                         &log_segments_cache,
@@ -263,6 +264,18 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
             }
         }
     }
+
+    let path = match &_replication_details {
+        ReplicationDetails::ReplicatedToFollower => "tcp",
+        ReplicationDetails::RepliatedToS3(_) => "s3",
+    };
+    debug!(
+        shard_id,
+        batch_count = initial_batch_count,
+        path,
+        duration_ms = start.elapsed().as_millis() as u64,
+        "Replication batch committed"
+    );
 
     commit_replication(
         &log_segments_cache,

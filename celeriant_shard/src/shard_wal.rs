@@ -1440,6 +1440,14 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             if let Some(last_client_event_index) = shard_mem_cache.get_client_event_index(aggregate_key, client_id) {
                 let attempted_client_event_index = write_request.events.iter().map(|e| e.client_event_index).min().unwrap_or(0);
                 if attempted_client_event_index <= last_client_event_index {
+                    debug!(
+                        shard_id = self.config.shard_id,
+                        aggregate_key = %aggregate_key,
+                        client_id = %celeriant_wal::format_uuid(client_id),
+                        last_client_event_index,
+                        attempted_client_event_index,
+                        "Write rejected: client idempotency violation"
+                    );
                     return Err(ShardWriteError::ClientIdempotencyViolation {
                         last_client_event_index,
                         attempted_client_event_index,
@@ -1458,6 +1466,13 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         // Validate optimistic concurrency (only for existing aggregates, not recreates)
         if let Some(expected) = write_request.expected_event_batch_index {
             if expected != aggregate_current_indexes.event_batch_index {
+                debug!(
+                    shard_id = self.config.shard_id,
+                    aggregate_key = %aggregate_key,
+                    expected_event_batch_index = expected,
+                    current_event_batch_index = aggregate_current_indexes.event_batch_index,
+                    "Write rejected: optimistic concurrency violation"
+                );
                 return Err(ShardWriteError::OptimisticConcurrencyViolation {
                     expected_event_batch_index: expected,
                     current_event_batch_index: aggregate_current_indexes.event_batch_index,
