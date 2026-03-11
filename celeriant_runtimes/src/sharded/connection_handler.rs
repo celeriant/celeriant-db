@@ -20,7 +20,7 @@ use celeriant_msg::read_wire_data_error::ReadWireDataError;
 use celeriant_wire::network::wire_error::WireError;
 use celeriant_wire::network::wire_header::WireHeader;
 use glommio::{channels::{channel_mesh::Senders, local_channel::LocalSender}, net::TcpStream};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::{
     intrashard_messages::IntrashardMessages,
@@ -115,10 +115,14 @@ enum ClusterRedirectResult {
 pub fn handle_new_connection<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(mut tcp_stream: TcpStream, ctx: ConnectionContext<R, D, S>, port_type: PortType) {
     let _ = tcp_stream.set_nodelay(true);
 
+    let peer_addr = tcp_stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+
     glommio::spawn_local(async move {
         if ctx.shutdown_requested.get() {
             return;
         }
+
+        debug!(shard_id = ctx.current_shard_id, peer = %peer_addr, ?port_type, "Connection accepted");
 
         let shard_label = [("shard_id", ctx.current_shard_id.to_string())];
         metrics::gauge!("celeriant_client_connections_active", &shard_label).increment(1.0);
@@ -382,6 +386,7 @@ fn handle_identify(req: &celeriant_msg::request::requests::IdentifyRequest, conn
         let client_id = match Crypto::validate_with_public_key(public_key, nonce, signature) {
             Ok(id) => id,
             Err(celeriant_crypto::CryptoError::InvalidNonce) => {
+                debug!("Identity rejected: nonce expired or clock skew");
                 return Err(ClientResponse::GenericError(ErrorResponse {
                     correlation_id: req.correlation_id,
                     error_code: IDENTIFY_INVALID_NONCE,
@@ -389,6 +394,7 @@ fn handle_identify(req: &celeriant_msg::request::requests::IdentifyRequest, conn
                 }));
             }
             Err(_) => {
+                debug!("Identity rejected: invalid signature");
                 return Err(ClientResponse::GenericError(ErrorResponse {
                     correlation_id: req.correlation_id,
                     error_code: IDENTIFY_INVALID_SIGNATURE,
@@ -432,6 +438,7 @@ fn handle_identify(req: &celeriant_msg::request::requests::IdentifyRequest, conn
         let key_hash = celeriant_crypto::hash_api_key(&key_array);
 
         let access_level = api_key_hashes.validate(&key_hash).ok_or_else(|| {
+            debug!("Identity rejected: invalid API key");
             ClientResponse::GenericError(ErrorResponse {
                 correlation_id: req.correlation_id,
                 error_code: ErrorResponse::AUTH_INVALID_KEY,

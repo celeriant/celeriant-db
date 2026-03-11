@@ -193,6 +193,12 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
                             celeriant_msg::response::responses::FollowerRejection::WalIndexMismatch { max_follower_wal_index } => {
                                 //We need to provide older wal entries to follower as they are behind
                                 //If we are unable to provide older wal entries, we need to fallback to S3
+                                debug!(
+                                    shard_id,
+                                    follower_wal_index = max_follower_wal_index,
+                                    leader_wal_index = batches[0].metablock.wal_index,
+                                    "Follower WAL index mismatch — fetching catchup entries"
+                                );
                                 let fetch_catchup_entries_result = fetch_catchup_entries(
                                     &log_segments_cache,
                                     *max_follower_wal_index,

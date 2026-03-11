@@ -110,7 +110,9 @@ impl LogSegmentsCache {
 
     pub async fn rotate_to_next_log(&self) -> Result<(), OpenOrCreateError> {
         let current_log_id = self.active_log_id();
+        let wal_index_at_rotation = self.active().metadata.borrow().write.wal_index;
         let new_log_segment_file = Rc::new(self.active().rotate(&self.shard_dir, self.preallocate_bytes).await?);
+        let new_log_id = new_log_segment_file.metadata.borrow().log_id;
 
         let mut current_log_segment_cache = self.active_file.borrow_mut();
         let old = std::mem::replace(&mut *current_log_segment_cache, new_log_segment_file);
@@ -119,6 +121,7 @@ impl LogSegmentsCache {
 
         metrics::counter!("celeriant_log_rotations_total", &self.shard_label).increment(1);
         metrics::gauge!("celeriant_log_segments_total", &self.shard_label).set((1 + self.lru_cache.borrow().len()) as f64);
+        tracing::info!(shard_id = %self.shard_label[0].1, old_log_id = current_log_id, new_log_id, wal_index_at_rotation, "Log segment rotated");
 
         Ok(())
     }

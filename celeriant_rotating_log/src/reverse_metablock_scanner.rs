@@ -91,6 +91,7 @@ impl<'a> ReverseMetablockScanner<'a> {
             // Check bloom filter - skip entire log segment if key definitely not present
             if let Some(hash) = &self.bloom_filter_hash {
                 if !read.aggregate_key_bloom.may_contain_hash(hash) {
+                    tracing::trace!(log_id, "Bloom filter skip");
                     return Ok(None);
                 }
             }

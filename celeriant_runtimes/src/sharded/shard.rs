@@ -274,9 +274,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
                                 "Compaction complete"
                             );
                         }
-                        Ok(None) => {
-                            info!(shard_id, "Compaction no-op");
-                        }
+                        Ok(None) => {}
                         Err(e) => {
                             warn!(shard_id, error = ?e, "Compaction failed");
                         }
@@ -563,7 +561,7 @@ async fn run_leader_loop<R: ReplicationClient + 'static, D: S3Downloader + 'stat
                                 info!(peer = ?info, "Follower discovered");
                                 break info;
                             }
-                            debug!("Follower not yet registered, retrying");
+                            debug!(task = "boot_orchestrator", next_backoff_ms = (backoff * 2).min(max_backoff).as_millis() as u64, "Follower not yet registered, retrying");
                             update_follower_address(ctx, None).await;
                             backoff = (backoff * 2).min(max_backoff);
                         }

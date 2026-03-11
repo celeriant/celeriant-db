@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use glommio::sync::Semaphore;
-use tracing::debug;
+use tracing::{debug, trace};
 
 use celeriant_disk::files::rwlock_timeout::write_with_timeout;
 use celeriant_distributed::node_status::NodeStatus;
@@ -1093,6 +1093,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
         let min_ratio = self.config.compaction_min_reclaimable_ratio;
         let temp_dir = &self.config.compaction_temp_dir;
+        let mut segments_checked: u32 = 0;
 
         for log_id in 1..active_log_id {
             let result = compact_segment(
@@ -1109,6 +1110,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                 Ok(Some(r)) => return Ok(Some(r)),
                 // Below threshold or pending advance — yield then try next segment.
                 Ok(None) => {
+                    segments_checked += 1;
                     glommio::yield_if_needed().await;
                     continue;
                 }
@@ -1118,6 +1120,13 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                 Err(e) => return Err(e),
             }
         }
+
+        debug!(
+            shard_id = self.config.shard_id,
+            segments_checked,
+            sealed_segments = active_log_id - 1,
+            "Compaction: no eligible segments"
+        );
 
         Ok(None)
     }
@@ -1298,6 +1307,13 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     async fn aggregate_exists_and_cache(&self, searching_for_aggregate_key: &AggregateKey, cache_path: CachePath) -> Result<bool, ShardCacheLoadError> {
         // If we are cached already
         if let (true, status) = self.shard_mem_cache.borrow_mut().aggregate_load_status(searching_for_aggregate_key, cache_path) {
+            trace!(
+                shard_id = self.config.shard_id,
+                aggregate_key = %searching_for_aggregate_key,
+                ?cache_path,
+                found = (status == AggregateStatus::Found),
+                "Cache hit — no disk scan needed"
+            );
             return Ok(status == AggregateStatus::Found);
         }
 
@@ -1414,6 +1430,13 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             .map_err(ShardCacheLoadError::FileScanningError)?;
 
         let found = find_result.unwrap_or(false);
+        trace!(
+            shard_id = self.config.shard_id,
+            aggregate_key = %searching_for_aggregate_key,
+            ?cache_path,
+            found,
+            "Disk scan complete"
+        );
         if find_result.is_none() {
             // Never found any metablock for this aggregate
             let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
