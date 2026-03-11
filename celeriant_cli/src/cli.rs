@@ -74,6 +74,9 @@ pub enum Commands {
 
     /// List aggregates
     ListAggregates(ListAggregatesArgs),
+
+    /// Register a schema for an aggregate type
+    RegisterSchema(RegisterSchemaArgs),
 }
 
 #[derive(Args, Clone)]
@@ -310,6 +313,64 @@ pub struct ListAggregatesArgs {
     /// Output format
     #[arg(long, value_enum, default_value = "table")]
     pub format: OutputFormat,
+}
+
+#[derive(Args, Clone)]
+pub struct RegisterSchemaArgs {
+    /// Organisation ID (UUID, numeric, or base64)
+    #[arg(long, value_parser = parse_u128)]
+    pub org: u128,
+
+    /// Aggregate type ID (UUID, numeric, or base64)
+    #[arg(long, long = "type", value_parser = parse_u128)]
+    pub aggregate_type: u128,
+
+    /// Schema major version
+    #[arg(long)]
+    pub major: u64,
+
+    /// Schema minor version
+    #[arg(long, default_value = "0")]
+    pub minor: u64,
+
+    /// Schema type
+    #[arg(long, value_enum)]
+    pub schema_type: SchemaTypeArg,
+
+    /// Schema definition as inline string (for json/avro)
+    #[arg(long, conflicts_with = "file", conflicts_with = "proto_descriptor")]
+    pub schema: Option<String>,
+
+    /// Read schema definition from file (for json/avro)
+    #[arg(long, conflicts_with = "schema", conflicts_with = "proto_descriptor")]
+    pub file: Option<PathBuf>,
+
+    /// Protobuf FileDescriptorSet binary file (from protoc --descriptor_set_out)
+    #[arg(long, conflicts_with = "schema", conflicts_with = "file", requires = "message_name")]
+    pub proto_descriptor: Option<PathBuf>,
+
+    /// Fully qualified protobuf message name (e.g. mypackage.MyMessage)
+    #[arg(long, requires = "proto_descriptor")]
+    pub message_name: Option<String>,
+
+    /// Client ID (UUID, numeric, or base64). Optional if using identity verification.
+    #[arg(long, value_parser = parse_u128)]
+    pub client_id: Option<u128>,
+
+    /// User ID (UUID, numeric, or base64)
+    #[arg(long, value_parser = parse_u128)]
+    pub user_id: Option<u128>,
+
+    /// Correlation ID for tracking (UUID, numeric, or base64)
+    #[arg(long, value_parser = parse_u128)]
+    pub correlation_id: Option<u128>,
+}
+
+#[derive(ValueEnum, Clone, Copy)]
+pub enum SchemaTypeArg {
+    Json,
+    Avro,
+    Protobuf,
 }
 
 #[derive(ValueEnum, Clone, Copy, Default)]

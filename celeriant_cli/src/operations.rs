@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use base64::Engine;
 use celeriant_client_tokio::{CeleriantClient, ClientIdentityConfig, ClientTlsConfig};
 use celeriant_client_tokio::list_operations::*;
 use celeriant_crypto::pki::PkiManager;
@@ -15,6 +16,7 @@ use celeriant_wal::{
     aggregate_key::AggregateKey,
     compression_type::CompressionType,
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
+    schema_key::SchemaKey,
 };
 use rustls::pki_types::ServerName;
 use std::{collections::HashMap, fs};
@@ -124,6 +126,7 @@ pub async fn execute_command(cli: &Cli, command: Commands) -> Result<()> {
         Commands::ListOrgs(args) => list_orgs(&mut client, args).await,
         Commands::ListTypes(args) => list_types(&mut client, args).await,
         Commands::ListAggregates(args) => list_aggregates(&mut client, args).await,
+        Commands::RegisterSchema(args) => register_schema(&mut client, args, identity_client_id).await,
     }
 }
 
@@ -445,6 +448,70 @@ async fn list_types(client: &mut CeleriantClient, args: ListTypesArgs) -> Result
             }
         }
     }
+    Ok(())
+}
+
+async fn register_schema(client: &mut CeleriantClient, args: RegisterSchemaArgs, identity_client_id: Option<u128>) -> Result<()> {
+    let client_id = resolve_client_id(identity_client_id, args.client_id)?;
+
+    let (schema_type_id, schema) = match args.schema_type {
+        SchemaTypeArg::Json | SchemaTypeArg::Avro => {
+            let schema_str = if let Some(s) = args.schema {
+                s
+            } else if let Some(path) = args.file {
+                fs::read_to_string(&path)
+                    .with_context(|| format!("Failed to read schema file: {}", path.display()))?
+            } else {
+                bail!("Either --schema or --file is required for {} schemas", match args.schema_type {
+                    SchemaTypeArg::Json => "json",
+                    SchemaTypeArg::Avro => "avro",
+                    _ => unreachable!(),
+                });
+            };
+            let type_id = match args.schema_type {
+                SchemaTypeArg::Json => 0u8,
+                SchemaTypeArg::Avro => 1,
+                _ => unreachable!(),
+            };
+            (type_id, schema_str)
+        }
+        SchemaTypeArg::Protobuf => {
+            let descriptor_path = args.proto_descriptor
+                .ok_or_else(|| anyhow::anyhow!("--proto-descriptor is required for protobuf schemas"))?;
+            let message_name = args.message_name
+                .ok_or_else(|| anyhow::anyhow!("--message-name is required for protobuf schemas"))?;
+
+            let fds_bytes = fs::read(&descriptor_path)
+                .with_context(|| format!("Failed to read descriptor file: {}", descriptor_path.display()))?;
+
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&fds_bytes);
+            (2, format!("{b64}:{message_name}"))
+        }
+    };
+
+    let request = ClientRequest::RegisterSchema(RegisterSchemaRequest {
+        correlation_id: args.correlation_id,
+        client_id,
+        user_id: args.user_id,
+        schema_key: SchemaKey::new(args.org, args.aggregate_type, args.major, args.minor),
+        schema_type: schema_type_id,
+        schema,
+    });
+
+    let response = client.send_request(&request, CompressionType::None).await?;
+
+    match &response {
+        ClientResponse::RegisterSchema(_) => {
+            println!("Schema registered successfully.");
+        }
+        ClientResponse::GenericError(err) => {
+            anyhow::bail!("Error {}: {}", err.error_code, err.error_message);
+        }
+        other => {
+            println!("{}", format_response(other));
+        }
+    }
+
     Ok(())
 }
 

@@ -38,6 +38,7 @@ ShardWriteAheadLog                    WatchSession (per client)
 | `WatchSession` | Async session loop coordinating receive/flush/heartbeat |
 | `AggregateWatchEvent` | Internal event with aggregate key + operation |
 | `AggregateWatchEventOperation` | Enum of operation variants (Write, Read, Delete, TrimStart, AggregateDetails, Create) |
+| `WatchEventAccumulator` | Merges events by (AggregateKey, operation) before flattening to `WatchResponse` |
 | `WatchOutputType` | Session output: Response, Heartbeat, Done, Continue |
 
 ## Key Functions
@@ -86,7 +87,7 @@ pub struct WatcherHandle {
 
 ### Event merging
 
-Multiple operations on the same aggregate are merged in `WatchResponse`. The map key is `(AggregateKey, operation_u8)`:
+Multiple operations on the same aggregate are merged in `WatchEventAccumulator`, then flattened to a `WatchResponse` via `into_response()`. The map key is `(AggregateKey, operation_u8)`:
 
 | Operation | Merge Strategy |
 |-----------|---------------|

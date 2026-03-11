@@ -2052,10 +2052,6 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let schema_type = SchemaType::try_from(request.schema_type)
             .map_err(|_| ShardSchemaError::UnsupportedSchemaType { schema_type: request.schema_type })?;
 
-        if !matches!(schema_type, SchemaType::Json | SchemaType::Avro) {
-            return Err(ShardSchemaError::UnsupportedSchemaType { schema_type: request.schema_type });
-        }
-
         if request.schema.len() > max_schema_size {
             return Err(ShardSchemaError::InvalidSchema {
                 schema_type: request.schema_type,
@@ -3517,8 +3513,8 @@ mod tests {
             let (_tmp, dir) = test_dir();
             let shard = open_shard(&dir).await;
 
-            // schema_type 2 = Protobuf (unsupported)
-            let result = process(&shard, schema_req_with_type(1, 1, 1, 0, 2, NAME_AGE_SCHEMA)).await;
+            // schema_type 99 = unknown (unsupported)
+            let result = process(&shard, schema_req_with_type(1, 1, 1, 0, 99, NAME_AGE_SCHEMA)).await;
             assert!(matches!(result, Err(ShardError::RegisterSchema(
                 crate::error::shard_schema_error::ShardSchemaError::UnsupportedSchemaType { .. }
             ))), "expected UnsupportedSchemaType, got {:?}", result);

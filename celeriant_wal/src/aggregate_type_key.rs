@@ -32,7 +32,7 @@ impl AggregateTypeKey {
         Self::OFFSET_ORG_ID + Self::WIRE_SIZE_ORG_ID;
 
     /// Total wire size of AggregateKey (hash is not serialized)
-    pub const WIRE_SIZE_TOTAL: usize = Self::WIRE_SIZE_AGGREGATE_TYPE_ID; // = 32 bytes
+    pub const WIRE_SIZE_TOTAL: usize = Self::OFFSET_AGGREGATE_TYPE_ID + Self::WIRE_SIZE_AGGREGATE_TYPE_ID; // = 32 bytes
 
     pub fn new(org_id: u128, aggregate_type_id: u128) -> Self {
         let hash = Self::compute_hash(org_id, aggregate_type_id);

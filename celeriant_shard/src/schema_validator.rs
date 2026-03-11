@@ -1,10 +1,13 @@
+use base64::Engine;
+use celeriant_memcache::cached_schema::{CachedValidator, Validate};
 use celeriant_wal::SchemaType;
-use celeriant_memcache::cached_schema::{Validate, CachedValidator};
+use prost_reflect::{DynamicMessage, MessageDescriptor};
 use std::rc::Rc;
 
 enum Inner {
     Json(jsonschema::Validator),
     Avro(apache_avro::Schema),
+    Protobuf(MessageDescriptor),
 }
 
 pub struct CompiledValidator {
@@ -27,7 +30,7 @@ impl CompiledValidator {
                     .map_err(|e| format!("Invalid Avro schema: {}", e))?;
                 Inner::Avro(compiled)
             }
-            _ => return Err(format!("Unsupported schema type: {:?}", schema_type)),
+            SchemaType::Protobuf => compile_protobuf(schema)?,
         };
 
         let schema_size = schema.len();
@@ -46,6 +49,7 @@ impl Validate for CompiledValidator {
         match &self.inner {
             Inner::Json(compiled) => validate_json(compiled, event_value),
             Inner::Avro(schema) => validate_avro(schema, event_value),
+            Inner::Protobuf(descriptor) => validate_protobuf(descriptor, event_value),
         }
     }
 }
@@ -73,6 +77,31 @@ fn validate_avro(schema: &apache_avro::Schema, event_value: &[u8]) -> Result<(),
     if !value.validate(schema) {
         return Err("Avro schema validation failed: decoded value does not match schema".to_string());
     }
+    Ok(())
+}
+
+fn compile_protobuf(schema: &str) -> Result<Inner, String> {
+    let (fds_b64, message_name) = schema
+        .split_once(':')
+        .ok_or("Invalid protobuf schema format: expected 'base64(FileDescriptorSet):MessageName'")?;
+
+    let fds_bytes = base64::engine::general_purpose::STANDARD
+        .decode(fds_b64)
+        .map_err(|e| format!("Invalid protobuf schema: base64 decode failed: {e}"))?;
+
+    let pool = prost_reflect::DescriptorPool::decode(fds_bytes.as_slice())
+        .map_err(|e| format!("Invalid protobuf schema: descriptor parse failed: {e}"))?;
+
+    let descriptor = pool
+        .get_message_by_name(message_name)
+        .ok_or_else(|| format!("Invalid protobuf schema: message '{message_name}' not found in descriptor"))?;
+
+    Ok(Inner::Protobuf(descriptor))
+}
+
+fn validate_protobuf(descriptor: &MessageDescriptor, event_value: &[u8]) -> Result<(), String> {
+    DynamicMessage::decode(descriptor.clone(), event_value)
+        .map_err(|e| format!("Protobuf validation failed: {e}"))?;
     Ok(())
 }
 
@@ -118,10 +147,136 @@ mod tests {
         assert!(err.contains("Invalid JSON schema"), "{err}");
     }
 
+    // --- Protobuf Schema tests ---
+
+    /// Build a schema string from a FileDescriptorSet and message name.
+    fn proto_schema(fds_bytes: &[u8], message_name: &str) -> String {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(fds_bytes);
+        format!("{b64}:{message_name}")
+    }
+
+    /// Build a minimal FileDescriptorSet with a single message containing a string field.
+    fn simple_fds() -> Vec<u8> {
+        use prost::Message;
+        use prost_reflect::prost_types::{
+            DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
+            field_descriptor_proto::{Label, Type},
+        };
+
+        let fds = FileDescriptorSet {
+            file: vec![FileDescriptorProto {
+                name: Some("test.proto".to_string()),
+                package: Some("test".to_string()),
+                syntax: Some("proto3".to_string()),
+                message_type: vec![DescriptorProto {
+                    name: Some("TestEvent".to_string()),
+                    field: vec![FieldDescriptorProto {
+                        name: Some("name".to_string()),
+                        number: Some(1),
+                        r#type: Some(Type::String.into()),
+                        label: Some(Label::Optional.into()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        fds.encode_to_vec()
+    }
+
+    fn proto_compiled() -> CachedValidator<CompiledValidator> {
+        let fds = simple_fds();
+        let schema = proto_schema(&fds, "test.TestEvent");
+        CompiledValidator::compile(SchemaType::Protobuf, &schema).unwrap()
+    }
+
     #[test]
-    fn compile_unsupported_schema_type() {
-        let err = CompiledValidator::compile(SchemaType::Protobuf, JSON_SCHEMA).unwrap_err();
-        assert!(err.contains("Unsupported"), "{err}");
+    fn compile_valid_protobuf_schema() {
+        // Field 1 (string), length-delimited: tag=0x0a, len=5, "alice"
+        let mut buf = Vec::new();
+        prost::encoding::string::encode(1, &"alice".to_string(), &mut buf);
+        assert!(proto_compiled().validate(&buf).is_ok());
+    }
+
+    #[test]
+    fn protobuf_empty_message_is_valid() {
+        // Empty bytes are valid for any proto3 message (all fields optional)
+        assert!(proto_compiled().validate(b"").is_ok());
+    }
+
+    #[test]
+    fn protobuf_reject_malformed_bytes() {
+        // 0x0a = field 1, length-delimited; 0x05 = 5 bytes follow; but only 2 bytes present
+        let err = proto_compiled().validate(&[0x0a, 0x05, 0x41, 0x42]).unwrap_err();
+        assert!(err.contains("Protobuf validation failed"), "{err}");
+    }
+
+    #[test]
+    fn protobuf_reject_invalid_utf8_string() {
+        // Field 1 as string with invalid UTF-8
+        let err = proto_compiled().validate(&[0x0a, 0x02, 0xff, 0xfe]).unwrap_err();
+        assert!(err.contains("Protobuf validation failed"), "{err}");
+    }
+
+    #[test]
+    fn protobuf_unknown_fields_pass() {
+        // Protobuf preserves unknown fields — a message with extra fields not in the
+        // schema decodes successfully. This is by design for schema evolution: adding
+        // new fields to a schema should be backward-compatible.
+        let v = proto_compiled();
+
+        // Encode field 1 (name, string) + field 99 (unknown, varint)
+        let mut buf = Vec::new();
+        prost::encoding::string::encode(1, &"alice".to_string(), &mut buf);
+        prost::encoding::int32::encode(99, &42, &mut buf);
+        assert!(v.validate(&buf).is_ok());
+    }
+
+    #[test]
+    fn protobuf_wire_type_mismatch_rejected() {
+        // Schema has field 1 as string (length-delimited, wire type 2).
+        // Send field 1 as a varint (wire type 0) — this is a wire type mismatch.
+        let v = proto_compiled();
+
+        let mut buf = Vec::new();
+        prost::encoding::int32::encode(1, &42, &mut buf); // varint where string expected
+        let err = v.validate(&buf).unwrap_err();
+        assert!(err.contains("Protobuf validation failed"), "{err}");
+    }
+
+    #[test]
+    fn protobuf_missing_fields_pass() {
+        // In proto3, all fields are optional. A message with only field 1 set
+        // is valid even though the schema also defines field 2.
+        // (simple_fds has: name=string field 1)
+        let v = proto_compiled();
+
+        // Only encode field 1, skip everything else
+        let mut buf = Vec::new();
+        prost::encoding::string::encode(1, &"alice".to_string(), &mut buf);
+        assert!(v.validate(&buf).is_ok());
+    }
+
+    #[test]
+    fn protobuf_compile_missing_separator() {
+        let err = CompiledValidator::compile(SchemaType::Protobuf, "no_colon_here").unwrap_err();
+        assert!(err.contains("expected"), "{err}");
+    }
+
+    #[test]
+    fn protobuf_compile_bad_base64() {
+        let err = CompiledValidator::compile(SchemaType::Protobuf, "!!!invalid!!!:test.Msg").unwrap_err();
+        assert!(err.contains("base64"), "{err}");
+    }
+
+    #[test]
+    fn protobuf_compile_message_not_found() {
+        let fds = simple_fds();
+        let schema = proto_schema(&fds, "test.NonExistent");
+        let err = CompiledValidator::compile(SchemaType::Protobuf, &schema).unwrap_err();
+        assert!(err.contains("not found"), "{err}");
     }
 
     #[test]

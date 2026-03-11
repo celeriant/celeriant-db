@@ -23,6 +23,57 @@ use celeriant_wal::{
 
 const CLIENT_ID: u128 = 7777;
 
+/// Build a protobuf schema string (base64 FileDescriptorSet + message name) for a message
+/// with fields: name (string, field 1) and id (int32, field 2).
+fn build_proto_schema(message_name: &str) -> String {
+    use base64::Engine;
+    use prost::Message;
+    use prost_reflect::prost_types::{
+        DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
+        field_descriptor_proto::{Label, Type},
+    };
+
+    let parts: Vec<&str> = message_name.rsplitn(2, '.').collect();
+    let (msg_name, package) = if parts.len() == 2 {
+        (parts[0], Some(parts[1].to_string()))
+    } else {
+        (parts[0], None)
+    };
+
+    let fds = FileDescriptorSet {
+        file: vec![FileDescriptorProto {
+            name: Some("test.proto".to_string()),
+            package,
+            syntax: Some("proto3".to_string()),
+            message_type: vec![DescriptorProto {
+                name: Some(msg_name.to_string()),
+                field: vec![
+                    FieldDescriptorProto {
+                        name: Some("name".to_string()),
+                        number: Some(1),
+                        r#type: Some(Type::String.into()),
+                        label: Some(Label::Optional.into()),
+                        ..Default::default()
+                    },
+                    FieldDescriptorProto {
+                        name: Some("id".to_string()),
+                        number: Some(2),
+                        r#type: Some(Type::Int32.into()),
+                        label: Some(Label::Optional.into()),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+
+    let fds_bytes = fds.encode_to_vec();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&fds_bytes);
+    format!("{b64}:{message_name}")
+}
+
 fn json_schema_for_name_age() -> String {
     r#"{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"}},"required":["name","age"]}"#.to_string()
 }
@@ -209,18 +260,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     expect_error_code(result, 2022);
     println!("  PASS\n");
 
-    // Test 9c: Unsupported schema type (Protobuf=2) — error 2024
-    println!("Test 9c: Unsupported schema type rejected (error 2024)");
+    // Test 9c: Register a Protobuf schema
+    println!("Test 9c: Register Protobuf schema");
+    let proto_schema_str = build_proto_schema("test.TestEvent");
     let req = ClientRequest::RegisterSchema(RegisterSchemaRequest {
         correlation_id: Some(rand::random()),
         client_id: CLIENT_ID,
         user_id: None,
         schema_key: SchemaKey::new(1, 100, 4, 0),
         schema_type: 2, // Protobuf
-        schema: "{}".to_string(),
+        schema: proto_schema_str,
+    });
+    client.send_request(&req, CompressionType::None).await?;
+    println!("  PASS\n");
+
+    // Test 9d: Write valid Protobuf-encoded event
+    println!("Test 9d: Write valid Protobuf event against Protobuf schema");
+    let mut valid_proto = Vec::new();
+    prost::encoding::string::encode(1, &"hello".to_string(), &mut valid_proto);
+    prost::encoding::int32::encode(2, &42, &mut valid_proto);
+    let agg4 = AggregateKey::new(1, 100, 4);
+    let req = write_event(&agg4, 4, 0, &valid_proto, 0, true);
+    client.send_request(&req, CompressionType::None).await?;
+    println!("  PASS\n");
+
+    // Test 9e: Write malformed bytes against Protobuf schema — should fail
+    println!("Test 9e: Write malformed bytes against Protobuf schema rejected (error 2022)");
+    // Truncated length-delimited field: tag says 5 bytes follow but only 2 present
+    let req = write_event(&agg4, 4, 0, &[0x0a, 0x05, 0x41, 0x42], 1, false);
+    let result = client.send_request(&req, CompressionType::None).await;
+    expect_error_code(result, 2022);
+    println!("  PASS\n");
+
+    // Test 9f: Write invalid UTF-8 string against Protobuf schema — should fail
+    println!("Test 9f: Write invalid UTF-8 against Protobuf schema rejected (error 2022)");
+    let req = write_event(&agg4, 4, 0, &[0x0a, 0x02, 0xff, 0xfe], 1, false);
+    let result = client.send_request(&req, CompressionType::None).await;
+    expect_error_code(result, 2022);
+    println!("  PASS\n");
+
+    // Test 9g: Invalid protobuf schema — bad base64
+    println!("Test 9g: Invalid protobuf schema rejected (error 2021)");
+    let req = ClientRequest::RegisterSchema(RegisterSchemaRequest {
+        correlation_id: Some(rand::random()),
+        client_id: CLIENT_ID,
+        user_id: None,
+        schema_key: SchemaKey::new(1, 100, 5, 0),
+        schema_type: 2,
+        schema: "!!!not-base64!!!:test.Msg".to_string(),
     });
     let result = client.send_request(&req, CompressionType::None).await;
-    expect_error_code(result, 2024);
+    expect_error_code(result, 2021);
     println!("  PASS\n");
 
     // Test 10: Write to a different event_type_minor (no schema) — should pass

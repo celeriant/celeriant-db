@@ -106,10 +106,13 @@ pub enum DiskFormatError {
     ChecksumMismatch { expected: u32, actual: u32 },
     UnsupportedVersion(u32),
     HeaderSizeMismatch { expected: usize, actual: usize },
+    JsonSerialize(String),
     JsonDeserialize(String),
     Codec(CodecError),
 }
 ```
+
+Implements `From` for: `CodecError`, `bincode::error::DecodeError`, `CompressionError`.
 
 ### `WireError` (network/wire_error.rs)
 
@@ -215,8 +218,9 @@ The `metablock_bytes` module provides `#[inline]` functions for reading fields d
 | Function | Description |
 |----------|-------------|
 | `is_metablock_kind_event_batch_metadata` | True for discriminant 0 |
-| `is_metablock_kind_soft_delete` | True for discriminant 4 |
-| `is_metablock_kind_soft_trim` | True for discriminant 5 |
+| `is_metablock_kind_schema_registration` | True for discriminant 1 |
+| `is_metablock_kind_soft_delete` | True for discriminant 2 |
+| `is_metablock_kind_soft_trim` | True for discriminant 3 |
 
 ### Aggregate key matching
 
@@ -225,6 +229,7 @@ The `metablock_bytes` module provides `#[inline]` functions for reading fields d
 | `is_matches_aggregate_key` | True if EventBatchMetadata and key matches |
 | `is_soft_delete_for_aggregate` | True if SoftDelete and key matches |
 | `is_soft_trim_for_aggregate` | True if SoftTrim and key matches |
+| `is_schema_registration_for_key` | True if SchemaRegistration and key matches |
 
 ### EventBatch field readers
 
@@ -242,6 +247,16 @@ The `metablock_bytes` module provides `#[inline]` functions for reading fields d
 | `read_event_batch_max_event_timestamp` | `u64` |
 | `read_event_batch_client_id` | `u128` |
 | `read_event_batch_max_client_event_index` | `u64` |
+
+### SchemaRegistration field readers
+
+| Function | Return |
+|----------|--------|
+| `read_schema_registration_org_id` | `u128` |
+| `read_schema_registration_aggregate_type_id` | `u128` |
+| `read_schema_registration_event_type_major` | `u64` |
+| `read_schema_registration_event_type_minor` | `u64` |
+| `read_schema_registration_key` | `SchemaKey` |
 
 ### SoftDelete / SoftTrim field readers
 
@@ -261,17 +276,16 @@ The `metablock_bytes` module provides `#[inline]` functions for reading fields d
 | Discriminant | Variant |
 |-------------|---------|
 | 0 | `EventBatchMetadata` |
-| 1 | `SnapshotOrg` |
-| 3 | `SnapshotAggregate` |
-| 4 | `SoftDelete` |
-| 5 | `SoftTrim` |
+| 1 | `SchemaRegistration` |
+| 2 | `SoftDelete` |
+| 3 | `SoftTrim` |
 
 ## Dependencies
 
 - `celeriant_wal` - WAL types (Metablock, Datablock, CompressionType, constants)
 - `bincode` - Rust-native binary serialization (fixed-int encoding)
 - `rmp-serde` - MessagePack for cross-language clients
-- `serde` - Serialization framework
+- `serde` / `serde_json` - Serialization framework and JSON for S3 objects
 - `zstd`, `snap`, `brotli`, `flate2` - Compression algorithms
 - `crc32c` - Hardware-accelerated checksums
 - `futures-lite` - Async I/O traits
