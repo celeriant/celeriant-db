@@ -1,4 +1,5 @@
 use celeriant_msg::{
+    error_codes::*,
     process_client_responses::ClientResponse,
     process_cluster_responses::ClusterResponse,
     response::responses::ErrorResponse,
@@ -23,91 +24,6 @@ use celeriant_shard::error::{
 use celeriant_watch::aggregate_reader::WatchReadError;
 
 use super::connection_handler::ShardRoutingError;
-
-// Error codes as a cross-language u32 enum.
-// Each ShardError leaf variant gets a unique code.
-
-// Read errors: 1xxx
-const READ_UNAVAILABLE_BATCH_INDEX: u32 = 1000;
-const READ_AGGREGATE_NOT_EXISTS: u32 = 1001;
-const READ_CACHE_LOAD_LOCK_TIMEOUT: u32 = 1002;
-const READ_CACHE_LOAD_FILE_SCAN: u32 = 1003;
-const READ_FETCH_DATABLOCKS: u32 = 1004;
-const READ_FETCH_METABLOCKS: u32 = 1005;
-
-// Write errors: 2xxx
-const WRITE_EMPTY_EVENTS_LIST: u32 = 2000;
-const WRITE_ZERO_EVENT_TYPE: u32 = 2001;
-const WRITE_CLIENT_IDEMPOTENCY_VIOLATION: u32 = 2002;
-const WRITE_OPTIMISTIC_CONCURRENCY_VIOLATION: u32 = 2003;
-const WRITE_FAILED_TO_SERIALISE_DATABLOCKS: u32 = 2004;
-const WRITE_AGGREGATE_NOT_EXISTS: u32 = 2005;
-const WRITE_AGGREGATE_RECREATE_NOT_ALLOWED: u32 = 2006;
-const WRITE_REPLICATION_ERROR: u32 = 2007;
-const WRITE_FSYNC_ERROR: u32 = 2008;
-const WRITE_CACHE_AGGREGATE_CLIENT_ERROR: u32 = 2009;
-const WRITE_AGGREGATE_EXISTS_CACHE_ERROR: u32 = 2010;
-const WRITE_CANNOT_ACCEPT_WRITES: u32 = 2011;
-const REGISTER_SCHEMA_ALREADY_EXISTS: u32 = 2020;
-const REGISTER_SCHEMA_INVALID: u32 = 2021;
-const WRITE_SCHEMA_VALIDATION_FAILED: u32 = 2022;
-const WRITE_SCHEMA_COMPILATION_FAILED: u32 = 2023;
-const REGISTER_SCHEMA_UNSUPPORTED_TYPE: u32 = 2024;
-const REGISTER_SCHEMA_CACHE_LOAD_ERROR: u32 = 2025;
-const REGISTER_SCHEMA_FSYNC_ERROR: u32 = 2026;
-const REGISTER_SCHEMA_CANNOT_ACCEPT_WRITES: u32 = 2027;
-const REGISTER_SCHEMA_REPLICATION_ERROR: u32 = 2028;
-const REGISTER_SCHEMA_COORDINATION_FAILED: u32 = 2029;
-
-// Trim errors: 3xxx
-const TRIM_AGGREGATE_NOT_EXISTS: u32 = 3000;
-const TRIM_CACHE_ERROR: u32 = 3001;
-const TRIM_REPLICATION_ERROR: u32 = 3002;
-const TRIM_FSYNC_ERROR: u32 = 3003;
-const TRIM_INDEX_OUT_OF_RANGE: u32 = 3004;
-const TRIM_CANNOT_ACCEPT_WRITES: u32 = 3005;
-
-// Delete errors: 4xxx
-const DELETE_AGGREGATE_NOT_EXISTS: u32 = 4000;
-const DELETE_EMPTY_DELETE_LIST: u32 = 4001;
-const DELETE_OPTIMISTIC_CONCURRENCY_VIOLATION: u32 = 4002;
-const DELETE_CACHE_ERROR: u32 = 4003;
-const DELETE_REPLICATION_ERROR: u32 = 4004;
-const DELETE_FSYNC_ERROR: u32 = 4005;
-const DELETE_CANNOT_ACCEPT_WRITES: u32 = 4006;
-
-// Listing errors: 5xxx
-const LIST_ORGS_DISK_READ: u32 = 5000;
-const LIST_AGGREGATE_TYPES_DISK_READ: u32 = 5001;
-const LIST_AGGREGATES_DISK_READ: u32 = 5002;
-
-// Replication batch errors: 6xxx
-const REPLICATION_BATCH_FSYNC: u32 = 6000;
-const REPLICATION_BATCH_SERIALISE_DATABLOCKS: u32 = 6001;
-const REPLICATION_BATCH_WAL_INDEX_GAP: u32 = 6002;
-
-// Exists errors: 7xxx
-const EXISTS_CACHE_ERROR: u32 = 7000;
-const EXISTS_AGGREGATE_NOT_EXISTS: u32 = 7001;
-const EXISTS_METABLOCK_READ_ERROR: u32 = 7002;
-
-// Watch errors: 8xxx
-const WATCH_REQUEST_INVALID: u32 = 8000;
-const WATCH_LATENCY_TOO_HIGH: u32 = 8001;
-const WATCH_READ_IO: u32 = 8002;
-const WATCH_READ_SERIALIZATION: u32 = 8003;
-const WATCH_READ_OTHER: u32 = 8004;
-
-// Shard routing errors: 9xxx
-pub const SHARD_ROUTING_NO_KEY: u32 = 9000;
-pub const SHARD_ROUTING_MULTIPLE_SHARDS: u32 = 9001;
-pub const SHARD_ROUTING_INCOMPATIBLE_FILTERS: u32 = 9002;
-
-// Identify errors: 10xxx
-pub const IDENTIFY_INVALID_NONCE: u32 = 10001;
-pub const IDENTIFY_INVALID_SIGNATURE: u32 = 10002;
-pub const IDENTIFY_MISMATCH: u32 = 10003;
-pub const IDENTIFY_REQUIRED: u32 = ErrorResponse::IDENTIFY_REQUIRED;
 
 pub fn shard_error_to_client_response(correlation_id: Option<u128>, error: ShardError) -> ClientResponse {
     let (error_code, error_message) = shard_error_to_code(error);
@@ -206,7 +122,7 @@ fn write_error(e: ShardWriteError) -> (u32, String) {
         ShardWriteError::ShardFsyncError(e) => (WRITE_FSYNC_ERROR, fsync_message(e)),
         ShardWriteError::CacheAggregateClientError(e) => cache_load_error(WRITE_CACHE_AGGREGATE_CLIENT_ERROR, WRITE_CACHE_AGGREGATE_CLIENT_ERROR, e),
         ShardWriteError::AggregateExistsAndCacheError(e) => cache_load_error(WRITE_AGGREGATE_EXISTS_CACHE_ERROR, WRITE_AGGREGATE_EXISTS_CACHE_ERROR, e),
-        ShardWriteError::ShardCannotAcceptWrites { leader_address } => (WRITE_CANNOT_ACCEPT_WRITES, cannot_accept_writes_message(leader_address)),
+        ShardWriteError::ShardCannotAcceptWrites { leader_address } => (WRITE_NOT_LEADER, cannot_accept_writes_message(leader_address)),
         ShardWriteError::SchemaValidationFailed { event_type_major, event_type_minor, client_event_index, validation_error } => (
             WRITE_SCHEMA_VALIDATION_FAILED,
             format!(
@@ -240,7 +156,7 @@ fn trim_error(e: ShardTrimError) -> (u32, String) {
             TRIM_INDEX_OUT_OF_RANGE,
             format!(r#"{{"requested":{},"max_event_batch_index":{}}}"#, requested, max_event_batch_index),
         ),
-        ShardTrimError::ShardCannotAcceptWrites { leader_address } => (TRIM_CANNOT_ACCEPT_WRITES, cannot_accept_writes_message(leader_address)),
+        ShardTrimError::ShardCannotAcceptWrites { leader_address } => (TRIM_NOT_LEADER, cannot_accept_writes_message(leader_address)),
     }
 }
 
@@ -255,7 +171,7 @@ fn delete_error(e: ShardDeleteError) -> (u32, String) {
         ShardDeleteError::AggregateExistsAndCacheError(e) => cache_load_error(DELETE_CACHE_ERROR, DELETE_CACHE_ERROR, e),
         ShardDeleteError::ReplicationError(e) => (DELETE_REPLICATION_ERROR, replication_message(e)),
         ShardDeleteError::ShardFsyncError(e) => (DELETE_FSYNC_ERROR, fsync_message(e)),
-        ShardDeleteError::ShardCannotAcceptWrites { leader_address } => (DELETE_CANNOT_ACCEPT_WRITES, cannot_accept_writes_message(leader_address)),
+        ShardDeleteError::ShardCannotAcceptWrites { leader_address } => (DELETE_NOT_LEADER, cannot_accept_writes_message(leader_address)),
     }
 }
 
@@ -590,7 +506,7 @@ mod tests {
         );
         match resp {
             ClientResponse::GenericError(e) => {
-                assert_eq!(e.error_code, WRITE_CANNOT_ACCEPT_WRITES);
+                assert_eq!(e.error_code, WRITE_NOT_LEADER);
                 assert_eq!(e.error_message, r#"{"leader_address":"10.0.0.1:9000"}"#);
                 assert_eq!(e.correlation_id, Some(1));
             }
@@ -608,7 +524,7 @@ mod tests {
         );
         match resp {
             ClientResponse::GenericError(e) => {
-                assert_eq!(e.error_code, WRITE_CANNOT_ACCEPT_WRITES);
+                assert_eq!(e.error_code, WRITE_NOT_LEADER);
                 assert_eq!(e.error_message, "{}");
             }
             _ => panic!("expected GenericError"),
@@ -625,7 +541,7 @@ mod tests {
         );
         match resp {
             ClientResponse::GenericError(e) => {
-                assert_eq!(e.error_code, DELETE_CANNOT_ACCEPT_WRITES);
+                assert_eq!(e.error_code, DELETE_NOT_LEADER);
                 assert_eq!(e.error_message, r#"{"leader_address":"10.0.0.2:9000"}"#);
             }
             _ => panic!("expected GenericError"),
@@ -642,7 +558,7 @@ mod tests {
         );
         match resp {
             ClientResponse::GenericError(e) => {
-                assert_eq!(e.error_code, TRIM_CANNOT_ACCEPT_WRITES);
+                assert_eq!(e.error_code, TRIM_NOT_LEADER);
                 assert_eq!(e.error_message, r#"{"leader_address":"10.0.0.3:9000"}"#);
             }
             _ => panic!("expected GenericError"),

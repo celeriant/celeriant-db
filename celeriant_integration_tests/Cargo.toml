@@ -317,6 +317,14 @@ path = "src/leader_read_visibility_main.rs"
 name = "read_list_benchmark_main"
 path = "src/read_list_benchmark_main.rs"
 
+[[bin]]
+name = "typed_operations_main"
+path = "src/typed_operations_main.rs"
+
+[[bin]]
+name = "pool_test_main"
+path = "src/pool_test_main.rs"
+
 [features]
 default = []
 small-metablock = [
@@ -355,5 +363,6 @@ apache-avro.workspace = true
 prost.workspace = true
 prost-reflect.workspace = true
 base64.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 hex = "0.4"

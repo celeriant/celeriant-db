@@ -200,17 +200,12 @@ async fn test_identity_mismatch_rejection(
         .await;
 
     match result {
-        Err(ClientError::CeleriantError(err)) => {
-            if err.error_code == 10003 {
-                println!("  ✓ Received expected error code 10003 (IDENTIFY_MISMATCH)");
-                println!("  Error message: {}", err.error_message);
-            } else {
-                return Err(format!(
-                    "Expected error code 10003, got {} - {}",
-                    err.error_code, err.error_message
-                )
-                .into());
-            }
+        Err(ClientError::Server(celeriant_client_tokio::server_error::ServerError::Auth { kind: celeriant_client_tokio::server_error::AuthError::Mismatch, ref error_message })) => {
+            println!("  ✓ Received expected IDENTIFY_MISMATCH error");
+            println!("  Error message: {}", error_message);
+        }
+        Err(ClientError::Server(ref err)) => {
+            return Err(format!("Expected IDENTIFY_MISMATCH, got: {}", err).into());
         }
         Ok(response) => {
             return Err(format!(
@@ -322,7 +317,7 @@ async fn test_enforcement_rejects_unidentified(
         .await;
 
     match result {
-        Err(ClientError::IdentityRequired(_)) => {
+        Err(ClientError::IdentityRequired) => {
             println!("  ✓ Received IdentityRequired error (10004)");
         }
         Ok(response) => {

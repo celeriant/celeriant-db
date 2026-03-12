@@ -110,10 +110,18 @@ async fn test_basic_idempotency(
 
     println!("  Retrying same write (should fail with error 2002)...");
     match client.send_request(&retry_request, CompressionType::None).await {
-        Err(ClientError::CeleriantError(e)) if e.error_code == 2002 => {
-            println!("  Retry: REJECTED with error 2002 (ClientIdempotencyViolation) - CORRECT");
+        Err(ClientError::Server(celeriant_client_tokio::server_error::ServerError::Write {
+            kind: celeriant_client_tokio::server_error::WriteError::ClientIdempotencyViolation {
+                last_client_event_index,
+                attempted_client_event_index,
+            }, ..
+        })) => {
+            assert_eq!(last_client_event_index, Some(1), "last_client_event_index should be 1");
+            assert_eq!(attempted_client_event_index, Some(1), "attempted_client_event_index should be 1");
+            println!("  Retry: REJECTED with ClientIdempotencyViolation (last={}, attempted={}) - CORRECT",
+                last_client_event_index.unwrap(), attempted_client_event_index.unwrap());
         }
-        other => panic!("Expected error 2002, got {:?}", other),
+        other => panic!("Expected ClientIdempotencyViolation, got {:?}", other),
     }
 
     // Read back and verify exactly one event batch
@@ -174,14 +182,22 @@ async fn test_uncertain_ack(
     });
 
     match client2.send_request(&retry_request, CompressionType::None).await {
-        Err(ClientError::CeleriantError(e)) if e.error_code == 2002 => {
-            println!("  Retry: REJECTED with error 2002 (original succeeded) - CORRECT");
+        Err(ClientError::Server(celeriant_client_tokio::server_error::ServerError::Write {
+            kind: celeriant_client_tokio::server_error::WriteError::ClientIdempotencyViolation {
+                last_client_event_index,
+                attempted_client_event_index,
+            }, ..
+        })) => {
+            assert_eq!(last_client_event_index, Some(2), "last_client_event_index should be 2");
+            assert_eq!(attempted_client_event_index, Some(2), "attempted_client_event_index should be 2");
+            println!("  Retry: REJECTED with ClientIdempotencyViolation (last={}, attempted={}) - CORRECT",
+                last_client_event_index.unwrap(), attempted_client_event_index.unwrap());
         }
         Ok(ClientResponse::Write(_)) => {
             println!("  Retry: SUCCESS (original didn't reach server) - ACCEPTABLE");
             println!("  (Either way, exactly one event should exist)");
         }
-        other => panic!("Expected error 2002 or Write response, got {:?}", other),
+        other => panic!("Expected ClientIdempotencyViolation or Write response, got {:?}", other),
     }
 
     // Read back and verify exactly one event exists for this client_event_index

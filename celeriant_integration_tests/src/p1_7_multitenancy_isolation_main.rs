@@ -122,17 +122,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => {
             // Expect error code 1001 (AggregateDoesNotExist)
             match &e {
-                celeriant_client_tokio::client_error::ClientError::CeleriantError(error_response) => {
-                    println!("  Received error code: {}", error_response.error_code);
-                    assert!(
-                        error_response.error_code == 1001,
-                        "Expected error code 1001 (AggregateDoesNotExist), got {}",
-                        error_response.error_code
-                    );
+                celeriant_client_tokio::client_error::ClientError::Server(
+                    celeriant_client_tokio::server_error::ServerError::Read {
+                        kind: celeriant_client_tokio::server_error::ReadError::AggregateNotExists,
+                        ..
+                    }
+                ) => {
                     println!("  PASS: org=2 key for org=1 data returns AggregateDoesNotExist");
                 }
                 _ => {
-                    panic!("Expected CeleriantError with code 1001, got: {:?}", e);
+                    panic!("Expected ReadError::AggregateNotExists, got: {:?}", e);
                 }
             }
         }

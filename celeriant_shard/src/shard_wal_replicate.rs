@@ -251,6 +251,11 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
                                         metablock: f.metablock,
                                     })
                                     .collect();
+                                debug!(
+                                    shard_id,
+                                    catchup_entries = additional_batch_items.len(),
+                                    "Fetched catchup entries for follower — retrying replication"
+                                );
                                 workset_size_bytes += additional_batch_items.iter().map(|c| c.size_bytes()).sum::<u64>();
                                 batches.splice(0..0, additional_batch_items);
 

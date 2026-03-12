@@ -80,13 +80,11 @@ async fn write_with_payload(
 }
 
 fn expect_schema_violation(result: Result<(), ClientError>, context: &str) {
+    use celeriant_client_tokio::server_error::{SchemaError, ServerError};
     match result {
-        Err(ClientError::CeleriantError(e)) if e.error_code == 2022 => {}
-        Err(ClientError::CeleriantError(e)) => {
-            panic!("{}: expected error 2022, got {}: {}", context, e.error_code, e.error_message)
-        }
-        Ok(()) => panic!("{}: expected error 2022, got success", context),
-        Err(e) => panic!("{}: expected CeleriantError(2022), got: {:?}", context, e),
+        Err(ClientError::Server(ServerError::Schema { kind: SchemaError::ValidationFailed, .. })) => {}
+        Ok(()) => panic!("{}: expected SchemaValidationFailed, got success", context),
+        Err(e) => panic!("{}: expected SchemaValidationFailed, got: {:?}", context, e),
     }
 }
 
@@ -257,10 +255,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Duplicate registration
     let result = new_leader_client.send_request(&register_req, CompressionType::None).await;
     match &result {
-        Err(ClientError::CeleriantError(e)) if e.error_code == 2020 => {
+        Err(ClientError::Server(celeriant_client_tokio::server_error::ServerError::Schema {
+            kind: celeriant_client_tokio::server_error::SchemaError::AlreadyExists, ..
+        })) => {
             println!("  Duplicate registration rejected: PASS");
         }
-        _ => return Err(format!("Expected error 2020, got: {:?}", result).into()),
+        _ => return Err(format!("Expected SchemaAlreadyExists, got: {:?}", result).into()),
     }
 
     println!("\n=== All Tests Passed ===");

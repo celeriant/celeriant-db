@@ -23,6 +23,14 @@ pub struct ClientTlsConfig {
     pub server_name: ServerName<'static>,
 }
 
+impl std::fmt::Debug for ClientTlsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientTlsConfig")
+            .field("server_name", &self.server_name)
+            .finish_non_exhaustive()
+    }
+}
+
 impl ClientTlsConfig {
     pub fn new(client_config: Arc<rustls::ClientConfig>, server_name: ServerName<'static>) -> Self {
         Self {
@@ -120,11 +128,21 @@ pub(crate) async fn connect_stream(
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ClientIdentityConfig {
     pub public_key: Option<String>,
     pub private_key: Option<String>,
     pub api_key: Option<String>,
+}
+
+impl ClientIdentityConfig {
+    pub fn from_api_key(api_key: impl Into<String>) -> Self {
+        Self { public_key: None, private_key: None, api_key: Some(api_key.into()) }
+    }
+
+    pub fn from_key_pair(public_key: impl Into<String>, private_key: impl Into<String>) -> Self {
+        Self { public_key: Some(public_key.into()), private_key: Some(private_key.into()), api_key: None }
+    }
 }
 
 /// Minimal, high-performance Celeriant TCP client
@@ -138,6 +156,8 @@ pub struct CeleriantClient {
     max_request_size: u64,
     max_response_size: u64,
     timeout: Option<Duration>,
+    pub(crate) compression: CompressionType,
+    pub(crate) auto_compression_threshold: u64,
 }
 
 impl CeleriantClient {
@@ -164,9 +184,11 @@ impl CeleriantClient {
 
         Ok(Self {
             stream,
-            max_request_size: 10_000_000,      // 10 MB default
+            max_request_size: 10_000_000,        // 10 MB default
             max_response_size: 64 * 1024 * 1024, // 64 MB — matches server default
             timeout: connection_timeout,
+            compression: CompressionType::Zstd { level: 3 },
+            auto_compression_threshold: 1024,
         })
     }
 
@@ -188,11 +210,21 @@ impl CeleriantClient {
         self
     }
 
+    /// Set compression algorithm used when payload exceeds the auto-compression threshold (default: Zstd level 3)
+    pub fn with_compression(mut self, compression: CompressionType) -> Self {
+        self.compression = compression;
+        self
+    }
+
+    /// Set the payload size threshold in bytes above which auto-compression is applied (default: 1024)
+    pub fn with_auto_compression_threshold(mut self, bytes: u64) -> Self {
+        self.auto_compression_threshold = bytes;
+        self
+    }
+
     /// Send a request and await the response
     ///
     /// Compression is specified per-request. Returns the response or an error.
-    /// CeleriantError from the response is surfaced as ClientError::CeleriantError.
-    ///
     /// This is a blocking operation on the connection. For concurrent requests,
     /// create multiple client instances (one per connection).
     pub async fn send_request(

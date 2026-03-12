@@ -28,11 +28,7 @@ pub struct ListOptions {
 
 /// Helper to detect shard routing errors (indicates invalid shard_id)
 fn is_shard_routing_error(error: &ClientError) -> bool {
-    if let ClientError::CeleriantError(e) = error {
-        e.error_code == 9001 || e.error_code == 9002
-    } else {
-        false
-    }
+    matches!(error, ClientError::Server(crate::server_error::ServerError::ShardRouting { .. }))
 }
 
 impl Default for ListOptions {
@@ -360,7 +356,7 @@ pub struct AggregateStats {
 
 impl AggregateStats {
     /// Create from a single list item
-    fn from_item(item: &AggregateListItem) -> Self {
+    pub(crate) fn from_item(item: &AggregateListItem) -> Self {
         Self {
             org_id: item.org_id,
             aggregate_type_id: item.aggregate_type_id,
@@ -381,7 +377,7 @@ impl AggregateStats {
     }
 
     /// Merge another item's stats into this one
-    fn merge(&mut self, item: &AggregateListItem) {
+    pub(crate) fn merge(&mut self, item: &AggregateListItem) {
         // is_deleted: true if ANY shard reports deleted
         self.is_deleted = self.is_deleted || item.is_deleted;
         // Sums

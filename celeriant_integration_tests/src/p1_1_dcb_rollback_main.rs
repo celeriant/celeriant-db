@@ -200,19 +200,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .send_request(&request, CompressionType::None)
         .await;
 
-    // The server returns OCC violation as a CeleriantError, not a Response
     match result {
-        Err(ClientError::CeleriantError(error)) => {
-            println!("  ✓ DCB write rejected with error: {}", error.error_message);
-            assert_eq!(
-                error.error_code, 2003,
-                "Expected OCC violation error code 2003, got {}",
-                error.error_code
-            );
-            println!("  ✓ Error code is 2003 (WRITE_OPTIMISTIC_CONCURRENCY_VIOLATION)");
+        Err(ClientError::Server(celeriant_client_tokio::server_error::ServerError::Write {
+            kind: celeriant_client_tokio::server_error::WriteError::OptimisticConcurrencyViolation { .. },
+            ref error_message,
+        })) => {
+            println!("  ✓ DCB write rejected with OptimisticConcurrencyViolation: {}", error_message);
         }
         Ok(resp) => panic!("Expected OCC error, got success: {:?}", resp),
-        Err(e) => panic!("Expected OCC error (code 2003), got: {:?}", e),
+        Err(e) => panic!("Expected OptimisticConcurrencyViolation, got: {:?}", e),
     }
 
     // Phase 4: Verify rollback - both A and B unchanged

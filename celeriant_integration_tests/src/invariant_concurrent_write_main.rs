@@ -115,7 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(ClientResponse::GenericError(_)) => {
                         failures.fetch_add(1, Ordering::Relaxed);
                     }
-                    Err(ClientError::CeleriantError(_)) => {
+                    Err(ClientError::Server(_)) => {
                         failures.fetch_add(1, Ordering::Relaxed);
                     }
                     Ok(_) => {

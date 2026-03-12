@@ -264,13 +264,11 @@ async fn count_events_all(
             }
             Ok(other) => return Err(format!("Unexpected response: {:?}", other).into()),
             Err(e) => match &e {
-                celeriant_client_tokio::client_error::ClientError::CeleriantError(error_response) => {
-                    if error_response.error_code == 1001 {
-                        return Ok(total);
-                    } else {
-                        return Err(Box::new(e));
+                celeriant_client_tokio::client_error::ClientError::Server(
+                    celeriant_client_tokio::server_error::ServerError::Read {
+                        kind: celeriant_client_tokio::server_error::ReadError::AggregateNotExists, ..
                     }
-                }
+                ) => return Ok(total),
                 _ => return Err(Box::new(e)),
             },
         }

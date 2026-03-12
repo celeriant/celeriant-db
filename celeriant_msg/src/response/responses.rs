@@ -101,26 +101,13 @@ pub struct ErrorResponse {
 }
 
 impl ErrorResponse {
-    /// Error codes returned when a write/trim/delete is sent to a non-leader node.
-    /// The error_message JSON may contain `{"leader_address":"host:port"}`.
-    pub const WRITE_NOT_LEADER: u32 = 2011;
-    pub const TRIM_NOT_LEADER: u32 = 3005;
-    pub const DELETE_NOT_LEADER: u32 = 4006;
-
-    /// Server requires client identity verification but none was provided.
-    pub const IDENTIFY_REQUIRED: u32 = 10004;
-
-    /// Authentication error codes
-    pub const AUTH_REQUIRED: u32 = 1001;
-    pub const AUTH_INVALID_KEY: u32 = 1002;
-    pub const AUTH_INSUFFICIENT_PERMISSIONS: u32 = 1003;
-
     pub fn is_not_leader(&self) -> bool {
-        matches!(self.error_code, Self::WRITE_NOT_LEADER | Self::TRIM_NOT_LEADER | Self::DELETE_NOT_LEADER)
+        use crate::error_codes::*;
+        matches!(self.error_code, WRITE_NOT_LEADER | TRIM_NOT_LEADER | DELETE_NOT_LEADER)
     }
 
     pub fn is_identity_required(&self) -> bool {
-        self.error_code == Self::IDENTIFY_REQUIRED
+        self.error_code == crate::error_codes::IDENTIFY_REQUIRED
     }
 
     /// Extract leader address from error_message JSON like `{"leader_address":"host:port"}`.

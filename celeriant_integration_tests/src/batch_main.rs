@@ -1076,11 +1076,8 @@ async fn run_connection_benchmark(
                 latencies.push(latency_us);
                 request_count += 1;
             }
-            Err(ClientError::CeleriantError(err_resp)) => {
-                eprintln!(
-                    "Connection {} server error: {} ({})",
-                    connection_id, err_resp.error_message, err_resp.error_code
-                );
+            Err(ClientError::Server(err)) => {
+                eprintln!("Connection {} server error: {}", connection_id, err);
             }
             Err(e) => match e {
                 ClientError::RequestTimeout => {

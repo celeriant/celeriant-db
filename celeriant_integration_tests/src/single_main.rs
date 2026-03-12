@@ -137,9 +137,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .send_request(&request, CompressionType::None)
             .await
         {
-            Err(ClientError::CeleriantError(e)) => {
-                assert_eq!(e.error_code, 7001, "expected error 7001 for nonexistent aggregate");
-                println!("Aggregate {:?}: correctly returned error {}", agg, e.error_code);
+            Err(ClientError::Server(celeriant_client_tokio::server_error::ServerError::Details {
+                kind: celeriant_client_tokio::server_error::DetailsError::AggregateNotExists, ..
+            })) => {
+                println!("Aggregate {:?}: correctly returned AggregateNotExists", agg);
             }
             Ok(response) => panic!("Expected error for nonexistent aggregate {:?}, got {:?}", agg, response),
             Err(e) => panic!("Aggregate {:?}: transport error - {:?}", agg, e),

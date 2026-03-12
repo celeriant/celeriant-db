@@ -16,7 +16,7 @@ async fn main() -> Result<()> {
             operations::execute_command(&cli, cmd).await?;
         }
         None => {
-            tui::run(&cli.server).await?;
+            tui::run(&cli).await?;
         }
     }
 

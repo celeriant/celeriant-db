@@ -14,6 +14,8 @@ celeriant_crypto = { path = "../celeriant_crypto" }
 celeriant_msg = { path = "../celeriant_msg" }
 celeriant_wire = { path = "../celeriant_wire" }
 celeriant_wal = { path = "../celeriant_wal" }
+serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 futures-util.workspace = true
 tokio-util.workspace = true

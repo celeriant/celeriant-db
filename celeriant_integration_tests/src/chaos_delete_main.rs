@@ -522,14 +522,15 @@ async fn run_writer_task(
                 Ok(_) => {
                     state.record_delete(aggregate_index);
                 }
-                Err(ClientError::CeleriantError(err_resp)) => {
-                    // Error codes 1001 (read) and 4000 (delete) = AggregateNotExists,
-                    // expected for aggregates never written or already deleted.
-                    if err_resp.error_code != 1001 && err_resp.error_code != 4000 {
-                        eprintln!(
-                            "[Writer {}] Delete error: {} ({})",
-                            worker_id, err_resp.error_message, err_resp.error_code
-                        );
+                Err(ClientError::Server(ref err)) => {
+                    use celeriant_client_tokio::server_error::{DeleteError, ReadError, ServerError};
+                    // AggregateNotExists is expected for aggregates never written or already deleted.
+                    let is_expected = matches!(err,
+                        ServerError::Read { kind: ReadError::AggregateNotExists, .. } |
+                        ServerError::Delete { kind: DeleteError::AggregateNotExists, .. }
+                    );
+                    if !is_expected {
+                        eprintln!("[Writer {}] Delete error: {}", worker_id, err);
                         state.delete_errors.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -590,11 +591,8 @@ async fn run_writer_task(
                         .await;
                     event_index += 1;
                 }
-                Err(ClientError::CeleriantError(err_resp)) => {
-                    eprintln!(
-                        "[Writer {}] Write error: {} ({})",
-                        worker_id, err_resp.error_message, err_resp.error_code
-                    );
+                Err(ClientError::Server(err)) => {
+                    eprintln!("[Writer {}] Write error: {}", worker_id, err);
                     state.write_errors.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(e) => {
@@ -644,10 +642,14 @@ async fn run_reader_task(
             Ok(_) => {
                 state.total_reads.fetch_add(1, Ordering::Relaxed);
             }
-            Err(ClientError::CeleriantError(err_resp)) => {
-                // Error codes 1001 (read) and 4000 (delete) = AggregateNotExists,
-                // expected for aggregates not yet written or already deleted.
-                if err_resp.error_code != 1001 && err_resp.error_code != 4000 {
+            Err(ClientError::Server(ref err)) => {
+                use celeriant_client_tokio::server_error::{DeleteError, ReadError, ServerError};
+                // AggregateNotExists is expected for aggregates not yet written or already deleted.
+                let is_expected = matches!(err,
+                    ServerError::Read { kind: ReadError::AggregateNotExists, .. } |
+                    ServerError::Delete { kind: DeleteError::AggregateNotExists, .. }
+                );
+                if !is_expected {
                     state.read_errors.fetch_add(1, Ordering::Relaxed);
                 }
             }

@@ -56,7 +56,10 @@ async fn delete_aggregate(
 fn is_not_found(err: &ClientError) -> bool {
     matches!(
         err,
-        ClientError::CeleriantError(e) if e.error_code == 1001
+        ClientError::Server(celeriant_client_tokio::server_error::ServerError::Read {
+            kind: celeriant_client_tokio::server_error::ReadError::AggregateNotExists,
+            ..
+        })
     )
 }
 

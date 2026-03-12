@@ -3,6 +3,10 @@ use celeriant_msg::process_client_responses::ClientResponse;
 use chrono::{TimeZone, Utc};
 use uuid::Uuid;
 
+pub fn extract_host(address: &str) -> &str {
+    address.split(':').next().unwrap_or(address)
+}
+
 pub fn parse_u128(s: &str) -> Result<u128, String> {
     if s.contains('-') {
         Uuid::parse_str(s)

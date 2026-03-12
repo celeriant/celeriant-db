@@ -309,11 +309,8 @@ async fn run_writer_task(
                     .latest_event_batch_index
                     .fetch_max(event_index, Ordering::Release);
             }
-            Err(ClientError::CeleriantError(err_resp)) => {
-                eprintln!(
-                    "[Writer {}] Server error: {} ({})",
-                    aggregate_id, err_resp.error_message, err_resp.error_code
-                );
+            Err(ClientError::Server(err)) => {
+                eprintln!("[Writer {}] Server error: {}", aggregate_id, err);
                 state.write_errors.fetch_add(1, Ordering::Relaxed);
             }
             Err(e) => {
@@ -377,9 +374,9 @@ async fn run_reader_task(
             Ok(_response) => {
                 state.read_count.fetch_add(1, Ordering::Relaxed);
             }
-            Err(ClientError::CeleriantError(err_resp)) => {
-                // Some errors are expected (e.g., batch not found yet)
-                if !err_resp.error_message.contains("not found") {
+            Err(ClientError::Server(err)) => {
+                // Some errors are expected (e.g., aggregate not found yet)
+                if !matches!(err, celeriant_client_tokio::server_error::ServerError::Read { kind: celeriant_client_tokio::server_error::ReadError::AggregateNotExists, .. }) {
                     state.read_errors.fetch_add(1, Ordering::Relaxed);
                 }
             }

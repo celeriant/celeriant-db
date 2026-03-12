@@ -116,7 +116,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(ClientResponse::GenericError(_)) => {
                     failures.fetch_add(1, Ordering::Relaxed);
                 }
-                Err(ClientError::CeleriantError(_)) => {
+                Err(ClientError::Server(_)) => {
                     failures.fetch_add(1, Ordering::Relaxed);
                 }
                 Ok(_) => {
@@ -243,12 +243,11 @@ async fn read_all_batches(
                     None => return Ok(all_batches),
                 }
             }
-            Err(ClientError::CeleriantError(error_response)) => {
-                if error_response.error_code == 1001 {
-                    return Ok(all_batches);
-                } else {
-                    return Err(format!("Read error: {:?}", error_response).into());
-                }
+            Err(ClientError::Server(celeriant_client_tokio::server_error::ServerError::Read { kind: celeriant_client_tokio::server_error::ReadError::AggregateNotExists, .. })) => {
+                return Ok(all_batches);
+            }
+            Err(ClientError::Server(e)) => {
+                return Err(format!("Read error: {:?}", e).into());
             }
             other => return Err(format!("Unexpected response: {:?}", other).into()),
         }

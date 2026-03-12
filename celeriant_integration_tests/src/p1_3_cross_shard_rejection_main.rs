@@ -144,22 +144,16 @@ async fn test_cross_shard_write_rejection(
         .await;
 
     match response {
-        Err(celeriant_client_tokio::client_error::ClientError::CeleriantError(err_resp)) => {
-            println!("  Received error code: {}", err_resp.error_code);
-            println!("  Error message: {}", err_resp.error_message);
+        Err(celeriant_client_tokio::client_error::ClientError::Server(
+            celeriant_client_tokio::server_error::ServerError::ShardRouting { error_code: 9002, ref error_message }
+        )) => {
+            println!("  Received ShardRouting::IncompatibleFilters error");
+            println!("  Error message: {}", error_message);
 
-            if err_resp.error_code != 9002 {
-                return Err(format!(
-                    "Expected error code 9002 (SHARD_ROUTING_INCOMPATIBLE_FILTERS), got {}",
-                    err_resp.error_code
-                )
-                .into());
-            }
-
-            if !err_resp.error_message.contains("spans multiple shards") {
+            if !error_message.contains("spans multiple shards") {
                 return Err(format!(
                     "Error message doesn't match expected pattern. Got: {}",
-                    err_resp.error_message
+                    error_message
                 )
                 .into());
             }
@@ -263,15 +257,11 @@ async fn test_no_partial_writes(server_address: &str) -> Result<(), Box<dyn std:
         .await
     {
         Ok(_) => return Err("Aggregate on shard 0 already exists before test!".into()),
-        Err(celeriant_client_tokio::client_error::ClientError::CeleriantError(err)) => {
-            if err.error_code != 7001 {
-                return Err(format!(
-                    "Expected error 7001 (not exists), got {}",
-                    err.error_code
-                )
-                .into());
+        Err(celeriant_client_tokio::client_error::ClientError::Server(
+            celeriant_client_tokio::server_error::ServerError::Details {
+                kind: celeriant_client_tokio::server_error::DetailsError::AggregateNotExists, ..
             }
-        }
+        )) => {}
         Err(e) => return Err(format!("Unexpected error for Exists check: {}", e).into()),
     }
 
@@ -280,15 +270,11 @@ async fn test_no_partial_writes(server_address: &str) -> Result<(), Box<dyn std:
         .await
     {
         Ok(resp) => return Err(format!("Aggregate on shard 1 already exists before test! Response: {:?}", resp).into()),
-        Err(celeriant_client_tokio::client_error::ClientError::CeleriantError(err)) => {
-            if err.error_code != 7001 {
-                return Err(format!(
-                    "Expected error 7001 (not exists), got {}",
-                    err.error_code
-                )
-                .into());
+        Err(celeriant_client_tokio::client_error::ClientError::Server(
+            celeriant_client_tokio::server_error::ServerError::Details {
+                kind: celeriant_client_tokio::server_error::DetailsError::AggregateNotExists, ..
             }
-        }
+        )) => {}
         Err(e) => return Err(format!("Unexpected error for Exists check: {}", e).into()),
     }
 
@@ -341,15 +327,11 @@ async fn test_no_partial_writes(server_address: &str) -> Result<(), Box<dyn std:
         .await
     {
         Ok(_) => return Err("Aggregate on shard 0 was created despite rejection!".into()),
-        Err(celeriant_client_tokio::client_error::ClientError::CeleriantError(err)) => {
-            if err.error_code != 7001 {
-                return Err(format!(
-                    "Expected error 7001 (not exists) after rejection, got {}",
-                    err.error_code
-                )
-                .into());
+        Err(celeriant_client_tokio::client_error::ClientError::Server(
+            celeriant_client_tokio::server_error::ServerError::Details {
+                kind: celeriant_client_tokio::server_error::DetailsError::AggregateNotExists, ..
             }
-        }
+        )) => {}
         Err(e) => {
             return Err(format!("Unexpected error for post-write Exists check: {}", e).into())
         }
@@ -360,15 +342,11 @@ async fn test_no_partial_writes(server_address: &str) -> Result<(), Box<dyn std:
         .await
     {
         Ok(_) => return Err("Aggregate on shard 1 was created despite rejection!".into()),
-        Err(celeriant_client_tokio::client_error::ClientError::CeleriantError(err)) => {
-            if err.error_code != 7001 {
-                return Err(format!(
-                    "Expected error 7001 (not exists) after rejection, got {}",
-                    err.error_code
-                )
-                .into());
+        Err(celeriant_client_tokio::client_error::ClientError::Server(
+            celeriant_client_tokio::server_error::ServerError::Details {
+                kind: celeriant_client_tokio::server_error::DetailsError::AggregateNotExists, ..
             }
-        }
+        )) => {}
         Err(e) => {
             return Err(format!("Unexpected error for post-write Exists check: {}", e).into())
         }

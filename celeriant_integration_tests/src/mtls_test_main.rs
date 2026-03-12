@@ -422,7 +422,7 @@ async fn cross_shard_roundtrip(
             .send_request(&request, CompressionType::None)
             .await
         {
-            Ok(_) | Err(celeriant_client_tokio::client_error::ClientError::CeleriantError(_)) => {}
+            Ok(_) | Err(celeriant_client_tokio::client_error::ClientError::Server(_)) => {}
             Err(e) => {
                 return Err(
                     format!("Interleaved request {i} (shard {}) failed: {e}", i % 4).into(),

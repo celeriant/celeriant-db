@@ -90,17 +90,21 @@ fn write_event(
     })
 }
 
-fn expect_error_code(result: Result<impl std::fmt::Debug, ClientError>, expected_code: u32) {
+fn expect_schema_validation_failed(result: Result<impl std::fmt::Debug, ClientError>) {
+    use celeriant_client_tokio::server_error::{SchemaError, ServerError};
     match result {
-        Err(ClientError::CeleriantError(e)) => {
-            assert_eq!(
-                e.error_code, expected_code,
-                "Expected error code {}, got {}: {}",
-                expected_code, e.error_code, e.error_message
-            );
-        }
-        Ok(resp) => panic!("Expected error {}, got success: {:?}", expected_code, resp),
-        Err(e) => panic!("Expected CeleriantError({}), got: {:?}", expected_code, e),
+        Err(ClientError::Server(ServerError::Schema { kind: SchemaError::ValidationFailed, .. })) => {}
+        Ok(resp) => panic!("Expected SchemaValidationFailed, got success: {:?}", resp),
+        Err(e) => panic!("Expected SchemaValidationFailed, got: {:?}", e),
+    }
+}
+
+fn expect_schema_already_exists(result: Result<impl std::fmt::Debug, ClientError>) {
+    use celeriant_client_tokio::server_error::{SchemaError, ServerError};
+    match result {
+        Err(ClientError::Server(ServerError::Schema { kind: SchemaError::AlreadyExists, .. })) => {}
+        Ok(resp) => panic!("Expected SchemaAlreadyExists, got success: {:?}", resp),
+        Err(e) => panic!("Expected SchemaAlreadyExists, got: {:?}", e),
     }
 }
 
@@ -148,25 +152,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Invalid — missing field
     let req = write_event(&agg, 1, 0, br#"{"name":"Bob"}"#, 2, false);
     let result = client.send_request(&req, CompressionType::None).await;
-    expect_error_code(result, 2022);
+    expect_schema_validation_failed(result);
     println!("  Invalid write (missing field) rejected: PASS");
 
     // Invalid — wrong type
     let req = write_event(&agg, 1, 0, br#"{"name":"Carol","age":"thirty"}"#, 2, false);
     let result = client.send_request(&req, CompressionType::None).await;
-    expect_error_code(result, 2022);
+    expect_schema_validation_failed(result);
     println!("  Invalid write (wrong type) rejected: PASS");
 
     // Invalid — non-JSON
     let req = write_event(&agg, 1, 0, b"not json", 2, false);
     let result = client.send_request(&req, CompressionType::None).await;
-    expect_error_code(result, 2022);
+    expect_schema_validation_failed(result);
     println!("  Invalid write (non-JSON) rejected: PASS");
 
     // Duplicate registration
     let req = register_schema_request(1, 100, 1, 0, schema.to_string());
     let result = client.send_request(&req, CompressionType::None).await;
-    expect_error_code(result, 2020);
+    expect_schema_already_exists(result);
     println!("  Duplicate registration rejected: PASS\n");
 
     // ========================================
@@ -187,13 +191,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Invalid write after restart
     let req = write_event(&agg, 1, 0, br#"{"name":"Eve"}"#, 3, false);
     let result = client.send_request(&req, CompressionType::None).await;
-    expect_error_code(result, 2022);
+    expect_schema_validation_failed(result);
     println!("  Invalid write rejected after restart: PASS");
 
     // Duplicate registration after restart
     let req = register_schema_request(1, 100, 1, 0, schema.to_string());
     let result = client.send_request(&req, CompressionType::None).await;
-    expect_error_code(result, 2020);
+    expect_schema_already_exists(result);
     println!("  Duplicate registration rejected after restart: PASS\n");
 
     // ========================================
@@ -216,7 +220,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Invalid write against second schema
     let req = write_event(&agg, 2, 0, br#"{"id":"not_int"}"#, 4, false);
     let result = client.send_request(&req, CompressionType::None).await;
-    expect_error_code(result, 2022);
+    expect_schema_validation_failed(result);
     println!("  Invalid write against second schema rejected: PASS");
 
     // First schema still enforced
@@ -226,7 +230,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let req = write_event(&agg, 1, 0, br#"{"name":"Grace"}"#, 5, false);
     let result = client.send_request(&req, CompressionType::None).await;
-    expect_error_code(result, 2022);
+    expect_schema_validation_failed(result);
     println!("  First schema still enforced (invalid): PASS");
 
     // Unschema'd event type still passes
@@ -251,7 +255,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let req = write_event(&agg, 1, 0, br#"{"age":50}"#, 7, false);
     let result = client.send_request(&req, CompressionType::None).await;
-    expect_error_code(result, 2022);
+    expect_schema_validation_failed(result);
     println!("  First schema invalid write rejected: PASS");
 
     // Second schema still enforced
@@ -261,18 +265,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let req = write_event(&agg, 2, 0, br#"{"id":"nope"}"#, 8, false);
     let result = client.send_request(&req, CompressionType::None).await;
-    expect_error_code(result, 2022);
+    expect_schema_validation_failed(result);
     println!("  Second schema invalid write rejected: PASS");
 
     // Both duplicates rejected
     let req = register_schema_request(1, 100, 1, 0, schema.to_string());
     let result = client.send_request(&req, CompressionType::None).await;
-    expect_error_code(result, 2020);
+    expect_schema_already_exists(result);
     println!("  First schema duplicate rejected: PASS");
 
     let req = register_schema_request(1, 100, 2, 0, schema2.to_string());
     let result = client.send_request(&req, CompressionType::None).await;
-    expect_error_code(result, 2020);
+    expect_schema_already_exists(result);
     println!("  Second schema duplicate rejected: PASS\n");
 
     println!("=== All Zero-Cache Tests Passed ===");

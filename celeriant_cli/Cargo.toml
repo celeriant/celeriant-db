@@ -40,3 +40,4 @@ unicode-width = "0.1"
 rustls.workspace = true
 uuid.workspace = true
 directories.workspace = true
+toml.workspace = true

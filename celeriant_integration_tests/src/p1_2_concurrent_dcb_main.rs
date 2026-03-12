@@ -153,8 +153,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(ClientResponse::GenericError(e)) if e.error_code == 2003 => {
                 println!("  Client 1: OCC FAILURE (error {})", e.error_code);
             }
-            Err(ClientError::CeleriantError(e)) if e.error_code == 2003 => {
-                println!("  Client 1: OCC FAILURE (error {})", e.error_code);
+            Err(ClientError::Server(celeriant_client_tokio::server_error::ServerError::Write {
+                kind: celeriant_client_tokio::server_error::WriteError::OptimisticConcurrencyViolation { .. }, ..
+            })) => {
+                println!("  Client 1: OCC FAILURE (OptimisticConcurrencyViolation)");
             }
             other => {
                 panic!("Client 1: unexpected response: {:?}", other);
@@ -208,8 +210,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(ClientResponse::GenericError(e)) if e.error_code == 2003 => {
                 println!("  Client 2: OCC FAILURE (error {})", e.error_code);
             }
-            Err(ClientError::CeleriantError(e)) if e.error_code == 2003 => {
-                println!("  Client 2: OCC FAILURE (error {})", e.error_code);
+            Err(ClientError::Server(celeriant_client_tokio::server_error::ServerError::Write {
+                kind: celeriant_client_tokio::server_error::WriteError::OptimisticConcurrencyViolation { .. }, ..
+            })) => {
+                println!("  Client 2: OCC FAILURE (OptimisticConcurrencyViolation)");
             }
             other => {
                 panic!("Client 2: unexpected response: {:?}", other);

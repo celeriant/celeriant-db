@@ -178,10 +178,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let result =
         write_with_payload(&mut leader_client, &aggregate_key, 100, 0, b"not json").await;
     match &result {
-        Err(ClientError::CeleriantError(e)) if e.error_code == 2022 => {
+        Err(ClientError::Server(celeriant_client_tokio::server_error::ServerError::Schema { kind: celeriant_client_tokio::server_error::SchemaError::ValidationFailed, .. })) => {
             println!("  Invalid write rejected on leader: PASS");
         }
-        _ => return Err(format!("Expected error 2022 on leader, got: {:?}", result).into()),
+        _ => return Err(format!("Expected SchemaValidationFailed on leader, got: {:?}", result).into()),
     }
 
     // Wait for replication of schema to follower
@@ -223,12 +223,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let result =
         write_with_payload(&mut new_leader_client, &aggregate_key, 100, 0, b"bad data").await;
     match &result {
-        Err(ClientError::CeleriantError(e)) if e.error_code == 2022 => {
+        Err(ClientError::Server(celeriant_client_tokio::server_error::ServerError::Schema { kind: celeriant_client_tokio::server_error::SchemaError::ValidationFailed, .. })) => {
             println!("  Invalid write (non-JSON) rejected on new leader: PASS");
         }
         _ => {
             return Err(
-                format!("Expected error 2022 on new leader, got: {:?}", result).into(),
+                format!("Expected SchemaValidationFailed on new leader, got: {:?}", result).into(),
             )
         }
     }
@@ -243,12 +243,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await;
     match &result {
-        Err(ClientError::CeleriantError(e)) if e.error_code == 2022 => {
+        Err(ClientError::Server(celeriant_client_tokio::server_error::ServerError::Schema { kind: celeriant_client_tokio::server_error::SchemaError::ValidationFailed, .. })) => {
             println!("  Invalid write (missing field) rejected on new leader: PASS");
         }
         _ => {
             return Err(
-                format!("Expected error 2022 on new leader, got: {:?}", result).into(),
+                format!("Expected SchemaValidationFailed on new leader, got: {:?}", result).into(),
             )
         }
     }
@@ -263,12 +263,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await;
     match &result {
-        Err(ClientError::CeleriantError(e)) if e.error_code == 2022 => {
+        Err(ClientError::Server(celeriant_client_tokio::server_error::ServerError::Schema { kind: celeriant_client_tokio::server_error::SchemaError::ValidationFailed, .. })) => {
             println!("  Invalid write (wrong type) rejected on new leader: PASS");
         }
         _ => {
             return Err(
-                format!("Expected error 2022 on new leader, got: {:?}", result).into(),
+                format!("Expected SchemaValidationFailed on new leader, got: {:?}", result).into(),
             )
         }
     }
@@ -278,12 +278,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .send_request(&register_req, CompressionType::None)
         .await;
     match &result {
-        Err(ClientError::CeleriantError(e)) if e.error_code == 2020 => {
+        Err(ClientError::Server(celeriant_client_tokio::server_error::ServerError::Schema { kind: celeriant_client_tokio::server_error::SchemaError::AlreadyExists, .. })) => {
             println!("  Duplicate schema rejected on new leader: PASS");
         }
         _ => {
             return Err(
-                format!("Expected error 2020 on new leader, got: {:?}", result).into(),
+                format!("Expected SchemaAlreadyExists on new leader, got: {:?}", result).into(),
             )
         }
     }

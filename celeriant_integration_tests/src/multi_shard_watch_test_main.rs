@@ -398,6 +398,7 @@ async fn test_max_shard_hint_skips_probe(
         start_shard: 0,
         max_shard_hint: Some(2), // Tell it there are 3 shards (0..2), skip probe
         tls_config: None,
+        identity_config: None,
     };
 
     let watch = WatchConnection::connect(address, watch_request, options).await?;

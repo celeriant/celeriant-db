@@ -22,11 +22,7 @@ use rustls::pki_types::ServerName;
 use std::{collections::HashMap, fs};
 
 use crate::cli::*;
-use crate::utils::{format_response, format_timestamp, format_u128_uuid};
-
-fn extract_host(address: &str) -> &str {
-    address.split(':').next().unwrap_or(address)
-}
+use crate::utils::{extract_host, format_response, format_timestamp, format_u128_uuid};
 
 fn build_tls_config(cli: &Cli) -> Result<Option<ClientTlsConfig>> {
     if !cli.tls {

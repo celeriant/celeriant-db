@@ -3,6 +3,7 @@ use std::{cell::{Cell, RefCell}, collections::HashMap, fmt, future::Future, rc::
 use base64::Engine;
 use celeriant_distributed::{heartbeat::now_ms, lease_manager::LeaseManager, lease_store::LeaseStore, node_status::NodeStatus, validated_node_status::ValidatedNodeStatus};
 use celeriant_msg::{
+    error_codes,
     process_client_requests::ClientRequest,
     process_client_responses::ClientResponse,
     process_cluster_requests::ClusterRequest,
@@ -25,7 +26,7 @@ use tracing::{debug, info, warn};
 use super::{
     intrashard_messages::IntrashardMessages,
     shard_config::ShardConfig,
-    shard_error_response::{shard_error_to_client_response, shard_error_to_cluster_response, shard_routing_error_to_code, watch_read_error_to_client_response, watch_session_error_to_client_response, IDENTIFY_INVALID_NONCE, IDENTIFY_INVALID_SIGNATURE, IDENTIFY_MISMATCH, IDENTIFY_REQUIRED},
+    shard_error_response::{shard_error_to_client_response, shard_error_to_cluster_response, shard_routing_error_to_code, watch_read_error_to_client_response, watch_session_error_to_client_response},
 };
 
 struct ConnectionGuard<'a>(&'a [(&'static str, String); 1]);
@@ -163,7 +164,7 @@ pub fn handle_new_connection<R: ReplicationClient + 'static, D: S3Downloader + '
                         if ctx.config.require_client_identity {
                             let response = ClientResponse::GenericError(ErrorResponse {
                                 correlation_id: request.correlation_id(),
-                                error_code: IDENTIFY_REQUIRED,
+                                error_code: error_codes::IDENTIFY_REQUIRED,
                                 error_message: "Server requires client identity verification".to_string(),
                             });
                             let _ = write_client_response_with_timeout(&mut tcp_stream, &response, ctx.config.max_response_size, ctx.config.server_compression_algorithm, version, ctx.config.slow_client_timeout).await;
@@ -277,7 +278,7 @@ async fn handle_client_pipelining<R: ReplicationClient + 'static, D: S3Downloade
             if !is_valid_for_access_level(&request, conn_state.access_level) {
                 let response = ClientResponse::GenericError(ErrorResponse {
                     correlation_id: request.correlation_id(),
-                    error_code: ErrorResponse::AUTH_INSUFFICIENT_PERMISSIONS,
+                    error_code: error_codes::AUTH_INSUFFICIENT_PERMISSIONS,
                     error_message: "Insufficient permissions for this operation".to_string(),
                 });
                 let _ = write_client_response_with_timeout(&mut tcp_stream, &response, max_response_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
@@ -389,7 +390,7 @@ fn handle_identify(req: &celeriant_msg::request::requests::IdentifyRequest, conn
                 debug!("Identity rejected: nonce expired or clock skew");
                 return Err(ClientResponse::GenericError(ErrorResponse {
                     correlation_id: req.correlation_id,
-                    error_code: IDENTIFY_INVALID_NONCE,
+                    error_code: error_codes::IDENTIFY_INVALID_NONCE,
                     error_message: "Nonce expired or too far in the future".to_string(),
                 }));
             }
@@ -397,7 +398,7 @@ fn handle_identify(req: &celeriant_msg::request::requests::IdentifyRequest, conn
                 debug!("Identity rejected: invalid signature");
                 return Err(ClientResponse::GenericError(ErrorResponse {
                     correlation_id: req.correlation_id,
-                    error_code: IDENTIFY_INVALID_SIGNATURE,
+                    error_code: error_codes::IDENTIFY_INVALID_SIGNATURE,
                     error_message: "Invalid signature".to_string(),
                 }));
             }
@@ -409,7 +410,7 @@ fn handle_identify(req: &celeriant_msg::request::requests::IdentifyRequest, conn
         let api_key_str = req.api_key.as_ref().ok_or_else(|| {
             ClientResponse::GenericError(ErrorResponse {
                 correlation_id: req.correlation_id,
-                error_code: ErrorResponse::AUTH_REQUIRED,
+                error_code: error_codes::AUTH_REQUIRED,
                 error_message: "API key required but not provided".to_string(),
             })
         })?;
@@ -419,7 +420,7 @@ fn handle_identify(req: &celeriant_msg::request::requests::IdentifyRequest, conn
             .map_err(|_| {
                 ClientResponse::GenericError(ErrorResponse {
                     correlation_id: req.correlation_id,
-                    error_code: ErrorResponse::AUTH_INVALID_KEY,
+                    error_code: error_codes::AUTH_INVALID_KEY,
                     error_message: "Invalid API key format".to_string(),
                 })
             })?;
@@ -427,7 +428,7 @@ fn handle_identify(req: &celeriant_msg::request::requests::IdentifyRequest, conn
         if api_key_bytes.len() != 32 {
             return Err(ClientResponse::GenericError(ErrorResponse {
                 correlation_id: req.correlation_id,
-                error_code: ErrorResponse::AUTH_INVALID_KEY,
+                error_code: error_codes::AUTH_INVALID_KEY,
                 error_message: "Invalid API key length".to_string(),
             }));
         }
@@ -441,7 +442,7 @@ fn handle_identify(req: &celeriant_msg::request::requests::IdentifyRequest, conn
             debug!("Identity rejected: invalid API key");
             ClientResponse::GenericError(ErrorResponse {
                 correlation_id: req.correlation_id,
-                error_code: ErrorResponse::AUTH_INVALID_KEY,
+                error_code: error_codes::AUTH_INVALID_KEY,
                 error_message: "Invalid API key".to_string(),
             })
         })?;
@@ -471,7 +472,7 @@ fn validate_client_id(request: &ClientRequest, verified_client_id: Option<u128>)
         if claimed != verified {
             return Err(ClientResponse::GenericError(ErrorResponse {
                 correlation_id: request.correlation_id(),
-                error_code: IDENTIFY_MISMATCH,
+                error_code: error_codes::IDENTIFY_MISMATCH,
                 error_message: format!(
                     "client_id mismatch: request has {}, connection verified as {}",
                     claimed, verified
@@ -521,6 +522,11 @@ async fn check_client_redirect<R: ReplicationClient + 'static, D: S3Downloader +
     };
 
     if target_shard != ctx.current_shard_id {
+        debug!(
+            from_shard = ctx.current_shard_id,
+            to_shard = target_shard,
+            "Client connection redirected to another shard"
+        );
         metrics::counter!("celeriant_connection_redirects_total").increment(1);
         let msg = IntrashardMessages::ClientConnectionRedirect {
             accepted_tcp_stream: tcp_stream.into_accepted(),
@@ -1740,7 +1746,7 @@ mod tests {
         let result = super::validate_client_id(&req, Some(888));
         assert!(result.is_err());
         if let Err(ClientResponse::GenericError(err)) = result {
-            assert_eq!(err.error_code, IDENTIFY_MISMATCH);
+            assert_eq!(err.error_code, error_codes::IDENTIFY_MISMATCH);
             assert!(err.error_message.contains("999"));
             assert!(err.error_message.contains("888"));
         } else {

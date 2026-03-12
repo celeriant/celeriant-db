@@ -32,7 +32,7 @@ async fn send_probe(
     request: &ClientRequest,
 ) -> Result<(), ClientError> {
     match client.send_request(request, CompressionType::None).await {
-        Ok(_) | Err(ClientError::CeleriantError(_)) => Ok(()),
+        Ok(_) | Err(ClientError::Server(_)) => Ok(()),
         Err(e) => Err(e),
     }
 }

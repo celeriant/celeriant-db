@@ -603,6 +603,7 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "toml",
  "tui-textarea",
  "unicode-width",
  "uuid",
@@ -635,6 +636,8 @@ dependencies = [
  "futures-util",
  "rustls",
  "rustls-pki-types",
+ "serde",
+ "serde_json",
  "tokio",
  "tokio-rustls",
  "tokio-util",
@@ -681,6 +684,7 @@ dependencies = [
  "celeriant_wal",
  "celeriant_wire",
  "futures",
+ "tracing",
 ]
 
 [[package]]
@@ -709,6 +713,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rustls",
  "rustls-pki-types",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

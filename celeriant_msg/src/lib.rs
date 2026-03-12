@@ -1,3 +1,4 @@
+pub mod error_codes;
 pub mod process_client_requests;
 pub mod process_client_responses;
 pub mod process_cluster_requests;

@@ -239,7 +239,7 @@ async fn test_read_only_key_blocks_writes(
         }
     }
 
-    // Now verify write fails with AUTH_INSUFFICIENT_PERMISSIONS (1003)
+    // Now verify write fails with AUTH_INSUFFICIENT_PERMISSIONS
     let event = create_test_event(2);
     let mut writes = HashMap::new();
     writes.insert(
@@ -266,17 +266,12 @@ async fn test_read_only_key_blocks_writes(
         .await;
 
     match result {
-        Err(ClientError::CeleriantError(err)) => {
-            if err.error_code == 1003 {
-                println!("  ✓ Received expected error code 1003 (AUTH_INSUFFICIENT_PERMISSIONS)");
-                println!("  Error message: {}", err.error_message);
-            } else {
-                return Err(format!(
-                    "Expected error code 1003, got {} - {}",
-                    err.error_code, err.error_message
-                )
-                .into());
-            }
+        Err(ClientError::Server(celeriant_client_tokio::server_error::ServerError::Auth {
+            kind: celeriant_client_tokio::server_error::AuthError::InsufficientPermissions,
+            ref error_message,
+        })) => {
+            println!("  ✓ Received expected AUTH_INSUFFICIENT_PERMISSIONS error");
+            println!("  Error message: {}", error_message);
         }
         Ok(response) => {
             return Err(format!(
@@ -316,17 +311,12 @@ async fn test_invalid_key_rejected(
     let result = client.identify(&identity_config).await;
 
     match result {
-        Err(ClientError::CeleriantError(err)) => {
-            if err.error_code == 1002 {
-                println!("  ✓ Received expected error code 1002 (AUTH_INVALID_KEY)");
-                println!("  Error message: {}", err.error_message);
-            } else {
-                return Err(format!(
-                    "Expected error code 1002, got {} - {}",
-                    err.error_code, err.error_message
-                )
-                .into());
-            }
+        Err(ClientError::Server(celeriant_client_tokio::server_error::ServerError::Auth {
+            kind: celeriant_client_tokio::server_error::AuthError::InvalidKey,
+            ref error_message,
+        })) => {
+            println!("  ✓ Received expected AUTH_INVALID_KEY error");
+            println!("  Error message: {}", error_message);
         }
         Ok(_) => {
             return Err("Expected AUTH_INVALID_KEY error, got success".into());
@@ -359,17 +349,12 @@ async fn test_missing_key_when_required(
     let result = client.identify(&identity_config).await;
 
     match result {
-        Err(ClientError::CeleriantError(err)) => {
-            if err.error_code == 1001 {
-                println!("  ✓ Received expected error code 1001 (AUTH_REQUIRED)");
-                println!("  Error message: {}", err.error_message);
-            } else {
-                return Err(format!(
-                    "Expected error code 1001, got {} - {}",
-                    err.error_code, err.error_message
-                )
-                .into());
-            }
+        Err(ClientError::Server(celeriant_client_tokio::server_error::ServerError::Auth {
+            kind: celeriant_client_tokio::server_error::AuthError::AuthRequired,
+            ref error_message,
+        })) => {
+            println!("  ✓ Received expected AUTH_REQUIRED error");
+            println!("  Error message: {}", error_message);
         }
         Ok(_) => {
             return Err("Expected AUTH_REQUIRED error, got success".into());

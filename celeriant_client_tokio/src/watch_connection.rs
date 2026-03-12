@@ -1,16 +1,16 @@
+use celeriant_crypto::Crypto;
+use celeriant_msg::error_codes;
 use celeriant_msg::process_client_requests::ClientRequest;
 use celeriant_msg::process_client_responses::ClientResponse;
-use celeriant_msg::request::requests::WatchRequest;
+use celeriant_msg::process_identify::{IDENTIFY_RESPONSE_TYPE_ID, read_identify_response, write_identify_request};
+use celeriant_msg::request::requests::{IdentifyRequest, WatchRequest};
 use celeriant_msg::response::responses::WatchResponse;
 use celeriant_wal::compression_type::CompressionType;
-use celeriant_wire::network::wire_header::PROTOCOL_VERSION_V2;
+use celeriant_wire::network::wire_header::{PROTOCOL_VERSION_V2, WireHeader};
 use tokio::time::{timeout, Duration};
 
-use crate::celeriant_client::ClientTlsConfig;
+use crate::celeriant_client::{ClientIdentityConfig, ClientStream, ClientTlsConfig};
 use crate::client_error::ClientError;
-
-const SHARD_ROUTING_MULTIPLE_SHARDS: u32 = 9001;
-const SHARD_ROUTING_INCOMPATIBLE_FILTERS: u32 = 9002;
 
 /// Options for configuring a watch connection
 #[derive(Clone)]
@@ -20,6 +20,7 @@ pub struct WatchOptions {
     pub start_shard: u64,
     pub max_shard_hint: Option<u64>,
     pub tls_config: Option<ClientTlsConfig>,
+    pub identity_config: Option<ClientIdentityConfig>,
 }
 
 impl Default for WatchOptions {
@@ -30,6 +31,7 @@ impl Default for WatchOptions {
             start_shard: 0,
             max_shard_hint: None,
             tls_config: None,
+            identity_config: None,
         }
     }
 }
@@ -65,6 +67,41 @@ enum WatchMode {
 struct MultiShardState {
     receiver: tokio::sync::mpsc::UnboundedReceiver<Result<WatchResponse, ClientError>>,
     _tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+async fn identify_stream(
+    stream: &mut ClientStream,
+    identity: &ClientIdentityConfig,
+) -> Result<(), ClientError> {
+    let (public_key, nonce, signature) = match (&identity.public_key, &identity.private_key) {
+        (Some(pub_key), Some(priv_key)) => {
+            let n = Crypto::generate_nonce()?;
+            let sig = Crypto::sign_nonce(priv_key, &n)?;
+            (Some(pub_key.clone()), Some(n), Some(sig))
+        }
+        _ => (None, None, None),
+    };
+
+    let req = IdentifyRequest {
+        correlation_id: None,
+        public_key,
+        nonce,
+        signature,
+        api_key: identity.api_key.clone(),
+    };
+
+    write_identify_request(stream, &req, PROTOCOL_VERSION_V2).await?;
+
+    let header = WireHeader::from_reader(stream, 10_000_000).await?;
+    if header.message_type == IDENTIFY_RESPONSE_TYPE_ID {
+        read_identify_response(header, stream).await?;
+        return Ok(());
+    }
+    let response = ClientResponse::read_from_header(header, stream).await?;
+    match response {
+        ClientResponse::GenericError(err) => Err(ClientError::from_error_response(err)),
+        _ => Err(ClientError::ProtocolError),
+    }
 }
 
 fn spawn_shard_readers(streams: Vec<ShardStream>) -> MultiShardState {
@@ -128,6 +165,10 @@ impl WatchConnection {
         )
         .await?;
 
+        if let Some(ref identity) = options.identity_config {
+            identify_stream(&mut stream, identity).await?;
+        }
+
         // Send initial watch request without shard_id
         ClientRequest::write_request(
             &mut stream,
@@ -148,8 +189,8 @@ impl WatchConnection {
                 }),
             }),
             ClientResponse::GenericError(error)
-                if error.error_code == SHARD_ROUTING_MULTIPLE_SHARDS
-                    || error.error_code == SHARD_ROUTING_INCOMPATIBLE_FILTERS =>
+                if error.error_code == error_codes::SHARD_ROUTING_MULTIPLE_SHARDS
+                    || error.error_code == error_codes::SHARD_ROUTING_INCOMPATIBLE_FILTERS =>
             {
                 let num_shards = Self::parse_num_shards(&error.error_message)?;
 
@@ -244,6 +285,10 @@ impl WatchConnection {
             options.tls_config.as_ref(),
         )
         .await?;
+
+        if let Some(ref identity) = options.identity_config {
+            identify_stream(&mut stream, identity).await?;
+        }
 
         let mut shard_request = request.clone();
         shard_request.shard_id = Some(shard_id);

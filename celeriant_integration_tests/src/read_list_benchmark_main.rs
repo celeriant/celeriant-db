@@ -487,7 +487,7 @@ async fn read_worker(
                 count += 1;
             }
             Ok(_) => errors += 1,
-            Err(ClientError::CeleriantError(_)) => errors += 1,
+            Err(ClientError::Server(_)) => errors += 1,
             Err(ClientError::RequestTimeout) => errors += 1,
             Err(_) => {
                 errors += 1;
@@ -566,7 +566,7 @@ async fn list_worker(
                     errors += 1;
                     break;
                 }
-                Err(ClientError::CeleriantError(_)) => {
+                Err(ClientError::Server(_)) => {
                     errors += 1;
                     break;
                 }
@@ -651,8 +651,8 @@ async fn write_worker(
                 latencies.push(t.elapsed().as_millis() as u64);
                 count += 1;
             }
-            Err(ClientError::CeleriantError(e)) => {
-                eprintln!("  Writer {} error: {} ({})", id, e.error_message, e.error_code);
+            Err(ClientError::Server(e)) => {
+                eprintln!("  Writer {} error: {}", id, e);
                 errors += 1;
             }
             Err(ClientError::RequestTimeout) => errors += 1,

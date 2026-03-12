@@ -1,3 +1,5 @@
+use tracing::debug;
+
 use celeriant_wal::s3::lease::Lease;
 use celeriant_wal::s3::membership::{Membership, NodeInfo};
 
@@ -71,6 +73,7 @@ impl<S: LeaseStore> LeaseManager<S> {
 
         match self.store.get_lease().await? {
             None => {
+                debug!("Election: no existing lease in S3 — racing to create");
                 let lease = Lease::new_initial(
                     self.config.node_id,
                     now,
@@ -93,9 +96,20 @@ impl<S: LeaseStore> LeaseManager<S> {
             Some(lwe) if !lwe.lease.is_expired(now)
                 && lwe.lease.leader_node_id != self.config.node_id =>
             {
+                debug!(
+                    observed_lease_index = lwe.lease.lease_index,
+                    leader_node_id = lwe.lease.leader_node_id,
+                    "Election: valid lease held by another node — becoming follower"
+                );
                 self.become_follower(&lwe.lease).await
             }
             Some(lwe) => {
+                debug!(
+                    observed_lease_index = lwe.lease.lease_index,
+                    leader_node_id = lwe.lease.leader_node_id,
+                    expired = lwe.lease.is_expired(now),
+                    "Election: existing lease found — racing CAS"
+                );
                 let promoted = lwe.lease.promote(
                     self.config.node_id,
                     now,

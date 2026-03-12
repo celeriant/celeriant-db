@@ -1136,20 +1136,20 @@ pub async fn count_events(
                 other => return Err(format!("Unexpected response: {:?}", other).into()),
             },
             Err(e) => match &e {
-                celeriant_client_tokio::client_error::ClientError::CeleriantError(error_response) => {
-                    if error_response.error_code == 1001 {
-                        return Ok(total);
-                    } else if error_response.error_code == 1000 {
-                        // UnavailableBatchIndex — trimmed data, retry from minimum_available
-                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&error_response.error_message) {
-                            if let Some(min) = parsed["minimum_available"].as_u64() {
+                celeriant_client_tokio::client_error::ClientError::Server(
+                    celeriant_client_tokio::server_error::ServerError::Read { kind, error_message: _ }
+                ) => {
+                    use celeriant_client_tokio::server_error::ReadError;
+                    match kind {
+                        ReadError::AggregateNotExists => return Ok(total),
+                        ReadError::UnavailableBatchIndex { minimum_available_batch_index, .. } => {
+                            if let Some(&min) = minimum_available_batch_index.as_ref() {
                                 from_batch = min;
                                 continue;
                             }
+                            return Err(Box::new(e));
                         }
-                        return Err(Box::new(e));
-                    } else {
-                        return Err(Box::new(e));
+                        _ => return Err(Box::new(e)),
                     }
                 }
                 _ => return Err(Box::new(e)),

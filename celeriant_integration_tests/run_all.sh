@@ -95,6 +95,9 @@ TESTS=(
   schema_failover_main
   schema_follower_crash_main
   schema_old_leader_recovery_main
+  # --- Tokio client typed operations ---
+  typed_operations_main
+  pool_test_main
   # --- Compaction ---
   compaction_standalone_main
   compaction_restart_main

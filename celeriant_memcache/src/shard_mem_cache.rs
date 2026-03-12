@@ -90,6 +90,7 @@ pub struct ShardMemCache<V: Validate> {
     /// Flag set when replication rollback occurs, cleared by following leader
     /// Used to distinguish "empty queue due to rollback" from "empty queue due to race".
     replication_rollback_occurred: bool,
+
 }
 
 impl<V: Validate> ShardMemCache<V> {

@@ -68,6 +68,7 @@ pub(crate) async fn commit_fsync_with_rollback(
         shard_id,
         batch_count = batch_size,
         required_disk_bytes = captured.required_disk_space,
+        is_leader = node_status.is_leader(),
         "Fsync batch captured"
     );
 
