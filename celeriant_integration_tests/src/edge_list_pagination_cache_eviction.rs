@@ -30,7 +30,7 @@
 //! Run with: cargo run --bin edge_list_pagination_cache_eviction_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{write_event, write_large_event, ServerConfig, TestServer};
+use crate::{write_event, write_large_event, ServerConfig, TestServer};
 use celeriant_msg::process_client_requests::ClientRequest;
 use celeriant_msg::process_client_responses::ClientResponse;
 use celeriant_msg::request::requests::ListAggregatesRequest;
@@ -38,10 +38,9 @@ use celeriant_runtimes::RoutingRule;
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::compression_type::CompressionType;
 use std::collections::HashSet;
-use std::time::Duration;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Edge Case: List Pagination Across Cache Eviction ===\n");
 
     let port_base = 17500 + (std::process::id() % 100) as u16;
@@ -193,9 +192,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
             .map_err(|e| format!("Cache eviction write failed on page {}: {}", page_num, e))?;
         scratch_event += 1;
-
-        // Tiny pause to let the write settle.
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     println!(

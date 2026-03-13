@@ -17,14 +17,14 @@
 //! Run with: cargo run --bin s3_stale_lease_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{count_events, write_event, MinioContainer, ServerConfig, TestServer};
+use crate::{count_events, write_event, MinioContainer, ServerConfig, TestServer};
 use celeriant_runtimes::RoutingRule;
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wire::disk::versioned_block::deserialise_lease;
 use std::time::Duration;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== S3 Stale Lease Integration Test ===\n");
 
     let port_base = 12100 + (std::process::id() % 100) as u16;
@@ -91,8 +91,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 1..=3 {
         write_event(&mut leader_client, &aggregate_key, i, i == 1).await?;
     }
-
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
     let follower_count = count_events(&mut follower_client, &aggregate_key).await?;
@@ -193,9 +191,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         write_event(&mut leader_client, &aggregate_key, i, false).await?;
     }
     println!("  ✓ Leader accepted writes");
-
-    println!("  Waiting for replication...");
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let mut restarted_follower_client = CeleriantClient::connect(follower.address()).await?;
     let final_follower_count = count_events(&mut restarted_follower_client, &aggregate_key).await?;

@@ -86,6 +86,8 @@ impl ConnState {
         }
         if self.client.is_none() {
             let addr = address.as_deref().ok_or(ClientError::NoAddress)?;
+            let has_tls = replication_client_config.is_some();
+            debug!(addr, has_tls, reset, "internode: connecting");
             let tls_config = replication_client_config
                 .map(|c| GlommioTlsConfig::from_address(c.clone(), addr))
                 .transpose()
@@ -100,6 +102,7 @@ impl ConnState {
                 tls_config,
             )
             .await?;
+            debug!(addr, "internode: connected");
             self.client = Some(match request_timeout {
                 Some(t) => client.with_timeout(t),
                 None => client,
@@ -255,8 +258,15 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
 
         let response = match guard.client.as_mut().unwrap().send_cluster_request(&request, CompressionType::None).await {
             Ok(r) => r,
-            Err(_) => {
-                guard.ensure_connected(&address, true, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref()).await?;
+            Err(e) => {
+                debug!(shard_id = self.shard_id, error = ?e, "heartbeat send failed, reconnecting");
+                match guard.ensure_connected(&address, true, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref()).await {
+                    Ok(()) => debug!(shard_id = self.shard_id, "heartbeat reconnected, retrying"),
+                    Err(reconnect_err) => {
+                        debug!(shard_id = self.shard_id, error = ?reconnect_err, "heartbeat reconnect failed");
+                        return Err(SendHeartbeatError::from(reconnect_err));
+                    }
+                }
                 guard.client.as_mut().unwrap().send_cluster_request(&request, CompressionType::None).await?
             }
         };

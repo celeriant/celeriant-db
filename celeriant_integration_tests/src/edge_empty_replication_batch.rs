@@ -16,14 +16,14 @@
 //! Run with: cargo run --bin edge_empty_replication_batch_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{
+use crate::{
     count_events, is_leader, s3_cluster_config, write_event, MinioContainer, TestServer,
 };
 use celeriant_wal::aggregate_key::AggregateKey;
 use std::time::Duration;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Edge Case: Empty Replication Batch ===\n");
 
     let port_base = 13900 + (std::process::id() % 100) as u16;
@@ -103,8 +103,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ========================================
     println!("\nPHASE 3: Verify follower received the event");
     println!("--------------------------------------------");
-    println!("  Waiting 5s for replication...");
-    tokio::time::sleep(Duration::from_secs(5)).await;
 
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
     let count = count_events(&mut follower_client, &key).await.map_err(|e| {

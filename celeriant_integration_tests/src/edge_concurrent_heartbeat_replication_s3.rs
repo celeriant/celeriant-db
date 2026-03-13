@@ -24,15 +24,15 @@
 //! Run with: cargo run --bin edge_concurrent_heartbeat_replication_s3_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{
+use crate::{
     count_events, is_leader, s3_cluster_config, write_event, write_large_event, MinioContainer,
     TcpProxy, TestServer,
 };
 use celeriant_wal::aggregate_key::AggregateKey;
 use std::time::Duration;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Regression Guard: Concurrent Heartbeat + Replication + S3 Upload ===\n");
     println!("This test guards against the no-lock S3 path regression in FollowerConnection.");
     println!("If S3 uploads hold the replication lock, heartbeats stall during fallback,");
@@ -114,7 +114,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut leader_client = CeleriantClient::connect(leader.address()).await?;
     write_event(&mut leader_client, &key_shard0, 1, true).await?;
     write_event(&mut leader_client, &key_shard1, 1, true).await?;
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Confirm baseline replication works before stressing.
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;

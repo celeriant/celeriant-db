@@ -15,7 +15,7 @@ use std::sync::Arc;
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::ClientTlsConfig;
 use celeriant_crypto::pki::PkiManager;
-use celeriant_integration_tests::{ServerConfig, TestPki, TestServer};
+use crate::{ServerConfig, TestPki, TestServer};
 use celeriant_lib::server_config::{ConfigClientAuth, ConfigTlsMode};
 use celeriant_msg::{
     process_client_requests::ClientRequest,
@@ -37,8 +37,8 @@ fn test_port(offset: u16) -> u16 {
     10400 + (std::process::id() % 100) as u16 + offset * 2
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== mTLS Integration Tests ===\n");
 
     if let Err(e) = celeriant_ktls::verify_ktls_support() {

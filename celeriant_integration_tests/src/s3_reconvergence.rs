@@ -12,14 +12,14 @@
 //! Run with: cargo run --bin s3_reconvergence_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{count_events, write_event, MinioContainer, ServerConfig, TestServer, TcpProxy};
+use crate::{count_events, write_event, MinioContainer, ServerConfig, TestServer, TcpProxy};
 use celeriant_runtimes::RoutingRule;
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wire::disk::versioned_block::deserialise_lease;
 use std::time::Duration;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== S3 Reconvergence Integration Test ===\n");
 
     let port_base = 13100 + (std::process::id() % 100) as u16;
@@ -103,9 +103,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 1..=3 {
         write_event(&mut leader_client, &aggregate_key, i, i == 1).await?;
     }
-
-    println!("  Waiting for replication through proxy...");
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let follower_count = count_events(&mut follower_client, &aggregate_key).await?;
     assert_eq!(follower_count, 3, "Follower should have 3 events (replication through proxy)");

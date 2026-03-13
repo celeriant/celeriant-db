@@ -16,20 +16,20 @@
 //! Run with: cargo run --bin p2_3_wal_corruption_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{count_events, write_event, TestServer};
+use crate::{count_events, write_event, TestServer};
 use celeriant_wal::aggregate_key::AggregateKey;
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 use std::time::Duration;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== P2-3: WAL On-Disk Corruption Detection on Restart ===\n");
 
     let port_base = 20300;
     let port = port_base;
 
-    let config = celeriant_integration_tests::ServerConfig {
+    let config = crate::ServerConfig {
         num_shards: Some(1),
         log_level: "warn".to_string(),
         standalone: true,

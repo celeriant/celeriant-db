@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{
+use crate::{
     count_events, s3_cluster_config, write_event, MinioContainer, TcpProxy, TestServer,
 };
 use celeriant_msg::process_client_requests::ClientRequest;
@@ -44,8 +44,8 @@ const PROXY_PORT: u16 = 11200;
 
 const FOLLOWER_ADDRESS: &str = "127.0.0.1:11100";
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Debug Follower Pressure Test (follower launched externally) ===\n");
 
     // ========================================
@@ -166,8 +166,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 1..=3 {
         write_event(&mut leader_client, &probe_shard0, base + i, false).await?;
     }
-
-    tokio::time::sleep(Duration::from_secs(3)).await;
 
     let mut follower_client = CeleriantClient::connect(FOLLOWER_ADDRESS).await?;
     let fc = count_events(&mut follower_client, &probe_shard0).await?;

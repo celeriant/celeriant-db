@@ -7,7 +7,7 @@
 //! Run with: cargo run --bin follower_read_snapshot_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{
+use crate::{
     count_events, s3_cluster_config, write_event, MinioContainer, TestServer,
 };
 use celeriant_msg::process_client_requests::ClientRequest;
@@ -73,8 +73,8 @@ async fn trim_aggregate(
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Follower Read Snapshot Test ===\n");
 
     // Setup cluster
@@ -111,9 +111,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         write_event(&mut leader_client, &key_basic, i, i == 1).await?;
     }
 
-    println!("  Waiting for replication...");
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
     let leader_count = count_events(&mut leader_client, &key_basic).await?;
     let follower_count = count_events(&mut follower_client, &key_basic).await?;
     println!("  leader={}, follower={}", leader_count, follower_count);
@@ -128,11 +125,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 1..=10 {
         write_event(&mut leader_client, &key_trim, i, i == 1).await?;
     }
-    tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Trim first 5 batches
     trim_aggregate(&mut leader_client, &key_trim, 6).await?;
-    tokio::time::sleep(Duration::from_secs(3)).await;
 
     let leader_count = count_events(&mut leader_client, &key_trim).await?;
     let follower_count = count_events(&mut follower_client, &key_trim).await?;
@@ -147,7 +142,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 1..=3 {
         write_event(&mut leader_client, &key_delete, i, i == 1).await?;
     }
-    tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Verify exists before delete
     let follower_count = count_events(&mut follower_client, &key_delete).await?;
@@ -155,7 +149,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Delete the aggregate
     delete_aggregate(&mut leader_client, &key_delete, false).await?;
-    tokio::time::sleep(Duration::from_secs(3)).await;
 
     // After delete, follower should return 0 or an error
     let leader_count = count_events(&mut leader_client, &key_delete).await?;
@@ -172,17 +165,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 1..=3 {
         write_event(&mut leader_client, &key_recreate, i, i == 1).await?;
     }
-    tokio::time::sleep(Duration::from_secs(3)).await;
 
     delete_aggregate(&mut leader_client, &key_recreate, true).await?;
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Recreate with new events — use allow_create but don't assert batch index 0
     // since the aggregate's batch index continues from before deletion.
     for i in 1..=2 {
         write_event(&mut leader_client, &key_recreate, 100 + i, i == 1).await?;
     }
-    tokio::time::sleep(Duration::from_secs(3)).await;
 
     let leader_count = count_events(&mut leader_client, &key_recreate).await?;
     let follower_count = count_events(&mut follower_client, &key_recreate).await?;

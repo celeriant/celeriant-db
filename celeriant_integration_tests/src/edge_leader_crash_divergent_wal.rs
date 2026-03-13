@@ -32,7 +32,7 @@
 //! Run with: cargo run --bin edge_leader_crash_divergent_wal_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{
+use crate::{
     copy_shard_dirs, count_events, s3_cluster_config, write_event, write_large_event,
     MinioContainer, RoutingRule, ServerConfig, TestServer,
 };
@@ -42,8 +42,8 @@ use tempfile::TempDir;
 
 const PORT_BASE: u16 = 18700;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Edge Case: Leader Crash Before Replication — Divergent WAL Recovery ===\n");
     println!("Tests the split-brain scenario where a leader fsyncs a write but crashes");
     println!("before replication. The old leader restarts with a divergent WAL.\n");
@@ -319,9 +319,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     write_event(&mut client_b, &aggregate_key, 15, false).await?;
     write_event(&mut client_b, &aggregate_key, 16, false).await?;
     println!("  Wrote events 15-16 to leader B.");
-
-    println!("  Waiting 10s for replication B -> A...");
-    tokio::time::sleep(Duration::from_secs(10)).await;
 
     let b_final = count_events(&mut client_b, &aggregate_key).await?;
     assert_eq!(b_final, 16, "B should have 16 events, got {}", b_final);

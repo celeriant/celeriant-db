@@ -14,12 +14,12 @@
 //! Run with: cargo run --bin s3_fallback_s3_down_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{count_events, s3_cluster_config, write_event, MinioContainer, TestServer};
+use crate::{count_events, s3_cluster_config, write_event, MinioContainer, TestServer};
 use celeriant_wal::aggregate_key::AggregateKey;
 use std::time::Duration;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== S3 Goes Down Integration Test ===\n");
 
     let port_base = 10900 + (std::process::id() % 100) as u16;
@@ -58,9 +58,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 1..=3 {
         write_event(&mut leader_client, &aggregate_key, i, i == 1).await?;
     }
-
-    println!("  Waiting for replication...");
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
     let follower_count = count_events(&mut follower_client, &aggregate_key).await?;

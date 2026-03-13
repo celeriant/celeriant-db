@@ -19,7 +19,7 @@
 //! Run with: cargo run --bin edge_stale_cache_rotation_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{
+use crate::{
     count_events, s3_cluster_config, write_event, write_large_event, MinioContainer, TestServer,
 };
 use celeriant_runtimes::RoutingRule;
@@ -48,8 +48,8 @@ async fn verify_aggregate_counts(
     failures
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Edge Case: Stale Cache After Log Rotation + Eviction ===\n");
 
     let port_base = 14100 + (std::process::id() % 100) as u16;
@@ -72,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &endpoint,
         allow_http,
     );
-    let config = celeriant_integration_tests::ServerConfig {
+    let config = crate::ServerConfig {
         // 2MB log preallocate — 50 × 32KB events (~1.6MB) cause rotation.
         shard_log_preallocate_bytes: 2 * 1024 * 1024,
         // Small memory budget per shard — forces cache eviction
@@ -180,9 +180,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ========================================
     // Phase D continued: Verify on follower after replication
     // ========================================
-    println!("\nWaiting 5s for replication to follower...");
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
     println!("Verifying event counts on follower");
     println!("-----------------------------------");
 

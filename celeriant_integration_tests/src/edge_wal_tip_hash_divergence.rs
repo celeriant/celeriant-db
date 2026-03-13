@@ -22,7 +22,7 @@
 //! Run with: cargo run --bin edge_wal_tip_hash_divergence_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{
+use crate::{
     copy_shard_dirs, count_events, is_leader, s3_cluster_config, write_event, write_large_event,
     MinioContainer, RoutingRule, ServerConfig, TestServer,
 };
@@ -32,8 +32,8 @@ use tempfile::TempDir;
 
 const PORT_BASE: u16 = 17900;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Edge Case: WAL Tip Hash Divergence Detection ===\n");
     println!("This test verifies that a divergent follower auto-heals via TipHashMismatch");
     println!("detection, WAL truncation, and S3 catchup.\n");
@@ -144,6 +144,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     node_a.restart_with_config(leader_config).await?;
     println!("  Node A restarted as distributed leader (no follower yet)");
+
+    println!("  Waiting for S3 election...");
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
     let mut client_a = CeleriantClient::connect(node_a.address()).await?;
     for i in 6u64..=8 {

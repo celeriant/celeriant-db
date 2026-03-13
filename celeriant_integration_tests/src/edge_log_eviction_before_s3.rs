@@ -19,14 +19,14 @@
 //! Run with: cargo run --bin edge_log_eviction_before_s3_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{
+use crate::{
     count_events, s3_cluster_config, write_event, write_large_event, MinioContainer, TestServer,
 };
 use celeriant_wal::aggregate_key::AggregateKey;
 use std::time::Duration;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Edge Case: Log File Evicted Before S3 Upload ===\n");
 
     let port_base = 15500 + (std::process::id() % 100) as u16;
@@ -59,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         allow_http,
     );
 
-    let config = celeriant_integration_tests::ServerConfig {
+    let config = crate::ServerConfig {
         // 2MB preallocate — 10 aggs × 10 events × 32KB = 3.2MB forces 3+ rotations.
         shard_log_preallocate_bytes: 2 * 1024 * 1024,
         // max_open_files=2: with 3+ log files, older ones are evicted before S3 upload.
@@ -96,7 +96,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let probe_key = AggregateKey::new(agg_type_id, category_id, 1);
     write_event(&mut leader_client, &probe_key, 1, true).await?;
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
     let follower_count = count_events(&mut follower_client, &probe_key).await?;

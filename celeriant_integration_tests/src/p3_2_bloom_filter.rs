@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{ServerConfig, TestServer};
+use crate::{ServerConfig, TestServer};
 use celeriant_msg::{
     process_client_requests::ClientRequest,
     request::requests::{ReadRequest, SingleAggregateWrite, WriteRequest},
@@ -53,8 +53,8 @@ fn create_large_event(event_num: u64, payload_size: usize) -> DatablockAggregate
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== P3-2: Bloom Filter False Positive Behaviour ===\n");
 
     let config = ServerConfig {

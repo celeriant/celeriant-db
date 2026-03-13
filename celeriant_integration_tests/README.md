@@ -1,200 +1,91 @@
 # Celeriant Integration Tests
 
-Integration tests for the Celeriant database. Each test binary spawns its own server instance(s) with temporary data directories. Tests requiring S3 also manage their own MinIO container lifecycle via Docker.
+Integration tests for the Celeriant database. All tests are compiled into a single binary with CLI-driven filtering by category, deployment mode, or individual test name. Each test spawns its own server instance(s) in a subprocess with temporary data directories. Tests requiring S3 also manage their own MinIO container lifecycle via Docker.
 
 ## Prerequisites
 
 - Server binary built: `cargo build --release -p celeriant`
-- Docker installed (required for any test in the S3 categories)
+- Docker installed (required for distributed/S3 tests)
 
 ## Running Tests
 
-All tests use `--release` for realistic timing:
+```bash
+# Build and run all tests
+cargo run --release -p celeriant_integration_tests --
+
+# Run a specific test
+cargo run --release -p celeriant_integration_tests -- --test single
+
+# Run with a custom timeout (seconds, applied to every test)
+cargo run --release -p celeriant_integration_tests -- --timeout 120
+```
+
+## Filtering
+
+Tests can be filtered by category, deployment mode, or name. Multiple filters compose together.
+
+### Category filters
 
 ```bash
-cargo run --bin <test_name> -p celeriant_integration_tests --release
+# Include tests matching ALL listed categories (AND)
+cargo run --release -p celeriant_integration_tests -- --include core,performance
+
+# Include tests matching ANY listed category (OR)
+cargo run --release -p celeriant_integration_tests -- --include-or correctness,security
+
+# Exclude tests matching ALL listed categories (AND)
+cargo run --release -p celeriant_integration_tests -- --exclude core,performance
+
+# Exclude tests matching ANY listed category (OR)
+cargo run --release -p celeriant_integration_tests -- --exclude-or performance
+
+# Combine: election tests, but not performance-tagged ones
+cargo run --release -p celeriant_integration_tests -- --include-or election --exclude-or performance
+```
+
+### Deployment mode filters
+
+```bash
+# Only standalone tests (no Docker/MinIO required)
+cargo run --release -p celeriant_integration_tests -- --standalone
+
+# Only distributed tests (require MinIO + multi-node)
+cargo run --release -p celeriant_integration_tests -- --distributed
+```
+
+### Listing
+
+```bash
+# List matching tests without running them
+cargo run --release -p celeriant_integration_tests -- --list
+
+# List with filters
+cargo run --release -p celeriant_integration_tests -- --include-or edge --standalone --list
+
+# List all categories with test counts
+cargo run --release -p celeriant_integration_tests -- --list-categories
 ```
 
 ---
 
-## Test Categories
+## Categories
 
-### Core Tests
-
-Basic correctness, concurrency, and connection handling. No Docker required.
-
-| Binary | What it tests |
+| Category | Description |
 |---|---|
-| `single_main` | CRUD operations, idempotency, list functionality |
-| `batch_main` | Write throughput; measures request latency percentiles across many concurrent connections |
-| `chaos_main` | Concurrent read/write stress with variable payload sizes (1 byte to 5MB) |
-| `chaos_delete_main` | Write/delete/read concurrency with final state verification across multiple orgs and types |
-| `watch_test_main` | Watch API: streaming subscriptions, aggregate filtering, heartbeats, multiple concurrent watchers |
-| `connection_test_main` | Connection handling: pipelining, cross-shard routing, connection churn, long-lived connections |
-| `identity_test_main` | Client identity verification via public key cryptography; enforcement modes, mismatch rejection |
-| `api_key_test` | API key authentication; read-write vs read-only permissions, invalid keys, backward compatibility |
-
-```bash
-cargo run --bin single_main -p celeriant_integration_tests --release
-cargo run --bin chaos_main -p celeriant_integration_tests --release
-```
-
-`batch_main` supports environment variable tuning:
-
-```bash
-NUM_CONNECTIONS=4096 cargo run --bin batch_main -p celeriant_integration_tests --release
-SWEEP_MODE=1 cargo run --bin batch_main -p celeriant_integration_tests --release
-```
-
----
-
-### S3 Fallback Tests
-
-Tests for the S3 fallback replication path: what happens when a follower goes down and the leader buffers batches to S3 for later catchup. Requires Docker.
-
-| Binary | What it tests |
-|---|---|
-| `s3_fallback_main` | Happy path: follower down, events land in S3 at correct paths (`batch_{start}_{end}.bin`) in lexicographic order |
-| `s3_fallback_catchup_main` | Full cycle: normal replication -> follower down -> S3 fallback -> follower restart -> WAL catchup -> normal replication resumes |
-| `s3_fallback_no_s3_main` | No S3 configured: follower down, writes roll back with client error; writes resume after follower restarts |
-| `s3_fallback_s3_down_main` | S3 configured but unreachable: follower down, S3 put fails, writes roll back with client error |
-| `s3_fallback_createonly_main` | Pre-seeds S3 at target paths with garbage; verifies CreateOnly semantics: write succeeds (AlreadyExists treated as OK) but content is not overwritten |
-
-```bash
-cargo run --bin s3_fallback_main -p celeriant_integration_tests --release
-cargo run --bin s3_fallback_catchup_main -p celeriant_integration_tests --release
-```
-
----
-
-### S3 Leadership and Replication Tests
-
-Tests for distributed consensus via S3 leases: leader election, failover, fencing, and split-brain scenarios. Requires Docker.
-
-| Binary | What it tests |
-|---|---|
-| `s3_election_main` | Leader election via S3 lease acquisition; verifies only one node holds the lease at a time |
-| `s3_failover_main` | Leader failure triggers follower promotion via lease expiry |
-| `s3_failover_latency_main` | Measures failover time from leader crash to follower accepting writes; asserts < 3 seconds |
-| `s3_leader_solo_main` | Leader operating without any follower connected; S3 writes still proceed |
-| `s3_follower_crash_main` | Follower crashes mid-replication; leader detects and recovers |
-| `s3_stale_lease_main` | Stale lease (old leader's lease still in S3); new leader correctly fences the old one |
-| `s3_fencing_writes_main` | Fenced old leader rejects writes correctly |
-| `s3_lease_monotonicity_main` | Lease epoch numbers are strictly monotonically increasing across elections |
-| `s3_unreachable_failover_main` | Leader becomes unreachable (not crashed); follower promotes after lease expires |
-| `s3_network_partition_main` | Network partition between leader and follower via TcpProxy; verifies correct behavior on each side |
-| `s3_reconvergence_main` | After a partition heals, cluster reconverges to a single leader with consistent state |
-| `s3_old_leader_recovery_main` | Old leader rejoins as follower after being fenced; catches up via WAL or S3 |
-| `s3_writes_during_fencing_main` | Writes issued during the fencing window get the correct error response |
-| `s3_concurrent_cas_main` | Concurrent compare-and-swap operations from multiple clients; verifies exactly-once semantics |
-| `s3_follower_kick_main` | Follower that falls too far behind gets kicked and must re-sync |
-
-```bash
-cargo run --bin s3_election_main -p celeriant_integration_tests --release
-cargo run --bin s3_network_partition_main -p celeriant_integration_tests --release
-```
-
----
-
-### Invariant Tests
-
-Property checks that must hold across all cluster states. Each test runs a workload then asserts a system invariant. Requires Docker for replication variants.
-
-| Binary | What it tests |
-|---|---|
-| `invariant_read_count_main` | Event count on reads matches what was written; no phantom or missing events |
-| `invariant_concurrent_write_main` | Concurrent writers to the same aggregate preserve ordering and no events are lost |
-| `invariant_replication_convergence_main` | Leader and follower eventually agree on event count and content |
-| `invariant_s3_fallback_dedup_main` | S3 fallback batches are not applied twice after a follower catches up |
-| `invariant_replication_queue_pressure_main` | Under high write pressure the replication queue stays bounded and does not deadlock |
-
-```bash
-cargo run --bin invariant_replication_convergence_main -p celeriant_integration_tests --release
-```
-
----
-
-### Edge Case Tests
-
-Targeted tests for specific failure modes and corner cases. Requires Docker for S3 and replication variants.
-
-| Binary | What it tests |
-|---|---|
-| `edge_empty_replication_batch_main` | Empty batches in the replication stream are handled without errors or hangs |
-| `edge_stale_cache_rotation_main` | Cache entries become stale after log rotation; reads return correct data |
-| `edge_s3_missing_batches_main` | S3 batch deleted after upload; follower detects the gap and errors appropriately |
-| `edge_s3_batch_ordering_main` | S3 batches applied out of order; verifies ordering enforcement |
-| `edge_log_rotation_mid_replication_main` | Log file rotates while replication is in progress; no data loss |
-| `edge_log_eviction_before_s3_main` | LRU evicts a log segment before S3 upload completes; read still succeeds |
-| `edge_heartbeat_lock_contention_main` | Heartbeat and write paths contend on the same locks; no deadlock |
-| `edge_concurrent_heartbeat_replication_s3_main` | Heartbeat, replication, and S3 uploads run concurrently; no data corruption |
-| `edge_split_brain_s3_unavailable_main` | S3 unavailable during a split-brain window; verifies the cluster does not corrupt data |
-| `edge_corrupted_s3_batch_main` | S3 batch contains corrupt bytes; follower rejects and surfaces the error |
-| `edge_list_pagination_cache_eviction_main` | Cache eviction mid-pagination; list continues to return correct results |
-| `edge_wal_tip_hash_divergence_main` | Tip hash on leader and follower diverge; divergence is detected |
-| `edge_wal_divergence_recovery_main` | After WAL divergence is detected, the follower recovers to a consistent state |
-
-```bash
-cargo run --bin edge_log_rotation_mid_replication_main -p celeriant_integration_tests --release
-```
-
----
-
-### Phase / Qualification Tests
-
-Structured qualification suite. Tests are grouped by phase (P1 correctness, P2 durability, P3 read performance, P4 operations). Run these before releasing a new version.
-
-**P1 - Correctness**
-
-| Binary | What it tests |
-|---|---|
-| `p1_1_dcb_rollback_main` | Deterministic conditional batch (DCB) rollback on precondition failure |
-| `p1_2_concurrent_dcb_main` | Concurrent DCB writes; only one succeeds per epoch |
-| `p1_3_cross_shard_rejection_main` | Writes targeting the wrong shard are rejected |
-| `p1_4_exactly_once_main` | Client idempotency: retried writes are not applied twice |
-| `p1_6_ordering_verification_main` | Events within an aggregate are always read in write order |
-| `p1_7_multitenancy_isolation_main` | Events from one tenant are not visible to another |
-
-**P2 - Durability**
-
-| Binary | What it tests |
-|---|---|
-| `p2_1_write_survival_main` | Writes survive a server restart (WAL replay) |
-| `p2_2_dual_restart_main` | Both leader and follower restart; cluster resumes with no data loss |
-| `p2_3_wal_corruption_main` | WAL file partially corrupted on disk; server detects and refuses to start with bad data |
-| `p2_4_s3_capacity_main` | S3 bucket fills up during fallback; error surfaces correctly and writes do not hang |
-
-**P3 - Read Performance**
-
-| Binary | What it tests |
-|---|---|
-| `p3_1_cold_read_latency_main` | Cold read latency from disk (cache empty) stays within acceptable bounds |
-| `p3_2_bloom_filter_main` | Bloom filter eliminates disk I/O for non-existent aggregates |
-| `p3_3_sequential_cold_reads_main` | Sequential cold reads across many aggregates; measures throughput |
-
-**P4 - Operations**
-
-| Binary | What it tests |
-|---|---|
-| `p4_1_rolling_upgrade_main` | Rolling upgrade: follower upgraded first while leader still runs old version |
-
-```bash
-# Run the full P1 suite
-for t in p1_1_dcb_rollback_main p1_2_concurrent_dcb_main p1_3_cross_shard_rejection_main p1_4_exactly_once_main p1_6_ordering_verification_main p1_7_multitenancy_isolation_main; do
-  cargo run --bin $t -p celeriant_integration_tests --release
-done
-```
-
----
-
-### Debugging and Migration Tests
-
-Tools for investigating specific issues, not part of the regular qualification suite.
-
-| Binary | What it does |
-|---|---|
-| `debug_follower_pressure_main` | Applies sustained write pressure to expose follower queue backpressure issues |
-| `standalone_to_distributed_main` | Starts a node in standalone mode, migrates it to a distributed cluster, verifies data survives |
+| `core` | Basic CRUD, connections, watch API, typed operations, connection pooling |
+| `replication` | S3 fallback, follower catchup, leader solo, reconvergence, read visibility |
+| `election` | S3 lease election, failover, stale lease, network partition |
+| `fencing` | Write rejection on fenced nodes, concurrent CAS |
+| `invariant` | Property checks: event counts, convergence, deduplication, queue pressure |
+| `edge` | Corner cases: cache eviction, WAL divergence, lock contention, corruption detection |
+| `correctness` | Pilot Phase 1: DCB rollback, OCC conflicts, cross-shard rejection, exactly-once, ordering, multi-tenancy |
+| `durability` | Pilot Phase 2: write survival, dual restart, WAL corruption, S3 capacity |
+| `performance` | Pilot Phase 3 + benchmarks: cold reads, bloom filters, throughput |
+| `operations` | Rolling upgrade, standalone-to-distributed migration |
+| `security` | mTLS, client identity, API key auth |
+| `schema` | Schema registration, enforcement, failover, crash recovery |
+| `compaction` | Space reclamation, restart survival, replicated compaction |
+| `debug` | Follower pressure debugging (not part of regular suite) |
 
 ---
 

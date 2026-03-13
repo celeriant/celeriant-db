@@ -20,14 +20,14 @@
 //! Run with: cargo run --bin edge_heartbeat_lock_contention_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{
+use crate::{
     count_events, is_leader, s3_cluster_config, write_event, MinioContainer, TcpProxy, TestServer,
 };
 use celeriant_wal::aggregate_key::AggregateKey;
 use std::time::Duration;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Regression Guard: Heartbeat Independence Under Replication Pressure ===\n");
     println!("This test guards against regression of the split-locking fix in FollowerConnection.");
     println!("If heartbeat and replication share a single lock, slow replication will starve");
@@ -106,7 +106,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Write a baseline event and verify it replicates.
     let probe_key = AggregateKey::new(1, 0, 12345);
     write_event(&mut leader_client, &probe_key, 1, true).await?;
-    tokio::time::sleep(Duration::from_secs(2)).await;
     let baseline = count_events(&mut follower_client, &probe_key).await?;
     assert_eq!(baseline, 1, "Baseline event should have replicated to follower");
     println!("  Cluster healthy, baseline replication confirmed\n");

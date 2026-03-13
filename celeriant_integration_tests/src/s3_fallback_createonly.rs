@@ -16,12 +16,12 @@
 //! Run with: cargo run --bin s3_fallback_createonly_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{count_events, s3_cluster_config, write_event, MinioContainer, TestServer};
+use crate::{count_events, s3_cluster_config, write_event, MinioContainer, TestServer};
 use celeriant_wal::aggregate_key::AggregateKey;
 use std::time::Duration;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== CreateOnly Prevents Overwrites Integration Test ===\n");
 
     let port_base = 11100 + (std::process::id() % 100) as u16;
@@ -62,9 +62,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 1..=3 {
         write_event(&mut leader_client, &aggregate_key, i, i == 1).await?;
     }
-
-    println!("  Waiting for replication...");
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
     let follower_count = count_events(&mut follower_client, &aggregate_key).await?;
@@ -107,8 +104,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Writing event 4 to leader (fallback should hit pre-seeded object)...");
     write_event(&mut leader_client, &aggregate_key, 4, false).await?;
     println!("  Write succeeded (AlreadyExists was treated as Ok)\n");
-
-    tokio::time::sleep(Duration::from_millis(1000)).await;
 
     // ========================================
     // Phase 4: Verify pre-seeded objects are NOT overwritten

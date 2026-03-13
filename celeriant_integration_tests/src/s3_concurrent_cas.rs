@@ -17,14 +17,14 @@
 //! Run with: cargo run --bin s3_concurrent_cas_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{write_event, MinioContainer, ServerConfig, TestServer, TcpProxy};
+use crate::{write_event, MinioContainer, ServerConfig, TestServer, TcpProxy};
 use celeriant_runtimes::RoutingRule;
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wire::disk::versioned_block::deserialise_lease;
 use std::time::Duration;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== S3 Concurrent CAS Integration Test ===\n");
 
     let port_base = 13700 + (std::process::id() % 100) as u16;

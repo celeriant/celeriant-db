@@ -8,14 +8,14 @@
 //! This catches any per-shard dedup issues.
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{
+use crate::{
     count_events, s3_cluster_config, write_event, MinioContainer, TestServer,
 };
 use celeriant_wal::aggregate_key::AggregateKey;
 use std::time::Duration;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== S3 Fallback Deduplication Test (Multi-Shard) ===");
     println!("Tests: S3 boot catchup produces no duplicates\n");
 
@@ -62,8 +62,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     println!("  Wrote 20 events to each of 4 shards");
-
-    tokio::time::sleep(Duration::from_secs(3)).await;
 
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
     for key in &keys {
@@ -154,8 +152,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     println!("  Wrote 10 more events per shard");
-
-    tokio::time::sleep(Duration::from_secs(3)).await;
 
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
     for key in &keys {

@@ -15,7 +15,7 @@
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
-use celeriant_integration_tests::{
+use crate::{
     count_events, verify_compacted_segment_sizes, write_event, write_large_event, ServerConfig,
     TestServer,
 };
@@ -64,8 +64,8 @@ fn is_not_found(err: &ClientError) -> bool {
     )
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Compaction Integration Test: Standalone ===\n");
 
     let port_base = 16200 + (std::process::id() % 100) as u16;

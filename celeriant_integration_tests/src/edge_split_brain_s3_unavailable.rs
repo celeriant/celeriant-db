@@ -24,15 +24,15 @@
 //! Run with: cargo run --bin edge_split_brain_s3_unavailable_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{
+use crate::{
     count_events, s3_cluster_config, write_event, MinioContainer, TestServer, TcpProxy,
 };
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wire::disk::versioned_block::deserialise_lease;
 use std::time::Duration;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Edge Case: Split-Brain with S3 Unavailable ===\n");
 
     let port_base = 16700 + (std::process::id() % 100) as u16;
@@ -112,8 +112,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 1u64..=3 {
         write_event(&mut leader_client, &aggregate_key, i, i == 1).await?;
     }
-
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let follower_count = count_events(&mut follower_client, &aggregate_key).await?;
     assert_eq!(follower_count, 3, "Follower should have 3 events");

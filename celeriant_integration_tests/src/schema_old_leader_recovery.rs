@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
-use celeriant_integration_tests::{count_events, s3_cluster_config, write_event, MinioContainer, TestServer};
+use crate::{count_events, s3_cluster_config, write_event, MinioContainer, TestServer};
 use celeriant_msg::{
     process_client_requests::ClientRequest,
     request::requests::{RegisterSchemaRequest, SingleAggregateWrite, WriteRequest},
@@ -89,8 +89,8 @@ fn expect_schema_violation(result: Result<(), ClientError>, context: &str) {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Schema Validation — Old Leader Recovery ===\n");
 
     let port_base = 14500 + (std::process::id() % 100) as u16;
@@ -133,7 +133,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 1..=3 {
         write_event(&mut node_a_client, &aggregate_key, i, i == 1).await?;
     }
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Register schema while both nodes are up (replicates via TCP)
     println!("  Registering schema on node A...");
@@ -159,8 +158,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     expect_schema_violation(result, "node A reject");
     println!("  Invalid write rejected on A: PASS");
 
-    // Verify replication to B
-    tokio::time::sleep(Duration::from_secs(2)).await;
     let mut node_b_client = CeleriantClient::connect(node_b.address()).await?;
     let b_count = count_events(&mut node_b_client, &aggregate_key).await?;
     assert_eq!(b_count, 4, "Node B should have 4 events");
@@ -177,8 +174,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     node_a.stop();
     println!("  Node A stopped");
 
-    println!("  Waiting for failover...");
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    println!("  Waiting for failover (lease expiry + election)...");
+    tokio::time::sleep(Duration::from_secs(12)).await;
 
     let mut node_b_client = CeleriantClient::connect(node_b.address()).await?;
     write_event(&mut node_b_client, &aggregate_key, 5, false).await?;
@@ -217,7 +214,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Write one more through B to confirm replication B→A is flowing
     write_event(&mut node_b_client, &aggregate_key, 10, false).await?;
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let mut node_a_client = CeleriantClient::connect(node_a.address()).await?;
     let a_count = count_events(&mut node_a_client, &aggregate_key).await?;

@@ -19,15 +19,15 @@
 //! Run with: cargo run --bin p2_4_s3_capacity_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{count_events, s3_cluster_config, write_event, write_large_event, MinioContainer, TestServer};
+use crate::{count_events, s3_cluster_config, write_event, write_large_event, MinioContainer, TestServer};
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wire::disk::versioned_block::deserialise_fallback_batch;
 use std::time::Duration;
 
 const PORT_BASE: u16 = 19900;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== P2-4 S3 Degraded-Mode Capacity Integration Test ===\n");
 
     let leader_port = PORT_BASE;
@@ -68,9 +68,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 1..=5 {
         write_event(&mut leader_client, &aggregate_key, i, i == 1).await?;
     }
-
-    println!("  Waiting for replication...");
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
     let follower_count = count_events(&mut follower_client, &aggregate_key).await?;
@@ -171,9 +168,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Writing post-catchup event {} to leader...", expected_after_fallback + 1);
     write_event(&mut leader_client, &aggregate_key, (expected_after_fallback + 1) as u64, false).await?;
 
-    println!("  Waiting for replication...");
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
     // ========================================
     // Phase 5: Verify follower caught up completely
     // ========================================
@@ -213,9 +207,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in (expected_after_fallback + 2)..=(expected_after_fallback + 4) {
         write_event(&mut leader_client, &aggregate_key, i as u64, false).await?;
     }
-
-    println!("  Waiting for replication...");
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let follower_count = count_events(&mut follower_client, &aggregate_key).await?;
     assert_eq!(

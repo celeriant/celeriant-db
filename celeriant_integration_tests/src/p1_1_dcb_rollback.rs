@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
-use celeriant_integration_tests::{count_events, ServerConfig, TestServer};
+use crate::{count_events, ServerConfig, TestServer};
 use celeriant_msg::{
     process_client_requests::ClientRequest,
     process_client_responses::ClientResponse,
@@ -46,8 +46,8 @@ fn create_event(client_event_index: u64, message: String) -> DatablockAggregateE
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== P1-1: DCB Rollback on Partial OCC Failure ===\n");
 
     // Start standalone server (simpler, faster for this test)

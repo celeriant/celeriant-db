@@ -16,7 +16,7 @@
 //! Run with: cargo run --bin p3_3_sequential_cold_reads_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{write_event, ServerConfig, TestServer};
+use crate::{write_event, ServerConfig, TestServer};
 use celeriant_msg::{process_client_requests::ClientRequest, process_client_responses::ClientResponse, request::requests::ReadRequest};
 use celeriant_wal::{aggregate_key::AggregateKey, compression_type::CompressionType};
 use std::time::{Duration, Instant};
@@ -67,8 +67,8 @@ async fn read_aggregate(
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== P3-3: Sustained Cold Sequential Reads (Audit Replay) ===\n");
 
     // Start standalone server with SMALL cache

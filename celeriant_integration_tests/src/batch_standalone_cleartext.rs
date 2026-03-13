@@ -12,7 +12,7 @@ use base64::Engine;
 use celeriant_client_tokio::celeriant_client::{CeleriantClient, ClientIdentityConfig};
 use celeriant_client_tokio::client_error::ClientError;
 use celeriant_crypto::{generate_api_key, hash_api_key, Crypto};
-use celeriant_integration_tests::{ServerConfig, TestServer};
+use crate::{ServerConfig, TestServer};
 use celeriant_msg::request::requests::WriteRequest;
 use celeriant_msg::{process_client_requests::ClientRequest, request::requests::SingleAggregateWrite};
 use celeriant_wal::{
@@ -130,8 +130,8 @@ fn check_thresholds(result: &BenchmarkResult, thresholds: &Thresholds) -> Vec<St
     failures
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Standalone Cleartext Batch Write Benchmark ===\n");
 
     let base_port = 10100 + (std::process::id() % 100) as u16;

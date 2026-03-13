@@ -19,7 +19,7 @@ use base64::Engine;
 use celeriant_client_tokio::celeriant_client::{CeleriantClient, ClientIdentityConfig};
 use celeriant_client_tokio::client_error::ClientError;
 use celeriant_crypto::{generate_api_key, hash_api_key};
-use celeriant_integration_tests::{ServerConfig, TestServer};
+use crate::{ServerConfig, TestServer};
 use celeriant_msg::{
     process_client_requests::ClientRequest,
     process_client_responses::ClientResponse,
@@ -80,8 +80,8 @@ secondary_ro = "{}"
     fs::write(data_root.join("api_keys.toml"), content)
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== API Key Authentication Integration Tests ===\n");
 
     let base_port = 10200 + (std::process::id() % 100) as u16;

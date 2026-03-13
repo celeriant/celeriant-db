@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
-use celeriant_integration_tests::{ServerConfig, TestServer};
+use crate::{ServerConfig, TestServer};
 use celeriant_msg::{
     process_client_requests::ClientRequest,
     request::requests::{RegisterSchemaRequest, SingleAggregateWrite, WriteRequest},
@@ -165,8 +165,8 @@ fn expect_schema_invalid(result: Result<impl std::fmt::Debug, ClientError>) {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Schema Validation Integration Tests ===\n");
 
     let port = 10800 + (std::process::id() % 100) as u16;

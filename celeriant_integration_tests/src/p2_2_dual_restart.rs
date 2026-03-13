@@ -17,14 +17,14 @@
 //! Run with: cargo run --bin p2_2_dual_restart_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{count_events, is_leader, write_event, MinioContainer, ServerConfig, TestServer};
+use crate::{count_events, is_leader, write_event, MinioContainer, ServerConfig, TestServer};
 use celeriant_runtimes::RoutingRule;
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wire::disk::versioned_block::deserialise_lease;
 use std::time::Duration;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== P2-2: Both Nodes Restart Simultaneously ===\n");
 
     let port_base = 19700;
@@ -91,8 +91,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 1..=5 {
         write_event(&mut node_a_client, &aggregate_key, i, i == 1).await?;
     }
-
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
     let mut node_b_client = CeleriantClient::connect(node_b.address()).await?;
     let node_b_count = count_events(&mut node_b_client, &aggregate_key).await?;

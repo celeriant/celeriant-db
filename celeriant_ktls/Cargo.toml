@@ -11,3 +11,4 @@ rustls-pki-types.workspace = true
 glommio.workspace = true
 libc.workspace = true
 futures-lite.workspace = true
+tracing.workspace = true

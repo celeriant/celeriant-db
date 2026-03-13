@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use celeriant_runtimes::RoutingRule;
 
-use celeriant_integration_tests::{MinioContainer, ServerConfig, TestServer};
+use crate::{MinioContainer, ServerConfig, TestServer};
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
 use celeriant_client_tokio::list_operations::{
@@ -88,8 +88,8 @@ impl ReplicatedServers {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mode_str = if REPLICATED_MODE {
         "Replicated (writes->leader, reads->follower)"
     } else {
@@ -232,12 +232,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => println!("Idempotent retry result: {:?}", e),
     }
 
-    // Wait for replication before reading from follower
-    if REPLICATED_MODE {
-        println!("\n  Waiting for replication...");
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
-
     // Read back events from both aggregates (use read_client - follower in replicated mode)
     println!("\n=== Reading events from both aggregates ===");
     if REPLICATED_MODE {
@@ -348,11 +342,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         Ok(response) => println!("Delete aggregate 1: {:?}", response),
         Err(e) => println!("Delete aggregate 1 failed: {:?}", e),
-    }
-
-    // Wait for delete to replicate
-    if REPLICATED_MODE {
-        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
     // === List Aggregates again to verify delete ===

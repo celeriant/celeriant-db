@@ -9,7 +9,7 @@
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
-use celeriant_integration_tests::{ServerConfig, TestServer};
+use crate::{ServerConfig, TestServer};
 use celeriant_msg::process_client_requests::ClientRequest;
 use celeriant_msg::process_client_responses::ClientResponse;
 use celeriant_msg::request::read_filters::ReadFilters;
@@ -24,8 +24,8 @@ use tokio::sync::Barrier;
 
 const PORT_BASE: u16 = 19100;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== P1-6: Per-Aggregate Strict Total Ordering Verification ===\n");
 
     let port = PORT_BASE + (std::process::id() % 100) as u16;

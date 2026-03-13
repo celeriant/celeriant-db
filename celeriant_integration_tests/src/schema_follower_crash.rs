@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
-use celeriant_integration_tests::{count_events, s3_cluster_config, write_event, MinioContainer, TestServer};
+use crate::{count_events, s3_cluster_config, write_event, MinioContainer, TestServer};
 use celeriant_msg::{
     process_client_requests::ClientRequest,
     request::requests::{RegisterSchemaRequest, SingleAggregateWrite, WriteRequest},
@@ -88,8 +88,8 @@ fn expect_schema_violation(result: Result<(), ClientError>, context: &str) {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Schema Validation — Follower Crash + Restart + Promotion ===\n");
 
     let port_base = 14100 + (std::process::id() % 100) as u16;
@@ -133,7 +133,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 1..=3 {
         write_event(&mut leader_client, &aggregate_key, i, i == 1).await?;
     }
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Register schema while both nodes are up (replicates via TCP)
     println!("  Registering schema...");
@@ -154,9 +153,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Write a validated event to confirm
     write_event(&mut leader_client, &aggregate_key, 4, false).await?;
     println!("  Valid write: PASS");
-
-    // Wait for schema + events to replicate to follower
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
     let follower_count = count_events(&mut follower_client, &aggregate_key).await?;
@@ -201,7 +197,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Write one more to confirm replication flowing
     write_event(&mut leader_client, &aggregate_key, 8, false).await?;
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
     let follower_count = count_events(&mut follower_client, &aggregate_key).await?;

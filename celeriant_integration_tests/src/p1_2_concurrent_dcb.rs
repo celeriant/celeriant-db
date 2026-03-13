@@ -9,7 +9,7 @@
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
-use celeriant_integration_tests::{count_events, ServerConfig, TestServer};
+use crate::{count_events, ServerConfig, TestServer};
 use celeriant_msg::process_client_requests::ClientRequest;
 use celeriant_msg::request::requests::{SingleAggregateWrite, WriteRequest};
 use celeriant_msg::process_client_responses::ClientResponse;
@@ -23,8 +23,8 @@ use tokio::sync::Barrier;
 
 const PORT_BASE: u16 = 18900;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== P1-2: Concurrent DCB Writes with Shared Aggregate ===\n");
 
     let port = PORT_BASE + (std::process::id() % 100) as u16;

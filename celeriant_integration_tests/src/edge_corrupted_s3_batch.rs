@@ -23,15 +23,15 @@
 //! Run with: cargo run --bin edge_corrupted_s3_batch_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{
+use crate::{
     count_events, is_leader, s3_cluster_config, write_event, write_large_event, MinioContainer,
     TestServer,
 };
 use celeriant_wal::aggregate_key::AggregateKey;
 use std::time::Duration;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Edge Case: Corrupted S3 Batch Data ===\n");
 
     let port_base = 17100 + (std::process::id() % 100) as u16;
@@ -61,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Small batch size (32KB) forces multiple S3 fallback batches.
-    let config = celeriant_integration_tests::ServerConfig {
+    let config = crate::ServerConfig {
         max_s3_fallback_batch_bytes: 32 * 1024,
         shard_log_preallocate_bytes: 2 * 1024 * 1024,
         ..base_config
@@ -106,8 +106,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 1u64..=3 {
         write_event(&mut leader_client, &aggregate_key, i, i == 1).await?;
     }
-
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
     let initial_count = count_events(&mut follower_client, &aggregate_key).await?;

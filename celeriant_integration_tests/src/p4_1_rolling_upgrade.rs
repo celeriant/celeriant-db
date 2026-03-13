@@ -28,7 +28,7 @@
 //! Run with: cargo test --test p4_1_rolling_upgrade_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{
+use crate::{
     count_events, s3_cluster_config, write_event, MinioContainer, TestServer,
 };
 use celeriant_wal::aggregate_key::AggregateKey;
@@ -39,8 +39,8 @@ use tokio::time::sleep;
 
 const PORT_BASE: u16 = 21100;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== P4-1. Rolling Upgrade with Zero Downtime Integration Test ===\n");
 
     let node_a_port = PORT_BASE;

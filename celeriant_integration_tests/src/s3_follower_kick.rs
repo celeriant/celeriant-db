@@ -14,14 +14,14 @@
 //! Run with: cargo run --bin s3_follower_kick_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{
+use crate::{
     count_events, s3_cluster_config, write_event, MinioContainer, TcpProxy, TestServer,
 };
 use celeriant_wal::aggregate_key::AggregateKey;
 use std::time::Duration;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== S3 Follower Kick Integration Test (4 shards) ===\n");
 
     // ========================================
@@ -83,9 +83,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         write_event(&mut leader_client, &key_shard2, i, i == 1).await?;
     }
 
-    println!("  Waiting for replication...");
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
     let count1 = count_events(&mut follower_client, &key_shard1).await?;
     let count2 = count_events(&mut follower_client, &key_shard2).await?;
@@ -117,8 +114,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         write_event(&mut leader_client, &key_shard2, i, false).await?;
     }
     println!("  Writes succeeded (leader fell back to S3)");
-
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Verify S3 fallback happened during the block
     let mut s3_objects_phase2 = 0;
@@ -225,9 +220,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         write_event(&mut leader_client, &key_shard1, base1 as u64 + i + 1, false).await?;
         write_event(&mut leader_client, &key_shard2, base2 as u64 + i + 1, false).await?;
     }
-
-    println!("  Waiting for replication...");
-    tokio::time::sleep(Duration::from_secs(3)).await;
 
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
     let final1 = count_events(&mut follower_client, &key_shard1).await?;

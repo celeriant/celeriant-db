@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use celeriant_integration_tests::{TestServer, ServerConfig, RoutingRule};
+use crate::{TestServer, ServerConfig, RoutingRule};
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::watch_connection::{WatchConnection, WatchOptions};
 use celeriant_msg::{
@@ -26,8 +26,8 @@ use tokio::time::sleep;
 
 const CLIENT_ID: u128 = 12345;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Multi-Shard Watch API Integration Tests ===\n");
 
     println!("Starting multi-shard test server (3 shards)...");

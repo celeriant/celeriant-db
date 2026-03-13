@@ -20,7 +20,7 @@
 //! Run with: cargo run --release --bin standalone_to_distributed_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{
+use crate::{
     copy_shard_dirs, count_events, is_leader, s3_cluster_config, write_event, write_large_event,
     MinioContainer, RoutingRule, ServerConfig, TestServer,
 };
@@ -259,9 +259,6 @@ async fn verify_cluster(
         write_event(&mut leader_client, key, 8, false).await?;
     }
 
-    println!("  Waiting for replication...");
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
     assert_event_counts(&mut leader_client, keys, 8, "leader-final").await?;
     assert_event_counts(&mut follower_client, keys, 8, "follower-final").await?;
     println!("  Both nodes have 8 events per shard (32 total)");
@@ -275,8 +272,8 @@ async fn verify_cluster(
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Standalone-to-Distributed Transition Test ===\n");
 
     let base = 13500 + (std::process::id() % 50) as u16;

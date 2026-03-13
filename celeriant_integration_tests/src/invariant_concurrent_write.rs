@@ -5,7 +5,7 @@
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
-use celeriant_integration_tests::{count_events, write_event, ServerConfig, TestServer};
+use crate::{count_events, write_event, ServerConfig, TestServer};
 use celeriant_msg::process_client_requests::ClientRequest;
 use celeriant_msg::process_client_responses::ClientResponse;
 use celeriant_msg::request::requests::{SingleAggregateWrite, WriteRequest};
@@ -17,8 +17,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Barrier;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Invariant Test: Concurrent Writes to Same Aggregate ===\n");
 
     let port = 10800 + (std::process::id() % 100) as u16;

@@ -16,7 +16,7 @@
 //! so they MUST survive SIGKILL. If this test fails, we found a durability bug.
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{write_event, MinioContainer, TestServer, s3_cluster_config};
+use crate::{write_event, MinioContainer, TestServer, s3_cluster_config};
 use celeriant_msg::{
     process_client_requests::ClientRequest,
     process_client_responses::ClientResponse,
@@ -31,8 +31,8 @@ use std::time::Duration;
 const PORT_BASE: u16 = 20100;
 const NUM_EVENTS: u64 = 100;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== P2-1: Acknowledged Write Survival Under SIGKILL ===\n");
 
     let leader_port = PORT_BASE;

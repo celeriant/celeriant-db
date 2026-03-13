@@ -12,7 +12,7 @@ use celeriant_client_tokio::{
     CeleriantPool, PoolOptions,
     list_operations::ListOptions,
 };
-use celeriant_integration_tests::TestServer;
+use crate::TestServer;
 use celeriant_msg::request::{
     read_filters::ReadFilters,
     requests::{
@@ -351,8 +351,8 @@ async fn test_pool_list_aggregates(pool: &CeleriantPool) {
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Connection Pool Integration Tests ===\n");
 
     let port = 10600 + (std::process::id() % 100) as u16;

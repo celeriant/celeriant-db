@@ -13,15 +13,15 @@
 //! Run with: cargo run --bin invariant_replication_convergence_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{
+use crate::{
     count_events, s3_cluster_config, write_event, MinioContainer, TestServer,
 };
 use celeriant_wal::aggregate_key::AggregateKey;
 use std::collections::HashMap;
 use std::time::Duration;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Invariant: Replication Convergence Test ===\n");
 
     // ========================================
@@ -72,9 +72,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         println!("    Shard {}: 50 events written", shard_id);
     }
-
-    println!("  Waiting for replication...");
-    tokio::time::sleep(Duration::from_secs(5)).await;
 
     println!("  Verifying counts on leader and follower...");
     for (shard_id, key) in keys.iter().enumerate() {
@@ -154,9 +151,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let total_writes: usize = expected_counts.values().sum();
     println!("  Total successful writes: {} across {} aggregates", total_writes, expected_counts.len());
-
-    println!("  Waiting for replication...");
-    tokio::time::sleep(Duration::from_secs(5)).await;
 
     println!("  Verifying counts for all {} aggregates...", expected_counts.len());
     let mut mismatches = 0;

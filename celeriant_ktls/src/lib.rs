@@ -9,6 +9,7 @@ use rustls::client::UnbufferedClientConnection;
 use rustls::server::UnbufferedServerConnection;
 use rustls::unbuffered::{ConnectionState, EncodeError, UnbufferedStatus};
 use rustls_pki_types::ServerName;
+use tracing::debug;
 
 /// Maximum size for the incoming handshake buffer. TLS records are at most
 /// 16KB + 5-byte header, so 128KB gives ample room for multi-record flights
@@ -224,9 +225,13 @@ pub async fn ktls_accept(
     mut stream: TcpStream,
     server_config: Arc<rustls::ServerConfig>,
 ) -> Result<TcpStream, KtlsError> {
+    let fd = stream.as_raw_fd();
+    debug!(fd, "kTLS accept: starting handshake");
     let conn = UnbufferedServerConnection::new(server_config)?;
     let secrets = drive_handshake_server(&mut stream, conn).await?;
-    setup_ktls(stream.as_raw_fd(), secrets)?;
+    debug!(fd, "kTLS accept: handshake complete, installing kernel TLS");
+    setup_ktls(fd, secrets)?;
+    debug!(fd, "kTLS accept: kernel TLS active");
     Ok(stream)
 }
 
@@ -239,9 +244,13 @@ pub async fn ktls_connect(
     client_config: Arc<rustls::ClientConfig>,
     server_name: ServerName<'static>,
 ) -> Result<TcpStream, KtlsError> {
+    let fd = stream.as_raw_fd();
+    debug!(fd, server_name = ?server_name, "kTLS connect: starting handshake");
     let conn = UnbufferedClientConnection::new(client_config, server_name)?;
     let secrets = drive_handshake_client(&mut stream, conn).await?;
-    setup_ktls(stream.as_raw_fd(), secrets)?;
+    debug!(fd, "kTLS connect: handshake complete, installing kernel TLS");
+    setup_ktls(fd, secrets)?;
+    debug!(fd, "kTLS connect: kernel TLS active");
     Ok(stream)
 }
 
@@ -386,14 +395,27 @@ async fn read_into(
 /// Enable kTLS on `fd` using the extracted TLS session secrets.
 fn setup_ktls(fd: RawFd, secrets: rustls::ExtractedSecrets) -> Result<(), KtlsError> {
     enable_tls_ulp(fd)?;
+    debug!(fd, "kTLS ULP enabled");
 
     let (tx_seq, tx_secret) = secrets.tx;
     let (rx_seq, rx_secret) = secrets.rx;
+
+    let cipher = cipher_name(&tx_secret);
+    debug!(fd, cipher, tx_seq, rx_seq, "installing kTLS crypto");
 
     set_tls_crypto(fd, TLS_TX, tx_seq, &tx_secret)?;
     set_tls_crypto(fd, TLS_RX, rx_seq, &rx_secret)?;
 
     Ok(())
+}
+
+fn cipher_name(secret: &ConnectionTrafficSecrets) -> &'static str {
+    match secret {
+        ConnectionTrafficSecrets::Aes128Gcm { .. } => "AES-128-GCM",
+        ConnectionTrafficSecrets::Aes256Gcm { .. } => "AES-256-GCM",
+        ConnectionTrafficSecrets::Chacha20Poly1305 { .. } => "ChaCha20-Poly1305",
+        _ => "unknown",
+    }
 }
 
 fn enable_tls_ulp(fd: RawFd) -> Result<(), KtlsError> {

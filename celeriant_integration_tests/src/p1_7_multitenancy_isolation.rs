@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use celeriant_integration_tests::TestServer;
+use crate::TestServer;
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::list_operations::{ListAggregatesIterator, ListOptions};
 use celeriant_msg::{
@@ -31,8 +31,8 @@ use celeriant_wal::{
 
 const PORT_BASE: u16 = 18700;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== P1-7: Multi-Tenancy Isolation Test ===\n");
 
     // Start standalone server

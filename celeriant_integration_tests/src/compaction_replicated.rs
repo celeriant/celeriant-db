@@ -14,7 +14,7 @@
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
-use celeriant_integration_tests::{
+use crate::{
     count_events, s3_cluster_config, verify_compacted_segment_sizes, write_event,
     write_large_event, MinioContainer, ServerConfig, TestServer,
 };
@@ -110,8 +110,8 @@ async fn verify_deleted(
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Compaction Integration Test: Replicated ===\n");
 
     let port_base = 16600 + (std::process::id() % 100) as u16;

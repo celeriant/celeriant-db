@@ -7,7 +7,7 @@
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use celeriant_integration_tests::TestServer;
+use crate::TestServer;
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
 use celeriant_msg::{
@@ -63,8 +63,8 @@ struct ChaosStats {
     total_bytes_written: u64,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Chaos Testing Mode ===\n");
 
     println!("Starting test server...");

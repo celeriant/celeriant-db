@@ -14,14 +14,14 @@
 //! Run with: cargo run --bin s3_old_leader_recovery_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{count_events, write_event, MinioContainer, ServerConfig, TestServer};
+use crate::{count_events, write_event, MinioContainer, ServerConfig, TestServer};
 use celeriant_runtimes::RoutingRule;
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wire::disk::versioned_block::deserialise_lease;
 use std::time::Duration;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== S3 Old Leader Recovery Integration Test ===\n");
 
     let port_base = 13300 + (std::process::id() % 100) as u16;
@@ -97,9 +97,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 1..=5 {
         write_event(&mut node_a_client, &aggregate_key, i, i == 1).await?;
     }
-
-    println!("  Waiting for replication to node B...");
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let node_b_count = count_events(&mut node_b_client, &aggregate_key).await?;
     assert_eq!(node_b_count, 5, "Node B should have 5 events replicated");
@@ -210,9 +207,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 6..=10 {
         write_event(&mut node_b_client, &aggregate_key, i, false).await?;
     }
-
-    println!("  Waiting for replication from B to A...");
-    tokio::time::sleep(Duration::from_secs(3)).await;
 
     let node_a_final_count = count_events(&mut node_a_client, &aggregate_key).await?;
     assert_eq!(node_a_final_count, 10,

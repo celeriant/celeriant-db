@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{
+use crate::{
     count_events, s3_cluster_config, write_event, MinioContainer, TcpProxy, TestServer,
 };
 use celeriant_msg::process_client_requests::ClientRequest;
@@ -39,8 +39,8 @@ const CLIENTSIDE_TIMEOUT_S: u64 = 60;
 /// than unthrottled, giving fsync batches time to accumulate in the pending queue.
 const THROTTLE_MS_PER_CHUNK: u64 = 200;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Replication Queue Pressure Test (2 shards) ===\n");
 
     // ========================================
@@ -104,8 +104,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 1..=3 {
         write_event(&mut leader_client, &probe_shard0, i, i == 1).await?;
     }
-
-    tokio::time::sleep(Duration::from_secs(3)).await;
 
     let mut follower_client = CeleriantClient::connect(_follower.address()).await?;
     let fc = count_events(&mut follower_client, &probe_shard0).await?;
@@ -370,8 +368,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     println!("  Events written: {}", phase5_written);
     assert!(phase5_written > 0, "Post-recovery writes should succeed");
-
-    tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Verify follower received the new writes
     let mut leader_client = CeleriantClient::connect(_leader.address()).await?;

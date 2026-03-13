@@ -14,7 +14,7 @@ use celeriant_client_tokio::{
     server_error::{DeleteError, ReadError, ServerError, WriteError},
     client_error::ClientError,
 };
-use celeriant_integration_tests::TestServer;
+use crate::TestServer;
 use celeriant_msg::request::{
     read_filters::ReadFilters,
     requests::{
@@ -500,8 +500,8 @@ async fn test_delete_error_aggregate_not_exists(client: &mut CeleriantClient) {
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Typed Operations Integration Tests ===\n");
 
     let port = 10500 + (std::process::id() % 100) as u16;

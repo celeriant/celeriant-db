@@ -21,15 +21,15 @@
 //! Run with: cargo run --bin edge_log_rotation_mid_replication_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{
+use crate::{
     count_events, s3_cluster_config, write_event, write_large_event, MinioContainer, TcpProxy,
     TestServer,
 };
 use celeriant_wal::aggregate_key::AggregateKey;
 use std::time::Duration;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Edge Case: Log Rotation While Replication Batch Mid-Flight ===\n");
 
     let port_base = 15100 + (std::process::id() % 100) as u16;
@@ -67,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         allow_http,
     );
 
-    let config = celeriant_integration_tests::ServerConfig {
+    let config = crate::ServerConfig {
         // Minimum valid preallocate (3 × 512KB headers). Usable space per file ≈ 512KB.
         // 50 events/shard × 32KB = 1.6MB/shard → ~3 rotations per shard.
         shard_log_preallocate_bytes: 3 * 512 * 1024,

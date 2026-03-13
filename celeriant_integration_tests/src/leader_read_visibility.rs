@@ -9,15 +9,15 @@
 //! Run with: cargo run --bin leader_read_visibility_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{
+use crate::{
     count_events, write_event, MinioContainer, ServerConfig, TestServer, TcpProxy,
 };
 use celeriant_runtimes::RoutingRule;
 use celeriant_wal::aggregate_key::AggregateKey;
 use std::time::Duration;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Leader Read Visibility Invariant Test ===\n");
 
     let port_base = 11700 + (std::process::id() % 100) as u16;
@@ -96,7 +96,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 1..=3 {
         write_event(&mut leader_client, &key, i, i == 1).await?;
     }
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let leader_count = count_events(&mut leader_client, &key).await?;
     let follower_count = count_events(&mut follower_client, &key).await?;
@@ -160,7 +159,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Wait for background writes to finish
     write_handle.await?;
 
-    // Give a moment for read positions to be updated
+    // The proxy throttle delays heartbeats enough to trigger clock-drift fencing,
+    // which kicks the follower into S3 catchup. Give it time to finish.
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let leader_count_post = count_events(&mut leader_client, &key2).await?;

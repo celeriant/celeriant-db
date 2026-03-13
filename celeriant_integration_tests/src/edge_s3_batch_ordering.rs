@@ -22,14 +22,14 @@
 //! Run with: cargo run --bin edge_s3_batch_ordering_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{
+use crate::{
     count_events, is_leader, s3_cluster_config, write_event, MinioContainer, TestServer,
 };
 use celeriant_wal::aggregate_key::AggregateKey;
 use std::time::Duration;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Edge Case: S3 Batch Ordering During Catchup ===\n");
 
     let port_base = 14500 + (std::process::id() % 100) as u16;
@@ -55,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Small batch size (32KB) forces multiple S3 fallback batches, exercising the sort path.
-    let config = celeriant_integration_tests::ServerConfig {
+    let config = crate::ServerConfig {
         max_s3_fallback_batch_bytes: 32 * 1024,
         shard_log_preallocate_bytes: 2 * 1024 * 1024,
         ..base_config
@@ -110,7 +110,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for agg in &aggregates {
         write_event(&mut leader_client, agg, 1, true).await?;
     }
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
     for agg in &aggregates {

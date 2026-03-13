@@ -18,7 +18,7 @@
 //! Run with: cargo run --bin edge_wal_divergence_recovery_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{
+use crate::{
     copy_shard_dirs, count_events, s3_cluster_config, write_event, write_large_event,
     MinioContainer, RoutingRule, ServerConfig, TestServer,
 };
@@ -28,8 +28,8 @@ use tempfile::TempDir;
 
 const PORT_BASE: u16 = 18300;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Edge Case: WAL Divergence Recovery ===\n");
     println!("This test verifies the operational recovery path for WAL divergence:");
     println!("wipe the divergent node and let it re-sync from S3 as a fresh follower.\n");
@@ -234,8 +234,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Writing events 9-10 to verify healthy replication...");
     write_event(&mut client_a, &aggregate_key, 9, false).await?;
     write_event(&mut client_a, &aggregate_key, 10, false).await?;
-
-    tokio::time::sleep(Duration::from_secs(4)).await;
 
     let leader_final = count_events(&mut client_a, &aggregate_key).await?;
     drop(client_b);

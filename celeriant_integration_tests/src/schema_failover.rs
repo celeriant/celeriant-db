@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
-use celeriant_integration_tests::{write_event, MinioContainer, ServerConfig, TestServer};
+use crate::{write_event, MinioContainer, ServerConfig, TestServer};
 use celeriant_msg::{
     process_client_requests::ClientRequest,
     request::requests::{RegisterSchemaRequest, SingleAggregateWrite, WriteRequest},
@@ -82,8 +82,8 @@ async fn write_with_payload(
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Schema Validation Failover Test ===\n");
 
     let port_base = 11900 + (std::process::id() % 100) as u16;
@@ -184,9 +184,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => return Err(format!("Expected SchemaValidationFailed on leader, got: {:?}", result).into()),
     }
 
-    // Wait for replication of schema to follower
-    println!("  Waiting for schema replication to follower...");
-    tokio::time::sleep(Duration::from_secs(2)).await;
     println!("  DONE\n");
 
     // ========================================

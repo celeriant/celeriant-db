@@ -5,13 +5,13 @@
 //! configurations.
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{count_events, write_event, ServerConfig, TestServer};
+use crate::{count_events, write_event, ServerConfig, TestServer};
 use celeriant_runtimes::RoutingRule;
 use celeriant_wal::aggregate_key::AggregateKey;
 use std::time::Duration;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Invariant Test: count_events Accuracy ===\n");
 
     let port = 10700 + (std::process::id() % 100) as u16;

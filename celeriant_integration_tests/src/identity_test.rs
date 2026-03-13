@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use celeriant_integration_tests::{ServerConfig, TestServer};
+use crate::{ServerConfig, TestServer};
 use celeriant_client_tokio::celeriant_client::{CeleriantClient, ClientIdentityConfig};
 use celeriant_client_tokio::client_error::ClientError;
 use celeriant_crypto::Crypto;
@@ -27,8 +27,8 @@ use celeriant_wal::{
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
 };
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Client Identity Verification Integration Tests ===\n");
 
     let base_port = 10100 + (std::process::id() % 100) as u16;

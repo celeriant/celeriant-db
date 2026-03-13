@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
-use celeriant_integration_tests::{ServerConfig, TestServer};
+use crate::{ServerConfig, TestServer};
 use celeriant_msg::{
     process_client_requests::ClientRequest,
     process_client_responses::ClientResponse,
@@ -32,8 +32,8 @@ use celeriant_wal::{
 const PORT_BASE: u16 = 19500;
 const CLIENT_ID: u128 = 777;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== P1-4: Exactly-Once Writes Under Connection Failure ===\n");
 
     // Start standalone server
@@ -94,9 +94,6 @@ async fn test_basic_idempotency(
         ClientResponse::Write(_) => println!("  First write: SUCCESS"),
         other => panic!("Expected Write response, got {:?}", other),
     }
-
-    // Brief delay to ensure fsync completion and cache update
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
     // Retry same write (same client_id, same client_event_index)
     // Note: We can't reuse the exact same request object because WriteRequest takes ownership

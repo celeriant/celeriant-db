@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::u64;
 
-use celeriant_integration_tests::TestServer;
+use crate::TestServer;
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_msg::{
     process_client_requests::ClientRequest,
@@ -28,8 +28,8 @@ use tokio_util::compat::TokioAsyncReadCompatExt;
 
 const CLIENT_ID: u128 = 12345;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Watch API Integration Tests ===\n");
 
     println!("Starting test server...");

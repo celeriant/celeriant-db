@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use celeriant_integration_tests::{ServerConfig, TestServer};
+use crate::{ServerConfig, TestServer};
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_msg::{
     process_client_requests::ClientRequest,
@@ -23,8 +23,8 @@ use celeriant_wal::{
 const CLIENT_ID: u128 = 99999;
 const PORT_BASE: u16 = 19300;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== P1-3: Cross-Shard Write Rejection Test ===\n");
 
     // Start server with 4 shards for cross-shard routing tests

@@ -19,13 +19,13 @@
 //! Run with: cargo run --bin s3_follower_crash_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{count_events, s3_cluster_config, write_event, MinioContainer, TestServer};
+use crate::{count_events, s3_cluster_config, write_event, MinioContainer, TestServer};
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wire::disk::versioned_block::{deserialise_fallback_batch, deserialise_lease};
 use std::time::Duration;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== S3 Lease Follower Crash Integration Test ===\n");
 
     let port_base = 11900 + (std::process::id() % 100) as u16;
@@ -66,8 +66,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 1..=3 {
         write_event(&mut leader_client, &aggregate_key, i, i == 1).await?;
     }
-
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
     let follower_count = count_events(&mut follower_client, &aggregate_key).await?;
@@ -144,8 +142,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nPHASE 5.5: Verify S3 fallback batches carry new lease_index");
     println!("------------------------------------------------------------");
 
-    tokio::time::sleep(Duration::from_millis(1000)).await;
-
     let fallback_objects = minio.list_objects(&shard_prefix).await?;
     println!("  S3 fallback objects: {}", fallback_objects.len());
     assert!(!fallback_objects.is_empty(), "Expected S3 fallback objects after follower crash");
@@ -190,9 +186,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Writing events 6-7 to leader (after follower restart)...");
     write_event(&mut leader_client, &aggregate_key, 6, false).await?;
     write_event(&mut leader_client, &aggregate_key, 7, false).await?;
-
-    println!("  Waiting for replication...");
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let final_follower_count = count_events(&mut restarted_follower_client, &aggregate_key).await?;
     println!("  Restarted follower has {} events", final_follower_count);

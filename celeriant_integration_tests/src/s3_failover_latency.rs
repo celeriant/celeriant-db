@@ -12,7 +12,7 @@
 //! Run with: cargo run --bin s3_failover_latency_main -p celeriant_integration_tests --release
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{
+use crate::{
     count_events, write_event, MinioContainer, ServerConfig, TestServer,
 };
 use celeriant_runtimes::RoutingRule;
@@ -23,8 +23,8 @@ const MAX_FAILOVER: Duration = Duration::from_secs(3);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const POLL_TIMEOUT: Duration = Duration::from_secs(15);
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== S3 Failover Latency Test ===\n");
 
     let port_base = 11500 + (std::process::id() % 100) as u16;
@@ -77,8 +77,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 1..=3 {
         write_event(&mut leader_client, &aggregate_key, i, i == 1).await?;
     }
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
     let count = count_events(&mut follower_client, &aggregate_key).await?;
     assert_eq!(count, 3, "Follower should have replicated 3 events");

@@ -22,7 +22,7 @@ use celeriant_client_tokio::celeriant_client::{CeleriantClient, ClientIdentityCo
 use celeriant_client_tokio::client_error::ClientError;
 use celeriant_client_tokio::ClientTlsConfig;
 use celeriant_crypto::{generate_api_key, hash_api_key, Crypto};
-use celeriant_integration_tests::{count_events, MinioContainer, ServerConfig, TestPki, TestServer};
+use crate::{count_events, MinioContainer, ServerConfig, TestPki, TestServer};
 use celeriant_lib::server_config::{ConfigClientAuth, ConfigTlsMode};
 use celeriant_msg::request::requests::WriteRequest;
 use celeriant_msg::{process_client_requests::ClientRequest, request::requests::SingleAggregateWrite};
@@ -316,8 +316,8 @@ fn check_thresholds(result: &BenchmarkResult, thresholds: &Thresholds) -> Vec<St
     failures
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var("SWEEP_MODE").is_ok() {
         return run_sweep_benchmark().await;
     }

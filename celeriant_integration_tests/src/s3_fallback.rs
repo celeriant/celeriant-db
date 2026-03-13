@@ -15,13 +15,13 @@
 //! Run with: cargo run --bin s3_fallback_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use celeriant_integration_tests::{count_events, s3_cluster_config, write_event, MinioContainer, TestServer};
+use crate::{count_events, s3_cluster_config, write_event, MinioContainer, TestServer};
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wire::disk::versioned_block::deserialise_fallback_batch;
 use std::time::Duration;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== S3 Fallback Integration Test — Happy Path ===\n");
 
     let port_base = 10400 + (std::process::id() % 100) as u16;
@@ -64,9 +64,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         write_event(&mut leader_client, &aggregate_key, i, i == 1).await?;
     }
 
-    println!("  Waiting for replication...");
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
     let mut follower_client = CeleriantClient::connect(follower.address()).await?;
     let follower_count = count_events(&mut follower_client, &aggregate_key).await?;
     assert_eq!(
@@ -91,8 +88,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         write_event(&mut leader_client, &aggregate_key, i, false).await?;
     }
     println!("  Leader writes succeeded (S3 fallback active)\n");
-
-    tokio::time::sleep(Duration::from_millis(1000)).await;
 
     // ========================================
     // Phase 3: Verify S3 objects (first batch)
@@ -153,8 +148,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Writing event 7 to leader (still no follower)...");
     write_event(&mut leader_client, &aggregate_key, 7, false).await?;
     println!("  Write succeeded\n");
-
-    tokio::time::sleep(Duration::from_millis(1000)).await;
 
     let objects_after = minio.list_objects(&shard_prefix).await?;
     println!("  S3 objects now: {}", objects_after.len());
