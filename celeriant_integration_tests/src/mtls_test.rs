@@ -71,6 +71,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     run_test!(test_strict_mode_rejects_plaintext);
     run_test!(test_untrusted_cert_rejected);
     run_test!(test_ktls_cross_shard_redirect);
+    run_test!(test_trust_domain_isolation);
 
     println!("\n=== Results: {} passed, {} failed ===", passed, failed);
 
@@ -347,6 +348,116 @@ async fn test_ktls_cross_shard_redirect() -> Result<(), Box<dyn std::error::Erro
     }
 
     Err(format!("Cross-shard test failed after {KTLS_RETRIES} attempts: {last_err}").into())
+}
+
+/// Dual-CA trust domain isolation: client cert rejected on replication port.
+///
+/// Uses separate CAs for client-facing and intracluster trust. Verifies that a
+/// client cert (signed by client CA) can connect to the client port but is
+/// rejected on the replication port (which trusts only the intracluster CA).
+async fn test_trust_domain_isolation() -> Result<(), Box<dyn std::error::Error>> {
+    let client_pki = TestPki::new()?;
+    let intracluster_pki = TestPki::new()?;
+
+    // Node cert must be signed by intracluster CA (server presents it on both ports).
+    let (node_cert, node_key) = intracluster_pki.create_node_cert("node")?;
+    // Client cert signed by client CA — valid for client port only.
+    let (client_cert, client_key) = client_pki.create_client_cert("legit-client")?;
+
+    let port = test_port(6);
+    let server = TestServer::start_with_config(
+        port,
+        ServerConfig {
+            num_shards: Some(1),
+            log_level: "warn".to_string(),
+            standalone: true,
+            tls_mode: ConfigTlsMode::Strict,
+            tls_ca_cert: Some(client_pki.ca_cert_path()),
+            tls_intracluster_ca_cert: Some(intracluster_pki.ca_cert_path()),
+            tls_node_cert: Some(node_cert),
+            tls_node_key: Some(node_key),
+            tls_client_auth: ConfigClientAuth::Require,
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    // 1. Client cert should work on the client port.
+    let mut last_err = String::new();
+    let mut client_port_ok = false;
+    for attempt in 0..KTLS_RETRIES {
+        // Client trusts intracluster CA to verify the server's node cert.
+        let ca_bundle = PkiManager::load_ca_bundle(&intracluster_pki.ca_cert_path())?;
+        let (cert_chain, key) = PkiManager::load_identity(&client_cert, &client_key)?;
+        let client_config = PkiManager::build_client_config(&ca_bundle, cert_chain, key)?;
+        let sni = ServerName::try_from("localhost".to_string())?;
+        let tls = ClientTlsConfig::new(client_config, sni);
+
+        match CeleriantClient::connect_with_timeout(
+            server.address(),
+            Some(Duration::from_secs(10)),
+            Some(tls),
+        ).await {
+            Ok(mut client) => {
+                let req = ClientRequest::Read(ReadRequest {
+                    correlation_id: Some(1),
+                    aggregate_key: AggregateKey::new(1, 1, 60001),
+                    filters: celeriant_msg::request::read_filters::ReadFilters::new(1),
+                });
+                match client.send_request(&req, CompressionType::None).await {
+                    Ok(_) | Err(celeriant_client_tokio::client_error::ClientError::Server(_)) => {
+                        println!("  Client cert accepted on client port (as expected)");
+                        client_port_ok = true;
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = format!("request failed (attempt {attempt}): {e}");
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                }
+            }
+            Err(e) => {
+                last_err = format!("connect failed (attempt {attempt}): {e}");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
+    if !client_port_ok {
+        return Err(format!("Client cert should be accepted on client port but wasn't: {last_err}").into());
+    }
+
+    // 2. Same client cert should be rejected on the replication port.
+    let repl_addr = format!("127.0.0.1:{}", port + 1);
+    let ca_bundle = PkiManager::load_ca_bundle(&intracluster_pki.ca_cert_path())?;
+    let (cert_chain, key) = PkiManager::load_identity(&client_cert, &client_key)?;
+    let client_config = PkiManager::build_client_config(&ca_bundle, cert_chain, key)?;
+    let sni = ServerName::try_from("localhost".to_string())?;
+    let tls = ClientTlsConfig::new(client_config, sni);
+
+    match CeleriantClient::connect_with_timeout(
+        &repl_addr,
+        Some(Duration::from_secs(10)),
+        Some(tls),
+    ).await {
+        Err(_) => {
+            println!("  Client cert correctly rejected on replication port (handshake failure)");
+            Ok(())
+        }
+        Ok(mut client) => {
+            let req = ClientRequest::Read(ReadRequest {
+                correlation_id: Some(2),
+                aggregate_key: AggregateKey::new(1, 1, 60002),
+                filters: celeriant_msg::request::read_filters::ReadFilters::new(1),
+            });
+            match client.send_request(&req, CompressionType::None).await {
+                Err(_) => {
+                    println!("  Client cert rejected on replication port (post-handshake)");
+                    Ok(())
+                }
+                Ok(r) => Err(format!("Client cert should be rejected on replication port but got: {r:?}").into()),
+            }
+        }
+    }
 }
 
 async fn cross_shard_roundtrip(

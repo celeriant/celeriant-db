@@ -662,6 +662,11 @@ impl ServerConfigExt for ServerConfig {
             args.push(ca_cert.to_str().unwrap().to_string());
         }
 
+        if let Some(intracluster_ca_cert) = &self.tls_intracluster_ca_cert {
+            args.push("--tls-intracluster-ca-cert".to_string());
+            args.push(intracluster_ca_cert.to_str().unwrap().to_string());
+        }
+
         if let Some(node_cert) = &self.tls_node_cert {
             args.push("--tls-node-cert".to_string());
             args.push(node_cert.to_str().unwrap().to_string());

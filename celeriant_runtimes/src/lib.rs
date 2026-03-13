@@ -103,7 +103,7 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                 };
                 let s3_uploader = SidecarS3Uploader::new(sidecar_senders.clone());
                 let replication_client_config = shard_config.tls_config.as_ref()
-                    .map(|t| t.client_config.clone());
+                    .map(|t| t.replication_client_config.clone());
                 let replication_client = FollowerConnection::new(
                     None,
                     shard_config.internode_connection_timeout,

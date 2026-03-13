@@ -391,6 +391,16 @@ pub struct ServerConfig {
 
     #[arg(
         long,
+        env = "CELERIANT_TLS_INTRACLUSTER_CA_CERT",
+        help = "Path to intracluster CA certificate (PEM). When set, the replication \
+                listener and outbound replication client trust only this CA, while the \
+                client listener trusts only --tls-ca-cert. When not set, both listeners \
+                use --tls-ca-cert (current behaviour)."
+    )]
+    pub tls_intracluster_ca_cert: Option<PathBuf>,
+
+    #[arg(
+        long,
         env = "CELERIANT_TLS_NODE_CERT",
         help = "Path to node certificate (PEM)"
     )]
@@ -575,8 +585,13 @@ impl ServerConfig {
         let key_path = self.tls_node_key.as_ref()
             .ok_or("--tls-node-key is required when TLS is enabled")?;
 
-        let ca_bundle = PkiManager::load_ca_bundle(ca_path)
+        let client_ca = PkiManager::load_ca_bundle(ca_path)
             .map_err(|e| format!("Failed to load CA bundle from {:?}: {:?}", ca_path, e))?;
+        let intracluster_ca = match &self.tls_intracluster_ca_cert {
+            Some(path) => PkiManager::load_ca_bundle(path)
+                .map_err(|e| format!("Failed to load intracluster CA bundle from {:?}: {:?}", path, e))?,
+            None => client_ca.clone(),
+        };
         let (cert_chain, node_key) = PkiManager::load_identity(cert_path, key_path)
             .map_err(|e| format!("Failed to load node identity from {:?}/{:?}: {:?}", cert_path, key_path, e))?;
 
@@ -586,21 +601,24 @@ impl ServerConfig {
             ConfigClientAuth::None => ClientAuthMode::None,
         };
 
-        let mut server_config = PkiManager::build_server_config(&ca_bundle, cert_chain.clone(), node_key.clone_key(), client_auth)
-            .map_err(|e| format!("Failed to build TLS server config: {:?}", e))?;
-
-        // Required for kTLS key extraction after handshake.
-        Arc::get_mut(&mut server_config)
+        // Client-facing server config trusts the client CA.
+        let mut client_server_config = PkiManager::build_server_config(&client_ca, cert_chain.clone(), node_key.clone_key(), client_auth)
+            .map_err(|e| format!("Failed to build client-facing TLS server config: {:?}", e))?;
+        Arc::get_mut(&mut client_server_config)
             .ok_or("BUG: Arc<ServerConfig> was cloned before secret extraction could be enabled")?
             .enable_secret_extraction = true;
 
-        // Build a client config for outbound replication connections (node → node).
-        // The node cert has serverAuth + clientAuth EKU so it works on both sides.
-        let mut client_config = PkiManager::build_client_config(&ca_bundle, cert_chain, node_key)
-            .map_err(|e| format!("Failed to build TLS client config: {:?}", e))?;
+        // Replication server config trusts the intracluster CA. Always requires client auth.
+        let mut replication_server_config = PkiManager::build_server_config(&intracluster_ca, cert_chain.clone(), node_key.clone_key(), ClientAuthMode::Require)
+            .map_err(|e| format!("Failed to build replication TLS server config: {:?}", e))?;
+        Arc::get_mut(&mut replication_server_config)
+            .ok_or("BUG: Arc<ServerConfig> was cloned before secret extraction could be enabled")?
+            .enable_secret_extraction = true;
 
-        // Required for kTLS key extraction on the outbound (client) side.
-        Arc::get_mut(&mut client_config)
+        // Outbound replication client config trusts the intracluster CA.
+        let mut replication_client_config = PkiManager::build_client_config(&intracluster_ca, cert_chain, node_key)
+            .map_err(|e| format!("Failed to build replication TLS client config: {:?}", e))?;
+        Arc::get_mut(&mut replication_client_config)
             .ok_or("BUG: Arc<ClientConfig> was cloned before secret extraction could be enabled")?
             .enable_secret_extraction = true;
 
@@ -609,7 +627,7 @@ impl ServerConfig {
             ConfigTlsMode::Strict => TlsMode::Strict,
         };
 
-        Ok(Some(Arc::new(TlsConfig { server_config, client_config, tls_mode })))
+        Ok(Some(Arc::new(TlsConfig { client_server_config, replication_server_config, replication_client_config, tls_mode })))
     }
 
     pub fn to_shard_config(
@@ -708,7 +726,12 @@ impl ServerConfig {
                     self.tls_node_cert.clone(),
                     self.tls_node_key.clone(),
                 ) {
-                    Some(TlsCertPaths { ca_cert: ca, node_cert: cert, node_key: key })
+                    Some(TlsCertPaths {
+                        ca_cert: ca,
+                        intracluster_ca_cert: self.tls_intracluster_ca_cert.clone(),
+                        node_cert: cert,
+                        node_key: key,
+                    })
                 } else {
                     tracing::warn!(
                         "tls_cert_reload_interval_secs is set but cert paths are incomplete \
@@ -800,6 +823,7 @@ impl ServerConfig {
         check_field!(max_s3_fallback_batch_bytes);
         check_field!(tls_mode);
         check_field!(tls_ca_cert);
+        check_field!(tls_intracluster_ca_cert);
         check_field!(tls_node_cert);
         check_field!(tls_node_key);
         check_field!(tls_client_auth);
@@ -883,6 +907,7 @@ impl Default for ServerConfig {
             max_s3_fallback_batch_bytes: 1024 * 1024 * 100,
             tls_mode: ConfigTlsMode::Disabled,
             tls_ca_cert: None,
+            tls_intracluster_ca_cert: None,
             tls_node_cert: None,
             tls_node_key: None,
             tls_client_auth: ConfigClientAuth::Require,

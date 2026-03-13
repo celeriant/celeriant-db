@@ -151,7 +151,8 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
                 }
                 // Read current TLS config each iteration so hot-reloads take effect
                 // for new connections without requiring a restart.
-                let tls_snapshot = client_tls.borrow().clone();
+                let tls_snapshot = client_tls.borrow().as_ref()
+                    .map(|t| (t.tls_mode, t.client_server_config.clone()));
                 match glommio::timer::timeout(Duration::from_secs(1), client_listener.shared_accept()).await {
                     Ok(stream) => {
                         let tcp_stream = stream.bind_to_executor();
@@ -178,7 +179,8 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
                 if repl_ctx.shutdown_requested.get() || repl_shard_failed.load(Ordering::Relaxed) {
                     break;
                 }
-                let tls_snapshot = repl_tls.borrow().clone();
+                let tls_snapshot = repl_tls.borrow().as_ref()
+                    .map(|t| (t.tls_mode, t.replication_server_config.clone()));
                 match glommio::timer::timeout(Duration::from_secs(1), repl_listener.shared_accept()).await {
                     Ok(stream) => {
                         let tcp_stream = stream.bind_to_executor();
@@ -208,6 +210,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
                 let client_auth = self.ctx.config.tls_client_auth;
                 let reloader = TlsReloader::new(
                     paths.ca_cert.clone(),
+                    paths.intracluster_ca_cert.clone(),
                     paths.node_cert.clone(),
                     paths.node_key.clone(),
                     client_auth,
@@ -836,21 +839,21 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
 /// which logs and continues the accept loop.
 async fn maybe_ktls_accept(
     stream: glommio::net::TcpStream,
-    tls_config: &Option<std::sync::Arc<crate::sharded::tls_config::TlsConfig>>,
+    tls_config: &Option<(TlsMode, Arc<rustls::ServerConfig>)>,
 ) -> Result<glommio::net::TcpStream, celeriant_ktls::KtlsError> {
-    let tls = match tls_config {
+    let (mode, server_config) = match tls_config {
         Some(t) => t,
         None => return Ok(stream),
     };
 
-    match tls.tls_mode {
+    match mode {
         TlsMode::Disabled => {
             warn!("TlsConfig present with TlsMode::Disabled; passing stream through unencrypted");
             Ok(stream)
         }
         TlsMode::Strict => {
             match glommio::timer::timeout(TLS_HANDSHAKE_TIMEOUT, async {
-                Ok::<_, glommio::GlommioError<()>>(celeriant_ktls::ktls_accept(stream, tls.server_config.clone()).await)
+                Ok::<_, glommio::GlommioError<()>>(celeriant_ktls::ktls_accept(stream, server_config.clone()).await)
             })
             .await
             {

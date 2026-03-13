@@ -41,6 +41,7 @@ impl ApiKeyHashes {
 #[derive(Clone, Debug)]
 pub struct TlsCertPaths {
     pub ca_cert: PathBuf,
+    pub intracluster_ca_cert: Option<PathBuf>,
     pub node_cert: PathBuf,
     pub node_key: PathBuf,
 }
