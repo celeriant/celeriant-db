@@ -1,4 +1,6 @@
-use std::{cell::{Cell, RefCell}, collections::HashMap, fmt, future::Future, rc::Rc, time::Duration};
+use std::{cell::{Cell, RefCell}, collections::HashMap, fmt, future::Future, io, pin::Pin, rc::Rc, task::{Context, Poll}, time::Duration};
+
+use futures_lite::AsyncRead;
 
 use base64::Engine;
 use celeriant_distributed::{heartbeat::now_ms, lease_manager::LeaseManager, lease_store::LeaseStore, node_status::NodeStatus, validated_node_status::ValidatedNodeStatus};
@@ -113,7 +115,7 @@ enum ClusterRedirectResult {
     ErrorSentContinue(TcpStream),
 }
 
-pub fn handle_new_connection<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(mut tcp_stream: TcpStream, ctx: ConnectionContext<R, D, S>, port_type: PortType) {
+pub fn handle_new_connection<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(mut tcp_stream: TcpStream, trailing: Vec<u8>, ctx: ConnectionContext<R, D, S>, port_type: PortType) {
     let _ = tcp_stream.set_nodelay(true);
 
     let peer_addr = tcp_stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
@@ -123,7 +125,7 @@ pub fn handle_new_connection<R: ReplicationClient + 'static, D: S3Downloader + '
             return;
         }
 
-        debug!(shard_id = ctx.current_shard_id, peer = %peer_addr, ?port_type, "Connection accepted");
+        debug!(shard_id = ctx.current_shard_id, peer = %peer_addr, ?port_type, trailing_bytes = trailing.len(), "Connection accepted");
 
         let shard_label = [("shard_id", ctx.current_shard_id.to_string())];
         metrics::gauge!("celeriant_client_connections_active", &shard_label).increment(1.0);
@@ -136,9 +138,17 @@ pub fn handle_new_connection<R: ReplicationClient + 'static, D: S3Downloader + '
                     access_level: None,
                 };
 
-                let first_message = match read_first_message(&mut tcp_stream, &ctx).await {
-                    Some(m) => m,
-                    None => return,
+                let first_message = if trailing.is_empty() {
+                    match read_first_message(&mut tcp_stream, &ctx).await {
+                        Some(m) => m,
+                        None => return,
+                    }
+                } else {
+                    let mut reader = PrefixedReader::new(trailing, &mut tcp_stream);
+                    match read_first_message_from(&mut reader, &ctx).await {
+                        Some(m) => m,
+                        None => return,
+                    }
                 };
 
                 let (request, message_version) = match first_message {
@@ -185,9 +195,17 @@ pub fn handle_new_connection<R: ReplicationClient + 'static, D: S3Downloader + '
                 }
             }
             PortType::Replication => {
-                let (request, message_version) = match read_cluster_request(&mut tcp_stream, &ctx).await {
-                    Some(r) => r,
-                    None => return,
+                let (request, message_version) = if trailing.is_empty() {
+                    match read_cluster_request(&mut tcp_stream, &ctx).await {
+                        Some(r) => r,
+                        None => return,
+                    }
+                } else {
+                    let mut reader = PrefixedReader::new(trailing, &mut tcp_stream);
+                    match read_cluster_request_from(&mut reader, &ctx).await {
+                        Some(r) => r,
+                        None => return,
+                    }
                 };
 
                 match check_cluster_redirect(tcp_stream, request, ctx.config.max_response_size, ctx.config.server_compression_algorithm, message_version, &ctx).await {
@@ -836,6 +854,75 @@ async fn read_cluster_request<R: ReplicationClient + 'static, D: S3Downloader + 
             .map_err(ReadWireDataError::ReadHeaderFailure)?;
         let version = header.version;
         let req = ClusterRequest::read_from_header(header, tcp_stream).await?;
+        Ok((req, version))
+    }.await;
+    match result {
+        Ok(r) => Some(r),
+        Err(ReadWireDataError::ReadHeaderFailure(WireError::NetworkError(ref e)))
+            if e.kind() == std::io::ErrorKind::UnexpectedEof => None,
+        Err(e) => {
+            warn!(shard = ctx.current_shard_id, "Failed to read cluster request: {e:?}");
+            None
+        }
+    }
+}
+
+/// Wraps a prefix buffer and an inner reader, serving the prefix first.
+/// Used to deliver application data that was buffered during the kTLS handshake.
+struct PrefixedReader<'a> {
+    prefix: Vec<u8>,
+    prefix_pos: usize,
+    inner: &'a mut TcpStream,
+}
+
+impl<'a> PrefixedReader<'a> {
+    fn new(prefix: Vec<u8>, inner: &'a mut TcpStream) -> Self {
+        Self { prefix, prefix_pos: 0, inner }
+    }
+}
+
+impl AsyncRead for PrefixedReader<'_> {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let remaining = this.prefix.len() - this.prefix_pos;
+        if remaining > 0 {
+            let n = remaining.min(buf.len());
+            buf[..n].copy_from_slice(&this.prefix[this.prefix_pos..this.prefix_pos + n]);
+            this.prefix_pos += n;
+            Poll::Ready(Ok(n))
+        } else {
+            Pin::new(&mut *this.inner).poll_read(cx, buf)
+        }
+    }
+}
+
+async fn read_first_message_from<Rd: futures_lite::AsyncReadExt + Unpin, R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
+    reader: &mut Rd,
+    ctx: &ConnectionContext<R, D, S>,
+) -> Option<FirstMessage> {
+    read_with_timeout(ctx.config.slow_client_timeout, ctx.current_shard_id, "first message", async {
+        let header = WireHeader::from_reader(reader, ctx.config.max_request_size).await
+            .map_err(ReadWireDataError::ReadHeaderFailure)?;
+        let version = header.version;
+        if header.message_type == IDENTIFY_REQUEST_TYPE_ID {
+            let req = read_identify_request(header, reader).await?;
+            Ok(FirstMessage::Identify(req, version))
+        } else {
+            let req = ClientRequest::read_from_header(header, reader).await?;
+            Ok(FirstMessage::ClientRequest(req, version))
+        }
+    }).await
+}
+
+async fn read_cluster_request_from<Rd: futures_lite::AsyncReadExt + Unpin, R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
+    reader: &mut Rd,
+    ctx: &ConnectionContext<R, D, S>,
+) -> Option<(ClusterRequest, u32)> {
+    let result: Result<(ClusterRequest, u32), ReadWireDataError> = async {
+        let header = WireHeader::from_reader(reader, ctx.config.max_request_size).await
+            .map_err(ReadWireDataError::ReadHeaderFailure)?;
+        let version = header.version;
+        let req = ClusterRequest::read_from_header(header, reader).await?;
         Ok((req, version))
     }.await;
     match result {

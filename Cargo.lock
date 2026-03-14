@@ -800,6 +800,7 @@ dependencies = [
  "celeriant_watch",
  "celeriant_wire",
  "flume",
+ "futures-lite",
  "glommio",
  "libc",
  "metrics",

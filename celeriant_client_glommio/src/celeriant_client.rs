@@ -161,7 +161,8 @@ impl CeleriantClient {
             None => stream,
             Some(cfg) => ktls_connect(stream, cfg.client_config, cfg.server_name)
                 .await
-                .map_err(ClientError::KtlsError)?,
+                .map_err(ClientError::KtlsError)?
+                .0,
         };
 
         Ok(Self {

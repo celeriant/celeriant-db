@@ -160,7 +160,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
                             warn!("set_nodelay failed on client connection: {e}");
                         }
                         match maybe_ktls_accept(tcp_stream, &tls_snapshot).await {
-                            Ok(tcp_stream) => handle_new_connection(tcp_stream, client_ctx.clone(), PortType::Client),
+                            Ok((tcp_stream, trailing)) => handle_new_connection(tcp_stream, trailing, client_ctx.clone(), PortType::Client),
                             Err(e) => warn!("TLS handshake failed on client port: {:?}", e),
                         }
                     }
@@ -189,7 +189,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
                         }
                         set_tcp_keepalive(&tcp_stream);
                         match maybe_ktls_accept(tcp_stream, &tls_snapshot).await {
-                            Ok(tcp_stream) => handle_new_connection(tcp_stream, repl_ctx.clone(), PortType::Replication),
+                            Ok((tcp_stream, trailing)) => handle_new_connection(tcp_stream, trailing, repl_ctx.clone(), PortType::Replication),
                             Err(e) => warn!("TLS handshake failed on replication port: {:?}", e),
                         }
                     }
@@ -842,16 +842,16 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
 async fn maybe_ktls_accept(
     stream: glommio::net::TcpStream,
     tls_config: &Option<(TlsMode, Arc<rustls::ServerConfig>)>,
-) -> Result<glommio::net::TcpStream, celeriant_ktls::KtlsError> {
+) -> Result<(glommio::net::TcpStream, Vec<u8>), celeriant_ktls::KtlsError> {
     let (mode, server_config) = match tls_config {
         Some(t) => t,
-        None => return Ok(stream),
+        None => return Ok((stream, Vec::new())),
     };
 
     match mode {
         TlsMode::Disabled => {
             warn!("TlsConfig present with TlsMode::Disabled; passing stream through unencrypted");
-            Ok(stream)
+            Ok((stream, Vec::new()))
         }
         TlsMode::Strict => {
             match glommio::timer::timeout(TLS_HANDSHAKE_TIMEOUT, async {

@@ -294,7 +294,7 @@ mod tests {
                 // has compatibility issues on some kernels (e.g. 6.17).
                 let server = glommio::spawn_local(async move {
                     let stream = listener.accept().await.unwrap();
-                    let _stream = ktls_accept(stream, server_config).await
+                    let (_stream, _trailing) = ktls_accept(stream, server_config).await
                         .expect("ktls_accept must succeed");
                     // Keep connection alive until client finishes
                     glommio::timer::sleep(std::time::Duration::from_millis(100)).await;
@@ -303,7 +303,7 @@ mod tests {
                 let client = glommio::spawn_local(async move {
                     let stream = TcpStream::connect(addr).await.unwrap();
                     let server_name = ServerName::try_from("localhost").unwrap();
-                    let _stream = ktls_connect(stream, client_config, server_name).await
+                    let (_stream, _trailing) = ktls_connect(stream, client_config, server_name).await
                         .expect("ktls_connect must succeed");
                     // Keep connection alive until server finishes
                     glommio::timer::sleep(std::time::Duration::from_millis(100)).await;
@@ -329,15 +329,15 @@ mod tests {
 pub async fn ktls_accept(
     mut stream: TcpStream,
     server_config: Arc<rustls::ServerConfig>,
-) -> Result<TcpStream, KtlsError> {
+) -> Result<(TcpStream, Vec<u8>), KtlsError> {
     let fd = stream.as_raw_fd();
     debug!(fd, "kTLS accept: starting handshake");
     let conn = UnbufferedServerConnection::new(server_config)?;
-    let secrets = drive_handshake_server(&mut stream, conn).await?;
-    debug!(fd, "kTLS accept: handshake complete, installing kernel TLS");
+    let (secrets, trailing) = drive_handshake_server(&mut stream, conn).await?;
+    debug!(fd, trailing_bytes = trailing.len(), "kTLS accept: handshake complete, installing kernel TLS");
     setup_ktls(fd, secrets)?;
     debug!(fd, "kTLS accept: kernel TLS active");
-    Ok(stream)
+    Ok((stream, trailing))
 }
 
 /// Perform a TLS handshake over a Glommio TcpStream (client side),
@@ -348,21 +348,51 @@ pub async fn ktls_connect(
     mut stream: TcpStream,
     client_config: Arc<rustls::ClientConfig>,
     server_name: ServerName<'static>,
-) -> Result<TcpStream, KtlsError> {
+) -> Result<(TcpStream, Vec<u8>), KtlsError> {
     let fd = stream.as_raw_fd();
     debug!(fd, server_name = ?server_name, "kTLS connect: starting handshake");
     let conn = UnbufferedClientConnection::new(client_config, server_name)?;
-    let secrets = drive_handshake_client(&mut stream, conn).await?;
-    debug!(fd, "kTLS connect: handshake complete, installing kernel TLS");
+    let (secrets, trailing) = drive_handshake_client(&mut stream, conn).await?;
+    debug!(fd, trailing_bytes = trailing.len(), "kTLS connect: handshake complete, installing kernel TLS");
     setup_ktls(fd, secrets)?;
     debug!(fd, "kTLS connect: kernel TLS active");
-    Ok(stream)
+    Ok((stream, trailing))
+}
+
+/// Drain any remaining TLS records from the incoming buffer after the handshake
+/// completes. Extracts decrypted application data into `trailing`.
+macro_rules! drain_remaining_records {
+    ($conn:expr, $incoming:expr, $incoming_filled:expr, $outgoing:expr, $stream:expr, $trailing:expr) => {
+        while $incoming_filled > 0 {
+            let UnbufferedStatus { discard: d, state: s } =
+                $conn.process_tls_records(&mut $incoming[..$incoming_filled]);
+            let encode = match s? {
+                ConnectionState::EncodeTlsData(mut etd) => {
+                    let n = etd.encode(&mut $outgoing)?;
+                    Some(n)
+                }
+                ConnectionState::TransmitTlsData(ttd) => { ttd.done(); None }
+                ConnectionState::WriteTraffic(_) => None,
+                ConnectionState::ReadTraffic(mut rt) => {
+                    while let Some(Ok(record)) = rt.next_record() {
+                        $trailing.extend_from_slice(record.payload);
+                    }
+                    None
+                }
+                _ => { drain_discard(&mut $incoming, &mut $incoming_filled, d); break; }
+            };
+            drain_discard(&mut $incoming, &mut $incoming_filled, d);
+            if let Some(n) = encode {
+                $stream.write_all(&$outgoing[..n]).await?;
+            }
+        }
+    };
 }
 
 async fn drive_handshake_server(
     stream: &mut TcpStream,
     mut conn: UnbufferedServerConnection,
-) -> Result<rustls::ExtractedSecrets, KtlsError> {
+) -> Result<(rustls::ExtractedSecrets, Vec<u8>), KtlsError> {
     let mut incoming: Vec<u8> = vec![0u8; 16 * 1024];
     let mut incoming_filled = 0usize;
     let mut outgoing: Vec<u8> = vec![0u8; 16 * 1024];
@@ -393,31 +423,28 @@ async fn drive_handshake_server(
                 continue;
             }
 
-            ConnectionState::WriteTraffic(_) | ConnectionState::ReadTraffic(_) => {
-                // Drain discard from this process_tls_records call, then consume
-                // any remaining buffered records (e.g. client Finished that arrived
-                // in the same TCP read). Bytes already read from TCP won't be
-                // available to the kernel — leaving them causes a record gap → EIO.
-                drain_discard(&mut incoming, &mut incoming_filled, discard);
-                while incoming_filled > 0 {
-                    let UnbufferedStatus { discard: d, state: s } =
-                        conn.process_tls_records(&mut incoming[..incoming_filled]);
-                    let encode = match s? {
-                        ConnectionState::EncodeTlsData(mut etd) => {
-                            let n = etd.encode(&mut outgoing)?;
-                            Some(n)
-                        }
-                        ConnectionState::TransmitTlsData(ttd) => { ttd.done(); None }
-                        ConnectionState::WriteTraffic(_) | ConnectionState::ReadTraffic(_) => None,
-                        _ => { drain_discard(&mut incoming, &mut incoming_filled, d); break; }
-                    };
-                    drain_discard(&mut incoming, &mut incoming_filled, d);
-                    if let Some(n) = encode {
-                        stream.write_all(&outgoing[..n]).await?;
-                    }
+            ConnectionState::ReadTraffic(mut rt) => {
+                // process_tls_records processed the Finished AND app data in
+                // one call. Extract the decrypted plaintext before it's lost —
+                // once kTLS is installed, the kernel can't see bytes that were
+                // already consumed from the TCP receive buffer by userspace.
+                let mut trailing = Vec::new();
+                while let Some(Ok(record)) = rt.next_record() {
+                    trailing.extend_from_slice(record.payload);
                 }
-                debug!(incoming_filled, "server: extracting kernel connection");
-                return Ok(conn.dangerous_into_kernel_connection()?.0);
+                drop(rt);
+                drain_discard(&mut incoming, &mut incoming_filled, discard);
+                drain_remaining_records!(conn, incoming, incoming_filled, outgoing, stream, trailing);
+                debug!(incoming_filled, trailing_bytes = trailing.len(), "server: extracting kernel connection");
+                return Ok((conn.dangerous_into_kernel_connection()?.0, trailing));
+            }
+
+            ConnectionState::WriteTraffic(_) => {
+                let mut trailing = Vec::new();
+                drain_discard(&mut incoming, &mut incoming_filled, discard);
+                drain_remaining_records!(conn, incoming, incoming_filled, outgoing, stream, trailing);
+                debug!(incoming_filled, trailing_bytes = trailing.len(), "server: extracting kernel connection");
+                return Ok((conn.dangerous_into_kernel_connection()?.0, trailing));
             }
 
             ConnectionState::ReadEarlyData(mut red) => {
@@ -441,7 +468,7 @@ async fn drive_handshake_server(
 async fn drive_handshake_client(
     stream: &mut TcpStream,
     mut conn: UnbufferedClientConnection,
-) -> Result<rustls::ExtractedSecrets, KtlsError> {
+) -> Result<(rustls::ExtractedSecrets, Vec<u8>), KtlsError> {
     let mut incoming: Vec<u8> = vec![0u8; 16 * 1024];
     let mut incoming_filled = 0usize;
     let mut outgoing: Vec<u8> = vec![0u8; 16 * 1024];
@@ -472,32 +499,24 @@ async fn drive_handshake_client(
                 continue;
             }
 
-            ConnectionState::WriteTraffic(_) | ConnectionState::ReadTraffic(_) => {
-                // Drain discard from this process_tls_records call, then consume
-                // any remaining buffered records (e.g. NewSessionTicket that arrived
-                // in the same TCP read as the server Finished). Bytes already read
-                // from TCP won't be available to the kernel — leaving them causes
-                // a record gap → EIO.
-                drain_discard(&mut incoming, &mut incoming_filled, discard);
-                while incoming_filled > 0 {
-                    let UnbufferedStatus { discard: d, state: s } =
-                        conn.process_tls_records(&mut incoming[..incoming_filled]);
-                    let encode = match s? {
-                        ConnectionState::EncodeTlsData(mut etd) => {
-                            let n = etd.encode(&mut outgoing)?;
-                            Some(n)
-                        }
-                        ConnectionState::TransmitTlsData(ttd) => { ttd.done(); None }
-                        ConnectionState::WriteTraffic(_) | ConnectionState::ReadTraffic(_) => None,
-                        _ => { drain_discard(&mut incoming, &mut incoming_filled, d); break; }
-                    };
-                    drain_discard(&mut incoming, &mut incoming_filled, d);
-                    if let Some(n) = encode {
-                        stream.write_all(&outgoing[..n]).await?;
-                    }
+            ConnectionState::ReadTraffic(mut rt) => {
+                let mut trailing = Vec::new();
+                while let Some(Ok(record)) = rt.next_record() {
+                    trailing.extend_from_slice(record.payload);
                 }
-                debug!(incoming_filled, "client: extracting kernel connection");
-                return Ok(conn.dangerous_into_kernel_connection()?.0);
+                drop(rt);
+                drain_discard(&mut incoming, &mut incoming_filled, discard);
+                drain_remaining_records!(conn, incoming, incoming_filled, outgoing, stream, trailing);
+                debug!(incoming_filled, trailing_bytes = trailing.len(), "client: extracting kernel connection");
+                return Ok((conn.dangerous_into_kernel_connection()?.0, trailing));
+            }
+
+            ConnectionState::WriteTraffic(_) => {
+                let mut trailing = Vec::new();
+                drain_discard(&mut incoming, &mut incoming_filled, discard);
+                drain_remaining_records!(conn, incoming, incoming_filled, outgoing, stream, trailing);
+                debug!(incoming_filled, trailing_bytes = trailing.len(), "client: extracting kernel connection");
+                return Ok((conn.dangerous_into_kernel_connection()?.0, trailing));
             }
 
             ConnectionState::PeerClosed | ConnectionState::Closed => {
