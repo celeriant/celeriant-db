@@ -214,13 +214,118 @@ mod tests {
         let _ = outcome; // panic is expected and acceptable in debug
     }
 
+    /// Generate a self-signed CA + node certificate for testing.
+    /// Returns (ServerConfig, ClientConfig) with secret extraction enabled
+    /// and session tickets disabled (required for kTLS-to-kTLS).
+    fn test_tls_configs() -> (Arc<rustls::ServerConfig>, Arc<rustls::ClientConfig>) {
+        use rcgen::{CertificateParams, Issuer, KeyPair};
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+
+        // CA
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+
+        // Node cert signed by CA (SAN: localhost, 127.0.0.1)
+        let ca_issuer = Issuer::from_ca_cert_pem(&ca.pem(), ca_key).unwrap();
+        let node_key = KeyPair::generate().unwrap();
+        let node_params = CertificateParams::new(vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+        ]).unwrap();
+        let node_cert = node_params.signed_by(&node_key, &ca_issuer).unwrap();
+
+        let ca_der = CertificateDer::from(ca.der().to_vec());
+        let node_der = CertificateDer::from(node_cert.der().to_vec());
+        let node_key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(node_key.serialize_der()));
+
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+
+        // Server config — send_tls13_tickets=0 prevents NewSessionTicket which
+        // would desync seq counters between kTLS endpoints.
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add(ca_der.clone()).unwrap();
+        let mut server_config = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![node_der.clone()], node_key_der.clone_key())
+            .unwrap();
+        server_config.enable_secret_extraction = true;
+        server_config.send_tls13_tickets = 0;
+        let server_config = Arc::new(server_config);
+
+        // Client config
+        let mut client_config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(root_store)
+            .with_client_auth_cert(vec![node_der], node_key_der)
+            .unwrap();
+        client_config.enable_secret_extraction = true;
+        let client_config = Arc::new(client_config);
+
+        (server_config, client_config)
+    }
+
+    #[test]
+    fn test_ktls_connect_accept_roundtrip() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("debug")
+            .try_init();
+
+        if verify_ktls_support().is_err() {
+            eprintln!("kTLS not supported on this kernel, skipping test");
+            return;
+        }
+
+        let (server_config, client_config) = test_tls_configs();
+
+        let ex = glommio::LocalExecutorBuilder::default()
+            .spawn(move || async move {
+                use glommio::net::TcpListener;
+
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let addr = listener.local_addr().unwrap();
+
+                // Verify kTLS handshake + install succeeds on both sides.
+                // Data transfer is not tested here because io_uring + kTLS
+                // has compatibility issues on some kernels (e.g. 6.17).
+                let server = glommio::spawn_local(async move {
+                    let stream = listener.accept().await.unwrap();
+                    let _stream = ktls_accept(stream, server_config).await
+                        .expect("ktls_accept must succeed");
+                    // Keep connection alive until client finishes
+                    glommio::timer::sleep(std::time::Duration::from_millis(100)).await;
+                });
+
+                let client = glommio::spawn_local(async move {
+                    let stream = TcpStream::connect(addr).await.unwrap();
+                    let server_name = ServerName::try_from("localhost").unwrap();
+                    let _stream = ktls_connect(stream, client_config, server_name).await
+                        .expect("ktls_connect must succeed");
+                    // Keep connection alive until server finishes
+                    glommio::timer::sleep(std::time::Duration::from_millis(100)).await;
+                });
+
+                server.await;
+                client.await;
+            })
+            .unwrap();
+
+        ex.join().unwrap();
+    }
 }
 
 /// Perform a TLS handshake over a Glommio TcpStream (server side),
 /// extract session keys, configure kTLS via setsockopt, and return
 /// the plain TcpStream with kernel-level encryption active.
 ///
-/// The provided `server_config` must have `enable_secret_extraction = true`.
+/// The provided `server_config` must have:
+/// - `enable_secret_extraction = true`
+/// - `send_tls13_tickets = 0` (for kTLS-to-kTLS internode connections;
+///   session tickets desync sequence counters between kTLS endpoints)
 pub async fn ktls_accept(
     mut stream: TcpStream,
     server_config: Arc<rustls::ServerConfig>,
@@ -289,6 +394,29 @@ async fn drive_handshake_server(
             }
 
             ConnectionState::WriteTraffic(_) | ConnectionState::ReadTraffic(_) => {
+                // Drain discard from this process_tls_records call, then consume
+                // any remaining buffered records (e.g. client Finished that arrived
+                // in the same TCP read). Bytes already read from TCP won't be
+                // available to the kernel — leaving them causes a record gap → EIO.
+                drain_discard(&mut incoming, &mut incoming_filled, discard);
+                while incoming_filled > 0 {
+                    let UnbufferedStatus { discard: d, state: s } =
+                        conn.process_tls_records(&mut incoming[..incoming_filled]);
+                    let encode = match s? {
+                        ConnectionState::EncodeTlsData(mut etd) => {
+                            let n = etd.encode(&mut outgoing)?;
+                            Some(n)
+                        }
+                        ConnectionState::TransmitTlsData(ttd) => { ttd.done(); None }
+                        ConnectionState::WriteTraffic(_) | ConnectionState::ReadTraffic(_) => None,
+                        _ => { drain_discard(&mut incoming, &mut incoming_filled, d); break; }
+                    };
+                    drain_discard(&mut incoming, &mut incoming_filled, d);
+                    if let Some(n) = encode {
+                        stream.write_all(&outgoing[..n]).await?;
+                    }
+                }
+                debug!(incoming_filled, "server: extracting kernel connection");
                 return Ok(conn.dangerous_into_kernel_connection()?.0);
             }
 
@@ -345,6 +473,30 @@ async fn drive_handshake_client(
             }
 
             ConnectionState::WriteTraffic(_) | ConnectionState::ReadTraffic(_) => {
+                // Drain discard from this process_tls_records call, then consume
+                // any remaining buffered records (e.g. NewSessionTicket that arrived
+                // in the same TCP read as the server Finished). Bytes already read
+                // from TCP won't be available to the kernel — leaving them causes
+                // a record gap → EIO.
+                drain_discard(&mut incoming, &mut incoming_filled, discard);
+                while incoming_filled > 0 {
+                    let UnbufferedStatus { discard: d, state: s } =
+                        conn.process_tls_records(&mut incoming[..incoming_filled]);
+                    let encode = match s? {
+                        ConnectionState::EncodeTlsData(mut etd) => {
+                            let n = etd.encode(&mut outgoing)?;
+                            Some(n)
+                        }
+                        ConnectionState::TransmitTlsData(ttd) => { ttd.done(); None }
+                        ConnectionState::WriteTraffic(_) | ConnectionState::ReadTraffic(_) => None,
+                        _ => { drain_discard(&mut incoming, &mut incoming_filled, d); break; }
+                    };
+                    drain_discard(&mut incoming, &mut incoming_filled, d);
+                    if let Some(n) = encode {
+                        stream.write_all(&outgoing[..n]).await?;
+                    }
+                }
+                debug!(incoming_filled, "client: extracting kernel connection");
                 return Ok(conn.dangerous_into_kernel_connection()?.0);
             }
 

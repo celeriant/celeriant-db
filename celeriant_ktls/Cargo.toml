@@ -12,3 +12,7 @@ glommio.workspace = true
 libc.workspace = true
 futures-lite.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

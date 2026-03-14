@@ -44,6 +44,8 @@ pub struct TlsCertPaths {
     pub intracluster_ca_cert: Option<PathBuf>,
     pub node_cert: PathBuf,
     pub node_key: PathBuf,
+    pub client_cert: Option<PathBuf>,
+    pub client_key: Option<PathBuf>,
 }
 
 /// Per-node configuration that gets cloned to each shard.

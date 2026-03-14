@@ -123,6 +123,13 @@ pub fn all_tests() -> &'static [TestEntry] {
             distributed: false,
         },
         TestEntry {
+            name: "rpi_cluster_bench",
+            description: "Write benchmark against a remote RPi cluster over mTLS",
+            estimated_secs: 60,
+            categories: &[Performance],
+            distributed: true,
+        },
+        TestEntry {
             name: "chaos",
             description: "Concurrent read/write testing with variable large payload sizes",
             estimated_secs: 31,

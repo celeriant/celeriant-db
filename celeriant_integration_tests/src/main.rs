@@ -196,6 +196,7 @@ async fn dispatch_test(name: &str) -> Result<(), Box<dyn std::error::Error>> {
         "p4_1_rolling_upgrade" => p4_1_rolling_upgrade::run().await,
         "pool_test" => pool_test::run().await,
         "read_list_benchmark" => read_list_benchmark::run().await,
+        "rpi_cluster_bench" => rpi_cluster_bench::run().await,
         "s3_concurrent_cas" => s3_concurrent_cas::run().await,
         "s3_election" => s3_election::run().await,
         "s3_failover" => s3_failover::run().await,

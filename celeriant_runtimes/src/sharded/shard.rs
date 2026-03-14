@@ -213,6 +213,8 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
                     paths.intracluster_ca_cert.clone(),
                     paths.node_cert.clone(),
                     paths.node_key.clone(),
+                    paths.client_cert.clone(),
+                    paths.client_key.clone(),
                     client_auth,
                     tls_mode,
                 );
