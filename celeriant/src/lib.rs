@@ -15,6 +15,7 @@ pub mod api_keys;
 pub mod memory_budget;
 mod dio_check;
 mod fs_check;
+mod fs_warmup;
 mod ntp_check;
 mod server_meta;
 
@@ -46,6 +47,13 @@ pub fn startup(args: Vec<String>) -> Result<(), std::io::Error> {
         std::process::exit(1);
     }
     info!("Direct I/O verification passed");
+
+    // Warm filesystem metadata (XFS extent trees, inodes) into page cache.
+    // With O_DIRECT, data bypasses page cache but metadata doesn't — cold metadata
+    // after restart causes severe throughput degradation until naturally warmed.
+    if let Err(e) = fs_warmup::warm_fs_metadata(&server_config.data_root) {
+        tracing::warn!("Filesystem metadata warmup failed (non-fatal): {}", e);
+    }
 
     // Warn if system clock is not NTP-synchronized (cluster requires synced clocks)
     match ntp_check::check_clock_synchronized() {

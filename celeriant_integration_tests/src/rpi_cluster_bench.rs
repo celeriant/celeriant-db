@@ -10,9 +10,10 @@
 //!   CLUSTER_CLIENT_CERT — client cert for mTLS (default: ~/rpi-certs/client.crt)
 //!   CLUSTER_CLIENT_KEY  — client key for mTLS (default: ~/rpi-certs/client.key)
 //!   CLUSTER_SERVER_NAME — TLS SNI server name (default: cs)
-//!   CLUSTER_THROUGHPUT_CONNECTIONS — throughput test connections (default: 3000)
+//!   CLUSTER_THROUGHPUT_CONNECTIONS — throughput test connections (default: 850)
 //!   CLUSTER_LATENCY_CONNECTIONS   — latency test connections (default: 125)
 //!   CLUSTER_DURATION              — test duration in seconds (default: 15)
+//!   CLUSTER_CONNECT_BATCH_SIZE    — concurrent connection batch size (default: 100)
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -77,7 +78,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let client_cert = env_or("CLUSTER_CLIENT_CERT", "~/rpi-certs/client.crt");
     let client_key = env_or("CLUSTER_CLIENT_KEY", "~/rpi-certs/client.key");
     let server_name = env_or("CLUSTER_SERVER_NAME", "cs");
-    let throughput_conns: usize = env_or("CLUSTER_THROUGHPUT_CONNECTIONS", "3000").parse()?;
+    let throughput_conns: usize = env_or("CLUSTER_THROUGHPUT_CONNECTIONS", "850").parse()?;
     let latency_conns: usize = env_or("CLUSTER_LATENCY_CONNECTIONS", "125").parse()?;
     let duration_secs: u64 = env_or("CLUSTER_DURATION", "15").parse()?;
 
@@ -183,35 +184,50 @@ async fn run_benchmark(
     tls: ClientTlsConfig,
 ) -> Result<BenchmarkResult, Box<dyn std::error::Error>> {
     let connect_start = Instant::now();
-
-    let mut connection_tasks = Vec::with_capacity(num_connections);
-    for id in 0..num_connections {
-        let addr = address.to_string();
-        let tls = tls.clone();
-        connection_tasks.push(tokio::spawn(async move {
-            let client = CeleriantClient::connect_with_timeout(
-                &addr,
-                Some(Duration::from_secs(CLIENTSIDE_TIMEOUT_S)),
-                Some(tls),
-            )
-            .await
-            .map_err(|e| format!("Connection {} error: {}", id, e))?
-            .with_timeout(Duration::from_secs(CLIENTSIDE_TIMEOUT_S));
-            Ok::<_, String>((id, client))
-        }));
-    }
+    let batch_size = std::env::var("CLUSTER_CONNECT_BATCH_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100usize);
 
     let mut clients = Vec::with_capacity(num_connections);
     let mut failed = 0;
-    for task in connection_tasks {
-        match task.await {
-            Ok(Ok(pair)) => clients.push(pair),
-            _ => failed += 1,
+
+    for batch_start in (0..num_connections).step_by(batch_size) {
+        let batch_end = (batch_start + batch_size).min(num_connections);
+        let mut batch_tasks = Vec::with_capacity(batch_end - batch_start);
+        for id in batch_start..batch_end {
+            let addr = address.to_string();
+            let tls = tls.clone();
+            batch_tasks.push(tokio::spawn(async move {
+                let client = CeleriantClient::connect_with_timeout(
+                    &addr,
+                    Some(Duration::from_secs(CLIENTSIDE_TIMEOUT_S)),
+                    Some(tls),
+                )
+                .await
+                .map_err(|e| format!("Connection {} error: {}", id, e))?
+                .with_timeout(Duration::from_secs(CLIENTSIDE_TIMEOUT_S));
+                Ok::<_, String>((id, client))
+            }));
+        }
+        for task in batch_tasks {
+            match task.await {
+                Ok(Ok(pair)) => clients.push(pair),
+                _ => failed += 1,
+            }
+        }
+        if batch_end < num_connections {
+            print!(
+                "\r  Connecting... {}/{} ({} failed)",
+                clients.len(),
+                num_connections,
+                failed
+            );
         }
     }
 
     println!(
-        "  Established {} connections in {:.2}s ({} failed)",
+        "\r  Established {} connections in {:.2}s ({} failed)",
         clients.len(),
         connect_start.elapsed().as_secs_f64(),
         failed
