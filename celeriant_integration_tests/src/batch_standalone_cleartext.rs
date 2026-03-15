@@ -145,11 +145,18 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         api_key: Some(api_key_b64),
     };
 
+    let fsync_delay: u64 = std::env::var("CELERIANT_FSYNC_DELAY_US")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(24000);
+    println!("  fsync_delay_us: {}", fsync_delay);
+
     let config = ServerConfig {
         log_level: "warn".to_string(),
         standalone: true,
         require_client_identity: true,
         insecure_allow_plaintext_auth: true,
+        fsync_delay_us: fsync_delay,
         ..Default::default()
     };
     let temp_dir = tempfile::TempDir::new()?;

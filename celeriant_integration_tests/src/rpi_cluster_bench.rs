@@ -74,9 +74,7 @@ struct TaskStats {
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let address = env_or("CLUSTER_ADDRESS", "cs:10000");
-    let ca_cert = env_or("CLUSTER_CA_CERT", "~/rpi-certs/client-ca.crt");
-    let client_cert = env_or("CLUSTER_CLIENT_CERT", "~/rpi-certs/client.crt");
-    let client_key = env_or("CLUSTER_CLIENT_KEY", "~/rpi-certs/client.key");
+    let plaintext = std::env::var("CLUSTER_PLAINTEXT").is_ok();
     let server_name = env_or("CLUSTER_SERVER_NAME", "cs");
     let throughput_conns: usize = env_or("CLUSTER_THROUGHPUT_CONNECTIONS", "850").parse()?;
     let latency_conns: usize = env_or("CLUSTER_LATENCY_CONNECTIONS", "125").parse()?;
@@ -84,15 +82,20 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("=== RPi Cluster Benchmark ===\n");
     println!("  Target:          {}", address);
-    println!("  Server name:     {}", server_name);
+    println!("  TLS:             {}", if plaintext { "disabled" } else { "mTLS" });
     println!("  Throughput conns: {}", throughput_conns);
     println!("  Latency conns:   {}", latency_conns);
     println!("  Duration:        {}s", duration_secs);
-    println!("  CA cert:         {}", ca_cert);
-    println!("  Client cert:     {}", client_cert);
     println!();
 
-    let tls = build_tls_config(&ca_cert, &client_cert, &client_key, &server_name)?;
+    let tls = if plaintext {
+        None
+    } else {
+        let ca_cert = env_or("CLUSTER_CA_CERT", "~/rpi-certs/client-ca.crt");
+        let client_cert = env_or("CLUSTER_CLIENT_CERT", "~/rpi-certs/client.crt");
+        let client_key = env_or("CLUSTER_CLIENT_KEY", "~/rpi-certs/client.key");
+        Some(build_tls_config(&ca_cert, &client_cert, &client_key, &server_name)?)
+    };
 
     // Smoke test: single connection write + read
     println!("--- Smoke test ---");
@@ -100,7 +103,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let mut client = CeleriantClient::connect_with_timeout(
             &address,
             Some(Duration::from_secs(CLIENTSIDE_TIMEOUT_S)),
-            Some(tls.clone()),
+            tls.clone(),
         )
         .await?;
 
@@ -181,7 +184,7 @@ async fn run_benchmark(
     address: &str,
     num_connections: usize,
     duration_secs: u64,
-    tls: ClientTlsConfig,
+    tls: Option<ClientTlsConfig>,
 ) -> Result<BenchmarkResult, Box<dyn std::error::Error>> {
     let connect_start = Instant::now();
     let batch_size = std::env::var("CLUSTER_CONNECT_BATCH_SIZE")
@@ -202,7 +205,7 @@ async fn run_benchmark(
                 let client = CeleriantClient::connect_with_timeout(
                     &addr,
                     Some(Duration::from_secs(CLIENTSIDE_TIMEOUT_S)),
-                    Some(tls),
+                    tls,
                 )
                 .await
                 .map_err(|e| format!("Connection {} error: {}", id, e))?

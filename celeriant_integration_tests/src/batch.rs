@@ -167,6 +167,7 @@ impl ReplicatedServers {
             s3_secret_access_key: Some(secret_key.clone()),
             s3_endpoint_override: Some(endpoint.clone()),
             s3_allow_http: allow_http,
+            fsync_delay_us: 24000,
             ..Default::default()
         };
 
@@ -213,6 +214,7 @@ impl ReplicatedServers {
             s3_secret_access_key: Some(secret_key),
             s3_endpoint_override: Some(endpoint),
             s3_allow_http: allow_http,
+            fsync_delay_us: 24000,
             ..Default::default()
         };
 
@@ -359,6 +361,7 @@ async fn run_full_benchmark_suite() -> Result<(), Box<dyn std::error::Error>> {
             standalone: true,
             require_client_identity: true,
             insecure_allow_plaintext_auth: true,
+            fsync_delay_us: 24000,
             ..Default::default()
         };
         let temp_dir = tempfile::TempDir::new()?;
@@ -427,6 +430,7 @@ async fn run_full_benchmark_suite() -> Result<(), Box<dyn std::error::Error>> {
             tls_node_key: Some(node_key.clone()),
             tls_client_auth: ConfigClientAuth::Require,
             require_client_identity: true,
+            fsync_delay_us: 24000,
             ..Default::default()
         };
         let temp_dir = tempfile::TempDir::new()?;
@@ -767,6 +771,7 @@ async fn run_sweep_benchmark() -> Result<(), Box<dyn std::error::Error>> {
         let config = ServerConfig {
             log_level: "warn".to_string(),
             standalone: true,
+            fsync_delay_us: 24000,
             ..Default::default()
         };
         let server = TestServer::start_with_config(port, config).await?;
