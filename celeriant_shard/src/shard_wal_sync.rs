@@ -15,7 +15,7 @@ use celeriant_memcache::sync_positions_snapshot::SyncPositionsSnapshot;
 use celeriant_rotating_log::log_segment_file::log_segment_file::{LogSegmentFile, write_dual_shard_log_header};
 use celeriant_rotating_log::log_segment_file::log_segment_file_metadata::LogSegmentFileMetadata;
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
-use celeriant_wal::constants::{EntryHashBytes, FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_METABLOCK};
+use celeriant_wal::constants::{self, EntryHashBytes, FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, MIN_WRITE_ALIGNMENT, WIRE_VERSION_WAL_METABLOCK};
 
 use celeriant_wal::metablocks::metablock::Metablock;
 use celeriant_wal::metablocks::metablock_kind::MetablockKind;
@@ -72,11 +72,13 @@ pub(crate) async fn commit_fsync_with_rollback(
         "Fsync batch captured"
     );
 
+    let metablock_padding = constants::write_padding(captured.sync_positions_snapshot.buffer_size_metablocks());
+    let total_required = captured.required_disk_space + metablock_padding + MIN_WRITE_ALIGNMENT - 1;
     let available_space = log_segments_cache.active_log_available_space();
-    if available_space < captured.required_disk_space {
+    if available_space < total_required {
         if log_segments_cache
             .preallocate_bytes
-            .saturating_sub(captured.required_disk_space)
+            .saturating_sub(total_required)
             .saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64 * 2)
             == 0
         {
@@ -283,15 +285,16 @@ pub(crate) async fn sync(
 
     // Write datablocks first so we can get the positions to include into metablocks
     let buffer_size_datablocks: u64 = sync_positions_snapshot.buffer_size_datablocks();
+    let alignment = (dma_file_writer.alignment() as u64).max(MIN_WRITE_ALIGNMENT);
 
     let mut datablocks_absolute_write_positions: Vec<u64> = Vec::with_capacity(sync_positions_snapshot.pending_append_queue.len());
     let mut new_datablocks_position = log_segment_file_metadata.write.datablocks_position;
     let mut datablocks_carry_over: Option<Vec<u8>> = log_segment_file_metadata.datablocks_carry_over.take();
 
     if buffer_size_datablocks > 0 {
-        let write_to_pos = dma_file_writer.align_up(log_segment_file_metadata.write.datablocks_position);
+        let write_to_pos = constants::align_up(log_segment_file_metadata.write.datablocks_position, alignment);
         new_datablocks_position = log_segment_file_metadata.write.datablocks_position.saturating_sub(buffer_size_datablocks);
-        let write_from_pos = dma_file_writer.align_down(new_datablocks_position);
+        let write_from_pos = constants::align_down(new_datablocks_position, alignment);
         let aligned_buffer_size_datablocks = write_to_pos.saturating_sub(write_from_pos);
 
         let front_carry_over = new_datablocks_position.saturating_sub(write_from_pos) as usize;
@@ -323,7 +326,7 @@ pub(crate) async fn sync(
             }
         }
 
-        let datablocks_carry_over_size = dma_file_writer.align_up(new_datablocks_position).saturating_sub(new_datablocks_position);
+        let datablocks_carry_over_size = constants::align_up(new_datablocks_position, alignment).saturating_sub(new_datablocks_position);
         if datablocks_carry_over_size > 0 {
             datablocks_carry_over =
                 Some(buffer_datablocks_slice[front_carry_over..(front_carry_over + datablocks_carry_over_size as usize)].to_vec());
@@ -335,8 +338,9 @@ pub(crate) async fn sync(
             .map_err(|e| ShardFsyncError::WriteDatablocksError(e.to_string()))?;
     }
 
-    let buffer_size_metablocks: u64 = sync_positions_snapshot.buffer_size_metablocks();
-    let mut buffer_metablocks = dma_file_writer.alloc_dma_buffer(buffer_size_metablocks as usize);
+    let content_size_metablocks: u64 = sync_positions_snapshot.buffer_size_metablocks();
+    let padded_size_metablocks = constants::align_up(content_size_metablocks, alignment) as usize;
+    let mut buffer_metablocks = dma_file_writer.alloc_dma_buffer(padded_size_metablocks);
     let buffer_metablocks_slice = buffer_metablocks.as_bytes_mut();
     let mut position = 0usize;
     let mut index = 0;
@@ -376,8 +380,8 @@ pub(crate) async fn sync(
         position += FIXED_BLOCK_SIZE_BYTES;
     }
 
-    //Write metablocks
-    let new_metablocks_position = log_segment_file_metadata.write.metablocks_position + buffer_metablocks.len() as u64;
+    //Write metablocks — position advances by content size, not padded size
+    let new_metablocks_position = log_segment_file_metadata.write.metablocks_position + content_size_metablocks;
     dma_file_writer
         .write_at(buffer_metablocks, log_segment_file_metadata.write.metablocks_position)
         .await

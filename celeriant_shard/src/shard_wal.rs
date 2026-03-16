@@ -5160,5 +5160,70 @@ mod tests {
             }
         });
     }
+
+    /// When compaction produces few surviving metablocks plus a small separate
+    /// datablock, the datablock DMA buffer's align_down start could reach back into the
+    /// metablock region, overwriting metablock content with zeros.
+    ///
+    /// The restart after compaction is essential: it forces cold-cache disk reads so the
+    /// test catches on-disk corruption (in-memory caches would mask it).
+    #[test]
+    fn compact_small_datablock_does_not_overwrite_metablocks() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+
+            {
+                let shard = open_compact_shard(&dir).await;
+
+                let dead = key(1, 1, 0);
+                let agg_a = key(1, 1, 1);
+
+                // Fill most of the segment with fat events that will be deleted.
+                write_fat(&shard, &dead, 40).await;
+
+                // Write one event batch with a non-compressible payload that forces a
+                // separate datablock (> MINIBATCH_SIZE_BYTES after compression).
+                // After compaction the file will have few kept metablocks (this batch +
+                // the tombstone) with a small datablock — the datablock DMA write's
+                // align_down must not reach back into the metablock region.
+                let payload: Vec<u8> = (0..600u32)
+                    .map(|i| (i.wrapping_mul(2654435761) >> 16) as u8)
+                    .collect();
+                write_ok(&shard, write_req(agg_a.clone(), vec![DatablockAggregateEvent {
+                    client_event_index: 1,
+                    event_type_major: 1,
+                    event_value: Arc::new(payload),
+                    ..Default::default()
+                }])).await;
+
+                // Delete the fat aggregate to create dead space (>20% ratio).
+                let result = process(&shard, delete_req(dead.clone())).await;
+                assert!(matches!(result, Ok(ClientResponse::Delete(_))));
+
+                trigger_rotation(&shard).await;
+
+                let result = shard.compact_oldest_eligible_segment().await.unwrap();
+                assert!(result.is_some(), "expected compaction to run");
+
+                shard.close().await;
+            }
+
+            // Reopen from disk — caches are cold, reads go to the compacted file.
+            // If the datablock DMA alignment overwrote metablock content, this
+            // will fail with deserialization or CRC errors.
+            {
+                let shard = open_compact_shard(&dir).await;
+
+                let agg_a = key(1, 1, 1);
+                let read_a = unwrap_read(process(&shard, read_req(agg_a.clone())).await);
+                assert_eq!(read_a.event_batches.len(), 1, "expected 1 batch after restart");
+                assert_eq!(read_a.event_batches[0].events.len(), 1, "expected 1 event after restart");
+                assert_eq!(read_a.event_batches[0].events[0].event_value.len(), 600,
+                    "event payload should survive compaction");
+
+                shard.close().await;
+            }
+        });
+    }
 }
 

@@ -15,7 +15,7 @@ use celeriant_rotating_log::log_segment_file::aggregate_key_bloom::AggregateKeyB
 use celeriant_rotating_log::log_segment_file::log_segment_file::write_dual_shard_log_header;
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
 use celeriant_wal::aggregate_key::AggregateKey;
-use celeriant_wal::constants::{FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_METABLOCK};
+use celeriant_wal::constants::{self, FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, MIN_WRITE_ALIGNMENT, WIRE_VERSION_WAL_METABLOCK};
 use celeriant_wal::metablocks::datablock_storage_kind::DatablockStorageKind;
 use celeriant_wal::metablocks::metablock_kind::MetablockKind;
 use celeriant_wal::shard_log_header::ShardLogHeader;
@@ -466,10 +466,15 @@ async fn build_compacted_file(
     // alignment matches the actual filesystem block size (may be 512 bytes,
     // not necessarily 4096), consistent with shard_wal_sync.rs.
     // -------------------------------------------------------------------------
-    let data_end = HEADER_BLOCK_SIZE_BYTES as u64
-        + estimate.kept_metablock_count * FIXED_BLOCK_SIZE_BYTES as u64
-        + estimate.kept_datablock_bytes;
-    let tail_header_pos = src_file.align_up(data_end);
+    let alignment = (src_file.alignment() as u64).max(MIN_WRITE_ALIGNMENT);
+    // Pad metablock region up to alignment so the datablock DMA write (which
+    // align_down's its start) can never reach back into metablock content.
+    let padded_metablocks_end = constants::align_up(
+        HEADER_BLOCK_SIZE_BYTES as u64 + estimate.kept_metablock_count * FIXED_BLOCK_SIZE_BYTES as u64,
+        alignment,
+    );
+    let data_end = padded_metablocks_end + estimate.kept_datablock_bytes;
+    let tail_header_pos = constants::align_up(data_end, alignment);
     let new_file_size = tail_header_pos + HEADER_BLOCK_SIZE_BYTES as u64;
 
     let temp_path = temp_dir.join(format!("log_{target_log_id}.compacting"));
@@ -492,7 +497,8 @@ async fn build_compacted_file(
     //    the buffer start is aligned (alloc_dma_buffer guarantees this) and the
     //    size is rounded up, so every write within the buffer lands correctly.
     // -------------------------------------------------------------------------
-    let metablocks_buf_size = estimate.kept_metablock_count as usize * FIXED_BLOCK_SIZE_BYTES;
+    let metablocks_content_size = estimate.kept_metablock_count as usize * FIXED_BLOCK_SIZE_BYTES;
+    let metablocks_buf_size = constants::align_up(metablocks_content_size as u64, alignment) as usize;
 
     // Datablock region: datablocks grow backward from the tail header position.
     // The region starts at `tail_header_pos - kept_datablock_bytes` and ends at `tail_header_pos`.
@@ -500,8 +506,9 @@ async fn build_compacted_file(
     let datablocks_region_start = datablocks_region_end - estimate.kept_datablock_bytes;
 
     // Align the write start down and the write end up so the single write_at is DMA-aligned.
-    let aligned_db_write_start = new_file.align_down(datablocks_region_start);
-    let aligned_db_write_end = new_file.align_up(datablocks_region_end);
+    let new_file_alignment = (new_file.alignment() as u64).max(MIN_WRITE_ALIGNMENT);
+    let aligned_db_write_start = constants::align_down(datablocks_region_start, new_file_alignment);
+    let aligned_db_write_end = constants::align_up(datablocks_region_end, new_file_alignment);
     let datablocks_buf_size = (aligned_db_write_end - aligned_db_write_start) as usize;
 
     // Only allocate metablock buffer when there are kept metablocks.
