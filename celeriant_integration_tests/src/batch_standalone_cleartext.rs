@@ -157,7 +157,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         num_shards,
         ..Default::default()
     };
-    let temp_dir = tempfile::TempDir::new()?;
+    let temp_dir = match std::env::var("CELERIANT_TEST_DATA_DIR") {
+        Ok(dir) => tempfile::TempDir::new_in(dir)?,
+        Err(_) => tempfile::TempDir::new()?,
+    };
     create_api_keys_file(temp_dir.path(), &api_keys)?;
     let server =
         TestServer::start_with_existing_dir(base_port, config, "standalone-pt".to_string(), temp_dir)
