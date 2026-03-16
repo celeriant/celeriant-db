@@ -50,7 +50,22 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
         let started_at = std::time::Instant::now();
         let mesh = MeshBuilder::<IntrashardMessages, Full>::full(num_shards, mesh_channel_size);
 
-        let results = LocalExecutorPoolBuilder::new(PoolPlacement::MaxSpread(num_shards, CpuSet::online().ok()))
+        // Build per-core CpuSets for deterministic pinning. MaxSpread breaks on
+        // platforms with fake NUMA nodes (e.g. RPi 5 exposes 8 NUMA nodes over 4
+        // CPUs, causing all executors to land on cpu0). Filtering by cpu id gives
+        // one CpuSet per physical core, wrapping when shards > cores.
+        let placement = match CpuSet::online() {
+            Ok(online) => {
+                let num_cpus = online.iter().map(|l| l.cpu).collect::<std::collections::HashSet<_>>().len();
+                let cpu_sets: Vec<CpuSet> = (0..num_shards)
+                    .map(|shard| online.clone().filter(|loc| loc.cpu == shard % num_cpus))
+                    .collect();
+                PoolPlacement::Custom(cpu_sets)
+            }
+            Err(_) => PoolPlacement::MaxSpread(num_shards, None),
+        };
+
+        let results = LocalExecutorPoolBuilder::new(placement)
             .on_all_shards(enclose!((mesh, shard_config, sidecar_senders, shard_failed) move || async move {
 
                 let (sender, receivers) = mesh.join().await
