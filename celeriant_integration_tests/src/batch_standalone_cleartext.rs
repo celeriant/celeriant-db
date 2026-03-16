@@ -31,9 +31,9 @@ const NUM_AGGREGATES: usize = 1024;
 const USE_MICRO_PAYLOAD: bool = true;
 const CLIENTSIDE_TIMEOUT_S: u64 = 5;
 
-const STANDALONE_THROUGHPUT_MIN: f64 = 297_500.0;
-const STANDALONE_LATENCY_AVG_MAX_MS: f64 = 23.0;
-const STANDALONE_LATENCY_P99_MAX_MS: u64 = 31;
+const STANDALONE_THROUGHPUT_MIN: f64 = 361_000.0; // ~425k * 0.85
+const STANDALONE_LATENCY_AVG_MAX_MS: f64 = 25.0; // ~21ms * 1.15
+const STANDALONE_LATENCY_P99_MAX_MS: u64 = 33; // ~28ms * 1.15
 
 struct ApiKeySet {
     primary_rw: [u8; 32],
@@ -145,11 +145,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         api_key: Some(api_key_b64),
     };
 
-    let fsync_delay: u64 = std::env::var("CELERIANT_FSYNC_DELAY_US")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(24000);
-    println!("  fsync_delay_us: {}", fsync_delay);
+    let (fsync_delay, num_shards) = crate::bench_tuning();
+    println!("  fsync_delay_us: {}, num_shards: {:?}", fsync_delay, num_shards);
 
     let config = ServerConfig {
         log_level: "warn".to_string(),
@@ -157,6 +154,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         require_client_identity: true,
         insecure_allow_plaintext_auth: true,
         fsync_delay_us: fsync_delay,
+        num_shards,
         ..Default::default()
     };
     let temp_dir = tempfile::TempDir::new()?;

@@ -1247,6 +1247,26 @@ pub async fn count_events(
     }
 }
 
+/// Benchmark-tuned shard count and fsync delay, overridable via env vars.
+///
+/// Defaults to `cpus * 2/3` shards (clamped to 4–24) so shard executors don't
+/// saturate every SMT sibling, leaving headroom for the OS, tokio test client,
+/// and sidecar threads. Fsync delay defaults to 17ms (server default).
+pub fn bench_tuning() -> (u64, Option<usize>) {
+    let fsync_delay: u64 = std::env::var("CELERIANT_FSYNC_DELAY_US")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(17000);
+    let num_shards: Option<usize> = std::env::var("CELERIANT_NUM_SHARDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .or_else(|| {
+            let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+            Some((cpus * 2 / 3).clamp(4, 24))
+        });
+    (fsync_delay, num_shards)
+}
+
 /// Build a ServerConfig for S3-backed cluster tests.
 ///
 /// Sets up S3 connection fields, routing rule, and heartbeat lease duration.

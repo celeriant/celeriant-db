@@ -42,19 +42,19 @@ const NUM_AGGREGATES: usize = 1024;
 const USE_MICRO_PAYLOAD: bool = true;
 const CLIENTSIDE_TIMEOUT_S: u64 = 5;
 
-// Performance thresholds — 15% regression from README numbers is an immediate fail.
+// Performance thresholds — 15% regression from tuned baselines is an immediate fail.
 //
-// README reference (32-core, NVMe PCIe5):
-//   Standalone  25k conn: 350k writes/s, avg 68ms, p99 170ms
-//   Replicated  25k conn: 190k writes/s, avg 125ms, p99 272ms
-//   Standalone   1k conn:  50k writes/s, avg 20ms, p99 27ms
-//   Replicated   1k conn:  15k writes/s, avg 63ms, p99 88ms
-const STANDALONE_THROUGHPUT_MIN: f64 = 297_500.0; // 350k * 0.85
-const REPLICATED_THROUGHPUT_MIN: f64 = 161_500.0; // 190k * 0.85
-const STANDALONE_LATENCY_AVG_MAX_MS: f64 = 23.0; // 20ms * 1.15
-const STANDALONE_LATENCY_P99_MAX_MS: u64 = 31; // 27ms * 1.15
+// Tuned baseline (32-core / 21 shards, NVMe PCIe5, 17ms fsync delay):
+//   Standalone  24k conn: 414k writes/s, avg 57ms, p99 117ms
+//   Replicated  24k conn: 239k writes/s, avg 99ms, p99 131ms
+//   Standalone   1k conn:  44k writes/s, avg 22ms, p99 28ms
+//   Replicated   1k conn:  16k writes/s, avg 63ms, p99 79ms
+const STANDALONE_THROUGHPUT_MIN: f64 = 352_000.0; // 414k * 0.85
+const REPLICATED_THROUGHPUT_MIN: f64 = 203_000.0; // 239k * 0.85
+const STANDALONE_LATENCY_AVG_MAX_MS: f64 = 25.5; // 22ms * 1.15
+const STANDALONE_LATENCY_P99_MAX_MS: u64 = 32; // 28ms * 1.15
 const REPLICATED_LATENCY_AVG_MAX_MS: f64 = 72.5; // 63ms * 1.15
-const REPLICATED_LATENCY_P99_MAX_MS: u64 = 101; // 88ms * 1.15
+const REPLICATED_LATENCY_P99_MAX_MS: u64 = 91; // 79ms * 1.15
 
 const CONNECTION_SWEEP: &[usize] = &[
     512, 1024, 2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384,
@@ -158,6 +158,7 @@ impl ReplicatedServers {
             None => None,
         };
 
+        let (fsync_delay, num_shards) = crate::bench_tuning();
         let mut leader_config = ServerConfig {
             log_level: log_level.to_string(),
             s3_enabled: true,
@@ -167,7 +168,8 @@ impl ReplicatedServers {
             s3_secret_access_key: Some(secret_key.clone()),
             s3_endpoint_override: Some(endpoint.clone()),
             s3_allow_http: allow_http,
-            fsync_delay_us: 24000,
+            fsync_delay_us: fsync_delay,
+            num_shards,
             ..Default::default()
         };
 
@@ -214,7 +216,8 @@ impl ReplicatedServers {
             s3_secret_access_key: Some(secret_key),
             s3_endpoint_override: Some(endpoint),
             s3_allow_http: allow_http,
-            fsync_delay_us: 24000,
+            fsync_delay_us: fsync_delay,
+            num_shards,
             ..Default::default()
         };
 
@@ -330,6 +333,9 @@ async fn run_full_benchmark_suite() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Batch Write Performance Suite ===\n");
     println!("Scenarios: standalone + replicated x throughput + latency x plaintext + mTLS\n");
 
+    let (fsync_delay, num_shards) = crate::bench_tuning();
+    println!("  fsync_delay_us: {}, num_shards: {:?}\n", fsync_delay, num_shards);
+
     let mut results: Vec<ScenarioResult> = Vec::new();
     let mut plaintext_pairs: Vec<(BenchmarkResult, BenchmarkResult)> = Vec::new();
     let mut mtls_pairs: Vec<(BenchmarkResult, BenchmarkResult)> = Vec::new();
@@ -361,7 +367,8 @@ async fn run_full_benchmark_suite() -> Result<(), Box<dyn std::error::Error>> {
             standalone: true,
             require_client_identity: true,
             insecure_allow_plaintext_auth: true,
-            fsync_delay_us: 24000,
+            fsync_delay_us: fsync_delay,
+            num_shards,
             ..Default::default()
         };
         let temp_dir = tempfile::TempDir::new()?;
@@ -430,7 +437,8 @@ async fn run_full_benchmark_suite() -> Result<(), Box<dyn std::error::Error>> {
             tls_node_key: Some(node_key.clone()),
             tls_client_auth: ConfigClientAuth::Require,
             require_client_identity: true,
-            fsync_delay_us: 24000,
+            fsync_delay_us: fsync_delay,
+            num_shards,
             ..Default::default()
         };
         let temp_dir = tempfile::TempDir::new()?;
@@ -768,10 +776,12 @@ async fn run_sweep_benchmark() -> Result<(), Box<dyn std::error::Error>> {
         (addr, None, Some(replicated))
     } else {
         println!("Starting standalone test server...");
+        let (fsync_delay, num_shards) = crate::bench_tuning();
         let config = ServerConfig {
             log_level: "warn".to_string(),
             standalone: true,
-            fsync_delay_us: 24000,
+            fsync_delay_us: fsync_delay,
+            num_shards,
             ..Default::default()
         };
         let server = TestServer::start_with_config(port, config).await?;
