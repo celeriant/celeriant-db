@@ -1723,7 +1723,7 @@ checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
 [[package]]
 name = "glommio"
 version = "0.9.0"
-source = "git+https://github.com/utilitydelta/glommio?branch=tcp-into-raw-fd-accepted-stream#3b420c7e1f14128e75679ca4084f2af5f29d17fb"
+source = "git+https://github.com/utilitydelta/glommio?branch=tcp-into-raw-fd-accepted-stream#9d1f8cc800345a355174eb843dc7e83f7e9887c3"
 dependencies = [
  "ahash 0.7.8",
  "backtrace",
