@@ -1460,27 +1460,6 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     ) -> Result<PreparedWrite, ShardWriteError> {
         let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
 
-        // Validate client idempotency
-        if write_request.enforce_client_idempotency {
-            if let Some(last_client_event_index) = shard_mem_cache.get_client_event_index(aggregate_key, client_id) {
-                let attempted_client_event_index = write_request.events.iter().map(|e| e.client_event_index).min().unwrap_or(0);
-                if attempted_client_event_index <= last_client_event_index {
-                    debug!(
-                        shard_id = self.config.shard_id,
-                        aggregate_key = %aggregate_key,
-                        client_id = %celeriant_wal::format_uuid(client_id),
-                        last_client_event_index,
-                        attempted_client_event_index,
-                        "Write rejected: client idempotency violation"
-                    );
-                    return Err(ShardWriteError::ClientIdempotencyViolation {
-                        last_client_event_index,
-                        attempted_client_event_index,
-                    });
-                }
-            }
-        }
-
         let aggregate_current_indexes = shard_mem_cache.get_write_event_indexes(aggregate_key);
 
         // There is a soft delete entry in the queue that hasn't been committed yet
@@ -1502,6 +1481,27 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                     expected_event_batch_index: expected,
                     current_event_batch_index: aggregate_current_indexes.event_batch_index,
                 });
+            }
+        }
+
+        // Validate client idempotency
+        if write_request.enforce_client_idempotency {
+            if let Some(last_client_event_index) = shard_mem_cache.get_client_event_index(aggregate_key, client_id) {
+                let attempted_client_event_index = write_request.events.iter().map(|e| e.client_event_index).min().unwrap_or(0);
+                if attempted_client_event_index <= last_client_event_index {
+                    debug!(
+                        shard_id = self.config.shard_id,
+                        aggregate_key = %aggregate_key,
+                        client_id = %celeriant_wal::format_uuid(client_id),
+                        last_client_event_index,
+                        attempted_client_event_index,
+                        "Write rejected: client idempotency violation"
+                    );
+                    return Err(ShardWriteError::ClientIdempotencyViolation {
+                        last_client_event_index,
+                        attempted_client_event_index,
+                    });
+                }
             }
         }
 
@@ -2686,6 +2686,35 @@ mod tests {
             assert!(matches!(
                 result,
                 Err(ShardError::Write(ShardWriteError::ClientIdempotencyViolation { .. }))
+            ));
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn occ_fires_before_idempotency() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 1, 1);
+
+            // Write with client_id=1, client_event_index=1 (batch index becomes 1)
+            let req = write_req_full(agg.clone(), events(1), true, None, 1, true);
+            write_ok(&shard, req).await;
+
+            // Write with client_id=2 to advance batch index to 2
+            let req = write_req_full(agg.clone(), events(1), true, Some(1), 2, false);
+            write_ok(&shard, req).await;
+
+            // Write with client_id=1, client_event_index=1 (idempotency violation)
+            // AND stale expected_event_batch_index=1 (OCC violation, current is 2)
+            // OCC should fire first
+            let req = write_req_full(agg, events(1), true, Some(1), 1, true);
+            let result = process(&shard, req).await;
+            assert!(matches!(
+                result,
+                Err(ShardError::Write(ShardWriteError::OptimisticConcurrencyViolation { .. }))
             ));
 
             shard.close().await;
