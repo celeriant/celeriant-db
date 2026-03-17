@@ -127,7 +127,7 @@ pub struct ServerConfig {
 
     #[arg(
         long,
-        default_value = "1024",
+        default_value = "8192",
         env = "CELERIANT_MESH_CHANNEL_SIZE",
         help = "Mesh channel size for inter-shard communication"
     )]
@@ -894,7 +894,7 @@ impl Default for ServerConfig {
             advertised_replication_address: None,
             advertised_client_address: None,
             standalone: false,
-            mesh_channel_size: 1024,
+            mesh_channel_size: 8192,
             num_shards: None,
             read_max_chunk_size: 32 * 1024,
             write_max_chunk_size: 32 * 1024,

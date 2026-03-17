@@ -73,10 +73,10 @@ struct TaskStats {
 }
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let address = env_or("CLUSTER_ADDRESS", "cs2:10000");
+    let address = env_or("CLUSTER_ADDRESS", "cs:10000");
     let plaintext = std::env::var("CLUSTER_PLAINTEXT").is_ok();
-    let server_name = env_or("CLUSTER_SERVER_NAME", "cs2");
-    let throughput_conns: usize = env_or("CLUSTER_THROUGHPUT_CONNECTIONS", "850").parse()?;
+    let server_name = env_or("CLUSTER_SERVER_NAME", "cs");
+    let throughput_conns: usize = env_or("CLUSTER_THROUGHPUT_CONNECTIONS", "8000").parse()?;
     let latency_conns: usize = env_or("CLUSTER_LATENCY_CONNECTIONS", "125").parse()?;
     let duration_secs: u64 = env_or("CLUSTER_DURATION", "15").parse()?;
 
@@ -322,7 +322,7 @@ async fn run_connection(
             iv: None,
         };
 
-        let aggregate_id = (id + request_count as usize) % NUM_AGGREGATES;
+        let aggregate_id = id;
         let mut writes = HashMap::new();
         writes.insert(
             AggregateKey::new(1, 1, aggregate_id as u128),
