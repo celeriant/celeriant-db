@@ -12,7 +12,6 @@ use celeriant_shard::timestamp_config::TimestampConfig;
 use celeriant_msg::request::requests::{AggregateDetailsRequest, SingleAggregateWrite, WriteRequest};
 use celeriant_shard::shard_wal::ShardWal;
 use celeriant_wal::aggregate_key::AggregateKey;
-use celeriant_wal::compression_type::CompressionType;
 use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use glommio::{LocalExecutorBuilder, Placement};
@@ -67,7 +66,6 @@ fn create_config(shard_dir: PathBuf) -> InternalShardConfig {
         schema_cache_bytes: 4 * 1024 * 1024,
         max_schema_size_bytes: 16384,
         pending_replication_high_water_bytes: 67_108_864, // 64MB
-        max_cluster_time_drift_ms: 5000,
         max_catchup_gap_bytes: 104_857_600,
         s3_download_max_rounds: 3,
         shard_id: 1,
@@ -125,7 +123,7 @@ fn setup_populated_wal(shard_dir: PathBuf, target_bytes: usize) -> usize {
     let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
         .spawn(move || async move {
             let config = create_config(shard_dir);
-            let shard_wal = Rc::new(ShardWal::open(config, ValidatedNodeStatus::standalone(), StubReplicationClient, StubS3Downloader).await.unwrap());
+            let shard_wal = Rc::new(ShardWal::open(config, ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader).await.unwrap());
 
             // Estimate bytes per write (events + metadata overhead ~512 bytes)
             let bytes_per_write_estimate = (EVENT_SIZE_BYTES * EVENTS_PER_BATCH) + 512;
@@ -212,7 +210,7 @@ fn bench_exists_wal_sizes(c: &mut Criterion) {
                     let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
                         .spawn(move || async move {
                             let config = create_config(shard_dir);
-                            let shard_wal = ShardWal::open(config, ValidatedNodeStatus::standalone(), StubReplicationClient, StubS3Downloader).await.unwrap();
+                            let shard_wal = ShardWal::open(config, ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader).await.unwrap();
 
                             // Timed iterations - cycle through all known aggregates
                             let mut total_duration = Duration::ZERO;
@@ -257,7 +255,7 @@ fn bench_exists_wal_sizes(c: &mut Criterion) {
                     let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
                         .spawn(move || async move {
                             let config = create_config(shard_dir);
-                            let shard_wal = ShardWal::open(config, ValidatedNodeStatus::standalone(), StubReplicationClient, StubS3Downloader).await.unwrap();
+                            let shard_wal = ShardWal::open(config, ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader).await.unwrap();
 
                             // Timed iterations - each uses a unique aggregate key
                             // Start from NUM_AGGREGATES to ensure they don't exist in WAL

@@ -161,6 +161,7 @@ impl ReplicatedServers {
         let (fsync_delay, num_shards) = crate::bench_tuning();
         let mut leader_config = ServerConfig {
             log_level: log_level.to_string(),
+            s3_lease_duration_ms: 10_000,
             s3_enabled: true,
             s3_region: Some(region.clone()),
             s3_bucket: Some(bucket.clone()),
@@ -209,6 +210,7 @@ impl ReplicatedServers {
         let follower_port = base_port + 100;
         let mut follower_config = ServerConfig {
             log_level: log_level.to_string(),
+            s3_lease_duration_ms: 10_000,
             s3_enabled: true,
             s3_region: Some(region),
             s3_bucket: Some(bucket),

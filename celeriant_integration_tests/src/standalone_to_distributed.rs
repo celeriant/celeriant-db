@@ -184,8 +184,8 @@ async fn run_scenario(
             )
             .await?;
 
-            println!("  Waiting for cluster formation...");
-            tokio::time::sleep(Duration::from_secs(10)).await;
+            println!("  Waiting for cluster formation and S3 lease expiry...");
+            tokio::time::sleep(Duration::from_secs(12)).await;
 
             let a_leader = is_leader(node_a.address()).await?;
             let b_leader = is_leader(node_b.address()).await?;
@@ -208,9 +208,9 @@ async fn run_scenario(
             )
             .await?;
 
-            // B catches up from S3 and becomes leader
-            println!("  Waiting for B to catch up from S3 and become leader...");
-            tokio::time::sleep(Duration::from_secs(10)).await;
+            // B catches up from S3, waits for A's S3 lease to expire, then becomes leader
+            println!("  Waiting for B to catch up from S3, S3 lease expiry, and become leader...");
+            tokio::time::sleep(Duration::from_secs(12)).await;
 
             assert!(
                 is_leader(node_b.address()).await?,

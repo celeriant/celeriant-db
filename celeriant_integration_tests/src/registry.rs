@@ -314,6 +314,13 @@ pub fn all_tests() -> &'static [TestEntry] {
             distributed: true,
         },
         TestEntry {
+            name: "s3_lease_renewal_backoff",
+            description: "S3 lease renewal backs off during follower outage instead of hammering at heartbeat rate",
+            estimated_secs: 25,
+            categories: &[Election],
+            distributed: true,
+        },
+        TestEntry {
             name: "s3_network_partition",
             description: "Network partition: both nodes fence, S3 CAS race resolves with monotonic lease",
             estimated_secs: 12,

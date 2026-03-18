@@ -51,6 +51,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         num_shards: Some(num_shards),
         log_level: "info".to_string(),
         routing_rule: RoutingRule::AggregateTypeId,
+        s3_lease_duration_ms: 10_000,
         s3_enabled: true,
         s3_region: Some(region.clone()),
         s3_bucket: Some(bucket_name.clone()),
@@ -70,6 +71,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         num_shards: Some(num_shards),
         log_level: "info".to_string(),
         routing_rule: RoutingRule::AggregateTypeId,
+        s3_lease_duration_ms: 10_000,
         s3_enabled: true,
         s3_region: Some(region),
         s3_bucket: Some(bucket_name),
@@ -83,8 +85,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Starting follower on port {}...", follower_port);
     let follower = TestServer::start_with_config(follower_port, follower_config).await?;
 
-    println!("  Waiting for election and heartbeat establishment...");
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    println!("  Waiting for election, heartbeat establishment, and S3 lease expiry...");
+    println!("  (S3 lease TTL = 10s; must expire so failover is gated only by heartbeat TTL)");
+    tokio::time::sleep(Duration::from_secs(12)).await;
 
     let mut leader_client = CeleriantClient::connect(leader.address()).await?;
 
@@ -133,7 +136,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("-----------------------------------");
 
     println!("  Waiting for follower to detect heartbeat loss and take over...");
-    println!("  (heartbeat timeout ~2s + S3 race ~1s = ~5s total)");
+    println!("  (S3 lease already expired; heartbeat timeout ~2s + S3 CAS ~1s)");
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // ========================================

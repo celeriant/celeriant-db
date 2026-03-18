@@ -13,7 +13,6 @@ use celeriant_shard::timestamp_config::TimestampConfig;
 use celeriant_msg::request::requests::{SingleAggregateWrite, WriteRequest};
 use celeriant_shard::shard_wal::ShardWal;
 use celeriant_wal::aggregate_key::AggregateKey;
-use celeriant_wal::compression_type::CompressionType;
 use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use glommio::timer::sleep;
@@ -98,7 +97,6 @@ fn create_config(
         schema_cache_bytes: 4 * 1024 * 1024,
         max_schema_size_bytes: 16384,
         pending_replication_high_water_bytes: 67_108_864, // 64MB
-        max_cluster_time_drift_ms: 5000,
         max_catchup_gap_bytes: 104_857_600,
         s3_download_max_rounds: 3,
         shard_id: 1,
@@ -197,7 +195,7 @@ fn bench_write_fsync_delays(c: &mut Criterion) {
                             .spawn(move || async move {
                                 let config =
                                     create_config(shard_dir, fsync_delay, 64 * 1024 * 1024);
-                                let shard_wal = Rc::new(ShardWal::open(config, ValidatedNodeStatus::standalone(), StubReplicationClient, StubS3Downloader).await.unwrap());
+                                let shard_wal = Rc::new(ShardWal::open(config, ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader).await.unwrap());
 
                                 let mut all_handles = Vec::with_capacity(TOTAL_WRITES);
                                 let num_waves = TOTAL_WRITES / WRITES_PER_WAVE;
@@ -274,7 +272,7 @@ fn bench_write_fsync_delays(c: &mut Criterion) {
                             .spawn(move || async move {
                                 let config =
                                     create_config(shard_dir, fsync_delay, 64 * 1024 * 1024);
-                                let shard_wal = Rc::new(ShardWal::open(config, ValidatedNodeStatus::standalone(), StubReplicationClient, StubS3Downloader).await.unwrap());
+                                let shard_wal = Rc::new(ShardWal::open(config, ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader).await.unwrap());
 
                                 let aggregate_key = AggregateKey::new(1, 1, 1);
                                 let mut all_handles = Vec::with_capacity(TOTAL_WRITES);
@@ -376,7 +374,7 @@ fn bench_write_idle_latency(c: &mut Criterion) {
                             .spawn(move || async move {
                                 let config =
                                     create_config(shard_dir, fsync_delay, 64 * 1024 * 1024);
-                                let shard_wal = Rc::new(ShardWal::open(config, ValidatedNodeStatus::standalone(), StubReplicationClient, StubS3Downloader).await.unwrap());
+                                let shard_wal = Rc::new(ShardWal::open(config, ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader).await.unwrap());
 
                                 let aggregate_key = AggregateKey::new(1, 1, 1);
                                 let mut cumulative_write_time = Duration::ZERO;
@@ -449,7 +447,7 @@ fn bench_write_cache_impact(c: &mut Criterion) {
                         let iteration_duration = LocalExecutorBuilder::new(Placement::Fixed(0))
                             .spawn(move || async move {
                                 let config = create_config(shard_dir, fsync_delay, cache_bytes);
-                                let shard_wal = Rc::new(ShardWal::open(config, ValidatedNodeStatus::standalone(), StubReplicationClient, StubS3Downloader).await.unwrap());
+                                let shard_wal = Rc::new(ShardWal::open(config, ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader).await.unwrap());
 
                                 let mut all_handles = Vec::with_capacity(TOTAL_WRITES);
                                 let num_waves = TOTAL_WRITES / WRITES_PER_WAVE;
@@ -521,7 +519,7 @@ fn bench_write_cache_impact(c: &mut Criterion) {
                         let iteration_duration = LocalExecutorBuilder::new(Placement::Fixed(0))
                             .spawn(move || async move {
                                 let config = create_config(shard_dir, fsync_delay, cache_bytes);
-                                let shard_wal = Rc::new(ShardWal::open(config, ValidatedNodeStatus::standalone(), StubReplicationClient, StubS3Downloader).await.unwrap());
+                                let shard_wal = Rc::new(ShardWal::open(config, ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader).await.unwrap());
 
                                 let aggregate_key = AggregateKey::new(1, 1, 1);
                                 let mut all_handles = Vec::with_capacity(TOTAL_WRITES);

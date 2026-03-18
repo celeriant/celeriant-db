@@ -81,8 +81,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Starting follower on port {}...", follower_port);
     let follower = TestServer::start_with_config(follower_port, follower_config).await?;
 
-    println!("  Waiting for election and heartbeat establishment...");
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    println!("  Waiting for election, heartbeat establishment, and S3 lease expiry...");
+    println!("  (S3 lease TTL = 10s; must expire so failover is gated only by heartbeat TTL)");
+    tokio::time::sleep(Duration::from_secs(12)).await;
 
     let mut leader_client = CeleriantClient::connect(leader.address()).await?;
     println!("  ✓ Cluster ready\n");
@@ -128,8 +129,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("-----------------------------------");
 
     println!("  Waiting for follower to detect heartbeat loss and take over...");
-    println!("  (heartbeat timeout ~2s + S3 race ~1s = ~5s total)");
-    tokio::time::sleep(Duration::from_secs(6)).await;
+    println!("  (heartbeat lease 1.5s + clock drift 0.5s + S3 race ~1s = ~3s total)");
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
     let mut new_leader_client = CeleriantClient::connect(follower.address()).await?;
 

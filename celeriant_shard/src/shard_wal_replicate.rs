@@ -615,7 +615,7 @@ mod tests {
 
         fn set_follower_address(&self, _address: Option<String>) {}
 
-        async fn send_heartbeat(&self) -> Result<celeriant_msg::response::responses::HeartbeatResult, crate::error::send_heartbeat_error::SendHeartbeatError> {
+        async fn send_heartbeat(&self, _unix_epoch_now_ms: u64) -> Result<celeriant_msg::response::responses::HeartbeatResult, crate::error::send_heartbeat_error::SendHeartbeatError> {
             unreachable!("s3 replication test should not call send_heartbeat")
         }
 

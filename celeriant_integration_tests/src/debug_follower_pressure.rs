@@ -77,7 +77,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     config.max_catchup_gap_bytes = 100_000_000;
     // 10-minute lease: plenty of time for debugging, prevents follower takeover
     config.heartbeat_lease_duration_ms = 600_000;
-    config.internode_connection_timeout_ms = Some(60_000);
+    config.internode_connection_timeout_ms = 60_000;
 
     println!("Starting leader on port {}...", LEADER_PORT);
     let _leader = TestServer::start_with_config_labeled(LEADER_PORT, config, "leader".into()).await?;

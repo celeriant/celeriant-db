@@ -45,6 +45,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         internode_request_timeout_ms: 30_000,
         // Long lease so throttled heartbeats don't cause leadership change
         heartbeat_lease_duration_ms: 120_000,
+        // S3 lease must also be long to prevent fencing during throttle
+        s3_lease_duration_ms: 120_000,
         s3_enabled: true,
         s3_region: Some(region.clone()),
         s3_bucket: Some(bucket.clone()),
@@ -70,6 +72,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         advertised_replication_address: Some(format!("127.0.0.1:{}", proxy_port)),
         routing_rule: RoutingRule::AggregateTypeId,
         heartbeat_lease_duration_ms: 120_000,
+        s3_lease_duration_ms: 120_000,
         s3_enabled: true,
         s3_region: Some(region),
         s3_bucket: Some(bucket),

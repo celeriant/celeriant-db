@@ -47,6 +47,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         heartbeat_lease_duration_ms: 1500,
         heartbeat_interval_ms: 500,
         max_clock_drift_ms: 500,
+        s3_lease_duration_ms: 10_000,
         s3_enabled: true,
         s3_region: Some(region),
         s3_bucket: Some(bucket),
@@ -66,11 +67,11 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting follower on port {}...", follower_port);
     let follower = TestServer::start_with_config(follower_port, config).await?;
 
-    // Wait for: election (S3 round-trip) + initial S3 lease to expire (1.5s) +
+    // Wait for: election (S3 round-trip) + initial S3 lease to expire (10s) +
     // heartbeat establishment + safety margin. After this window the follower's
     // ValidatedNodeStatus is refreshed purely by heartbeats with status_ttl_ms (2s).
-    println!("Waiting for election, initial lease expiry, and heartbeat establishment...");
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    println!("Waiting for election, initial S3 lease expiry, and heartbeat establishment...");
+    tokio::time::sleep(Duration::from_secs(12)).await;
 
     // --- Verify cluster health ---
     let mut leader_client = CeleriantClient::connect(leader.address()).await?;

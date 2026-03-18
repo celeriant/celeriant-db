@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use celeriant_distributed::{heartbeat::now_ms, lease_manager::{ElectionOutcome, LeaseManager}, lease_store::LeaseStore, node_status::NodeStatus, validated_node_status::ValidatedNodeStatus};
+use celeriant_distributed::{lease_store::LeaseStore, s3_lease_manager::{ElectionOutcome, S3LeaseManager}, validated_node_status::{self, ValidatedNodeStatus}};
 use celeriant_msg::response::responses::HeartbeatResult;
 use celeriant_shard::{error::send_heartbeat_error::SendHeartbeatError, replication_client::ReplicationClient, s3_downloader::S3Downloader, shard_wal::ShardWal};
 use glommio::{
@@ -68,7 +68,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
         client_tcp_listener: TcpListener,
         replication_tcp_listener: TcpListener,
         shard_wal: ShardWal<R, D>,
-        lease_manager: Option<LeaseManager<S>>,
+        lease_manager: Option<S3LeaseManager<S>>,
         shard_failed: Arc<AtomicBool>,
     ) -> Self {
         debug!("Initializing shard {current_shard_id}");
@@ -411,328 +411,268 @@ async fn run_s3_catchup<R: ReplicationClient + 'static, D: S3Downloader + 'stati
     }
 }
 
-async fn update_follower_address<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
-    ctx: &ConnectionContext<R, D, S>,
-    address: Option<String>,
-) {
-    ctx.shard_wal.replication_client.set_follower_address(address.clone());
-    broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::UpdateFollower { replication_address: address }, ctx.intrashard_sender.clone()).await;
+/// Retry an async S3 operation with exponential backoff (1s, 2s, 4s, …) up to
+/// `max_duration`. If `max_duration` is None, retries indefinitely.
+/// Only retries `LeaseStoreError::Unavailable`; other errors propagate immediately.
+async fn retry_s3_operation<F, Fut, T>(
+    max_duration: Option<Duration>,
+    op_name: &str,
+    mut op: F,
+) -> Result<T, celeriant_distributed::lease_store::LeaseStoreError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, celeriant_distributed::lease_store::LeaseStoreError>>,
+{
+    use celeriant_distributed::lease_store::LeaseStoreError;
+
+    let started_at = std::time::Instant::now();
+    let mut backoff = Duration::from_secs(1);
+    let max_backoff = Duration::from_secs(30);
+
+    loop {
+        match op().await {
+            Ok(v) => return Ok(v),
+            Err(LeaseStoreError::Unavailable { ref message }) => {
+                let elapsed = started_at.elapsed();
+                if let Some(max) = max_duration {
+                    if elapsed + backoff > max {
+                        warn!(op = op_name, elapsed_ms = elapsed.as_millis() as u64, error = %message, "S3 retry budget exhausted");
+                        return Err(LeaseStoreError::Unavailable { message: message.clone() });
+                    }
+                }
+                warn!(op = op_name, elapsed_ms = elapsed.as_millis() as u64, next_backoff_ms = backoff.as_millis() as u64, error = %message, "S3 unavailable, retrying");
+                glommio::timer::sleep(backoff).await;
+                backoff = (backoff * 2).min(max_backoff);
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
-async fn update_leader_client_address<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
+/// Reach out to S3 immediately to determine if this node is leader or follower
+/// Ensure we are up-to-date with any replicated S3 entries if we become leader
+/// Ensure all shards are updated with our new status
+async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
+    lease_manager: &S3LeaseManager<S>,
     ctx: &ConnectionContext<R, D, S>,
-    address: Option<String>,
-) {
-    *ctx.shard_wal.leader_client_address.borrow_mut() = address.clone();
-    broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::UpdateLeaderClientAddress { client_address: address }, ctx.intrashard_sender.clone()).await;
-}
-
-/// Renew leadership via S3 CAS when heartbeat path is unavailable.
-/// CAS-promotes the existing lease for a fresh TTL, updates node_status,
-/// and broadcasts to all local shards.
-async fn renew_s3_lease_and_broadcast<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
-    lease_manager: &LeaseManager<S>,
-    ctx: &ConnectionContext<R, D, S>,
+    rx: &LocalReceiver<CatchupCompletionMsg>,
 ) -> Result<ElectionOutcome, celeriant_distributed::lease_store::LeaseStoreError> {
-    let outcome = lease_manager.run_election().await?;
+
+    let is_currently_leader = ctx.shard_wal.node_status.get().raw().is_leader();
+
+    let outcome = retry_s3_operation(ctx.config.s3_retry_max_duration, "renew_s3_lease", || lease_manager.run_election_to_acquire_s3_lease()).await?;
+
+    metrics::counter!("celeriant_leader_elections_total").increment(1);
+    metrics::gauge!("celeriant_node_role").set(if outcome.status.raw().is_leader() { 1.0 } else { 0.0 });
+
+    // We took over the leadership. Catch up from S3 as a sanity check
+    // Unlikely to have previous leader race condition here, but possible
+    if !is_currently_leader && outcome.status.is_leader() {
+        info!("Starting post-election S3 catchup");
+        if !run_s3_catchup(ctx, &rx).await {
+            return Err(celeriant_distributed::lease_store::LeaseStoreError::Unavailable { message: "Could not catch up WAL via S3".to_string() });
+        }
+    }
+
+    // Do we have a peer? It tells us where to replicate or where to direct clients if this node isn't the leader
+    let (leader_client_address, follower_replication_address) = if let Some(peer_info) = outcome.peer_info.as_ref() {
+        if outcome.status.is_leader() {
+            (None, Some(peer_info.replication_address.clone()))
+        } else {
+            (Some(peer_info.client_address.clone()), None)
+        }
+    } else {
+        (None, None)
+    };
+    
+    *ctx.shard_wal.leader_client_address.borrow_mut() = leader_client_address.clone();
+    broadcast_message_to_other_shards(
+        ctx.current_shard_id,
+        IntrashardMessages::UpdateLeaderClientAddress { client_address: leader_client_address },
+        ctx.intrashard_sender.clone(),
+    ).await;
+    
+    ctx.shard_wal.replication_client.set_follower_address(follower_replication_address.clone());
+    broadcast_message_to_other_shards(
+        ctx.current_shard_id, 
+        IntrashardMessages::UpdateFollower { replication_address: follower_replication_address }, 
+        ctx.intrashard_sender.clone()
+    ).await;
+
+    // Finally open up writes if leader or accept replication if follower
+    let previous = ctx.shard_wal.node_status.get();
+    if !previous.raw().same_role(&outcome.status.raw()) {
+        warn!(
+            shard_id = ctx.current_shard_id,
+            previous = ?previous.raw(),
+            new = ?outcome.status.raw(),
+            expires_at_ms = outcome.status.lease_expires_at_ms(),
+            "Node status transition"
+        );
+    }
     ctx.shard_wal.node_status.set(outcome.status);
     broadcast_message_to_other_shards(
         ctx.current_shard_id,
         IntrashardMessages::StatusUpdate { status: outcome.status },
         ctx.intrashard_sender.clone(),
     ).await;
-    Ok(outcome)
-}
 
-/// Check if the follower in membership differs from the current peer.
-/// Returns Some(new_peer) if changed, None if same or lookup failed.
-async fn check_follower_changed<S: LeaseStore>(
-    lease_manager: &LeaseManager<S>,
-    current_peer: &celeriant_wal::s3::membership::NodeInfo,
-) -> Option<celeriant_wal::s3::membership::NodeInfo> {
-    match lease_manager.discover_peer().await {
-        Ok(Some(peer)) if peer != *current_peer => {
-            info!(old = ?current_peer, new = ?peer, "Follower address changed in membership");
-            Some(peer)
-        }
-        _ => None,
-    }
+
+    Ok(outcome)
 }
 
 fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
     ctx: ConnectionContext<R, D, S>,
     rx: LocalReceiver<CatchupCompletionMsg>,
 ) {
+    // Sanity check for standalone
+    if ctx.shard_wal.node_status.get().raw().is_standalone() || ctx.config.replication_config.is_none() || ctx.lease_manager.is_none() {
+        warn!("Running boot orchestrator but in standalone mode. Skipping.");
+        return;
+    }
+
     let lease_manager = ctx.lease_manager.clone().unwrap();
     glommio::spawn_local(async move {
 
-        info!("Starting pre-election S3 catchup");
-        if !run_s3_catchup(&ctx, &rx).await {
-            return;
-        }
-
-        info!("All shards caught up, running election");
-
-        if let Err(e) = lease_manager.register_self().await {
+        // Node registration only needs to be done once on boot
+        if let Err(e) = lease_manager.register_self_on_membership_s3_object().await {
             error!(error = %e, "Failed to register node in membership, shutting down");
             ctx.shutdown_requested.set(true);
             broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::Shutdown, ctx.intrashard_sender.clone()).await;
             return;
         }
 
-        let outcome = match lease_manager.run_election().await {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                error!(error = %e, "Election failed, shutting down");
-                ctx.shutdown_requested.set(true);
-                broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::Shutdown, ctx.intrashard_sender.clone()).await;
-                return;
-            }
-        };
-
-        metrics::counter!("celeriant_leader_elections_total").increment(1);
-        info!(status = ?outcome.status, peer = ?outcome.peer_info, "Election complete. Starting post-election S3 catchup");
-
-        if !run_s3_catchup(&ctx, &rx).await {
-            return;
-        }
-
-        ctx.shard_wal.node_status.set(outcome.status);
-        metrics::gauge!("celeriant_node_role").set(if outcome.status.raw().is_leader() { 1.0 } else { 0.0 });
-        broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::StatusUpdate { status: outcome.status }, ctx.intrashard_sender.clone()).await;
-
-        let leader_addr = if outcome.status.is_any_follower_state() {
-            outcome.peer_info.as_ref().map(|p| p.client_address.clone())
-        } else {
-            None
-        };
-        update_leader_client_address(&ctx, leader_addr).await;
-
-        let mut initial_peer = outcome.peer_info;
+        let half_s3_lease = ctx.config.replication_config.as_ref().unwrap().s3_lease_duration / 2;
+        let mut has_peer = false;
+        let mut peer_discovery_backoff = Duration::from_secs(1);
+        let mut last_peer_discovery_attempt = std::time::Instant::now();
 
         loop {
-            let status = ctx.shard_wal.node_status.get().raw();
-            if status.is_leader() {
-                run_leader_loop(&lease_manager, &ctx, initial_peer.take()).await;
-                update_follower_address(&ctx, None).await;
-            } else if matches!(status, NodeStatus::FollowerCatchingUp { .. }) {
-                run_kick_catchup(&ctx, &rx).await;
-            } else {
-                run_follower_watchdog(&lease_manager, &ctx).await;
-            }
             if ctx.shutdown_requested.get() {
                 break;
+            }
+
+            if ctx.shard_wal.node_status.get().is_leader() {
+                glommio::timer::sleep(ctx.config.heartbeat_interval_duration).await;
+
+                let unix_epoch_now_ms = validated_node_status::unix_epoch_now_ms();
+                let result = ctx.shard_wal.replication_client.send_heartbeat(unix_epoch_now_ms).await;
+
+                if let Err(SendHeartbeatError::LockTimeout) = &result {
+                    warn!("Heartbeat lock contention, skipping heartbeat");
+                    continue;
+                }
+
+                if let Ok(HeartbeatResult::Ack { .. }) = result {
+                    has_peer = true;
+                    peer_discovery_backoff = Duration::from_secs(1);
+                    let refreshed = ValidatedNodeStatus::create_custom_status(
+                        ctx.shard_wal.node_status.get().raw(), ctx.config.max_clock_drift_ms, unix_epoch_now_ms + ctx.config.heartbeat_lease_duration.as_millis() as u64);
+                    ctx.shard_wal.node_status.set(refreshed);
+                    broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::StatusUpdate { status: refreshed }, ctx.intrashard_sender.clone()).await;
+                    continue;
+                }
+
+                metrics::counter!("celeriant_heartbeat_failures_total").increment(1);
+
+                // Decide whether to check S3: either for peer discovery (no known peer)
+                // or for lease renewal (known peer but unreachable)
+                let should_check_s3 = if !has_peer {
+                    // No peer known — eagerly discover with backoff (1s, 2s, 4s, … capped at half S3 lease)
+                    last_peer_discovery_attempt.elapsed() >= peer_discovery_backoff
+                } else {
+                    // Peer known but unreachable — only check S3 when lease needs renewal
+                    let unix_epoch_now_ms = validated_node_status::unix_epoch_now_ms();
+                    let half_s3_lease_ms = half_s3_lease.as_millis() as u64;
+                    let proactive = unix_epoch_now_ms > ctx.shard_wal.node_status.get().lease_expires_at_ms().saturating_sub(half_s3_lease_ms);
+                    let expired = ctx.shard_wal.node_status.get().is_lease_expired();
+                    proactive || expired
+                };
+
+                if !should_check_s3 {
+                    continue;
+                }
+
+                warn!(has_peer, "Heartbeat failure, attempting S3 lease extension and membership discovery");
+
+                match set_node_role_via_s3(&lease_manager, &ctx, &rx).await {
+                    Ok(outcome) => {
+                        if outcome.peer_info.is_some() {
+                            has_peer = true;
+                            peer_discovery_backoff = Duration::from_secs(1);
+                        } else {
+                            has_peer = false;
+                            last_peer_discovery_attempt = std::time::Instant::now();
+                            peer_discovery_backoff = (peer_discovery_backoff * 2).min(half_s3_lease);
+                        }
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Election failed after retries, shutting down");
+                        ctx.shutdown_requested.set(true);
+                        broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::Shutdown, ctx.intrashard_sender.clone()).await;
+                        return;
+                    }
+                }
+
+                continue;
+            }
+
+            if ctx.shard_wal.node_status.get().is_follower() || ctx.shard_wal.node_status.get().is_fenced() {
+
+                // If we are a happy follower of just fenced, we can challenge the lease at the expiry time
+                let unix_epoch_now_ms = validated_node_status::unix_epoch_now_ms();
+                let remaining_time_until_lease_expires_ms = ctx.shard_wal.node_status.get().lease_expires_at_ms().saturating_sub(unix_epoch_now_ms);
+                if remaining_time_until_lease_expires_ms > 0 {
+                    //Only sleep for max of 500ms so we can still respond to shutdown commands
+                    glommio::timer::sleep(Duration::from_millis(remaining_time_until_lease_expires_ms.min(500))).await;
+                }
+
+                // Could have been updated by a re-connecting heartbeat on another task
+                if !ctx.shard_wal.node_status.get().is_lease_expired() {
+                    continue;
+                }
+
+                let still_right_status = ctx.shard_wal.node_status.get().is_follower() || ctx.shard_wal.node_status.get().is_fenced();
+                if !still_right_status {
+                    continue;
+                }
+
+                info!(node_status = ?ctx.shard_wal.node_status.get(), "Follower or fenced node detected expired lease, challenging for leadership");
+
+                if let Err(e) = set_node_role_via_s3(&lease_manager, &ctx, &rx).await {
+                    error!(error = %e, "Election failed after retries, shutting down");
+                    ctx.shutdown_requested.set(true);
+                    broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::Shutdown, ctx.intrashard_sender.clone()).await;
+                    return;
+                }
+
+                continue;
+            }
+
+            if ctx.shard_wal.node_status.get().raw().is_catching_up() {
+
+                info!("Node was follower but got kicked, or we are in boot catchup phase, asking shards to catch up via s3");
+
+                if !run_s3_catchup(&ctx, &rx).await {
+                    error!("Failed to run s3 catchup, shutting down");
+                    ctx.shutdown_requested.set(true);
+                    broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::Shutdown, ctx.intrashard_sender.clone()).await;
+                    return;
+                }
+
+                // WAL is caught up — now determine our role via S3 election
+                if let Err(e) = set_node_role_via_s3(&lease_manager, &ctx, &rx).await {
+                    error!(error = %e, "Post-catchup election failed, shutting down");
+                    ctx.shutdown_requested.set(true);
+                    broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::Shutdown, ctx.intrashard_sender.clone()).await;
+                    return;
+                }
+
+                continue;
             }
         }
     })
     .detach();
-}
-
-/// Leader steady-state: discover follower, heartbeat, renew S3 lease on failure.
-/// Returns when leadership is lost (status already set to Follower by renew_s3_lease_and_broadcast).
-async fn run_leader_loop<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
-    lease_manager: &Rc<LeaseManager<S>>,
-    ctx: &ConnectionContext<R, D, S>,
-    initial_peer: Option<celeriant_wal::s3::membership::NodeInfo>,
-) {
-    let rc = ctx.config.replication_config.as_ref().unwrap();
-    let heartbeat_interval = rc.heartbeat_interval;
-    let status_ttl_ms = rc.status_ttl_ms();
-
-    let mut known_peer = initial_peer;
-
-    loop {
-        // Phase 1: discover a follower
-        // Each iteration renews the S3 lease (prevents self-fencing during
-        // extended discovery) and discovers the peer in one shot —
-        // run_election() calls discover_peer() internally.
-        // Backoff is capped at half the S3 lease TTL so renewal always
-        // lands with headroom before the lease expires.
-        let peer_info = match known_peer.take() {
-            Some(info) => info,
-            None => {
-                let max_backoff = rc.initial_lease_duration / 2;
-                let mut backoff = Duration::from_secs(1).min(max_backoff);
-                loop {
-                    glommio::timer::sleep(backoff).await;
-                    match renew_s3_lease_and_broadcast(lease_manager, ctx).await {
-                        Ok(outcome) if !outcome.status.raw().is_leader() => {
-                            warn!("Lost leadership during follower discovery");
-                            update_leader_client_address(ctx, outcome.peer_info.as_ref().map(|p| p.client_address.clone())).await;
-                            return;
-                        }
-                        Ok(outcome) => {
-                            if let Some(info) = outcome.peer_info {
-                                info!(peer = ?info, "Follower discovered");
-                                break info;
-                            }
-                            debug!(task = "boot_orchestrator", next_backoff_ms = (backoff * 2).min(max_backoff).as_millis() as u64, "Follower not yet registered, retrying");
-                            update_follower_address(ctx, None).await;
-                            backoff = (backoff * 2).min(max_backoff);
-                        }
-                        Err(e) => {
-                            warn!(error = ?e, "S3 lease renewal failed during discovery, retrying");
-                            backoff = (backoff * 2).min(max_backoff);
-                        }
-                    }
-                }
-            }
-        };
-
-        update_follower_address(ctx, Some(peer_info.replication_address.clone())).await;
-
-        // Phase 2: heartbeat loop
-        // On failure: renew lease via S3, check if follower changed in membership.
-        // If changed, set known_peer and break to re-discover. Otherwise keep
-        // trying — transient failures don't mean the follower is gone.
-        loop {
-            glommio::timer::sleep(heartbeat_interval).await;
-
-            let result = ctx.shard_wal.replication_client.send_heartbeat().await;
-
-            if let Err(SendHeartbeatError::LockTimeout) = &result {
-                warn!("Heartbeat lock contention, skipping heartbeat");
-                continue;
-            }
-
-            if let Ok(HeartbeatResult::Ack { .. }) = result {
-                let leader_ms = now_ms();
-                let current_status = ctx.shard_wal.node_status.get().raw();
-                let refreshed = ValidatedNodeStatus::new(current_status, leader_ms + status_ttl_ms);
-                ctx.shard_wal.node_status.set(refreshed);
-                broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::StatusUpdate { status: refreshed }, ctx.intrashard_sender.clone()).await;
-                continue;
-            }
-
-            metrics::counter!("celeriant_heartbeat_failures_total").increment(1);
-            warn!(result = ?result, "Heartbeat unsuccessful, renewing lease via S3");
-            match renew_s3_lease_and_broadcast(lease_manager, ctx).await {
-                Ok(renewal) if !renewal.status.raw().is_leader() => {
-                    metrics::counter!("celeriant_leader_elections_total").increment(1);
-                    metrics::gauge!("celeriant_node_role").set(0.0);
-                    info!("Lost leadership after S3 CAS race");
-                    update_leader_client_address(ctx, renewal.peer_info.as_ref().map(|p| p.client_address.clone())).await;
-                    return;
-                }
-                Ok(_) => {
-                    if let Some(new_peer) = check_follower_changed(lease_manager, &peer_info).await {
-                        known_peer = Some(new_peer);
-                        break;
-                    }
-                }
-                Err(e) => {
-                    // Both heartbeat and S3 unavailable. Writes already rejected
-                    // (replication has no target). TTL self-fencing is the safety bound.
-                    error!(error = ?e, "S3 lease renewal failed, relying on TTL");
-                }
-            }
-        }
-    }
-}
-
-/// Monitor heartbeat liveness and race to S3 when leader is presumed dead.
-/// Returns when:
-/// - This node wins the CAS race (status set to Leader by renew_s3_lease_and_broadcast)
-/// - A kick transitions status to FollowerCatchingUp (role-flip loop handles catchup)
-async fn run_follower_watchdog<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
-    lease_manager: &Rc<LeaseManager<S>>,
-    ctx: &ConnectionContext<R, D, S>,
-) {
-    info!("Entering follower watchdog");
-
-    loop {
-        // Sleep until TTL expiry or kick detection. If a heartbeat refreshes
-        // the TTL during our sleep, we wake at the old deadline, re-check,
-        // and sleep the delta to the new deadline.
-        // For TTL-exempt catchup states, poll every 500ms to detect kicks.
-        let expired_lease_index;
-        loop {
-            let status = ctx.shard_wal.node_status.get();
-            if !status.is_any_follower_state() {
-                expired_lease_index = status.raw().lease_index_for_logging();
-                break;
-            }
-            // Kick received — return to role-flip loop for catchup orchestration
-            if status.raw().is_catching_up() {
-                info!("Kick detected, returning to role-flip loop for catchup");
-                return;
-            }
-            let sleep_ms = status.expires_at_ms().saturating_sub(now_ms()).min(500);
-            glommio::timer::sleep(Duration::from_millis(sleep_ms)).await;
-        }
-
-        // TTL expired — leader presumed dead.
-        // Self-fencing via TTL already rejects writes/replication.
-        // Explicit broadcast updates raw() for observability.
-        info!(expired_lease_index, "Leader heartbeat expired, racing to S3");
-        let fenced = ValidatedNodeStatus::fenced();
-        ctx.shard_wal.node_status.set(fenced);
-        broadcast_message_to_other_shards(
-            ctx.current_shard_id,
-            IntrashardMessages::StatusUpdate { status: fenced },
-            ctx.intrashard_sender.clone(),
-        ).await;
-
-        match renew_s3_lease_and_broadcast(lease_manager, ctx).await {
-            Ok(outcome) if outcome.status.raw().is_leader() => {
-                metrics::counter!("celeriant_leader_elections_total").increment(1);
-                metrics::gauge!("celeriant_node_role").set(1.0);
-                info!(lease_index = outcome.status.raw().lease_index_for_logging(), "Won S3 CAS race, becoming leader");
-                update_leader_client_address(ctx, None).await;
-                return;
-            }
-            Ok(outcome) => {
-                info!(lease_index = outcome.status.raw().lease_index_for_logging(), "Lost S3 CAS race, resuming watchdog");
-                update_leader_client_address(ctx, outcome.peer_info.as_ref().map(|p| p.client_address.clone())).await;
-                // Status already set to Follower with fresh TTL by
-                // renew_s3_lease_and_broadcast. Inner loop will sleep
-                // until the new leader's heartbeats stop.
-            }
-            Err(e) => {
-                // Already fenced. Retry after backoff.
-                error!(error = ?e, "S3 race failed, retrying");
-                glommio::timer::sleep(Duration::from_secs(1)).await;
-            }
-        }
-    }
-}
-
-/// Coordinated S3 catchup after being kicked by the leader.
-/// Reuses the same catchup logic as boot. On success, transitions directly
-/// to Follower — the leader's next TCP replication attempt succeeds naturally.
-async fn run_kick_catchup<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
-    ctx: &ConnectionContext<R, D, S>,
-    rx: &LocalReceiver<CatchupCompletionMsg>,
-) {
-    info!("Starting kick catchup (S3)");
-    if !run_s3_catchup(ctx, rx).await {
-        return; // fatal error, shutdown already triggered
-    }
-
-    let current = ctx.shard_wal.node_status.get().raw();
-    match current {
-        NodeStatus::FollowerCatchingUp { leader_lease_index } => {
-            let rc = ctx.config.replication_config.as_ref();
-            let status_ttl_ms = rc.map(|r| r.status_ttl_ms()).unwrap_or(5000);
-            let follower = ValidatedNodeStatus::new(
-                NodeStatus::Follower { leader_lease_index },
-                now_ms() + status_ttl_ms,
-            );
-            ctx.shard_wal.node_status.set(follower);
-            broadcast_message_to_other_shards(
-                ctx.current_shard_id,
-                IntrashardMessages::StatusUpdate { status: follower },
-                ctx.intrashard_sender.clone(),
-            ).await;
-            info!("Kick catchup complete — resuming as Follower");
-        }
-        NodeStatus::Fenced => {
-            info!("Leader died during kick catchup — fenced, will race");
-        }
-        other => {
-            warn!(status = ?other, "Unexpected status after kick catchup");
-        }
-    }
 }
 
 fn spawn_intrashard_message_handler<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
@@ -799,7 +739,7 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
                     shard_id = ctx.current_shard_id,
                     previous = ?previous.raw(),
                     new = ?status.raw(),
-                    expires_at_ms = status.expires_at_ms(),
+                    expires_at_ms = status.lease_expires_at_ms(),
                     "Node status transition"
                 );
             }

@@ -51,6 +51,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         num_shards: Some(num_shards),
         log_level: "info".to_string(),
         routing_rule: RoutingRule::AggregateTypeId,
+        s3_lease_duration_ms: 10_000,
         s3_enabled: true,
         s3_region: Some(region.clone()),
         s3_bucket: Some(bucket_name.clone()),
@@ -70,6 +71,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         num_shards: Some(num_shards),
         log_level: "info".to_string(),
         routing_rule: RoutingRule::AggregateTypeId,
+        s3_lease_duration_ms: 10_000,
         s3_enabled: true,
         s3_region: Some(region),
         s3_bucket: Some(bucket_name),
@@ -83,8 +85,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Starting follower B on port {}...", leader_b_port);
     let mut leader_b = TestServer::start_with_config(leader_b_port, leader_b_config).await?;
 
-    println!("  Waiting for election and heartbeat establishment...");
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    println!("  Waiting for election, heartbeat establishment, and S3 lease expiry...");
+    println!("  (S3 lease TTL = 10s; must expire so failover is gated only by heartbeat TTL)");
+    tokio::time::sleep(Duration::from_secs(12)).await;
 
     let mut leader_a_client = CeleriantClient::connect(leader_a.address()).await?;
 
@@ -162,9 +165,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     leader_a.restart().await?;
     println!("  Leader A process restarted");
 
-    println!("  Waiting for A to complete election and become follower...");
-    println!("  (startup + election + heartbeat = ~8s)");
-    tokio::time::sleep(Duration::from_secs(8)).await;
+    println!("  Waiting for A to become follower and B's S3 lease to expire...");
+    println!("  (startup + election + heartbeat + S3 lease expiry = ~12s)");
+    tokio::time::sleep(Duration::from_secs(12)).await;
 
     leader_a_client = CeleriantClient::connect(leader_a.address()).await?;
 

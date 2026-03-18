@@ -1,7 +1,7 @@
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::Duration;
 
-use celeriant_distributed::lease_manager::LeaseManager;
+use celeriant_distributed::s3_lease_manager::S3LeaseManager;
 use celeriant_distributed::validated_node_status::ValidatedNodeStatus;
 use celeriant_shard::{internal_shard_config::InternalShardConfig, replication_client::FollowerConnection, shard_wal::ShardWal, shard_wal_compact::cleanup_orphaned_compacting_files};
 use celeriant_sidecar::store::SidecarStoreTrait;
@@ -109,12 +109,12 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                     schema_cache_bytes: shard_config.schema_cache_bytes,
                     max_schema_size_bytes: shard_config.max_schema_size_bytes,
                     pending_replication_high_water_bytes: shard_config.pending_replication_high_water_bytes,
-                    max_cluster_time_drift_ms: shard_config.max_cluster_time_drift_ms,
                     max_catchup_gap_bytes: shard_config.max_catchup_gap_bytes,
                     max_s3_fallback_batch_bytes: shard_config.max_s3_fallback_batch_bytes,
                     compaction_check_interval: shard_config.compaction_check_interval,
                     compaction_min_reclaimable_ratio: shard_config.compaction_min_reclaimable_ratio,
                     compaction_temp_dir,
+                    max_clock_drift_ms: shard_config.max_clock_drift_ms,
                 };
                 let s3_uploader = SidecarS3Uploader::new(sidecar_senders.clone());
                 let replication_client_config = shard_config.tls_config.as_ref()
@@ -132,9 +132,9 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                 let s3_downloader = SidecarS3Downloader::new(sidecar_senders.clone());
 
                 let validated_node_status = if shard_config.replication_config.is_some() {
-                    ValidatedNodeStatus::boot_catchup()
+                    ValidatedNodeStatus::create_boot_catchup()
                 } else {
-                    ValidatedNodeStatus::standalone()
+                    ValidatedNodeStatus::create_standalone()
                 };
                 // Create compaction temp dir and clean up any orphaned .compacting files
                 // from a previous crashed compaction before opening the WAL.
@@ -161,7 +161,7 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                 let lease_manager = if shard_config.replication_config.is_some() && current_shard_id == 0 {
                     let lease_storage = SidecarLeaseStorage::new(sidecar_senders.clone());
                     let replication_config = shard_config.replication_config.clone().unwrap();
-                    Some(LeaseManager::new(lease_storage, replication_config))
+                    Some(S3LeaseManager::new(lease_storage, replication_config))
                 } else {
                     None
                 };

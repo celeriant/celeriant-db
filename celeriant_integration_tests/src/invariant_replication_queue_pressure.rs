@@ -71,10 +71,11 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     config.pending_replication_high_water_bytes = 262144;
     // High max_catchup_gap_bytes: we are NOT testing WAL gap detection, only queue pressure.
     config.max_catchup_gap_bytes = 100_000_000;
-    // Long heartbeat lease: no failover, just kick.
+    // Long timeouts: no failover, just kick.
     config.heartbeat_lease_duration_ms = 30_000;
+    config.s3_lease_duration_ms = 30_000;
     // Generous internode timeout so the throttled connection stays open.
-    config.internode_connection_timeout_ms = Some(60_000);
+    config.internode_connection_timeout_ms = 60_000;
 
     let mut follower_config = config.clone();
     follower_config.advertised_replication_address = Some(proxy.address());

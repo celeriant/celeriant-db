@@ -13,7 +13,6 @@ use celeriant_shard::timestamp_config::TimestampConfig;
 use celeriant_msg::request::requests::{AggregateDetailsRequest, SingleAggregateWrite, WriteRequest};
 use celeriant_shard::shard_wal::ShardWal;
 use celeriant_wal::aggregate_key::AggregateKey;
-use celeriant_wal::compression_type::CompressionType;
 use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use glommio::timer::sleep;
@@ -77,7 +76,6 @@ fn create_config(shard_dir: PathBuf) -> InternalShardConfig {
         schema_cache_bytes: 4 * 1024 * 1024,
         max_schema_size_bytes: 16384,
         pending_replication_high_water_bytes: 67_108_864, // 64MB
-        max_cluster_time_drift_ms: 5000,
         max_catchup_gap_bytes: 104_857_600,
         s3_download_max_rounds: 3,
         shard_id: 1,
@@ -194,7 +192,7 @@ fn bench_bloom_effectiveness(c: &mut Criterion) {
             LocalExecutorBuilder::new(Placement::Fixed(0))
                 .spawn(move || async move {
                     let config = create_config(shard_dir);
-                    let shard_wal = Rc::new(ShardWal::open(config, ValidatedNodeStatus::standalone(), StubReplicationClient, StubS3Downloader).await.unwrap());
+                    let shard_wal = Rc::new(ShardWal::open(config, ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader).await.unwrap());
                     populate_wal(shard_wal.clone(), num_aggregates, total_writes).await;
                     shard_wal.close().await;
                 })
@@ -226,7 +224,7 @@ fn bench_bloom_effectiveness(c: &mut Criterion) {
                     let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
                         .spawn(move || async move {
                             let config = create_config(shard_dir);
-                            let shard_wal = ShardWal::open(config, ValidatedNodeStatus::standalone(), StubReplicationClient, StubS3Downloader).await.unwrap();
+                            let shard_wal = ShardWal::open(config, ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader).await.unwrap();
 
                             let mut total_duration = Duration::ZERO;
 
@@ -270,7 +268,7 @@ fn bench_bloom_effectiveness(c: &mut Criterion) {
                     let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
                         .spawn(move || async move {
                             let config = create_config(shard_dir);
-                            let shard_wal = ShardWal::open(config, ValidatedNodeStatus::standalone(), StubReplicationClient, StubS3Downloader).await.unwrap();
+                            let shard_wal = ShardWal::open(config, ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader).await.unwrap();
 
                             let mut total_duration = Duration::ZERO;
                             // Use IDs way outside the written range

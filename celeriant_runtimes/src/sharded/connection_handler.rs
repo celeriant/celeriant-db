@@ -3,7 +3,7 @@ use std::{cell::{Cell, RefCell}, collections::HashMap, fmt, future::Future, io, 
 use futures_lite::AsyncRead;
 
 use base64::Engine;
-use celeriant_distributed::{heartbeat::now_ms, lease_manager::LeaseManager, lease_store::LeaseStore, node_status::NodeStatus, validated_node_status::ValidatedNodeStatus};
+use celeriant_distributed::{lease_store::LeaseStore, node_status::NodeStatus, s3_lease_manager::S3LeaseManager, validated_node_status::{self, ValidatedNodeStatus}};
 use celeriant_msg::{
     error_codes,
     process_client_requests::ClientRequest,
@@ -62,7 +62,7 @@ pub struct ConnectionContext<R: ReplicationClient + 'static, D: S3Downloader + '
     pub shard_wal: Rc<ShardWal<R, D>>,
     pub catchup_completion_tx: Option<Rc<LocalSender<CatchupCompletionMsg>>>,
     pub schema_registration_pending: Option<Rc<RefCell<HashMap<u64, LocalSender<SchemaRegistrationCompletionMsg>>>>>,
-    pub lease_manager: Option<Rc<LeaseManager<S>>>,
+    pub lease_manager: Option<Rc<S3LeaseManager<S>>>,
 }
 
 /// Connection-level state for identity verification and access control
@@ -1104,7 +1104,7 @@ async fn handle_heartbeat<R: ReplicationClient + 'static, D: S3Downloader + 'sta
     req: &HeartbeatRequest,
     ctx: &ConnectionContext<R, D, S>,
 ) -> ClusterResponse {
-    let follower_ms = now_ms();
+    let follower_ms = validated_node_status::unix_epoch_now_ms();
 
     if !ctx.shard_wal.node_status.get().is_any_follower_state() {
         return ClusterResponse::Heartbeat(HeartbeatResponse {
@@ -1118,15 +1118,15 @@ async fn handle_heartbeat<R: ReplicationClient + 'static, D: S3Downloader + 'sta
     // any time-based decisions with skewed clocks.
     let drift = follower_ms.abs_diff(req.leader_timestamp_ms);
     metrics::gauge!("celeriant_clock_drift_ms").set(drift as f64);
-    if drift > ctx.config.max_cluster_time_drift_ms {
+    if drift > ctx.config.max_clock_drift_ms {
         tracing::error!(
             leader_ms = req.leader_timestamp_ms,
             follower_ms,
             drift_ms = drift,
-            max_allowed_ms = ctx.config.max_cluster_time_drift_ms,
+            max_allowed_ms = ctx.config.max_clock_drift_ms,
             "Clock drift too high, fencing all shards"
         );
-        let fenced = ValidatedNodeStatus::fenced();
+        let fenced = ValidatedNodeStatus::create_fenced();
         ctx.shard_wal.node_status.set(fenced);
         broadcast_status(ctx, fenced).await;
 
@@ -1135,18 +1135,24 @@ async fn handle_heartbeat<R: ReplicationClient + 'static, D: S3Downloader + 'sta
             result: HeartbeatResult::Rejected(HeartbeatRejection::ClockDriftTooHigh {
                 leader_ms: req.leader_timestamp_ms,
                 follower_ms,
-                max_allowed_ms: ctx.config.max_cluster_time_drift_ms,
+                max_allowed_ms: ctx.config.max_clock_drift_ms,
             }),
         });
     }
 
-    let status_ttl_ms = match &ctx.config.replication_config {
-        Some(rc) => rc.status_ttl_ms(),
-        None => 5000,
+    // Extend the lease due to the live heartbeat
+    let current_lease_expiry_ms = ctx.shard_wal.node_status.get().lease_expires_at_ms();
+    let proposed_lease_expiry_ms = req.leader_timestamp_ms + ctx.config.heartbeat_lease_duration.as_millis() as u64;
+    let new_lease_expiry_ms = if proposed_lease_expiry_ms > current_lease_expiry_ms {
+        proposed_lease_expiry_ms
+    } else {
+        current_lease_expiry_ms
     };
-    let new_expires_at = follower_ms + status_ttl_ms;
-    let current_status = ctx.shard_wal.node_status.get().raw();
-    let refreshed = ValidatedNodeStatus::new(current_status, new_expires_at);
+    
+    let refreshed = ValidatedNodeStatus::create_custom_status(
+        ctx.shard_wal.node_status.get().raw(), 
+        ctx.config.max_clock_drift_ms, 
+        new_lease_expiry_ms);
     ctx.shard_wal.node_status.set(refreshed);
     broadcast_status(ctx, refreshed).await;
 
@@ -1173,8 +1179,8 @@ async fn handle_kick_follower<R: ReplicationClient + 'static, D: S3Downloader + 
     // Only transition from Follower (already catching up → ignore duplicate kicks)
     if status.raw().is_follower() {
         let leader_lease_index = status.raw().lease_index_for_logging();
-        let catching_up = ValidatedNodeStatus::new(
-            NodeStatus::FollowerCatchingUp { leader_lease_index }, 0,
+        let catching_up = ValidatedNodeStatus::create_custom_status(
+            NodeStatus::FollowerCatchingUp { leader_lease_index }, 0,0,
         );
         ctx.shard_wal.node_status.set(catching_up);
         broadcast_status(ctx, catching_up).await;
@@ -1290,6 +1296,9 @@ mod tests {
             num_shards,
             s3_download_max_rounds: 3,
             replication_config: None,
+            heartbeat_lease_duration: Duration::from_millis(1500),
+            heartbeat_interval_duration: Duration::from_millis(250),
+            s3_retry_max_duration: None,
             advertised_replication_address: None,
             data_root: "/tmp".into(),
             listen_address: "127.0.0.1".into(),
@@ -1321,7 +1330,7 @@ mod tests {
             max_schema_size_bytes: 16384,
             pending_replication_high_water_bytes: 67_108_864, // 64MB
             replication_delay: Duration::from_millis(20),
-            max_cluster_time_drift_ms: 5000,
+            max_clock_drift_ms: 5000,
             max_catchup_gap_bytes: 104_857_600,
             internode_connection_timeout: None,
             internode_request_timeout: Duration::from_secs(10),

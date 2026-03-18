@@ -124,8 +124,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Starting node B (follower) on port {}...", node_b_port);
     let mut node_b = TestServer::start_with_config_labeled(node_b_port, config, "node-b".into()).await?;
 
-    println!("  Waiting for election + replication...");
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    println!("  Waiting for election, replication, and S3 lease expiry...");
+    tokio::time::sleep(Duration::from_secs(12)).await;
 
     let mut node_a_client = CeleriantClient::connect(node_a.address()).await?;
 
@@ -174,8 +174,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     node_a.stop();
     println!("  Node A stopped");
 
-    println!("  Waiting for failover (lease expiry + election)...");
-    tokio::time::sleep(Duration::from_secs(12)).await;
+    println!("  Waiting for failover (heartbeat lease 1.5s + S3 race)...");
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
     let mut node_b_client = CeleriantClient::connect(node_b.address()).await?;
     write_event(&mut node_b_client, &aggregate_key, 5, false).await?;
@@ -231,7 +231,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     node_b.stop();
     println!("  Node B stopped");
 
-    println!("  Waiting for node A to take over...");
+    println!("  Waiting for node A to take over (heartbeat lease 1.5s + S3 race)...");
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     let mut node_a_client = CeleriantClient::connect(node_a.address()).await?;

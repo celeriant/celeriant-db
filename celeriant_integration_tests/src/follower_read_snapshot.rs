@@ -92,6 +92,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         num_shards, &region, &bucket, &access_key, &secret_key, &endpoint, allow_http,
     );
     config.heartbeat_lease_duration_ms = 30_000;
+    config.s3_lease_duration_ms = 30_000;
 
     println!("Starting cluster...");
     let leader = TestServer::start_with_config_labeled(leader_port, config.clone(), "leader".into()).await?;

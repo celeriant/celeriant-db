@@ -123,8 +123,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Starting follower on port {}...", follower_port);
     let mut follower = TestServer::start_with_config_labeled(follower_port, config, "follower".into()).await?;
 
-    println!("  Waiting for election + replication...");
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    println!("  Waiting for election, replication, and S3 lease expiry...");
+    tokio::time::sleep(Duration::from_secs(12)).await;
 
     let mut leader_client = CeleriantClient::connect(leader.address()).await?;
 
@@ -214,7 +214,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     leader.stop();
     println!("  Leader stopped");
 
-    println!("  Waiting for failover...");
+    println!("  Waiting for failover (heartbeat lease 1.5s + S3 race)...");
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     let mut new_leader_client = CeleriantClient::connect(follower.address()).await?;

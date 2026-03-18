@@ -52,8 +52,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // and the gap exceeds this, it triggers FollowerTooFarBehind → S3 fallback + kick.
     // FIXED_BLOCK_SIZE_BYTES=1024, so ~5 WAL entries exceed 4096.
     config.max_catchup_gap_bytes = 4096;
-    // Long heartbeat timeout — we don't want failover, just kick
+    // Long timeouts — we don't want failover, just kick
     config.heartbeat_lease_duration_ms = 30_000;
+    config.s3_lease_duration_ms = 30_000;
 
     let mut follower_config = config.clone();
     follower_config.advertised_replication_address = Some(proxy.address());

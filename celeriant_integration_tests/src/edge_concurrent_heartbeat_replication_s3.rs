@@ -68,6 +68,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // If S3 holds the replication lock, heartbeats cannot acquire it, so they are blocked
     // entirely — not just slowed. Missing all heartbeats for >lease_duration causes failover.
     config.heartbeat_lease_duration_ms = 30_000;
+    config.s3_lease_duration_ms = 30_000;
     // Low high water mark: 32KB triggers S3 fallback when concurrent writes accumulate.
     // With 20 concurrent writers × 4KB events in one fsync window, the pending queue
     // reaches ~240KB, far above this threshold. Must be above ~12KB (single event pending
@@ -77,7 +78,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // the S3 pointer promptly after unthrottle.
     config.max_catchup_gap_bytes = 4096;
     // Generous internode timeout so throttled connections are not killed prematurely.
-    config.internode_connection_timeout_ms = Some(60_000);
+    config.internode_connection_timeout_ms = 60_000;
 
     let mut follower_config = config.clone();
     follower_config.advertised_replication_address = Some(proxy.address());

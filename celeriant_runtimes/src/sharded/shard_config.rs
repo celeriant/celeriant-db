@@ -3,7 +3,7 @@ use std::{cell::RefCell, path::PathBuf, sync::Arc, time::Duration};
 use celeriant_crypto::pki::ClientAuthMode;
 use celeriant_msg::response::responses::AccessLevel;
 use celeriant_shard::timestamp_config::TimestampConfig;
-use celeriant_distributed::config::ReplicationConfig;
+use celeriant_distributed::s3_lease_config::S3LeaseConfig;
 use celeriant_wal::compression_type::CompressionType;
 
 use crate::sharded::routing_rule::RoutingRule;
@@ -54,7 +54,9 @@ pub struct TlsCertPaths {
 pub struct ShardConfig {
     pub node_id: u128,
     pub num_shards: u32,
-    pub replication_config: Option<ReplicationConfig>,
+    pub replication_config: Option<S3LeaseConfig>,
+    pub heartbeat_lease_duration: Duration,
+    pub heartbeat_interval_duration: Duration,
     pub advertised_replication_address: Option<String>,
     pub data_root: PathBuf,
     pub listen_address: String,
@@ -86,7 +88,7 @@ pub struct ShardConfig {
     pub schema_cache_bytes: u64,
     pub max_schema_size_bytes: u64,
     pub pending_replication_high_water_bytes: u64,
-    pub max_cluster_time_drift_ms: u64,
+    pub max_clock_drift_ms: u64,
     pub max_catchup_gap_bytes: u64,
     pub max_s3_fallback_batch_bytes: u64,
     pub tls_config: Option<Arc<TlsConfig>>,
@@ -98,4 +100,5 @@ pub struct ShardConfig {
     pub compaction_check_interval: Duration,
     pub compaction_min_reclaimable_ratio: f64,
     pub compaction_temp_dir: Option<std::path::PathBuf>,
+    pub s3_retry_max_duration: Option<Duration>,
 }

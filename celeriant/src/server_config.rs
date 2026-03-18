@@ -1,5 +1,5 @@
 use celeriant_crypto::pki::{ClientAuthMode, PkiManager};
-use celeriant_distributed::config::ReplicationConfig;
+use celeriant_distributed::s3_lease_config::S3LeaseConfig;
 use celeriant_runtimes::RoutingRule;
 use celeriant_runtimes::{TlsConfig, TlsMode};
 use celeriant_runtimes::{ShardConfig, SidecarConfig};
@@ -222,9 +222,6 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 64 * 1024 * 1024, env = "CELERIANT_PENDING_REPLICATION_HIGH_WATER_BYTES", help = "High water mark for pending replication queue before triggering S3 fallback (64MB)")]
     pub pending_replication_high_water_bytes: u64,
 
-    #[arg(long, default_value_t = 5000, env = "CELERIANT_MAX_CLUSTER_TIME_DRIFT_MS", help = "Maximum allowed clock drift between leader and follower nodes (5s)")]
-    pub max_cluster_time_drift_ms: u64,
-
     #[arg(
         long,
         default_value_t = 104_857_600,
@@ -236,9 +233,10 @@ pub struct ServerConfig {
     #[arg(
         long,
         env = "CELERIANT_INTERNODE_CONNECTION_TIMEOUT_MS",
-        help = "Timeout for inter-node TCP connection establishment in milliseconds"
+        help = "Timeout for inter-node TCP connection establishment in milliseconds",
+        default_value_t = 5_000
     )]
-    pub internode_connection_timeout_ms: Option<u64>,
+    pub internode_connection_timeout_ms: u64,
 
     #[arg(
         long,
@@ -368,8 +366,14 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 1500, env = "CELERIANT_HEARTBEAT_LEASE_DURATION_MS", help = "Duration before a missed heartbeat is considered a lease expiry (1500ms)")]
     pub heartbeat_lease_duration_ms: u64,
 
+    #[arg(long, default_value_t = 30000, env = "CELERIANT_S3_LEASE_DURATION_MS", help = "S3 lease TTL for leader election, independent of heartbeat timing (30s)")]
+    pub s3_lease_duration_ms: u64,
+
     #[arg(long, default_value_t = 500, env = "CELERIANT_MAX_CLOCK_DRIFT_MS", help = "Allowed clock drift added to heartbeat lease checks (500ms)")]
     pub max_clock_drift_ms: u64,
+
+    #[arg(long, env = "CELERIANT_S3_RETRY_MAX_DURATION_SECS", help = "Maximum total duration (seconds) for retrying S3 operations when S3 is unreachable, with exponential backoff. Unset = retry indefinitely.")]
+    pub s3_retry_max_duration_secs: Option<u64>,
 
     #[arg(long, default_value_t = 1024 * 1024 * 100, env = "CELERIANT_MAX_S3_FALLBACK_BATCH_BYTES", help = "Maximum batch size for S3 fallback replication uploads (100MB)")]
     pub max_s3_fallback_batch_bytes: u64,
@@ -674,15 +678,12 @@ impl ServerConfig {
                 .unwrap_or_else(|| format!("{}:{}", self.listen_address, self.client_port));
             let replication_address = self.advertised_replication_address.clone()
                 .unwrap_or_else(|| format!("{}:{}", self.listen_address, self.replication_port));
-            Some(ReplicationConfig {
+            Some(S3LeaseConfig {
                 node_id,
-                client_address,
-                replication_address,
-                num_shards,
-                initial_lease_duration: Duration::from_millis(self.heartbeat_lease_duration_ms),
-                heartbeat_interval: Duration::from_millis(self.heartbeat_interval_ms),
+                advertised_client_address: client_address,
+                advertised_replication_address: replication_address,
                 max_clock_drift: Duration::from_millis(self.max_clock_drift_ms),
-                ..Default::default()
+                s3_lease_duration: Duration::from_millis(self.s3_lease_duration_ms)
             })
         };
 
@@ -733,9 +734,9 @@ impl ServerConfig {
             schema_cache_bytes: memory_budget.schema_cache_bytes,
             max_schema_size_bytes: self.max_schema_size_bytes,
             pending_replication_high_water_bytes: self.pending_replication_high_water_bytes,
-            max_cluster_time_drift_ms: self.max_cluster_time_drift_ms,
+            max_clock_drift_ms: self.max_clock_drift_ms,
             max_catchup_gap_bytes: self.max_catchup_gap_bytes,
-            internode_connection_timeout: self.internode_connection_timeout_ms.map(Duration::from_millis),
+            internode_connection_timeout: Some(Duration::from_millis(self.internode_connection_timeout_ms)),
             internode_request_timeout: Duration::from_millis(self.internode_request_timeout_ms),
             server_compression_algorithm: match self.server_compression_algorithm {
                 ConfigCompressionType::None => CompressionType::None,
@@ -781,6 +782,9 @@ impl ServerConfig {
             compaction_check_interval: Duration::from_secs(self.compaction_check_interval_secs),
             compaction_min_reclaimable_ratio: self.compaction_min_reclaimable_ratio,
             compaction_temp_dir: self.compaction_temp_dir.clone(),
+            s3_retry_max_duration: self.s3_retry_max_duration_secs.map(Duration::from_secs),
+            heartbeat_interval_duration: Duration::from_millis(self.heartbeat_interval_ms),
+            heartbeat_lease_duration: Duration::from_millis(self.heartbeat_lease_duration_ms),
         }
     }
 
@@ -826,7 +830,6 @@ impl ServerConfig {
         check_field!(client_connection_timeout_ms);
         check_field!(shard_log_preallocate_bytes);
         check_field!(pending_replication_high_water_bytes);
-        check_field!(max_cluster_time_drift_ms);
         check_field!(max_catchup_gap_bytes);
         check_field!(internode_connection_timeout_ms);
         check_field!(internode_request_timeout_ms);
@@ -847,6 +850,7 @@ impl ServerConfig {
         check_field!(s3_catchup_max_rounds);
         check_field!(heartbeat_interval_ms);
         check_field!(heartbeat_lease_duration_ms);
+        check_field!(s3_lease_duration_ms);
         check_field!(max_clock_drift_ms);
         check_field!(max_s3_fallback_batch_bytes);
         check_field!(tls_mode);
@@ -863,6 +867,7 @@ impl ServerConfig {
         check_field!(compaction_check_interval_secs);
         check_field!(compaction_min_reclaimable_ratio);
         check_field!(compaction_temp_dir);
+        check_field!(s3_retry_max_duration_secs);
         check_field!(memory_consumption_percent);
         check_field!(memory_budget_bytes);
         check_field!(metrics_enabled);
@@ -915,7 +920,6 @@ impl Default for ServerConfig {
             client_connection_timeout_ms: 30000,
             routing_rule: RoutingRule::AggregateId,
             pending_replication_high_water_bytes: 64 * 1024 * 1024,
-            max_cluster_time_drift_ms: 5000,
             max_catchup_gap_bytes: 104_857_600,
             timestamp_precision: ConfigTimestampPrecision::Milliseconds,
             timestamp_epoch_offset_secs: 0,
@@ -926,13 +930,14 @@ impl Default for ServerConfig {
             s3_endpoint_override: None,
             s3_skip_signature: false,
             s3_allow_http: false,
-            internode_connection_timeout_ms: None,
+            internode_connection_timeout_ms: 5_000,
             internode_request_timeout_ms: 10_000,
             server_compression_algorithm: ConfigCompressionType::Snappy,
             server_compression_level: None,
             s3_catchup_max_rounds: 3,
             heartbeat_interval_ms: 500,
             heartbeat_lease_duration_ms: 1500,
+            s3_lease_duration_ms: 30000,
             max_clock_drift_ms: 500,
             max_s3_fallback_batch_bytes: 1024 * 1024 * 100,
             tls_mode: ConfigTlsMode::Disabled,
@@ -949,6 +954,7 @@ impl Default for ServerConfig {
             compaction_check_interval_secs: 7200,
             compaction_min_reclaimable_ratio: 0.20,
             compaction_temp_dir: None,
+            s3_retry_max_duration_secs: None,
             memory_consumption_percent: 80,
             memory_budget_bytes: None,
             metrics_enabled: true,

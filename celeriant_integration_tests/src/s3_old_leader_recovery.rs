@@ -48,6 +48,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         log_level: "info".to_string(),
         client_port: node_a_port,
         routing_rule: RoutingRule::AggregateTypeId,
+        s3_lease_duration_ms: 10_000,
         s3_enabled: true,
         s3_region: Some(region.clone()),
         s3_bucket: Some(bucket_name.clone()),
@@ -68,6 +69,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         log_level: "info".to_string(),
         client_port: node_b_port,
         routing_rule: RoutingRule::AggregateTypeId,
+        s3_lease_duration_ms: 10_000,
         s3_enabled: true,
         s3_region: Some(region.clone()),
         s3_bucket: Some(bucket_name.clone()),
@@ -81,8 +83,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Starting node B (follower) on port {}...", node_b_port);
     let _node_b = TestServer::start_with_config_labeled(node_b_port, node_b_config, "node-b-follower".into()).await?;
 
-    println!("  Waiting for leader to discover follower...");
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    println!("  Waiting for election, heartbeat establishment, and S3 lease expiry...");
+    println!("  (S3 lease TTL = 10s; must expire so failover is gated only by heartbeat TTL)");
+    tokio::time::sleep(Duration::from_secs(12)).await;
 
     // ========================================
     // PHASE 2: Write data on leader (node A)

@@ -210,6 +210,7 @@ async fn dispatch_test(name: &str) -> Result<(), Box<dyn std::error::Error>> {
         "s3_follower_kick" => s3_follower_kick::run().await,
         "s3_leader_solo" => s3_leader_solo::run().await,
         "s3_lease_monotonicity" => s3_lease_monotonicity::run().await,
+        "s3_lease_renewal_backoff" => s3_lease_renewal_backoff::run().await,
         "s3_network_partition" => s3_network_partition::run().await,
         "s3_old_leader_recovery" => s3_old_leader_recovery::run().await,
         "s3_reconvergence" => s3_reconvergence::run().await,

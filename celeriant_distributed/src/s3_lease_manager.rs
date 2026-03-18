@@ -3,15 +3,11 @@ use tracing::debug;
 use celeriant_wal::s3::lease::Lease;
 use celeriant_wal::s3::membership::{Membership, NodeInfo};
 
-use crate::config::ReplicationConfig;
-use crate::heartbeat::now_ms;
+use crate::s3_lease_config::S3LeaseConfig;
 use crate::lease_store::{LeaseStore, LeaseStoreError, MembershipWithEtag};
 use crate::node_status::NodeStatus;
-use crate::validated_node_status::ValidatedNodeStatus;
+use crate::validated_node_status::{self, ValidatedNodeStatus};
 
-/// Max CAS retries for membership updates. In a 2-node cluster, one retry
-/// suffices — the second attempt merges the concurrent write. Extra retries
-/// guard against transient S3 inconsistency.
 const MEMBERSHIP_CAS_MAX_RETRIES: u32 = 5;
 
 #[derive(Debug, Clone)]
@@ -20,20 +16,18 @@ pub struct ElectionOutcome {
     pub peer_info: Option<NodeInfo>,
 }
 
-pub struct LeaseManager<S: LeaseStore> {
+pub struct S3LeaseManager<S: LeaseStore> {
     store: S,
-    config: ReplicationConfig,
+    config: S3LeaseConfig,
 }
 
-impl<S: LeaseStore> LeaseManager<S> {
-    pub fn new(store: S, config: ReplicationConfig) -> Self {
+impl<S: LeaseStore> S3LeaseManager<S> {
+    pub fn new(store: S, config: S3LeaseConfig) -> Self {
         Self { store, config }
     }
 
-    /// Read-modify-write membership with CAS to register this node.
-    /// On conflict, re-reads and retries. The S3 round-trip (~100ms)
-    /// provides natural backoff between retries.
-    pub async fn register_self(&self) -> Result<(), LeaseStoreError> {
+    /// Add or update self on membership.bin in s3. Handles conflicts and retries.
+    pub async fn register_self_on_membership_s3_object(&self) -> Result<(), LeaseStoreError> {
 
         for _ in 0..MEMBERSHIP_CAS_MAX_RETRIES {
             let existing = self.store.get_membership().await?;
@@ -44,8 +38,8 @@ impl<S: LeaseStore> LeaseManager<S> {
 
             membership.register(NodeInfo::new(
                 self.config.node_id,
-                self.config.client_address.clone(),
-                self.config.replication_address.clone(),
+                self.config.advertised_client_address.clone(),
+                self.config.advertised_replication_address.clone(),
             ));
 
             match self.store.put_membership(&membership, etag.as_deref()).await {
@@ -62,14 +56,11 @@ impl<S: LeaseStore> LeaseManager<S> {
         })
     }
 
-    /// Determine this node's role via S3 lease.
-    ///
-    /// - No lease: fresh cluster, race with CreateOnly.
-    /// - Valid lease, someone else's: become follower.
-    /// - Valid lease, ours: CAS-promote for fresh TTL (safe to extend at boot or renewal).
-    /// - Expired lease: race with CAS. Exactly one node wins.
-    pub async fn run_election(&self) -> Result<ElectionOutcome, LeaseStoreError> {
-        let now = now_ms();
+    /// Determine this node's role via S3 lease. No lease? Try create with self as leader.
+    /// Lease expired or still leader? CAS race update and with self as leader, extending lease.
+    /// Other node still leader? Become follower, no lease.bin update.
+    pub async fn run_election_to_acquire_s3_lease(&self) -> Result<ElectionOutcome, LeaseStoreError> {
+        let now = validated_node_status::unix_epoch_now_ms();
 
         match self.store.get_lease().await? {
             None => {
@@ -77,7 +68,7 @@ impl<S: LeaseStore> LeaseManager<S> {
                 let lease = Lease::new_initial(
                     self.config.node_id,
                     now,
-                    self.config.initial_lease_duration.as_millis() as u64,
+                    self.config.s3_lease_duration.as_millis() as u64,
                 );
                 match self.store.put_lease_create_only(&lease).await {
                     Ok(_) => self.become_leader(&lease).await,
@@ -110,10 +101,11 @@ impl<S: LeaseStore> LeaseManager<S> {
                     expired = lwe.lease.is_expired(now),
                     "Election: existing lease found — racing CAS"
                 );
+                // Add one to the lease index and set self as leader
                 let promoted = lwe.lease.promote(
                     self.config.node_id,
                     now,
-                    self.config.initial_lease_duration.as_millis() as u64,
+                    self.config.s3_lease_duration.as_millis() as u64,
                 );
                 match self
                     .store
@@ -143,8 +135,9 @@ impl<S: LeaseStore> LeaseManager<S> {
     async fn become_follower(&self, lease: &Lease) -> Result<ElectionOutcome, LeaseStoreError> {
         let peer_info = self.discover_peer().await.ok().flatten();
         Ok(ElectionOutcome {
-            status: ValidatedNodeStatus::new(
+            status: ValidatedNodeStatus::create_custom_status(
                 NodeStatus::Follower { leader_lease_index: lease.lease_index },
+                self.config.max_clock_drift.as_millis() as u64,
                 lease.expires_at_ms,
             ),
             peer_info,
@@ -154,8 +147,9 @@ impl<S: LeaseStore> LeaseManager<S> {
     async fn become_leader(&self, lease: &Lease) -> Result<ElectionOutcome, LeaseStoreError> {
         let peer_info = self.discover_peer().await.ok().flatten();
         Ok(ElectionOutcome {
-            status: ValidatedNodeStatus::new(
+            status: ValidatedNodeStatus::create_custom_status(
                 NodeStatus::Leader { lease_index: lease.lease_index },
+                self.config.max_clock_drift.as_millis() as u64,
                 lease.expires_at_ms,
             ),
             peer_info,
@@ -276,13 +270,13 @@ mod tests {
         }
     }
 
-    fn test_config(node_id: u128) -> ReplicationConfig {
-        ReplicationConfig {
+    fn test_config(node_id: u128) -> S3LeaseConfig {
+        S3LeaseConfig {
             node_id,
-            client_address: format!("127.0.0.1:{}", 10000 + node_id),
-            replication_address: format!("127.0.0.1:{}", 11000 + node_id),
-            initial_lease_duration: Duration::from_secs(5),
-            ..Default::default()
+            advertised_client_address: format!("127.0.0.1:{}", 10000 + node_id),
+            advertised_replication_address: format!("127.0.0.1:{}", 11000 + node_id),
+            s3_lease_duration: Duration::from_secs(5),
+            max_clock_drift: Duration::from_millis(500)
         }
     }
 
@@ -320,8 +314,6 @@ mod tests {
         }
     }
 
-    // --- run_election: fresh cluster ---
-
     #[test]
     fn test_fresh_cluster_wins_race() {
         let store = MockLeaseStore::new();
@@ -329,8 +321,8 @@ mod tests {
         store.push_put_lease_create_only(Ok("etag1".into()));
         store.push_get_membership(Ok(None));
 
-        let manager = LeaseManager::new(store, test_config(1));
-        let outcome = block_on(manager.run_election()).unwrap();
+        let manager = S3LeaseManager::new(store, test_config(1));
+        let outcome = block_on(manager.run_election_to_acquire_s3_lease()).unwrap();
 
         assert!(matches!(
             outcome.status.raw(),
@@ -342,15 +334,15 @@ mod tests {
     #[test]
     fn test_fresh_cluster_lost_race() {
         let store = MockLeaseStore::new();
-        let now = now_ms();
+        let now = validated_node_status::unix_epoch_now_ms();
 
         store.push_get_lease(Ok(None));
         store.push_put_lease_create_only(Err(LeaseStoreError::AlreadyExists));
         store.push_get_lease(Ok(Some(make_lease_with_etag(2, 1, now, 5000))));
         store.push_get_membership(Ok(Some(membership_with_etag(both_nodes_membership()))));
 
-        let manager = LeaseManager::new(store, test_config(1));
-        let outcome = block_on(manager.run_election()).unwrap();
+        let manager = S3LeaseManager::new(store, test_config(1));
+        let outcome = block_on(manager.run_election_to_acquire_s3_lease()).unwrap();
 
         assert!(matches!(
             outcome.status.raw(),
@@ -361,19 +353,17 @@ mod tests {
         assert_eq!(outcome.peer_info.as_ref().unwrap().node_id, 2);
     }
 
-    // --- run_election: valid lease ---
-
     #[test]
     fn test_valid_lease_own_node_extends() {
         let store = MockLeaseStore::new();
-        let now = now_ms();
+        let now = validated_node_status::unix_epoch_now_ms();
 
         store.push_get_lease(Ok(Some(make_lease_with_etag(1, 3, now, 10000))));
         store.push_put_lease_conditional(Ok("etag2".into()));
         store.push_get_membership(Ok(None));
 
-        let manager = LeaseManager::new(store, test_config(1));
-        let outcome = block_on(manager.run_election()).unwrap();
+        let manager = S3LeaseManager::new(store, test_config(1));
+        let outcome = block_on(manager.run_election_to_acquire_s3_lease()).unwrap();
 
         assert!(matches!(
             outcome.status.raw(),
@@ -384,13 +374,13 @@ mod tests {
     #[test]
     fn test_valid_lease_other_node_becomes_follower() {
         let store = MockLeaseStore::new();
-        let now = now_ms();
+        let now = validated_node_status::unix_epoch_now_ms();
 
         store.push_get_lease(Ok(Some(make_lease_with_etag(2, 5, now, 10000))));
         store.push_get_membership(Ok(Some(membership_with_etag(both_nodes_membership()))));
 
-        let manager = LeaseManager::new(store, test_config(1));
-        let outcome = block_on(manager.run_election()).unwrap();
+        let manager = S3LeaseManager::new(store, test_config(1));
+        let outcome = block_on(manager.run_election_to_acquire_s3_lease()).unwrap();
 
         assert!(matches!(
             outcome.status.raw(),
@@ -402,39 +392,16 @@ mod tests {
     }
 
     #[test]
-    fn test_old_leader_restart_becomes_follower() {
-        let store = MockLeaseStore::new();
-        let now = now_ms();
-
-        // Node 1 was the old leader. Lease now shows node 2 as leader (valid).
-        store.push_get_lease(Ok(Some(make_lease_with_etag(2, 2, now, 10000))));
-        store.push_get_membership(Ok(Some(membership_with_etag(both_nodes_membership()))));
-
-        let manager = LeaseManager::new(store, test_config(1));
-        let outcome = block_on(manager.run_election()).unwrap();
-
-        assert!(matches!(
-            outcome.status.raw(),
-            NodeStatus::Follower {
-                leader_lease_index: 2
-            }
-        ));
-        assert_eq!(outcome.peer_info.as_ref().unwrap().node_id, 2);
-    }
-
-    // --- run_election: expired lease (CAS race) ---
-
-    #[test]
     fn test_expired_lease_wins_cas() {
         let store = MockLeaseStore::new();
-        let now = now_ms();
+        let now = validated_node_status::unix_epoch_now_ms();
 
         store.push_get_lease(Ok(Some(make_lease_with_etag(2, 3, now - 10000, 5000))));
         store.push_put_lease_conditional(Ok("etag2".into()));
         store.push_get_membership(Ok(Some(membership_with_etag(both_nodes_membership()))));
 
-        let manager = LeaseManager::new(store, test_config(1));
-        let outcome = block_on(manager.run_election()).unwrap();
+        let manager = S3LeaseManager::new(store, test_config(1));
+        let outcome = block_on(manager.run_election_to_acquire_s3_lease()).unwrap();
 
         assert!(matches!(
             outcome.status.raw(),
@@ -446,15 +413,15 @@ mod tests {
     #[test]
     fn test_expired_own_lease_wins_cas() {
         let store = MockLeaseStore::new();
-        let now = now_ms();
+        let now = validated_node_status::unix_epoch_now_ms();
 
         // Own expired lease — same CAS path, no special handling.
         store.push_get_lease(Ok(Some(make_lease_with_etag(1, 2, now - 10000, 5000))));
         store.push_put_lease_conditional(Ok("etag2".into()));
         store.push_get_membership(Ok(None));
 
-        let manager = LeaseManager::new(store, test_config(1));
-        let outcome = block_on(manager.run_election()).unwrap();
+        let manager = S3LeaseManager::new(store, test_config(1));
+        let outcome = block_on(manager.run_election_to_acquire_s3_lease()).unwrap();
 
         assert!(matches!(
             outcome.status.raw(),
@@ -465,15 +432,15 @@ mod tests {
     #[test]
     fn test_expired_lease_loses_cas() {
         let store = MockLeaseStore::new();
-        let now = now_ms();
+        let now = validated_node_status::unix_epoch_now_ms();
 
         store.push_get_lease(Ok(Some(make_lease_with_etag(2, 3, now - 10000, 5000))));
         store.push_put_lease_conditional(Err(LeaseStoreError::PreconditionFailed));
         store.push_get_lease(Ok(Some(make_lease_with_etag(2, 4, now, 5000))));
         store.push_get_membership(Ok(Some(membership_with_etag(both_nodes_membership()))));
 
-        let manager = LeaseManager::new(store, test_config(1));
-        let outcome = block_on(manager.run_election()).unwrap();
+        let manager = S3LeaseManager::new(store, test_config(1));
+        let outcome = block_on(manager.run_election_to_acquire_s3_lease()).unwrap();
 
         assert!(matches!(
             outcome.status.raw(),
@@ -487,19 +454,17 @@ mod tests {
     #[test]
     fn test_expired_cas_fails_lease_disappears() {
         let store = MockLeaseStore::new();
-        let now = now_ms();
+        let now = validated_node_status::unix_epoch_now_ms();
 
         store.push_get_lease(Ok(Some(make_lease_with_etag(2, 1, now - 10000, 5000))));
         store.push_put_lease_conditional(Err(LeaseStoreError::PreconditionFailed));
         store.push_get_lease(Ok(None));
 
-        let manager = LeaseManager::new(store, test_config(1));
-        let result = block_on(manager.run_election());
+        let manager = S3LeaseManager::new(store, test_config(1));
+        let result = block_on(manager.run_election_to_acquire_s3_lease());
 
         assert!(matches!(result, Err(LeaseStoreError::Unavailable { .. })));
     }
-
-    // --- register_self ---
 
     #[test]
     fn test_register_self() {
@@ -507,13 +472,15 @@ mod tests {
         store.push_get_membership(Ok(None));
         store.push_put_membership(Ok(()));
 
-        let manager = LeaseManager::new(store, test_config(1));
-        block_on(manager.register_self()).unwrap();
+        let manager = S3LeaseManager::new(store, test_config(1));
+        block_on(manager.register_self_on_membership_s3_object()).unwrap();
 
         let memberships = manager.store.get_registered_memberships();
         assert_eq!(memberships.len(), 1);
         assert_eq!(memberships[0].node_count(), 1);
         assert_eq!(memberships[0].nodes[0].as_ref().unwrap().node_id, 1);
+        assert_eq!(memberships[0].nodes[0].as_ref().unwrap().client_address, "127.0.0.1:10001");
+        assert_eq!(memberships[0].nodes[0].as_ref().unwrap().replication_address, "127.0.0.1:11001");
     }
 
     #[test]
@@ -534,25 +501,25 @@ mod tests {
         store.push_get_membership(Ok(Some(membership_with_etag(other_membership))));
         store.push_put_membership(Ok(()));
 
-        let manager = LeaseManager::new(store, test_config(1));
-        block_on(manager.register_self()).unwrap();
+        let manager = S3LeaseManager::new(store, test_config(1));
+        block_on(manager.register_self_on_membership_s3_object()).unwrap();
 
         let memberships = manager.store.get_registered_memberships();
         assert_eq!(memberships.len(), 2);
         assert_eq!(memberships[1].node_count(), 2);
     }
 
-    // --- discover_peer ---
-
     #[test]
     fn test_discover_peer() {
         let store = MockLeaseStore::new();
         store.push_get_membership(Ok(Some(membership_with_etag(both_nodes_membership()))));
 
-        let manager = LeaseManager::new(store, test_config(1));
+        let manager = S3LeaseManager::new(store, test_config(1));
         let peer = block_on(manager.discover_peer()).unwrap();
 
         assert_eq!(peer.as_ref().unwrap().node_id, 2);
+        assert_eq!(peer.as_ref().unwrap().client_address, "127.0.0.1:10002");
+        assert_eq!(peer.as_ref().unwrap().replication_address, "127.0.0.1:11002");
     }
 
     #[test]
@@ -560,10 +527,12 @@ mod tests {
         let store = MockLeaseStore::new();
         store.push_get_membership(Ok(Some(membership_with_etag(both_nodes_membership()))));
 
-        let manager = LeaseManager::new(store, test_config(2));
+        let manager = S3LeaseManager::new(store, test_config(2));
         let peer = block_on(manager.discover_peer()).unwrap();
 
         assert_eq!(peer.as_ref().unwrap().node_id, 1);
+        assert_eq!(peer.as_ref().unwrap().client_address, "127.0.0.1:10001");
+        assert_eq!(peer.as_ref().unwrap().replication_address, "127.0.0.1:11001");
     }
 }
 

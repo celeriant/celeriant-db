@@ -112,6 +112,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         num_shards: Some(1),
         log_level: "warn".to_string(),
         routing_rule: RoutingRule::AggregateTypeId,
+        s3_lease_duration_ms: 10_000,
         s3_enabled: true,
         s3_region: Some(region.clone()),
         s3_bucket: Some(bucket.clone()),
@@ -140,8 +141,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    println!("  Waiting for election and replication connection...");
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    println!("  Waiting for election, replication connection, and S3 lease expiry...");
+    println!("  (S3 lease TTL = 10s; must expire so failover is gated only by heartbeat TTL)");
+    tokio::time::sleep(Duration::from_secs(12)).await;
 
     let mut leader_client = CeleriantClient::connect(leader.address()).await?;
 

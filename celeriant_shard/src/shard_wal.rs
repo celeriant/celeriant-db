@@ -7,7 +7,7 @@ use tracing::{debug, trace};
 
 use celeriant_disk::files::rwlock_timeout::write_with_timeout;
 use celeriant_distributed::node_status::NodeStatus;
-use celeriant_distributed::validated_node_status::ValidatedNodeStatus;
+use celeriant_distributed::validated_node_status::{self, ValidatedNodeStatus};
 use celeriant_rotating_log::errors::ready_up_error::ReadyUpError;
 use celeriant_rotating_log::errors::scan_error::ScanError;
 use celeriant_wire::disk::disk_format_error::DiskFormatError;
@@ -743,7 +743,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
     pub async fn trim_start(&self, trim_request: TrimStartRequest) -> Result<SuccessResponse, ShardTrimError> {
         
-        let lease_index = match self.node_status.get().effective() {
+        let lease_index = match self.node_status.get().effective_node_status() {
             NodeStatus::Leader { lease_index } => lease_index,
             NodeStatus::Standalone => 0,
             _ => return Err(ShardTrimError::ShardCannotAcceptWrites { leader_address: self.leader_client_address.borrow().clone() }),
@@ -823,7 +823,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     
     pub async fn delete(&self, delete_request: DeleteRequest) -> Result<SuccessResponse, ShardDeleteError> {
         
-        let lease_index = match self.node_status.get().effective() {
+        let lease_index = match self.node_status.get().effective_node_status() {
             NodeStatus::Leader { lease_index } => lease_index,
             NodeStatus::Standalone => 0,
             _ => return Err(ShardDeleteError::ShardCannotAcceptWrites { leader_address: self.leader_client_address.borrow().clone() }),
@@ -925,11 +925,11 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     pub async fn write(&self, write_request: WriteRequest) -> Result<SuccessResponse, ShardWriteError> {
         
         let status = self.node_status.get();
-        let lease_index = match status.effective() {
+        let lease_index = match status.effective_node_status() {
             NodeStatus::Leader { lease_index } => lease_index,
             NodeStatus::Standalone => 0,
             other => {
-                debug!(effective = ?other, raw = ?status.raw(), expires_at_ms = status.expires_at_ms(), now_ms = celeriant_distributed::heartbeat::now_ms(), "Write rejected: not Leader/Standalone");
+                debug!(effective = ?other, raw = ?status.raw(), expires_at_ms = status.lease_expires_at_ms(), now_ms = validated_node_status::unix_epoch_now_ms(), "Write rejected: not Leader/Standalone");
                 return Err(ShardWriteError::ShardCannotAcceptWrites { leader_address: self.leader_client_address.borrow().clone() });
             }
         };
@@ -1719,16 +1719,16 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             result,
         };
 
-        let leader_lease_index = match self.node_status.get().effective() {
+        let leader_lease_index = match self.node_status.get().effective_node_status() {
             NodeStatus::Follower { leader_lease_index } => leader_lease_index,
             _ => return Ok(response(ReplicationResult::Rejected(FollowerRejection::NotAFollower))),
         };
 
-        if follower_timestamp_ms.saturating_sub(request.leader_timestamp_ms) > self.config.max_cluster_time_drift_ms {
+        if follower_timestamp_ms.saturating_sub(request.leader_timestamp_ms) > self.config.max_clock_drift_ms {
             return Ok(response(ReplicationResult::Rejected(FollowerRejection::TimeDriftTooHigh {
                 leader_ms: request.leader_timestamp_ms,
                 follower_ms: follower_timestamp_ms,
-                max_allowed_ms: self.config.max_cluster_time_drift_ms,
+                max_allowed_ms: self.config.max_clock_drift_ms,
             })));
         }
 
@@ -2046,7 +2046,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             NodeStatus::BootCatchup => NodeStatus::BootCatchup,
             _ => NodeStatus::BootCatchup,
         };
-        self.node_status.set(ValidatedNodeStatus::new(catchup_status, 0));
+        self.node_status.set(ValidatedNodeStatus::create_custom_status(catchup_status, 0, 0));
 
         catchup_from_s3(
             &self.log_segments_cache,
@@ -2066,7 +2066,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let max_schema_size = self.config.max_schema_size_bytes as usize;
 
         // Validate we can accept writes
-        let lease_index = match self.node_status.get().effective() {
+        let lease_index = match self.node_status.get().effective_node_status() {
             NodeStatus::Leader { lease_index } => lease_index,
             NodeStatus::Standalone => 0,
             _ => return Err(ShardSchemaError::ShardCannotAcceptWrites {
@@ -2240,12 +2240,12 @@ mod tests {
             schema_cache_bytes: 4 * 1024 * 1024,
             max_schema_size_bytes: 16384,
             pending_replication_high_water_bytes: 64 * 1024 * 1024,
-            max_cluster_time_drift_ms: 5000,
             max_catchup_gap_bytes: 100 * 1024 * 1024,
             max_s3_fallback_batch_bytes: 1024 * 1024 * 100,
             compaction_check_interval: Duration::from_secs(600),
             compaction_min_reclaimable_ratio: 0.20,
             compaction_temp_dir: std::path::PathBuf::from("/tmp/test_compaction"),
+            max_clock_drift_ms: 500,
         }
     }
 
@@ -2384,7 +2384,7 @@ mod tests {
     }
 
     async fn open_shard(dir: &std::path::Path) -> ShardWal<StubReplicationClient, StubS3Downloader> {
-        ShardWal::open(test_config(dir), ValidatedNodeStatus::standalone(), StubReplicationClient, StubS3Downloader)
+        ShardWal::open(test_config(dir), ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader)
             .await
             .unwrap()
     }
@@ -2596,7 +2596,7 @@ mod tests {
         glommio_test!({
             let (_tmp, dir) = test_dir();
             let shard = open_shard(&dir).await;
-            shard.node_status.set(ValidatedNodeStatus::fenced());
+            shard.node_status.set(ValidatedNodeStatus::create_fenced());
 
             let result = process(&shard, write_req(key(1, 1, 1), events(1))).await;
             assert!(matches!(result, Err(ShardError::Write(ShardWriteError::ShardCannotAcceptWrites { .. }))));
@@ -3056,15 +3056,16 @@ mod tests {
 
         fn set_follower_address(&self, _address: Option<String>) {}
 
-        async fn send_heartbeat(&self) -> Result<celeriant_msg::response::responses::HeartbeatResult, crate::error::send_heartbeat_error::SendHeartbeatError> {
-            Ok(celeriant_msg::response::responses::HeartbeatResult::Ack { follower_timestamp_ms: celeriant_distributed::heartbeat::now_ms() })
+        async fn send_heartbeat(&self, unix_epoch_now_ms: u64) -> Result<celeriant_msg::response::responses::HeartbeatResult, crate::error::send_heartbeat_error::SendHeartbeatError> {
+            glommio::timer::sleep(std::time::Duration::from_millis(10)).await;
+            Ok(celeriant_msg::response::responses::HeartbeatResult::Ack { follower_timestamp_ms: unix_epoch_now_ms + 10 })
         }
 
         async fn send_kick(&self) -> Result<bool, crate::error::send_heartbeat_error::SendHeartbeatError> { Ok(true) }
     }
 
     async fn open_leader_shard(dir: &std::path::Path, client: FailThenSucceedReplicationClient) -> ShardWal<FailThenSucceedReplicationClient, StubS3Downloader> {
-        ShardWal::open(test_config(dir), ValidatedNodeStatus::new(NodeStatus::Leader { lease_index: 0 }, now_ms() + 10_000), client, StubS3Downloader)
+        ShardWal::open(test_config(dir), ValidatedNodeStatus::create_custom_status(NodeStatus::Leader { lease_index: 0 }, 500, now_ms() + 10_000), client, StubS3Downloader)
             .await
             .unwrap()
     }
@@ -3134,7 +3135,7 @@ mod tests {
     // ── Replication (handle_replication_batch) ──
 
     async fn open_follower_shard(dir: &std::path::Path) -> ShardWal<StubReplicationClient, StubS3Downloader> {
-        ShardWal::open(test_config(dir), ValidatedNodeStatus::new(NodeStatus::Follower { leader_lease_index: 0 }, now_ms() + 10_000), StubReplicationClient, StubS3Downloader)
+        ShardWal::open(test_config(dir), ValidatedNodeStatus::create_custom_status(NodeStatus::Follower { leader_lease_index: 0 }, 500, now_ms() + 10_000), StubReplicationClient, StubS3Downloader)
             .await
             .unwrap()
     }
@@ -3802,7 +3803,7 @@ mod tests {
     }
 
     async fn open_compact_shard(dir: &std::path::Path) -> ShardWal<StubReplicationClient, StubS3Downloader> {
-        ShardWal::open(compact_config(dir), ValidatedNodeStatus::standalone(), StubReplicationClient, StubS3Downloader)
+        ShardWal::open(compact_config(dir), ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader)
             .await
             .unwrap()
     }
@@ -4837,7 +4838,7 @@ mod tests {
             let (_tmp, dir) = test_dir();
             // Use a small page size (3) to force pagination across WAL index gaps.
             let config = compact_config_small_page(&dir, 3);
-            let shard = ShardWal::open(config, ValidatedNodeStatus::standalone(), StubReplicationClient, StubS3Downloader)
+            let shard = ShardWal::open(config, ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader)
                 .await
                 .unwrap();
 

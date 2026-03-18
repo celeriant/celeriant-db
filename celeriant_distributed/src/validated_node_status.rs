@@ -1,65 +1,76 @@
-use crate::heartbeat::now_ms;
 use crate::node_status::NodeStatus;
 
-/// NodeStatus with a TTL. If shard 0 doesn't refresh before `expires_at_ms`,
+pub fn unix_epoch_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// NodeStatus with a TTL. If shard 0 doesn't refresh before expires_at_ms - max_clock_drift_ms,
 /// the effective status decays to Fenced.
 #[derive(Clone, Copy, Debug)]
 pub struct ValidatedNodeStatus {
     status: NodeStatus,
-    expires_at_ms: u64,
+    lease_expires_at_ms: u64,
+    max_clock_drift_ms: u64,
 }
 
 impl ValidatedNodeStatus {
 
-    pub fn fenced() -> Self {
-        Self { status: NodeStatus::Fenced, expires_at_ms: 0 }
+    pub fn is_lease_expired(&self) -> bool {
+        unix_epoch_now_ms() > self.lease_expires_at_ms
     }
 
-    pub fn standalone() -> Self {
-        Self { status: NodeStatus::Standalone, expires_at_ms: 0 }
+    fn must_fence(&self) -> bool {
+        unix_epoch_now_ms() > self.lease_expires_at_ms.saturating_sub(self.max_clock_drift_ms)
     }
 
-    pub fn boot_catchup() -> Self {
-        Self { status: NodeStatus::BootCatchup, expires_at_ms: 0 }
+    pub fn create_fenced() -> Self {
+        Self { status: NodeStatus::Fenced, max_clock_drift_ms: 0, lease_expires_at_ms: 0 }
     }
 
-    pub fn new(status: NodeStatus, expires_at_ms: u64) -> Self {
-        Self { status, expires_at_ms }
+    pub fn create_standalone() -> Self {
+        Self { status: NodeStatus::Standalone, max_clock_drift_ms: 0, lease_expires_at_ms: 0 }
     }
 
-    /// Returns the effective status. Fenced if expired.
-    /// TTL-exempt: Standalone, BootCatchup, FollowerCatchingUp.
-    /// Catchup states are orchestrated by shard 0, which provides a fresh TTL on exit.
-    pub fn effective(&self) -> NodeStatus {
+    pub fn create_boot_catchup() -> Self {
+        Self { status: NodeStatus::BootCatchup, max_clock_drift_ms: 0, lease_expires_at_ms: 0 }
+    }
+
+    pub fn create_custom_status(status: NodeStatus, max_clock_drift_ms: u64, lease_expires_at_ms: u64) -> Self {
+        Self { status, max_clock_drift_ms, lease_expires_at_ms }
+    }
+
+    pub fn effective_node_status(&self) -> NodeStatus {
         match self.status {
             NodeStatus::Standalone
             | NodeStatus::BootCatchup
             | NodeStatus::Fenced
             | NodeStatus::FollowerCatchingUp { .. } => self.status,
-            _ if now_ms() > self.expires_at_ms => NodeStatus::Fenced,
+            _ if self.must_fence() => NodeStatus::Fenced,
             _ => self.status,
         }
     }
 
-    /// Raw status without time check (for logging, debugging).
     pub fn raw(&self) -> NodeStatus {
         self.status
     }
 
-    pub fn expires_at_ms(&self) -> u64 {
-        self.expires_at_ms
+    pub fn lease_expires_at_ms(&self) -> u64 {
+        self.lease_expires_at_ms
     }
 
     pub fn is_follower(&self) -> bool {
-        self.effective().is_follower()
+        self.effective_node_status().is_follower()
     }
 
     pub fn is_leader(&self) -> bool {
-        self.effective().is_leader()
+        self.effective_node_status().is_leader()
     }
 
     pub fn is_fenced(&self) -> bool {
-        self.effective().is_fenced()
+        self.effective_node_status().is_fenced()
     }
 
     pub fn is_standalone(&self) -> bool {
@@ -67,11 +78,11 @@ impl ValidatedNodeStatus {
     }
 
     pub fn is_catching_up(&self) -> bool {
-        self.effective().is_catching_up()
+        self.effective_node_status().is_catching_up()
     }
 
     pub fn is_any_follower_state(&self) -> bool {
-        self.effective().is_any_follower_state()
+        self.effective_node_status().is_any_follower_state()
     }
 
     pub fn can_accept_writes(&self) -> bool {

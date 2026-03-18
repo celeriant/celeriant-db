@@ -67,6 +67,7 @@ pub mod s3_follower_crash;
 pub mod s3_follower_kick;
 pub mod s3_leader_solo;
 pub mod s3_lease_monotonicity;
+pub mod s3_lease_renewal_backoff;
 pub mod s3_network_partition;
 pub mod s3_old_leader_recovery;
 pub mod s3_reconvergence;
@@ -625,16 +626,11 @@ impl ServerConfigExt for ServerConfig {
         args.push("--pending-replication-high-water-bytes".to_string());
         args.push(self.pending_replication_high_water_bytes.to_string());
 
-        args.push("--max-cluster-time-drift-ms".to_string());
-        args.push(self.max_cluster_time_drift_ms.to_string());
-
         args.push("--max-catchup-gap-bytes".to_string());
         args.push(self.max_catchup_gap_bytes.to_string());
 
-        if let Some(timeout) = self.internode_connection_timeout_ms {
-            args.push("--internode-connection-timeout-ms".to_string());
-            args.push(timeout.to_string());
-        }
+        args.push("--internode-connection-timeout-ms".to_string());
+        args.push(self.internode_connection_timeout_ms.to_string());
 
         args.push("--internode-request-timeout-ms".to_string());
         args.push(self.internode_request_timeout_ms.to_string());
@@ -647,6 +643,9 @@ impl ServerConfigExt for ServerConfig {
 
         args.push("--heartbeat-lease-duration-ms".to_string());
         args.push(self.heartbeat_lease_duration_ms.to_string());
+
+        args.push("--s3-lease-duration-ms".to_string());
+        args.push(self.s3_lease_duration_ms.to_string());
 
         args.push("--max-clock-drift-ms".to_string());
         args.push(self.max_clock_drift_ms.to_string());
@@ -1284,9 +1283,9 @@ pub fn s3_cluster_config(
         num_shards: Some(num_shards),
         log_level: "info".to_string(),
         routing_rule: RoutingRule::AggregateTypeId,
-        // S3 lease: 10s initial TTL (enough for discovery + first heartbeat)
-        // Heartbeat status TTL: ~2s from defaults (heartbeat_interval=500ms × 3 + clock_drift=500ms)
-        heartbeat_lease_duration_ms: 10_000,
+        // S3 lease: 10s TTL so tests don't need 30s+ waits for initial lease expiry.
+        // Heartbeat lease: default 1500ms. Failover ≈ 2s after leader death.
+        s3_lease_duration_ms: 10_000,
         s3_enabled: true,
         s3_region: Some(region.to_string()),
         s3_bucket: Some(bucket.to_string()),

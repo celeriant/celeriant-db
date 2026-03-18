@@ -61,6 +61,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Long heartbeat lease: 30s gives ample margin — if the follower triggers failover
     // during a 10s throttle window, the test fails and the regression is detected.
     config.heartbeat_lease_duration_ms = 30_000;
+    config.s3_lease_duration_ms = 30_000;
     // Default heartbeat interval: 500ms. With a 30s lease, the follower would need
     // ~60 consecutive missed heartbeats to trigger failover. A healthy system should
     // not miss any; a regressed system will miss all of them during throttle.
@@ -69,7 +70,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // does NOT trigger S3 fallback. We want to verify no false S3 fallback occurs.
     config.pending_replication_high_water_bytes = 10 * 1024 * 1024;
     // Allow longer internode timeout so the throttled connection is not dropped.
-    config.internode_connection_timeout_ms = Some(60_000);
+    config.internode_connection_timeout_ms = 60_000;
 
     let mut follower_config = config.clone();
     // Route the follower's advertised replication address through the proxy.

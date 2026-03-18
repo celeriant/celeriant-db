@@ -58,6 +58,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         num_shards: Some(num_shards),
         log_level: "info".to_string(),
         routing_rule: RoutingRule::AggregateTypeId,
+        s3_lease_duration_ms: 10_000,
         s3_enabled: true,
         s3_region: Some(region.clone()),
         s3_bucket: Some(bucket_name.clone()),
@@ -78,6 +79,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         num_shards: Some(num_shards),
         log_level: "info".to_string(),
         routing_rule: RoutingRule::AggregateTypeId,
+        s3_lease_duration_ms: 10_000,
         s3_enabled: true,
         s3_region: Some(region.clone()),
         s3_bucket: Some(bucket_name.clone()),
@@ -97,9 +99,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         node_b.address()
     );
 
-    // Wait for election to complete and heartbeat to establish
-    println!("Waiting for election and heartbeat establishment (3 seconds)...");
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Wait for election, heartbeat establishment, and S3 lease expiry (15s TTL).
+    // Must expire so failover is gated only by heartbeat TTL.
+    println!("Waiting for election, heartbeat establishment, and S3 lease expiry...");
+    tokio::time::sleep(Duration::from_secs(12)).await;
 
     // ========================================
     // PHASE 1: Verify leader accepts writes

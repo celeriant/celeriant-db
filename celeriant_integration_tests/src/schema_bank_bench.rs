@@ -142,6 +142,7 @@ impl ReplicatedServers {
         let mut leader_config = ServerConfig {
             log_level: log_level.to_string(),
             routing_rule: RoutingRule::AggregateTypeId,
+            s3_lease_duration_ms: 10_000,
             s3_enabled: true,
             s3_region: Some(region.clone()),
             s3_bucket: Some(bucket.clone()),
@@ -188,6 +189,7 @@ impl ReplicatedServers {
         let mut follower_config = ServerConfig {
             log_level: log_level.to_string(),
             routing_rule: RoutingRule::AggregateTypeId,
+            s3_lease_duration_ms: 10_000,
             s3_enabled: true,
             s3_region: Some(region),
             s3_bucket: Some(bucket),

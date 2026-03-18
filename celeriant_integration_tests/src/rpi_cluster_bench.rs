@@ -33,7 +33,6 @@ use rustls_pki_types::ServerName;
 use tokio::sync::Barrier;
 use tokio::time::Instant;
 
-const NUM_AGGREGATES: usize = 1024;
 const CLIENTSIDE_TIMEOUT_S: u64 = 30;
 
 fn env_or(key: &str, default: &str) -> String {

@@ -50,6 +50,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         log_level: "info".to_string(),
         client_port: leader_port,
         routing_rule: RoutingRule::AggregateTypeId,
+        s3_lease_duration_ms: 10_000,
         s3_enabled: true,
         s3_region: Some(region.clone()),
         s3_bucket: Some(bucket_name.clone()),
@@ -76,6 +77,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         client_port: follower_port,
         advertised_replication_address: Some(format!("127.0.0.1:{}", proxy_port)),
         routing_rule: RoutingRule::AggregateTypeId,
+        s3_lease_duration_ms: 10_000,
         s3_enabled: true,
         s3_region: Some(region),
         s3_bucket: Some(bucket_name.clone()),
@@ -90,8 +92,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         follower_port, proxy_port);
     let _follower = TestServer::start_with_config_labeled(follower_port, follower_config, "follower".into()).await?;
 
-    println!("  Waiting for leader to discover follower through proxy...");
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    println!("  Waiting for election, heartbeat establishment, and S3 lease expiry...");
+    println!("  (S3 lease TTL = 10s; must expire so fencing is gated only by heartbeat TTL)");
+    tokio::time::sleep(Duration::from_secs(12)).await;
 
     // ========================================
     // PHASE 2: Write events and verify replication
@@ -123,14 +126,15 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let initial_lease_index = initial_lease.lease_index;
     println!("  Initial lease_index={}", initial_lease_index);
 
-    proxy.block();
-    println!("  ✓ Proxy blocked - nodes partitioned");
-
-    // Pause MinIO so nodes can't complete S3 race — they'll stay Fenced
+    // Pause MinIO FIRST so the leader can't renew its S3 lease when the first
+    // heartbeat fails (the proactive renewal check is always true with a
+    // heartbeat-based TTL). Then block the proxy to stop heartbeats.
     println!("  Pausing MinIO so nodes stay Fenced (can't re-elect)...");
-    tokio::time::sleep(Duration::from_secs(1)).await;
     minio.pause()?;
-    println!("  ✓ MinIO paused\n");
+    println!("  ✓ MinIO paused");
+
+    proxy.block();
+    println!("  ✓ Proxy blocked - nodes partitioned\n");
 
     // ========================================
     // PHASE 4: Wait for both nodes to fence
@@ -196,8 +200,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     proxy.unblock();
     println!("  ✓ Proxy unblocked - nodes can race and reconnect\n");
 
-    println!("  Waiting for S3 race and reconvergence...");
-    tokio::time::sleep(Duration::from_secs(8)).await;
+    println!("  Waiting for S3 race, reconvergence, and new S3 lease expiry if needed...");
+    println!("  (race winner gets 10s S3 lease; discovery backoff may delay heartbeat establishment)");
+    tokio::time::sleep(Duration::from_secs(12)).await;
 
     let post_race_lease_bytes = minio.get_object("cluster/lease.json").await?;
     let post_race_lease = deserialise_lease(&post_race_lease_bytes)
