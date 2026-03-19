@@ -1411,6 +1411,44 @@ mod tests {
         assert!(matches!(result, Err(ShardRoutingError::IncompatibleFilters { .. })));
     }
 
+    /// Heartbeat and KickFollower always route to shard 0
+    #[test]
+    fn routing_schema_registration_always_shard_zero() {
+        let config = test_config(4, crate::RoutingRule::AggregateId);
+        let request = ClientRequest::RegisterSchema(celeriant_msg::request::requests::RegisterSchemaRequest {
+            correlation_id: None,
+            client_id: 1,
+            user_id: None,
+            schema_key: celeriant_wal::schema_key::SchemaKey::new(1, 1, 100, 0),
+            schema_type: 0,
+            schema: String::new(),
+        });
+        let shard = determine_client_shard(&request, &config).unwrap();
+        assert_eq!(shard, 0, "Schema registration must always route to shard 0");
+    }
+
+    #[test]
+    fn routing_heartbeat_always_shard_zero() {
+        let config = test_config(4, crate::RoutingRule::AggregateId);
+        let request = ClusterRequest::Heartbeat(HeartbeatRequest {
+            correlation_id: None,
+            shard_id: 0,
+            leader_timestamp_ms: 1000,
+        });
+        let shard = determine_cluster_shard(&request, &config).unwrap();
+        assert_eq!(shard, 0, "Heartbeat must always route to shard 0");
+    }
+
+    #[test]
+    fn routing_kick_follower_always_shard_zero() {
+        let config = test_config(4, crate::RoutingRule::AggregateId);
+        let request = ClusterRequest::KickFollower(KickFollowerRequest {
+            correlation_id: None,
+        });
+        let shard = determine_cluster_shard(&request, &config).unwrap();
+        assert_eq!(shard, 0, "KickFollower must always route to shard 0");
+    }
+
     // --- Client shard routing (list, write, delete, watch) ---
 
     #[test]

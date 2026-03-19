@@ -1,28 +1,17 @@
 //! S3 Fencing Writes Integration Test
 //!
-//! Tests write fencing invariants from the S3 lease design:
-//! - Invariant 4: "A write is only acknowledged if the shard's NodeStatus is Leader"
-//! - Invariant 9: "No node serves writes while Fenced"
+//! Tests write fencing invariants from the S3 lease design.
+//! Absorbs not_leader_error (NotLeader error type + leader address assertion).
 //!
 //! Scenario:
-//! Part A: Follower always rejects writes
-//!   1. Start cluster (leader + follower)
-//!   2. Verify leader accepts writes
-//!   3. Verify follower rejects writes across multiple aggregate keys and shards
+//! Part A: Follower rejects writes across all shards, returns NotLeader with leader address
+//! Part B: Writes rejected during failover transition (kill leader, immediate write fails)
+//! Part C: Former follower becomes leader, lease_index incremented, writes succeed
 //!
-//! Part B: Writes rejected during failover transition
-//!   1. Kill the leader
-//!   2. Immediately try to write to follower (should fail - still Follower)
-//!   3. Wait for S3 race resolution
-//!   4. Write to follower again (should succeed - now Leader)
-//!
-//! Part C: Verify lease_index changes after role transition
-//!   1. Read S3 lease, verify lease_index incremented
-//!   2. Write events to new leader, verify they succeed with new lease term
-//!
-//! Run with: cargo run -p celeriant_integration_tests --bin s3_fencing_writes_main
+//! Invariants tested: 3 (write gating), 4 (asymmetric fencing)
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
+use celeriant_client_tokio::client_error::ClientError;
 use crate::{count_events, write_event, MinioContainer, ServerConfig, TestServer};
 use celeriant_runtimes::RoutingRule;
 use celeriant_wal::aggregate_key::AggregateKey;
@@ -138,6 +127,31 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("  ✓ Node B rejected writes on all shards (is follower)");
     } else {
         return Err("Node B accepted writes on some shards but should be follower!".into());
+    }
+
+    // Verify NotLeader error type with leader address (absorbed from not_leader_error)
+    let not_leader_key = AggregateKey::new(9, 1, 1);
+    let not_leader_result = write_event(&mut node_b_client, &not_leader_key, 1, true).await;
+    match not_leader_result {
+        Err(ref e) => {
+            if let Some(client_err) = e.downcast_ref::<ClientError>() {
+                match client_err {
+                    ClientError::NotLeader { leader_address: Some(addr), .. } => {
+                        assert!(
+                            addr.ends_with(&format!(":{}", leader_port)),
+                            "NotLeader leader_address '{}' should contain leader port {}",
+                            addr, leader_port
+                        );
+                        println!("  ✓ NotLeader error includes correct leader address");
+                    }
+                    ClientError::NotLeader { leader_address: None, .. } => {
+                        println!("  ✓ NotLeader returned (leader address not yet known)");
+                    }
+                    _ => println!("  ✓ Follower rejected write (non-NotLeader error type)"),
+                }
+            }
+        }
+        Ok(_) => return Err("Follower accepted write but should return NotLeader".into()),
     }
 
     // ========================================

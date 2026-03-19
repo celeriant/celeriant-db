@@ -89,3 +89,159 @@ impl ValidatedNodeStatus {
         self.is_leader() || self.is_standalone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FAR_FUTURE: u64 = u64::MAX / 2;
+    const FAR_PAST: u64 = 0;
+    const DRIFT: u64 = 500;
+
+    // Leader fences at lease_expires_at - max_clock_drift (early).
+    // Follower challenges at lease_expires_at (full TTL).
+    #[test]
+    fn leader_fences_before_lease_expires() {
+        // Leader with TTL that just passed the must_fence threshold
+        // but hasn't reached full expiry yet.
+        let now = unix_epoch_now_ms();
+        // Lease expires 200ms from now — within the drift window (500ms)
+        let status = ValidatedNodeStatus::create_custom_status(
+            NodeStatus::Leader { lease_index: 1 },
+            DRIFT,
+            now + 200, // 200ms left < 500ms drift → must_fence() fires
+        );
+        assert_eq!(status.effective_node_status(), NodeStatus::Fenced,
+            "Leader should fence when remaining time < max_clock_drift");
+        assert!(!status.is_lease_expired(),
+            "Full lease should NOT be expired yet (200ms left)");
+    }
+
+    #[test]
+    fn leader_active_when_ttl_sufficient() {
+        let now = unix_epoch_now_ms();
+        let status = ValidatedNodeStatus::create_custom_status(
+            NodeStatus::Leader { lease_index: 1 },
+            DRIFT,
+            now + 5000, // 5s left >> 500ms drift
+        );
+        assert_eq!(status.effective_node_status(), NodeStatus::Leader { lease_index: 1 },
+            "Leader should remain active when TTL >> drift");
+    }
+
+    #[test]
+    fn follower_fences_only_at_full_expiry() {
+        let now = unix_epoch_now_ms();
+        // Follower with 200ms remaining — within leader's drift window but NOT expired
+        let status = ValidatedNodeStatus::create_custom_status(
+            NodeStatus::Follower { leader_lease_index: 1 },
+            DRIFT,
+            now + 200,
+        );
+        // Follower should ALSO fence when must_fence() fires (same code path)
+        assert_eq!(status.effective_node_status(), NodeStatus::Fenced,
+            "Follower fences when must_fence() fires");
+    }
+
+    #[test]
+    fn follower_active_when_ttl_sufficient() {
+        let status = ValidatedNodeStatus::create_custom_status(
+            NodeStatus::Follower { leader_lease_index: 1 },
+            DRIFT,
+            FAR_FUTURE,
+        );
+        assert_eq!(status.effective_node_status(), NodeStatus::Follower { leader_lease_index: 1 });
+    }
+
+    #[test]
+    fn expired_leader_is_fenced() {
+        let status = ValidatedNodeStatus::create_custom_status(
+            NodeStatus::Leader { lease_index: 1 },
+            DRIFT,
+            FAR_PAST,
+        );
+        assert!(status.is_fenced());
+        assert!(status.is_lease_expired());
+        assert!(!status.can_accept_writes());
+    }
+
+    #[test]
+    fn expired_follower_is_fenced() {
+        let status = ValidatedNodeStatus::create_custom_status(
+            NodeStatus::Follower { leader_lease_index: 1 },
+            DRIFT,
+            FAR_PAST,
+        );
+        assert!(status.is_fenced());
+        assert!(status.is_lease_expired());
+    }
+
+    // BootCatchup and FollowerCatchingUp are never decayed to Fenced,
+    // even when must_fence() would fire.
+    #[test]
+    fn boot_catchup_ttl_exempt() {
+        let status = ValidatedNodeStatus::create_custom_status(
+            NodeStatus::BootCatchup,
+            DRIFT,
+            FAR_PAST, // lease "expired" long ago
+        );
+        assert_eq!(status.effective_node_status(), NodeStatus::BootCatchup,
+            "BootCatchup must not decay to Fenced even with expired TTL");
+        assert!(!status.is_fenced());
+        assert!(status.is_catching_up());
+    }
+
+    #[test]
+    fn follower_catching_up_ttl_exempt() {
+        let status = ValidatedNodeStatus::create_custom_status(
+            NodeStatus::FollowerCatchingUp { leader_lease_index: 1 },
+            DRIFT,
+            FAR_PAST, // lease "expired" long ago
+        );
+        assert_eq!(
+            status.effective_node_status(),
+            NodeStatus::FollowerCatchingUp { leader_lease_index: 1 },
+            "FollowerCatchingUp must not decay to Fenced even with expired TTL"
+        );
+        assert!(!status.is_fenced());
+        assert!(status.is_catching_up());
+    }
+
+    #[test]
+    fn standalone_ttl_exempt() {
+        let status = ValidatedNodeStatus::create_custom_status(
+            NodeStatus::Standalone,
+            DRIFT,
+            FAR_PAST,
+        );
+        assert_eq!(status.effective_node_status(), NodeStatus::Standalone);
+        assert!(status.can_accept_writes());
+    }
+
+    #[test]
+    fn fenced_stays_fenced() {
+        let status = ValidatedNodeStatus::create_custom_status(
+            NodeStatus::Fenced,
+            DRIFT,
+            FAR_FUTURE, // even with valid TTL, fenced stays fenced
+        );
+        assert!(status.is_fenced());
+        assert!(!status.can_accept_writes());
+    }
+
+    #[test]
+    fn only_leader_and_standalone_accept_writes() {
+        let cases = [
+            (NodeStatus::Leader { lease_index: 1 }, true),
+            (NodeStatus::Standalone, true),
+            (NodeStatus::Follower { leader_lease_index: 1 }, false),
+            (NodeStatus::FollowerCatchingUp { leader_lease_index: 1 }, false),
+            (NodeStatus::BootCatchup, false),
+            (NodeStatus::Fenced, false),
+        ];
+        for (status, expected) in cases {
+            let vns = ValidatedNodeStatus::create_custom_status(status, DRIFT, FAR_FUTURE);
+            assert_eq!(vns.can_accept_writes(), expected, "can_accept_writes wrong for {:?}", status);
+        }
+    }
+}

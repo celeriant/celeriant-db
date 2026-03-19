@@ -2055,6 +2055,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             &self.watched_aggregates,
             &self.s3_downloader,
             self.config.shard_id,
+            self.config.node_id,
             self.config.s3_download_max_rounds).await
 
     }

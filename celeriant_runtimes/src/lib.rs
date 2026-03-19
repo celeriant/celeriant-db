@@ -126,6 +126,7 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                     shard_config.max_request_size,
                     shard_config.max_response_size,
                     current_shard_id as u64,
+                    shard_config.node_id,
                     replication_client_config,
                     Some(s3_uploader),
                 );

@@ -99,6 +99,7 @@ fn create_config(
         pending_replication_high_water_bytes: 67_108_864, // 64MB
         max_catchup_gap_bytes: 104_857_600,
         s3_download_max_rounds: 3,
+        max_clock_drift_ms: 500,
         shard_id: 1,
         max_s3_fallback_batch_bytes: 100 * 1024 * 1024,
         compaction_check_interval: Duration::from_secs(600),

@@ -1,6 +1,6 @@
-//! S3 Old Leader Recovery Integration Test
+//! S3 Failover and Recovery Integration Test
 //!
-//! Tests the "Old Leader Returns" scenario from the S3 lease design:
+//! Tests the complete failover + old leader recovery cycle:
 //! 1. Two-node cluster (A=leader, B=follower)
 //! 2. Leader (A) crashes
 //! 3. Follower (B) takes over via S3 race, becomes new leader
@@ -11,7 +11,9 @@
 //! 8. Heartbeat resumes between B (leader) and A (follower)
 //! 9. Replication works from B to A
 //!
-//! Run with: cargo run --bin s3_old_leader_recovery_main
+//! Subsumes the old s3_failover test (phases 1-7 were a strict subset).
+//! Invariants tested: 1 (single leader), 2 (monotonic lease_index),
+//!   3 (write gating), 15 (valid transitions), 17 (membership CAS).
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use crate::{count_events, write_event, MinioContainer, ServerConfig, TestServer};
@@ -22,7 +24,7 @@ use std::time::Duration;
 
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== S3 Old Leader Recovery Integration Test ===\n");
+    println!("=== S3 Failover and Recovery Integration Test ===\n");
 
     let port_base = 13300 + (std::process::id() % 100) as u16;
     let node_a_port = port_base;

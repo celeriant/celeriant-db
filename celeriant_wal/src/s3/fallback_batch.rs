@@ -7,6 +7,7 @@ pub struct FallbackBatch {
     pub fallback_index: u64,
     pub end_wal_index: u64,
     pub shard_id: u32,
+    pub uploaded_by_node_id: u128,
     pub items: Vec<FallbackItem>,
 }
 
@@ -17,11 +18,12 @@ pub struct FallbackItem {
 }
 
 impl FallbackBatch {
-    pub fn new(fallback_index: u64, end_wal_index: u64, shard_id: u32) -> Self {
+    pub fn new(fallback_index: u64, end_wal_index: u64, shard_id: u32, uploaded_by_node_id: u128) -> Self {
         Self {
             fallback_index,
             end_wal_index,
             shard_id,
+            uploaded_by_node_id,
             items: Vec::new(),
         }
     }

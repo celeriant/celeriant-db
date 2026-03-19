@@ -1,27 +1,24 @@
-//! S3 Unreachable Failover Integration Test - MinIO down during leader crash
+//! S3 Unreachable Failover Integration Test
 //!
-//! Tests the "S3 unreachable, heartbeat lost" failure mode from the design spec.
-//! This validates the critical liveness scenario where both nodes fence but cannot
-//! complete the S3 race because MinIO is down.
+//! Tests the "S3 unreachable + network partition" failure mode. Both nodes are alive
+//! but partitioned, and S3 is also down — the hardest failure case.
+//! Absorbs s3_writes_during_fencing (both-nodes-reject assertion).
 //!
 //! Scenario:
-//! 1. Start MinIO, establish two-node cluster (leader + follower)
-//! 2. Write events 1-3, verify cluster is healthy (replication works)
-//! 3. Pause MinIO container (S3 becomes unreachable)
-//! 4. Kill leader process (follower detects heartbeat loss)
-//! 5. Verify follower stays fenced (can't complete S3 race, S3 unreachable)
-//! 6. Unpause MinIO (S3 becomes reachable again)
-//! 7. Verify follower recovers (wins S3 race, becomes leader)
+//! 1. Start two-node cluster with TcpProxy, verify replication
+//! 2. Pause MinIO (prevent S3 lease renewal/race)
+//! 3. Block proxy (simulate network partition)
+//! 4. Wait for both nodes to fence
+//! 5. Verify BOTH nodes reject writes while fenced (invariant 3)
+//! 6. Verify write rejection is consistent across multiple attempts
+//! 7. Unpause MinIO + unblock proxy
+//! 8. Wait for S3 race to resolve
+//! 9. Verify exactly one leader emerges
 //!
-//! Expected behavior from design spec:
-//! "S3 unreachable, heartbeat lost: Both sides fence. Both try S3 race — S3 unreachable.
-//!  Both stay fenced, retry with backoff. No writes served by either node until S3 returns."
-//!
-//! Test results: S3 retry works! The follower successfully recovers after MinIO is unpaused,
-//! completes the S3 race, and becomes leader. This validates the liveness guarantee.
+//! Invariants tested: 1 (single leader), 3 (write gating), 4 (asymmetric fencing)
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use crate::{count_events, write_event, MinioContainer, ServerConfig, TestServer};
+use crate::{count_events, write_event, MinioContainer, ServerConfig, TestServer, TcpProxy};
 use celeriant_runtimes::RoutingRule;
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wire::disk::versioned_block::deserialise_lease;
@@ -34,25 +31,27 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let port_base = 12700 + (std::process::id() % 100) as u16;
     let leader_port = port_base;
     let follower_port = port_base + 100;
+    let proxy_port = port_base + 200;
     let minio_port = port_base + 10;
-
-    println!("Starting MinIO container on port {}...", minio_port);
-    let minio = MinioContainer::start_with_bucket(minio_port, "test-s3-unreachable").await?;
-    let (region, bucket_name, access_key, secret_key, minio_endpoint, allow_http) = minio.s3_config_fields();
-    println!("MinIO ready at {}\n", minio_endpoint);
 
     let num_shards = 4;
     let aggregate_key = AggregateKey::new(1, 1, 1);
 
     // ========================================
-    // PHASE 1: Start cluster and verify healthy
+    // PHASE 1: Start cluster with TcpProxy, verify healthy
     // ========================================
-    println!("PHASE 1: Start cluster and verify healthy");
-    println!("------------------------------------------");
+    println!("PHASE 1: Start cluster with TcpProxy");
+    println!("-------------------------------------");
+
+    println!("  Starting MinIO container on port {}...", minio_port);
+    let minio = MinioContainer::start_with_bucket(minio_port, "test-s3-unreachable").await?;
+    let (region, bucket_name, access_key, secret_key, minio_endpoint, allow_http) = minio.s3_config_fields();
+    println!("  MinIO ready at {}", minio_endpoint);
 
     let leader_config = ServerConfig {
         num_shards: Some(num_shards),
         log_level: "info".to_string(),
+        client_port: leader_port,
         routing_rule: RoutingRule::AggregateTypeId,
         s3_lease_duration_ms: 10_000,
         s3_enabled: true,
@@ -66,13 +65,19 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
     println!("  Starting leader on port {}...", leader_port);
-    let mut leader = TestServer::start_with_config(leader_port, leader_config).await?;
+    let _leader = TestServer::start_with_config_labeled(leader_port, leader_config, "leader".into()).await?;
 
     tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let follower_repl_port = follower_port + 1;
+    println!("  Starting TcpProxy: {} -> {}", proxy_port, follower_repl_port);
+    let proxy = TcpProxy::start(proxy_port, format!("127.0.0.1:{}", follower_repl_port)).await?;
 
     let follower_config = ServerConfig {
         num_shards: Some(num_shards),
         log_level: "info".to_string(),
+        client_port: follower_port,
+        advertised_replication_address: Some(format!("127.0.0.1:{}", proxy_port)),
         routing_rule: RoutingRule::AggregateTypeId,
         s3_lease_duration_ms: 10_000,
         s3_enabled: true,
@@ -85,123 +90,123 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         s3_skip_signature: false,
         ..Default::default()
     };
-    println!("  Starting follower on port {}...", follower_port);
-    let follower = TestServer::start_with_config(follower_port, follower_config).await?;
+    println!("  Starting follower on port {} (advertised repl: proxy {})",
+        follower_port, proxy_port);
+    let _follower = TestServer::start_with_config_labeled(follower_port, follower_config, "follower".into()).await?;
 
-    println!("  Waiting for election and heartbeat establishment...");
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    println!("  Waiting for election, heartbeat, and S3 lease expiry...");
+    tokio::time::sleep(Duration::from_secs(12)).await;
 
-    let mut leader_client = CeleriantClient::connect(leader.address()).await?;
+    let mut leader_client = CeleriantClient::connect(&format!("127.0.0.1:{}", leader_port)).await?;
+    let mut follower_client = CeleriantClient::connect(&format!("127.0.0.1:{}", follower_port)).await?;
 
     println!("  Writing events 1-3 to verify cluster health...");
     for i in 1..=3 {
         write_event(&mut leader_client, &aggregate_key, i, i == 1).await?;
     }
 
-    let mut follower_client = CeleriantClient::connect(follower.address()).await?;
     let follower_count = count_events(&mut follower_client, &aggregate_key).await?;
     assert_eq!(follower_count, 3, "Follower should have 3 events");
-    println!("  ✓ Cluster healthy: follower has {} events", follower_count);
+    println!("  Cluster healthy: follower has {} events\n", follower_count);
+
+    // ========================================
+    // PHASE 2: Pause MinIO, then block proxy
+    // ========================================
+    println!("PHASE 2: Pause MinIO + block proxy (dual failure)");
+    println!("--------------------------------------------------");
 
     let initial_lease_bytes = minio.get_object("cluster/lease.json").await?;
     let initial_lease = deserialise_lease(&initial_lease_bytes)
-        .map_err(|e| format!("Failed to deserialise initial lease: {:?}", e))?;
-    println!("  ✓ Initial lease: leader_node_id={:x}, lease_index={}\n",
-        initial_lease.leader_node_id, initial_lease.lease_index);
+        .map_err(|e| format!("Failed to deserialise lease: {:?}", e))?;
     let initial_lease_index = initial_lease.lease_index;
+    println!("  Initial lease_index={}", initial_lease_index);
 
-    // ========================================
-    // PHASE 2: Pause MinIO (S3 unreachable)
-    // ========================================
-    println!("PHASE 2: Pause MinIO (S3 unreachable)");
-    println!("-------------------------------------");
-
-    println!("  Pausing MinIO container...");
+    // Pause MinIO FIRST to prevent S3 lease renewal on first heartbeat miss
+    println!("  Pausing MinIO (S3 unreachable)...");
     minio.pause()?;
-    println!("  ✓ S3 is now unreachable (all S3 requests will timeout)\n");
+
+    proxy.block();
+    println!("  Proxy blocked - both replication paths down\n");
 
     // ========================================
-    // PHASE 3: Kill leader
+    // PHASE 3: Verify BOTH nodes reject writes while fenced
     // ========================================
-    println!("PHASE 3: Kill leader");
-    println!("--------------------");
+    println!("PHASE 3: Verify BOTH nodes reject writes while fenced");
+    println!("------------------------------------------------------");
 
-    println!("  Stopping leader process...");
-    drop(leader_client);
-    leader.stop();
-    println!("  ✓ Leader stopped (follower will detect heartbeat loss)\n");
-
-    // ========================================
-    // PHASE 4: Verify follower is fenced (S3 unreachable)
-    // ========================================
-    println!("PHASE 4: Verify follower is fenced (S3 unreachable)");
-    println!("---------------------------------------------------");
-
-    println!("  Waiting for heartbeat timeout (~2s) + S3 race attempts...");
+    println!("  Waiting for heartbeat timeout + fencing...");
     tokio::time::sleep(Duration::from_secs(5)).await;
 
-    println!("  Attempting write to follower (should fail - fenced or can't complete S3 race)...");
-    let write_result_1 = write_event(&mut follower_client, &aggregate_key, 4, false).await;
+    let fenced_key_a = AggregateKey::new(2, 1, 1);
+    let fenced_key_b = AggregateKey::new(3, 1, 1);
 
-    if write_result_1.is_err() {
-        println!("  ✓ First write rejected (follower fenced or still Follower)");
-    } else {
-        return Err("Follower accepted write but should be fenced (S3 unreachable)!".into());
+    let leader_accepts = write_event(&mut leader_client, &fenced_key_a, 1, true).await.is_ok();
+    let follower_accepts = write_event(&mut follower_client, &fenced_key_b, 1, true).await.is_ok();
+
+    assert!(!leader_accepts, "Leader accepted writes while Fenced");
+    assert!(!follower_accepts, "Follower accepted writes while Fenced");
+    println!("  Both nodes correctly reject writes while fenced");
+
+    // Verify consistency across multiple attempts
+    for i in 1u64..=3 {
+        let retry_key = AggregateKey::new(4, 1, i as u128);
+        let a_ok = write_event(&mut leader_client, &retry_key, i, true).await.is_ok();
+        let b_ok = write_event(&mut follower_client, &retry_key, i, true).await.is_ok();
+        assert!(!a_ok, "Leader accepted write attempt {} while Fenced", i);
+        assert!(!b_ok, "Follower accepted write attempt {} while Fenced", i);
     }
-
-    println!("  Waiting another 3s to ensure follower stays fenced...");
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    println!("  Attempting second write to follower (should still fail)...");
-    let write_result_2 = write_event(&mut follower_client, &aggregate_key, 5, false).await;
-
-    if write_result_2.is_err() {
-        println!("  ✓ Second write rejected (follower still fenced, S3 unreachable)");
-    } else {
-        return Err("Follower accepted write but should stay fenced (S3 unreachable)!".into());
-    }
-    println!("  ✓ Verified: follower stays fenced when S3 is unreachable\n");
+    println!("  Write rejection consistent across 3 additional attempts\n");
 
     // ========================================
-    // PHASE 5: Unpause MinIO (S3 becomes reachable)
+    // PHASE 4: Restore S3 + network, verify recovery
     // ========================================
-    println!("PHASE 5: Unpause MinIO (S3 becomes reachable)");
-    println!("---------------------------------------------");
+    println!("PHASE 4: Unpause MinIO + unblock proxy");
+    println!("----------------------------------------");
 
-    println!("  Unpausing MinIO container...");
     minio.unpause()?;
-    println!("  ✓ S3 is now reachable (requests can succeed)\n");
+    println!("  MinIO unpaused");
+    proxy.unblock();
+    println!("  Proxy unblocked");
+
+    println!("  Waiting for S3 race + reconvergence + S3 lease expiry...");
+    tokio::time::sleep(Duration::from_secs(12)).await;
 
     // ========================================
-    // PHASE 6: Verify follower recovers
+    // PHASE 5: Verify exactly one leader emerges
     // ========================================
-    println!("PHASE 6: Verify follower recovers");
-    println!("---------------------------------");
+    println!("\nPHASE 5: Verify exactly one leader after recovery");
+    println!("--------------------------------------------------");
 
-    println!("  Waiting for S3 race retry to complete (~5s)...");
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    let post_key_a = AggregateKey::new(5, 1, 1);
+    let post_key_b = AggregateKey::new(6, 1, 1);
 
-    println!("  Attempting write to follower (should succeed now that S3 is reachable)...");
-    write_event(&mut follower_client, &aggregate_key, 6, false).await?;
-    println!("  ✓ Follower recovered and became leader (S3 retry works!)");
+    let leader_accepts_after = write_event(&mut leader_client, &post_key_a, 1, true).await.is_ok();
+    let follower_accepts_after = write_event(&mut follower_client, &post_key_b, 1, true).await.is_ok();
+
+    println!("  Leader accepts writes after recovery: {}", leader_accepts_after);
+    println!("  Follower accepts writes after recovery: {}", follower_accepts_after);
+
+    assert_ne!(
+        leader_accepts_after, follower_accepts_after,
+        "Both nodes have same write acceptance state. Expected exactly one leader."
+    );
 
     let final_lease_bytes = minio.get_object("cluster/lease.json").await?;
     let final_lease = deserialise_lease(&final_lease_bytes)
-        .map_err(|e| format!("Failed to deserialise final lease: {:?}", e))?;
-
-    println!("  ✓ Final lease: leader_node_id={:x}, lease_index={}",
-        final_lease.leader_node_id, final_lease.lease_index);
+        .map_err(|e| format!("Failed to deserialise lease: {:?}", e))?;
     assert!(
         final_lease.lease_index > initial_lease_index,
-        "lease_index should have increased after takeover: was {}, now {}",
+        "lease_index should have increased: was {}, now {}",
         initial_lease_index, final_lease.lease_index
     );
+    println!("  lease_index {} -> {} (monotonic)", initial_lease_index, final_lease.lease_index);
 
-    let final_count = count_events(&mut follower_client, &aggregate_key).await?;
-    assert_eq!(final_count, 4, "Should have 4 events (1-3 + 6)");
-    println!("  ✓ Recovery complete: follower became leader after S3 returned");
-
-    println!("\n=== Test Complete ===\n");
+    println!("\n=== All Tests Passed ===");
+    println!("S3 unreachable failover validated:");
+    println!("  1. Both nodes correctly rejected writes while Fenced (S3 + TCP down)");
+    println!("  2. Write rejection consistent across multiple attempts");
+    println!("  3. After recovery: exactly one leader emerged");
+    println!("  4. lease_index monotonically increased\n");
 
     Ok(())
 }

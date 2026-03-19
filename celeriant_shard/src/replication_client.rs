@@ -117,6 +117,7 @@ impl ConnState {
 /// Manage follower communication with split internal locks
 pub struct FollowerConnection<S: S3Uploader> {
     follower_address: RefCell<Option<String>>,
+    node_id: u128,
     shard_id: u64,
     replication_conn: RwLock<ConnState>,
     heartbeat_conn: RwLock<ConnState>,
@@ -136,12 +137,14 @@ impl<S: S3Uploader> FollowerConnection<S> {
         max_request_size: u64,
         max_response_size: u64,
         shard_id: u64,
+        node_id: u128,
         replication_client_config: Option<Arc<rustls::ClientConfig>>,
         s3_uploader: Option<S>,
     ) -> Self {
         assert!(shard_id <= u32::MAX as u64, "shard_id {} exceeds u32::MAX", shard_id);
         Self {
             follower_address: RefCell::new(follower_address),
+            node_id,
             shard_id,
             replication_conn: RwLock::new(ConnState::new()),
             heartbeat_conn: RwLock::new(ConnState::new()),
@@ -223,6 +226,7 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
             fallback_index,
             end_wal_index,
             shard_id,
+            uploaded_by_node_id: self.node_id,
             items,
         };
 
@@ -399,6 +403,7 @@ mod tests {
                 1024,
                 1024,
                 7,
+                1,
                 None,
                 Some(mock_uploader),
             );
@@ -420,6 +425,7 @@ mod tests {
                 1024,
                 1024,
                 7,
+                1,
                 None,
                 None,
             );
@@ -447,6 +453,7 @@ mod tests {
                 1024,
                 1024,
                 7,
+                42,
                 None,
                 Some(mock_uploader),
             );
@@ -475,6 +482,7 @@ mod tests {
             let deserialized = celeriant_wire::disk::versioned_block::deserialise_fallback_batch(data)
                 .expect("should deserialize");
             assert_eq!(deserialized.shard_id, 7);
+            assert_eq!(deserialized.uploaded_by_node_id, 42);
             assert_eq!(deserialized.fallback_index, 42);
             assert_eq!(deserialized.end_wal_index, 43);
             assert_eq!(deserialized.items.len(), 2);
@@ -493,6 +501,7 @@ mod tests {
                 1024,
                 1024,
                 5,
+                1,
                 None,
                 Some(mock_uploader),
             );
@@ -525,6 +534,7 @@ mod tests {
             let deserialized = celeriant_wire::disk::versioned_block::deserialise_fallback_batch(data)
                 .expect("should deserialize");
             assert_eq!(deserialized.fallback_index, 100);
+            assert_eq!(deserialized.uploaded_by_node_id, 1);
             assert_eq!(deserialized.end_wal_index, 102);
             assert_eq!(deserialized.items[0].metablock.wal_index, 100);
             assert_eq!(deserialized.items[1].metablock.wal_index, 101);
@@ -549,6 +559,7 @@ mod tests {
                 1024,
                 1024,
                 7,
+                1,
                 None,
                 Some(mock_uploader),
             );

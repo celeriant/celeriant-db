@@ -2,19 +2,20 @@
 //!
 //! Tests the full cycle: normal replication, follower goes down, S3 fallback,
 //! follower comes back via boot catchup from S3, and continued normal replication.
+//! Absorbs s3_fallback (S3 object verification + ordering assertions).
 //!
 //! Scenario:
 //! 1. Start MinIO + two-node cluster via S3 election
 //! 2. Write events 1-3. Verify follower has 3 events
 //! 3. Stop follower
 //! 4. Write events 4-8 to leader (S3 fallback for these)
-//! 5. Restart follower — boot catchup reads S3 fallback batches
-//! 6. Write event 9. Verify follower has all 9 events
-//! 7. Verify S3 objects exist from step 4
+//! 5. Verify S3 objects: correct paths, batch content, lexicographic ordering
+//! 6. Restart follower — boot catchup reads S3 fallback batches
+//! 7. Write event 9. Verify follower has all 9 events
 //! 8. Write events 10-12. Verify follower gets them via normal replication
 //!    (no new S3 objects)
 //!
-//! Run with: cargo run --bin s3_fallback_catchup_main
+//! Invariants tested: 10 (post-election S3 catchup), 11 (S3 fallback)
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use crate::{count_events, s3_cluster_config, write_event, MinioContainer, TestServer};
@@ -108,6 +109,12 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "Expected S3 objects from fallback period"
     );
 
+    // Verify lexicographic ordering (from s3_fallback)
+    let mut sorted = objects.clone();
+    sorted.sort();
+    assert_eq!(objects, sorted, "S3 objects should be in lexicographic (temporal) order");
+    println!("  S3 objects are lexicographically ordered");
+
     let first_object_path = &objects[0];
     let object_bytes = minio.get_object(first_object_path).await?;
     let fallback_batch = deserialise_fallback_batch(&object_bytes)
@@ -118,6 +125,21 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         fallback_batch.fallback_index,
         fallback_batch.items.len()
     );
+
+    assert_eq!(
+        fallback_batch.shard_id, expected_shard,
+        "FallbackBatch shard_id should match expected_shard"
+    );
+    assert!(
+        !fallback_batch.items.is_empty(),
+        "FallbackBatch should contain items"
+    );
+    let first_wal_index = fallback_batch.items[0].metablock.wal_index;
+    assert_eq!(
+        fallback_batch.fallback_index, first_wal_index,
+        "fallback_index should match first item's WAL index"
+    );
+    println!("  Batch content verified: shard_id, item count, WAL index alignment");
 
     // ========================================
     // Phase 4: Follower restarts — boot catchup reads S3 fallback batches

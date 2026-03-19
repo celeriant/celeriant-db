@@ -1,4 +1,5 @@
-//! Edge Case: Leader Crash Before Replication — Divergent WAL Auto-Heal
+//! Edge Case: WAL Divergence and Recovery — Divergent WAL Auto-Heal
+//! Absorbs edge_wal_divergence_recovery (same detection+recovery path, different setup).
 //!
 //! Tests the only split-brain scenario in a two-node cluster that fsyncs before
 //! replication: the leader fsyncs a write to local disk but crashes before

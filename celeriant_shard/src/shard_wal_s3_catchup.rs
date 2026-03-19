@@ -47,6 +47,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader>(
     watched_aggregates: &Rc<AggregateWatchers>,
     downloader: &Rc<D>,
     shard_id: u32,
+    node_id: u128,
     max_rounds: u32,
 ) -> Result<S3CatchupResult, S3CatchupError> {
     let prefix = fallback_shard_prefix(shard_id);
@@ -62,7 +63,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader>(
 
         let round = catchup_round(
             log_segments_cache, shard_mem_cache, fsync_coordinator,
-            watched_aggregates, downloader, &prefix, shard_id,
+            watched_aggregates, downloader, &prefix, shard_id, node_id,
         ).await?;
 
         // After truncation, continue loop to re-apply from S3
@@ -100,6 +101,7 @@ async fn catchup_round<D: S3Downloader>(
     downloader: &Rc<D>,
     prefix: &str,
     shard_id: u32,
+    node_id: u128,
 ) -> Result<RoundApplied, S3CatchupError> {
     let objects = downloader.list_objects(prefix).await?;
 
@@ -142,6 +144,17 @@ async fn catchup_round<D: S3Downloader>(
                 path: batch_ref.path.clone(),
                 source: e,
             })?;
+
+        // Never process batches uploaded by this node. A leader must not
+        // consume its own S3 fallback batches; they exist for the follower to catch up.
+        if fallback_batch.uploaded_by_node_id == node_id {
+            tracing::warn!(
+                shard_id,
+                path = %batch_ref.path,
+                "Skipping S3 batch uploaded by this node (self-catchup prevented)"
+            );
+            continue;
+        }
 
         let all_items: Vec<ReplicationBatchItem> = fallback_batch
             .items
@@ -582,7 +595,7 @@ mod tests {
     }
 
     fn make_fallback_batch(shard_id: u32, start: u64, end: u64, tip_hash: [u8; 32]) -> (String, Bytes) {
-        let mut batch = FallbackBatch::new(start, end, shard_id);
+        let mut batch = FallbackBatch::new(start, end, shard_id, 0);
         for wal_index in start..=end {
             batch.push_item(FallbackItem {
                 metablock: test_metablock(wal_index, tip_hash),
@@ -697,8 +710,8 @@ mod tests {
         async fn catchup(&self, downloader: &Rc<MockDownloader>, shard_id: u32, max_rounds: u32) -> Result<S3CatchupResult, S3CatchupError> {
             catchup_from_s3(
                 &self.log_segments_cache, &self.shard_mem_cache, &self.fsync_coordinator,
-                &self.watched_aggregates, 
-                downloader, shard_id, max_rounds,
+                &self.watched_aggregates,
+                downloader, shard_id, 99, max_rounds,
             ).await
         }
 
@@ -1219,7 +1232,7 @@ mod tests {
 
     #[test]
     fn test_fallback_batch_s3_path() {
-        let batch = FallbackBatch::new(5, 10, 2);
+        let batch = FallbackBatch::new(5, 10, 2, 0);
         assert_eq!(fallback_batch_path(batch.shard_id, batch.fallback_index, batch.end_wal_index), "cluster/fallback/shard_002/batch_000000005_000000010.bin");
     }
 
@@ -1311,6 +1324,7 @@ mod tests {
             fallback_index: 42,
             end_wal_index: 43,
             shard_id: 7,
+            uploaded_by_node_id: 1,
             items: vec![
                 FallbackItem {
                     metablock: metablock1,
@@ -1386,6 +1400,7 @@ mod tests {
             fallback_index: 100,
             end_wal_index: 101,
             shard_id: 5,
+            uploaded_by_node_id: 1,
             items: vec![
                 FallbackItem {
                     metablock: metablock_first,
@@ -1404,13 +1419,13 @@ mod tests {
 
     #[test]
     fn test_shard_id_narrowing() {
-        let batch_0 = FallbackBatch::new(1, 5, 0);
+        let batch_0 = FallbackBatch::new(1, 5, 0, 0);
         assert_eq!(
             fallback_batch_path(batch_0.shard_id, batch_0.fallback_index, batch_0.end_wal_index),
             "cluster/fallback/shard_000/batch_000000001_000000005.bin"
         );
 
-        let batch_999 = FallbackBatch::new(1, 10, 999);
+        let batch_999 = FallbackBatch::new(1, 10, 999, 0);
         assert_eq!(
             fallback_batch_path(batch_999.shard_id, batch_999.fallback_index, batch_999.end_wal_index),
             "cluster/fallback/shard_999/batch_000000001_000000010.bin"
