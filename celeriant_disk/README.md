@@ -8,7 +8,7 @@ This crate handles the complexities of DMA I/O—alignment requirements, chunked
 
 ```
 File on Disk
-├── Metadata (fixed 256B records)
+├── Metablocks (fixed 1024B records)
 └── Event Batches (variable size, compressed)
 
 celeriant_disk provides:

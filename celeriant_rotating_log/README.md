@@ -52,19 +52,31 @@ LogSegmentFileMetadata
 |----------|---------|
 | `LogSegmentsCache::ready_up` | Initialize shard, open/create active log file |
 | `LogSegmentsCache::active` | Get active log segment for writing |
+| `LogSegmentsCache::active_log_id` | Get the log_id of the active file |
 | `LogSegmentsCache::get` | Get log segment by ID (from cache or disk) |
 | `LogSegmentsCache::get_if_cached` | Non-async check if log_id is already cached, no I/O |
+| `LogSegmentsCache::evict_from_lru` | Evict a log segment from the LRU cache |
 | `LogSegmentsCache::rotate_to_next_log` | Create new active log, move current to LRU cache |
 | `LogSegmentsCache::rollback_write_position` | Rollback write cursor after failed replication |
 | `LogSegmentsCache::get_latest_read_cursor` | Get replicated read position (handles rotation boundary) |
 | `LogSegmentsCache::active_log_available_space` | Quick space check against write cursor |
+| `LogSegmentsCache::shard_dir` | Get the shard directory path |
 | `LogSegmentsCache::close` | Close all file handles |
 | `LogSegmentFile::open_or_create_first_file_for_shard` | Open existing or create new log file |
 | `LogSegmentFile::open_existing` | Open existing log file (errors if missing) |
+| `LogSegmentFile::lock_reader` | Acquire read lock on the DmaFile with timeout |
+| `LogSegmentFile::lock_writer` | Acquire write lock on the DmaFile with timeout |
+| `LogSegmentFile::close` | Close both reader and writer file handles |
 | `LogSegmentFileMetadata::advance_visible_position` | Promote write cursor to read (post-replication) |
 | `LogSegmentFileMetadata::is_pending_advance` | True if write cursor is ahead of read cursor |
+| `LogSegmentFileMetadata::to_shard_log_header` | Convert metadata to ShardLogHeader for persistence |
+| `LogSegmentFileMetadata::available_space` | Remaining bytes between metablocks and datablocks |
+| `LogSegmentFileMetadata::readable_metablocks_end` | End position of metablocks visible to readers |
 | `ReverseMetablockScanner::scan` | Scan metablocks in reverse with visitor |
+| `ReverseMetablockScanner::with_bloom_filter` | Skip segments where aggregate is definitely absent |
+| `ReverseMetablockScanner::with_bloom_filter_hash` | Same as above but with pre-computed hash bytes |
 | `write_dual_shard_log_header` | Write header to both start and end of file |
+| `read_datablocks_carry_over_bytes` | Read unaligned bytes at datablocks boundary on open |
 
 ## Usage
 
@@ -74,6 +86,7 @@ let cache = LogSegmentsCache::ready_up(
     shard_dir,
     1 << 30,        // 1GB preallocate (must be multiple of 512KB)
     8,              // max cached files
+    shard_id,       // shard identifier for metrics labels
 ).await?;
 
 // Write path: get active log
@@ -291,7 +304,7 @@ All lock acquisitions use 1-second timeouts. If exceeded, returns `PotentialDead
 ### Preallocated files
 
 ```rust
-LogSegmentsCache::ready_up(shard_dir, preallocate_bytes, max_cached)
+LogSegmentsCache::ready_up(shard_dir, preallocate_bytes, max_cached, shard_id)
 ```
 
 Files are preallocated to `preallocate_bytes` (typically 1GB) on creation. Size must be a multiple of `HEADER_BLOCK_SIZE_BYTES` (512KB) and large enough for two headers. This:
@@ -318,3 +331,6 @@ This allows writers to continue appending at unaligned positions without losing 
 - `celeriant_disk` - Low-level DMA read utilities
 - `fastbloom` - Bloom filter implementation
 - `bincode` - Binary serialization
+- `metrics` - Runtime metrics collection
+- `tracing` - Structured logging and diagnostics
+- `futures-lite` - Lightweight async utilities

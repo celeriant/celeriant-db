@@ -149,7 +149,7 @@ Timestamps are by default Unix epoch ms. But the server could be configured to b
 
 ### Minibatch optimization
 
-If encoded, uncompressed batch ≤512 bytes (`MINIBATCH_SIZE_BYTES`), it's stored inline in the metablock via `DatablockInlineData`, avoiding an extra disk read. `DatablockStorageKind::Inline` holds a 512-byte fixed array.
+If encoded, compressed batch is less than 512 bytes (`MINIBATCH_SIZE_BYTES`), it's stored inline in the metablock via `DatablockInlineData`, avoiding an extra disk read. `DatablockStorageKind::Inline` holds a 512-byte fixed array.
 
 ### Optional event ID
 

@@ -7,49 +7,49 @@ Request and response message types for the Celeriant wire protocol. Defines the 
 ```
 Client Port                               Server
   │                                         │
-  │  ClientRequest (AggregateDetails,      │
-  │     Read, Write, TrimStart, Delete,    │
+  │  ClientRequest (AggregateDetails,       │
+  │     Read, Write, TrimStart, Delete,     │
   │     Watch, ListOrgs, ListAggregateTypes,│
-  │     ListAggregates, RegisterSchema)    │
+  │     ListAggregates, RegisterSchema)     │
   ├────────────────────────────────────────►│
   │                                         │
-  │  ClientResponse (AggregateDetails,     │
-  │     Read, SuccessResponse, Error,      │
-  │     Watch, List*, RegisterSchema)      │
+  │  ClientResponse (AggregateDetails,      │
+  │     Read, SuccessResponse, Error,       │
+  │     Watch, List*, RegisterSchema)       │
   │◄────────────────────────────────────────┤
 
 Replication Port                          Server
   │                                         │
-  │  ClusterRequest (ReplicationBatch,     │
-  │     Heartbeat, KickFollower)           │
+  │  ClusterRequest (ReplicationBatch,      │
+  │     Heartbeat, KickFollower)            │
   ├────────────────────────────────────────►│
   │                                         │
-  │  ClusterResponse (ReplicationBatch,    │
-  │     Heartbeat, KickFollower)           │
+  │  ClusterResponse (ReplicationBatch,     │
+  │     Heartbeat, KickFollower)            │
   │◄────────────────────────────────────────┤
 
 Identify (pre-auth, client port only)
-  │  IdentifyRequest  ──────────────────►  │
-  │  IdentifyResponse ◄──────────────────  │
+  │  IdentifyRequest  ──────────────────►   │
+  │  IdentifyResponse ◄──────────────────   │
 
 Message Classification:
 ┌─────────────────────────────────────────────────────────────┐
 │ Fixed-size (no compression, stack buffer)                   │
-│   Client Req:  AggregateDetails, Read, TrimStart, Delete,  │
+│   Client Req:  AggregateDetails, Read, TrimStart, Delete,   │
 │                Watch, ListOrgs, ListAggregateTypes,         │
 │                ListAggregates, Identify                     │
-│   Client Res:  AggregateDetails, Write, TrimStart, Delete, │
+│   Client Res:  AggregateDetails, Write, TrimStart, Delete,  │
 │                ProtocolError, GenericError, RegisterSchema, │
 │                Identify                                     │
 │   Cluster Req: Heartbeat, KickFollower                      │
 │   Cluster Res: All (ReplicationBatch, Heartbeat,            │
-│                KickFollower, ProtocolError, GenericError)    │
+│                KickFollower, ProtocolError, GenericError)   │
 ├─────────────────────────────────────────────────────────────┤
 │ Variable-size (compression, heap allocation)                │
 │   Client Req:  Write, RegisterSchema                        │
 │   Client Res:  Read, Watch, ListOrgs,                       │
-│                ListAggregateTypes, ListAggregates            │
-│   Cluster Req: ReplicationBatch                              │
+│                ListAggregateTypes, ListAggregates           │
+│   Cluster Req: ReplicationBatch                             │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -57,10 +57,11 @@ Message Classification:
 
 | Module | Purpose |
 |--------|---------|
-| `process_client_requests` | Client request wire protocol: `ClientRequest` enum, read/write |
-| `process_client_responses` | Client response wire protocol: `ClientResponse` enum, read/write |
-| `process_cluster_requests` | Cluster request wire protocol: `ClusterRequest` enum, read/write |
-| `process_cluster_responses` | Cluster response wire protocol: `ClusterResponse` enum, read/write |
+| `error_codes` | Canonical `u32` error code constants, organized by range (1xxx read, 2xxx write, etc.) |
+| `process_client_requests` | Client request wire protocol: `ClientRequest` enum, `ClientRequestType`, read/write |
+| `process_client_responses` | Client response wire protocol: `ClientResponse` enum, `ClientResponseType`, read/write |
+| `process_cluster_requests` | Cluster request wire protocol: `ClusterRequest` enum, `ClusterRequestType`, read/write |
+| `process_cluster_responses` | Cluster response wire protocol: `ClusterResponse` enum, `ClusterResponseType`, read/write |
 | `process_identify` | Pre-auth identify request/response, separate from client/cluster enums |
 | `read_wire_data_error` | Wire deserialization error type |
 | `request` | Request struct definitions, `ReadFilters` builder |
@@ -159,19 +160,24 @@ Identify is handled on the client port before authentication, outside both enums
 
 ### Error Codes
 
-`ErrorResponse` defines well-known error codes:
+All error codes are defined in `error_codes.rs`. No other file should define `u32` error codes.
 
-| Constant | Value | Purpose |
-|----------|-------|---------|
-| `WRITE_NOT_LEADER` | 2011 | Write rejected, node is not leader |
-| `TRIM_NOT_LEADER` | 3005 | Trim rejected, node is not leader |
-| `DELETE_NOT_LEADER` | 4006 | Delete rejected, node is not leader |
-| `IDENTIFY_REQUIRED` | 10004 | Client must identify before requests |
-| `AUTH_REQUIRED` | 1001 | Authentication required |
-| `AUTH_INVALID_KEY` | 1002 | Invalid API key |
-| `AUTH_INSUFFICIENT_PERMISSIONS` | 1003 | Insufficient permissions |
+| Range | Category | Examples |
+|-------|----------|----------|
+| 1xxx | Read errors | `READ_AGGREGATE_NOT_EXISTS` (1001), `READ_FETCH_DATABLOCKS` (1004) |
+| 2xxx | Write errors | `WRITE_NOT_LEADER` (2011), `WRITE_OPTIMISTIC_CONCURRENCY_VIOLATION` (2003) |
+| 2020–2029 | Schema registration | `REGISTER_SCHEMA_ALREADY_EXISTS` (2020), `REGISTER_SCHEMA_INVALID` (2021) |
+| 3xxx | Trim errors | `TRIM_NOT_LEADER` (3005), `TRIM_INDEX_OUT_OF_RANGE` (3004) |
+| 4xxx | Delete errors | `DELETE_NOT_LEADER` (4006), `DELETE_OPTIMISTIC_CONCURRENCY_VIOLATION` (4002) |
+| 5xxx | Listing errors | `LIST_ORGS_DISK_READ` (5000) |
+| 6xxx | Replication batch | `REPLICATION_BATCH_FSYNC` (6000), `REPLICATION_BATCH_WAL_INDEX_GAP` (6002) |
+| 7xxx | Exists/aggregate-details | `EXISTS_AGGREGATE_NOT_EXISTS` (7001) |
+| 8xxx | Watch errors | `WATCH_REQUEST_INVALID` (8000), `WATCH_LATENCY_TOO_HIGH` (8001) |
+| 9xxx | Shard routing | `SHARD_ROUTING_NO_KEY` (9000), `SHARD_ROUTING_MULTIPLE_SHARDS` (9001) |
+| 10xxx | Identity & auth | `IDENTIFY_REQUIRED` (10004), `AUTH_REQUIRED` (10005), `AUTH_INVALID_KEY` (10006) |
+| 11xxx | Server health | `SERVER_BUSY` (11000) |
 
-`ErrorResponse` methods: `is_not_leader()`, `is_identity_required()`, `parse_leader_address()`.
+`ErrorResponse` methods: `is_not_leader()`, `is_identity_required()`, `is_server_busy()`, `parse_leader_address()`.
 
 ### ReadWireDataError
 
@@ -191,6 +197,7 @@ pub enum ReadWireDataError {
 |----------|---------|
 | `ClientRequest::read_from_header` | Deserialize client request given a pre-read wire header |
 | `ClientRequest::write_request` | Serialize client request to async writer |
+| `ClientRequest::request_type` | Returns `ClientRequestType` enum variant for the request |
 | `ClientRequest::correlation_id` | Extract correlation ID for request/response matching |
 | `ClientRequest::aggregate_id` | Extract aggregate ID for routing (0 for non-aggregate requests) |
 | `ClientRequest::org_id` | Extract org ID for routing (0 for non-aggregate requests) |
@@ -198,6 +205,7 @@ pub enum ReadWireDataError {
 | `ClientResponse::read_response` | Deserialize client response from async reader |
 | `ClientResponse::read_from_header` | Deserialize client response given a pre-read wire header |
 | `ClientResponse::write_response` | Serialize client response to async writer |
+| `ClientResponse::response_type` | Returns `ClientResponseType` enum variant for the response |
 | `ClientResponse::determine_compression_type` | Get appropriate compression for response type |
 
 ### Cluster
@@ -206,10 +214,12 @@ pub enum ReadWireDataError {
 |----------|---------|
 | `ClusterRequest::read_from_header` | Deserialize cluster request given a pre-read wire header |
 | `ClusterRequest::write_request` | Serialize cluster request to async writer |
+| `ClusterRequest::request_type` | Returns `ClusterRequestType` enum variant for the request |
 | `ClusterRequest::correlation_id` | Extract correlation ID |
 | `ClusterResponse::read_response` | Deserialize cluster response from async reader |
 | `ClusterResponse::read_from_header` | Deserialize cluster response given a pre-read wire header |
 | `ClusterResponse::write_response` | Serialize cluster response to async writer |
+| `ClusterResponse::response_type` | Returns `ClusterResponseType` enum variant for the response |
 | `ClusterResponse::determine_compression_type` | Always returns `CompressionType::None` |
 
 ### Identify

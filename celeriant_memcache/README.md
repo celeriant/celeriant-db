@@ -1,6 +1,6 @@
 # celeriant_memcache
 
-In-memory caching layer for the Celeriant WAL. Manages recent writes, aggregate positions, client idempotency tracking, pending write queues, and replication visibility.
+In-memory caching layer for the Celeriant WAL. Manages recent writes, aggregate positions, client idempotency tracking, pending write queues, replication visibility, and schema validation caching.
 
 ## Architecture
 
@@ -24,8 +24,8 @@ Write Path (Leader):
                                        │ take_pending_replication
                                        ▼
 ┌─────────────────────┐     ┌──────────────────────┐
-│ aggregate_read_     │<────│ commit_read_position_│
-│ snapshots (LRU)     │     │ snapshot             │
+│ aggregate_read_     │<────│ commit_position_     │
+│ snapshots (LRU)     │     │ snapshot (Read)      │
 └─────────────────────┘     └──────────────────────┘
 
 Write Path (Non-Leader / Single Node):
@@ -55,7 +55,7 @@ Read Path:
 
 | Type | Purpose |
 |------|---------|
-| `ShardMemCache` | Main cache coordinating all sub-caches |
+| `ShardMemCache<V: Validate>` | Main cache coordinating all sub-caches, generic over schema validator |
 | `CachePath` | `Read` or `Write` - controls which snapshot LRU is accessed |
 | `AggregateRecentWrites` | VecDeque of recent writes for one aggregate |
 | `MemSnapshotAggregate` | Cached aggregate position, status, and metadata |
@@ -69,6 +69,10 @@ Read Path:
 | `AggregateStatus` | `Found` / `NotFound` / `Deleted` |
 | `EventIndexes` | Latest indexes from queue or write snapshot |
 | `WalIndexPosition` | Cached WAL index → log file position mapping |
+| `Validate` | Trait for schema validators used by `ShardMemCache<V>` |
+| `CachedSchema<V>` | `Validated(CachedValidator<V>)` or `CompilationFailed(String)` |
+| `CachedValidator<V>` | Wraps an `Rc<V>` validator with size estimate |
+| `UniqueSchemaKeys` | Small-vec optimized set of schema keys (inline up to 2, then Vec) |
 
 ## Key Functions
 
@@ -92,10 +96,11 @@ Read Path:
 | `get_aggregate_last_metablock_pos` | Get last known metablock position (takes `CachePath`) |
 | `get_aggregate_snapshot` | Retrieve cloned snapshot (takes `CachePath`) |
 | `put_aggregate_into_cache` | Insert snapshot with client tracking (takes `CachePath`) |
+| `put_aggregate_snapshot_only` | Insert snapshot without client tracking (takes `CachePath`) |
 | `put_aggregate_into_cache_as_not_found` | Mark aggregate as never created |
 | `put_aggregate_into_cache_as_deleted` | Mark as soft-deleted; clears recent writes on read path |
 | `put_aggregate_client_into_cache` | Insert client event index |
-| `commit_read_position_snapshot` | Update read LRU from replicated batch |
+| `commit_position_snapshot` | Update aggregate position in specified LRU (takes `CachePath`) |
 | `copy_write_to_read_snapshot` | Copy single aggregate write→read snapshot on commit |
 | `update_aggregate_min_event_batch_index` | Update trim position; evicts stale recent writes on read path |
 | `push_pending_replication` | Add batch to pending replication queue, returns true if high water mark exceeded |
@@ -107,6 +112,15 @@ Read Path:
 | `cache_wal_index_position` | Cache WAL index → file position mapping |
 | `get_wal_index_position` | Retrieve exact cached position |
 | `find_nearest_wal_index_position` | Find nearest cached position ≤ target (for list pagination) |
+| `schema_cache_get` | Get cached schema (`Validated` or `CompilationFailed`) |
+| `schema_cache_insert` | Insert a compiled schema into cache |
+| `no_schema_cache_insert` | Cache that a schema key has no schema registered |
+| `schema_cache_contains` | Check if either schema or no-schema cache contains a key |
+| `schema_cache_has_schema` | Check if a real schema (not no-schema) exists |
+| `schema_is_pending` | Check if a schema registration is pending fsync |
+| `schema_mark_pending` | Mark a schema as pending fsync |
+| `clear_all_caches` | Clear all caches including read snapshots and recent writes |
+| `pending_replication_bytes` | Get current replication queue byte count |
 
 ## Usage
 
@@ -117,6 +131,7 @@ let cache = ShardMemCache::new(
     16 * 1024 * 1024,  // 16MB aggregate snapshots (shared cap for read+write LRUs)
     8 * 1024 * 1024,   // 8MB client snapshots
     1024 * 1024,       // 1MB WAL index cache
+    4 * 1024 * 1024,   // 4MB schema cache
     256 * 1024 * 1024, // 256MB replication high water mark
 );
 
@@ -138,7 +153,7 @@ cache.commit_sync_positions_snapshot(node_status, snapshot);
 // On non-leader: read snapshots updated immediately
 
 // Leader: after replication completes
-cache.commit_read_position_snapshot(&event_batch, log_id, metablock_absolute_pos);
+cache.commit_position_snapshot(&event_batch, log_id, metablock_absolute_pos, CachePath::Read);
 
 // Cache hot data after commit
 cache.cache_recent_write(aggregate_key, batch_index, metablock, datablock, size);
@@ -169,7 +184,7 @@ The write cache is visible to the leader for OCC and idempotency checks. The rea
 ### Pending replication queue with high water mark backpressure
 
 ```rust
-pub struct ShardMemCache {
+pub struct ShardMemCache<V: Validate> {
     pending_replication_batches: Vec<PendingCommitData>, // post-fsync, pre-commit
     pending_replication_bytes: u64,
     pending_replication_high_water_bytes: u64,           // S3 fallback threshold
@@ -200,7 +215,7 @@ During fsync, the queue snapshot is cloned so new writes see correct indexes. Th
 ### Size-bounded recent write cache
 
 ```rust
-pub struct ShardMemCache {
+pub struct ShardMemCache<V: Validate> {
     recent_write_cache_bytes: u64,      // Max size
     cache_current_bytes: u64,           // Current size
     cache_eviction_queue: VecDeque<_>,  // FIFO eviction order
@@ -289,6 +304,16 @@ pub fn get_cached_writes_from(
 
 Each `RecentWrite` carries the `wal_index` of the write that produced it. The reader supplies the highest `wal_index` that is safe to serve (i.e. confirmed replicated). Writes beyond that boundary are silently excluded, ensuring readers never see data ahead of the replication frontier even if it is already cached in memory.
 
+### Schema validation caching
+
+```rust
+schema_cache: LruCache<SchemaKey, CachedSchema<V>>   // compiled validators
+no_schema_cache: LruCache<SchemaKey, ()>              // confirmed no-schema-registered
+pending_schema_registrations: HashSet<SchemaKey>      // awaiting fsync
+```
+
+Two-tier schema cache: `schema_cache` holds compiled validators (or compilation failures), while `no_schema_cache` records keys confirmed to have no schema. This avoids repeated disk lookups for unschema'd aggregates. `pending_schema_registrations` tracks registrations that are queued but not yet fsynced, preventing duplicate registrations within the same batch.
+
 ## Dependencies
 
 - `celeriant_wal` - WAL data structures (Metablock, Datablock, keys, constants)
@@ -296,3 +321,4 @@ Each `RecentWrite` carries the `wal_index` of the write that produced it. The re
 - `celeriant_rotating_log` - `LogSegmentFileMetadata` stored in `PendingCommitData`
 - `lru` - LRU cache implementation
 - `deepsize` - Memory size estimation for queue items
+- `metrics` - Metrics collection
