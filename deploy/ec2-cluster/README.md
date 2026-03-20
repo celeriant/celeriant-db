@@ -92,7 +92,8 @@ deploy/ec2-cluster/
 ├── scripts/
 │   ├── generate-certs.sh        # Dual-CA cert generation with IP SANs
 │   ├── deploy.sh                # Deploys binaries, certs, env files, enables systemd
-│   └── run-benchmark.sh         # Runs benchmark on client, collects results locally
+│   ├── run-benchmark.sh         # Runs benchmark on client, collects results locally
+│   └── deploy-dashboard.sh      # Imports Celeriant dashboard to Grafana Cloud
 ├── certs/                       # Generated certs (gitignored)
 ├── results/                     # Benchmark results (gitignored)
 ├── .cluster-env                 # Cached IPs/config (gitignored, written by deploy.sh)
@@ -113,6 +114,7 @@ make restart           # Stop then start
 make status            # Check service status
 make logs              # Tail logs from both nodes (Ctrl+C to stop)
 make run-benchmark     # Run benchmark and save results
+make dashboard         # Import Celeriant dashboard to Grafana Cloud
 make sync-env          # Re-read CDK outputs into .cluster-env
 make teardown          # Stop cluster + destroy CDK stack
 make teardown-data     # Wipe data on data nodes
@@ -164,6 +166,7 @@ A client cert cannot authenticate to the replication port.
 | Storage | NVMe HAT | NVMe instance store or EBS gp3 |
 | S3 | MinIO on infra node | AWS S3 |
 | Monitoring | Self-hosted Grafana/Prometheus/Loki | Grafana Cloud (optional) |
+| Dashboard | Auto-provisioned from local-cluster | `make dashboard` imports same JSON |
 | Network | LAN switch | Same AZ (LAN-equivalent) |
 | Service mgmt | systemd | systemd |
 | Orchestration | Makefile | Makefile |
@@ -197,6 +200,15 @@ ssh ec2-user@<node> 'journalctl -u celeriant -n 100 --no-pager'
 With Grafana Cloud (set `grafanaApiKey`, `grafanaPromUrl`, `grafanaLokiUrl`):
 - Metrics: `{job="celeriant"}` in Prometheus
 - Logs: `{unit="celeriant.service"}` in Loki
+
+Import the same Celeriant cluster dashboard used by the RPi and local clusters:
+```bash
+make dashboard GRAFANA_URL=https://your-stack.grafana.net GRAFANA_TOKEN=glsa_...
+```
+
+The `GRAFANA_TOKEN` needs Editor or Admin role — the `MetricsPublisher` key used
+by Alloy is not sufficient. Create a Service Account token in Grafana Cloud under
+**Administration > Service Accounts**.
 
 ## Teardown
 

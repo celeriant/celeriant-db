@@ -25,7 +25,7 @@ BENCH_CONNS ?= $(BENCH_TASKS)
 BENCH_DURATION ?= 15
 
 .PHONY: help infra certs deploy start stop restart status logs \
-        run-benchmark sync-env teardown teardown-data
+        dashboard run-benchmark sync-env teardown teardown-data
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -111,6 +111,13 @@ logs: ## Tail logs from both data nodes (Ctrl+C to stop)
 # ---------------------------------------------------------------------------
 # Benchmarks
 # ---------------------------------------------------------------------------
+
+dashboard: ## Import Celeriant dashboard to Grafana Cloud (needs GRAFANA_URL and GRAFANA_TOKEN)
+	@if [[ -z "$(GRAFANA_URL)" || -z "$(GRAFANA_TOKEN)" ]]; then \
+		printf "$(RED)Usage: make dashboard GRAFANA_URL=https://your-stack.grafana.net GRAFANA_TOKEN=glsa_...$(RESET)\n"; \
+		exit 1; \
+	fi
+	@bash scripts/deploy-dashboard.sh --grafana-url $(GRAFANA_URL) --grafana-token $(GRAFANA_TOKEN)
 
 run-benchmark: ## Run benchmark on client node and collect results
 	@if [[ -z "$(CLIENT_PUB)" ]]; then printf "$(RED)No .cluster-env$(RESET)\n"; exit 1; fi
