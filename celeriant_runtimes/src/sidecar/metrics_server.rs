@@ -97,6 +97,7 @@ fn register_metric_descriptions() {
     // Connections
     describe_gauge!("celeriant_client_connections_active", "Open client TCP connections");
     describe_counter!("celeriant_connection_redirects_total", "Cross-shard connection redirects");
+    describe_counter!("celeriant_mesh_channel_full_total", "Mesh channel full events by message type");
     describe_gauge!("celeriant_watch_subscribers_active", "Active watch subscriptions");
 
     // Cluster

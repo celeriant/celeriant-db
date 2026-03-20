@@ -110,6 +110,10 @@ impl ErrorResponse {
         self.error_code == crate::error_codes::IDENTIFY_REQUIRED
     }
 
+    pub fn is_server_busy(&self) -> bool {
+        self.error_code == crate::error_codes::SERVER_BUSY
+    }
+
     /// Extract leader address from error_message JSON like `{"leader_address":"host:port"}`.
     /// Returns None if the message doesn't contain a leader address.
     pub fn parse_leader_address(&self) -> Option<String> {

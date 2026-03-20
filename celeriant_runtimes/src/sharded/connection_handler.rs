@@ -27,6 +27,7 @@ use tracing::{debug, info, warn};
 
 use super::{
     intrashard_messages::IntrashardMessages,
+    shard::try_send_with_retry,
     shard_config::ShardConfig,
     shard_error_response::{shard_error_to_client_response, shard_error_to_cluster_response, shard_routing_error_to_code, watch_read_error_to_client_response, watch_session_error_to_client_response},
 };
@@ -264,9 +265,12 @@ pub fn handle_enter_s3_catchup<R: ReplicationClient + 'static, D: S3Downloader +
     glommio::spawn_local(async move {
         let result = ctx.shard_wal.enter_s3_catchup().await;
 
-        let _ = ctx.intrashard_sender.send_to(
-            0, IntrashardMessages::S3CatchupComplete { shard_id: ctx.current_shard_id, result }
-        ).await;
+        if let Err(e) = try_send_with_retry(
+            ctx.intrashard_sender.as_ref(), 0,
+            IntrashardMessages::S3CatchupComplete { shard_id: ctx.current_shard_id, result }, 10
+        ).await {
+            panic!("Shard {} failed to send S3CatchupComplete to shard 0 after retries: {e:?}", ctx.current_shard_id);
+        }
     })
     .detach();
 }
@@ -546,6 +550,7 @@ async fn check_client_redirect<R: ReplicationClient + 'static, D: S3Downloader +
             "Client connection redirected to another shard"
         );
         metrics::counter!("celeriant_connection_redirects_total").increment(1);
+        let correlation_id = request.correlation_id();
         let msg = IntrashardMessages::ClientConnectionRedirect {
             accepted_tcp_stream: tcp_stream.into_accepted(),
             request,
@@ -553,8 +558,21 @@ async fn check_client_redirect<R: ReplicationClient + 'static, D: S3Downloader +
             verified_client_id: conn_state.verified_client_id,
             access_level: conn_state.access_level,
         };
-        if let Err(e) = ctx.intrashard_sender.send_to(target_shard, msg).await {
-            warn!("Failed to redirect client connection to shard {target_shard}: {e:?}");
+        if let Err(e) = ctx.intrashard_sender.try_send_to(target_shard, msg) {
+            metrics::counter!("celeriant_mesh_channel_full_total", "message_type" => "client_redirect").increment(1);
+            warn!("Mesh channel full, rejecting client redirect to shard {target_shard}: {e:?}");
+            if let Some(inner) = e.into_inner() {
+                if let IntrashardMessages::ClientConnectionRedirect { accepted_tcp_stream, .. } = inner {
+                    let mut stream = accepted_tcp_stream.bind_to_executor();
+                    let response = ClientResponse::GenericError(ErrorResponse {
+                        correlation_id,
+                        error_code: error_codes::SERVER_BUSY,
+                        error_message: "{}".into(),
+                    });
+                    let _ = write_client_response_with_timeout(&mut stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
+                    return ClientRedirectResult::ErrorSentContinue(stream);
+                }
+            }
         }
         return ClientRedirectResult::Redirected;
     }
@@ -585,13 +603,27 @@ async fn check_cluster_redirect<R: ReplicationClient + 'static, D: S3Downloader 
     };
 
     if target_shard != ctx.current_shard_id {
+        let correlation_id = request.correlation_id();
         let msg = IntrashardMessages::ClusterConnectionRedirect {
             accepted_tcp_stream: tcp_stream.into_accepted(),
             request,
             message_version,
         };
-        if let Err(e) = ctx.intrashard_sender.send_to(target_shard, msg).await {
-            warn!("Failed to redirect cluster connection to shard {target_shard}: {e:?}");
+        if let Err(e) = ctx.intrashard_sender.try_send_to(target_shard, msg) {
+            metrics::counter!("celeriant_mesh_channel_full_total", "message_type" => "cluster_redirect").increment(1);
+            warn!("Mesh channel full, rejecting cluster redirect to shard {target_shard}: {e:?}");
+            if let Some(inner) = e.into_inner() {
+                if let IntrashardMessages::ClusterConnectionRedirect { accepted_tcp_stream, .. } = inner {
+                    let mut stream = accepted_tcp_stream.bind_to_executor();
+                    let response = ClusterResponse::GenericError(ErrorResponse {
+                        correlation_id,
+                        error_code: error_codes::SERVER_BUSY,
+                        error_message: "{}".into(),
+                    });
+                    let _ = write_cluster_response_with_timeout(&mut stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
+                    return ClusterRedirectResult::ErrorSentContinue(stream);
+                }
+            }
         }
         return ClusterRedirectResult::Redirected;
     }
@@ -999,7 +1031,7 @@ async fn handle_schema_registration_coordination<R: ReplicationClient + 'static,
             request_id,
         };
 
-        if ctx.intrashard_sender.send_to(shard_id, msg).await.is_err() {
+        if try_send_with_retry(ctx.intrashard_sender.as_ref(), shard_id, msg, 10).await.is_err() {
             return Err(ShardSchemaError::SchemaCoordinationFailed {
                 failed_shard_count: num_shards - shard_id,
                 total_shards: num_shards,
@@ -1203,8 +1235,9 @@ async fn broadcast_status<R: ReplicationClient + 'static, D: S3Downloader + 'sta
         if peer == ctx.current_shard_id {
             continue;
         }
-        let _ = ctx.intrashard_sender.send_to(
-            peer, IntrashardMessages::StatusUpdate { status }
+        let _ = try_send_with_retry(
+            ctx.intrashard_sender.as_ref(), peer,
+            IntrashardMessages::StatusUpdate { status }, 10
         ).await;
     }
 }

@@ -214,6 +214,8 @@ impl From<ErrorResponse> for ServerError {
                 ServerError::ShardRouting { error_code: code, error_message: msg }
             }
 
+            SERVER_BUSY => ServerError::Unknown { error_code: code, error_message: msg },
+
             IDENTIFY_INVALID_NONCE => ServerError::Auth { kind: AuthError::InvalidNonce, error_message: msg },
             IDENTIFY_INVALID_SIGNATURE => ServerError::Auth { kind: AuthError::InvalidSignature, error_message: msg },
             IDENTIFY_MISMATCH => ServerError::Auth { kind: AuthError::Mismatch, error_message: msg },

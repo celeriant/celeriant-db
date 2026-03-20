@@ -305,10 +305,26 @@ async fn broadcast_message_to_other_shards(current_shard_id: usize, message: Int
         if peer == current_shard_id {
             continue;
         }
-        if let Err(e) = senders.as_ref().send_to(peer, message.clone()).await {
-            error!("Failed to send shutdown signal to shard {peer}: {e:?}");
+        if let Err(e) = try_send_with_retry(senders.as_ref(), peer, message.clone(), 10).await {
+            error!("Failed to send message to shard {peer}: {e:?}");
         }
     }
+}
+
+pub(crate) async fn try_send_with_retry<T: Send>(senders: &Senders<T>, peer: usize, mut msg: T, max_retries: usize) -> Result<(), glommio::GlommioError<T>> {
+    for _ in 0..max_retries {
+        match senders.try_send_to(peer, msg) {
+            Ok(()) => return Ok(()),
+            Err(e) => match e {
+                glommio::GlommioError::WouldBlock(glommio::ResourceType::Channel(returned)) => {
+                    msg = returned;
+                    glommio::yield_if_needed().await;
+                }
+                other => return Err(other),
+            },
+        }
+    }
+    senders.try_send_to(peer, msg)
 }
 
 fn spawn_shard_zero_shutdown_handler<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(ctx: ConnectionContext<R, D, S>) {
@@ -350,7 +366,9 @@ async fn run_s3_catchup<R: ReplicationClient + 'static, D: S3Downloader + 'stati
     loop {
         attempt += 1;
         for peer in 1..shard_count {
-            let _ = ctx.intrashard_sender.send_to(peer, IntrashardMessages::EnterS3Catchup).await;
+            if let Err(e) = try_send_with_retry(ctx.intrashard_sender.as_ref(), peer, IntrashardMessages::EnterS3Catchup, 10).await {
+                panic!("Failed to send S3 catchup to shard {peer} after retries: {e:?}");
+            }
         }
 
         let mut results = vec![];
@@ -536,10 +554,7 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
 
         // Node registration only needs to be done once on boot
         if let Err(e) = lease_manager.register_self_on_membership_s3_object().await {
-            error!(error = %e, "Failed to register node in membership, shutting down");
-            ctx.shutdown_requested.set(true);
-            broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::Shutdown, ctx.intrashard_sender.clone()).await;
-            return;
+            panic!("Failed to register node in membership (IAM or network issue): {e}");
         }
 
         let half_s3_lease = ctx.config.replication_config.as_ref().unwrap().s3_lease_duration / 2;
@@ -607,10 +622,7 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                         }
                     }
                     Err(e) => {
-                        error!(error = %e, "Election failed after retries, shutting down");
-                        ctx.shutdown_requested.set(true);
-                        broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::Shutdown, ctx.intrashard_sender.clone()).await;
-                        return;
+                        panic!("Election failed after retries: {e}");
                     }
                 }
 
@@ -640,10 +652,7 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                 info!(node_status = ?ctx.shard_wal.node_status.get(), "Follower or fenced node detected expired lease, challenging for leadership");
 
                 if let Err(e) = set_node_role_via_s3(&lease_manager, &ctx, &rx).await {
-                    error!(error = %e, "Election failed after retries, shutting down");
-                    ctx.shutdown_requested.set(true);
-                    broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::Shutdown, ctx.intrashard_sender.clone()).await;
-                    return;
+                    panic!("Election failed after retries: {e}");
                 }
 
                 continue;
@@ -654,18 +663,12 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                 info!("Node was follower but got kicked, or we are in boot catchup phase, asking shards to catch up via s3");
 
                 if !run_s3_catchup(&ctx, &rx).await {
-                    error!("Failed to run s3 catchup, shutting down");
-                    ctx.shutdown_requested.set(true);
-                    broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::Shutdown, ctx.intrashard_sender.clone()).await;
-                    return;
+                    panic!("S3 catchup failed with fatal error");
                 }
 
                 // WAL is caught up — now determine our role via S3 election
                 if let Err(e) = set_node_role_via_s3(&lease_manager, &ctx, &rx).await {
-                    error!(error = %e, "Post-catchup election failed, shutting down");
-                    ctx.shutdown_requested.set(true);
-                    broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::Shutdown, ctx.intrashard_sender.clone()).await;
-                    return;
+                    panic!("Post-catchup election failed after retries: {e}");
                 }
 
                 continue;
@@ -760,7 +763,7 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
                 request_id,
                 result,
             };
-            let _ = ctx.intrashard_sender.send_to(0, completion_msg).await;
+            let _ = try_send_with_retry(ctx.intrashard_sender.as_ref(), 0, completion_msg, 10).await;
         }
         IntrashardMessages::SchemaRegistrationComplete { request_id, result } => {
             if let Some(pending_map) = &ctx.schema_registration_pending {

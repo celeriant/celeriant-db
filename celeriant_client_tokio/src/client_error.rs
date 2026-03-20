@@ -18,6 +18,9 @@ pub enum ClientError {
     /// Server requires client identity verification (error 10004).
     /// The client should call `identify()` before sending other requests.
     IdentityRequired,
+    /// Server is too busy to handle the request.
+    /// The client should retry after a brief backoff.
+    ServerBusy,
     ConnectionTimeout,
     RequestTimeout,
     /// Identity verification error (nonce generation, signing, or verification failure)
@@ -32,6 +35,8 @@ impl ClientError {
             ClientError::NotLeader { leader_address, error_message }
         } else if error.is_identity_required() {
             ClientError::IdentityRequired
+        } else if error.is_server_busy() {
+            ClientError::ServerBusy
         } else {
             ClientError::Server(ServerError::from(error))
         }
@@ -49,6 +54,7 @@ impl std::fmt::Display for ClientError {
             ClientError::NotLeader { leader_address: None, .. } => write!(f, "Not leader, leader address unknown"),
             ClientError::Server(e) => write!(f, "{}", e),
             ClientError::IdentityRequired => write!(f, "Server requires client identity verification — call identify() first"),
+            ClientError::ServerBusy => write!(f, "Server busy — retry after backoff"),
             ClientError::RequestTimeout => write!(f, "Request timeout"),
             ClientError::ConnectionTimeout => write!(f, "Connection timeout"),
             ClientError::IdentityError(e) => write!(f, "Identity verification error: {}", e),

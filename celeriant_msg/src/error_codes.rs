@@ -92,6 +92,10 @@ pub const SHARD_ROUTING_NO_KEY: u32 = 9000;
 pub const SHARD_ROUTING_MULTIPLE_SHARDS: u32 = 9001;
 pub const SHARD_ROUTING_INCOMPATIBLE_FILTERS: u32 = 9002;
 
+// --- Server health errors: 11xxx ---
+/// Returned when a shard's inter-shard channel is full and the request cannot be routed.
+pub const SERVER_BUSY: u32 = 11000;
+
 // --- Identity & authentication errors: 10xxx ---
 pub const IDENTIFY_INVALID_NONCE: u32 = 10001;
 pub const IDENTIFY_INVALID_SIGNATURE: u32 = 10002;

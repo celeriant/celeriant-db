@@ -27,6 +27,7 @@ macro_rules! leader_route {
             }
             Err(ClientError::NotLeader { leader_address: None, .. }) => {}
             Err(ClientError::ConnectionFailed(_)) => {}
+            Err(ClientError::ServerBusy) => {}
             Err(e) => return Err(e),
         }
 
@@ -49,6 +50,7 @@ macro_rules! leader_route {
                 }
                 Err(ClientError::NotLeader { leader_address: None, .. }) => continue,
                 Err(ClientError::ConnectionFailed(_)) => continue,
+                Err(ClientError::ServerBusy) => continue,
                 Err(e) => return Err(e),
             }
         }
@@ -91,6 +93,7 @@ macro_rules! read_route {
                             conn.mark_broken();
                             continue;
                         }
+                        Err(ClientError::ServerBusy) => continue,
                         Err(e) => return Err(e),
                     }
                 }
