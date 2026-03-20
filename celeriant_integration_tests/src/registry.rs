@@ -130,6 +130,13 @@ pub fn all_tests() -> &'static [TestEntry] {
             distributed: true,
         },
         TestEntry {
+            name: "rpi_cluster_pool_bench",
+            description: "Pool-based write benchmark with automatic leader failover",
+            estimated_secs: 60,
+            categories: &[Performance],
+            distributed: true,
+        },
+        TestEntry {
             name: "chaos",
             description: "Concurrent read/write testing with variable large payload sizes",
             estimated_secs: 31,

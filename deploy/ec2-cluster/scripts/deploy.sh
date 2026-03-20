@@ -1,15 +1,11 @@
 #!/bin/bash
-# Deploy Celeriant binaries and certs to the EC2 kTLS test cluster.
+# Deploy Celeriant binaries, certs, and env files to the EC2 cluster.
+# Installs systemd services on data nodes (mirrors deploy/rpi-cluster).
 #
 # Reads IPs from CDK stack outputs. Run after `npx cdk deploy`.
 #
 # Usage:
-#   ./deploy.sh [--key-file ~/.ssh/your-key.pem]
-#
-# Prerequisites:
-#   - CDK stack deployed (npx cdk deploy)
-#   - Certs generated (./generate-certs.sh)
-#   - Binaries built (cargo build --release -p celeriant -p celeriant_integration_tests)
+#   ./deploy.sh --key-file ~/.ssh/your-key.pem
 
 set -euo pipefail
 
@@ -48,12 +44,15 @@ LEADER_IP=$(get_output LeaderPrivateIp)
 FOLLOWER_IP=$(get_output FollowerPrivateIp)
 BUCKET=$(get_output BucketName)
 REGION=$(get_output Region)
+INSTANCE_TYPE=$(get_output InstanceType)
+STORAGE_TYPE=$(get_output StorageType)
 
 echo "  Leader:   $LEADER_PUB ($LEADER_IP)"
 echo "  Follower: $FOLLOWER_PUB ($FOLLOWER_IP)"
 echo "  Client:   $CLIENT_PUB"
 echo "  Bucket:   $BUCKET"
 echo "  Region:   $REGION"
+echo "  Instance: $INSTANCE_TYPE ($STORAGE_TYPE storage)"
 
 # Check prerequisites
 BINARY="$REPO_ROOT/target/release/celeriant"
@@ -113,7 +112,7 @@ $SCP "$CERT_DIR/client-ca.crt" "$CERT_DIR/client.crt" "$CERT_DIR/client.key" \
 $SSH@${CLIENT_PUB} 'sudo mv /tmp/client-ca.crt /tmp/client.crt /tmp/client.key /etc/celeriant/certs/ && sudo chmod 600 /etc/celeriant/certs/client.key'
 
 echo ""
-echo "==> Generating env files"
+echo "==> Generating and deploying env files"
 
 generate_env() {
   local NODE_IP=$1
@@ -143,26 +142,43 @@ CELERIANT_SHARD_LOG_PREALLOCATE_BYTES=134217728
 EOF
 }
 
+# Deploy env files to /etc/celeriant/ (read by systemd EnvironmentFile)
 generate_env "$LEADER_IP" > /tmp/celeriant-leader.env
 generate_env "$FOLLOWER_IP" > /tmp/celeriant-follower.env
 
 $SCP /tmp/celeriant-leader.env ec2-user@${LEADER_PUB}:/tmp/celeriant.env
+$SSH@${LEADER_PUB} 'sudo mv /tmp/celeriant.env /etc/celeriant/celeriant.env'
+
 $SCP /tmp/celeriant-follower.env ec2-user@${FOLLOWER_PUB}:/tmp/celeriant.env
+$SSH@${FOLLOWER_PUB} 'sudo mv /tmp/celeriant.env /etc/celeriant/celeriant.env'
+
+echo "==> Enabling systemd service on data nodes"
+for HOST in $LEADER_PUB $FOLLOWER_PUB; do
+  $SSH@${HOST} 'sudo systemctl enable celeriant'
+  echo "  Enabled on $HOST"
+done
+
+# Write .cluster-env for Makefile consumption
+ENV_FILE="$CDK_DIR/.cluster-env"
+cat > "$ENV_FILE" <<EOF
+LEADER_PUB=$LEADER_PUB
+FOLLOWER_PUB=$FOLLOWER_PUB
+CLIENT_PUB=$CLIENT_PUB
+LEADER_IP=$LEADER_IP
+FOLLOWER_IP=$FOLLOWER_IP
+BUCKET=$BUCKET
+REGION=$REGION
+INSTANCE_TYPE=$INSTANCE_TYPE
+STORAGE_TYPE=$STORAGE_TYPE
+KEY_FILE=$KEY_FILE
+EOF
+echo ""
+echo "==> Wrote $ENV_FILE (used by Makefile)"
 
 echo ""
-echo "==> Done! To start the cluster:"
-echo ""
-echo "  # Terminal 1 — leader"
-echo "  ssh $SSH_OPTS ec2-user@${LEADER_PUB}"
-echo "  set -a && source /tmp/celeriant.env && set +a && celeriant"
-echo ""
-echo "  # Terminal 2 — follower (wait ~5s for leader to grab S3 lease)"
-echo "  ssh $SSH_OPTS ec2-user@${FOLLOWER_PUB}"
-echo "  set -a && source /tmp/celeriant.env && set +a && celeriant"
-echo ""
-echo "  # Terminal 3 — benchmark client"
-echo "  ssh $SSH_OPTS ec2-user@${CLIENT_PUB}"
-echo "  CELERIANT_TLS_CA_CERT=/etc/celeriant/certs/client-ca.crt \\"
-echo "  CELERIANT_TLS_CLIENT_CERT=/etc/celeriant/certs/client.crt \\"
-echo "  CELERIANT_TLS_CLIENT_KEY=/etc/celeriant/certs/client.key \\"
-echo "    celeriant-integration-tests batch --address ${LEADER_IP}:10000"
+echo "==> Done! Use the Makefile to manage the cluster:"
+echo "  make start        # Start leader then follower"
+echo "  make status       # Check service status"
+echo "  make logs         # Tail logs from both nodes"
+echo "  make run-benchmark # Run benchmark and collect results"
+echo "  make stop         # Stop cluster"

@@ -18,8 +18,8 @@ RESET  := \033[0m
         deploy build ship restart stop start logs run-test teardown teardown-data
 
 help: ## Show this help
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
-		awk 'BEGIN {FS = ":.*?## "}; {printf "  $(GREEN)%-18s$(RESET) %s\n", $$1, $$2}'
+	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
+		awk 'BEGIN {FS = ":.*## "}; {printf "  $(GREEN)%-18s$(RESET) %s\n", $$1, $$2}'
 
 # ---------------------------------------------------------------------------
 # Full setup (first-time)
@@ -140,15 +140,15 @@ logs: ## Tail logs from both data nodes (Ctrl+C to stop)
 # Integration tests
 # ---------------------------------------------------------------------------
 
-run-test: ## Run rpi_cluster_bench integration test against the cluster
-	@printf "$(BOLD)>>> Running rpi_cluster_bench against $(LEADER_HOST):$(CLIENT_PORT)$(RESET)\n"
+run-test: ## Run rpi_cluster_pool_bench integration test against the cluster
+	@printf "$(BOLD)>>> Running rpi_cluster_pool_bench against $(LEADER_HOST):$(CLIENT_PORT) + $(FOLLOWER_HOST):$(CLIENT_PORT)$(RESET)\n"
 	cd $(PROJECT_ROOT) && \
-		CLUSTER_ADDRESS=$(LEADER_HOST):$(CLIENT_PORT) \
+		CLUSTER_ADDRESS_1=$(LEADER_HOST):$(CLIENT_PORT) \
+		CLUSTER_ADDRESS_2=$(FOLLOWER_HOST):$(CLIENT_PORT) \
 		CLUSTER_SERVER_NAME=$(LEADER_HOST) \
-		CLUSTER_THROUGHPUT_CONNECTIONS=$(CLUSTER_THROUGHPUT_CONNECTIONS) \
-		CLUSTER_LATENCY_CONNECTIONS=$(CLUSTER_LATENCY_CONNECTIONS) \
+		CLUSTER_TASKS=$(CLUSTER_THROUGHPUT_CONNECTIONS) \
 		CLUSTER_DURATION=$(CLUSTER_DURATION) \
-		cargo run --release -p celeriant_integration_tests -- --test rpi_cluster_bench
+		cargo run --release -p celeriant_integration_tests -- --test rpi_cluster_pool_bench
 
 # ---------------------------------------------------------------------------
 # Teardown

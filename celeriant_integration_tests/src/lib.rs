@@ -57,6 +57,7 @@ pub mod p4_1_rolling_upgrade;
 pub mod pool_test;
 pub mod read_list_benchmark;
 pub mod rpi_cluster_bench;
+pub mod rpi_cluster_pool_bench;
 pub mod s3_concurrent_cas;
 pub mod s3_election;
 pub mod s3_failover_and_recovery;

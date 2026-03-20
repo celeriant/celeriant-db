@@ -5,16 +5,17 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import { Construct } from 'constructs';
 
 /**
- * Celeriant kTLS test cluster on EC2.
+ * Celeriant performance test cluster on EC2.
  *
- * Mirrors the RPi cluster setup (see docs/pending/rpi-ktls-testbed.md):
- *   - 2 data nodes (leader + follower) with dual-CA mTLS, local NVMe storage
+ * Mirrors the RPi cluster setup (deploy/rpi-cluster):
+ *   - 2 data nodes (leader + follower) with dual-CA mTLS, systemd services
  *   - 1 client node for running benchmarks and CLI
  *   - Real S3 for cluster coordination (replaces MinIO)
  *   - Grafana Cloud for observability (replaces self-hosted Grafana/Prometheus/Loki)
  *
- * Default instance: c6id.2xlarge (8 vCPUs, 16GB RAM, 1x 474GB NVMe)
- * Data nodes use the local NVMe for /var/lib/celeriant (formatted XFS on boot).
+ * Storage modes:
+ *   - instance-store (default): local NVMe for /var/lib/celeriant (e.g. c6id, i3en)
+ *   - ebs: dedicated gp3 volume for /var/lib/celeriant (e.g. t3, m5, c5)
  */
 export class Ec2ClusterStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -23,6 +24,8 @@ export class Ec2ClusterStack extends cdk.Stack {
     // --- Context values (override with -c key=value) ---
     const instanceType = this.node.tryGetContext('instanceType') ?? 'c6id.2xlarge';
     const keyPairName = this.node.tryGetContext('keyPair');
+    const storageType = this.node.tryGetContext('storageType') ?? 'instance-store';
+    const ebsDataVolumeSize = parseInt(this.node.tryGetContext('ebsDataVolumeSize') ?? '100', 10);
 
     // Grafana Cloud (optional — set all three to enable)
     const grafanaPromUser = this.node.tryGetContext('grafanaPromUser') ?? '';
@@ -105,8 +108,30 @@ export class Ec2ClusterStack extends cdk.Stack {
       'dnf install -y tar gzip',
     ];
 
-    // NVMe detection, format, and mount for data nodes
-    const nvmeSetup = [
+    // Storage setup for data nodes — depends on storageType
+    const storageSetup = storageType === 'ebs' ? [
+      '',
+      '# Mount dedicated EBS data volume',
+      '# CDK attaches it as /dev/sdb, Nitro exposes it as /dev/nvme1n1',
+      'DATA_DEV=""',
+      'for i in $(seq 1 30); do',
+      '  for dev in /dev/nvme1n1 /dev/xvdb; do',
+      '    if [[ -b "$dev" ]]; then DATA_DEV="$dev"; break 2; fi',
+      '  done',
+      '  sleep 1',
+      'done',
+      '',
+      'if [[ -n "$DATA_DEV" ]]; then',
+      '  mkfs.xfs -f "$DATA_DEV"',
+      '  mkdir -p /var/lib/celeriant',
+      '  mount -o noatime "$DATA_DEV" /var/lib/celeriant',
+      '  echo "$DATA_DEV /var/lib/celeriant xfs defaults,noatime,nofail 0 2" >> /etc/fstab',
+      '  echo "Mounted $DATA_DEV as /var/lib/celeriant"',
+      'else',
+      '  echo "ERROR: EBS data volume not found after 30s"',
+      '  mkdir -p /var/lib/celeriant',
+      'fi',
+    ] : [
       '',
       '# Mount local NVMe instance store for data',
       '# Find the first NVMe instance store device (skip root EBS which is also NVMe)',
@@ -128,8 +153,32 @@ export class Ec2ClusterStack extends cdk.Stack {
       '  echo "WARNING: No NVMe instance store found, using root EBS"',
       '  mkdir -p /var/lib/celeriant',
       'fi',
+    ];
+
+    const directoryAndServiceSetup = [
       '',
       'mkdir -p /etc/celeriant/certs',
+      '',
+      '# Systemd service (mirrors deploy/rpi-cluster/setup-nodes.sh)',
+      "cat > /etc/systemd/system/celeriant.service <<'SERVICE'",
+      '[Unit]',
+      'Description=Celeriant Database',
+      'After=network-online.target',
+      'Wants=network-online.target',
+      '',
+      '[Service]',
+      'Type=simple',
+      'EnvironmentFile=/etc/celeriant/celeriant.env',
+      'ExecStart=/usr/local/bin/celeriant',
+      'Restart=on-failure',
+      'RestartSec=5',
+      'LimitNOFILE=1048576',
+      'LimitMEMLOCK=infinity',
+      '',
+      '[Install]',
+      'WantedBy=multi-user.target',
+      'SERVICE',
+      'systemctl daemon-reload',
     ];
 
     // Grafana Alloy agent for shipping metrics + logs to Grafana Cloud
@@ -200,7 +249,9 @@ export class Ec2ClusterStack extends cdk.Stack {
       'systemctl enable --now alloy',
     ] : [];
 
-    const nodeUserData = [...commonSetup, ...nvmeSetup, ...alloySetup].join('\n');
+    const nodeUserData = [
+      ...commonSetup, ...storageSetup, ...directoryAndServiceSetup, ...alloySetup,
+    ].join('\n');
     const clientUserData = [...commonSetup, '', 'mkdir -p /etc/celeriant/certs'].join('\n');
 
     // --- Helper to create instances ---
@@ -208,9 +259,18 @@ export class Ec2ClusterStack extends cdk.Stack {
       name: string,
       role: iam.IRole,
       userData: string,
+      extraBlockDevices?: ec2.BlockDevice[],
     ): ec2.Instance => {
       const ud = ec2.UserData.forLinux();
       ud.addCommands(userData);
+
+      const blockDevices: ec2.BlockDevice[] = [{
+        deviceName: '/dev/xvda',
+        volume: ec2.BlockDeviceVolume.ebs(20, {
+          volumeType: ec2.EbsDeviceVolumeType.GP3,
+        }),
+      }];
+      if (extraBlockDevices) blockDevices.push(...extraBlockDevices);
 
       const instance = new ec2.Instance(this, name, {
         vpc,
@@ -220,12 +280,7 @@ export class Ec2ClusterStack extends cdk.Stack {
         role,
         userData: ud,
         keyPair,
-        blockDevices: [{
-          deviceName: '/dev/xvda',
-          volume: ec2.BlockDeviceVolume.ebs(20, {
-            volumeType: ec2.EbsDeviceVolumeType.GP3,
-          }),
-        }],
+        blockDevices,
         vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
       });
 
@@ -235,9 +290,19 @@ export class Ec2ClusterStack extends cdk.Stack {
       return instance;
     };
 
+    // --- Data volume for EBS storage mode ---
+    const dataBlockDevices: ec2.BlockDevice[] | undefined = storageType === 'ebs'
+      ? [{
+        deviceName: '/dev/xvdb',
+        volume: ec2.BlockDeviceVolume.ebs(ebsDataVolumeSize, {
+          volumeType: ec2.EbsDeviceVolumeType.GP3,
+        }),
+      }]
+      : undefined;
+
     // --- Instances ---
-    const leader = createInstance('Leader', nodeRole, nodeUserData);
-    const follower = createInstance('Follower', nodeRole, nodeUserData);
+    const leader = createInstance('Leader', nodeRole, nodeUserData, dataBlockDevices);
+    const follower = createInstance('Follower', nodeRole, nodeUserData, dataBlockDevices);
     const client = createInstance('Client', clientRole, clientUserData);
 
     // --- Outputs ---
@@ -252,5 +317,7 @@ export class Ec2ClusterStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'LeaderInstanceId', { value: leader.instanceId });
     new cdk.CfnOutput(this, 'FollowerInstanceId', { value: follower.instanceId });
     new cdk.CfnOutput(this, 'ClientInstanceId', { value: client.instanceId });
+    new cdk.CfnOutput(this, 'InstanceType', { value: instanceType });
+    new cdk.CfnOutput(this, 'StorageType', { value: storageType });
   }
 }

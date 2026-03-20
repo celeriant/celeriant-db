@@ -27,9 +27,15 @@ DOCKER_INSTALL
 # Create directory structure on infra node
 ssh "$INFRA_HOST" 'mkdir -p ~/celeriant-infra/grafana-provisioning/datasources ~/celeriant-infra/grafana-provisioning/dashboards ~/celeriant-infra/dashboards'
 
-# Deploy compose file and prometheus config
+# Deploy compose file and prometheus config (templated from config.env)
 scp docker-compose.yml "$INFRA_HOST":~/celeriant-infra/
-scp prometheus.yml "$INFRA_HOST":~/celeriant-infra/
+PROM_TMP="$(mktemp)"
+sed -e "s/LEADER_HOST_PLACEHOLDER/$LEADER_HOST/g" \
+    -e "s/FOLLOWER_HOST_PLACEHOLDER/$FOLLOWER_HOST/g" \
+    -e "s/METRICS_PORT_PLACEHOLDER/$METRICS_PORT/g" \
+    prometheus.yml > "$PROM_TMP"
+scp "$PROM_TMP" "$INFRA_HOST":~/celeriant-infra/prometheus.yml
+rm -f "$PROM_TMP"
 
 # Deploy Grafana provisioning from local-cluster (reuse existing configs)
 GRAFANA_SRC="${PROJECT_ROOT}/deploy/local-cluster/grafana"
