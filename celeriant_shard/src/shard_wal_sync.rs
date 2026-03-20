@@ -542,6 +542,8 @@ mod tests {
             wal_metablock_type: MetablockKind::SoftTrim(MetablockSoftTrim {
                 aggregate_key,
                 keep_from_event_batch_index: keep_from,
+                event_batch_index: 0,
+                event_index: 0,
                 client_id: 1,
                 user_id: None,
             }),

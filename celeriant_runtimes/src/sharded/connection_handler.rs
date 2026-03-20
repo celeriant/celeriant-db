@@ -1325,6 +1325,7 @@ mod tests {
             list_max_duration: Duration::from_secs(10),
             list_page_size: 100,
             list_max_concurrent: 16,
+            read_max_concurrent: 64,
             list_wal_index_cache_bytes: 1024,
             schema_cache_bytes: 4_194_304, // 4MB
             max_schema_size_bytes: 16384,
@@ -1344,6 +1345,7 @@ mod tests {
             compaction_check_interval: Duration::from_secs(600),
             compaction_min_reclaimable_ratio: 0.20,
             compaction_temp_dir: None,
+            cache_warmup_max_duration: None,
         }
     }
 

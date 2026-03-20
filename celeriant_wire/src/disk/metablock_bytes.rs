@@ -93,11 +93,11 @@ pub fn is_soft_delete_for_aggregate(bytes: &[u8], target: &AggregateKey) -> bool
 }
 
 #[inline]
-pub fn read_soft_delete_aggregate_key(bytes: &[u8]) -> AggregateKey {    
+pub fn read_soft_delete_aggregate_key(bytes: &[u8]) -> AggregateKey {
     let org_id = read_soft_delete_org_id(bytes);
     let type_id = read_soft_delete_aggregate_type_id(bytes);
     let agg_id = read_soft_delete_aggregate_id(bytes);
-    
+
     AggregateKey::new(org_id, type_id, agg_id)
 }
 
@@ -393,6 +393,8 @@ mod tests {
             wal_metablock_type: MetablockKind::SoftTrim(MetablockSoftTrim {
                 aggregate_key,
                 keep_from_event_batch_index,
+                event_batch_index: 0,
+                event_index: 0,
                 client_id: 111,
                 user_id: None,
             }),

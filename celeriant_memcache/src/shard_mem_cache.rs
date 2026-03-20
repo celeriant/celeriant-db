@@ -414,6 +414,18 @@ impl<V: Validate> ShardMemCache<V> {
         }
     }
 
+    pub fn is_aggregate_snapshot_cache_full(&self, cache_path: CachePath) -> bool {
+        let cache = match cache_path {
+            CachePath::Read => &self.aggregate_read_snapshots,
+            CachePath::Write => &self.aggregate_write_snapshots,
+        };
+        cache.len() == cache.cap().get()
+    }
+
+    pub fn is_aggregate_client_cache_full(&self) -> bool {
+        self.aggregate_write_client_snapshots.len() == self.aggregate_write_client_snapshots.cap().get()
+    }
+
     pub fn is_aggregate_snapshot_full_or_contains(&self, aggregate_key: &AggregateKey, cache_path: CachePath) -> bool {
         let cache = match cache_path {
             CachePath::Read => &self.aggregate_read_snapshots,
@@ -486,6 +498,20 @@ impl<V: Validate> ShardMemCache<V> {
             CachePath::Write => &mut self.aggregate_write_snapshots,
         };
         cache.get(aggregate_key).cloned()
+    }
+
+    pub fn put_aggregate_snapshot_only(
+        &mut self,
+        aggregate_key: AggregateKey,
+        snapshot: MemSnapshotAggregate,
+        low_priority: bool,
+        cache_path: CachePath,
+    ) {
+        let cache = match cache_path {
+            CachePath::Read => &mut self.aggregate_read_snapshots,
+            CachePath::Write => &mut self.aggregate_write_snapshots,
+        };
+        put_with_priority(cache, aggregate_key, snapshot, low_priority);
     }
 
     pub fn put_aggregate_into_cache(

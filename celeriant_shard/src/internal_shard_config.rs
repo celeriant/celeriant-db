@@ -22,6 +22,7 @@ pub struct InternalShardConfig {
     pub timestamp_config: TimestampConfig,
     pub list_page_size: usize,
     pub list_max_concurrent: u64,
+    pub read_max_concurrent: u64,
     pub list_max_duration: Duration,
     pub list_wal_index_cache_bytes: u64,
     pub schema_cache_bytes: u64,
@@ -32,4 +33,5 @@ pub struct InternalShardConfig {
     pub compaction_min_reclaimable_ratio: f64,
     pub compaction_temp_dir: PathBuf,
     pub max_clock_drift_ms: u64,
+    pub cache_warmup_max_duration: Duration,
 }

@@ -84,6 +84,7 @@ pub struct ShardConfig {
     pub list_max_duration: Duration,
     pub list_page_size: usize,
     pub list_max_concurrent: u64,
+    pub read_max_concurrent: u64,
     pub list_wal_index_cache_bytes: u64,
     pub schema_cache_bytes: u64,
     pub max_schema_size_bytes: u64,
@@ -101,4 +102,5 @@ pub struct ShardConfig {
     pub compaction_min_reclaimable_ratio: f64,
     pub compaction_temp_dir: Option<std::path::PathBuf>,
     pub s3_retry_max_duration: Option<Duration>,
+    pub cache_warmup_max_duration: Option<Duration>,
 }

@@ -202,6 +202,14 @@ pub struct ServerConfig {
 
     #[arg(
         long,
+        default_value_t = 64,
+        env = "CELERIANT_READ_MAX_CONCURRENT",
+        help = "Maximum concurrent in-flight backwards metablock scans per shard (64)"
+    )]
+    pub read_max_concurrent: u64,
+
+    #[arg(
+        long,
         default_value_t = 16384,
         env = "CELERIANT_MAX_SCHEMA_SIZE_BYTES",
         help = "Maximum size of a single schema definition in bytes (16KB)"
@@ -491,6 +499,13 @@ pub struct ServerConfig {
 
     #[arg(
         long,
+        env = "CELERIANT_CACHE_WARMUP_MAX_SECS",
+        help = "Maximum time (seconds) to spend warming caches on shard open. Unset = no limit."
+    )]
+    pub cache_warmup_max_secs: Option<u64>,
+
+    #[arg(
+        long,
         default_value_t = 80,
         env = "CELERIANT_MEMORY_CONSUMPTION_PERCENT",
         help = "Percentage of detected available memory to use for caches (1-95, default: 80)"
@@ -730,6 +745,7 @@ impl ServerConfig {
             list_max_duration: Duration::from_millis(self.list_max_duration_ms),
             list_page_size: self.list_page_size as usize,
             list_max_concurrent: self.list_max_concurrent,
+            read_max_concurrent: self.read_max_concurrent,
             list_wal_index_cache_bytes: memory_budget.list_wal_index_cache_bytes,
             schema_cache_bytes: memory_budget.schema_cache_bytes,
             max_schema_size_bytes: self.max_schema_size_bytes,
@@ -783,6 +799,7 @@ impl ServerConfig {
             compaction_min_reclaimable_ratio: self.compaction_min_reclaimable_ratio,
             compaction_temp_dir: self.compaction_temp_dir.clone(),
             s3_retry_max_duration: self.s3_retry_max_duration_secs.map(Duration::from_secs),
+            cache_warmup_max_duration: self.cache_warmup_max_secs.map(Duration::from_secs),
             heartbeat_interval_duration: Duration::from_millis(self.heartbeat_interval_ms),
             heartbeat_lease_duration: Duration::from_millis(self.heartbeat_lease_duration_ms),
         }
@@ -826,6 +843,7 @@ impl ServerConfig {
         check_field!(list_max_duration_ms);
         check_field!(list_page_size);
         check_field!(list_max_concurrent);
+        check_field!(read_max_concurrent);
         check_field!(max_schema_size_bytes);
         check_field!(client_connection_timeout_ms);
         check_field!(shard_log_preallocate_bytes);
@@ -868,6 +886,7 @@ impl ServerConfig {
         check_field!(compaction_min_reclaimable_ratio);
         check_field!(compaction_temp_dir);
         check_field!(s3_retry_max_duration_secs);
+        check_field!(cache_warmup_max_secs);
         check_field!(memory_consumption_percent);
         check_field!(memory_budget_bytes);
         check_field!(metrics_enabled);
@@ -926,6 +945,7 @@ impl Default for ServerConfig {
             list_max_duration_ms: 2000,
             list_page_size: 2000,
             list_max_concurrent: 16,
+            read_max_concurrent: 64,
             max_schema_size_bytes: 16384,
             s3_endpoint_override: None,
             s3_skip_signature: false,
@@ -955,6 +975,7 @@ impl Default for ServerConfig {
             compaction_min_reclaimable_ratio: 0.20,
             compaction_temp_dir: None,
             s3_retry_max_duration_secs: None,
+            cache_warmup_max_secs: None,
             memory_consumption_percent: 80,
             memory_budget_bytes: None,
             metrics_enabled: true,

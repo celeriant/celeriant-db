@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use glommio::sync::Semaphore;
-use tracing::{debug, trace};
+use tracing::{debug, info, trace};
 
 use celeriant_disk::files::rwlock_timeout::write_with_timeout;
 use celeriant_distributed::node_status::NodeStatus;
@@ -129,6 +129,10 @@ pub struct ShardWal<R: ReplicationClient + 'static, D: S3Downloader + 'static> {
     /// Limits concurrent list operations to bound unbudgeted per-request memory
     list_semaphore: Rc<Semaphore>,
 
+    /// Limits concurrent cache-miss disk scans to prevent NVMe read saturation
+    /// starving the fsync write path (cold start read amplification)
+    cache_load_semaphore: Rc<Semaphore>,
+
     /// Client for replicating data to followers or S3.
     /// Interior mutability — FollowerConnection manages its own split locks.
     pub replication_client: Rc<R>,
@@ -227,15 +231,21 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         .await?;
 
         let list_semaphore = Rc::new(Semaphore::new(config.list_max_concurrent));
+        let cache_load_semaphore = Rc::new(Semaphore::new(config.read_max_concurrent));
 
         metrics::gauge!("celeriant_replication_queue_high_water_bytes").set(config.pending_replication_high_water_bytes as f64);
 
         let metrics_shard_label = [("shard_id", config.shard_id.to_string())];
 
+        let shard_mem_cache = Rc::new(RefCell::new(shard_mem_cache));
+        let log_segments_cache = Rc::new(log_segments_cache);
+
+        Self::pre_warm_cache(&log_segments_cache, &shard_mem_cache, &config).await?;
+
         Ok(Self {
             s3_downloader: Rc::new(s3_downloader),
-            shard_mem_cache: Rc::new(RefCell::new(shard_mem_cache)),
-            log_segments_cache: Rc::new(log_segments_cache),
+            shard_mem_cache,
+            log_segments_cache,
             fsync_coordinator: Rc::new(Coordinator::new()),
             replication_coordinator: Rc::new(Coordinator::new()),
             watched_aggregates: Rc::new(AggregateWatchers::new()),
@@ -246,14 +256,163 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             aggregate_client_loading: LoadingCoordinator::new(),
             schema_loading: LoadingCoordinator::new(),
             list_semaphore,
+            cache_load_semaphore,
             replication_client: Rc::new(replication_client),
             leader_client_address: RefCell::new(None),
             metrics_shard_label,
         })
     }
 
+    /// Pre-warm aggregate and client caches by reverse-scanning the WAL.
+    /// SoftDelete/SoftTrim metablocks carry full aggregate state, so each
+    /// metablock kind can populate the cache immediately without continuing the scan.
+    async fn pre_warm_cache(
+        log_segments_cache: &Rc<LogSegmentsCache>,
+        shard_mem_cache: &Rc<RefCell<MemCache>>,
+        config: &InternalShardConfig,
+    ) -> Result<(), ReadyUpError> {
+        let warmup_start = Instant::now();
+        let warmup_deadline = config.cache_warmup_max_duration;
+        let mut warmup_agg_count = 0u64;
+        let mut warmup_client_count = 0u64;
+        let mut agg_cache_full = false;
+        let mut client_cache_full = false;
+        let mut timed_out = false;
+
+        let starting_log_id = log_segments_cache.active_log_id();
+        let mut scanner = ReverseMetablockScanner::new(
+            log_segments_cache,
+            starting_log_id,
+            None,
+            config.read_max_chunk_size,
+        );
+
+        scanner
+            .scan::<(), ReadyUpError>(|log_id, metablock_absolute_pos, metablock_bytes| {
+                if agg_cache_full && client_cache_full {
+                    return Ok(Some(()));
+                }
+                if warmup_start.elapsed() >= warmup_deadline {
+                    timed_out = true;
+                    return Ok(Some(()));
+                }
+
+                if metablock_bytes::is_metablock_kind_soft_delete(metablock_bytes) {
+                    let metablock = deserialise_metablock(metablock_bytes)
+                        .map_err(|e| ReadyUpError::UnableToAccessDirectory {
+                            directory: format!("corrupt soft-delete metablock at log {log_id} pos {metablock_absolute_pos}"),
+                            source: std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}")),
+                        })?;
+                    if let MetablockKind::SoftDelete(soft_delete) = metablock.wal_metablock_type {
+                        let mut cache = shard_mem_cache.borrow_mut();
+                        if !cache.is_aggregate_snapshot_full_or_contains(&soft_delete.aggregate_key, CachePath::Write) {
+                            cache.put_aggregate_into_cache_as_deleted(
+                                soft_delete.aggregate_key,
+                                log_id,
+                                metablock_absolute_pos,
+                                soft_delete.event_index,
+                                soft_delete.event_batch_index,
+                                soft_delete.allow_recreate,
+                                soft_delete.allow_index_continuation,
+                                CachePath::Write,
+                            );
+                            warmup_agg_count += 1;
+                            agg_cache_full = cache.is_aggregate_snapshot_cache_full(CachePath::Write);
+                        }
+                    }
+                    return Ok(None);
+                }
+
+                if metablock_bytes::is_metablock_kind_soft_trim(metablock_bytes) {
+                    let metablock = deserialise_metablock(metablock_bytes)
+                        .map_err(|e| ReadyUpError::UnableToAccessDirectory {
+                            directory: format!("corrupt soft-trim metablock at log {log_id} pos {metablock_absolute_pos}"),
+                            source: std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}")),
+                        })?;
+                    if let MetablockKind::SoftTrim(soft_trim) = metablock.wal_metablock_type {
+                        let mut cache = shard_mem_cache.borrow_mut();
+                        if !cache.is_aggregate_snapshot_full_or_contains(&soft_trim.aggregate_key, CachePath::Write) {
+                            let snapshot = MemSnapshotAggregate::found(
+                                log_id,
+                                metablock_absolute_pos,
+                                soft_trim.event_index,
+                                soft_trim.event_batch_index,
+                                soft_trim.keep_from_event_batch_index,
+                            );
+                            cache.put_aggregate_snapshot_only(soft_trim.aggregate_key, snapshot, false, CachePath::Write);
+                            warmup_agg_count += 1;
+                            agg_cache_full = cache.is_aggregate_snapshot_cache_full(CachePath::Write);
+                        }
+                    }
+                    return Ok(None);
+                }
+
+                if !metablock_bytes::is_metablock_kind_event_batch_metadata(metablock_bytes) {
+                    return Ok(None);
+                }
+
+                let aggregate_key = metablock_bytes::read_event_batch_aggregate_key(metablock_bytes);
+                let mut cache = shard_mem_cache.borrow_mut();
+
+                if !cache.is_aggregate_snapshot_full_or_contains(&aggregate_key, CachePath::Write) {
+                    let snapshot = MemSnapshotAggregate::found(
+                        log_id,
+                        metablock_absolute_pos,
+                        metablock_bytes::read_event_batch_max_event_index(metablock_bytes),
+                        metablock_bytes::read_event_batch_event_batch_index(metablock_bytes),
+                        metablock_bytes::read_event_batch_min_event_batch_index(metablock_bytes),
+                    );
+                    let client_id = metablock_bytes::read_event_batch_client_id(metablock_bytes);
+                    let last_client_event_index = metablock_bytes::read_event_batch_max_client_event_index(metablock_bytes);
+                    cache.put_aggregate_into_cache(aggregate_key, snapshot, client_id, last_client_event_index, false, CachePath::Write);
+                    warmup_agg_count += 1;
+                    agg_cache_full = cache.is_aggregate_snapshot_cache_full(CachePath::Write);
+                    client_cache_full = cache.is_aggregate_client_cache_full();
+                } else {
+                    let client_id = metablock_bytes::read_event_batch_client_id(metablock_bytes);
+                    let client_key = AggregateClientKey::new(aggregate_key, client_id);
+                    if !cache.is_aggregate_client_cache_full_or_contains(&client_key) {
+                        let last_client_event_index = metablock_bytes::read_event_batch_max_client_event_index(metablock_bytes);
+                        cache.put_aggregate_client_into_cache(client_key, last_client_event_index, false);
+                        warmup_client_count += 1;
+                        client_cache_full = cache.is_aggregate_client_cache_full();
+                    }
+                }
+
+                Ok(None)
+            })
+            .await
+            .map_err(|e| match e {
+                ScanError::Visitor(ready_up) => ready_up,
+                ScanError::OpenLogSegment(e) => ReadyUpError::ActiveFileError(e),
+                ScanError::Io { log_id, source } => ReadyUpError::UnableToAccessDirectory {
+                    directory: format!("log segment {log_id}"),
+                    source: std::io::Error::new(std::io::ErrorKind::Other, source),
+                },
+                ScanError::LockTimeout(e) => ReadyUpError::UnableToAccessDirectory {
+                    directory: "lock timeout during warmup".to_string(),
+                    source: std::io::Error::new(std::io::ErrorKind::TimedOut, e.to_string()),
+                },
+                ScanError::NoFileHandle { log_id } => ReadyUpError::UnableToAccessDirectory {
+                    directory: format!("log segment {log_id}"),
+                    source: std::io::Error::new(std::io::ErrorKind::NotFound, "no file handle"),
+                },
+            })?;
+
+        info!(
+            shard_id = config.shard_id,
+            aggregates = warmup_agg_count,
+            clients = warmup_client_count,
+            timed_out,
+            duration_ms = warmup_start.elapsed().as_millis() as u64,
+            "Cache warmup complete"
+        );
+
+        Ok(())
+    }
+
     /// List all unique organizations that have data in this shard.
-    /// 
+    ///
     /// Scans WAL in reverse order, returning orgs with most recent activity first.
     /// Uses bounded LRU for deduplication within a page.
     pub async fn list_orgs(&self, request: ListOrgsRequest) -> Result<ListOrgsResponse, ShardListingError> {
@@ -778,6 +937,8 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let metablock_soft_trim = MetablockSoftTrim {
             aggregate_key: aggregate_key.clone(),
             keep_from_event_batch_index: trim_request.keep_from_event_batch_index,
+            event_batch_index: current_indexes.event_batch_index,
+            event_index: current_indexes.event_index,
             client_id: trim_request.client_id,
             user_id: trim_request.user_id,
         };
@@ -1148,7 +1309,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             return Ok(());
         }
 
-        // Take an exclusive lock on this aggregate client
+        // Take an exclusive lock on this aggregate client to deduplicate thundering herd
         let aggregate_lock = self.aggregate_client_loading.acquire(aggregate_client_key);
         let _ = write_with_timeout(&aggregate_lock, "cache_aggregate_client").await
             .map_err(|_| ShardCacheLoadError::AggregateLoadingLockTimeout)?;
@@ -1161,6 +1322,10 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         {
             return Ok(());
         }
+
+        // Limit concurrent disk scans across different aggregates (NVMe starvation)
+        let _cache_permit = self.cache_load_semaphore.acquire_permit(1).await
+            .map_err(|_| ShardCacheLoadError::AggregateLoadingLockTimeout)?;
 
         let last_known_metablock = self.shard_mem_cache.borrow_mut().get_aggregate_last_metablock_pos(aggregate_key, CachePath::Write);
 
@@ -1251,6 +1416,10 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             return Ok(());
         }
 
+        // Limit concurrent disk scans across different aggregates (NVMe starvation)
+        let _cache_permit = self.cache_load_semaphore.acquire_permit(1).await
+            .map_err(|_| ShardCacheLoadError::AggregateLoadingLockTimeout)?;
+
         let starting_log_id = self.log_segments_cache.active_log_id();
         let mut scanner = ReverseMetablockScanner::new(
             &self.log_segments_cache,
@@ -1319,7 +1488,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             return Ok(status == AggregateStatus::Found);
         }
 
-        // Take an exclusive lock on this aggregate
+        // Take an exclusive lock on this aggregate to deduplicate thundering herd
         let aggregate_lock = self.aggregate_loading.acquire(searching_for_aggregate_key);
         let _ = write_with_timeout(&aggregate_lock, "move_aggregate_to_memcache").await
             .map_err(|_| ShardCacheLoadError::AggregateLoadingLockTimeout)?;
@@ -1329,6 +1498,10 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             return Ok(status == AggregateStatus::Found);
         }
 
+        // Limit concurrent disk scans across different aggregates (NVMe starvation)
+        let _cache_permit = self.cache_load_semaphore.acquire_permit(1).await
+            .map_err(|_| ShardCacheLoadError::AggregateLoadingLockTimeout)?;
+
         let (starting_log_id, start_from_postion) = match cache_path {
             CachePath::Read => {
                 let read_cursor = self.log_segments_cache.get_latest_read_cursor();
@@ -1336,9 +1509,6 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             },
             CachePath::Write => (self.log_segments_cache.active_log_id(), None),
         };
-
-        // Track if we've seen a more recent trim
-        let mut seen_trim_min: Option<u64> = None;
 
         // Begin the search from the active log, moving backwards
         let mut scanner = ReverseMetablockScanner::new(
@@ -1373,15 +1543,27 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                     return Ok(Some(false)); // Found but deleted
                 }
 
-                // Check for soft trim - record min but keep scanning for EventBatch
+                // SoftTrim carries full aggregate state — cache and stop scanning
                 if metablock_bytes::is_soft_trim_for_aggregate(metablock_bytes, searching_for_aggregate_key) {
-                    let trim_min = metablock_bytes::read_soft_trim_keep_from_event_batch_index(metablock_bytes);
-                    match seen_trim_min {
-                        None => seen_trim_min = Some(trim_min),
-                        Some(existing) if trim_min > existing => seen_trim_min = Some(trim_min),
-                        _ => {}
+                    let metablock = deserialise_metablock(metablock_bytes)
+                        .map_err(|_| ())?;
+                    if let MetablockKind::SoftTrim(soft_trim) = metablock.wal_metablock_type {
+                        let snapshot = MemSnapshotAggregate::found(
+                            log_id,
+                            metablock_absolute_pos,
+                            soft_trim.event_index,
+                            soft_trim.event_batch_index,
+                            soft_trim.keep_from_event_batch_index,
+                        );
+                        let mut shard_mem_cache = self.shard_mem_cache.borrow_mut();
+                        shard_mem_cache.put_aggregate_snapshot_only(
+                            searching_for_aggregate_key.clone(),
+                            snapshot,
+                            false,
+                            cache_path,
+                        );
                     }
-                    return Ok(None);
+                    return Ok(Some(true));
                 }
 
                 if !metablock_bytes::is_metablock_kind_event_batch_metadata(metablock_bytes) {
@@ -1398,16 +1580,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                     return Ok(None);
                 }
 
-                let mut min_event_batch_index = metablock_bytes::read_event_batch_min_event_batch_index(metablock_bytes);
-                    
-                // Apply any more recent trim we saw
-                if !low_priority {
-                    if let Some(trim_min) = seen_trim_min {
-                        if trim_min > min_event_batch_index {
-                            min_event_batch_index = trim_min;
-                        }
-                    }
-                }
+                let min_event_batch_index = metablock_bytes::read_event_batch_min_event_batch_index(metablock_bytes);
 
                 let snapshot = MemSnapshotAggregate::found(
                     log_id,
@@ -2247,6 +2420,8 @@ mod tests {
             compaction_min_reclaimable_ratio: 0.20,
             compaction_temp_dir: std::path::PathBuf::from("/tmp/test_compaction"),
             max_clock_drift_ms: 500,
+            read_max_concurrent: 64,
+            cache_warmup_max_duration: Duration::MAX,
         }
     }
 
@@ -5254,6 +5429,163 @@ mod tests {
 
                 shard.close().await;
             }
+        });
+    }
+
+    // ── Cache warm-up tests ──
+
+    #[test]
+    fn warmup_caches_event_batch_and_client() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let agg = key(1, 1, 1);
+
+            {
+                let shard = open_shard(&dir).await;
+                write_ok(&shard, write_req(agg.clone(), events(3))).await;
+                shard.close().await;
+            }
+
+            let shard = open_shard(&dir).await;
+            let mut cache = shard.shard_mem_cache.borrow_mut();
+
+            let (in_cache, status) = cache.aggregate_load_status(&agg, CachePath::Write);
+            assert!(in_cache, "aggregate should be in cache after warmup");
+            assert_eq!(status, AggregateStatus::Found);
+
+            let snap = cache.get_aggregate_snapshot(&agg, CachePath::Write).unwrap();
+            assert_eq!(snap.event_index, 3);
+            assert_eq!(snap.event_batch_index, 1);
+
+            // Client cache should also be populated from the EventBatch
+            let client_key = AggregateClientKey::new(agg.clone(), 1);
+            let (client_in_cache, client_event_index) = cache.aggregate_client_load_status(&agg, &client_key);
+            assert!(client_in_cache, "client cache should be populated from EventBatch warmup");
+            assert_eq!(client_event_index, Some(3));
+
+            drop(cache);
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn warmup_caches_deleted_aggregate() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let agg = key(1, 1, 1);
+
+            {
+                let shard = open_shard(&dir).await;
+                write_ok(&shard, write_req(agg.clone(), events(2))).await;
+                let result = process(&shard, delete_req(agg.clone())).await;
+                assert!(matches!(result, Ok(ClientResponse::Delete(_))));
+                shard.close().await;
+            }
+
+            let shard = open_shard(&dir).await;
+            let (in_cache, status) = shard.shard_mem_cache.borrow_mut().aggregate_load_status(&agg, CachePath::Write);
+            assert!(in_cache, "deleted aggregate should be in cache after warmup");
+            assert_eq!(status, AggregateStatus::Deleted);
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn warmup_caches_trimmed_aggregate() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let agg = key(1, 1, 1);
+
+            {
+                let shard = open_shard(&dir).await;
+                write_ok(&shard, write_req(agg.clone(), events(2))).await;
+                write_ok(&shard, write_req(agg.clone(), events(2))).await;
+                write_ok(&shard, write_req(agg.clone(), events(2))).await;
+                let result = process(&shard, trim_req(agg.clone(), 2)).await;
+                assert!(matches!(result, Ok(ClientResponse::TrimStart(_))));
+                shard.close().await;
+            }
+
+            let shard = open_shard(&dir).await;
+            let mut cache = shard.shard_mem_cache.borrow_mut();
+
+            let (in_cache, status) = cache.aggregate_load_status(&agg, CachePath::Write);
+            assert!(in_cache, "trimmed aggregate should be in cache after warmup");
+            assert_eq!(status, AggregateStatus::Found);
+
+            let snap = cache.get_aggregate_snapshot(&agg, CachePath::Write).unwrap();
+            assert_eq!(snap.min_event_batch_index, 2, "trim boundary must be reflected in cached snapshot");
+            assert_eq!(snap.event_batch_index, 3);
+            assert_eq!(snap.event_index, 6);
+
+            // Client cache is populated from the EventBatch (not the SoftTrim itself)
+            let client_key = AggregateClientKey::new(agg.clone(), 1);
+            let (client_in_cache, client_event_index) = cache.aggregate_client_load_status(&agg, &client_key);
+            assert!(client_in_cache, "client cache should be populated from EventBatch after SoftTrim");
+            assert_eq!(client_event_index, Some(2));
+
+            drop(cache);
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn warmup_does_not_cache_deleted_as_found() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let agg_a = key(1, 1, 1);
+            let agg_b = key(1, 1, 2);
+
+            {
+                let shard = open_shard(&dir).await;
+                // Write to both, then delete A
+                write_ok(&shard, write_req(agg_a.clone(), events(2))).await;
+                write_ok(&shard, write_req(agg_b.clone(), events(3))).await;
+                let result = process(&shard, delete_req(agg_a.clone())).await;
+                assert!(matches!(result, Ok(ClientResponse::Delete(_))));
+                shard.close().await;
+            }
+
+            let shard = open_shard(&dir).await;
+
+            // A should be Deleted, not Found
+            let (in_cache, status) = shard.shard_mem_cache.borrow_mut().aggregate_load_status(&agg_a, CachePath::Write);
+            assert!(in_cache);
+            assert_eq!(status, AggregateStatus::Deleted, "deleted aggregate must not appear as Found");
+
+            // B should be Found
+            let (in_cache, status) = shard.shard_mem_cache.borrow_mut().aggregate_load_status(&agg_b, CachePath::Write);
+            assert!(in_cache);
+            assert_eq!(status, AggregateStatus::Found);
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn warmup_respects_timeout() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let agg = key(1, 1, 1);
+
+            {
+                let shard = open_shard(&dir).await;
+                write_ok(&shard, write_req(agg.clone(), events(2))).await;
+                shard.close().await;
+            }
+
+            // Reopen with zero timeout — warmup should stop immediately
+            let mut cfg = test_config(&dir);
+            cfg.cache_warmup_max_duration = Duration::ZERO;
+            let shard = ShardWal::open(cfg, ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader)
+                .await
+                .unwrap();
+
+            let (in_cache, _) = shard.shard_mem_cache.borrow_mut().aggregate_load_status(&agg, CachePath::Write);
+            assert!(!in_cache, "zero-timeout warmup should not populate cache");
+
+            shard.close().await;
         });
     }
 }

@@ -105,6 +105,7 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                     list_max_duration: shard_config.list_max_duration,
                     list_page_size: shard_config.list_page_size,
                     list_max_concurrent: shard_config.list_max_concurrent,
+                    read_max_concurrent: shard_config.read_max_concurrent,
                     list_wal_index_cache_bytes: shard_config.list_wal_index_cache_bytes,
                     schema_cache_bytes: shard_config.schema_cache_bytes,
                     max_schema_size_bytes: shard_config.max_schema_size_bytes,
@@ -115,6 +116,7 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                     compaction_min_reclaimable_ratio: shard_config.compaction_min_reclaimable_ratio,
                     compaction_temp_dir,
                     max_clock_drift_ms: shard_config.max_clock_drift_ms,
+                    cache_warmup_max_duration: shard_config.cache_warmup_max_duration.unwrap_or(Duration::MAX),
                 };
                 let s3_uploader = SidecarS3Uploader::new(sidecar_senders.clone());
                 let replication_client_config = shard_config.tls_config.as_ref()
