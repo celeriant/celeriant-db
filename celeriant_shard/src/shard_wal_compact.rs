@@ -311,7 +311,7 @@ fn should_keep_metablock(
             }
         }
         // Tombstones: always keep (no datablock, tiny cost, required for cross-segment safety).
-        MetablockKind::SoftDelete(_) | MetablockKind::SoftTrim(_) => true,
+        MetablockKind::SoftDelete(_) | MetablockKind::SoftTrim(_) | MetablockKind::SegmentSummary(_) => true,
         // Schema registrations: always keep — immutable, cannot be regenerated.
         MetablockKind::SchemaRegistration(_) => true,
     }
@@ -584,6 +584,7 @@ async fn build_compacted_file(
                     MetablockKind::SchemaRegistration(sr) => {
                         bloom.insert_hash(&sr.schema_key.hash_bytes())
                     }
+                    MetablockKind::SegmentSummary(_) => {}
                 }
 
                 mb_offset += FIXED_BLOCK_SIZE_BYTES;

@@ -17,9 +17,15 @@ use celeriant_rotating_log::log_segment_file::log_segment_file_metadata::LogSegm
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
 use celeriant_wal::constants::{self, EntryHashBytes, FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, MIN_WRITE_ALIGNMENT, WIRE_VERSION_WAL_METABLOCK};
 
+use celeriant_wal::datablocks::datablock::Datablock;
+use celeriant_wal::datablocks::datablock_kind::DatablockKind;
+use celeriant_wal::datablocks::datablock_segment_summary::SegmentSummaryPayload;
 use celeriant_wal::metablocks::metablock::Metablock;
 use celeriant_wal::metablocks::metablock_kind::MetablockKind;
+use celeriant_wal::metablocks::metablock_segment_summary::MetablockSegmentSummary;
+use celeriant_wal::compression_type::CompressionType;
 use celeriant_watch::aggregate_watchers::AggregateWatchers;
+use celeriant_wire::disk::serialised_datablock::SerialisedDatablock;
 use celeriant_wire::disk::versioned_block;
 use celeriant_wire::disk::versioned_block::serialize_versioned_message;
 
@@ -72,8 +78,9 @@ pub(crate) async fn commit_fsync_with_rollback(
         "Fsync batch captured"
     );
 
+    let summary_size = shard_mem_cache.borrow().segment_summary_exact_bytes();
     let metablock_padding = constants::write_padding(captured.sync_positions_snapshot.buffer_size_metablocks());
-    let total_required = captured.required_disk_space + metablock_padding + MIN_WRITE_ALIGNMENT - 1;
+    let total_required = captured.required_disk_space + metablock_padding + MIN_WRITE_ALIGNMENT - 1 + summary_size;
     let available_space = log_segments_cache.active_log_available_space();
     if available_space < total_required {
         if log_segments_cache
@@ -85,6 +92,17 @@ pub(crate) async fn commit_fsync_with_rollback(
             return Err(ShardFsyncError::BatchesTooLarge {
                 preallocate_bytes: log_segments_cache.preallocate_bytes,
             });
+        }
+
+        let payload = shard_mem_cache.borrow_mut().take_segment_summary();
+        if !payload.aggregates.is_empty() {
+            write_segment_summary(
+                node_status,
+                &log_segments_cache,
+                &shard_mem_cache,
+                &watched_aggregates,
+                payload,
+            ).await?;
         }
 
         log_segments_cache
@@ -164,6 +182,10 @@ fn commit_sync(
     let mut event_collector = WatchEventCollector::new();
 
     for queue_item in pending_append_queue {
+        if !node_status.is_leader() {
+            shard_mem_cache.update_segment_summary(&queue_item.metablock);
+        }
+
         match &queue_item.metablock.wal_metablock_type {
             MetablockKind::EventBatchMetadata(event_batch_metadata) => {
                 if !node_status.is_leader() {
@@ -259,6 +281,76 @@ fn commit_sync(
 
 fn rollback_sync(shard_mem_cache: Rc<RefCell<MemCache>>) {
     shard_mem_cache.borrow_mut().execute_fsync_rollback();
+}
+
+async fn write_segment_summary(
+    node_status: NodeStatus,
+    log_segments_cache: &Rc<LogSegmentsCache>,
+    shard_mem_cache: &Rc<RefCell<MemCache>>,
+    watched_aggregates: &Rc<AggregateWatchers>,
+    payload: SegmentSummaryPayload,
+) -> Result<(), ShardFsyncError> {
+    let unique_org_count = payload.orgs.len() as u32;
+    let unique_aggregate_type_count = payload.aggregate_types.len() as u32;
+    let unique_aggregate_count = payload.aggregates.len() as u32;
+
+    let datablock = Datablock {
+        datablock_kind: DatablockKind::SegmentSummary(payload),
+    };
+
+    let serialized = SerialisedDatablock::new(&datablock, CompressionType::None)
+        .map_err(|e| ShardFsyncError::MetablockSerialisationError(format!("{e:?}")))?;
+
+    let summary_metablock = MetablockSegmentSummary {
+        segment_log_id: log_segments_cache.active_log_id(),
+        unique_org_count,
+        unique_aggregate_type_count,
+        unique_aggregate_count,
+        datablock_position: 0,
+        datablock_compressed_size: serialized.compressed_size,
+        datablock_uncompressed_size: serialized.uncompressed_size,
+    };
+
+    let metablock = Metablock {
+        wal_index: 0,
+        server_timestamp: 0,
+        lease_index: 0,
+        node_id: 0,
+        uncompressed_size: serialized.uncompressed_size,
+        compressed_size: serialized.compressed_size,
+        datablock_version: serialized.datablock_version,
+        datablock_compression_type: serialized.compression_type,
+        previous_tip_hash: constants::GENESIS_HASH,
+        datablock_position: 0,
+        wal_metablock_type: MetablockKind::SegmentSummary(summary_metablock),
+        datablock: serialized.storage_kind,
+    };
+
+    let queue_item = celeriant_memcache::shard_log_queue_item::ShardLogQueueItem::new(
+        Some(datablock),
+        serialized.external_data,
+        metablock,
+    );
+
+    let mut snapshot = SyncPositionsSnapshot {
+        pending_append_queue: vec![queue_item],
+        aggregate_queue_positions: std::collections::HashMap::new(),
+        pending_schema_registrations: std::collections::HashSet::new(),
+    };
+
+    let active_log = log_segments_cache.active();
+    let updated_metadata = sync(active_log.clone(), &mut snapshot).await?;
+
+    commit_sync(
+        node_status,
+        shard_mem_cache.clone(),
+        watched_aggregates.clone(),
+        snapshot,
+        active_log,
+        updated_metadata,
+    );
+
+    Ok(())
 }
 
 /// Writes pending queue items to disk.
@@ -402,6 +494,7 @@ pub(crate) async fn sync(
             MetablockKind::SoftTrim(soft_trim) => {
                 log_segment_file_metadata.write.aggregate_key_bloom.insert(&soft_trim.aggregate_key);
             }
+            MetablockKind::SegmentSummary(_) => {}
         }
     }
 

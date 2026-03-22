@@ -7,3 +7,4 @@ pub mod datablock_inline_data;
 pub mod metablock_kind;
 pub mod metablock_soft_delete;
 pub mod metablock_soft_trim;
+pub mod metablock_segment_summary;

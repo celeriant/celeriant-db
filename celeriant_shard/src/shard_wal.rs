@@ -12,7 +12,7 @@ use celeriant_rotating_log::errors::ready_up_error::ReadyUpError;
 use celeriant_rotating_log::errors::scan_error::ScanError;
 use celeriant_wire::disk::disk_format_error::DiskFormatError;
 use celeriant_wire::disk::metablock_bytes;
-use celeriant_wire::disk::serialised_datablock::{SerialisedDatablock};
+use celeriant_wire::disk::serialised_datablock::{SerialisedDatablock, deserialise_datablock};
 use celeriant_wire::disk::versioned_block::deserialise_metablock;
 use celeriant_memcache::cache_path::CachePath;
 use celeriant_memcache::mem_snapshot_aggregate::{AggregateStatus, MemSnapshotAggregate};
@@ -35,9 +35,10 @@ use celeriant_wal::aggregate_client_key::AggregateClientKey;
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::aggregate_type_key::AggregateTypeKey;
 use celeriant_wal::schema_key::SchemaKey;
-use celeriant_wal::constants::{FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, GENESIS_HASH};
+use celeriant_wal::constants::{FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, GENESIS_HASH, HEADER_BLOCK_SIZE_BYTES};
 use celeriant_wal::datablocks::datablock::Datablock;
 use celeriant_wal::datablocks::datablock_aggregate_event_batch::DatablockAggregateEventBatch;
+use celeriant_wal::datablocks::datablock_segment_summary::SegmentSummaryPayload;
 use celeriant_wal::datablocks::datablock_kind::DatablockKind;
 use celeriant_wal::datablocks::datablock_schema_registration::DatablockSchemaRegistration;
 use celeriant_wal::metablocks::datablock_storage_kind::DatablockStorageKind;
@@ -148,6 +149,74 @@ pub struct ShardWal<R: ReplicationClient + 'static, D: S3Downloader + 'static> {
 impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> AggregateReader for ShardWal<R, D> {
     fn watched_aggregates(&self) -> Rc<AggregateWatchers> {
         Rc::clone(&self.watched_aggregates)
+    }
+}
+
+/// Read the segment summary from a closed log segment.
+/// Returns `None` for legacy segments that don't have a summary metablock.
+pub(crate) async fn read_segment_summary(
+    log_segments_cache: &LogSegmentsCache,
+    log_id: u64,
+) -> Result<Option<SegmentSummaryPayload>, ScanError<()>> {
+    let log_segment_file = log_segments_cache.get(log_id).await?;
+
+    let metablocks_position = {
+        let metadata = log_segment_file.metadata.borrow();
+        match &metadata.read {
+            Some(r) => r.metablocks_position,
+            None => metadata.write.metablocks_position,
+        }
+    };
+
+    if metablocks_position <= HEADER_BLOCK_SIZE_BYTES as u64 + FIXED_BLOCK_SIZE_BYTES as u64 {
+        return Ok(None);
+    }
+
+    let last_metablock_pos = metablocks_position - FIXED_BLOCK_SIZE_BYTES as u64;
+
+    let guard = log_segment_file.lock_reader("read_segment_summary").await?;
+    let dma_file = guard.as_ref().ok_or(ScanError::NoFileHandle { log_id })?;
+
+    let buf = dma_file.read_at(last_metablock_pos, FIXED_BLOCK_SIZE_BYTES).await
+        .map_err(|e| ScanError::Io { log_id, source: format!("{e:?}") })?;
+
+    let metablock_bytes_slice = &(*buf)[..FIXED_BLOCK_SIZE_BYTES];
+    if !metablock_bytes::is_metablock_kind_segment_summary(metablock_bytes_slice) {
+        return Ok(None);
+    }
+
+    let metablock_array: &[u8; FIXED_BLOCK_SIZE_BYTES] = metablock_bytes_slice.try_into().unwrap();
+    let metablock = deserialise_metablock(metablock_array)
+        .map_err(|e| {
+            tracing::warn!(log_id, error = ?e, "Failed to deserialise segment summary metablock");
+            ScanError::Io { log_id, source: format!("{e:?}") }
+        })?;
+
+    let external_data = match &metablock.datablock {
+        DatablockStorageKind::Block(_) => {
+            let compressed_size = metablock.compressed_size as usize;
+            if compressed_size == 0 { return Ok(None); }
+            let buf = dma_file.read_at(metablock.datablock_position, compressed_size).await
+                .map_err(|e| ScanError::Io { log_id, source: format!("{e:?}") })?;
+            Some((*buf)[..compressed_size].to_vec())
+        }
+        DatablockStorageKind::Inline(_) => None,
+        DatablockStorageKind::None => return Ok(None),
+    };
+
+    match deserialise_datablock(
+        metablock.uncompressed_size, metablock.compressed_size,
+        metablock.datablock_version, metablock.datablock_compression_type,
+        &metablock.datablock, external_data.as_deref(),
+    ) {
+        Ok(datablock) => match datablock.datablock_kind {
+            DatablockKind::SegmentSummary(payload) => Ok(Some(payload)),
+            _ => Ok(None),
+        },
+        Err(e) => {
+            tracing::warn!(log_id, error = ?e, "Failed to deserialise segment summary datablock");
+            Ok(None)
+        }
     }
 }
 
@@ -280,6 +349,8 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let mut timed_out = false;
 
         let starting_log_id = log_segments_cache.active_log_id();
+        let mut active_segment_metablocks: Vec<Metablock> = Vec::new();
+
         let mut scanner = ReverseMetablockScanner::new(
             log_segments_cache,
             starting_log_id,
@@ -303,6 +374,9 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                             directory: format!("corrupt soft-delete metablock at log {log_id} pos {metablock_absolute_pos}"),
                             source: std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}")),
                         })?;
+                    if log_id == starting_log_id {
+                        active_segment_metablocks.push(metablock.clone());
+                    }
                     if let MetablockKind::SoftDelete(soft_delete) = metablock.wal_metablock_type {
                         let mut cache = shard_mem_cache.borrow_mut();
                         if !cache.is_aggregate_snapshot_full_or_contains(&soft_delete.aggregate_key, CachePath::Write) {
@@ -329,6 +403,9 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                             directory: format!("corrupt soft-trim metablock at log {log_id} pos {metablock_absolute_pos}"),
                             source: std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}")),
                         })?;
+                    if log_id == starting_log_id {
+                        active_segment_metablocks.push(metablock.clone());
+                    }
                     if let MetablockKind::SoftTrim(soft_trim) = metablock.wal_metablock_type {
                         let mut cache = shard_mem_cache.borrow_mut();
                         if !cache.is_aggregate_snapshot_full_or_contains(&soft_trim.aggregate_key, CachePath::Write) {
@@ -351,9 +428,14 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                     return Ok(None);
                 }
 
+                if log_id == starting_log_id {
+                    if let Ok(metablock) = deserialise_metablock(metablock_bytes) {
+                        active_segment_metablocks.push(metablock);
+                    }
+                }
+
                 let aggregate_key = metablock_bytes::read_event_batch_aggregate_key(metablock_bytes);
                 let mut cache = shard_mem_cache.borrow_mut();
-
                 if !cache.is_aggregate_snapshot_full_or_contains(&aggregate_key, CachePath::Write) {
                     let snapshot = MemSnapshotAggregate::found(
                         log_id,
@@ -399,6 +481,15 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                 },
             })?;
 
+        // Replay active segment metablocks in forward (write) order for correct summary state.
+        // The reverse scan collected them newest-first; reversing gives chronological order.
+        {
+            let mut cache = shard_mem_cache.borrow_mut();
+            for metablock in active_segment_metablocks.into_iter().rev() {
+                cache.update_segment_summary(&metablock);
+            }
+        }
+
         info!(
             shard_id = config.shard_id,
             aggregates = warmup_agg_count,
@@ -413,419 +504,373 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
     /// List all unique organizations that have data in this shard.
     ///
-    /// Scans WAL in reverse order, returning orgs with most recent activity first.
-    /// Uses bounded LRU for deduplication within a page.
+    /// Reads segment summaries newest-to-oldest, falling back to reverse metablock
+    /// scan for legacy segments without summaries. Pagination breaks between segments:
+    /// each segment is fully processed before checking the page limit.
     pub async fn list_orgs(&self, request: ListOrgsRequest) -> Result<ListOrgsResponse, ShardListingError> {
         let _permit = self.list_semaphore.acquire_permit(1).await
             .map_err(|_| ShardListingError::ListSemaphoreClosed)?;
+
         let start_time = Instant::now();
         let max_duration = self.config.list_max_duration;
         let page_size = self.config.list_page_size;
-        let start_wal_index = request.cursor.unwrap_or(u64::MAX);
+        let active_log_id = self.log_segments_cache.active_log_id();
 
         let mut seen: HashSet<u128> = HashSet::with_capacity(page_size);
         let mut results: Vec<OrgListItem> = Vec::with_capacity(page_size);
-        let mut last_wal_index: Option<u64> = None;
-        let mut reached_end = false;
 
-        // Try to find a cached starting position
-        let (start_log_id, start_pos) = self.find_list_scan_start(start_wal_index).await;
-
-        let mut scanner = ReverseMetablockScanner::new(
-            &self.log_segments_cache,
-            start_log_id,
-            start_pos,
-            self.config.read_max_chunk_size,
-        );
-
-        let scan_result = scanner
-            .scan::<bool, ()>(|log_id, pos, bytes| {
-                // Check time limit
-                if start_time.elapsed() >= max_duration {
-                    return Ok(Some(false)); // Stop due to timeout, not end of WAL
-                }
-
-                let wal_index = metablock_bytes::read_wal_index(bytes);
-
-                // Skip entries newer than our cursor
-                if wal_index > start_wal_index {
-                    return Ok(None);
-                }
-
-                // Cache this position for future lookups (sample every ~100 entries)
-                if wal_index % 100 == 0 {
-                    self.shard_mem_cache.borrow_mut().cache_wal_index_position(wal_index, log_id, pos);
-                }
-
-                // Only process EventBatch metablocks for org discovery
-                if !metablock_bytes::is_metablock_kind_event_batch_metadata(bytes) {
-                    return Ok(None);
-                }
-
-                let org_id = metablock_bytes::read_event_batch_org_id(bytes);
-
-                if seen.insert(org_id) {
-                    results.push(OrgListItem { org_id });
-                    last_wal_index = Some(wal_index);
-
-                    if results.len() >= page_size {
-                        return Ok(Some(false)); // Page full
+        // cursor: None = first page, Some(log_id) = resume from this closed segment downward
+        let start_log_id = match request.cursor {
+            None => {
+                let orgs = { self.shard_mem_cache.borrow().peek_segment_summary_orgs().clone() };
+                for org_id in orgs {
+                    if seen.insert(org_id) {
+                        results.push(OrgListItem { org_id });
                     }
                 }
-
-                Ok(None)
-            })
-            .await
-            .map_err(ShardListingError::ReadFromDiskError)?;
-
-        // If scan completed without early exit, we reached the end
-        if scan_result.is_none() {
-            reached_end = true;
-        }
-
-        let next_cursor = if reached_end || results.is_empty() {
-            None
-        } else {
-            last_wal_index.map(|i| i.saturating_sub(1))
+                active_log_id.saturating_sub(1)
+            }
+            Some(log_id) => log_id,
         };
 
-        Ok(ListOrgsResponse {
-            correlation_id: request.correlation_id,
-            orgs: results,
-            next_cursor,
-        })
+        if start_log_id == 0 {
+            return Ok(ListOrgsResponse { correlation_id: request.correlation_id, orgs: results, next_cursor: None });
+        }
+
+        for log_id in (1..=start_log_id).rev() {
+            if results.len() >= page_size || start_time.elapsed() >= max_duration {
+                return Ok(ListOrgsResponse {
+                    correlation_id: request.correlation_id, orgs: results,
+                    next_cursor: Some(log_id),
+                });
+            }
+
+            match read_segment_summary(&self.log_segments_cache, log_id).await {
+                Ok(Some(payload)) => {
+                    for org_id in payload.orgs {
+                        if seen.insert(org_id) {
+                            results.push(OrgListItem { org_id });
+                        }
+                    }
+                }
+                Ok(None) => {
+                    self.list_orgs_legacy_segment(log_id, &mut seen, &mut results).await
+                        .map_err(ShardListingError::ReadFromDiskError)?;
+                }
+                Err(e) => return Err(ShardListingError::ReadFromDiskError(e)),
+            }
+        }
+
+        Ok(ListOrgsResponse { correlation_id: request.correlation_id, orgs: results, next_cursor: None })
+    }
+
+    async fn list_orgs_legacy_segment(
+        &self,
+        target_log_id: u64,
+        seen: &mut HashSet<u128>,
+        results: &mut Vec<OrgListItem>,
+    ) -> Result<(), ScanError<()>> {
+        let mut scanner = ReverseMetablockScanner::new(
+            &self.log_segments_cache, target_log_id, None, self.config.read_max_chunk_size,
+        );
+        scanner.scan::<bool, ()>(|log_id, _pos, bytes| {
+            if log_id != target_log_id { return Ok(Some(true)); }
+            if !metablock_bytes::is_metablock_kind_event_batch_metadata(bytes) { return Ok(None); }
+            let org_id = metablock_bytes::read_event_batch_org_id(bytes);
+            if seen.insert(org_id) {
+                results.push(OrgListItem { org_id });
+            }
+            Ok(None)
+        }).await?;
+        Ok(())
     }
 
     /// List aggregate types, optionally filtered by org_id.
     ///
-    /// Scans WAL in reverse order, returning types with most recent activity first.
+    /// Reads segment summaries newest-to-oldest, falling back to reverse metablock
+    /// scan for legacy segments without summaries.
     pub async fn list_aggregate_types(&self, request: ListAggregateTypesRequest) -> Result<ListAggregateTypesResponse, ShardListingError> {
         let _permit = self.list_semaphore.acquire_permit(1).await
             .map_err(|_| ShardListingError::ListSemaphoreClosed)?;
+
+        let filter_org_id = request.org_id;
+
         let start_time = Instant::now();
         let max_duration = self.config.list_max_duration;
         let page_size = self.config.list_page_size;
-        let start_wal_index = request.cursor.unwrap_or(u64::MAX);
-        let filter_org_id = request.org_id;
+        let active_log_id = self.log_segments_cache.active_log_id();
 
         let mut seen: HashSet<AggregateTypeKey> = HashSet::with_capacity(page_size);
         let mut results: Vec<AggregateTypeListItem> = Vec::with_capacity(page_size);
-        let mut last_wal_index: Option<u64> = None;
-        let mut reached_end = false;
 
-        let (start_log_id, start_pos) = self.find_list_scan_start(start_wal_index).await;
-
-        let mut scanner = ReverseMetablockScanner::new(
-            &self.log_segments_cache,
-            start_log_id,
-            start_pos,
-            self.config.read_max_chunk_size,
-        );
-
-        let scan_result = scanner
-            .scan::<bool, ()>(|log_id, pos, bytes| {
-                if start_time.elapsed() >= max_duration {
-                    return Ok(Some(false));
-                }
-
-                let wal_index = metablock_bytes::read_wal_index(bytes);
-
-                if wal_index > start_wal_index {
-                    return Ok(None);
-                }
-
-                if wal_index % 100 == 0 {
-                    self.shard_mem_cache.borrow_mut().cache_wal_index_position(wal_index, log_id, pos);
-                }
-
-                if !metablock_bytes::is_metablock_kind_event_batch_metadata(bytes) {
-                    return Ok(None);
-                }
-
-                let org_id = metablock_bytes::read_event_batch_org_id(bytes);
-
-                // Apply org filter if specified
-                if let Some(filter) = filter_org_id {
-                    if org_id != filter {
-                        return Ok(None);
+        let start_log_id = match request.cursor {
+            None => {
+                let types = { self.shard_mem_cache.borrow().peek_segment_summary_types().clone() };
+                for atk in types {
+                    if let Some(filter) = filter_org_id {
+                        if atk.org_id != filter { continue; }
+                    }
+                    if seen.insert(atk.clone()) {
+                        results.push(AggregateTypeListItem { org_id: atk.org_id, aggregate_type_id: atk.aggregate_type_id });
                     }
                 }
-
-                let aggregate_type_id = metablock_bytes::read_event_batch_aggregate_type_id(bytes);
-                let type_key = AggregateTypeKey::new(org_id, aggregate_type_id);
-
-                if seen.insert(type_key) {
-                    results.push(AggregateTypeListItem { org_id, aggregate_type_id });
-                    last_wal_index = Some(wal_index);
-
-                    if results.len() >= page_size {
-                        return Ok(Some(false));
-                    }
-                }
-
-                Ok(None)
-            })
-            .await
-            .map_err(ShardListingError::ReadFromDiskError)?;
-
-        if scan_result.is_none() {
-            reached_end = true;
-        }
-
-        let next_cursor = if reached_end || results.is_empty() {
-            None
-        } else {
-            last_wal_index.map(|i| i.saturating_sub(1))
+                active_log_id.saturating_sub(1)
+            }
+            Some(log_id) => log_id,
         };
 
-        Ok(ListAggregateTypesResponse {
-            correlation_id: request.correlation_id,
-            aggregate_types: results,
-            next_cursor,
-        })
+        if start_log_id == 0 {
+            return Ok(ListAggregateTypesResponse { correlation_id: request.correlation_id, aggregate_types: results, next_cursor: None });
+        }
+
+        for log_id in (1..=start_log_id).rev() {
+            if results.len() >= page_size || start_time.elapsed() >= max_duration {
+                return Ok(ListAggregateTypesResponse {
+                    correlation_id: request.correlation_id, aggregate_types: results,
+                    next_cursor: Some(log_id),
+                });
+            }
+
+            match read_segment_summary(&self.log_segments_cache, log_id).await {
+                Ok(Some(payload)) => {
+                    for atk in payload.aggregate_types {
+                        if let Some(filter) = filter_org_id {
+                            if atk.org_id != filter { continue; }
+                        }
+                        if seen.insert(atk.clone()) {
+                            results.push(AggregateTypeListItem { org_id: atk.org_id, aggregate_type_id: atk.aggregate_type_id });
+                        }
+                    }
+                }
+                Ok(None) => {
+                    self.list_types_legacy_segment(log_id, filter_org_id, &mut seen, &mut results).await
+                        .map_err(ShardListingError::ReadFromDiskError)?;
+                }
+                Err(e) => return Err(ShardListingError::ReadFromDiskError(e)),
+            }
+        }
+
+        Ok(ListAggregateTypesResponse { correlation_id: request.correlation_id, aggregate_types: results, next_cursor: None })
+    }
+
+    async fn list_types_legacy_segment(
+        &self,
+        target_log_id: u64,
+        filter_org_id: Option<u128>,
+        seen: &mut HashSet<AggregateTypeKey>,
+        results: &mut Vec<AggregateTypeListItem>,
+    ) -> Result<(), ScanError<()>> {
+        let mut scanner = ReverseMetablockScanner::new(
+            &self.log_segments_cache, target_log_id, None, self.config.read_max_chunk_size,
+        );
+        scanner.scan::<bool, ()>(|log_id, _pos, bytes| {
+            if log_id != target_log_id { return Ok(Some(true)); }
+            if !metablock_bytes::is_metablock_kind_event_batch_metadata(bytes) { return Ok(None); }
+            let org_id = metablock_bytes::read_event_batch_org_id(bytes);
+            if let Some(filter) = filter_org_id {
+                if org_id != filter { return Ok(None); }
+            }
+            let aggregate_type_id = metablock_bytes::read_event_batch_aggregate_type_id(bytes);
+            if seen.insert(AggregateTypeKey::new(org_id, aggregate_type_id)) {
+                results.push(AggregateTypeListItem { org_id, aggregate_type_id });
+            }
+            Ok(None)
+        }).await?;
+        Ok(())
     }
 
     /// List aggregates, optionally filtered by org_id and/or aggregate_type_id.
     ///
-    /// Scans WAL in reverse order. Returns aggregates with accumulated statistics
-    /// from batches seen within this page. Client must merge stats across pages.
+    /// Reads segment summaries newest-to-oldest with delete barrier semantics.
+    /// Falls back to reverse metablock scan for legacy segments without summaries.
     pub async fn list_aggregates(&self, request: ListAggregatesRequest) -> Result<ListAggregatesResponse, ShardListingError> {
         let _permit = self.list_semaphore.acquire_permit(1).await
             .map_err(|_| ShardListingError::ListSemaphoreClosed)?;
         let start_time = Instant::now();
         let max_duration = self.config.list_max_duration;
         let page_size = self.config.list_page_size;
-        let start_wal_index = request.cursor.unwrap_or(u64::MAX);
+        let active_log_id = self.log_segments_cache.active_log_id();
         let filter_org_id = request.org_id;
         let filter_aggregate_type_id = request.aggregate_type_id;
 
-        // Track aggregate stats with insertion order preserved
-        // Key -> accumulated stats for this page
-        struct AggregatePageStats {
+        struct AccumulatedStats {
             is_deleted: bool,
             event_batch_count: u64,
-            min_event_timestamp: u64,
-            max_event_timestamp: u64,
-            min_server_timestamp: u64,
-            max_server_timestamp: u64,
             min_event_batch_index: u64,
             max_event_batch_index: u64,
-            min_event_index: u64,
-            max_event_index: u64,
+            max_server_timestamp: u64,
             compressed_size: u64,
             uncompressed_size: u64,
         }
 
-        let mut seen: HashMap<AggregateKey, AggregatePageStats> = HashMap::with_capacity(page_size);
-        let mut result_order: Vec<AggregateKey> = Vec::with_capacity(page_size);
-        let mut last_wal_index: Option<u64> = None;
-        let mut reached_end = false;
-        let mut unique_count = 0usize;
+        fn build_response(
+            correlation_id: Option<u128>,
+            result_order: Vec<AggregateKey>,
+            seen: &HashMap<AggregateKey, AccumulatedStats>,
+            next_cursor: Option<u64>,
+        ) -> ListAggregatesResponse {
+            let aggregates = result_order.into_iter()
+                .filter_map(|key| {
+                    seen.get(&key).map(|stats| AggregateListItem {
+                        org_id: key.org_id,
+                        aggregate_type_id: key.aggregate_type_id,
+                        aggregate_id: key.aggregate_id,
+                        is_deleted: stats.is_deleted,
+                        event_batch_count: stats.event_batch_count,
+                        min_event_timestamp: 0,
+                        max_event_timestamp: 0,
+                        min_event_batch_index: if stats.min_event_batch_index == u64::MAX { 0 } else { stats.min_event_batch_index },
+                        max_event_batch_index: stats.max_event_batch_index,
+                        min_event_index: 0,
+                        max_event_index: 0,
+                        min_server_timestamp: 0,
+                        max_server_timestamp: stats.max_server_timestamp,
+                        compressed_size: stats.compressed_size,
+                        uncompressed_size: stats.uncompressed_size,
+                    })
+                })
+                .collect();
+            ListAggregatesResponse { correlation_id, aggregates, next_cursor }
+        }
 
-        let (start_log_id, start_pos) = self.find_list_scan_start(start_wal_index).await;
+        fn process_aggregate_entry(
+            org_id: u128, aggregate_type_id: u128, aggregate_id: u128,
+            is_deleted: bool, event_batch_count: u64,
+            min_event_batch_index: u64, last_event_batch_index: u64,
+            last_server_timestamp: u64, compressed_size: u64, uncompressed_size: u64,
+            filter_org_id: Option<u128>, filter_aggregate_type_id: Option<u128>,
+            seen: &mut HashMap<AggregateKey, AccumulatedStats>,
+            result_order: &mut Vec<AggregateKey>,
+            deleted_barrier: &mut HashSet<AggregateKey>,
+            unique_count: &mut usize,
+        ) {
+            if let Some(f) = filter_org_id { if org_id != f { return; } }
+            if let Some(f) = filter_aggregate_type_id { if aggregate_type_id != f { return; } }
 
-        let mut scanner = ReverseMetablockScanner::new(
-            &self.log_segments_cache,
-            start_log_id,
-            start_pos,
-            self.config.read_max_chunk_size,
-        );
+            let key = AggregateKey::new(org_id, aggregate_type_id, aggregate_id);
+            if deleted_barrier.contains(&key) { return; }
 
-        let scan_result = scanner
-            .scan::<bool, ()>(|log_id, pos, bytes| {
-                if start_time.elapsed() >= max_duration {
-                    return Ok(Some(false));
+            if is_deleted {
+                deleted_barrier.insert(key.clone());
+                if !seen.contains_key(&key) {
+                    seen.insert(key.clone(), AccumulatedStats {
+                        is_deleted: true, event_batch_count: 0,
+                        min_event_batch_index: u64::MAX, max_event_batch_index: 0,
+                        max_server_timestamp: 0, compressed_size: 0, uncompressed_size: 0,
+                    });
+                    result_order.push(key);
+                    *unique_count += 1;
                 }
+                return;
+            }
 
-                let wal_index = metablock_bytes::read_wal_index(bytes);
-
-                if wal_index > start_wal_index {
-                    return Ok(None);
-                }
-
-                if wal_index % 100 == 0 {
-                    self.shard_mem_cache.borrow_mut().cache_wal_index_position(wal_index, log_id, pos);
-                }
-
-                // Handle SoftDelete - mark aggregate as deleted
-                if metablock_bytes::is_metablock_kind_soft_delete(bytes) {
-                    let aggregate_key = metablock_bytes::read_soft_delete_aggregate_key(bytes);
-                    
-                    if let Some(filter) = filter_org_id {
-                        if aggregate_key.org_id != filter {
-                            return Ok(None);
-                        }
-                    }
-                    if let Some(filter) = filter_aggregate_type_id {
-                        if aggregate_key.aggregate_type_id != filter {
-                            return Ok(None);
-                        }
-                    }
-
-                    if !seen.contains_key(&aggregate_key) {
-                        // First time seeing this aggregate (as deleted)
-                        if unique_count >= page_size {
-                            return Ok(Some(false)); // Page full
-                        }
-
-                        result_order.push(aggregate_key.clone());
-                        seen.insert(aggregate_key, AggregatePageStats {
-                            is_deleted: true,
-                            event_batch_count: 0,
-                            min_event_timestamp: u64::MAX,
-                            max_event_timestamp: 0,
-                            min_server_timestamp: u64::MAX,
-                            max_server_timestamp: 0,
-                            min_event_batch_index: u64::MAX,
-                            max_event_batch_index: 0,
-                            min_event_index: u64::MAX,
-                            max_event_index: 0,
-                            uncompressed_size: 0,
-                            compressed_size: 0,
-                        });
-                        unique_count += 1;
-                        last_wal_index = Some(wal_index);
-                    }
-                    return Ok(None);
-                }
-
-                // Handle EventBatch
-                if !metablock_bytes::is_metablock_kind_event_batch_metadata(bytes) {
-                    return Ok(None);
-                }
-
-                let aggregate_key = metablock_bytes::read_event_batch_aggregate_key(bytes);
-
-                if let Some(filter) = filter_org_id {
-                    if aggregate_key.org_id != filter {
-                        return Ok(None);
-                    }
-                }
-                if let Some(filter) = filter_aggregate_type_id {
-                    if aggregate_key.aggregate_type_id != filter {
-                        return Ok(None);
-                    }
-                }
-
-                // Read stats from this metablock
-                let event_batch_index = metablock_bytes::read_event_batch_event_batch_index(bytes);
-                let min_event_ts = metablock_bytes::read_event_batch_min_event_timestamp(bytes);
-                let max_event_ts = metablock_bytes::read_event_batch_max_event_timestamp(bytes);
-                let server_ts = metablock_bytes::read_server_timestamp(bytes);
-                let min_event_idx = metablock_bytes::read_event_batch_min_event_index(bytes);
-                let max_event_idx = metablock_bytes::read_event_batch_max_event_index(bytes);
-                let compressed_size = metablock_bytes::read_compressed_size(bytes);
-                let uncompressed_size = metablock_bytes::read_uncompressed_size(bytes);
-
-                if let Some(stats) = seen.get_mut(&aggregate_key) {
-                    // Already seen this aggregate, accumulate stats
-                    stats.event_batch_count += 1;
-                    stats.min_event_timestamp = stats.min_event_timestamp.min(min_event_ts);
-                    stats.max_event_timestamp = stats.max_event_timestamp.max(max_event_ts);
-                    stats.min_server_timestamp = stats.min_server_timestamp.min(server_ts);
-                    stats.max_server_timestamp = stats.max_server_timestamp.max(server_ts);
-                    stats.min_event_batch_index = stats.min_event_batch_index.min(event_batch_index);
-                    stats.max_event_batch_index = stats.max_event_batch_index.max(event_batch_index);
-                    stats.min_event_index = stats.min_event_index.min(min_event_idx);
-                    stats.max_event_index = stats.max_event_index.max(max_event_idx);
+            if let Some(stats) = seen.get_mut(&key) {
+                if !stats.is_deleted {
+                    stats.event_batch_count += event_batch_count;
+                    stats.min_event_batch_index = stats.min_event_batch_index.min(min_event_batch_index);
+                    stats.max_event_batch_index = stats.max_event_batch_index.max(last_event_batch_index);
+                    stats.max_server_timestamp = stats.max_server_timestamp.max(last_server_timestamp);
                     stats.compressed_size += compressed_size;
                     stats.uncompressed_size += uncompressed_size;
-                } else {
-                    // First time seeing this aggregate
-                    if unique_count >= page_size {
-                        return Ok(Some(false)); // Page full
-                    }
-
-                    result_order.push(aggregate_key.clone());
-                    seen.insert(aggregate_key, AggregatePageStats {
-                        is_deleted: false,
-                        event_batch_count: 1,
-                        min_event_timestamp: min_event_ts,
-                        max_event_timestamp: max_event_ts,
-                        min_server_timestamp: server_ts,
-                        max_server_timestamp: server_ts,
-                        min_event_batch_index: event_batch_index,
-                        max_event_batch_index: event_batch_index,
-                        min_event_index: min_event_idx,
-                        max_event_index: max_event_idx,
-                        compressed_size,
-                        uncompressed_size,
-                    });
-                    unique_count += 1;
-                    last_wal_index = Some(wal_index);
                 }
-
-                Ok(None)
-            })
-            .await
-            .map_err(ShardListingError::ReadFromDiskError)?;
-
-        if scan_result.is_none() {
-            reached_end = true;
-        }
-
-        // Convert to results, preserving insertion order
-        let results: Vec<AggregateListItem> = result_order
-            .into_iter()
-            .filter_map(|key| {
-                seen.get(&key).map(|stats| AggregateListItem {
-                    org_id: key.org_id,
-                    aggregate_type_id: key.aggregate_type_id,
-                    aggregate_id: key.aggregate_id,
-                    is_deleted: stats.is_deleted,
-                    event_batch_count: stats.event_batch_count,
-                    min_event_timestamp: if stats.min_event_timestamp == u64::MAX { 0 } else { stats.min_event_timestamp },
-                    max_event_timestamp: stats.max_event_timestamp,
-                    min_event_batch_index: if stats.min_event_batch_index == u64::MAX { 0 } else { stats.min_event_batch_index },
-                    max_event_batch_index: stats.max_event_batch_index,
-                    min_event_index: if stats.min_event_index == u64::MAX { 0 } else { stats.min_event_index },
-                    max_event_index: stats.max_event_index,
-                    min_server_timestamp: if stats.min_server_timestamp == u64::MAX { 0 } else { stats.min_server_timestamp },
-                    max_server_timestamp: stats.max_server_timestamp,
-                    uncompressed_size: stats.uncompressed_size,
-                    compressed_size: stats.compressed_size,
-                })
-            })
-            .collect();
-
-        let next_cursor = if reached_end || results.is_empty() {
-            None
-        } else {
-            last_wal_index.map(|i| i.saturating_sub(1))
-        };
-
-        Ok(ListAggregatesResponse {
-            correlation_id: request.correlation_id,
-            aggregates: results,
-            next_cursor,
-        })
-    }
-
-    /// Find the starting position for a list scan.
-    /// 
-    /// Tries to use cached position if available, otherwise starts from active log.
-    async fn find_list_scan_start(&self, mut target_wal_index: u64) -> (u64, Option<u64>) {
-        // If no cursor (starting from latest), just use active log
-        if target_wal_index == u64::MAX {
-            return (self.log_segments_cache.active_log_id(), None);
-        }
-
-        // Make sure we can't read the write tip, only from committed read positions
-        let read_cursor = self.log_segments_cache.get_latest_read_cursor();
-        target_wal_index = target_wal_index.min(read_cursor.wal_index);
-
-        // Try to find cached position at or near target
-        let cached = self.shard_mem_cache.borrow_mut().find_nearest_wal_index_position(target_wal_index);
-        
-        if let Some((cached_wal_index, pos)) = cached {
-            //TODO: Benchmarking and testing of this, needs more thought on cache relevance
-            if cached_wal_index <= target_wal_index && target_wal_index - cached_wal_index < 1000 {
-                return (pos.log_id, Some(pos.metablock_absolute_pos.saturating_add(FIXED_BLOCK_SIZE_BYTES as u64))); //Include self
+            } else {
+                seen.insert(key.clone(), AccumulatedStats {
+                    is_deleted: false,
+                    event_batch_count,
+                    min_event_batch_index,
+                    max_event_batch_index: last_event_batch_index,
+                    max_server_timestamp: last_server_timestamp,
+                    compressed_size,
+                    uncompressed_size,
+                });
+                result_order.push(key);
+                *unique_count += 1;
             }
         }
 
-        // No useful cache hit, start from active log
-        (read_cursor.log_id, None)
+        let mut seen: HashMap<AggregateKey, AccumulatedStats> = HashMap::with_capacity(page_size);
+        let mut result_order: Vec<AggregateKey> = Vec::with_capacity(page_size);
+        let mut deleted_barrier: HashSet<AggregateKey> = HashSet::new();
+        let mut unique_count = 0usize;
+        macro_rules! process {
+            ($org:expr, $atype:expr, $aid:expr, $del:expr, $ebc:expr,
+             $min_ebi:expr, $last_ebi:expr, $last_ts:expr, $csz:expr, $usz:expr) => {
+                process_aggregate_entry(
+                    $org, $atype, $aid, $del, $ebc, $min_ebi, $last_ebi, $last_ts, $csz, $usz,
+                    filter_org_id, filter_aggregate_type_id,
+                    &mut seen, &mut result_order, &mut deleted_barrier, &mut unique_count,
+                )
+            }
+        }
+
+        // cursor: None = first page, Some(log_id) = resume from this closed segment downward
+        let start_log_id = match request.cursor {
+            None => {
+                let summary = { self.shard_mem_cache.borrow().peek_segment_summary().clone() };
+                for (key, entry) in &summary {
+                    process!(key.org_id, key.aggregate_type_id, key.aggregate_id,
+                        entry.is_deleted, entry.event_batch_count,
+                        entry.min_event_batch_index, entry.last_event_batch_index,
+                        entry.last_server_timestamp, entry.compressed_size, entry.uncompressed_size);
+                }
+                active_log_id.saturating_sub(1)
+            }
+            Some(log_id) => log_id,
+        };
+
+        if start_log_id == 0 {
+            return Ok(build_response(request.correlation_id, result_order, &seen, None));
+        }
+
+        for log_id in (1..=start_log_id).rev() {
+            // Check page limit between segments (not within)
+            if unique_count >= page_size || start_time.elapsed() >= max_duration {
+                return Ok(build_response(request.correlation_id, result_order, &seen, Some(log_id)));
+            }
+
+            match read_segment_summary(&self.log_segments_cache, log_id).await {
+                Ok(Some(payload)) => {
+                    for entry in &payload.aggregates {
+                        process!(entry.org_id, entry.aggregate_type_id, entry.aggregate_id,
+                            entry.is_deleted, entry.event_batch_count,
+                            entry.min_event_batch_index, entry.last_event_batch_index,
+                            entry.last_server_timestamp, entry.compressed_size, entry.uncompressed_size);
+                    }
+                }
+                Ok(None) => {
+                    // Legacy fallback: scan this single segment's metablocks
+                    let mut scanner = ReverseMetablockScanner::new(
+                        &self.log_segments_cache, log_id, None, self.config.read_max_chunk_size,
+                    );
+                    scanner.scan::<bool, ()>(|scan_log_id, _pos, bytes| {
+                        if scan_log_id != log_id { return Ok(Some(true)); }
+
+                        if metablock_bytes::is_metablock_kind_soft_delete(bytes) {
+                            let ak = metablock_bytes::read_soft_delete_aggregate_key(bytes);
+                            process!(ak.org_id, ak.aggregate_type_id, ak.aggregate_id,
+                                        true, 0, u64::MAX, 0, 0, 0, 0);
+                            return Ok(None);
+                        }
+
+                        if !metablock_bytes::is_metablock_kind_event_batch_metadata(bytes) {
+                            return Ok(None);
+                        }
+
+                        let ak = metablock_bytes::read_event_batch_aggregate_key(bytes);
+                        let ebi = metablock_bytes::read_event_batch_event_batch_index(bytes);
+                        let ts = metablock_bytes::read_server_timestamp(bytes);
+                        let csz = metablock_bytes::read_compressed_size(bytes);
+                        let usz = metablock_bytes::read_uncompressed_size(bytes);
+                        process!(ak.org_id, ak.aggregate_type_id, ak.aggregate_id,
+                                    false, 1, ebi, ebi, ts, csz, usz);
+                        Ok(None)
+                    }).await.map_err(ShardListingError::ReadFromDiskError)?;
+                }
+                Err(e) => return Err(ShardListingError::ReadFromDiskError(e)),
+            }
+        }
+
+        Ok(build_response(request.correlation_id, result_order, &seen, None))
     }
     
     pub async fn exists(&self, exists_request: &AggregateDetailsRequest) -> Result<AggregateDetailsResponse, ShardAggregateDetailsError> {
@@ -892,9 +937,11 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let (client_id, user_id) = match &metablock.wal_metablock_type {
             MetablockKind::EventBatchMetadata(eb) => (eb.client_id, eb.user_id),
             MetablockKind::SoftDelete(sd) => (sd.client_id, sd.user_id),
-            other => return Err(ShardAggregateDetailsError::MetablockReadError(
-                format!("unexpected metablock kind: {:?}", std::mem::discriminant(other)),
-            )),
+            other @ (MetablockKind::SoftTrim(_) | MetablockKind::SchemaRegistration(_) | MetablockKind::SegmentSummary(_)) => {
+                return Err(ShardAggregateDetailsError::MetablockReadError(
+                    format!("unexpected metablock kind: {:?}", std::mem::discriminant(other)),
+                ))
+            }
         };
 
         Ok((metablock.server_timestamp, client_id, user_id))
@@ -5584,6 +5631,345 @@ mod tests {
 
             let (in_cache, _) = shard.shard_mem_cache.borrow_mut().aggregate_load_status(&agg, CachePath::Write);
             assert!(!in_cache, "zero-timeout warmup should not populate cache");
+
+            shard.close().await;
+        });
+    }
+
+    // ── read_segment_summary ──
+
+    #[test]
+    fn read_segment_summary_from_rotated_segment() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_compact_shard(&dir).await;
+
+            let agg_a = key(1, 10, 100);
+            let agg_b = key(2, 20, 200);
+            write_ok(&shard, write_req(agg_a.clone(), fat_event(1))).await;
+            write_ok(&shard, write_req(agg_b.clone(), fat_event(1))).await;
+
+            trigger_rotation(&shard).await;
+            assert!(shard.log_segments_cache.active_log_id() > 1);
+
+            let result = read_segment_summary(&shard.log_segments_cache, 1).await;
+            let payload = result.expect("should not error").expect("should have summary");
+
+            assert!(payload.orgs.contains(&1));
+            assert!(payload.orgs.contains(&2));
+            assert!(payload.aggregate_types.contains(&AggregateTypeKey::new(1, 10)));
+            assert!(payload.aggregate_types.contains(&AggregateTypeKey::new(2, 20)));
+            assert!(payload.aggregates.iter().any(|a| a.aggregate_id == 100));
+            assert!(payload.aggregates.iter().any(|a| a.aggregate_id == 200));
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn read_segment_summary_returns_none_for_active_segment() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+
+            write_ok(&shard, write_req(key(1, 1, 1), events(1))).await;
+
+            let active_id = shard.log_segments_cache.active_log_id();
+            let result = read_segment_summary(&shard.log_segments_cache, active_id).await;
+            assert!(result.expect("should not error").is_none());
+
+            shard.close().await;
+        });
+    }
+
+    // ── Summary-based list operations ──
+
+    #[test]
+    fn list_active_segment_from_memory() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+
+            // Write data without rotation — all in active segment
+            write_ok(&shard, write_req(key(1, 10, 100), events(2))).await;
+            write_ok(&shard, write_req(key(2, 20, 200), events(3))).await;
+
+            let orgs = unwrap_list_orgs(process(&shard, list_orgs_req()).await);
+            let org_ids: HashSet<u128> = orgs.orgs.iter().map(|o| o.org_id).collect();
+            assert!(org_ids.contains(&1));
+            assert!(org_ids.contains(&2));
+            assert!(orgs.next_cursor.is_none());
+
+            let types = unwrap_list_types(process(&shard, list_types_req(None)).await);
+            assert_eq!(types.aggregate_types.len(), 2);
+            assert!(types.next_cursor.is_none());
+
+            let aggs = unwrap_list_aggs(process(&shard, list_aggs_req(None, None)).await);
+            assert_eq!(aggs.aggregates.len(), 2);
+            let ids: HashSet<u128> = aggs.aggregates.iter().map(|a| a.aggregate_id).collect();
+            assert!(ids.contains(&100));
+            assert!(ids.contains(&200));
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn list_across_segments_with_summaries() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_compact_shard(&dir).await;
+
+            // Segment 1: two aggregates in different orgs
+            write_ok(&shard, write_req(key(1, 10, 100), events(2))).await;
+            write_ok(&shard, write_req(key(2, 20, 200), events(1))).await;
+
+            trigger_rotation(&shard).await;
+            assert!(shard.log_segments_cache.active_log_id() > 1);
+
+            // Segment 2 (active): one more aggregate
+            write_ok(&shard, write_req(key(3, 30, 300), events(1))).await;
+
+            // list_orgs: all three orgs
+            let orgs = unwrap_list_orgs(process(&shard, list_orgs_req()).await);
+            let org_ids: HashSet<u128> = orgs.orgs.iter().map(|o| o.org_id).collect();
+            assert!(org_ids.contains(&1));
+            assert!(org_ids.contains(&2));
+            assert!(org_ids.contains(&3));
+
+            // list_types: all three types
+            let types = unwrap_list_types(process(&shard, list_types_req(None)).await);
+            assert!(types.aggregate_types.len() >= 3);
+
+            // list_types filtered by org=1
+            let types_1 = unwrap_list_types(process(&shard, list_types_req(Some(1))).await);
+            assert_eq!(types_1.aggregate_types.len(), 1);
+            assert_eq!(types_1.aggregate_types[0].aggregate_type_id, 10);
+
+            // list_aggs: all three
+            let aggs = unwrap_list_aggs(process(&shard, list_aggs_req(None, None)).await);
+            let agg_ids: HashSet<u128> = aggs.aggregates.iter().map(|a| a.aggregate_id).collect();
+            assert!(agg_ids.contains(&100));
+            assert!(agg_ids.contains(&200));
+            assert!(agg_ids.contains(&300));
+
+            // Verify stats accumulation: agg 100 had 2 events in 1 batch
+            let agg_100 = aggs.aggregates.iter().find(|a| a.aggregate_id == 100).unwrap();
+            assert_eq!(agg_100.event_batch_count, 1);
+            assert!(!agg_100.is_deleted);
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn list_aggregates_delete_barrier() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_compact_shard(&dir).await;
+
+            let agg_a = key(1, 1, 1);
+
+            // Segment 1: 3 batches for agg_a
+            write_ok(&shard, write_req(agg_a.clone(), events(1))).await;
+            write_ok(&shard, write_req(agg_a.clone(), events(1))).await;
+            write_ok(&shard, write_req(agg_a.clone(), events(1))).await;
+
+            trigger_rotation(&shard).await;
+
+            // Segment 2 (active): delete agg_a
+            let _ = process(&shard, delete_req(agg_a.clone())).await.unwrap();
+
+            let aggs = unwrap_list_aggs(process(&shard, list_aggs_req(Some(1), Some(1))).await);
+
+            // agg_a should appear as deleted
+            let agg = aggs.aggregates.iter().find(|a| a.aggregate_id == 1).unwrap();
+            assert!(agg.is_deleted);
+            // Delete barrier: old batches from segment 1 should NOT be accumulated
+            assert_eq!(agg.event_batch_count, 0, "delete barrier should prevent stat accumulation");
+            assert_eq!(agg.compressed_size, 0);
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn standalone_write_updates_segment_summary() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+
+            assert!(shard.shard_mem_cache.borrow().peek_segment_summary().is_empty());
+
+            write_ok(&shard, write_req(key(1, 10, 100), events(1))).await;
+
+            let cache = shard.shard_mem_cache.borrow();
+            assert_eq!(cache.peek_segment_summary().len(), 1);
+            assert!(cache.peek_segment_summary_orgs().contains(&1));
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn leader_write_updates_summary_only_after_replication() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+
+            // Leader with replication that succeeds on first attempt
+            let client = FailThenSucceedReplicationClient::new(0, 1);
+            let shard = open_leader_shard(&dir, client).await;
+
+            write_ok(&shard, write_req(key(1, 10, 100), events(1))).await;
+
+            // Summary should be populated (replication succeeded → commit_replication ran)
+            let cache = shard.shard_mem_cache.borrow();
+            assert_eq!(cache.peek_segment_summary().len(), 1,
+                "summary should be populated after successful replication");
+            assert!(cache.peek_segment_summary_orgs().contains(&1));
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn leader_rollback_does_not_pollute_segment_summary() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+
+            // Leader: first write fails replication, second succeeds
+            let client = FailThenSucceedReplicationClient::new(1, 1);
+            let shard = open_leader_shard(&dir, client).await;
+
+            // Write 1 to org 1: replication fails → rollback
+            let result = process(&shard, write_req(key(1, 10, 100), events(1))).await;
+            assert!(matches!(result, Err(ShardError::Write(ShardWriteError::ReplicationError(_)))));
+
+            // Summary should be empty — rolled-back data must not appear
+            assert!(shard.shard_mem_cache.borrow().peek_segment_summary().is_empty(),
+                "rolled-back write must not appear in segment summary");
+
+            // Write 2 to org 2: replication succeeds
+            write_ok(&shard, write_req(key(2, 20, 200), events(1))).await;
+
+            // Summary should contain only org 2, not org 1
+            let cache = shard.shard_mem_cache.borrow();
+            assert_eq!(cache.peek_segment_summary().len(), 1);
+            assert!(!cache.peek_segment_summary_orgs().contains(&1),
+                "rolled-back org 1 must not be in summary");
+            assert!(cache.peek_segment_summary_orgs().contains(&2));
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn prewarm_summary_respects_delete_order() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+
+            // Write then delete in the active segment, close without rotation
+            {
+                let shard = open_shard(&dir).await;
+                let agg = key(1, 10, 100);
+                write_ok(&shard, write_req(agg.clone(), events(1))).await;
+                let _ = process(&shard, delete_req(agg)).await.unwrap();
+                shard.close().await;
+            }
+
+            // Reopen — pre-warm reverse scans the active segment
+            let shard = open_shard(&dir).await;
+
+            // The summary must reflect the delete (is_deleted=true), not the write
+            let cache = shard.shard_mem_cache.borrow();
+            let entry = cache.peek_segment_summary().values().next().unwrap();
+            assert!(entry.is_deleted, "pre-warm should replay in forward order: delete after write");
+
+            // list_aggregates should show the aggregate as deleted
+            drop(cache);
+            let aggs = unwrap_list_aggs(process(&shard, list_aggs_req(Some(1), Some(10))).await);
+            let found = aggs.aggregates.iter().find(|a| a.aggregate_id == 100);
+            assert!(found.is_some() && found.unwrap().is_deleted,
+                "deleted aggregate should appear as deleted after pre-warm");
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn prewarm_summary_respects_recreate_order() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+
+            // Write, delete with allow_recreate, recreate — all in active segment
+            {
+                let shard = open_shard(&dir).await;
+                let agg = key(1, 10, 100);
+                write_ok(&shard, write_req(agg.clone(), events(1))).await;
+                write_ok(&shard, write_req(agg.clone(), events(1))).await;
+                let _ = process(&shard, delete_req_full(agg.clone(), true, false, None)).await.unwrap();
+                write_ok(&shard, write_req(agg.clone(), events(1))).await;
+                shard.close().await;
+            }
+
+            // Reopen
+            let shard = open_shard(&dir).await;
+
+            // Summary should show alive with batch_count=1 (new incarnation only)
+            let cache = shard.shard_mem_cache.borrow();
+            let entry = cache.peek_segment_summary().values().next().unwrap();
+            assert!(!entry.is_deleted, "recreated aggregate should not be deleted after pre-warm");
+            assert_eq!(entry.event_batch_count, 1,
+                "recreated aggregate should have 1 batch (new incarnation only)");
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn list_orgs_across_segments_after_rotation() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+
+            // Segment 1: write data, then rotate so segment 1 gets a summary
+            {
+                let shard = open_compact_shard(&dir).await;
+                let agg_a = key(1, 10, 100);
+                let agg_b = key(2, 20, 200);
+                write_ok(&shard, write_req(agg_a.clone(), fat_event(1))).await;
+                write_ok(&shard, write_req(agg_b.clone(), fat_event(1))).await;
+                trigger_rotation(&shard).await;
+
+                // Segment 2 (active): write more data with a new org
+                let agg_c = key(3, 30, 300);
+                write_ok(&shard, write_req(agg_c.clone(), events(1))).await;
+
+                shard.close().await;
+            }
+
+            // Reopen and verify list_orgs returns orgs from both segments
+            let shard = open_compact_shard(&dir).await;
+
+            let orgs = unwrap_list_orgs(process(&shard, list_orgs_req()).await);
+            let mut org_ids: Vec<u128> = orgs.orgs.iter().map(|o| o.org_id).collect();
+            org_ids.sort();
+            assert!(org_ids.contains(&1));
+            assert!(org_ids.contains(&2));
+            assert!(org_ids.contains(&3));
+
+            // list_aggregate_types returns correct types
+            let types = unwrap_list_types(process(&shard, list_types_req(Some(1))).await);
+            assert_eq!(types.aggregate_types.len(), 1);
+            assert_eq!(types.aggregate_types[0].org_id, 1);
+            assert_eq!(types.aggregate_types[0].aggregate_type_id, 10);
+
+            // Writes after open are reflected in the active segment summary
+            let agg_d = key(4, 40, 400);
+            write_ok(&shard, write_req(agg_d, events(1))).await;
+
+            let orgs = unwrap_list_orgs(process(&shard, list_orgs_req()).await);
+            let org_ids: Vec<u128> = orgs.orgs.iter().map(|o| o.org_id).collect();
+            assert!(org_ids.contains(&4), "new writes should appear in active segment summary");
 
             shard.close().await;
         });

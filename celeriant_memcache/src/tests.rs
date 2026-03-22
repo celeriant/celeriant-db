@@ -9,12 +9,15 @@ use celeriant_distributed::node_status::NodeStatus;
 use celeriant_rotating_log::log_segment_file::log_segment_file_metadata::LogSegmentFileMetadata;
 use celeriant_wal::aggregate_client_key::AggregateClientKey;
 use celeriant_wal::aggregate_key::AggregateKey;
-use celeriant_wal::constants::{GENESIS_HASH, HEADER_BLOCK_SIZE_BYTES, MINIBATCH_SIZE_BYTES};
+use celeriant_wal::aggregate_type_key::AggregateTypeKey;
+use celeriant_wal::constants::{FIXED_BLOCK_SIZE_BYTES, GENESIS_HASH, HEADER_BLOCK_SIZE_BYTES, MIN_WRITE_ALIGNMENT, MINIBATCH_SIZE_BYTES};
 use celeriant_wal::metablocks::datablock_inline_data::DatablockInlineData;
 use celeriant_wal::metablocks::datablock_storage_kind::DatablockStorageKind;
 use celeriant_wal::metablocks::metablock::Metablock;
 use celeriant_wal::metablocks::metablock_event_batch::{EventTypesKind, MetablockEventBatch};
 use celeriant_wal::metablocks::metablock_kind::MetablockKind;
+use celeriant_wal::metablocks::metablock_soft_delete::MetablockSoftDelete;
+use celeriant_wal::metablocks::metablock_soft_trim::MetablockSoftTrim;
 use celeriant_wal::schema_key::SchemaKey;
 use celeriant_wal::shard_log_header::ShardLogHeader;
 
@@ -1650,4 +1653,234 @@ fn follower_soft_trim_after_events_updates_min_event_batch_index() {
         let pos = c.get_aggregate_last_metablock_pos(&k, path);
         assert_eq!(pos.min_event_batch_index, 2, "min_event_batch_index should be 2 on {:?}", path);
     }
+}
+
+// ── Segment Summary Tests ──
+
+fn eb_metablock(key: AggregateKey, batch_idx: u64, server_ts: u64) -> Metablock {
+    Metablock {
+        wal_index: 0,
+        server_timestamp: server_ts,
+        lease_index: 1,
+        node_id: 1,
+        uncompressed_size: 100,
+        compressed_size: 50,
+        datablock_version: 1,
+        datablock_compression_type: 0,
+        previous_tip_hash: GENESIS_HASH,
+        datablock_position: 0,
+        wal_metablock_type: MetablockKind::EventBatchMetadata(MetablockEventBatch {
+            aggregate_key: key,
+            event_batch_index: batch_idx,
+            min_event_batch_index: 1,
+            min_client_event_index: 1,
+            max_client_event_index: 1,
+            min_event_timestamp: 100,
+            max_event_timestamp: 200,
+            min_event_index: 1,
+            max_event_index: 1,
+            client_id: 1,
+            user_id: None,
+            event_types_data: EventTypesKind::Direct([1, 0, 0, 0]),
+        }),
+        datablock: DatablockStorageKind::Inline(DatablockInlineData {
+            minibatch: [0u8; MINIBATCH_SIZE_BYTES],
+        }),
+    }
+}
+
+fn sd_metablock(key: AggregateKey) -> Metablock {
+    Metablock {
+        wal_index: 0,
+        server_timestamp: 0,
+        lease_index: 1,
+        node_id: 1,
+        uncompressed_size: 0,
+        compressed_size: 0,
+        datablock_version: 0,
+        datablock_compression_type: 0,
+        previous_tip_hash: GENESIS_HASH,
+        datablock_position: 0,
+        wal_metablock_type: MetablockKind::SoftDelete(MetablockSoftDelete {
+            aggregate_key: key,
+            allow_recreate: false,
+            allow_index_continuation: false,
+            event_batch_index: 1,
+            event_index: 1,
+            client_id: 1,
+            user_id: None,
+        }),
+        datablock: DatablockStorageKind::None,
+    }
+}
+
+fn st_metablock(key: AggregateKey, keep_from: u64) -> Metablock {
+    Metablock {
+        wal_index: 0,
+        server_timestamp: 0,
+        lease_index: 1,
+        node_id: 1,
+        uncompressed_size: 0,
+        compressed_size: 0,
+        datablock_version: 0,
+        datablock_compression_type: 0,
+        previous_tip_hash: GENESIS_HASH,
+        datablock_position: 0,
+        wal_metablock_type: MetablockKind::SoftTrim(MetablockSoftTrim {
+            aggregate_key: key,
+            keep_from_event_batch_index: keep_from,
+            event_batch_index: 1,
+            event_index: 1,
+            client_id: 1,
+            user_id: None,
+        }),
+        datablock: DatablockStorageKind::None,
+    }
+}
+
+#[test]
+fn segment_summary_tracks_event_batch() {
+    let mut c = cache();
+    let key = agg(1, 2, 3);
+    c.update_segment_summary(&eb_metablock(key.clone(), 1, 1000));
+    c.update_segment_summary(&eb_metablock(key.clone(), 2, 2000));
+
+    let summary = c.peek_segment_summary();
+    let entry = summary.get(&key).unwrap();
+    assert_eq!(entry.event_batch_count, 2);
+    assert_eq!(entry.last_event_batch_index, 2);
+    assert_eq!(entry.last_server_timestamp, 2000);
+    assert_eq!(entry.compressed_size, 100);
+    assert_eq!(entry.uncompressed_size, 200);
+    assert!(!entry.is_deleted);
+}
+
+#[test]
+fn segment_summary_soft_delete_resets_counts() {
+    let mut c = cache();
+    let key = agg(1, 2, 3);
+    c.update_segment_summary(&eb_metablock(key.clone(), 1, 1000));
+    c.update_segment_summary(&sd_metablock(key.clone()));
+
+    let summary = c.peek_segment_summary();
+    let entry = summary.get(&key).unwrap();
+    assert!(entry.is_deleted);
+    assert_eq!(entry.event_batch_count, 0);
+    assert_eq!(entry.compressed_size, 0);
+    assert_eq!(entry.uncompressed_size, 0);
+}
+
+#[test]
+fn segment_summary_soft_trim_updates_min_batch_index() {
+    let mut c = cache();
+    let key = agg(1, 2, 3);
+    c.update_segment_summary(&eb_metablock(key.clone(), 1, 1000));
+    c.update_segment_summary(&st_metablock(key.clone(), 5));
+
+    let entry = c.peek_segment_summary().get(&key).unwrap();
+    assert_eq!(entry.min_event_batch_index, 5);
+}
+
+#[test]
+fn segment_summary_soft_trim_ignored_for_unknown_aggregate() {
+    let mut c = cache();
+    let key = agg(1, 2, 3);
+    c.update_segment_summary(&st_metablock(key.clone(), 5));
+    assert!(c.peek_segment_summary().is_empty());
+}
+
+#[test]
+fn take_segment_summary_returns_and_clears() {
+    let mut c = cache();
+    let k1 = agg(1, 2, 3);
+    let k2 = agg(1, 4, 5);
+    c.update_segment_summary(&eb_metablock(k1, 1, 1000));
+    c.update_segment_summary(&eb_metablock(k2, 1, 1000));
+
+    let payload = c.take_segment_summary();
+    assert_eq!(payload.orgs.len(), 1);
+    assert_eq!(payload.aggregate_types.len(), 2);
+    assert_eq!(payload.aggregates.len(), 2);
+
+    // State is cleared
+    assert!(c.peek_segment_summary().is_empty());
+    let empty = c.take_segment_summary();
+    assert!(empty.aggregates.is_empty());
+}
+
+#[test]
+fn segment_summary_exact_bytes_empty() {
+    let c = cache();
+    let expected = FIXED_BLOCK_SIZE_BYTES as u64 + 24 + 2 * (MIN_WRITE_ALIGNMENT - 1);
+    assert_eq!(c.segment_summary_exact_bytes(), expected);
+}
+
+#[test]
+fn segment_summary_exact_bytes_with_data() {
+    let mut c = cache();
+    c.update_segment_summary(&eb_metablock(agg(1, 2, 3), 1, 1000));
+    // 1 org (16) + 1 type (32) + 1 aggregate (97) + 24 + FIXED_BLOCK_SIZE_BYTES + alignment padding
+    let expected = FIXED_BLOCK_SIZE_BYTES as u64 + 16 + 32 + 97 + 24 + 2 * (MIN_WRITE_ALIGNMENT - 1);
+    assert_eq!(c.segment_summary_exact_bytes(), expected);
+}
+
+#[test]
+fn segment_summary_preserved_on_fsync_rollback() {
+    let mut c = cache();
+    c.update_segment_summary(&eb_metablock(agg(1, 2, 3), 1, 1000));
+    assert!(!c.peek_segment_summary().is_empty());
+    c.execute_fsync_rollback();
+    assert!(!c.peek_segment_summary().is_empty());
+}
+
+#[test]
+fn peek_segment_summary_orgs_returns_unique_orgs() {
+    let mut c = cache();
+    c.update_segment_summary(&eb_metablock(agg(1, 2, 3), 1, 1000));
+    c.update_segment_summary(&eb_metablock(agg(1, 4, 5), 1, 1000));
+    c.update_segment_summary(&eb_metablock(agg(7, 8, 9), 1, 1000));
+
+    let orgs = c.peek_segment_summary_orgs();
+    assert_eq!(orgs.len(), 2);
+    assert!(orgs.contains(&1));
+    assert!(orgs.contains(&7));
+}
+
+#[test]
+fn peek_segment_summary_types_returns_unique_types() {
+    let mut c = cache();
+    c.update_segment_summary(&eb_metablock(agg(1, 2, 3), 1, 1000));
+    c.update_segment_summary(&eb_metablock(agg(1, 2, 4), 1, 1000));
+    c.update_segment_summary(&eb_metablock(agg(1, 5, 6), 1, 1000));
+
+    let types = c.peek_segment_summary_types();
+    assert_eq!(types.len(), 2);
+    assert!(types.contains(&AggregateTypeKey::new(1, 2)));
+    assert!(types.contains(&AggregateTypeKey::new(1, 5)));
+}
+
+#[test]
+fn take_segment_summary_clears_segment_state() {
+    let mut c = cache();
+    c.update_segment_summary(&eb_metablock(agg(1, 2, 3), 1, 1000));
+    c.update_segment_summary(&eb_metablock(agg(4, 5, 6), 1, 1000));
+
+    let _payload = c.take_segment_summary();
+
+    assert!(c.peek_segment_summary_orgs().is_empty());
+    assert!(c.peek_segment_summary_types().is_empty());
+    assert!(c.peek_segment_summary().is_empty());
+}
+
+#[test]
+fn fsync_rollback_preserves_segment_summary() {
+    let mut c = cache();
+    c.update_segment_summary(&eb_metablock(agg(1, 2, 3), 1, 1000));
+    c.update_segment_summary(&eb_metablock(agg(4, 5, 6), 1, 1000));
+
+    c.execute_fsync_rollback();
+
+    assert_eq!(c.peek_segment_summary_orgs().len(), 2);
+    assert_eq!(c.peek_segment_summary_types().len(), 2);
+    assert_eq!(c.peek_segment_summary().len(), 2);
 }

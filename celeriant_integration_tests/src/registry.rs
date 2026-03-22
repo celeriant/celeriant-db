@@ -118,7 +118,7 @@ pub fn all_tests() -> &'static [TestEntry] {
         TestEntry {
             name: "read_list_benchmark",
             description: "Read and list performance benchmark with large WAL and concurrent ops",
-            estimated_secs: 76,
+            estimated_secs: 150,
             categories: &[Core, Performance],
             distributed: false,
         },
@@ -517,6 +517,13 @@ pub fn all_tests() -> &'static [TestEntry] {
             name: "p1_7_multitenancy_isolation",
             description: "Multi-tenancy isolation: org A cannot see org B's data",
             estimated_secs: 1,
+            categories: &[Correctness],
+            distributed: false,
+        },
+        TestEntry {
+            name: "segment_summary_correctness",
+            description: "Cross-segment delete barriers, trim, multi-org/type listing, and recreate-after-delete with segment summaries",
+            estimated_secs: 30,
             categories: &[Correctness],
             distributed: false,
         },

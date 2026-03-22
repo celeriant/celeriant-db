@@ -8,10 +8,13 @@ use crate::{
     recent_write::RecentWrite, shard_log_queue_item::ShardLogQueueItem, sync_positions_snapshot::{SyncPositionsSnapshot},
 };
 use celeriant_distributed::node_status::NodeStatus;
+use celeriant_wal::datablocks::datablock_segment_summary::{SegmentAggregateEntry, SegmentSummaryPayload};
 use celeriant_wal::metablocks::metablock_event_batch::MetablockEventBatch;
+use celeriant_wal::metablocks::metablock_kind::MetablockKind;
 use celeriant_wal::schema_key::SchemaKey;
 use celeriant_wal::{
-    aggregate_client_key::AggregateClientKey, aggregate_key::AggregateKey, constants::FIXED_BLOCK_SIZE_BYTES, datablocks::datablock::Datablock,
+    aggregate_client_key::AggregateClientKey, aggregate_key::AggregateKey, aggregate_type_key::AggregateTypeKey,
+    constants::{FIXED_BLOCK_SIZE_BYTES, MIN_WRITE_ALIGNMENT}, datablocks::datablock::Datablock,
     metablocks::metablock::Metablock,
 };
 use lru::LruCache;
@@ -91,6 +94,10 @@ pub struct ShardMemCache<V: Validate> {
     /// Used to distinguish "empty queue due to rollback" from "empty queue due to race".
     replication_rollback_occurred: bool,
 
+    /// Running segment summary: per-aggregate stats accumulated since last rotation
+    segment_summary: HashMap<AggregateKey, SegmentAggregateEntry>,
+    segment_summary_orgs: HashSet<u128>,
+    segment_summary_types: HashSet<AggregateTypeKey>,
 }
 
 impl<V: Validate> ShardMemCache<V> {
@@ -902,7 +909,82 @@ impl<V: Validate> ShardMemCache<V> {
             pending_replication_high_water_bytes,
             fsync_rollback_occurred: false,
             replication_rollback_occurred: false,
+            segment_summary: HashMap::new(),
+            segment_summary_orgs: HashSet::new(),
+            segment_summary_types: HashSet::new(),
         }
+    }
+
+    pub fn update_segment_summary(&mut self, metablock: &Metablock) {
+        match &metablock.wal_metablock_type {
+            MetablockKind::EventBatchMetadata(eb) => {
+                let key = &eb.aggregate_key;
+                self.segment_summary_orgs.insert(key.org_id);
+                self.segment_summary_types.insert(AggregateTypeKey::new(key.org_id, key.aggregate_type_id));
+                let entry = self.segment_summary.entry(key.clone()).or_insert_with(|| {
+                    let mut e = SegmentAggregateEntry::new(key.org_id, key.aggregate_type_id, key.aggregate_id);
+                    e.min_event_batch_index = eb.min_event_batch_index;
+                    e
+                });
+                entry.is_deleted = false;
+                entry.event_batch_count += 1;
+                if eb.event_batch_index > entry.last_event_batch_index {
+                    entry.last_event_batch_index = eb.event_batch_index;
+                }
+                if metablock.server_timestamp > entry.last_server_timestamp {
+                    entry.last_server_timestamp = metablock.server_timestamp;
+                }
+                entry.compressed_size += metablock.compressed_size;
+                entry.uncompressed_size += metablock.uncompressed_size;
+            }
+            MetablockKind::SoftDelete(sd) => {
+                let key = &sd.aggregate_key;
+                self.segment_summary_orgs.insert(key.org_id);
+                self.segment_summary_types.insert(AggregateTypeKey::new(key.org_id, key.aggregate_type_id));
+                let entry = self.segment_summary.entry(key.clone())
+                    .or_insert_with(|| SegmentAggregateEntry::new(key.org_id, key.aggregate_type_id, key.aggregate_id));
+                entry.is_deleted = true;
+                entry.event_batch_count = 0;
+                entry.compressed_size = 0;
+                entry.uncompressed_size = 0;
+            }
+            MetablockKind::SoftTrim(st) => {
+                let key = &st.aggregate_key;
+                if let Some(entry) = self.segment_summary.get_mut(key) {
+                    if st.keep_from_event_batch_index > entry.min_event_batch_index {
+                        entry.min_event_batch_index = st.keep_from_event_batch_index;
+                    }
+                }
+            }
+            MetablockKind::SchemaRegistration(_) | MetablockKind::SegmentSummary(_) => {}
+        }
+    }
+
+    pub fn take_segment_summary(&mut self) -> SegmentSummaryPayload {
+        let orgs: Vec<u128> = self.segment_summary_orgs.drain().collect();
+        let aggregate_types: Vec<AggregateTypeKey> = self.segment_summary_types.drain().collect();
+        let aggregates: Vec<SegmentAggregateEntry> = self.segment_summary.drain().map(|(_, v)| v).collect();
+        SegmentSummaryPayload { orgs, aggregate_types, aggregates }
+    }
+
+    pub fn segment_summary_exact_bytes(&self) -> u64 {
+        let datablock_size = self.segment_summary_orgs.len() as u64 * std::mem::size_of::<u128>() as u64
+            + self.segment_summary_types.len() as u64 * AggregateTypeKey::WIRE_SIZE_TOTAL as u64
+            + self.segment_summary.len() as u64 * SegmentAggregateEntry::WIRE_SIZE
+            + SegmentSummaryPayload::WIRE_OVERHEAD;
+        FIXED_BLOCK_SIZE_BYTES as u64 + datablock_size + 2 * (MIN_WRITE_ALIGNMENT - 1)
+    }
+
+    pub fn peek_segment_summary(&self) -> &HashMap<AggregateKey, SegmentAggregateEntry> {
+        &self.segment_summary
+    }
+
+    pub fn peek_segment_summary_orgs(&self) -> &HashSet<u128> {
+        &self.segment_summary_orgs
+    }
+
+    pub fn peek_segment_summary_types(&self) -> &HashSet<AggregateTypeKey> {
+        &self.segment_summary_types
     }
 
     /// Check if a rollback has occurred since items were last added.

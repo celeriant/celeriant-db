@@ -221,6 +221,7 @@ async fn dispatch_test(name: &str) -> Result<(), Box<dyn std::error::Error>> {
         "schema_old_leader_recovery" => schema_old_leader_recovery::run().await,
         "schema_validation" => schema_validation::run().await,
         "schema_zero_cache" => schema_zero_cache::run().await,
+        "segment_summary_correctness" => segment_summary_correctness::run().await,
         "single" => single::run().await,
         "standalone_to_distributed" => standalone_to_distributed::run().await,
         "typed_operations" => typed_operations::run().await,

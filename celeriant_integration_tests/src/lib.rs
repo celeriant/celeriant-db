@@ -78,6 +78,7 @@ pub mod schema_follower_crash;
 pub mod schema_old_leader_recovery;
 pub mod schema_validation;
 pub mod schema_zero_cache;
+pub mod segment_summary_correctness;
 pub mod single;
 pub mod standalone_to_distributed;
 pub mod typed_operations;

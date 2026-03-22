@@ -322,6 +322,8 @@ fn commit_replication(
 
         let log_id = commit_data.log_id();
         for item in commit_data.pending_queue {
+            shard_mem_cache.update_segment_summary(&item.metablock);
+
             match &item.metablock.wal_metablock_type {
                 MetablockKind::EventBatchMetadata(event_batch) => {
                     shard_mem_cache.commit_position_snapshot(&event_batch, log_id, item.metablock_absolute_pos, CachePath::Read);
