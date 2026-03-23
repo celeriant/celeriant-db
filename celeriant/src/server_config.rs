@@ -383,9 +383,6 @@ pub struct ServerConfig {
     #[arg(long, env = "CELERIANT_S3_RETRY_MAX_DURATION_SECS", help = "Maximum total duration (seconds) for retrying S3 operations when S3 is unreachable, with exponential backoff. Unset = retry indefinitely.")]
     pub s3_retry_max_duration_secs: Option<u64>,
 
-    #[arg(long, default_value_t = 1024 * 1024 * 100, env = "CELERIANT_MAX_S3_FALLBACK_BATCH_BYTES", help = "Maximum batch size for S3 fallback replication uploads (100MB)")]
-    pub max_s3_fallback_batch_bytes: u64,
-
     #[arg(
         long,
         default_value = "disabled",
@@ -761,7 +758,6 @@ impl ServerConfig {
                 ConfigCompressionType::Brotli => CompressionType::Brotli { level: self.server_compression_level.unwrap_or(6) },
                 ConfigCompressionType::Gzip => CompressionType::Gzip { level: self.server_compression_level.unwrap_or(6) },
             },
-            max_s3_fallback_batch_bytes: self.max_s3_fallback_batch_bytes,
             tls_config,
             tls_cert_paths: if self.tls_cert_reload_interval_secs > 0 {
                 if let (Some(ca), Some(cert), Some(key)) = (
@@ -870,7 +866,6 @@ impl ServerConfig {
         check_field!(heartbeat_lease_duration_ms);
         check_field!(s3_lease_duration_ms);
         check_field!(max_clock_drift_ms);
-        check_field!(max_s3_fallback_batch_bytes);
         check_field!(tls_mode);
         check_field!(tls_ca_cert);
         check_field!(tls_intracluster_ca_cert);
@@ -959,7 +954,6 @@ impl Default for ServerConfig {
             heartbeat_lease_duration_ms: 1500,
             s3_lease_duration_ms: 30000,
             max_clock_drift_ms: 500,
-            max_s3_fallback_batch_bytes: 1024 * 1024 * 100,
             tls_mode: ConfigTlsMode::Disabled,
             tls_ca_cert: None,
             tls_intracluster_ca_cert: None,

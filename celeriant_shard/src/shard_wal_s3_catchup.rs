@@ -2,7 +2,7 @@ use std::cell::{RefCell};
 use std::rc::Rc;
 
 use celeriant_distributed::node_status::NodeStatus;
-use celeriant_distributed::paths::fallback_shard_prefix;
+use celeriant_distributed::paths::{fallback_shard_prefix, parse_fallback_path};
 use celeriant_msg::request::requests::ReplicationBatchItem;
 use celeriant_rotating_log::log_segment_file::log_segment_file::{read_datablocks_carry_over_bytes, write_dual_shard_log_header};
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
@@ -38,6 +38,11 @@ struct FallbackBatchRef {
     path: String,
     start_wal_index: u64,
     end_wal_index: u64,
+    node_id: u128,
+}
+
+fn remove_self_uploaded(batches: Vec<FallbackBatchRef>, node_id: u128) -> Vec<FallbackBatchRef> {
+    batches.into_iter().filter(|b| b.node_id != node_id).collect()
 }
 
 pub(crate) async fn catchup_from_s3<D: S3Downloader>(
@@ -110,16 +115,41 @@ async fn catchup_round<D: S3Downloader>(
         active.metadata.borrow().write.wal_index
     };
 
-    let mut batches: Vec<FallbackBatchRef> = objects
+    let batches: Vec<FallbackBatchRef> = objects
         .into_iter()
         .filter_map(|obj| {
-            let (_sid, start, end) = parse_fallback_path(&obj.path)?;
-            Some(FallbackBatchRef { path: obj.path, start_wal_index: start, end_wal_index: end })
+            let (_sid, start, end, nid) = parse_fallback_path(&obj.path)?;
+            Some(FallbackBatchRef { path: obj.path, start_wal_index: start, end_wal_index: end, node_id: nid })
         })
         .filter(|b| b.end_wal_index > current_wal_index)
         .collect();
 
+    let mut batches = remove_self_uploaded(batches, node_id);
+
     batches.sort_by_key(|b| b.start_wal_index);
+
+    let mut orphan_paths: Vec<String> = Vec::new();
+    let mut deduped: Vec<FallbackBatchRef> = Vec::with_capacity(batches.len());
+    for batch in batches {
+        match deduped.last_mut() {
+            Some(prev) if prev.start_wal_index == batch.start_wal_index => {
+                if batch.end_wal_index > prev.end_wal_index {
+                    orphan_paths.push(std::mem::replace(&mut prev.path, batch.path));
+                    prev.end_wal_index = batch.end_wal_index;
+                } else {
+                    orphan_paths.push(batch.path);
+                }
+            }
+            _ => deduped.push(batch),
+        }
+    }
+    let batches = deduped;
+
+    for orphan_path in &orphan_paths {
+        if let Err(e) = downloader.delete(orphan_path).await {
+            tracing::warn!(path = %orphan_path, error = ?e, "Failed to delete orphaned S3 batch, will retry next round");
+        }
+    }
 
     if batches.is_empty() {
         return Ok(RoundApplied { batches: 0, bytes: 0, truncated: false });
@@ -184,7 +214,7 @@ async fn catchup_round<D: S3Downloader>(
                     match find_divergence_from_batch(log_segments_cache, &all_items).await {
                         Ok(result) => result,
                         Err(_) => find_divergence_via_s3(
-                            log_segments_cache, downloader, prefix, current_wal_index,
+                            log_segments_cache, downloader, prefix, current_wal_index, node_id,
                         ).await?,
                     };
 
@@ -347,17 +377,20 @@ async fn find_divergence_via_s3<D: S3Downloader>(
     downloader: &Rc<D>,
     prefix: &str,
     current_wal_index: u64,
+    node_id: u128,
 ) -> Result<([u8; 32], u64, u64), S3CatchupError> {
     let objects = downloader.list_objects(prefix).await?;
 
-    let mut earlier_batches: Vec<FallbackBatchRef> = objects
+    let earlier_batches: Vec<FallbackBatchRef> = objects
         .into_iter()
         .filter_map(|obj| {
-            let (_sid, start, end) = parse_fallback_path(&obj.path)?;
-            Some(FallbackBatchRef { path: obj.path, start_wal_index: start, end_wal_index: end })
+            let (_sid, start, end, nid) = parse_fallback_path(&obj.path)?;
+            Some(FallbackBatchRef { path: obj.path, start_wal_index: start, end_wal_index: end, node_id: nid })
         })
         .filter(|b| b.start_wal_index <= current_wal_index)
         .collect();
+
+    let mut earlier_batches = remove_self_uploaded(earlier_batches, node_id);
 
     earlier_batches.sort_by(|a, b| b.start_wal_index.cmp(&a.start_wal_index));
 
@@ -514,32 +547,6 @@ async fn truncate_wal(
     Ok(divergent_count)
 }
 
-/// Parse a fallback batch path to extract shard_id, start_index, and end_index.
-/// Returns None if the path doesn't match the expected format.
-pub fn parse_fallback_path(path: &str) -> Option<(u32, u64, u64)> {
-    // Expected format: cluster/fallback/shard_XXX/batch_XXXXXXXXX_XXXXXXXXX.bin
-    let parts: Vec<&str> = path.split('/').collect();
-    if parts.len() < 3 {
-        return None;
-    }
-
-    let shard_part = parts.iter().find(|p| p.starts_with("shard_"))?;
-    let batch_part = parts.iter().find(|p| p.starts_with("batch_"))?;
-
-    let shard_id: u32 = shard_part.strip_prefix("shard_")?.parse().ok()?;
-    let batch_name = batch_part.strip_prefix("batch_")?.strip_suffix(".bin")?;
-
-    let indices: Vec<&str> = batch_name.split('_').collect();
-    if indices.len() != 2 {
-        return None;
-    }
-
-    let start_index: u64 = indices[0].parse().ok()?;
-    let end_index: u64 = indices[1].parse().ok()?;
-
-    Some((shard_id, start_index, end_index))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -595,14 +602,18 @@ mod tests {
     }
 
     fn make_fallback_batch(shard_id: u32, start: u64, end: u64, tip_hash: [u8; 32]) -> (String, Bytes) {
-        let mut batch = FallbackBatch::new(start, end, shard_id, 0);
+        make_fallback_batch_with_node(shard_id, start, end, tip_hash, 0)
+    }
+
+    fn make_fallback_batch_with_node(shard_id: u32, start: u64, end: u64, tip_hash: [u8; 32], node_id: u128) -> (String, Bytes) {
+        let mut batch = FallbackBatch::new(start, end, shard_id, node_id);
         for wal_index in start..=end {
             batch.push_item(FallbackItem {
                 metablock: test_metablock(wal_index, tip_hash),
                 datablock: None,
             });
         }
-        let path = fallback_batch_path(shard_id, start, end);
+        let path = fallback_batch_path(shard_id, start, end, node_id);
         (path, serialize_fallback_batch(&batch))
     }
 
@@ -1197,7 +1208,7 @@ mod tests {
             let (path7_9, data7_9) = make_fallback_batch(0, 7, 9, [0xBB; 32]);
             dl.insert(path7_9, data7_9);
 
-            let batch_7_9_path = fallback_batch_path(0, 7, 9);
+            let batch_7_9_path = fallback_batch_path(0, 7, 9, 0);
 
             // Call 2 (retry after truncation): remove batch 7-9 so only 6-6 applies this round
             let p = batch_7_9_path.clone();
@@ -1219,7 +1230,7 @@ mod tests {
 
             // Verify the S3 fallback downloaded batch 6-6 to find the ancestor
             let downloads = dl.downloaded_paths();
-            let batch_6_path = fallback_batch_path(0, 6, 6);
+            let batch_6_path = fallback_batch_path(0, 6, 6, 0);
             assert!(
                 downloads.contains(&batch_6_path),
                 "S3 fallback should have downloaded batch 6-6 to find ancestor, got: {:?}",
@@ -1233,22 +1244,7 @@ mod tests {
     #[test]
     fn test_fallback_batch_s3_path() {
         let batch = FallbackBatch::new(5, 10, 2, 0);
-        assert_eq!(fallback_batch_path(batch.shard_id, batch.fallback_index, batch.end_wal_index), "cluster/fallback/shard_002/batch_000000005_000000010.bin");
-    }
-
-    #[test]
-    fn test_parse_fallback_path() {
-        assert_eq!(
-            parse_fallback_path("cluster/fallback/shard_002/batch_000000005_000000010.bin"),
-            Some((2, 5, 10))
-        );
-        assert_eq!(
-            parse_fallback_path("cluster/fallback/shard_015/batch_123456789_123456799.bin"),
-            Some((15, 123456789, 123456799))
-        );
-        assert_eq!(parse_fallback_path("cluster/lease.json"), None);
-        assert_eq!(parse_fallback_path("invalid"), None);
-        assert_eq!(parse_fallback_path("cluster/fallback/shard_002/batch_000000005.bin"), None);
+        assert_eq!(fallback_batch_path(batch.shard_id, batch.fallback_index, batch.end_wal_index, batch.uploaded_by_node_id), "cluster/fallback/shard_002/batch_000000005_000000010_00000000-0000-0000-0000-000000000000.bin");
     }
 
     #[test]
@@ -1421,16 +1417,182 @@ mod tests {
     fn test_shard_id_narrowing() {
         let batch_0 = FallbackBatch::new(1, 5, 0, 0);
         assert_eq!(
-            fallback_batch_path(batch_0.shard_id, batch_0.fallback_index, batch_0.end_wal_index),
-            "cluster/fallback/shard_000/batch_000000001_000000005.bin"
+            fallback_batch_path(batch_0.shard_id, batch_0.fallback_index, batch_0.end_wal_index, batch_0.uploaded_by_node_id),
+            "cluster/fallback/shard_000/batch_000000001_000000005_00000000-0000-0000-0000-000000000000.bin"
         );
 
         let batch_999 = FallbackBatch::new(1, 10, 999, 0);
         assert_eq!(
-            fallback_batch_path(batch_999.shard_id, batch_999.fallback_index, batch_999.end_wal_index),
-            "cluster/fallback/shard_999/batch_000000001_000000010.bin"
+            fallback_batch_path(batch_999.shard_id, batch_999.fallback_index, batch_999.end_wal_index, batch_999.uploaded_by_node_id),
+            "cluster/fallback/shard_999/batch_000000001_000000010_00000000-0000-0000-0000-000000000000.bin"
         );
 
         assert!(u32::MAX > 999);
+    }
+
+    #[test]
+    fn dedup_keeps_longer_batch_and_deletes_orphan() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+            let dl = Rc::new(MockDownloader::new());
+
+            let (path_short, data_short) = make_fallback_batch(0, 1, 3, GENESIS_HASH);
+            let (path_long, data_long) = make_fallback_batch(0, 1, 5, GENESIS_HASH);
+            let orphan_path = path_short.clone();
+            dl.insert(path_short, data_short);
+            dl.insert(path_long, data_long);
+
+            let result = tc.catchup(&dl, 0, 10).await.unwrap();
+            assert_eq!(tc.wal_index(), 5);
+            assert_eq!(result.batches_applied, 1);
+            assert!(dl.deleted_paths().contains(&orphan_path));
+
+            tc.close().await;
+        });
+    }
+
+    #[test]
+    fn dedup_with_multiple_duplicates() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+            let dl = Rc::new(MockDownloader::new());
+
+            let (path_1_2, data_1_2) = make_fallback_batch(0, 1, 2, GENESIS_HASH);
+            let (path_1_4, data_1_4) = make_fallback_batch(0, 1, 4, GENESIS_HASH);
+            let (path_1_6, data_1_6) = make_fallback_batch(0, 1, 6, GENESIS_HASH);
+            let orphan_1_2 = path_1_2.clone();
+            let orphan_1_4 = path_1_4.clone();
+            dl.insert(path_1_2, data_1_2);
+            dl.insert(path_1_4, data_1_4);
+            dl.insert(path_1_6, data_1_6);
+
+            tc.catchup(&dl, 0, 10).await.unwrap();
+            assert_eq!(tc.wal_index(), 6);
+            let deleted = dl.deleted_paths();
+            assert!(deleted.contains(&orphan_1_2));
+            assert!(deleted.contains(&orphan_1_4));
+
+            tc.close().await;
+        });
+    }
+
+    #[test]
+    fn dedup_preserves_non_overlapping_batches() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+            let dl = Rc::new(MockDownloader::new());
+
+            let (path_1_3, data_1_3) = make_fallback_batch(0, 1, 3, GENESIS_HASH);
+            let tip = {
+                // Apply batch 1-3 to get tip hash, then reset
+                let tmp_dl = Rc::new(MockDownloader::new());
+                tmp_dl.insert(path_1_3.clone(), data_1_3.clone());
+                tc.catchup(&tmp_dl, 0, 10).await.unwrap();
+                tc.tip_hash()
+            };
+            // WAL is now at 3, insert batch 4-6 with correct tip
+            let (path_4_6, data_4_6) = make_fallback_batch(0, 4, 6, tip);
+            dl.insert(path_4_6.clone(), data_4_6);
+
+            let result = tc.catchup(&dl, 0, 10).await.unwrap();
+            assert_eq!(tc.wal_index(), 6);
+            assert_eq!(result.batches_applied, 1);
+            // Only the post-apply deletion of batch 4-6 should exist, no orphan deletions
+            let deleted = dl.deleted_paths();
+            assert_eq!(deleted, vec![path_4_6]);
+
+            tc.close().await;
+        });
+    }
+
+    #[test]
+    fn self_uploaded_batches_filtered_before_gap_check() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+            let dl = Rc::new(MockDownloader::new());
+
+            // node_id 99 is the catchup node (see TestComponents::catchup).
+            // Batch 1-5 from node_id=0 (other node) — will be applied.
+            let (path_real, data_real) = make_fallback_batch_with_node(0, 1, 5, GENESIS_HASH, 0);
+            dl.insert(path_real, data_real);
+
+            // Batch 1-3 from node_id=99 (self) — filtered out before dedup/gap check.
+            // Without the filter, dedup would handle this (keeps longer 1-5), but filtering
+            // is defence-in-depth: self-uploaded batches never participate in gap validation.
+            let (path_self, data_self) = make_fallback_batch_with_node(0, 1, 3, GENESIS_HASH, 99);
+            let self_path = path_self.clone();
+            dl.insert(path_self, data_self);
+
+            let result = tc.catchup(&dl, 0, 10).await.unwrap();
+            assert_eq!(tc.wal_index(), 5);
+            assert_eq!(result.batches_applied, 1);
+
+            // Self-uploaded batch must NOT be deleted — the other node may need it
+            assert!(
+                !dl.deleted_paths().contains(&self_path),
+                "Self-uploaded batches must not be deleted from S3"
+            );
+
+            tc.close().await;
+        });
+    }
+
+    #[test]
+    fn self_uploaded_batches_filtered_not_deleted() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+            let dl = Rc::new(MockDownloader::new());
+
+            // Insert only self-uploaded batches (node_id=99)
+            let (path1, data1) = make_fallback_batch_with_node(0, 1, 3, GENESIS_HASH, 99);
+            dl.insert(path1, data1);
+            let (path2, data2) = make_fallback_batch_with_node(0, 4, 6, GENESIS_HASH, 99);
+            dl.insert(path2, data2);
+
+            // Catchup should filter all self-uploaded batches and report nothing to apply
+            let result = tc.catchup(&dl, 0, 10).await.unwrap();
+            assert_eq!(result.batches_applied, 0);
+            assert!(result.fully_caught_up);
+
+            // Self-uploaded batches must NOT be deleted — the other node may need them
+            assert!(dl.deleted_paths().is_empty(), "Self-uploaded batches must not be deleted from S3");
+            assert_eq!(dl.objects.borrow().len(), 2, "Both S3 objects must remain");
+
+            tc.close().await;
+        });
+    }
+
+    #[test]
+    fn dedup_resolves_gap_from_orphaned_partial_upload() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+            let dl = Rc::new(MockDownloader::new());
+
+            // Advance WAL to 47
+            let (path, data) = make_fallback_batch(0, 1, 47, GENESIS_HASH);
+            dl.insert(path, data);
+            tc.catchup(&dl, 0, 10).await.unwrap();
+            assert_eq!(tc.wal_index(), 47);
+            let tip = tc.tip_hash();
+
+            // Orphan from failed chunk + successful retry
+            let (path_48_52, data_48_52) = make_fallback_batch(0, 48, 52, tip);
+            let (path_48_60, data_48_60) = make_fallback_batch(0, 48, 60, tip);
+            let orphan_path = path_48_52.clone();
+            dl.insert(path_48_52, data_48_52);
+            dl.insert(path_48_60, data_48_60);
+
+            tc.catchup(&dl, 0, 10).await.unwrap();
+            assert_eq!(tc.wal_index(), 60);
+            assert!(dl.deleted_paths().contains(&orphan_path));
+
+            tc.close().await;
+        });
     }
 }

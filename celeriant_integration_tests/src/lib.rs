@@ -618,8 +618,6 @@ impl ServerConfigExt for ServerConfig {
             args.push("--s3-catchup-max-rounds".to_string());
             args.push(self.s3_catchup_max_rounds.to_string());
 
-            args.push("--max-s3-fallback-batch-bytes".to_string());
-            args.push(self.max_s3_fallback_batch_bytes.to_string());
         }
 
         args.push("--pending-replication-high-water-bytes".to_string());

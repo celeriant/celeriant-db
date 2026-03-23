@@ -91,7 +91,6 @@ pub struct ShardConfig {
     pub pending_replication_high_water_bytes: u64,
     pub max_clock_drift_ms: u64,
     pub max_catchup_gap_bytes: u64,
-    pub max_s3_fallback_batch_bytes: u64,
     pub tls_config: Option<Arc<TlsConfig>>,
     pub tls_cert_paths: Option<TlsCertPaths>,
     pub tls_client_auth: ClientAuthMode,

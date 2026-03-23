@@ -1908,7 +1908,6 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let max_catchup_gap_bytes = self.config.max_catchup_gap_bytes;
         let max_request_size = self.config.max_request_size;
         let read_max_chunk_size = self.config.read_max_chunk_size;
-        let max_s3_fallback_batch_bytes = self.config.max_s3_fallback_batch_bytes;
         let shard_id = self.config.shard_id;
 
         if !self.node_status.get().raw().is_leader() {
@@ -1920,7 +1919,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             .request_sync_two_phase(
                 Some(self.config.replication_delay),
                 move || async move { capture_replication_snapshot(&mc_capture) },
-                move |captured| commit_replication_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates, captured, max_catchup_gap_bytes, max_request_size, max_s3_fallback_batch_bytes, read_max_chunk_size, shard_id),
+                move |captured| commit_replication_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates, captured, max_catchup_gap_bytes, max_request_size, read_max_chunk_size, shard_id),
             )
             .await
     }
@@ -2462,7 +2461,6 @@ mod tests {
             max_schema_size_bytes: 16384,
             pending_replication_high_water_bytes: 64 * 1024 * 1024,
             max_catchup_gap_bytes: 100 * 1024 * 1024,
-            max_s3_fallback_batch_bytes: 1024 * 1024 * 100,
             compaction_check_interval: Duration::from_secs(600),
             compaction_min_reclaimable_ratio: 0.20,
             compaction_temp_dir: std::path::PathBuf::from("/tmp/test_compaction"),

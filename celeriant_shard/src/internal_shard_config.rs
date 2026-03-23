@@ -18,7 +18,6 @@ pub struct InternalShardConfig {
     pub aggregate_snapshots_cache_bytes: u64,
     pub aggregate_client_snapshots_cache_bytes: u64,
     pub read_max_chunk_size: u64,
-    pub max_s3_fallback_batch_bytes: u64,
     pub timestamp_config: TimestampConfig,
     pub list_page_size: usize,
     pub list_max_concurrent: u64,

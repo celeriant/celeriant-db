@@ -237,7 +237,7 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
         ).map_err(|e| ReplicateToS3Error::SerializationFailed(e.to_string()))?;
 
         let total_bytes = serialized.len();
-        let path = fallback_batch_path(shard_id, fallback_index, end_wal_index);
+        let path = fallback_batch_path(shard_id, fallback_index, end_wal_index, self.node_id);
 
         debug!(
             "S3 fallback triggered: shard_id={}, batch_count={}, bytes={}, fallback_index={}, end_wal_index={}, path={}",
@@ -477,7 +477,7 @@ mod tests {
             assert_eq!(calls.len(), 1);
 
             let (path, data) = &calls[0];
-            assert_eq!(path, "cluster/fallback/shard_007/batch_000000042_000000043.bin");
+            assert_eq!(path, "cluster/fallback/shard_007/batch_000000042_000000043_00000000-0000-0000-0000-00000000002a.bin");
 
             let deserialized = celeriant_wire::disk::versioned_block::deserialise_fallback_batch(data)
                 .expect("should deserialize");
@@ -529,7 +529,7 @@ mod tests {
             assert_eq!(calls.len(), 1);
 
             let (path, data) = &calls[0];
-            assert_eq!(path, "cluster/fallback/shard_005/batch_000000100_000000102.bin");
+            assert_eq!(path, "cluster/fallback/shard_005/batch_000000100_000000102_00000000-0000-0000-0000-000000000001.bin");
 
             let deserialized = celeriant_wire::disk::versioned_block::deserialise_fallback_batch(data)
                 .expect("should deserialize");

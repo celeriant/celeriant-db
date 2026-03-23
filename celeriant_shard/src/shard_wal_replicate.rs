@@ -92,7 +92,6 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
     replication_captured_data: ReplicationCapturedData,
     max_catchup_gap_bytes: u64,
     max_request_size: u64,
-    max_s3_fallback_batch_bytes: u64,
     read_max_chunk_size: u64,
     shard_id: u32,
 ) -> Result<(), ReplicationError> {
@@ -137,12 +136,9 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
         // and needs to catch up itself first, or the follower is completely offline
         if follower_falling_behind_or_offline {
             metrics::counter!("celeriant_replication_s3_fallbacks_total", &shard_label).increment(1);
-            let end_idx = batch_end_index(&batches, max_s3_fallback_batch_bytes);
-            match replication_client.replicate_to_s3(batches[..end_idx].to_vec()).await {
+            match replication_client.replicate_to_s3(std::mem::take(&mut batches)).await {
                 Ok(()) => {
-                    batches.drain(..end_idx);
-                    // Kick after S3 write — follower's catchup will find data
-                    if !kick_sent && batches.is_empty() {
+                    if !kick_sent {
                         let _ = replication_client.send_kick().await;
                         kick_sent = true;
                     }
@@ -657,7 +653,7 @@ mod tests {
     }
 
     #[test]
-    fn s3_fallback_splits_by_max_batch_bytes() {
+    fn s3_fallback_uploads_entire_batch() {
         glommio_test!({
             let (_tmp, dir) = test_dir();
             let lsc = Rc::new(
@@ -670,8 +666,6 @@ mod tests {
             let (client, s3_counts) = RecordingReplicationClient::new();
             let client = Rc::new(client);
 
-            let sz = item().size_bytes();
-
             commit_replication_with_rollback(
                 client,
                 Rc::new(Coordinator::new()),
@@ -681,13 +675,12 @@ mod tests {
                 make_captured_data(5),
                 u64::MAX,   // max_catchup_gap_bytes (irrelevant, already flagged)
                 u64::MAX,   // max_request_size (irrelevant, S3 path)
-                sz * 2,     // max_s3_fallback_batch_bytes: 2 items per chunk
                 64 * 1024,  // read_max_chunk_size
                 0,          // shard_id
             ).await.unwrap();
 
-            // 5 items, 2 per chunk: [2, 2, 1]
-            assert_eq!(*s3_counts.borrow(), vec![2, 2, 1]);
+            // All 5 items uploaded in a single S3 call
+            assert_eq!(*s3_counts.borrow(), vec![5]);
 
             lsc.close().await;
         });

@@ -685,6 +685,7 @@ dependencies = [
  "celeriant_wire",
  "futures",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

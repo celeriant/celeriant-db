@@ -54,9 +54,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         allow_http,
     );
 
-    // Small batch size (32KB) forces multiple S3 fallback batches, exercising the sort path.
     let config = crate::ServerConfig {
-        max_s3_fallback_batch_bytes: 32 * 1024,
         shard_log_preallocate_bytes: 2 * 1024 * 1024,
         ..base_config
     };
