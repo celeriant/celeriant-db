@@ -110,10 +110,14 @@ The retry loop must distinguish between two failure types, because they have opp
 ```
 state = catch_up(aggregate)
 client_event_index = state.max_client_event_index + 1
+re_derive = false
 
 for attempt in 1..MAX_RETRIES:
     if attempt > 1:
         state = catch_up(aggregate)  // fresh projection for retry
+        if re_derive:
+            client_event_index = state.max_client_event_index + 1
+            re_derive = false
 
     if not valid(state, command):
         return validation_error
@@ -122,7 +126,7 @@ for attempt in 1..MAX_RETRIES:
         write to Celeriant with OCC + idempotency
         return success
     catch OptimisticConcurrencyViolation:
-        client_event_index = state.max_client_event_index + 1  // re-derive
+        re_derive = true  // re-derive AFTER next catch-up, not before
         continue
     catch RequestTimeout:
         // DO NOT update client_event_index — hold constant

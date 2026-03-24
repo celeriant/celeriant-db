@@ -81,6 +81,7 @@ x-celeriant-common: &celeriant-common
     CELERIANT_SHARD_LOG_PREALLOCATE_BYTES: "134217728"   # 128 MB log segments
     CELERIANT_MEMORY_CONSUMPTION_PERCENT: "20"
     CELERIANT_NUM_SHARDS: "4"
+    CELERIANT_ROUTING_RULE: ${CELERIANT_ROUTING_RULE:-aggregate_id}
 
 services:
   # ── MinIO (S3-compatible object storage) ─────────────────────────────

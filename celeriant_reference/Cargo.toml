@@ -1,0 +1,26 @@
+[package]
+name = "celeriant_reference"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "celeriant-reference"
+path = "src/main.rs"
+
+[dependencies]
+celeriant_client_tokio = { path = "../celeriant_client_tokio" }
+celeriant_msg = { path = "../celeriant_msg" }
+celeriant_wal = { path = "../celeriant_wal" }
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid = { workspace = true, features = ["v5", "serde"] }
+futures.workspace = true
+tower-http = { version = "0.6", features = ["fs"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
+rand.workspace = true
