@@ -20,6 +20,13 @@ impl SegmentSummaryPayload {
     }
 }
 
+/// On-disk segment summary, written as a sidecar file at rotation time.
+/// Not a WAL entry — no wal_index, no hash chain participation.
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct SegmentSummaryBlock {
+    pub payload: SegmentSummaryPayload,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode, DeepSizeOf)]
 pub struct SegmentAggregateEntry {
     pub org_id: u128,

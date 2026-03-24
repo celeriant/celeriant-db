@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use tracing::{debug, error};
@@ -15,19 +16,14 @@ use celeriant_memcache::sync_positions_snapshot::SyncPositionsSnapshot;
 use celeriant_rotating_log::log_segment_file::log_segment_file::{LogSegmentFile, write_dual_shard_log_header};
 use celeriant_rotating_log::log_segment_file::log_segment_file_metadata::LogSegmentFileMetadata;
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
-use celeriant_wal::constants::{self, EntryHashBytes, FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, MIN_WRITE_ALIGNMENT, WIRE_VERSION_WAL_METABLOCK};
+use celeriant_wal::constants::{self, EntryHashBytes, FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, MIN_WRITE_ALIGNMENT, WIRE_VERSION_SEGMENT_SUMMARY_BLOCK, WIRE_VERSION_WAL_METABLOCK};
+use celeriant_wal::segment_summary::{SegmentSummaryBlock, SegmentSummaryPayload};
 
-use celeriant_wal::datablocks::datablock::Datablock;
-use celeriant_wal::datablocks::datablock_kind::DatablockKind;
-use celeriant_wal::datablocks::datablock_segment_summary::SegmentSummaryPayload;
 use celeriant_wal::metablocks::metablock::Metablock;
 use celeriant_wal::metablocks::metablock_kind::MetablockKind;
-use celeriant_wal::metablocks::metablock_segment_summary::MetablockSegmentSummary;
-use celeriant_wal::compression_type::CompressionType;
 use celeriant_watch::aggregate_watchers::AggregateWatchers;
-use celeriant_wire::disk::serialised_datablock::SerialisedDatablock;
 use celeriant_wire::disk::versioned_block;
-use celeriant_wire::disk::versioned_block::serialize_versioned_message;
+use celeriant_wire::disk::versioned_block::{serialize_versioned_message, serialize_versioned_message_heap};
 
 use crate::amortisation::coordinator::CaptureResult;
 use crate::error::shard_fsync_error::ShardFsyncError;
@@ -78,9 +74,8 @@ pub(crate) async fn commit_fsync_with_rollback(
         "Fsync batch captured"
     );
 
-    let summary_size = shard_mem_cache.borrow().segment_summary_exact_bytes();
     let metablock_padding = constants::write_padding(captured.sync_positions_snapshot.buffer_size_metablocks());
-    let total_required = captured.required_disk_space + metablock_padding + MIN_WRITE_ALIGNMENT - 1 + summary_size;
+    let total_required = captured.required_disk_space + metablock_padding + MIN_WRITE_ALIGNMENT - 1;
     let available_space = log_segments_cache.active_log_available_space();
     if available_space < total_required {
         if log_segments_cache
@@ -94,14 +89,17 @@ pub(crate) async fn commit_fsync_with_rollback(
             });
         }
 
-        let payload = shard_mem_cache.borrow_mut().take_segment_summary();
-        if !payload.aggregates.is_empty() {
-            write_segment_summary(
-                node_status,
-                &log_segments_cache,
+        if node_status.is_leader() {
+            // Leader: defer sidecar write until replication confirms.
+            // Snapshot current accumulator for the sealed segment.
+            let old_log_id = log_segments_cache.active_log_id();
+            shard_mem_cache.borrow_mut().store_sealed_segment_summary(old_log_id);
+        } else {
+            // Non-leader: summary is complete, write sidecar now.
+            write_segment_summary_sidecar(
+                log_segments_cache.shard_dir(),
+                log_segments_cache.active_log_id(),
                 &shard_mem_cache,
-                &watched_aggregates,
-                payload,
             ).await?;
         }
 
@@ -267,7 +265,11 @@ fn commit_sync(
                     pending_commit_data.pending_queue.push(PendingCacheItem::new(queue_item));
                 }
             }
-            _ => {}
+            MetablockKind::SchemaRegistration(_) => {
+                if node_status.is_leader() {
+                    pending_commit_data.pending_queue.push(PendingCacheItem::new(queue_item));
+                }
+            }
         }
     }
 
@@ -281,76 +283,6 @@ fn commit_sync(
 
 fn rollback_sync(shard_mem_cache: Rc<RefCell<MemCache>>) {
     shard_mem_cache.borrow_mut().execute_fsync_rollback();
-}
-
-async fn write_segment_summary(
-    node_status: NodeStatus,
-    log_segments_cache: &Rc<LogSegmentsCache>,
-    shard_mem_cache: &Rc<RefCell<MemCache>>,
-    watched_aggregates: &Rc<AggregateWatchers>,
-    payload: SegmentSummaryPayload,
-) -> Result<(), ShardFsyncError> {
-    let unique_org_count = payload.orgs.len() as u32;
-    let unique_aggregate_type_count = payload.aggregate_types.len() as u32;
-    let unique_aggregate_count = payload.aggregates.len() as u32;
-
-    let datablock = Datablock {
-        datablock_kind: DatablockKind::SegmentSummary(payload),
-    };
-
-    let serialized = SerialisedDatablock::new(&datablock, CompressionType::None)
-        .map_err(|e| ShardFsyncError::MetablockSerialisationError(format!("{e:?}")))?;
-
-    let summary_metablock = MetablockSegmentSummary {
-        segment_log_id: log_segments_cache.active_log_id(),
-        unique_org_count,
-        unique_aggregate_type_count,
-        unique_aggregate_count,
-        datablock_position: 0,
-        datablock_compressed_size: serialized.compressed_size,
-        datablock_uncompressed_size: serialized.uncompressed_size,
-    };
-
-    let metablock = Metablock {
-        wal_index: 0,
-        server_timestamp: 0,
-        lease_index: 0,
-        node_id: 0,
-        uncompressed_size: serialized.uncompressed_size,
-        compressed_size: serialized.compressed_size,
-        datablock_version: serialized.datablock_version,
-        datablock_compression_type: serialized.compression_type,
-        previous_tip_hash: constants::GENESIS_HASH,
-        datablock_position: 0,
-        wal_metablock_type: MetablockKind::SegmentSummary(summary_metablock),
-        datablock: serialized.storage_kind,
-    };
-
-    let queue_item = celeriant_memcache::shard_log_queue_item::ShardLogQueueItem::new(
-        Some(datablock),
-        serialized.external_data,
-        metablock,
-    );
-
-    let mut snapshot = SyncPositionsSnapshot {
-        pending_append_queue: vec![queue_item],
-        aggregate_queue_positions: std::collections::HashMap::new(),
-        pending_schema_registrations: std::collections::HashSet::new(),
-    };
-
-    let active_log = log_segments_cache.active();
-    let updated_metadata = sync(active_log.clone(), &mut snapshot).await?;
-
-    commit_sync(
-        node_status,
-        shard_mem_cache.clone(),
-        watched_aggregates.clone(),
-        snapshot,
-        active_log,
-        updated_metadata,
-    );
-
-    Ok(())
 }
 
 /// Writes pending queue items to disk.
@@ -494,7 +426,6 @@ pub(crate) async fn sync(
             MetablockKind::SoftTrim(soft_trim) => {
                 log_segment_file_metadata.write.aggregate_key_bloom.insert(&soft_trim.aggregate_key);
             }
-            MetablockKind::SegmentSummary(_) => {}
         }
     }
 
@@ -527,6 +458,46 @@ fn compute_entry_hash(previous_hash: &EntryHashBytes, content: &[u8]) -> EntryHa
     hasher.update(&content[CRC_END..SKIP_START]);
     hasher.update(&content[SKIP_END..]);
     *hasher.finalize().as_bytes()
+}
+
+pub(crate) fn summary_path(shard_dir: &Path, log_id: u64) -> PathBuf {
+    shard_dir.join(format!("log_{log_id}.summary"))
+}
+
+pub(crate) async fn write_segment_summary_sidecar_from_payload(
+    shard_dir: &Path,
+    log_id: u64,
+    payload: SegmentSummaryPayload,
+) -> Result<(), ShardFsyncError> {
+    if payload.is_empty() {
+        return Ok(());
+    }
+
+    let block = SegmentSummaryBlock { payload };
+    let serialized = serialize_versioned_message_heap(&block, WIRE_VERSION_SEGMENT_SUMMARY_BLOCK)
+        .map_err(|e| ShardFsyncError::SegmentSummarySidecarWriteError(e.to_string()))?;
+
+    let path = summary_path(shard_dir, log_id);
+    let file = glommio::io::BufferedFile::create(&path)
+        .await
+        .map_err(|e| ShardFsyncError::SegmentSummarySidecarWriteError(e.to_string()))?;
+    file.write_at(serialized, 0)
+        .await
+        .map_err(|e| ShardFsyncError::SegmentSummarySidecarWriteError(e.to_string()))?;
+    file.fdatasync()
+        .await
+        .map_err(|e| ShardFsyncError::SegmentSummarySidecarWriteError(e.to_string()))?;
+
+    Ok(())
+}
+
+async fn write_segment_summary_sidecar(
+    shard_dir: &Path,
+    log_id: u64,
+    shard_mem_cache: &Rc<RefCell<MemCache>>,
+) -> Result<(), ShardFsyncError> {
+    let payload = shard_mem_cache.borrow_mut().take_segment_summary();
+    write_segment_summary_sidecar_from_payload(shard_dir, log_id, payload).await
 }
 
 #[cfg(test)]
@@ -845,6 +816,24 @@ mod tests {
             assert!(!pending[0].pending_queue.is_empty());
 
             lsc.close().await;
+        });
+    }
+
+    #[test]
+    fn empty_segment_no_summary_written() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            std::fs::create_dir_all(&dir).unwrap();
+
+            let smc = Rc::new(RefCell::new(
+                MemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 1024 * 1024, 4 * 1024 * 1024, 64 * 1024 * 1024)
+            ));
+
+            // No writes → empty segment summary → no file should be created
+            write_segment_summary_sidecar(&dir, 1, &smc).await.unwrap();
+
+            let path = summary_path(&dir, 1);
+            assert!(!path.exists(), "empty segment should not produce a .summary file");
         });
     }
 }

@@ -13,8 +13,6 @@ const DISCRIMINANT_EVENT_BATCH_METADATA: u8 = 0;
 const DISCRIMINANT_SCHEMA_REGISTRATION: u8 = 1;
 const DISCRIMINANT_SOFT_DELETE: u8 = 2;
 const DISCRIMINANT_SOFT_TRIM: u8 = 3;
-const DISCRIMINANT_SEGMENT_SUMMARY: u8 = 4;
-
 const METABLOCK_TYPE_PAYLOAD_OFFSET: usize = 
     HEADER_SIZE + Metablock::OFFSET_WAL_METABLOCK_TYPE + WIRE_SIZE_ENUM_DISCRIMINANT;
 
@@ -55,11 +53,6 @@ pub fn is_metablock_kind_soft_delete(bytes: &[u8]) -> bool {
 #[inline]
 pub fn is_metablock_kind_soft_trim(bytes: &[u8]) -> bool {
     read_metablock_kind_discriminant(bytes) == DISCRIMINANT_SOFT_TRIM
-}
-
-#[inline]
-pub fn is_metablock_kind_segment_summary(bytes: &[u8]) -> bool {
-    read_metablock_kind_discriminant(bytes) == DISCRIMINANT_SEGMENT_SUMMARY
 }
 
 #[inline]

@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use crate::metablocks::{
     metablock_event_batch::MetablockEventBatch,
     metablock_schema_registration::MetablockSchemaRegistration,
-    metablock_segment_summary::MetablockSegmentSummary,
     metablock_soft_delete::MetablockSoftDelete, metablock_soft_trim::MetablockSoftTrim,
 };
 
@@ -17,5 +16,4 @@ pub enum MetablockKind {
     SchemaRegistration(MetablockSchemaRegistration),
     SoftDelete(MetablockSoftDelete),
     SoftTrim(MetablockSoftTrim),
-    SegmentSummary(MetablockSegmentSummary),
 }

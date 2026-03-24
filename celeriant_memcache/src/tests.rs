@@ -10,7 +10,7 @@ use celeriant_rotating_log::log_segment_file::log_segment_file_metadata::LogSegm
 use celeriant_wal::aggregate_client_key::AggregateClientKey;
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::aggregate_type_key::AggregateTypeKey;
-use celeriant_wal::constants::{FIXED_BLOCK_SIZE_BYTES, GENESIS_HASH, HEADER_BLOCK_SIZE_BYTES, MIN_WRITE_ALIGNMENT, MINIBATCH_SIZE_BYTES};
+use celeriant_wal::constants::{GENESIS_HASH, HEADER_BLOCK_SIZE_BYTES, MINIBATCH_SIZE_BYTES};
 use celeriant_wal::metablocks::datablock_inline_data::DatablockInlineData;
 use celeriant_wal::metablocks::datablock_storage_kind::DatablockStorageKind;
 use celeriant_wal::metablocks::metablock::Metablock;
@@ -1806,22 +1806,6 @@ fn take_segment_summary_returns_and_clears() {
     assert!(c.peek_segment_summary().is_empty());
     let empty = c.take_segment_summary();
     assert!(empty.aggregates.is_empty());
-}
-
-#[test]
-fn segment_summary_exact_bytes_empty() {
-    let c = cache();
-    let expected = FIXED_BLOCK_SIZE_BYTES as u64 + 24 + 2 * (MIN_WRITE_ALIGNMENT - 1);
-    assert_eq!(c.segment_summary_exact_bytes(), expected);
-}
-
-#[test]
-fn segment_summary_exact_bytes_with_data() {
-    let mut c = cache();
-    c.update_segment_summary(&eb_metablock(agg(1, 2, 3), 1, 1000));
-    // 1 org (16) + 1 type (32) + 1 aggregate (97) + 24 + FIXED_BLOCK_SIZE_BYTES + alignment padding
-    let expected = FIXED_BLOCK_SIZE_BYTES as u64 + 16 + 32 + 97 + 24 + 2 * (MIN_WRITE_ALIGNMENT - 1);
-    assert_eq!(c.segment_summary_exact_bytes(), expected);
 }
 
 #[test]

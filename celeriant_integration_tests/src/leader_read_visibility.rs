@@ -9,6 +9,7 @@
 //! Run with: cargo run --bin leader_read_visibility_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
+use celeriant_client_tokio::list_operations::{ListAggregatesIterator, ListOptions};
 use crate::{
     count_events, write_event, MinioContainer, ServerConfig, TestServer, TcpProxy,
 };
@@ -147,6 +148,26 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("  INVARIANT HELD: leader shows {}/5 events mid-replication", leader_count_pre);
 
+    // Listing consistency check: if list_aggregates shows key2, its stats must match
+    // what count_events returns (i.e. listing must not show more than the read path).
+    let list_opts = ListOptions { max_shard_hint: Some(0), ..Default::default() };
+    let aggs = ListAggregatesIterator::new(&mut leader_client, Some(1), Some(0), list_opts)
+        .collect()
+        .await?;
+    let listed_ids: Vec<u128> = aggs.iter().map(|a| a.aggregate_id).collect();
+    let listed_key2_count = aggs.iter()
+        .find(|a| a.aggregate_id == key2.aggregate_id)
+        .map(|a| a.event_batch_count)
+        .unwrap_or(0);
+    println!("  Leader list_aggregates (mid-replication): ids={:?}, key2_batches={}", listed_ids, listed_key2_count);
+    assert!(
+        listed_key2_count <= leader_count_pre as u64,
+        "Listing must not show more batches than readable (listed={}, readable={})",
+        listed_key2_count, leader_count_pre
+    );
+    println!("  INVARIANT HELD: listing consistent with read path (listed={}, readable={})",
+        listed_key2_count, leader_count_pre);
+
     // The original aggregate should still be readable (already replicated)
     let leader_count_old = count_events(&mut leader_client, &key).await?;
     assert_eq!(leader_count_old, 3, "previously replicated data should still be readable");
@@ -164,7 +185,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // The proxy throttle delays heartbeats enough to trigger clock-drift fencing,
     // which kicks the follower into S3 catchup. Give it time to finish.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::sleep(Duration::from_secs(8)).await;
 
     let leader_count_post = count_events(&mut leader_client, &key2).await?;
     let follower_count_post = count_events(&mut follower_client, &key2).await?;

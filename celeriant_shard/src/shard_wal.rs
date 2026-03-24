@@ -12,8 +12,9 @@ use celeriant_rotating_log::errors::ready_up_error::ReadyUpError;
 use celeriant_rotating_log::errors::scan_error::ScanError;
 use celeriant_wire::disk::disk_format_error::DiskFormatError;
 use celeriant_wire::disk::metablock_bytes;
-use celeriant_wire::disk::serialised_datablock::{SerialisedDatablock, deserialise_datablock};
-use celeriant_wire::disk::versioned_block::deserialise_metablock;
+use celeriant_wire::disk::serialised_datablock::SerialisedDatablock;
+use celeriant_wire::disk::versioned_block::{deserialise_metablock, deserialise_segment_summary};
+use crate::shard_wal_sync::summary_path;
 use celeriant_memcache::cache_path::CachePath;
 use celeriant_memcache::mem_snapshot_aggregate::{AggregateStatus, MemSnapshotAggregate};
 use celeriant_memcache::metablock_position::MetablockPosition;
@@ -35,10 +36,10 @@ use celeriant_wal::aggregate_client_key::AggregateClientKey;
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::aggregate_type_key::AggregateTypeKey;
 use celeriant_wal::schema_key::SchemaKey;
-use celeriant_wal::constants::{FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, GENESIS_HASH, HEADER_BLOCK_SIZE_BYTES};
+use celeriant_wal::constants::{FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, GENESIS_HASH};
 use celeriant_wal::datablocks::datablock::Datablock;
 use celeriant_wal::datablocks::datablock_aggregate_event_batch::DatablockAggregateEventBatch;
-use celeriant_wal::datablocks::datablock_segment_summary::SegmentSummaryPayload;
+use celeriant_wal::segment_summary::SegmentSummaryPayload;
 use celeriant_wal::datablocks::datablock_kind::DatablockKind;
 use celeriant_wal::datablocks::datablock_schema_registration::DatablockSchemaRegistration;
 use celeriant_wal::metablocks::datablock_storage_kind::DatablockStorageKind;
@@ -152,71 +153,43 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> AggregateReader 
     }
 }
 
-/// Read the segment summary from a closed log segment.
-/// Returns `None` for legacy segments that don't have a summary metablock.
+/// Read the segment summary from a closed log segment's sidecar `.summary` file.
+/// Returns `None` for legacy segments that don't have a summary, or if the file is corrupt.
+/// Opens and closes the file each time — no LRU involvement, OS page cache handles repeats.
 pub(crate) async fn read_segment_summary(
-    log_segments_cache: &LogSegmentsCache,
+    shard_dir: &std::path::Path,
     log_id: u64,
-) -> Result<Option<SegmentSummaryPayload>, ScanError<()>> {
-    let log_segment_file = log_segments_cache.get(log_id).await?;
-
-    let metablocks_position = {
-        let metadata = log_segment_file.metadata.borrow();
-        match &metadata.read {
-            Some(r) => r.metablocks_position,
-            None => metadata.write.metablocks_position,
-        }
-    };
-
-    if metablocks_position <= HEADER_BLOCK_SIZE_BYTES as u64 + FIXED_BLOCK_SIZE_BYTES as u64 {
-        return Ok(None);
-    }
-
-    let last_metablock_pos = metablocks_position - FIXED_BLOCK_SIZE_BYTES as u64;
-
-    let guard = log_segment_file.lock_reader("read_segment_summary").await?;
-    let dma_file = guard.as_ref().ok_or(ScanError::NoFileHandle { log_id })?;
-
-    let buf = dma_file.read_at(last_metablock_pos, FIXED_BLOCK_SIZE_BYTES).await
-        .map_err(|e| ScanError::Io { log_id, source: format!("{e:?}") })?;
-
-    let metablock_bytes_slice = &(*buf)[..FIXED_BLOCK_SIZE_BYTES];
-    if !metablock_bytes::is_metablock_kind_segment_summary(metablock_bytes_slice) {
-        return Ok(None);
-    }
-
-    let metablock_array: &[u8; FIXED_BLOCK_SIZE_BYTES] = metablock_bytes_slice.try_into().unwrap();
-    let metablock = deserialise_metablock(metablock_array)
-        .map_err(|e| {
-            tracing::warn!(log_id, error = ?e, "Failed to deserialise segment summary metablock");
-            ScanError::Io { log_id, source: format!("{e:?}") }
-        })?;
-
-    let external_data = match &metablock.datablock {
-        DatablockStorageKind::Block(_) => {
-            let compressed_size = metablock.compressed_size as usize;
-            if compressed_size == 0 { return Ok(None); }
-            let buf = dma_file.read_at(metablock.datablock_position, compressed_size).await
-                .map_err(|e| ScanError::Io { log_id, source: format!("{e:?}") })?;
-            Some((*buf)[..compressed_size].to_vec())
-        }
-        DatablockStorageKind::Inline(_) => None,
-        DatablockStorageKind::None => return Ok(None),
-    };
-
-    match deserialise_datablock(
-        metablock.uncompressed_size, metablock.compressed_size,
-        metablock.datablock_version, metablock.datablock_compression_type,
-        &metablock.datablock, external_data.as_deref(),
-    ) {
-        Ok(datablock) => match datablock.datablock_kind {
-            DatablockKind::SegmentSummary(payload) => Ok(Some(payload)),
-            _ => Ok(None),
-        },
+) -> Option<SegmentSummaryPayload> {
+    let path = summary_path(shard_dir, log_id);
+    let file = match glommio::io::BufferedFile::open(&path).await {
+        Ok(f) => f,
+        Err(e) if e.raw_os_error() == Some(2) => return None, // ENOENT
         Err(e) => {
-            tracing::warn!(log_id, error = ?e, "Failed to deserialise segment summary datablock");
-            Ok(None)
+            tracing::warn!(log_id, error = %e, "Failed to open segment summary sidecar");
+            return None;
         }
+    };
+
+    let file_size = match file.file_size().await {
+        Ok(s) if s > 0 => s as usize,
+        Ok(_) => return None,
+        Err(e) => {
+            tracing::warn!(log_id, error = %e, "Failed to read segment summary file size");
+            return None;
+        }
+    };
+
+    let buf = match file.read_at(0, file_size).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(log_id, error = %e, "Failed to read segment summary sidecar");
+            return None;
+        }
+    };
+
+    match deserialise_segment_summary(&buf) {
+        Ok(block) => Some(block.payload),
+        Err(_) => None,
     }
 }
 
@@ -545,19 +518,18 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                 });
             }
 
-            match read_segment_summary(&self.log_segments_cache, log_id).await {
-                Ok(Some(payload)) => {
+            match read_segment_summary(self.log_segments_cache.shard_dir(), log_id).await {
+                Some(payload) => {
                     for org_id in payload.orgs {
                         if seen.insert(org_id) {
                             results.push(OrgListItem { org_id });
                         }
                     }
                 }
-                Ok(None) => {
+                None => {
                     self.list_orgs_legacy_segment(log_id, &mut seen, &mut results).await
                         .map_err(ShardListingError::ReadFromDiskError)?;
                 }
-                Err(e) => return Err(ShardListingError::ReadFromDiskError(e)),
             }
         }
 
@@ -631,8 +603,8 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                 });
             }
 
-            match read_segment_summary(&self.log_segments_cache, log_id).await {
-                Ok(Some(payload)) => {
+            match read_segment_summary(self.log_segments_cache.shard_dir(), log_id).await {
+                Some(payload) => {
                     for atk in payload.aggregate_types {
                         if let Some(filter) = filter_org_id {
                             if atk.org_id != filter { continue; }
@@ -642,11 +614,10 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                         }
                     }
                 }
-                Ok(None) => {
+                None => {
                     self.list_types_legacy_segment(log_id, filter_org_id, &mut seen, &mut results).await
                         .map_err(ShardListingError::ReadFromDiskError)?;
                 }
-                Err(e) => return Err(ShardListingError::ReadFromDiskError(e)),
             }
         }
 
@@ -828,8 +799,8 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                 return Ok(build_response(request.correlation_id, result_order, &seen, Some(log_id)));
             }
 
-            match read_segment_summary(&self.log_segments_cache, log_id).await {
-                Ok(Some(payload)) => {
+            match read_segment_summary(self.log_segments_cache.shard_dir(), log_id).await {
+                Some(payload) => {
                     for entry in &payload.aggregates {
                         process!(entry.org_id, entry.aggregate_type_id, entry.aggregate_id,
                             entry.is_deleted, entry.event_batch_count,
@@ -837,7 +808,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                             entry.last_server_timestamp, entry.compressed_size, entry.uncompressed_size);
                     }
                 }
-                Ok(None) => {
+                None => {
                     // Legacy fallback: scan this single segment's metablocks
                     let mut scanner = ReverseMetablockScanner::new(
                         &self.log_segments_cache, log_id, None, self.config.read_max_chunk_size,
@@ -866,7 +837,6 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                         Ok(None)
                     }).await.map_err(ShardListingError::ReadFromDiskError)?;
                 }
-                Err(e) => return Err(ShardListingError::ReadFromDiskError(e)),
             }
         }
 
@@ -937,7 +907,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let (client_id, user_id) = match &metablock.wal_metablock_type {
             MetablockKind::EventBatchMetadata(eb) => (eb.client_id, eb.user_id),
             MetablockKind::SoftDelete(sd) => (sd.client_id, sd.user_id),
-            other @ (MetablockKind::SoftTrim(_) | MetablockKind::SchemaRegistration(_) | MetablockKind::SegmentSummary(_)) => {
+            other @ (MetablockKind::SoftTrim(_) | MetablockKind::SchemaRegistration(_)) => {
                 return Err(ShardAggregateDetailsError::MetablockReadError(
                     format!("unexpected metablock kind: {:?}", std::mem::discriminant(other)),
                 ))
@@ -5650,8 +5620,8 @@ mod tests {
             trigger_rotation(&shard).await;
             assert!(shard.log_segments_cache.active_log_id() > 1);
 
-            let result = read_segment_summary(&shard.log_segments_cache, 1).await;
-            let payload = result.expect("should not error").expect("should have summary");
+            let payload = read_segment_summary(shard.log_segments_cache.shard_dir(), 1).await
+                .expect("should have summary");
 
             assert!(payload.orgs.contains(&1));
             assert!(payload.orgs.contains(&2));
@@ -5673,8 +5643,33 @@ mod tests {
             write_ok(&shard, write_req(key(1, 1, 1), events(1))).await;
 
             let active_id = shard.log_segments_cache.active_log_id();
-            let result = read_segment_summary(&shard.log_segments_cache, active_id).await;
-            assert!(result.expect("should not error").is_none());
+            let result = read_segment_summary(shard.log_segments_cache.shard_dir(), active_id).await;
+            assert!(result.is_none());
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn corrupt_summary_gracefully_returns_none() {
+        glommio_test!({
+            use crate::shard_wal_sync::summary_path;
+
+            let (_tmp, dir) = test_dir();
+            let shard = open_compact_shard(&dir).await;
+
+            write_ok(&shard, write_req(key(1, 10, 100), fat_event(1))).await;
+            trigger_rotation(&shard).await;
+            assert!(shard.log_segments_cache.active_log_id() > 1);
+
+            // Corrupt the .summary sidecar file before any read caches it
+            let path = summary_path(shard.log_segments_cache.shard_dir(), 1);
+            let mut bytes = std::fs::read(&path).expect("summary file should exist");
+            bytes[0] ^= 0xFF;
+            std::fs::write(&path, &bytes).expect("should write corrupted file");
+
+            let result = read_segment_summary(shard.log_segments_cache.shard_dir(), 1).await;
+            assert!(result.is_none(), "corrupt summary should return None");
 
             shard.close().await;
         });

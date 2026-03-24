@@ -286,6 +286,7 @@ fn fsync_message(e: ShardFsyncError) -> String {
         ShardFsyncError::LogSegmentFileHeaderWriteFailure(e) => format!(r#"{{"detail":{}}}"#, json_string(&format!("{:?}", e))),
         ShardFsyncError::FDataSyncError(msg) => format!(r#"{{"detail":{}}}"#, json_string(&msg)),
         ShardFsyncError::WriteDatablocksError(msg) => format!(r#"{{"detail":{}}}"#, json_string(&msg)),
+        ShardFsyncError::SegmentSummarySidecarWriteError(msg) => format!(r#"{{"detail":{}}}"#, json_string(&msg)),
     }
 }
 

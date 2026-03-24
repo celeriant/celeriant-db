@@ -1,5 +1,6 @@
 use crate::codec::bincode::{fixed_serialise_stack, fixed_serialise_heap};
-use celeriant_wal::{constants::{FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_METABLOCK, WIRE_VERSION_WAL_SHARD_LOG_HEADER, WIRE_VERSION_S3_FALLBACK_BATCH}, metablocks::metablock::Metablock, s3::{fallback_batch::FallbackBatch, lease::Lease, membership::Membership}, shard_log_header::ShardLogHeader};
+use celeriant_wal::{constants::{FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, WIRE_VERSION_WAL_METABLOCK, WIRE_VERSION_WAL_SHARD_LOG_HEADER, WIRE_VERSION_S3_FALLBACK_BATCH, WIRE_VERSION_SEGMENT_SUMMARY_BLOCK}, metablocks::metablock::Metablock, s3::{fallback_batch::FallbackBatch, lease::Lease, membership::Membership}, shard_log_header::ShardLogHeader};
+use celeriant_wal::segment_summary::SegmentSummaryBlock;
 use crate::{codec, disk::{disk_format_error::DiskFormatError}};
 
 const VERSION_SIZE: usize = 4;
@@ -83,6 +84,16 @@ pub fn deserialise_fallback_batch(
     let version = validate_header(data)?;
     match version {
         WIRE_VERSION_S3_FALLBACK_BATCH => Ok(codec::bincode::fixed_deserialise(&data[HEADER_SIZE..])?),
+        _ => Err(DiskFormatError::UnsupportedVersion(version)),
+    }
+}
+
+pub fn deserialise_segment_summary(
+    data: &[u8],
+) -> Result<SegmentSummaryBlock, DiskFormatError> {
+    let version = validate_header(data)?;
+    match version {
+        WIRE_VERSION_SEGMENT_SUMMARY_BLOCK => Ok(codec::bincode::fixed_deserialise(&data[HEADER_SIZE..])?),
         _ => Err(DiskFormatError::UnsupportedVersion(version)),
     }
 }
@@ -492,5 +503,44 @@ mod tests {
     fn membership_json_invalid_data_returns_error() {
         let result = deserialise_membership(b"not valid json");
         assert!(matches!(result, Err(DiskFormatError::JsonDeserialize(_))));
+    }
+
+    #[test]
+    fn segment_summary_block_roundtrip() {
+        use celeriant_wal::aggregate_type_key::AggregateTypeKey;
+        use celeriant_wal::constants::WIRE_VERSION_SEGMENT_SUMMARY_BLOCK;
+        use celeriant_wal::segment_summary::{
+            SegmentAggregateEntry, SegmentSummaryBlock, SegmentSummaryPayload,
+        };
+
+        let payload = SegmentSummaryPayload {
+            orgs: vec![1, 2],
+            aggregate_types: vec![AggregateTypeKey::new(1, 10), AggregateTypeKey::new(2, 20)],
+            aggregates: vec![
+                SegmentAggregateEntry {
+                    org_id: 1,
+                    aggregate_type_id: 10,
+                    aggregate_id: 100,
+                    is_deleted: false,
+                    event_batch_count: 5,
+                    last_event_batch_index: 10,
+                    min_event_batch_index: 1,
+                    last_server_timestamp: 999,
+                    compressed_size: 512,
+                    uncompressed_size: 1024,
+                },
+            ],
+        };
+
+        let block = SegmentSummaryBlock { payload };
+        let serialized = serialize_versioned_message_heap(&block, WIRE_VERSION_SEGMENT_SUMMARY_BLOCK).unwrap();
+        let deserialized = deserialise_segment_summary(&serialized).unwrap();
+
+        assert_eq!(deserialized.payload.orgs, vec![1u128, 2]);
+        assert_eq!(deserialized.payload.aggregate_types.len(), 2);
+        assert_eq!(deserialized.payload.aggregates.len(), 1);
+        assert_eq!(deserialized.payload.aggregates[0].org_id, 1);
+        assert_eq!(deserialized.payload.aggregates[0].event_batch_count, 5);
+        assert_eq!(deserialized.payload.aggregates[0].compressed_size, 512);
     }
 }

@@ -11,6 +11,7 @@ pub mod buffer_read;
 pub mod s3;
 pub mod schema_key;
 pub mod schema_type;
+pub mod segment_summary;
 
 pub use schema_type::SchemaType;
 

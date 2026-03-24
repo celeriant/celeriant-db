@@ -47,6 +47,9 @@ pub enum ShardFsyncError {
 
     /// Failed trying to write batch of datablocks to the active file
     WriteDatablocksError(String),
+
+    /// Failed to write the segment summary sidecar file at rotation time
+    SegmentSummarySidecarWriteError(String),
 }
 
 impl ShardFsyncError {

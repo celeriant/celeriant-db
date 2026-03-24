@@ -20,10 +20,12 @@ use crate::schema_validator::CompiledValidator;
 type MemCache = ShardMemCache<CompiledValidator>;
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
 use celeriant_wal::constants::{FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, GENESIS_HASH, HEADER_BLOCK_SIZE_BYTES};
+use celeriant_wal::segment_summary::SegmentSummaryPayload;
 use celeriant_wal::metablocks::metablock_kind::MetablockKind;
 use celeriant_watch::aggregate_watchers::AggregateWatchers;
 
 use crate::amortisation::coordinator::{CaptureResult, Coordinator};
+use crate::shard_wal_sync::write_segment_summary_sidecar_from_payload;
 use crate::collect_from_disk::{EventBatchFromLogSegmentFile, fetch_datablocks_for_metablocks};
 use crate::error::fetch_catchup_entries_error::FetchCatchupEntriesError;
 use crate::error::replication_error::ReplicationError;
@@ -284,12 +286,23 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
         "Replication batch committed"
     );
 
-    commit_replication(
+    let sealed_ready = commit_replication(
         &log_segments_cache,
         &shard_mem_cache,
         &watched_aggregates,
         replication_captured_data.replication_snapshot,
     );
+
+    // Write sidecars for sealed segments that are now fully replicated (best-effort)
+    for (log_id, payload) in sealed_ready {
+        if let Err(e) = write_segment_summary_sidecar_from_payload(
+            log_segments_cache.shard_dir(),
+            log_id,
+            payload,
+        ).await {
+            error!(shard_id, log_id, error = ?e, "Failed to write segment summary sidecar");
+        }
+    }
 
     metrics::histogram!("celeriant_replication_duration_seconds", &shard_label).record(start.elapsed().as_secs_f64());
     metrics::histogram!("celeriant_replication_batch_size", &shard_label).record(initial_batch_count as f64);
@@ -298,27 +311,31 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
 }
 
 /// Commits successful replication by updating read path, recent write cache, and broadcasting events.
-/// No failures here, all in-memory operations
+/// Returns sealed segments whose summaries are ready for sidecar write (fully replicated).
+/// No failures here, all in-memory operations.
 fn commit_replication(
     log_segments_cache: &Rc<LogSegmentsCache>,
     shard_mem_cache: &Rc<RefCell<MemCache>>,
     watched_aggregates: &Rc<AggregateWatchers>,
     replication_snapshot: Vec<PendingCommitData>,
-) {
+) -> Vec<(u64, SegmentSummaryPayload)> {
     let mut event_collector = WatchEventCollector::new();
+    let active_log_id = log_segments_cache.active_log_id();
+    let mut sealed_ready = Vec::new();
 
     for commit_data in replication_snapshot {
+        let log_id = commit_data.log_id();
+
         // Advance read position (visible) if log segment is cached
-        if let Some(log_segment) = log_segments_cache.get_if_cached(commit_data.log_id()) {
+        if let Some(log_segment) = log_segments_cache.get_if_cached(log_id) {
             let mut metadata = log_segment.metadata.borrow_mut();
             metadata.read = Some(commit_data.log_metadata.write.clone());
         }
 
         let mut shard_mem_cache = shard_mem_cache.borrow_mut();
 
-        let log_id = commit_data.log_id();
         for item in commit_data.pending_queue {
-            shard_mem_cache.update_segment_summary(&item.metablock);
+            shard_mem_cache.update_segment_summary_for_log(log_id, &item.metablock);
 
             match &item.metablock.wal_metablock_type {
                 MetablockKind::EventBatchMetadata(event_batch) => {
@@ -364,12 +381,25 @@ fn commit_replication(
                     );
                     event_collector.add_delete_event(soft_delete.aggregate_key.clone());
                 }
-                _ => {}
+                MetablockKind::SchemaRegistration(_) => {}
+            }
+        }
+
+        // Check if a sealed segment just became fully replicated
+        if log_id != active_log_id {
+            if let Some(log_segment) = log_segments_cache.get_if_cached(log_id) {
+                let fully_replicated = !log_segment.metadata.borrow().is_pending_advance();
+                if fully_replicated {
+                    if let Some(payload) = shard_mem_cache.take_sealed_segment_summary(log_id) {
+                        sealed_ready.push((log_id, payload));
+                    }
+                }
             }
         }
     }
 
     event_collector.broadcast_all(&watched_aggregates);
+    sealed_ready
 }
 
 async fn rollback_replicate(

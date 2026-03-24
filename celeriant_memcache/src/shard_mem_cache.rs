@@ -8,13 +8,13 @@ use crate::{
     recent_write::RecentWrite, shard_log_queue_item::ShardLogQueueItem, sync_positions_snapshot::{SyncPositionsSnapshot},
 };
 use celeriant_distributed::node_status::NodeStatus;
-use celeriant_wal::datablocks::datablock_segment_summary::{SegmentAggregateEntry, SegmentSummaryPayload};
+use celeriant_wal::segment_summary::{SegmentAggregateEntry, SegmentSummaryPayload};
 use celeriant_wal::metablocks::metablock_event_batch::MetablockEventBatch;
 use celeriant_wal::metablocks::metablock_kind::MetablockKind;
 use celeriant_wal::schema_key::SchemaKey;
 use celeriant_wal::{
     aggregate_client_key::AggregateClientKey, aggregate_key::AggregateKey, aggregate_type_key::AggregateTypeKey,
-    constants::{FIXED_BLOCK_SIZE_BYTES, MIN_WRITE_ALIGNMENT}, datablocks::datablock::Datablock,
+    constants::FIXED_BLOCK_SIZE_BYTES, datablocks::datablock::Datablock,
     metablocks::metablock::Metablock,
 };
 use lru::LruCache;
@@ -98,6 +98,18 @@ pub struct ShardMemCache<V: Validate> {
     segment_summary: HashMap<AggregateKey, SegmentAggregateEntry>,
     segment_summary_orgs: HashSet<u128>,
     segment_summary_types: HashSet<AggregateTypeKey>,
+
+    /// Sealed segment summaries waiting for replication to confirm before sidecar write.
+    /// Leader-only: stores summaries drained at rotation time, keyed by sealed log_id.
+    sealed_segment_summaries: HashMap<u64, SealedSegmentSummary>,
+}
+
+/// In-memory accumulator for a sealed segment's summary, mirroring the active segment fields.
+/// Converted to SegmentSummaryPayload when the segment becomes fully replicated.
+pub struct SealedSegmentSummary {
+    aggregates: HashMap<AggregateKey, SegmentAggregateEntry>,
+    orgs: HashSet<u128>,
+    aggregate_types: HashSet<AggregateTypeKey>,
 }
 
 impl<V: Validate> ShardMemCache<V> {
@@ -863,6 +875,7 @@ impl<V: Validate> ShardMemCache<V> {
         }
         self.pending_replication_batches.clear();
         self.pending_replication_bytes = 0;
+        self.sealed_segment_summaries.clear();
     }
 
     /// Copy a single aggregate's write snapshot to read snapshot.
@@ -912,6 +925,7 @@ impl<V: Validate> ShardMemCache<V> {
             segment_summary: HashMap::new(),
             segment_summary_orgs: HashSet::new(),
             segment_summary_types: HashSet::new(),
+            sealed_segment_summaries: HashMap::new(),
         }
     }
 
@@ -956,7 +970,7 @@ impl<V: Validate> ShardMemCache<V> {
                     }
                 }
             }
-            MetablockKind::SchemaRegistration(_) | MetablockKind::SegmentSummary(_) => {}
+            MetablockKind::SchemaRegistration(_) => {}
         }
     }
 
@@ -965,14 +979,6 @@ impl<V: Validate> ShardMemCache<V> {
         let aggregate_types: Vec<AggregateTypeKey> = self.segment_summary_types.drain().collect();
         let aggregates: Vec<SegmentAggregateEntry> = self.segment_summary.drain().map(|(_, v)| v).collect();
         SegmentSummaryPayload { orgs, aggregate_types, aggregates }
-    }
-
-    pub fn segment_summary_exact_bytes(&self) -> u64 {
-        let datablock_size = self.segment_summary_orgs.len() as u64 * std::mem::size_of::<u128>() as u64
-            + self.segment_summary_types.len() as u64 * AggregateTypeKey::WIRE_SIZE_TOTAL as u64
-            + self.segment_summary.len() as u64 * SegmentAggregateEntry::WIRE_SIZE
-            + SegmentSummaryPayload::WIRE_OVERHEAD;
-        FIXED_BLOCK_SIZE_BYTES as u64 + datablock_size + 2 * (MIN_WRITE_ALIGNMENT - 1)
     }
 
     pub fn peek_segment_summary(&self) -> &HashMap<AggregateKey, SegmentAggregateEntry> {
@@ -985,6 +991,88 @@ impl<V: Validate> ShardMemCache<V> {
 
     pub fn peek_segment_summary_types(&self) -> &HashSet<AggregateTypeKey> {
         &self.segment_summary_types
+    }
+
+    /// Store the current active segment summary for a sealed segment.
+    /// Called at rotation time on the leader to defer sidecar write until replication confirms.
+    pub fn store_sealed_segment_summary(&mut self, log_id: u64) {
+        let sealed = SealedSegmentSummary {
+            aggregates: std::mem::take(&mut self.segment_summary),
+            orgs: std::mem::take(&mut self.segment_summary_orgs),
+            aggregate_types: std::mem::take(&mut self.segment_summary_types),
+        };
+        if !sealed.aggregates.is_empty() {
+            self.sealed_segment_summaries.insert(log_id, sealed);
+        }
+    }
+
+    /// Update the segment summary for a specific log segment.
+    /// Routes to the sealed snapshot if one exists for this log_id,
+    /// otherwise updates the active segment accumulator.
+    pub fn update_segment_summary_for_log(&mut self, log_id: u64, metablock: &Metablock) {
+        if self.sealed_segment_summaries.contains_key(&log_id) {
+            self.update_sealed_segment_summary(log_id, metablock);
+        } else {
+            self.update_segment_summary(metablock);
+        }
+    }
+
+    /// Update a sealed segment's summary with a metablock that was replicated for that segment.
+    /// Mirrors update_segment_summary but targets the stored sealed snapshot.
+    pub fn update_sealed_segment_summary(&mut self, log_id: u64, metablock: &Metablock) {
+        let Some(sealed) = self.sealed_segment_summaries.get_mut(&log_id) else { return };
+        match &metablock.wal_metablock_type {
+            MetablockKind::EventBatchMetadata(eb) => {
+                let key = &eb.aggregate_key;
+                sealed.orgs.insert(key.org_id);
+                sealed.aggregate_types.insert(AggregateTypeKey::new(key.org_id, key.aggregate_type_id));
+                let entry = sealed.aggregates.entry(key.clone()).or_insert_with(|| {
+                    let mut e = SegmentAggregateEntry::new(key.org_id, key.aggregate_type_id, key.aggregate_id);
+                    e.min_event_batch_index = eb.min_event_batch_index;
+                    e
+                });
+                entry.is_deleted = false;
+                entry.event_batch_count += 1;
+                if eb.event_batch_index > entry.last_event_batch_index {
+                    entry.last_event_batch_index = eb.event_batch_index;
+                }
+                if metablock.server_timestamp > entry.last_server_timestamp {
+                    entry.last_server_timestamp = metablock.server_timestamp;
+                }
+                entry.compressed_size += metablock.compressed_size;
+                entry.uncompressed_size += metablock.uncompressed_size;
+            }
+            MetablockKind::SoftDelete(sd) => {
+                let key = &sd.aggregate_key;
+                sealed.orgs.insert(key.org_id);
+                sealed.aggregate_types.insert(AggregateTypeKey::new(key.org_id, key.aggregate_type_id));
+                let entry = sealed.aggregates.entry(key.clone())
+                    .or_insert_with(|| SegmentAggregateEntry::new(key.org_id, key.aggregate_type_id, key.aggregate_id));
+                entry.is_deleted = true;
+                entry.event_batch_count = 0;
+                entry.compressed_size = 0;
+                entry.uncompressed_size = 0;
+            }
+            MetablockKind::SoftTrim(st) => {
+                let key = &st.aggregate_key;
+                if let Some(entry) = sealed.aggregates.get_mut(key) {
+                    if st.keep_from_event_batch_index > entry.min_event_batch_index {
+                        entry.min_event_batch_index = st.keep_from_event_batch_index;
+                    }
+                }
+            }
+            MetablockKind::SchemaRegistration(_) => {}
+        }
+    }
+
+    /// Take the sealed segment summary, converting to SegmentSummaryPayload for sidecar write.
+    pub fn take_sealed_segment_summary(&mut self, log_id: u64) -> Option<SegmentSummaryPayload> {
+        let sealed = self.sealed_segment_summaries.remove(&log_id)?;
+        Some(SegmentSummaryPayload {
+            orgs: sealed.orgs.into_iter().collect(),
+            aggregate_types: sealed.aggregate_types.into_iter().collect(),
+            aggregates: sealed.aggregates.into_values().collect(),
+        })
     }
 
     /// Check if a rollback has occurred since items were last added.

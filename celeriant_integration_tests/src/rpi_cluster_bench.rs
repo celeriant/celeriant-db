@@ -5,11 +5,11 @@
 //! NOT start any servers — it connects to an already-running cluster.
 //!
 //! Environment variables:
-//!   CLUSTER_ADDRESS     — leader address (default: cs:10000)
+//!   CLUSTER_ADDRESS     — leader address (default: cs1:10000)
 //!   CLUSTER_CA_CERT     — CA cert for server verification (default: deploy/rpi-cluster/certs/client-ca.crt)
 //!   CLUSTER_CLIENT_CERT — client cert for mTLS (default: deploy/rpi-cluster/certs/client.crt)
 //!   CLUSTER_CLIENT_KEY  — client key for mTLS (default: deploy/rpi-cluster/certs/client.key)
-//!   CLUSTER_SERVER_NAME — TLS SNI server name (default: cs)
+//!   CLUSTER_SERVER_NAME — TLS SNI server name (default: cs1)
 //!   CLUSTER_THROUGHPUT_CONNECTIONS — throughput test connections (default: 850)
 //!   CLUSTER_LATENCY_CONNECTIONS   — latency test connections (default: 125)
 //!   CLUSTER_DURATION              — test duration in seconds (default: 15)
