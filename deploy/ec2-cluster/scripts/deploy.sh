@@ -3,6 +3,7 @@
 # Installs systemd services on data nodes (mirrors deploy/rpi-cluster).
 #
 # Reads IPs from CDK stack outputs. Run after `npx cdk deploy`.
+# Supports multiple client nodes (controlled by -c clientCount=N in CDK).
 #
 # Usage:
 #   ./deploy.sh --key-file ~/.ssh/your-key.pem
@@ -39,20 +40,36 @@ get_output() {
 
 LEADER_PUB=$(get_output LeaderPublicIp)
 FOLLOWER_PUB=$(get_output FollowerPublicIp)
-CLIENT_PUB=$(get_output ClientPublicIp)
 LEADER_IP=$(get_output LeaderPrivateIp)
 FOLLOWER_IP=$(get_output FollowerPrivateIp)
 BUCKET=$(get_output BucketName)
 REGION=$(get_output Region)
 INSTANCE_TYPE=$(get_output InstanceType)
+CLIENT_INSTANCE_TYPE=$(get_output ClientInstanceType)
+CLIENT_COUNT=$(get_output ClientCount 2>/dev/null || echo "1")
 STORAGE_TYPE=$(get_output StorageType)
+ARCH=$(get_output Architecture)
+
+# Collect client IPs as comma-separated (safe for Make/shell sourcing)
+CLIENT_PUBS=""
+for i in $(seq 1 "$CLIENT_COUNT"); do
+  if [[ $i -eq 1 ]]; then
+    PUB=$(get_output ClientPublicIp)
+  else
+    PUB=$(get_output "Client${i}PublicIp")
+  fi
+  if [[ -n "$CLIENT_PUBS" ]]; then CLIENT_PUBS="$CLIENT_PUBS,"; fi
+  CLIENT_PUBS="$CLIENT_PUBS$PUB"
+done
 
 echo "  Leader:   $LEADER_PUB ($LEADER_IP)"
 echo "  Follower: $FOLLOWER_PUB ($FOLLOWER_IP)"
-echo "  Client:   $CLIENT_PUB"
+echo "  Clients:  $CLIENT_PUBS ($CLIENT_COUNT nodes)"
 echo "  Bucket:   $BUCKET"
 echo "  Region:   $REGION"
 echo "  Instance: $INSTANCE_TYPE ($STORAGE_TYPE storage)"
+echo "  Client:   $CLIENT_INSTANCE_TYPE"
+echo "  Arch:     $ARCH"
 
 # Check prerequisites
 BINARY="$REPO_ROOT/target/release/celeriant"
@@ -90,10 +107,14 @@ for HOST in $LEADER_PUB $FOLLOWER_PUB; do
   echo "  Deployed to $HOST"
 done
 
-echo "==> Deploying test binary and CLI to client node"
-$SCP "$TEST_BINARY" ec2-user@${CLIENT_PUB}:/tmp/celeriant-integration-tests
-$SCP "$CLI_BINARY" ec2-user@${CLIENT_PUB}:/tmp/celeriant_cli
-$SSH@${CLIENT_PUB} 'sudo mv /tmp/celeriant-integration-tests /tmp/celeriant_cli /usr/local/bin/ && sudo chmod +x /usr/local/bin/celeriant-integration-tests /usr/local/bin/celeriant_cli'
+echo "==> Deploying server binary, test binary, and CLI to client nodes"
+for HOST in ${CLIENT_PUBS//,/ }; do
+  $SCP "$BINARY" ec2-user@${HOST}:/tmp/celeriant
+  $SCP "$TEST_BINARY" ec2-user@${HOST}:/tmp/celeriant-integration-tests
+  $SCP "$CLI_BINARY" ec2-user@${HOST}:/tmp/celeriant_cli
+  $SSH@${HOST} 'sudo mv /tmp/celeriant /tmp/celeriant-integration-tests /tmp/celeriant_cli /usr/local/bin/ && sudo chmod +x /usr/local/bin/celeriant /usr/local/bin/celeriant-integration-tests /usr/local/bin/celeriant_cli'
+  echo "  Deployed to $HOST"
+done
 
 echo ""
 echo "==> Deploying certs to data nodes"
@@ -106,10 +127,13 @@ for HOST in $LEADER_PUB $FOLLOWER_PUB; do
   echo "  Deployed to $HOST"
 done
 
-echo "==> Deploying certs to client node"
-$SCP "$CERT_DIR/client-ca.crt" "$CERT_DIR/client.crt" "$CERT_DIR/client.key" \
-     ec2-user@${CLIENT_PUB}:/tmp/
-$SSH@${CLIENT_PUB} 'sudo mv /tmp/client-ca.crt /tmp/client.crt /tmp/client.key /etc/celeriant/certs/ && sudo chmod 600 /etc/celeriant/certs/client.key'
+echo "==> Deploying certs to client nodes"
+for HOST in ${CLIENT_PUBS//,/ }; do
+  $SCP "$CERT_DIR/client-ca.crt" "$CERT_DIR/client.crt" "$CERT_DIR/client.key" \
+       ec2-user@${HOST}:/tmp/
+  $SSH@${HOST} 'sudo mv /tmp/client-ca.crt /tmp/client.crt /tmp/client.key /etc/celeriant/certs/ && sudo chmod 600 /etc/celeriant/certs/client.key'
+  echo "  Deployed to $HOST"
+done
 
 echo ""
 echo "==> Generating and deploying env files"
@@ -163,13 +187,16 @@ ENV_FILE="$CDK_DIR/.cluster-env"
 cat > "$ENV_FILE" <<EOF
 LEADER_PUB=$LEADER_PUB
 FOLLOWER_PUB=$FOLLOWER_PUB
-CLIENT_PUB=$CLIENT_PUB
+CLIENT_PUBS=$CLIENT_PUBS
+CLIENT_COUNT=$CLIENT_COUNT
 LEADER_IP=$LEADER_IP
 FOLLOWER_IP=$FOLLOWER_IP
 BUCKET=$BUCKET
 REGION=$REGION
 INSTANCE_TYPE=$INSTANCE_TYPE
+CLIENT_INSTANCE_TYPE=$CLIENT_INSTANCE_TYPE
 STORAGE_TYPE=$STORAGE_TYPE
+ARCH=$ARCH
 KEY_FILE=$KEY_FILE
 EOF
 echo ""

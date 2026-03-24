@@ -15,3 +15,9 @@ certs/
 
 # Benchmark results (local collection)
 results/
+
+# CDK context cache (VPC/AZ lookups — changes every deploy)
+cdk.context.json
+
+# Scratch files
+tmp.txt

@@ -14,8 +14,12 @@ import { Construct } from 'constructs';
  *   - Grafana Cloud for observability (replaces self-hosted Grafana/Prometheus/Loki)
  *
  * Storage modes:
- *   - instance-store (default): local NVMe for /var/lib/celeriant (e.g. c6id, i3en)
+ *   - instance-store (default): local NVMe for /var/lib/celeriant (e.g. c6id, i4i, i4g)
  *   - ebs: dedicated gp3 volume for /var/lib/celeriant (e.g. t3, m5, c5)
+ *
+ * Architecture: auto-detected from instance type family. ARM families (i4g, c7g, etc.)
+ * get an ARM AMI; all others get x86_64. Both data and client nodes must be the same
+ * architecture (they share binaries built with `make build` or `make build-arm`).
  */
 export class Ec2ClusterStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -23,9 +27,27 @@ export class Ec2ClusterStack extends cdk.Stack {
 
     // --- Context values (override with -c key=value) ---
     const instanceType = this.node.tryGetContext('instanceType') ?? 'c6id.2xlarge';
+    const clientInstanceType = this.node.tryGetContext('clientInstanceType') ?? instanceType;
+    const clientCount = Math.min(parseInt(this.node.tryGetContext('clientCount') ?? '1', 10), 4);
     const keyPairName = this.node.tryGetContext('keyPair');
     const storageType = this.node.tryGetContext('storageType') ?? 'instance-store';
     const ebsDataVolumeSize = parseInt(this.node.tryGetContext('ebsDataVolumeSize') ?? '100', 10);
+
+    // Detect ARM (Graviton) instance types for correct AMI selection.
+    // ARM families end in 'g' or 'gn' before the dot (i4g, c7g, c7gn, im4gn, is4gen, etc.)
+    const isArmFamily = (type: string): boolean => {
+      const family = type.split('.')[0];
+      return /g[dn]?$/.test(family);
+    };
+    const dataIsArm = isArmFamily(instanceType);
+    const clientIsArm = isArmFamily(clientInstanceType);
+    if (dataIsArm !== clientIsArm) {
+      throw new Error(
+        `Architecture mismatch: data nodes (${instanceType}) and client (${clientInstanceType}) ` +
+        `must be the same architecture. Both must be ARM or both must be x86_64.`
+      );
+    }
+    const cpuType = dataIsArm ? ec2.AmazonLinuxCpuType.ARM_64 : ec2.AmazonLinuxCpuType.X86_64;
 
     // Grafana Cloud (optional — set all three to enable)
     const grafanaPromUser = this.node.tryGetContext('grafanaPromUser') ?? '';
@@ -74,10 +96,8 @@ export class Ec2ClusterStack extends cdk.Stack {
     sg.addIngressRule(sg, ec2.Port.tcp(10001), 'Celeriant replication port');
     sg.addIngressRule(sg, ec2.Port.tcp(9090), 'Prometheus metrics');
 
-    // --- AMI: Amazon Linux 2023 (x86_64) ---
-    const ami = ec2.MachineImage.latestAmazonLinux2023({
-      cpuType: ec2.AmazonLinuxCpuType.X86_64,
-    });
+    // --- AMI: Amazon Linux 2023 (auto-detect x86_64 or ARM64) ---
+    const ami = ec2.MachineImage.latestAmazonLinux2023({ cpuType });
 
     // --- Key pair (optional — SSM works without it) ---
     const keyPair = keyPairName
@@ -102,7 +122,13 @@ export class Ec2ClusterStack extends cdk.Stack {
       'LIMITS',
       '',
       'sysctl -w fs.file-max=1048576',
-      "echo 'fs.file-max = 1048576' > /etc/sysctl.d/99-celeriant.conf",
+      'sysctl -w net.ipv4.ip_local_port_range="1024 65535"',
+      'sysctl -w net.core.somaxconn=65535',
+      "cat > /etc/sysctl.d/99-celeriant.conf <<'SYSCTL'",
+      'fs.file-max = 1048576',
+      'net.ipv4.ip_local_port_range = 1024 65535',
+      'net.core.somaxconn = 65535',
+      'SYSCTL',
       'sysctl -p /etc/sysctl.d/99-celeriant.conf',
       '',
       'dnf install -y tar gzip',
@@ -259,6 +285,7 @@ export class Ec2ClusterStack extends cdk.Stack {
       name: string,
       role: iam.IRole,
       userData: string,
+      instType: string,
       extraBlockDevices?: ec2.BlockDevice[],
     ): ec2.Instance => {
       const ud = ec2.UserData.forLinux();
@@ -274,7 +301,7 @@ export class Ec2ClusterStack extends cdk.Stack {
 
       const instance = new ec2.Instance(this, name, {
         vpc,
-        instanceType: new ec2.InstanceType(instanceType),
+        instanceType: new ec2.InstanceType(instType),
         machineImage: ami,
         securityGroup: sg,
         role,
@@ -301,23 +328,36 @@ export class Ec2ClusterStack extends cdk.Stack {
       : undefined;
 
     // --- Instances ---
-    const leader = createInstance('Leader', nodeRole, nodeUserData, dataBlockDevices);
-    const follower = createInstance('Follower', nodeRole, nodeUserData, dataBlockDevices);
-    const client = createInstance('Client', clientRole, clientUserData);
+    const leader = createInstance('Leader', nodeRole, nodeUserData, instanceType, dataBlockDevices);
+    const follower = createInstance('Follower', nodeRole, nodeUserData, instanceType, dataBlockDevices);
+
+    const clients: ec2.Instance[] = [];
+    for (let i = 1; i <= clientCount; i++) {
+      const name = clientCount === 1 ? 'Client' : `Client${i}`;
+      clients.push(createInstance(name, clientRole, clientUserData, clientInstanceType));
+    }
 
     // --- Outputs ---
     new cdk.CfnOutput(this, 'LeaderPrivateIp', { value: leader.instancePrivateIp });
     new cdk.CfnOutput(this, 'FollowerPrivateIp', { value: follower.instancePrivateIp });
-    new cdk.CfnOutput(this, 'ClientPrivateIp', { value: client.instancePrivateIp });
     new cdk.CfnOutput(this, 'LeaderPublicIp', { value: leader.instancePublicIp });
     new cdk.CfnOutput(this, 'FollowerPublicIp', { value: follower.instancePublicIp });
-    new cdk.CfnOutput(this, 'ClientPublicIp', { value: client.instancePublicIp });
     new cdk.CfnOutput(this, 'BucketName', { value: bucket.bucketName });
     new cdk.CfnOutput(this, 'Region', { value: cdk.Aws.REGION });
     new cdk.CfnOutput(this, 'LeaderInstanceId', { value: leader.instanceId });
     new cdk.CfnOutput(this, 'FollowerInstanceId', { value: follower.instanceId });
-    new cdk.CfnOutput(this, 'ClientInstanceId', { value: client.instanceId });
     new cdk.CfnOutput(this, 'InstanceType', { value: instanceType });
+    new cdk.CfnOutput(this, 'ClientInstanceType', { value: clientInstanceType });
+    new cdk.CfnOutput(this, 'ClientCount', { value: String(clientCount) });
     new cdk.CfnOutput(this, 'StorageType', { value: storageType });
+    new cdk.CfnOutput(this, 'Architecture', { value: dataIsArm ? 'arm64' : 'x86_64' });
+
+    // Client outputs — backward compatible: first client uses 'ClientPublicIp'/'ClientPrivateIp'
+    clients.forEach((c, idx) => {
+      const suffix = idx === 0 ? '' : String(idx + 1);
+      new cdk.CfnOutput(this, `Client${suffix}PublicIp`, { value: c.instancePublicIp });
+      new cdk.CfnOutput(this, `Client${suffix}PrivateIp`, { value: c.instancePrivateIp });
+      new cdk.CfnOutput(this, `Client${suffix}InstanceId`, { value: c.instanceId });
+    });
   }
 }

@@ -24,7 +24,9 @@ BENCH_TASKS ?= 8000
 BENCH_CONNS ?= $(BENCH_TASKS)
 BENCH_DURATION ?= 15
 
-.PHONY: help infra certs deploy start stop restart status logs \
+REPO_ROOT := $(shell cd ../.. && pwd)
+
+.PHONY: help build build-arm infra certs deploy start stop restart status logs \
         dashboard run-benchmark sync-env teardown teardown-data
 
 help: ## Show this help
@@ -35,8 +37,29 @@ help: ## Show this help
 # Infrastructure
 # ---------------------------------------------------------------------------
 
-infra: ## Deploy CDK stack (use CDK_ARGS for extra flags, e.g. CDK_ARGS="-c instanceType=t3.xlarge -c storageType=ebs")
-	npx cdk deploy $(CDK_ARGS)
+build: ## Build x86_64 release binaries in Docker (for c6id, i4i, etc.)
+	@printf "$(BOLD)>>> Building x86_64 release binaries in amazonlinux:2023 container$(RESET)\n"
+	cd $(REPO_ROOT) && docker run --rm -v "$$(pwd)":/build -w /build amazonlinux:2023 bash -c '\
+		set -e && \
+		yum install -y gcc gcc-c++ openssl-devel perl-FindBin perl-File-Compare make git >/dev/null 2>&1 && \
+		curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y >/dev/null 2>&1 && \
+		source $$HOME/.cargo/env && \
+		cargo build --release -p celeriant -p celeriant_integration_tests -p celeriant_cli'
+	@printf "$(GREEN)Build complete (x86_64).$(RESET)\n"
+
+build-arm: ## Build ARM64 release binaries in Docker (for i4g, c7g, etc. — requires QEMU binfmt)
+	@printf "$(BOLD)>>> Building ARM64 release binaries in amazonlinux:2023 container (QEMU)$(RESET)\n"
+	@docker run --rm --privileged tonistiigi/binfmt --install arm64 >/dev/null 2>&1 || true
+	cd $(REPO_ROOT) && docker run --rm --platform linux/arm64 -v "$$(pwd)":/build -w /build amazonlinux:2023 bash -c '\
+		set -e && \
+		yum install -y gcc gcc-c++ openssl-devel perl-FindBin perl-File-Compare make git >/dev/null 2>&1 && \
+		curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y >/dev/null 2>&1 && \
+		source $$HOME/.cargo/env && \
+		cargo build --release -p celeriant -p celeriant_integration_tests -p celeriant_cli'
+	@printf "$(GREEN)Build complete (arm64).$(RESET)\n"
+
+infra: ## Deploy CDK stack (use CDK_ARGS for extra flags, e.g. CDK_ARGS="-c keyPair=my-key")
+	npx cdk deploy --require-approval never $(CDK_ARGS)
 
 # ---------------------------------------------------------------------------
 # TLS certificates
@@ -62,11 +85,14 @@ sync-env: ## Re-read CDK outputs into .cluster-env (run if stack was redeployed)
 	@STACK=CeleriantKtlsTestStack; \
 	get() { aws cloudformation describe-stacks --stack-name $$STACK \
 		--query "Stacks[0].Outputs[?OutputKey=='$$1'].OutputValue" --output text; }; \
-	printf "LEADER_PUB=%s\nFOLLOWER_PUB=%s\nCLIENT_PUB=%s\nLEADER_IP=%s\nFOLLOWER_IP=%s\nBUCKET=%s\nREGION=%s\nINSTANCE_TYPE=%s\nSTORAGE_TYPE=%s\nKEY_FILE=$(KEY_FILE)\n" \
-		$$(get LeaderPublicIp) $$(get FollowerPublicIp) $$(get ClientPublicIp) \
+	CC=$$(get ClientCount 2>/dev/null || echo 1); \
+	CPUBS=$$(get ClientPublicIp); \
+	for i in $$(seq 2 $$CC); do CPUBS="$$CPUBS,$$(get Client$${i}PublicIp)"; done; \
+	printf "LEADER_PUB=%s\nFOLLOWER_PUB=%s\nCLIENT_PUBS=%s\nCLIENT_COUNT=%s\nLEADER_IP=%s\nFOLLOWER_IP=%s\nBUCKET=%s\nREGION=%s\nINSTANCE_TYPE=%s\nCLIENT_INSTANCE_TYPE=%s\nSTORAGE_TYPE=%s\nARCH=%s\nKEY_FILE=$(KEY_FILE)\n" \
+		$$(get LeaderPublicIp) $$(get FollowerPublicIp) "$$CPUBS" "$$CC" \
 		$$(get LeaderPrivateIp) $$(get FollowerPrivateIp) \
 		$$(get BucketName) $$(get Region) \
-		$$(get InstanceType) $$(get StorageType) \
+		$$(get InstanceType) $$(get ClientInstanceType) $$(get StorageType) $$(get Architecture) \
 		> $(CLUSTER_ENV); \
 	printf "$(GREEN)Wrote $(CLUSTER_ENV)$(RESET)\n"; \
 	cat $(CLUSTER_ENV)
@@ -119,8 +145,8 @@ dashboard: ## Import Celeriant dashboard to Grafana Cloud (needs GRAFANA_URL and
 	fi
 	@bash scripts/deploy-dashboard.sh --grafana-url $(GRAFANA_URL) --grafana-token $(GRAFANA_TOKEN)
 
-run-benchmark: ## Run benchmark on client node and collect results
-	@if [[ -z "$(CLIENT_PUB)" ]]; then printf "$(RED)No .cluster-env$(RESET)\n"; exit 1; fi
+run-benchmark: ## Run benchmark on client node(s) and collect results
+	@if [[ -z "$(CLIENT_PUBS)" ]]; then printf "$(RED)No .cluster-env$(RESET)\n"; exit 1; fi
 	@BENCH_TASKS=$(BENCH_TASKS) BENCH_CONNS=$(BENCH_CONNS) BENCH_DURATION=$(BENCH_DURATION) \
 		bash scripts/run-benchmark.sh
 
