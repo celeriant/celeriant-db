@@ -1,0 +1,45 @@
+name: Publish Client Libraries
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build client crates
+        run: cargo build --release -p celeriant_wal -p celeriant_crypto -p celeriant_wire -p celeriant_msg -p celeriant_client_tokio
+
+      - name: Test client crates
+        run: cargo test -p celeriant_wal -p celeriant_crypto -p celeriant_wire -p celeriant_msg -p celeriant_client_tokio
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          cargo publish -p celeriant_wal --no-verify
+          cargo publish -p celeriant_crypto --no-verify
+          cargo publish -p celeriant_wire --no-verify
+          cargo publish -p celeriant_msg --no-verify
+          cargo publish -p celeriant_client_tokio --no-verify

@@ -1,19 +1,21 @@
 [package]
 name = "celeriant_client_tokio"
+description = "Async Tokio client for the Celeriant event store with connection pooling, leader routing, and TLS"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [features]
 default = []
 small-metablock = ["celeriant_wal/small-metablock", "celeriant_msg/small-metablock", "celeriant_wire/small-metablock"]
 
 [dependencies]
-celeriant_crypto = { path = "../celeriant_crypto" }
-celeriant_msg = { path = "../celeriant_msg" }
-celeriant_wire = { path = "../celeriant_wire" }
-celeriant_wal = { path = "../celeriant_wal" }
+celeriant_crypto = { path = "../celeriant_crypto", version = "0.1.0" }
+celeriant_msg = { path = "../celeriant_msg", version = "0.1.0" }
+celeriant_wire = { path = "../celeriant_wire", version = "0.1.0" }
+celeriant_wal = { path = "../celeriant_wal", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

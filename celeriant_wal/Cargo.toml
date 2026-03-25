@@ -1,9 +1,11 @@
 [package]
 name = "celeriant_wal"
+description = "Internal: write-ahead log data structures for the Celeriant event store"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [features]
 default = []

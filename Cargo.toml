@@ -27,6 +27,7 @@ version = "0.1.0"
 authors = ["Celeriant"]
 edition = "2024"
 license = "Apache-2.0"
+repository = "https://github.com/celeriant/celeriant-db"
 
 [workspace.dependencies]
 object_store = { version = "0.13.0", features = ["aws"] }

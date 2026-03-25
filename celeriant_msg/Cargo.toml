@@ -1,17 +1,19 @@
 [package]
 name = "celeriant_msg"
+description = "Internal: request/response message types for the Celeriant wire protocol"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [features]
 default = []
 small-metablock = ["celeriant_wal/small-metablock", "celeriant_wire/small-metablock"]
 
 [dependencies]
-celeriant_wal = { path = "../celeriant_wal" }
-celeriant_wire = { path = "../celeriant_wire" }
+celeriant_wal = { path = "../celeriant_wal", version = "0.1.0" }
+celeriant_wire = { path = "../celeriant_wire", version = "0.1.0" }
 bincode.workspace = true
 futures-lite.workspace = true
 serde.workspace = true

@@ -1,16 +1,18 @@
 [package]
 name = "celeriant_wire"
+description = "Internal: wire protocol framing, serialization, and compression for Celeriant"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [features]
 default = []
 small-metablock = ["celeriant_wal/small-metablock"]
 
 [dependencies]
-celeriant_wal = { path = "../celeriant_wal" }
+celeriant_wal = { path = "../celeriant_wal", version = "0.1.0" }
 bincode.workspace = true
 serde.workspace = true
 serde_json.workspace = true
