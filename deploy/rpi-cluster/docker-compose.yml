@@ -1,6 +1,7 @@
 services:
   minio:
     image: minio/minio:latest
+    restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minioadmin
@@ -29,6 +30,7 @@ services:
 
   prometheus:
     image: prom/prometheus:latest
+    restart: unless-stopped
     ports:
       - "9090:9090"
     volumes:
@@ -40,6 +42,7 @@ services:
 
   loki:
     image: grafana/loki:3.0.0
+    restart: unless-stopped
     ports:
       - "3100:3100"
     command: -config.file=/etc/loki/local-config.yaml
@@ -48,6 +51,7 @@ services:
 
   grafana:
     image: grafana/grafana-oss:latest
+    restart: unless-stopped
     ports:
       - "3000:3000"
     environment:

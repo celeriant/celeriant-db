@@ -1,0 +1,12 @@
+[package]
+name = "kafka_bench"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "kafka-bench"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+rdkafka = { version = "0.39.0", features = ["ssl-vendored"] }
