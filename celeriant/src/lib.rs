@@ -237,11 +237,13 @@ pub fn startup(args: Vec<String>) -> Result<(), std::io::Error> {
         }
     };
 
-    // Validate TLS requirement for API key auth
-    if api_keys.is_some() && tls_config.is_none() && !server_config.insecure_allow_plaintext_auth {
+    // Validate TLS requirement for client auth (API keys and client identity)
+    let requires_tls = api_keys.is_some() || server_config.require_client_identity;
+    if requires_tls && tls_config.is_none() && !server_config.insecure_allow_plaintext_auth {
         error!(
-            "API key authentication is configured (api_keys.toml exists) but TLS is not enabled.\n\
-             API keys are transmitted during connection handshake and MUST be encrypted in transit.\n\
+            "Client authentication is configured but TLS is not enabled.\n\
+             API keys are transmitted in cleartext without TLS. Signed identity nonces are \
+             vulnerable to replay attacks within the 2-minute acceptance window.\n\
              \n\
              To fix, enable TLS:\n\
                --tls-ca-cert /path/to/ca.crt --tls-node-cert /path/to/node.crt --tls-node-key /path/to/node.key\n\
@@ -249,14 +251,14 @@ pub fn startup(args: Vec<String>) -> Result<(), std::io::Error> {
              For development/testing only, you can bypass this check:\n\
                --insecure-allow-plaintext-auth\n\
              \n\
-             WARNING: --insecure-allow-plaintext-auth transmits API keys in cleartext.\n\
+             WARNING: --insecure-allow-plaintext-auth disables transport security for auth.\n\
              Never use this flag in production."
         );
         std::process::exit(1);
     }
 
-    if api_keys.is_some() && tls_config.is_none() && server_config.insecure_allow_plaintext_auth {
-        tracing::warn!("API key authentication running WITHOUT TLS - keys transmitted in plaintext");
+    if requires_tls && tls_config.is_none() && server_config.insecure_allow_plaintext_auth {
+        tracing::warn!("Client authentication running WITHOUT TLS - vulnerable to replay attacks");
     }
 
     if api_keys.is_some() {

@@ -1,5 +1,7 @@
 mod cli;
 mod operations;
+#[cfg(test)]
+mod tests;
 mod tui;
 mod utils;
 

@@ -166,7 +166,7 @@ Rules the system enforces. Breaking any of these is a bug. Provide this to LLMs 
 - All certs use ECDSA P-256. CA certs have `pathLen:0`. Node certs carry both `serverAuth` and `clientAuth` EKU. Client certs carry only `clientAuth`.
 - API keys are stored as SHA-256 hashes only; raw keys are never stored server-side. Comparison is constant-time.
 - Four API key slots: two ReadWrite, two ReadOnly. `ReadOnly` blocks write/delete/trim/schema operations.
-- API keys require TLS unless `--insecure-allow-plaintext-auth` is explicitly set (server exits at startup otherwise).
+- API keys and client identity require TLS unless `--insecure-allow-plaintext-auth` is explicitly set (server exits at startup otherwise). Without TLS, signed nonces are vulnerable to replay attacks within the 2-minute acceptance window.
 - Client identity is `SHA-256(DER public key bytes)[0..16]` as little-endian u128. Validated per-connection at `Identify` time.
 - Nonces expire after 2 minutes with 60-second forward clock-skew tolerance. Signing uses RSA-2048 PKCS1v15-SHA256.
 

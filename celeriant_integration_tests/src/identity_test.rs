@@ -55,6 +55,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         log_level: "warn".to_string(),
         standalone: true,
         require_client_identity: true,
+        insecure_allow_plaintext_auth: true,
         ..Default::default()
     };
     let enforcing_server = TestServer::start_with_config(enforcing_port, enforcing_config).await?;

@@ -1,42 +1,32 @@
 
-# Workspace Setup
+# Contributing
 
-The project uses a workspace setup. To add a dependency:
+Celeriant is open source but **not accepting pull requests or external contributions** at this time.
 
-```
-cargo add serde --features derive,rc --package celeriant_wire
-```
+## Why?
 
-But you need to manually add it to Cargo.toml [workspace.dependencies] and change crates to serde.workspace = true
+Open source maintainers are drowning in low-effort, AI-generated pull requests and security reports. We don't have the bandwidth to triage these, and we'd rather be upfront about it than waste anyone's time.
 
+This isn't hypothetical. It's happening across the industry right now:
 
-# Running benchmarks
+- **curl** shut down its bug bounty program entirely after AI-generated vulnerability reports became a "DDoS attack on open source" — fewer than 5% of submissions were legitimate ([The Register](https://www.theregister.com/2025/05/07/curl_ai_bug_reports/))
+- The **Python Software Foundation** warned that LLM-hallucinated security reports "should be treated as if they are malicious" due to the triage burden they impose ([Seth Larson](https://sethmlarson.dev/slop-security-reports))
+- **OCaml** maintainers rejected a 13,000-line AI-generated PR that would have brought their review process to a halt ([DevClass](https://devclass.com/2025/11/27/ocaml-maintainers-reject-massive-ai-generated-pull-request/))
+- **GitHub Copilot's** autonomous PR features triggered a maintainer backlash, with 500+ upvotes on a demand for repository-level blocking controls ([Socket](https://socket.dev/blog/oss-maintainers-demand-ability-to-block-copilot-generated-issues-and-prs))
+- Bug bounty platforms industry-wide are being flooded with AI-generated reports that "look like gold but are actually just crap" ([TechCrunch](https://techcrunch.com/2025/07/24/ai-slop-and-fake-reports-are-exhausting-some-security-bug-bounties/))
 
-Can take a while. Selectively run a benchmarks based on what you are working on. Save benchmark data to git.
+We're a small team building a database where correctness matters at every level. We'd rather focus on that than review drive-by contributions.
 
-```
-cargo bench --package celeriant_wire --benches -- --save-baseline celeriant_wire
-critcmp --export celeriant_wire > ./celeriant_wire/benches/celeriant_wire.json
+## Want to get involved?
 
-# Run only write_benchmark
-cargo bench --package celeriant_shard --bench write_benchmark -- --save-baseline write_baseline
-critcmp --export write_baseline > ./celeriant_shard/benches/celeriant_shard_write.json
+We're not anti-community. We're anti-slop.
 
-# Run only aggregate count
-cargo bench --package celeriant_shard --bench aggregate_count_benchmark -- --save-baseline aggregate_count_baseline
-critcmp --export aggregate_count_baseline > ./celeriant_shard/benches/celeriant_shard_aggregate_count.json
+If you're a developer in Australia, or better, in Brisbane, and you're genuinely interested in contributing, reach out directly. We'd love to grab a coffee and talk about the project in person. Real human conversation is how we figure out if there's a good fit.
 
-# Run only exists_benchmark
-cargo bench --package celeriant_shard --bench exists_benchmark -- --save-baseline exists_baseline
-critcmp --export exists_baseline > ./celeriant_shard/benches/celeriant_shard_exists.json
+Open an issue to introduce yourself, or find us through the project links. No cold PRs.
 
-# Run only the fsync_delay group from write_benchmark
-cargo bench --package celeriant_shard --bench write_benchmark -- "write_fsync_delay"
+## What you can do right now
 
-# Run only cache_impact tests
-cargo bench --package celeriant_shard --bench write_benchmark -- "write_cache_impact"
-
-# Run only single_aggregate tests across all groups
-cargo bench --package celeriant_shard --bench write_benchmark -- "single_aggregate"
-
-```
+- **Use it.** That's the point.
+- **File genuine bugs.** If you hit a real issue, open an issue. Just be specific and include a reproduction.
+- **Fork it.** The license allows it.
