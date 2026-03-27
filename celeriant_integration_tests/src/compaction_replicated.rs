@@ -131,7 +131,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         shard_log_preallocate_bytes: 2 * 1024 * 1024,
         compaction_check_interval_secs: 5,
         compaction_min_reclaimable_ratio: 0.20,
-        pending_replication_high_water_bytes: 100_000_000,
+        pending_replication_high_water_bytes: Some(100_000_000),
         ..base_config
     };
 

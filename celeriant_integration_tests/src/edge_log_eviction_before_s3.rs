@@ -67,7 +67,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         // Very high water mark: prevent unintended S3 fallback during the write phase
         // while the follower is stopped. The test relies on S3 uploads triggered by the
         // stopped follower, not by queue pressure.
-        pending_replication_high_water_bytes: 100_000_000,
+        pending_replication_high_water_bytes: Some(100_000_000),
         // Generous catchup rounds: many S3 fallback objects are generated (one per write).
         // Default of 3 rounds is insufficient — the follower needs enough rounds to
         // download all objects during initial boot catchup (before any kicks arrive).

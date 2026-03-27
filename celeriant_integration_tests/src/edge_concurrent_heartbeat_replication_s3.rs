@@ -73,10 +73,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // With 20 concurrent writers × 4KB events in one fsync window, the pending queue
     // reaches ~240KB, far above this threshold. Must be above ~12KB (single event pending
     // size with 3x memory multiplier) so post-recovery serial writes use TCP, not S3.
-    config.pending_replication_high_water_bytes = 32_768; // 32KB
+    config.pending_replication_high_water_bytes = Some(32_768); // 32KB
     // Low max_catchup_gap_bytes: forces a kick after a small gap so the follower receives
     // the S3 pointer promptly after unthrottle.
-    config.max_catchup_gap_bytes = 4096;
+    config.max_catchup_gap_bytes = Some(4096);
     // Generous internode timeout so throttled connections are not killed prematurely.
     config.internode_connection_timeout_ms = 60_000;
 

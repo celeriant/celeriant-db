@@ -227,16 +227,11 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 1024 * 1024 * 1024, env = "CELERIANT_SHARD_LOG_PREALLOCATE_BYTES", help = "Size of each individual log file on disk (1GB)")]
     pub shard_log_preallocate_bytes: u64,
 
-    #[arg(long, default_value_t = 64 * 1024 * 1024, env = "CELERIANT_PENDING_REPLICATION_HIGH_WATER_BYTES", help = "High water mark for pending replication queue before triggering S3 fallback (64MB)")]
-    pub pending_replication_high_water_bytes: u64,
+    #[arg(long, env = "CELERIANT_PENDING_REPLICATION_HIGH_WATER_BYTES", hide = true)]
+    pub pending_replication_high_water_bytes: Option<u64>,
 
-    #[arg(
-        long,
-        default_value_t = 104_857_600,
-        env = "CELERIANT_MAX_CATCHUP_GAP_BYTES",
-        help = "Maximum gap between leader and follower before triggering catchup (100MB)"
-    )]
-    pub max_catchup_gap_bytes: u64,
+    #[arg(long, env = "CELERIANT_MAX_CATCHUP_GAP_BYTES", hide = true)]
+    pub max_catchup_gap_bytes: Option<u64>,
 
     #[arg(
         long,
@@ -746,9 +741,9 @@ impl ServerConfig {
             list_wal_index_cache_bytes: memory_budget.list_wal_index_cache_bytes,
             schema_cache_bytes: memory_budget.schema_cache_bytes,
             max_schema_size_bytes: self.max_schema_size_bytes,
-            pending_replication_high_water_bytes: self.pending_replication_high_water_bytes,
+            pending_replication_high_water_bytes: self.pending_replication_high_water_bytes.unwrap_or(memory_budget.replication_high_water_bytes),
             max_clock_drift_ms: self.max_clock_drift_ms,
-            max_catchup_gap_bytes: self.max_catchup_gap_bytes,
+            max_catchup_gap_bytes: self.max_catchup_gap_bytes.unwrap_or(memory_budget.max_catchup_gap_bytes),
             internode_connection_timeout: Some(Duration::from_millis(self.internode_connection_timeout_ms)),
             internode_request_timeout: Duration::from_millis(self.internode_request_timeout_ms),
             server_compression_algorithm: match self.server_compression_algorithm {
@@ -843,8 +838,6 @@ impl ServerConfig {
         check_field!(max_schema_size_bytes);
         check_field!(client_connection_timeout_ms);
         check_field!(shard_log_preallocate_bytes);
-        check_field!(pending_replication_high_water_bytes);
-        check_field!(max_catchup_gap_bytes);
         check_field!(internode_connection_timeout_ms);
         check_field!(internode_request_timeout_ms);
         check_field!(server_compression_algorithm);
@@ -929,12 +922,12 @@ impl Default for ServerConfig {
             s3_secret_access_key: None,
             s3_subfolder: None,
             shard_log_preallocate_bytes: 1024 * 1024 * 1024,
+            pending_replication_high_water_bytes: None,
+            max_catchup_gap_bytes: None,
             fsync_delay_us: 17000,
             replication_delay_us: 17000,
             client_connection_timeout_ms: 30000,
             routing_rule: RoutingRule::AggregateId,
-            pending_replication_high_water_bytes: 64 * 1024 * 1024,
-            max_catchup_gap_bytes: 104_857_600,
             timestamp_precision: ConfigTimestampPrecision::Milliseconds,
             timestamp_epoch_offset_secs: 0,
             list_max_duration_ms: 2000,

@@ -620,11 +620,14 @@ impl ServerConfigExt for ServerConfig {
 
         }
 
-        args.push("--pending-replication-high-water-bytes".to_string());
-        args.push(self.pending_replication_high_water_bytes.to_string());
-
-        args.push("--max-catchup-gap-bytes".to_string());
-        args.push(self.max_catchup_gap_bytes.to_string());
+        if let Some(v) = self.pending_replication_high_water_bytes {
+            args.push("--pending-replication-high-water-bytes".to_string());
+            args.push(v.to_string());
+        }
+        if let Some(v) = self.max_catchup_gap_bytes {
+            args.push("--max-catchup-gap-bytes".to_string());
+            args.push(v.to_string());
+        }
 
         args.push("--internode-connection-timeout-ms".to_string());
         args.push(self.internode_connection_timeout_ms.to_string());

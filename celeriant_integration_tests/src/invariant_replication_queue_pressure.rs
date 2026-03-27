@@ -68,9 +68,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Low high water mark: triggers S3 fallback when pending replication queue
     // accumulates > 256KB due to throttled follower. A single fsync batch from
     // ~100 concurrent connections is ~100KB, so we need 3+ batches to accumulate.
-    config.pending_replication_high_water_bytes = 262144;
+    config.pending_replication_high_water_bytes = Some(262144);
     // High max_catchup_gap_bytes: we are NOT testing WAL gap detection, only queue pressure.
-    config.max_catchup_gap_bytes = 100_000_000;
+    config.max_catchup_gap_bytes = Some(100_000_000);
     // Long timeouts: no failover, just kick.
     config.heartbeat_lease_duration_ms = 30_000;
     config.s3_lease_duration_ms = 30_000;

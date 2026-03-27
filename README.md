@@ -51,20 +51,21 @@ It is not a state machine, a message streaming platform, or a queue. You have to
 Per-operation throughput. No batching, no pipelining. Each write appends a single event,
 waits for the durable ack, then sends the next. This is the pattern real microservices use.
 
-- 2x i4i.8xlarge data nodes (32 vCPU, NVMe, XFS, Direct I/O)
-- 3x c7i.4xlarge client nodes (16 vCPU each)
+- 2x i4i data nodes (NVMe, XFS, Direct I/O via io_uring)
+- 3-4x c7i.4xlarge client nodes (16 vCPU each)
 - mTLS with kTLS offload (TLS 1.3) on all connections
 - Every write is `fdatasync()`'d to disk on both nodes before ack
 - AWS ap-southeast-2, single AZ
 
 | System | Peak req/s | P99 at peak | Nodes | TLS | Fsync | OCC |
 |---|---|---|---|---|---|---|
-| **Celeriant** | **389,759** | **217ms** | 2 | mTLS (kTLS) | Both nodes | Yes |
+| **Celeriant (64c)** | **535,292** | **210ms** | 2 | mTLS (kTLS) | Both nodes | Yes |
+| **Celeriant (32c)** | **389,759** | **217ms** | 2 | mTLS (kTLS) | Both nodes | Yes |
 | PostgreSQL/Marten | 42,721 | 46ms | 2 | mTLS (OpenSSL) | Both nodes | Yes |
 | Kafka | ~24,000 | ~1,342ms | 3 | TLS | None | No |
 
-Celeriant P99 stays under 90ms up to 24,000 concurrent connections. PostgreSQL
-delivers excellent latency at low concurrency but collapses at 12,000 connections
+Celeriant P99 stays under 110ms up to 24,000 concurrent connections on both configurations.
+PostgreSQL delivers excellent latency at low concurrency but collapses at 12,000 connections
 (throughput drops 98%). Kafka plateaus at ~24k req/s regardless of concurrency,
 without fsync or per-aggregate ordering.
 

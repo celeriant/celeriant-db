@@ -188,6 +188,12 @@ $SSH@${LEADER_PUB} 'sudo mv /tmp/celeriant.env /etc/celeriant/celeriant.env'
 $SCP /tmp/celeriant-follower.env ec2-user@${FOLLOWER_PUB}:/tmp/celeriant.env
 $SSH@${FOLLOWER_PUB} 'sudo mv /tmp/celeriant.env /etc/celeriant/celeriant.env'
 
+echo "==> Tuning kernel network parameters on all nodes"
+for HOST in $LEADER_PUB $FOLLOWER_PUB ${CLIENT_PUBS//,/ }; do
+  $SSH@${HOST} 'sudo sysctl -w net.ipv4.tcp_tw_reuse=1 net.ipv4.tcp_max_syn_backlog=65535 net.core.netdev_max_backlog=65535 >/dev/null'
+done
+echo "  Done"
+
 echo "==> Enabling systemd service on data nodes"
 for HOST in $LEADER_PUB $FOLLOWER_PUB; do
   $SSH@${HOST} 'sudo systemctl enable celeriant'

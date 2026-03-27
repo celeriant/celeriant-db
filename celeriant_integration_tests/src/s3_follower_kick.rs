@@ -51,7 +51,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Low max_catchup_gap_bytes: when leader tries to bridge WAL gap for follower
     // and the gap exceeds this, it triggers FollowerTooFarBehind → S3 fallback + kick.
     // FIXED_BLOCK_SIZE_BYTES=1024, so ~5 WAL entries exceed 4096.
-    config.max_catchup_gap_bytes = 4096;
+    config.max_catchup_gap_bytes = Some(4096);
     // Long timeouts — we don't want failover, just kick
     config.heartbeat_lease_duration_ms = 30_000;
     config.s3_lease_duration_ms = 30_000;

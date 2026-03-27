@@ -68,7 +68,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     config.heartbeat_interval_ms = 500;
     // High water mark: 10MB — intentionally high so that moderate throttle pressure
     // does NOT trigger S3 fallback. We want to verify no false S3 fallback occurs.
-    config.pending_replication_high_water_bytes = 10 * 1024 * 1024;
+    config.pending_replication_high_water_bytes = Some(10 * 1024 * 1024);
     // Allow longer internode timeout so the throttled connection is not dropped.
     config.internode_connection_timeout_ms = 60_000;
 
