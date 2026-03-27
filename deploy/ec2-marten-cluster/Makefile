@@ -23,7 +23,7 @@ DOTNET_ROOT ?= $(shell cd ../../.. && pwd)/celeriant-dotnet-client
 
 BENCH_RECORD_SIZE ?= 256
 
-.PHONY: help build infra deploy start stop restart status logs \
+.PHONY: help build infra deploy start stop restart status repl-status logs \
         run-benchmark run-sweep monitor-pg sync-env teardown teardown-data
 
 help: ## Show this help
@@ -65,8 +65,9 @@ sync-env: ## Re-read CDK outputs into .cluster-env
 		if [[ -n "$$CPUBS" ]]; then CPUBS="$$CPUBS,"; fi; \
 		CPUBS="$$CPUBS$$(get Client$${i}PublicIp)"; \
 	done; \
-	printf "PG_PUB=%s\nPG_IP=%s\nPG_INSTANCE_ID=%s\nCLIENT_PUBS=%s\nCLIENT_COUNT=%s\nREGION=%s\nINSTANCE_TYPE=%s\nCLIENT_INSTANCE_TYPE=%s\nSTORAGE_TYPE=%s\nARCH=%s\nPG_VERSION=%s\nKEY_FILE=$(KEY_FILE)\n" \
+	printf "PG_PUB=%s\nPG_IP=%s\nPG_INSTANCE_ID=%s\nSTANDBY_PUB=%s\nSTANDBY_IP=%s\nSTANDBY_INSTANCE_ID=%s\nCLIENT_PUBS=%s\nCLIENT_COUNT=%s\nREGION=%s\nINSTANCE_TYPE=%s\nCLIENT_INSTANCE_TYPE=%s\nSTORAGE_TYPE=%s\nARCH=%s\nPG_VERSION=%s\nKEY_FILE=$(KEY_FILE)\n" \
 		$$(get PostgreSQLPublicIp) $$(get PostgreSQLPrivateIp) $$(get PostgreSQLInstanceId) \
+		$$(get StandbyPublicIp) $$(get StandbyPrivateIp) $$(get StandbyInstanceId) \
 		"$$CPUBS" "$$CC" \
 		$$(get Region) $$(get InstanceType) $$(get ClientInstanceType) \
 		$$(get StorageType) $$(get Architecture) $$(get PgVersion) \
@@ -80,24 +81,36 @@ sync-env: ## Re-read CDK outputs into .cluster-env
 
 PG_SERVICE = postgresql
 
-start: ## Start PostgreSQL
+start: ## Start PostgreSQL (primary first, then standby)
 	@if [[ -z "$(PG_PUB)" ]]; then printf "$(RED)No .cluster-env$(RESET)\n"; exit 1; fi
-	@printf "$(BOLD)>>> Starting PostgreSQL on $(PG_PUB)$(RESET)\n"
+	@printf "$(BOLD)>>> Starting primary$(RESET)\n"
 	@$(SSH)@$(PG_PUB) 'sudo systemctl start $(PG_SERVICE)'
 	@sleep 2
-	@printf "$(GREEN)PostgreSQL started.$(RESET)\n"
+	@printf "$(BOLD)>>> Starting standby$(RESET)\n"
+	@$(SSH)@$(STANDBY_PUB) 'sudo systemctl start $(PG_SERVICE)' 2>/dev/null || true
+	@sleep 2
+	@printf "$(GREEN)PostgreSQL cluster started.$(RESET)\n"
 
-stop: ## Stop PostgreSQL
+stop: ## Stop PostgreSQL (standby first, then primary)
 	@if [[ -z "$(PG_PUB)" ]]; then printf "$(RED)No .cluster-env$(RESET)\n"; exit 1; fi
-	@printf "$(BOLD)>>> Stopping PostgreSQL on $(PG_PUB)$(RESET)\n"
+	@printf "$(BOLD)>>> Stopping standby$(RESET)\n"
+	@$(SSH)@$(STANDBY_PUB) 'sudo systemctl stop $(PG_SERVICE) 2>/dev/null || true' 2>/dev/null || true
+	@printf "$(BOLD)>>> Stopping primary$(RESET)\n"
 	@$(SSH)@$(PG_PUB) 'sudo systemctl stop $(PG_SERVICE) 2>/dev/null || true'
 
 restart: stop start ## Restart PostgreSQL
 
-status: ## Show PostgreSQL service status and connection count
+status: ## Show primary/standby service status and connection count
 	@if [[ -z "$(PG_PUB)" ]]; then printf "$(RED)No .cluster-env$(RESET)\n"; exit 1; fi
+	@printf "$(BOLD)Primary:$(RESET) "
 	@$(SSH)@$(PG_PUB) 'systemctl is-active $(PG_SERVICE) 2>/dev/null || echo "not running"'
 	@$(SSH)@$(PG_PUB) "sudo -u postgres psql -c \"SELECT count(*) AS connections FROM pg_stat_activity;\"" 2>/dev/null || true
+	@printf "$(BOLD)Standby:$(RESET) "
+	@$(SSH)@$(STANDBY_PUB) 'systemctl is-active $(PG_SERVICE) 2>/dev/null || echo "not running"' 2>/dev/null || printf "unknown\n"
+
+repl-status: ## Show synchronous replication status
+	@if [[ -z "$(PG_PUB)" ]]; then printf "$(RED)No .cluster-env$(RESET)\n"; exit 1; fi
+	@$(SSH)@$(PG_PUB) "sudo -u postgres psql -c \"SELECT application_name, state, sync_state, sent_lsn, replay_lsn, write_lag, flush_lag, replay_lag FROM pg_stat_replication;\""
 
 logs: ## Tail PostgreSQL logs (Ctrl+C to stop)
 	@if [[ -z "$(PG_PUB)" ]]; then printf "$(RED)No .cluster-env$(RESET)\n"; exit 1; fi

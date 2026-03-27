@@ -90,10 +90,22 @@ if [[ ! -f "$CLI_BINARY" ]]; then
   echo "Run: cargo build --release -p celeriant -p celeriant_integration_tests -p celeriant_cli"
   exit 1
 fi
+# Auto-regenerate certs if missing or if SANs don't match current IPs
+NEEDS_CERTS=false
 if [[ ! -f "$CERT_DIR/node.crt" ]]; then
-  echo "ERROR: Certs not found in $CERT_DIR"
-  echo "Run: ./generate-certs.sh $LEADER_IP $FOLLOWER_IP <client-ip>"
-  exit 1
+  NEEDS_CERTS=true
+else
+  EXISTING_SANS=$(openssl x509 -in "$CERT_DIR/client-server.crt" -noout -text 2>/dev/null \
+    | grep -A1 "Subject Alternative Name" | tail -1 || echo "")
+  if ! echo "$EXISTING_SANS" | grep -q "$LEADER_IP" || ! echo "$EXISTING_SANS" | grep -q "$FOLLOWER_IP"; then
+    echo "  Cert SANs don't match current IPs — regenerating"
+    NEEDS_CERTS=true
+  fi
+fi
+if [[ "$NEEDS_CERTS" == "true" ]]; then
+  echo "==> Generating TLS certificates"
+  CLIENT1_IP=$(get_output ClientPrivateIp)
+  bash "$SCRIPT_DIR/generate-certs.sh" "$LEADER_IP" "$FOLLOWER_IP" "$CLIENT1_IP"
 fi
 
 SSH="ssh $SSH_OPTS ec2-user"

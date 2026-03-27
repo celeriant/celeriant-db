@@ -7,9 +7,9 @@ import { Construct } from 'constructs';
  * Marten (PostgreSQL) benchmark cluster on EC2.
  *
  * For comparison benchmarking against the Celeriant ec2-cluster.
- *   - 1 PostgreSQL node (single, no replica)
+ *   - 1 PostgreSQL primary + 1 synchronous standby (both fsync before ack)
  *   - 1-4 client nodes for running marten-bench (.NET)
- *   - No TLS — plaintext connections
+ *   - mTLS (self-signed CA, client cert auth)
  *   - Same instance types as Celeriant cluster for hardware parity
  *
  * Storage: matches Celeriant setup — instance-store (NVMe) or EBS.
@@ -152,6 +152,13 @@ export class Ec2MartenClusterStack extends cdk.Stack {
 
     const pgUserData = [...pgSetup, ...storageSetup, ...pgInitSetup].join('\n');
 
+    // Standby: same packages + storage, but NO initdb (pg_basebackup creates the data dir)
+    const standbyInitSetup = [
+      '',
+      'chown postgres:postgres /var/lib/pgsql',
+    ];
+    const standbyUserData = [...pgSetup, ...storageSetup, ...standbyInitSetup].join('\n');
+
     // --- Client node user data ---
     const clientSetup = [
       '#!/bin/bash',
@@ -229,8 +236,9 @@ export class Ec2MartenClusterStack extends cdk.Stack {
       }]
       : undefined;
 
-    // --- Instances: 1 PostgreSQL node + N clients ---
+    // --- Instances: 1 PostgreSQL primary + 1 standby + N clients ---
     const pgNode = createInstance('PostgreSQL', pgUserData, instanceType, dataBlockDevices);
+    const standbyNode = createInstance('Standby', standbyUserData, instanceType, dataBlockDevices);
 
     const clients: ec2.Instance[] = [];
     for (let i = 1; i <= clientCount; i++) {
@@ -241,6 +249,10 @@ export class Ec2MartenClusterStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'PostgreSQLPrivateIp', { value: pgNode.instancePrivateIp });
     new cdk.CfnOutput(this, 'PostgreSQLPublicIp', { value: pgNode.instancePublicIp });
     new cdk.CfnOutput(this, 'PostgreSQLInstanceId', { value: pgNode.instanceId });
+
+    new cdk.CfnOutput(this, 'StandbyPrivateIp', { value: standbyNode.instancePrivateIp });
+    new cdk.CfnOutput(this, 'StandbyPublicIp', { value: standbyNode.instancePublicIp });
+    new cdk.CfnOutput(this, 'StandbyInstanceId', { value: standbyNode.instanceId });
 
     clients.forEach((c, idx) => {
       const n = idx + 1;

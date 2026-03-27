@@ -27,7 +27,7 @@ BENCH_DURATION ?= 15
 REPO_ROOT := $(shell cd ../.. && pwd)
 
 .PHONY: help build build-arm infra certs deploy start stop restart status logs \
-        dashboard run-benchmark sync-env teardown teardown-data
+        dashboard run-benchmark run-sweep sync-env teardown teardown-data
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -149,6 +149,10 @@ run-benchmark: ## Run benchmark on client node(s) and collect results
 	@if [[ -z "$(CLIENT_PUBS)" ]]; then printf "$(RED)No .cluster-env$(RESET)\n"; exit 1; fi
 	@BENCH_TASKS=$(BENCH_TASKS) BENCH_CONNS=$(BENCH_CONNS) BENCH_DURATION=$(BENCH_DURATION) \
 		bash scripts/run-benchmark.sh
+
+run-sweep: ## Run benchmark at increasing concurrency levels, output CSV
+	@if [[ -z "$(CLIENT_PUBS)" ]]; then printf "$(RED)No .cluster-env$(RESET)\n"; exit 1; fi
+	@BENCH_DURATION=$(BENCH_DURATION) bash scripts/run-sweep.sh
 
 # ---------------------------------------------------------------------------
 # Teardown

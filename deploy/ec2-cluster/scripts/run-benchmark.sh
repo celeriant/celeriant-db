@@ -125,10 +125,11 @@ TOTAL_ERRORS=0
 for i in $(seq 1 "$CLIENT_COUNT"); do
   OUTFILE="/tmp/bench_client_${i}.txt"
   if [[ -f "$OUTFILE" ]]; then
-    # Extract the summary line
     SUMMARY=$(grep -E "Tasks:.*Requests:" "$OUTFILE" 2>/dev/null || echo "")
+    LATENCY=$(grep -E "Latency —" "$OUTFILE" 2>/dev/null || echo "")
     if [[ -n "$SUMMARY" ]]; then
       echo "  Client $i: $SUMMARY"
+      [[ -n "$LATENCY" ]] && echo "  Client $i: $LATENCY"
       REQS=$(echo "$SUMMARY" | grep -oP 'Requests: \K[0-9]+')
       ERRS=$(echo "$SUMMARY" | grep -oP 'Errors: \K[0-9]+')
       TOTAL_REQUESTS=$((TOTAL_REQUESTS + REQS))

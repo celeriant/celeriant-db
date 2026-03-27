@@ -65,7 +65,7 @@ echo ""
 cat > "$RESULT_FILE" <<EOF
 # Marten/PostgreSQL EC2 Benchmark (marten-bench)
 # Date:         $(date -Iseconds)
-# PostgreSQL:   $INSTANCE_TYPE (x1)
+# PostgreSQL:   $INSTANCE_TYPE (primary + sync standby)
 # PG version:   ${PG_VERSION:-unknown}
 # Client node:  ${CLIENT_INSTANCE_TYPE:-$INSTANCE_TYPE}
 # Clients:      $CLIENT_COUNT
@@ -74,11 +74,11 @@ cat > "$RESULT_FILE" <<EOF
 # Tasks/client: $TASKS_PER_CLIENT
 # Duration:     ${DURATION}s
 # Record size:  ${RECORD_SIZE} bytes
-# TLS:          false
-# sync_commit:  on
+# TLS:          mTLS (self-signed CA, client cert auth)
+# sync_commit:  on (synchronous_standby_names = standby1)
+# Replication:  synchronous — primary + standby both fsync before ack
 #
-# NOTE: PostgreSQL with synchronous_commit=on fsyncs WAL before ack.
-# Celeriant fsyncs every write to WAL before ack.
+# NOTE: Apples-to-apples with Celeriant: mTLS, 2 data nodes, fsync before ack.
 # ---
 
 EOF
@@ -97,6 +97,10 @@ for HOST in $CLIENT_PUBS; do
      PG_DATABASE=marten_bench \
      PG_USER=bench \
      PG_PASSWORD=bench \
+     PG_SSL_MODE=VerifyFull \
+     PG_SSL_CERT=/opt/pg-certs/client.crt \
+     PG_SSL_KEY=/opt/pg-certs/client.key \
+     PG_SSL_CA=/opt/pg-certs/ca.crt \
      BENCH_TASKS=${TASKS_PER_CLIENT} \
      BENCH_DURATION=${DURATION} \
      BENCH_RECORD_SIZE=${RECORD_SIZE} \
