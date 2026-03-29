@@ -8,30 +8,31 @@ Not a relational database. Not a message broker. Just the write side of event so
 
 PostgreSQL gives you correctness but not throughput. Kafka gives you throughput but not correctness. Celeriant gives you both.
 
-**PostgreSQL** - Transactions and ACID are great, but append-only, high-cardinality, small-write workloads are its worst case. You will spend more time tuning vacuum and fighting WAL amplification than building your product. Real-world event stores hit 50k writes/sec on PostgreSQL before it buckles.
+**PostgreSQL** - It does all the things. You can design a single table that acts like an event store, add indexes, do conditional writes. PostgreSQL dies at scale. Every event append generates [8-10x the logical data size](docs/postgresql-event-sourcing-structural-mismatch.md) in actual I/O: heap writes, index updates, WAL, full page images, autovacuum. That continuous write pressure means vacuum can never catch up, and at 10,000 events/sec you hit [transaction ID wraparound](docs/postgresql-event-sourcing-structural-mismatch.md) every few days. Mailchimp lost 40 hours to it. The feature you need most for projections, `LISTEN/NOTIFY`, acquires a [global exclusive lock on the entire database](docs/postgresql-event-sourcing-structural-mismatch.md). Recall.ai had three outages in four days before ripping it out entirely. On Aurora I/O-Optimized the per-I/O charges go away, but storage never shrinks, MVCC dead tuple bloat compounds, and there's no lifecycle tiering. A modest 30k writes/sec workload costs [$16,000/month in month 1 and $205,000/month by month 12](docs/benchmark-summary.md).
 
-**Kafka** - Scales to millions of writes/sec, but it has no conditional writes and no per-aggregate ordering guarantee. Before a service can write events it needs to validate state, and that state may have changed between the read and the write. Kafka cannot help with that. There is also no way to filter events per-aggregate, every consumer gets the whole topic firehose. Also Kafka only works because of producer batching, single event writes max out at 25k events/sec.
+**Kafka** - Claims millions of writes/sec, but that number counts records inside batches. Per-operation throughput, one write, wait for the ack, maxes out at ~24k req/s on our hardware ([benchmark](docs/benchmark-results/kafka-benchmark.md)). No conditional writes, no per-aggregate ordering. Two services read the same aggregate, both write version 6, both succeed. Silent data corruption. This has been an [open issue since 2015](https://issues.apache.org/jira/browse/KAFKA-2260). There is no way to read events for a single aggregate either. You get the whole partition firehose and filter client-side. One slow event blocks every aggregate in that partition (head-of-line blocking). The standard fix is a Dead Letter Queue, but skipping an event breaks the causal chain. [Axon's docs](https://docs.axoniq.io/axon-framework-reference/4.11/events/event-processors/dead-letter-queue/) acknowledge you have to halt the entire aggregate stream, which defeats the purpose. Re-partitioning breaks ordering permanently, so you can't scale after the fact. Teams end up with a lot of code to handle the sharp edges.
 
-**Celeriant** - Per-aggregate ordering, optimistic concurrency control, exactly-once writes, and durable cluster replication. Scales to millions of aggregates with bounded memory regardless of cardinality.
+**Celeriant** - Per-aggregate ordering, optimistic concurrency control, exactly-once writes, and durable cluster replication. Scales to millions of aggregates with bounded memory regardless of cardinality. Cheap to run, predictable costs, no sharp edges or gotchas as you scale. A single Celeriant cluster writes up to 500k events/sec.
 
 ## What Celeriant Is
 
 A distributed, append-only log organised by aggregate:
 
 ```
-org_id / aggregate_type_id / aggregate_id → ordered event stream
+org_id / aggregate_type_id / aggregate_id -> ordered event stream
 ```
 
 Each aggregate is an independent, totally-ordered stream. Writes are acknowledged after durable disk write and quorum replication.
 
 **You get:**
+
 - Per-aggregate total ordering (no gaps, no reordering)
 - Optimistic concurrency control (expected batch index)
 - Dynamic consistency boundaries - conditionally, atomically write events to multiple aggregates
 - Exactly-once writes (client idempotency, duplicate writes rejected)
 - Infinite cardinality (millions of aggregates, no tuning, bounded memory)
 - Explicit offsets (you control your read position)
-- Event type filtering (bloom filter accelerated)
+- Event type filtering
 - Watch API (real-time change notifications)
 - Compression (zstd, snappy, brotli, gzip)
 - In-memory read cache (recent events served from memory)
@@ -39,9 +40,10 @@ Each aggregate is an independent, totally-ordered stream. Writes are acknowledge
 - Blake3 hash chain linking every event to its predecessor (tamper-evident audit log)
 
 **You don't get:**
+
 - SQL Queries
 - Tables with arbitary transaction semantics
-- key-value storage
+- Key-value storage
 - Consumer groups or automatic offset management
 
 It is not a state machine, a message streaming platform, or a queue. You have to build your read side yourself.
@@ -51,18 +53,18 @@ It is not a state machine, a message streaming platform, or a queue. You have to
 Per-operation throughput. No batching, no pipelining. Each write appends a single event,
 waits for the durable ack, then sends the next. This is the pattern real microservices use.
 
-- 2x i4i data nodes (NVMe, XFS, Direct I/O via io_uring)
-- 3-4x c7i.4xlarge client nodes (16 vCPU each)
-- mTLS with kTLS offload (TLS 1.3) on all connections
+- Two i4i data nodes (NVMe, XFS, Direct I/O via io_uring)
+- Three c7i.4xlarge client nodes (16 vCPU each)
+- mTLS for both client and cluster network traffic
 - Every write is `fdatasync()`'d to disk on both nodes before ack
 - AWS ap-southeast-2, single AZ
 
-| System | Peak req/s | P99 at peak | Nodes | TLS | Fsync | OCC |
-|---|---|---|---|---|---|---|
-| **Celeriant (64c)** | **535,292** | **210ms** | 2 | mTLS (kTLS) | Both nodes | Yes |
-| **Celeriant (32c)** | **389,759** | **217ms** | 2 | mTLS (kTLS) | Both nodes | Yes |
-| PostgreSQL/Marten | 42,721 | 46ms | 2 | mTLS (OpenSSL) | Both nodes | Yes |
-| Kafka | ~24,000 | ~1,342ms | 3 | TLS | None | No |
+| System              | Peak req/s  | P99 at peak | Nodes | TLS            | Fsync      | OCC |
+| ------------------- | ----------- | ----------- | ----- | -------------- | ---------- | --- |
+| **Celeriant (64c)** | **535,292** | **210ms**   | 2     | mTLS (kTLS)    | Both nodes | Yes |
+| **Celeriant (32c)** | **389,759** | **217ms**   | 2     | mTLS (kTLS)    | Both nodes | Yes |
+| PostgreSQL/Marten   | 42,721      | 46ms        | 2     | mTLS (OpenSSL) | Both nodes | Yes |
+| Kafka               | ~24,000     | ~1,342ms    | 3     | TLS            | None       | No  |
 
 Celeriant P99 stays under 110ms up to 24,000 concurrent connections on both configurations.
 PostgreSQL delivers excellent latency at low concurrency but collapses at 12,000 connections
@@ -95,7 +97,7 @@ If the follower is unreachable, the leader replicates to S3 instead. No write is
 
 ### Memory and Indexing Design
 
-Celeriant is designed for very high aggregate cardinality without memory growth proportional to aggregate count. One aggregate or ten million - the same memory footprint. You can model one stream per user, per device, per order, per game match, without worrying about whether your infrastructure will fall over.
+Celeriant is designed for very high aggregate cardinality without memory growth proportional to aggregate count. It does this with LRU bounded caches and bloom filters. One aggregate or ten million - the same memory footprint. You can model one stream per user, per device, per order, per game match, without worrying about whether your infrastructure will fall over.
 
 ## Quick Start
 
@@ -119,7 +121,7 @@ docker run -d --name celeriant \
   --standalone --data-root /var/lib/celeriant --num-shards 1
 ```
 
-`--standalone` runs a single node with no S3 or replication. For a full two-node cluster with Grafana, Prometheus, and MinIO, see [deploy/local-cluster](deploy/local-cluster/docker-compose.yml).
+`--standalone` runs a single node with no S3 or replication. For a full localhost two-node cluster with Grafana, Prometheus, and MinIO, see [deploy/local-cluster](deploy/local-cluster/docker-compose.yml).
 
 ### 2. Verify with the CLI
 
@@ -181,19 +183,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-For connection pooling, leader failover, TLS, and production patterns, see the [client guide](docs/guide.md).
+For connection pooling, leader failover, TLS, multi-aggregate writes, watch API and production patterns, see the [client guide](docs/guide.md).
 
-For multi-aggregate writes, watch API, and more, see the [client guide](docs/guide.md).
+**.NET** — A .NET client is available at [celeriant-dotnet-client](https://github.com/celeriant/celeriant-dotnet-client).
+
+### Next steps
+
+- **[Client Guide](docs/guide.md)** — connections, pooling, TLS, OCC, multi-aggregate writes, watch API, and production patterns
+- **[Demo App](celeriant_demo/README.md)** — browser-based banking demo showing basic read/write patterns, OCC conflicts, and live watch via SSE
+- **[Reference API](celeriant_reference/README.md)** — production-grade example with Postgres read projections, exactly-once writes, OCC retry loops, and HTTP idempotency
 
 ## Sharding
 
 Aggregates are assigned to shards by configurable routing:
 
-| Rule | Routes By |
-|------|-----------|
-| `OrgId` | `org_id % num_shards` |
+| Rule              | Routes By                        |
+| ----------------- | -------------------------------- |
+| `OrgId`           | `org_id % num_shards`            |
 | `AggregateTypeId` | `aggregate_type_id % num_shards` |
-| `AggregateId` | `aggregate_id % num_shards` |
+| `AggregateId`     | `aggregate_id % num_shards`      |
 
 Clients connect to any shard. Requests are redirected to the owning shard automatically.
 
@@ -204,6 +212,11 @@ Clients connect to any shard. Requests are redirected to the owning shard automa
 - You want server-managed consumer groups - use Kafka
 - You need to pipe large amounts of messages between unrelated systems - use Kafka
 
+## Position on Responsible LLM Use
+
+Celeriant is built by [Tyson Brown](https://www.linkedin.com/in/tyson-brown-208b88b6/). 20yrs XP in enterprise, high performance systems. Based in Australia.
+
+Celeriant is not built with agentic coding agents. It is overwhelmingly hand-crafted, a solo dev project which went through 7 iterations over 3 years. Claude Code is used to accelerate boilerplate output, explore ideas, prototype and review work, but it never writes large blocks of production code autonomously. LLM's don't perform well when working on complex, distributed systems with complex invariants.
 
 ## License
 
