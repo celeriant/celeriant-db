@@ -101,27 +101,52 @@ Celeriant is designed for very high aggregate cardinality without memory growth 
 
 ### 1. Start the server
 
-Celeriant uses io_uring internally, so the container needs `seccomp=unconfined`.
+**Linux (bare metal)** — Celeriant runs natively on any Linux system with io_uring support (kernel 5.11+):
 
 ```bash
+cargo build --release -p celeriant
+./target/release/celeriant --standalone --data-root /var/lib/celeriant --num-shards 1
+```
+
+**macOS / Windows** — Use Docker (the container provides the Linux kernel):
+
+```bash
+docker build -t celeriant:local .
 docker run -d --name celeriant \
   --security-opt seccomp=unconfined \
   -p 10000:10000 \
-  ghcr.io/celeriant/celeriant \
+  celeriant:local \
   --standalone --data-root /var/lib/celeriant --num-shards 1
 ```
 
-Works on Linux, macOS (Docker Desktop), and Windows (Docker Desktop / WSL2). `--standalone` runs a single node with no S3 or replication.
+`--standalone` runs a single node with no S3 or replication. For a full two-node cluster with Grafana, Prometheus, and MinIO, see [deploy/local-cluster](deploy/local-cluster/docker-compose.yml).
 
-For a full two-node cluster with Grafana, Prometheus, and MinIO, see [deploy/local-cluster](deploy/local-cluster/docker-compose.yml).
+### 2. Verify with the CLI
 
-### 2. Add the client
+The CLI and TUI run natively on all platforms:
+
+```bash
+cargo build --release -p celeriant_cli
+
+# Write an event
+./target/release/celeriant_cli write --org 1 --type 1 --id 1 \
+    --client-id 1 --event-type 1 \
+    --data '{"order_id": 42, "amount": 99.95}' --allow-create
+
+# Read it back
+./target/release/celeriant_cli read --org 1 --type 1 --id 1 --from 1
+
+# Interactive TUI
+./target/release/celeriant_cli
+```
+
+See [celeriant_cli](celeriant_cli/README.md) for the full CLI and TUI reference.
+
+### 3. Add the Rust client
 
 ```bash
 cargo add celeriant_client_tokio
 ```
-
-### 3. Write and read back
 
 ```rust
 use celeriant_client_tokio::{CeleriantClient, json_event, from_json};
