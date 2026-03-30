@@ -571,11 +571,22 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                 glommio::timer::sleep(ctx.config.heartbeat_interval_duration).await;
 
                 let unix_epoch_now_ms = validated_node_status::unix_epoch_now_ms();
+                let hb_start = std::time::Instant::now();
                 let result = ctx.shard_wal.replication_client.send_heartbeat(unix_epoch_now_ms).await;
+                let hb_elapsed_ms = hb_start.elapsed().as_millis() as u64;
 
                 if let Err(SendHeartbeatError::LockTimeout) = &result {
                     warn!("Heartbeat lock contention, skipping heartbeat");
                     continue;
+                }
+
+                if let Err(ref e) = result {
+                    warn!(shard_id = ctx.current_shard_id, elapsed_ms = hb_elapsed_ms, error = ?e, "Heartbeat send returned error");
+                }
+                if let Ok(ref r) = result {
+                    if !matches!(r, HeartbeatResult::Ack { .. }) {
+                        warn!(shard_id = ctx.current_shard_id, elapsed_ms = hb_elapsed_ms, result = ?r, "Heartbeat non-ack response");
+                    }
                 }
 
                 if let Ok(HeartbeatResult::Ack { .. }) = result {
@@ -630,6 +641,11 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
             }
 
             if ctx.shard_wal.node_status.get().is_follower() || ctx.shard_wal.node_status.get().is_fenced() {
+                let effective = ctx.shard_wal.node_status.get().effective_node_status();
+                let raw = ctx.shard_wal.node_status.get().raw();
+                if effective != raw {
+                    warn!(shard_id = ctx.current_shard_id, ?raw, ?effective, "Heartbeat TTL expired — auto-fenced");
+                }
 
                 // If we are a happy follower of just fenced, we can challenge the lease at the expiry time
                 let unix_epoch_now_ms = validated_node_status::unix_epoch_now_ms();

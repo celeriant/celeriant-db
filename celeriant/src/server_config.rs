@@ -366,6 +366,9 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 500, env = "CELERIANT_HEARTBEAT_INTERVAL_MS", help = "Interval between leader heartbeats to followers (500ms)")]
     pub heartbeat_interval_ms: u64,
 
+    #[arg(long, env = "CELERIANT_HEARTBEAT_TIMEOUT_MS", help = "Timeout for heartbeat connect+request. Defaults to heartbeat_interval_ms. Set lower than heartbeat_lease_duration_ms.")]
+    pub heartbeat_timeout_ms: Option<u64>,
+
     #[arg(long, default_value_t = 1500, env = "CELERIANT_HEARTBEAT_LEASE_DURATION_MS", help = "Duration before a missed heartbeat is considered a lease expiry (1500ms)")]
     pub heartbeat_lease_duration_ms: u64,
 
@@ -792,6 +795,7 @@ impl ServerConfig {
             s3_retry_max_duration: self.s3_retry_max_duration_secs.map(Duration::from_secs),
             cache_warmup_max_duration: self.cache_warmup_max_secs.map(Duration::from_secs),
             heartbeat_interval_duration: Duration::from_millis(self.heartbeat_interval_ms),
+            heartbeat_timeout: Duration::from_millis(self.heartbeat_timeout_ms.unwrap_or(self.heartbeat_interval_ms)),
             heartbeat_lease_duration: Duration::from_millis(self.heartbeat_lease_duration_ms),
         }
     }
@@ -944,6 +948,7 @@ impl Default for ServerConfig {
             server_compression_level: None,
             s3_catchup_max_rounds: 3,
             heartbeat_interval_ms: 500,
+            heartbeat_timeout_ms: None,
             heartbeat_lease_duration_ms: 1500,
             s3_lease_duration_ms: 30000,
             max_clock_drift_ms: 500,

@@ -14,7 +14,7 @@ use celeriant_msg::{
 };
 use celeriant_wal::{compression_type::CompressionType, s3::fallback_batch::{FallbackBatch, FallbackItem}};
 use glommio::sync::RwLock;
-use tracing::{debug};
+use tracing::debug;
 
 use crate::error::{replication_to_follower_error::ReplicateToFollowerError, replication_to_s3_error::ReplicateToS3Error, send_heartbeat_error::SendHeartbeatError};
 use crate::s3_uploader::S3Uploader;
@@ -123,6 +123,7 @@ pub struct FollowerConnection<S: S3Uploader> {
     heartbeat_conn: RwLock<ConnState>,
     connection_timeout: Option<Duration>,
     request_timeout: Option<Duration>,
+    heartbeat_timeout: Duration,
     max_request_size: u64,
     max_response_size: u64,
     replication_client_config: Option<Arc<rustls::ClientConfig>>,
@@ -134,6 +135,7 @@ impl<S: S3Uploader> FollowerConnection<S> {
         follower_address: Option<String>,
         connection_timeout: Option<Duration>,
         request_timeout: Option<Duration>,
+        heartbeat_timeout: Duration,
         max_request_size: u64,
         max_response_size: u64,
         shard_id: u64,
@@ -150,6 +152,7 @@ impl<S: S3Uploader> FollowerConnection<S> {
             heartbeat_conn: RwLock::new(ConnState::new()),
             connection_timeout,
             request_timeout,
+            heartbeat_timeout,
             max_request_size,
             max_response_size,
             replication_client_config,
@@ -252,8 +255,12 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
             .map_err(|_| SendHeartbeatError::LockTimeout)?;
 
         let address = self.follower_address.borrow().clone();
+        let hb_timeout = Some(self.heartbeat_timeout);
 
-        guard.ensure_connected(&address, false, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref()).await?;
+        // Always reset: forces a fresh TCP connection on each heartbeat attempt.
+        // This avoids stale connections hanging for the full internode_request_timeout
+        // (10s) when the peer is unreachable, which would prevent timely self-fencing.
+        guard.ensure_connected(&address, true, hb_timeout, hb_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref()).await?;
 
         let request = ClusterRequest::Heartbeat(HeartbeatRequest {
             correlation_id: None,
@@ -261,20 +268,7 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
             leader_timestamp_ms: unix_epoch_now_ms,
         });
 
-        let response = match guard.client.as_mut().unwrap().send_cluster_request(&request, CompressionType::None).await {
-            Ok(r) => r,
-            Err(e) => {
-                debug!(shard_id = self.shard_id, error = ?e, "heartbeat send failed, reconnecting");
-                match guard.ensure_connected(&address, true, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref()).await {
-                    Ok(()) => debug!(shard_id = self.shard_id, "heartbeat reconnected, retrying"),
-                    Err(reconnect_err) => {
-                        debug!(shard_id = self.shard_id, error = ?reconnect_err, "heartbeat reconnect failed");
-                        return Err(SendHeartbeatError::from(reconnect_err));
-                    }
-                }
-                guard.client.as_mut().unwrap().send_cluster_request(&request, CompressionType::None).await?
-            }
-        };
+        let response = guard.client.as_mut().unwrap().send_cluster_request(&request, CompressionType::None).await?;
 
         match response {
             ClusterResponse::Heartbeat(resp) => Ok(resp.result),
@@ -400,6 +394,7 @@ mod tests {
                 Some("127.0.0.1:8080".to_string()),
                 None,
                 None,
+                Duration::from_millis(500),
                 1024,
                 1024,
                 7,
@@ -422,6 +417,7 @@ mod tests {
                 Some("127.0.0.1:8080".to_string()),
                 None,
                 None,
+                Duration::from_millis(500),
                 1024,
                 1024,
                 7,
@@ -450,6 +446,7 @@ mod tests {
                 Some("127.0.0.1:8080".to_string()),
                 None,
                 None,
+                Duration::from_millis(500),
                 1024,
                 1024,
                 7,
@@ -498,6 +495,7 @@ mod tests {
                 Some("127.0.0.1:8080".to_string()),
                 None,
                 None,
+                Duration::from_millis(500),
                 1024,
                 1024,
                 5,
@@ -556,6 +554,7 @@ mod tests {
                 Some("127.0.0.1:8080".to_string()),
                 None,
                 None,
+                Duration::from_millis(500),
                 1024,
                 1024,
                 7,

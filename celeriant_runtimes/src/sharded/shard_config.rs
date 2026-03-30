@@ -57,6 +57,7 @@ pub struct ShardConfig {
     pub replication_config: Option<S3LeaseConfig>,
     pub heartbeat_lease_duration: Duration,
     pub heartbeat_interval_duration: Duration,
+    pub heartbeat_timeout: Duration,
     pub advertised_replication_address: Option<String>,
     pub data_root: PathBuf,
     pub listen_address: String,

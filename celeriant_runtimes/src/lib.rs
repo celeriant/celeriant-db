@@ -124,6 +124,7 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                     None,
                     shard_config.internode_connection_timeout,
                     Some(shard_config.internode_request_timeout),
+                    shard_config.heartbeat_timeout,
                     shard_config.max_request_size,
                     shard_config.max_response_size,
                     current_shard_id as u64,
