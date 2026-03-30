@@ -34,8 +34,8 @@ openssl ecparam -genkey -name prime256v1 -out intracluster-ca.key 2>/dev/null
 openssl req -new -x509 -key intracluster-ca.key -out intracluster-ca.crt -days 365 \
     -subj "/CN=celeriant-intracluster-ca" 2>/dev/null
 
-# SANs covering both data node hostnames
-ALL_SANS="DNS:${LEADER_HOST},DNS:${FOLLOWER_HOST},DNS:localhost,IP:127.0.0.1"
+# SANs covering both data nodes — use IP: prefix for IP addresses, DNS: for hostnames
+ALL_SANS="IP:${LEADER_HOST},IP:${FOLLOWER_HOST},DNS:localhost,IP:127.0.0.1"
 
 # --- Node cert (intracluster CA) ---
 cat > node.cnf <<EOF

@@ -5,11 +5,11 @@
 //! NOT start any servers — it connects to an already-running cluster.
 //!
 //! Environment variables:
-//!   CLUSTER_ADDRESS     — leader address (default: cs1:10000)
+//!   CLUSTER_ADDRESS     — leader address (default: 10.0.0.50:10000)
 //!   CLUSTER_CA_CERT     — CA cert for server verification (default: deploy/rpi-cluster/certs/client-ca.crt)
 //!   CLUSTER_CLIENT_CERT — client cert for mTLS (default: deploy/rpi-cluster/certs/client.crt)
 //!   CLUSTER_CLIENT_KEY  — client key for mTLS (default: deploy/rpi-cluster/certs/client.key)
-//!   CLUSTER_SERVER_NAME — TLS SNI server name (default: cs1)
+//!   CLUSTER_SERVER_NAME — TLS SNI server name (default: 10.0.0.50)
 //!   CLUSTER_THROUGHPUT_CONNECTIONS — throughput test connections (default: 850)
 //!   CLUSTER_LATENCY_CONNECTIONS   — latency test connections (default: 125)
 //!   CLUSTER_DURATION              — test duration in seconds (default: 15)
@@ -72,9 +72,9 @@ struct TaskStats {
 }
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let address = env_or("CLUSTER_ADDRESS", "cs1:10000");
+    let address = env_or("CLUSTER_ADDRESS", "10.0.0.50:10000");
     let plaintext = std::env::var("CLUSTER_PLAINTEXT").is_ok();
-    let server_name = env_or("CLUSTER_SERVER_NAME", "cs1");
+    let server_name = env_or("CLUSTER_SERVER_NAME", "10.0.0.50");
     let throughput_conns: usize = env_or("CLUSTER_THROUGHPUT_CONNECTIONS", "8000").parse()?;
     let latency_conns: usize = env_or("CLUSTER_LATENCY_CONNECTIONS", "125").parse()?;
     let duration_secs: u64 = env_or("CLUSTER_DURATION", "15").parse()?;
