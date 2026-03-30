@@ -3247,7 +3247,7 @@ mod tests {
 
         fn set_follower_address(&self, _address: Option<String>) {}
 
-        async fn send_heartbeat(&self, unix_epoch_now_ms: u64) -> Result<celeriant_msg::response::responses::HeartbeatResult, crate::error::send_heartbeat_error::SendHeartbeatError> {
+        async fn send_heartbeat(&self, unix_epoch_now_ms: u64, _lease_index: u64) -> Result<celeriant_msg::response::responses::HeartbeatResult, crate::error::send_heartbeat_error::SendHeartbeatError> {
             glommio::timer::sleep(std::time::Duration::from_millis(10)).await;
             Ok(celeriant_msg::response::responses::HeartbeatResult::Ack { follower_timestamp_ms: unix_epoch_now_ms + 10 })
         }

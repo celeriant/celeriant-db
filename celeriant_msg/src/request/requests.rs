@@ -149,6 +149,7 @@ pub struct HeartbeatRequest {
     pub correlation_id: Option<u128>,
     pub shard_id: u64,
     pub leader_timestamp_ms: u64,
+    pub lease_index: u64,
 }
 
 

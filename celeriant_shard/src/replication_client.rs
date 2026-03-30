@@ -24,7 +24,7 @@ pub trait ReplicationClient {
     fn set_follower_address(&self, address: Option<String>);
     async fn replicate_to_follower(&self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError>;
     async fn replicate_to_s3(&self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToS3Error>;
-    async fn send_heartbeat(&self, unix_epoch_now_ms: u64) -> Result<HeartbeatResult, SendHeartbeatError>;
+    async fn send_heartbeat(&self, unix_epoch_now_ms: u64, lease_index: u64) -> Result<HeartbeatResult, SendHeartbeatError>;
     async fn send_kick(&self) -> Result<bool, SendHeartbeatError>;
 }
 
@@ -43,7 +43,7 @@ impl ReplicationClient for StubReplicationClient {
         Ok(())
     }
 
-    async fn send_heartbeat(&self, unix_epoch_now_ms: u64) -> Result<HeartbeatResult, SendHeartbeatError> {
+    async fn send_heartbeat(&self, unix_epoch_now_ms: u64, _lease_index: u64) -> Result<HeartbeatResult, SendHeartbeatError> {
         glommio::timer::sleep(std::time::Duration::from_millis(100)).await;
         Ok(HeartbeatResult::Ack { follower_timestamp_ms: unix_epoch_now_ms + 100 })
     }
@@ -250,7 +250,7 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
         s3_uploader.upload(path, Bytes::from(serialized)).await
     }
 
-    async fn send_heartbeat(&self, unix_epoch_now_ms: u64) -> Result<HeartbeatResult, SendHeartbeatError> {
+    async fn send_heartbeat(&self, unix_epoch_now_ms: u64, lease_index: u64) -> Result<HeartbeatResult, SendHeartbeatError> {
         let mut guard = write_with_timeout(&self.heartbeat_conn, "send_heartbeat").await
             .map_err(|_| SendHeartbeatError::LockTimeout)?;
 
@@ -266,6 +266,7 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
             correlation_id: None,
             shard_id: self.shard_id,
             leader_timestamp_ms: unix_epoch_now_ms,
+            lease_index,
         });
 
         let response = guard.client.as_mut().unwrap().send_cluster_request(&request, CompressionType::None).await?;

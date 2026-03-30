@@ -571,8 +571,9 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                 glommio::timer::sleep(ctx.config.heartbeat_interval_duration).await;
 
                 let unix_epoch_now_ms = validated_node_status::unix_epoch_now_ms();
+                let lease_index = ctx.shard_wal.node_status.get().raw().lease_index().unwrap_or(0);
                 let hb_start = std::time::Instant::now();
-                let result = ctx.shard_wal.replication_client.send_heartbeat(unix_epoch_now_ms).await;
+                let result = ctx.shard_wal.replication_client.send_heartbeat(unix_epoch_now_ms, lease_index).await;
                 let hb_elapsed_ms = hb_start.elapsed().as_millis() as u64;
 
                 if let Err(SendHeartbeatError::LockTimeout) = &result {

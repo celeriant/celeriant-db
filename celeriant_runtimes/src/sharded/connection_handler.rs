@@ -1138,12 +1138,42 @@ async fn handle_heartbeat<R: ReplicationClient + 'static, D: S3Downloader + 'sta
 ) -> ClusterResponse {
     let follower_ms = validated_node_status::unix_epoch_now_ms();
 
-    if !ctx.shard_wal.node_status.get().is_any_follower_state() {
+    let current_status = ctx.shard_wal.node_status.get();
+    let local_lease_index = current_status.raw().lease_index().unwrap_or(0);
+
+    // Determine whether to accept the heartbeat and which raw_status to use.
+    let raw_status = if current_status.is_any_follower_state() {
+        // Normal path: already a follower, accept heartbeat.
+        current_status.raw()
+    } else if current_status.is_fenced() {
+        // Fenced node (e.g. old leader whose TTL expired): adopt follower role
+        // with the remote leader's lease_index.
+        tracing::warn!(
+            shard_id = req.shard_id,
+            local_lease_index,
+            remote_lease_index = req.lease_index,
+            "Fenced node accepting heartbeat from leader, transitioning to follower"
+        );
+        NodeStatus::Follower { leader_lease_index: req.lease_index }
+    } else if current_status.is_leader() && req.lease_index > local_lease_index {
+        // This node thinks it's leader, but the heartbeat sender won a more
+        // recent S3 election. Step down immediately instead of waiting for
+        // the slow S3 discovery path.
+        tracing::warn!(
+            shard_id = req.shard_id,
+            local_lease_index,
+            remote_lease_index = req.lease_index,
+            "Received heartbeat from leader with higher lease_index, stepping down"
+        );
+        NodeStatus::Follower { leader_lease_index: req.lease_index }
+    } else {
+        // Stale heartbeat (lower/equal lease_index from old leader), or
+        // BootCatchup/Standalone — reject.
         return ClusterResponse::Heartbeat(HeartbeatResponse {
             correlation_id: req.correlation_id,
             result: HeartbeatResult::Rejected(HeartbeatRejection::NotAFollower),
         });
-    }
+    };
 
     // Clock drift too high — nodes' clocks are dangerously skewed. Fence all local
     // shards immediately rather than waiting for TTL expiry, because we can't trust
@@ -1182,8 +1212,8 @@ async fn handle_heartbeat<R: ReplicationClient + 'static, D: S3Downloader + 'sta
     };
     
     let refreshed = ValidatedNodeStatus::create_custom_status(
-        ctx.shard_wal.node_status.get().raw(), 
-        ctx.config.max_clock_drift_ms, 
+        raw_status,
+        ctx.config.max_clock_drift_ms,
         new_lease_expiry_ms);
     ctx.shard_wal.node_status.set(refreshed);
     broadcast_status(ctx, refreshed).await;
@@ -1469,6 +1499,7 @@ mod tests {
             correlation_id: None,
             shard_id: 0,
             leader_timestamp_ms: 1000,
+            lease_index: 1,
         });
         let shard = determine_cluster_shard(&request, &config).unwrap();
         assert_eq!(shard, 0, "Heartbeat must always route to shard 0");
