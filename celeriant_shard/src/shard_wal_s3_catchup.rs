@@ -133,12 +133,17 @@ async fn catchup_round<D: S3Downloader>(
     for batch in batches {
         match deduped.last_mut() {
             Some(prev) if prev.start_wal_index == batch.start_wal_index => {
+                // Same-start duplicate: keep whichever covers more entries.
                 if batch.end_wal_index > prev.end_wal_index {
                     orphan_paths.push(std::mem::replace(&mut prev.path, batch.path));
                     prev.end_wal_index = batch.end_wal_index;
                 } else {
                     orphan_paths.push(batch.path);
                 }
+            }
+            Some(prev) if batch.end_wal_index <= prev.end_wal_index => {
+                // Fully contained within previous batch
+                orphan_paths.push(batch.path);
             }
             _ => deduped.push(batch),
         }
@@ -158,7 +163,7 @@ async fn catchup_round<D: S3Downloader>(
     for window in batches.windows(2) {
         let expected = window[0].end_wal_index + 1;
         let got = window[1].start_wal_index;
-        if expected != got {
+        if got > expected {
             return Err(S3CatchupError::WalIndexGap { expected, got });
         }
     }
@@ -1562,6 +1567,80 @@ mod tests {
             // Self-uploaded batches must NOT be deleted — the other node may need them
             assert!(dl.deleted_paths().is_empty(), "Self-uploaded batches must not be deleted from S3");
             assert_eq!(dl.objects.borrow().len(), 2, "Both S3 objects must remain");
+
+            tc.close().await;
+        });
+    }
+
+    #[test]
+    fn dedup_discards_batch_fully_contained_in_previous() {
+        // Leadership flap: batch from old term is fully contained within a batch
+        // from a later term (different starts). Must not cause WalIndexGap.
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+            let dl = Rc::new(MockDownloader::new());
+
+            // Large batch from one leadership term: 1-20
+            let (path_wide, data_wide) = make_fallback_batch(0, 1, 20, GENESIS_HASH);
+            // Smaller stale batch from old term: 5-10, fully inside 1-20
+            let (path_stale, data_stale) = make_fallback_batch_with_node(0, 5, 10, GENESIS_HASH, 1);
+            let stale_path = path_stale.clone();
+            dl.insert(path_wide, data_wide);
+            dl.insert(path_stale, data_stale);
+
+            let result = tc.catchup(&dl, 0, 10).await.unwrap();
+            assert_eq!(tc.wal_index(), 20);
+            assert_eq!(result.batches_applied, 1);
+            assert!(dl.deleted_paths().contains(&stale_path));
+
+            tc.close().await;
+        });
+    }
+
+    #[test]
+    fn partial_overlap_does_not_trigger_wal_index_gap() {
+        // Two batches from different leadership terms that partially overlap.
+        // The contiguity check must allow overlaps (got < expected), only forward
+        // gaps are fatal. The apply path handles divergence via TipHashMismatch.
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+            let dl = Rc::new(MockDownloader::new());
+
+            // Batch 1-10 from node 0
+            let (path_a, data_a) = make_fallback_batch(0, 1, 10, GENESIS_HASH);
+            // Batch 5-15 from node 1 (partial overlap: indices 5-10)
+            let (path_b, data_b) = make_fallback_batch_with_node(0, 5, 15, GENESIS_HASH, 1);
+            dl.insert(path_a, data_a);
+            dl.insert(path_b, data_b);
+
+            let result = tc.catchup(&dl, 0, 10).await;
+            // Must NOT be WalIndexGap. overlaps are allowed
+            assert!(!matches!(result, Err(S3CatchupError::WalIndexGap { .. })),
+                "Overlapping batches must not trigger WalIndexGap, got: {:?}", result);
+
+            tc.close().await;
+        });
+    }
+
+    #[test]
+    fn forward_gap_between_batches_still_fatal() {
+        // Genuine forward gap (missing entries between batches) must still error.
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+            let dl = Rc::new(MockDownloader::new());
+
+            // Batch 1-5
+            let (path_a, data_a) = make_fallback_batch(0, 1, 5, GENESIS_HASH);
+            // Batch 10-15: gap at 6-9
+            let (path_b, data_b) = make_fallback_batch_with_node(0, 10, 15, GENESIS_HASH, 1);
+            dl.insert(path_a, data_a);
+            dl.insert(path_b, data_b);
+
+            let result = tc.catchup(&dl, 0, 10).await;
+            assert!(matches!(result, Err(S3CatchupError::WalIndexGap { expected: 6, got: 10 })));
 
             tc.close().await;
         });
