@@ -41,8 +41,19 @@ struct FallbackBatchRef {
     node_id: u128,
 }
 
-fn remove_self_uploaded(batches: Vec<FallbackBatchRef>, node_id: u128) -> Vec<FallbackBatchRef> {
-    batches.into_iter().filter(|b| b.node_id != node_id).collect()
+/// Keep only batches uploaded by the peer node. Filters out self-uploaded
+/// batches (leader must not consume its own fallback) AND batches from
+/// unknown node_ids (stale data from a previous cluster generation).
+fn retain_peer_batches(batches: Vec<FallbackBatchRef>, self_node_id: u128, peer_node_id: Option<u128>) -> Vec<FallbackBatchRef> {
+    batches.into_iter().filter(|b| {
+        if b.node_id == self_node_id {
+            return false;
+        }
+        match peer_node_id {
+            Some(peer) => b.node_id == peer,
+            None => true, // no peer known yet — accept all non-self batches
+        }
+    }).collect()
 }
 
 pub(crate) async fn catchup_from_s3<D: S3Downloader>(
@@ -53,6 +64,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader>(
     downloader: &Rc<D>,
     shard_id: u32,
     node_id: u128,
+    peer_node_id: Option<u128>,
     max_rounds: u32,
 ) -> Result<S3CatchupResult, S3CatchupError> {
     let prefix = fallback_shard_prefix(shard_id);
@@ -68,7 +80,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader>(
 
         let round = catchup_round(
             log_segments_cache, shard_mem_cache, fsync_coordinator,
-            watched_aggregates, downloader, &prefix, shard_id, node_id,
+            watched_aggregates, downloader, &prefix, shard_id, node_id, peer_node_id,
         ).await?;
 
         // After truncation, continue loop to re-apply from S3
@@ -107,6 +119,7 @@ async fn catchup_round<D: S3Downloader>(
     prefix: &str,
     shard_id: u32,
     node_id: u128,
+    peer_node_id: Option<u128>,
 ) -> Result<RoundApplied, S3CatchupError> {
     let objects = downloader.list_objects(prefix).await?;
 
@@ -124,7 +137,7 @@ async fn catchup_round<D: S3Downloader>(
         .filter(|b| b.end_wal_index > current_wal_index)
         .collect();
 
-    let mut batches = remove_self_uploaded(batches, node_id);
+    let mut batches = retain_peer_batches(batches, node_id, peer_node_id);
 
     batches.sort_by_key(|b| b.start_wal_index);
 
@@ -219,7 +232,7 @@ async fn catchup_round<D: S3Downloader>(
                     match find_divergence_from_batch(log_segments_cache, &all_items).await {
                         Ok(result) => result,
                         Err(_) => find_divergence_via_s3(
-                            log_segments_cache, downloader, prefix, current_wal_index, node_id,
+                            log_segments_cache, downloader, prefix, current_wal_index, node_id, peer_node_id,
                         ).await?,
                     };
 
@@ -383,6 +396,7 @@ async fn find_divergence_via_s3<D: S3Downloader>(
     prefix: &str,
     current_wal_index: u64,
     node_id: u128,
+    peer_node_id: Option<u128>,
 ) -> Result<([u8; 32], u64, u64), S3CatchupError> {
     let objects = downloader.list_objects(prefix).await?;
 
@@ -395,7 +409,7 @@ async fn find_divergence_via_s3<D: S3Downloader>(
         .filter(|b| b.start_wal_index <= current_wal_index)
         .collect();
 
-    let mut earlier_batches = remove_self_uploaded(earlier_batches, node_id);
+    let mut earlier_batches = retain_peer_batches(earlier_batches, node_id, peer_node_id);
 
     earlier_batches.sort_by(|a, b| b.start_wal_index.cmp(&a.start_wal_index));
 
@@ -724,10 +738,14 @@ mod tests {
         }
 
         async fn catchup(&self, downloader: &Rc<MockDownloader>, shard_id: u32, max_rounds: u32) -> Result<S3CatchupResult, S3CatchupError> {
+            self.catchup_with_peer(downloader, shard_id, max_rounds, None).await
+        }
+
+        async fn catchup_with_peer(&self, downloader: &Rc<MockDownloader>, shard_id: u32, max_rounds: u32, peer_node_id: Option<u128>) -> Result<S3CatchupResult, S3CatchupError> {
             catchup_from_s3(
                 &self.log_segments_cache, &self.shard_mem_cache, &self.fsync_coordinator,
                 &self.watched_aggregates,
-                downloader, shard_id, 99, max_rounds,
+                downloader, shard_id, 99, peer_node_id, max_rounds,
             ).await
         }
 
@@ -1641,6 +1659,59 @@ mod tests {
 
             let result = tc.catchup(&dl, 0, 10).await;
             assert!(matches!(result, Err(S3CatchupError::WalIndexGap { expected: 6, got: 10 })));
+
+            tc.close().await;
+        });
+    }
+
+    #[test]
+    fn unknown_node_batches_ignored_when_peer_known() {
+        // Stale S3 batches from a previous cluster generation (different node_ids)
+        // must be ignored when the current peer is known. This prevents
+        // WalIndexGap errors from leftover data after a partial teardown.
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+            let dl = Rc::new(MockDownloader::new());
+
+            let peer_id: u128 = 42;
+            let stale_id: u128 = 777; // old node, not current peer
+
+            // Batch 1-5 from current peer — should be applied
+            let (path_peer, data_peer) = make_fallback_batch_with_node(0, 1, 5, GENESIS_HASH, peer_id);
+            dl.insert(path_peer, data_peer);
+
+            // Batch 10-15 from stale node — would cause WalIndexGap if not filtered
+            let (path_stale, data_stale) = make_fallback_batch_with_node(0, 10, 15, GENESIS_HASH, stale_id);
+            let stale_path = path_stale.clone();
+            dl.insert(path_stale, data_stale);
+
+            let result = tc.catchup_with_peer(&dl, 0, 10, Some(peer_id)).await.unwrap();
+            assert_eq!(tc.wal_index(), 5);
+            assert_eq!(result.batches_applied, 1);
+
+            // Stale batch must not be deleted (not our responsibility)
+            assert!(!dl.deleted_paths().contains(&stale_path));
+
+            tc.close().await;
+        });
+    }
+
+    #[test]
+    fn unknown_node_batches_accepted_when_no_peer_known() {
+        // When no peer is known yet (boot before first election), accept
+        // all non-self batches as before.
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+            let dl = Rc::new(MockDownloader::new());
+
+            let (path, data) = make_fallback_batch_with_node(0, 1, 5, GENESIS_HASH, 777);
+            dl.insert(path, data);
+
+            let result = tc.catchup_with_peer(&dl, 0, 10, None).await.unwrap();
+            assert_eq!(tc.wal_index(), 5);
+            assert_eq!(result.batches_applied, 1);
 
             tc.close().await;
         });

@@ -143,6 +143,10 @@ pub struct ShardWal<R: ReplicationClient + 'static, D: S3Downloader + 'static> {
     /// Included in write-rejection errors so clients can redirect.
     pub leader_client_address: RefCell<Option<String>>,
 
+    /// Peer's node_id from S3 membership. Used during S3 catchup to ignore
+    /// stale fallback batches from previous cluster generations.
+    pub peer_node_id: Cell<Option<u128>>,
+
     /// Cached metrics label to avoid per-request String allocation
     metrics_shard_label: [(&'static str, String); 1],
 }
@@ -301,6 +305,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             cache_load_semaphore,
             replication_client: Rc::new(replication_client),
             leader_client_address: RefCell::new(None),
+            peer_node_id: Cell::new(None),
             metrics_shard_label,
         })
     }
@@ -2245,6 +2250,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             &self.s3_downloader,
             self.config.shard_id,
             self.config.node_id,
+            self.peer_node_id.get(),
             self.config.s3_download_max_rounds).await
 
     }

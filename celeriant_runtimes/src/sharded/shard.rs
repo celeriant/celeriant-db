@@ -483,6 +483,16 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
     metrics::counter!("celeriant_leader_elections_total").increment(1);
     metrics::gauge!("celeriant_node_role").set(if outcome.status.raw().is_leader() { 1.0 } else { 0.0 });
 
+    // Set peer_node_id early so S3 catchup can filter stale batches from old cluster generations.
+    // Full UpdateFollower broadcast (with replication address) happens after catchup.
+    let peer_node_id = outcome.peer_info.as_ref().map(|p| p.node_id);
+    ctx.shard_wal.peer_node_id.set(peer_node_id);
+    broadcast_message_to_other_shards(
+        ctx.current_shard_id,
+        IntrashardMessages::UpdatePeerNodeId { peer_node_id },
+        ctx.intrashard_sender.clone()
+    ).await;
+
     // We took over the leadership. Catch up from S3 as a sanity check
     // Unlikely to have previous leader race condition here, but possible
     if !is_currently_leader && outcome.status.is_leader() {
@@ -510,10 +520,12 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
         ctx.intrashard_sender.clone(),
     ).await;
     
+    let peer_node_id = outcome.peer_info.as_ref().map(|p| p.node_id);
     ctx.shard_wal.replication_client.set_follower_address(follower_replication_address.clone());
+    ctx.shard_wal.peer_node_id.set(peer_node_id);
     broadcast_message_to_other_shards(
-        ctx.current_shard_id, 
-        IntrashardMessages::UpdateFollower { replication_address: follower_replication_address }, 
+        ctx.current_shard_id,
+        IntrashardMessages::UpdateFollower { replication_address: follower_replication_address, peer_node_id },
         ctx.intrashard_sender.clone()
     ).await;
 
@@ -765,8 +777,12 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
             }
             ctx.shard_wal.node_status.set(status);
         }
-        IntrashardMessages::UpdateFollower { replication_address } => {
+        IntrashardMessages::UpdatePeerNodeId { peer_node_id } => {
+            ctx.shard_wal.peer_node_id.set(peer_node_id);
+        }
+        IntrashardMessages::UpdateFollower { replication_address, peer_node_id } => {
             ctx.shard_wal.replication_client.set_follower_address(replication_address);
+            ctx.shard_wal.peer_node_id.set(peer_node_id);
         }
         IntrashardMessages::UpdateLeaderClientAddress { client_address } => {
             *ctx.shard_wal.leader_client_address.borrow_mut() = client_address;

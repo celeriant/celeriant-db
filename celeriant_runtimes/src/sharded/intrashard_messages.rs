@@ -24,7 +24,8 @@ pub enum IntrashardMessages {
         result: Result<S3CatchupResult, S3CatchupError>
     },
     StatusUpdate { status: ValidatedNodeStatus },
-    UpdateFollower { replication_address: Option<String> },
+    UpdatePeerNodeId { peer_node_id: Option<u128> },
+    UpdateFollower { replication_address: Option<String>, peer_node_id: Option<u128> },
     UpdateLeaderClientAddress { client_address: Option<String> },
     SchemaRegistration {
         request: RegisterSchemaRequest,
