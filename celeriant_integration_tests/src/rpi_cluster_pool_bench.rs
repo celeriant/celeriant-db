@@ -4,12 +4,12 @@
 //! using `CeleriantPool` for automatic leader failover and connection management.
 //!
 //! Environment variables:
-//!   CLUSTER_ADDRESS_1   — primary node (default: cs1:10000)
-//!   CLUSTER_ADDRESS_2   — seed node (default: cs2:10000)
+//!   CLUSTER_ADDRESS_1   — primary node (default: 10.0.0.50:10000)
+//!   CLUSTER_ADDRESS_2   — seed node (default: 10.0.0.51:10000)
 //!   CLUSTER_CA_CERT     — CA cert for server verification (default: deploy/rpi-cluster/certs/client-ca.crt)
 //!   CLUSTER_CLIENT_CERT — client cert for mTLS (default: deploy/rpi-cluster/certs/client.crt)
 //!   CLUSTER_CLIENT_KEY  — client key for mTLS (default: deploy/rpi-cluster/certs/client.key)
-//!   CLUSTER_SERVER_NAME — TLS SNI server name (default: cs)
+//!   CLUSTER_SERVER_NAME — TLS SNI server name (default: 10.0.0.50)
 //!   CLUSTER_CONNECTIONS — pool max connections per node (default: 500)
 //!   CLUSTER_TASKS       — concurrent writer tasks (default: 2000)
 //!   CLUSTER_DURATION    — test duration in seconds (default: 15)
@@ -62,10 +62,10 @@ fn build_tls_config(
 }
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let addr1 = env_or("CLUSTER_ADDRESS_1", "cs1:10000");
-    let addr2 = env_or("CLUSTER_ADDRESS_2", "cs2:10000");
+    let addr1 = env_or("CLUSTER_ADDRESS_1", "10.0.0.50:10000");
+    let addr2 = env_or("CLUSTER_ADDRESS_2", "10.0.0.51:10000");
     let plaintext = std::env::var("CLUSTER_PLAINTEXT").is_ok();
-    let server_name = env_or("CLUSTER_SERVER_NAME", "cs1");
+    let server_name = env_or("CLUSTER_SERVER_NAME", "10.0.0.50");
     let num_tasks: usize = env_or("CLUSTER_TASKS", "8000").parse()?;
     let max_conns: usize = env_or("CLUSTER_CONNECTIONS", &num_tasks.to_string()).parse()?;
     let duration_secs: u64 = env_or("CLUSTER_DURATION", "15").parse()?;
@@ -87,7 +87,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .with_seed_addresses(vec![resolved2])
         .with_max_connections(max_conns)
         .with_connection_timeout(Duration::from_secs(30))
-        .with_request_timeout(Duration::from_secs(30));
+        .with_request_timeout(Duration::from_secs(5));
 
     if !plaintext {
         let ca = env_or("CLUSTER_CA_CERT", "deploy/rpi-cluster/certs/client-ca.crt");

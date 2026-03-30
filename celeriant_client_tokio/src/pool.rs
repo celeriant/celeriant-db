@@ -27,6 +27,8 @@ macro_rules! leader_route {
             }
             Err(ClientError::NotLeader { leader_address: None, .. }) => {}
             Err(ClientError::ConnectionFailed(_)) => {}
+            Err(ClientError::ConnectionTimeout) => {}
+            Err(ClientError::RequestTimeout) => {}
             Err(ClientError::ServerBusy) => {}
             Err(e) => return Err(e),
         }
@@ -42,7 +44,10 @@ macro_rules! leader_route {
             }
             retries += 1;
             match $try_addr!(addr.as_str()) {
-                Ok(result) => return Ok(result),
+                Ok(result) => {
+                    pool.update_leader(addr.clone());
+                    return Ok(result);
+                }
                 Err(ClientError::NotLeader { leader_address: Some(ref new_addr), .. }) => {
                     let new_addr = new_addr.clone();
                     pool.update_leader(new_addr.clone());
@@ -50,6 +55,8 @@ macro_rules! leader_route {
                 }
                 Err(ClientError::NotLeader { leader_address: None, .. }) => continue,
                 Err(ClientError::ConnectionFailed(_)) => continue,
+                Err(ClientError::ConnectionTimeout) => continue,
+                Err(ClientError::RequestTimeout) => continue,
                 Err(ClientError::ServerBusy) => continue,
                 Err(e) => return Err(e),
             }
@@ -90,6 +97,14 @@ macro_rules! read_route {
                     match $body.await {
                         Ok(resp) => return Ok(resp),
                         Err(ClientError::ConnectionFailed(_)) => {
+                            conn.mark_broken();
+                            continue;
+                        }
+                        Err(ClientError::ConnectionTimeout) => {
+                            conn.mark_broken();
+                            continue;
+                        }
+                        Err(ClientError::RequestTimeout) => {
                             conn.mark_broken();
                             continue;
                         }
