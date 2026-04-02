@@ -1,11 +1,11 @@
 # RPi kTLS Cluster
 
-A 3-node Raspberry Pi cluster for testing Celeriant with kernel TLS (kTLS) on real hardware. Two RPi 5s run Celeriant (leader + follower) with NVMe storage; a third Pi runs the infrastructure stack (MinIO, Prometheus, Loki, Grafana).
+Two RPi 5s run Celeriant (leader + follower) with NVMe storage. The build machine (Ubuntu PC) doubles as the infrastructure node, running MinIO, Prometheus, Loki, and Grafana via Docker.
 
 ```
 ┌──────────────────┐   ┌──────────────────┐   ┌──────────────────┐
-│  RPi 5 (cs1)     │   │  RPi 5 (cs2)     │   │  RPi 4 (infra)   │
-│  10.0.0.50       │   │  10.0.0.51       │   │  10.0.0.52       │
+│  RPi 5 (cs1)     │   │  RPi 5 (cs2)     │   │  PC (infra)      │
+│  10.0.0.50       │   │  10.0.0.51       │   │  10.0.0.1        │
 │  Celeriant       │◄─►│  Celeriant       │   │  MinIO           │
 │  Leader          │   │  Follower        │   │  Prometheus      │
 │  NVMe + XFS      │   │  NVMe + XFS      │   │  Loki + Grafana  │
@@ -25,14 +25,13 @@ A 3-node Raspberry Pi cluster for testing Celeriant with kernel TLS (kTLS) on re
 | Qty | Item | Purpose |
 |-----|------|---------|
 | 2 | Raspberry Pi 5 (4 GB+ RAM) | Data nodes (Celeriant leader/follower) |
-| 1 | Raspberry Pi 4 or 5 (any RAM) | Infrastructure node (MinIO, monitoring) |
 | 2 | NVMe M.2 SSD (any capacity) | WAL storage — must be on XFS with O_DIRECT |
-| 2 | NVMe HAT / base board for Pi 5 | Connects NVMe to Pi 5 via PCIe |
-| 3 | microSD cards (32 GB+) | OS boot (Raspberry Pi OS Lite 64-bit) |
-| 3 | USB-C power supplies (5V/5A for Pi 5, 5V/3A for Pi 4) | |
-| 1 | Ethernet switch + 4 cables (or direct connections) | |
+| 2 | Pimoroni NVMe HAT for Pi 5 | Connects NVMe to Pi 5 via PCIe |
+| 2 | microSD cards (32 GB+) | OS boot (Raspberry Pi OS Lite 64-bit) |
+| 2 | USB-C power supplies (5V/5A) | |
+| 1 | Ethernet switch + 3 cables (or direct connections) | |
 
-The infra node does not need NVMe — MinIO stores to its SD card or a USB drive, which is fine for development.
+The infra stack (MinIO, monitoring) runs on the build machine via Docker, so no third Pi is needed.
 
 ### OS setup
 
@@ -42,12 +41,11 @@ Flash **Raspberry Pi OS Lite (64-bit)** to each SD card using `rpi-imager`. Duri
 2. Enable SSH with your public key
 3. Set locale/timezone
 
-Boot all three Pis and verify SSH access using their static IPs:
+Boot both Pis and verify SSH access using their static IPs:
 
 ```sh
 ssh 10.0.0.50 'uname -a'   # cs1
 ssh 10.0.0.51 'uname -a'   # cs2
-ssh 10.0.0.52 'uname -a'   # infra
 ```
 
 **Important:** All deployment configs use static IP addresses, not hostnames. RPi cloud-init maps all hostnames to `127.0.1.1` in `/etc/hosts`, which breaks inter-node communication. Update `config.env` if your IPs differ from the defaults.
@@ -79,7 +77,7 @@ Edit `config.env` to match your network:
 # config.env
 LEADER_HOST=10.0.0.50    # RPi 5 — will be Celeriant leader
 FOLLOWER_HOST=10.0.0.51  # RPi 5 — will be Celeriant follower
-INFRA_HOST=10.0.0.52     # RPi 4 — MinIO + monitoring
+INFRA_HOST=10.0.0.1      # Build machine — MinIO + monitoring
 ```
 
 All other settings have sensible defaults. See the file for NVMe device paths, ports, and tuning parameters.
@@ -179,17 +177,28 @@ CLUSTER_THROUGHPUT_CONNECTIONS=4000 \
 make run-test
 ```
 
+## What to expect
+
+Reference numbers from a 2-node RPi 5 cluster (Samsung 9100 PRO 1TB NVMe, Pimoroni NVMe HAT, Gigabit Ethernet), running `rpi_cluster_bench` for 360s per phase with mTLS enabled:
+
+| Phase | Connections | Requests | Throughput | Avg | P50 | P95 | P99 | P99.9 |
+|-------|-------------|----------|------------|-----|-----|-----|-----|-------|
+| Throughput | 8,000 | 13.6M | 37,770 req/s | 211ms | 192ms | 312ms | 340ms | 377ms |
+| Latency | 125 | 685K | 1,904 req/s | 65ms | 64ms | 70ms | 71ms | 82ms |
+
+The throughput phase saturates the connection pool to find the ceiling. The latency phase uses fewer connections to show what tail latency looks like under moderate load. Your numbers will vary with NVMe model and network setup.
+
 ## Monitoring
 
 Once the infra stack is running:
 
 | Service | URL | Credentials |
 |---------|-----|-------------|
-| Grafana | `http://10.0.0.52:3000` | admin / admin |
-| Prometheus | `http://10.0.0.52:9090` | — |
-| Loki | `http://10.0.0.52:3100` | — |
-| MinIO Console | `http://10.0.0.52:9001` | minioadmin / minioadmin |
-| MinIO API | `http://10.0.0.52:9000` | minioadmin / minioadmin |
+| Grafana | `http://10.0.0.1:3000` | admin / admin |
+| Prometheus | `http://10.0.0.1:9090` | — |
+| Loki | `http://10.0.0.1:3100` | — |
+| MinIO Console | `http://10.0.0.1:9001` | minioadmin / minioadmin |
+| MinIO API | `http://10.0.0.1:9000` | minioadmin / minioadmin |
 | Celeriant metrics (leader) | `http://10.0.0.50:9090/metrics` | — |
 | Celeriant metrics (follower) | `http://10.0.0.51:9090/metrics` | — |
 
@@ -228,7 +237,7 @@ Certificates are generated with SANs covering both data node IPs, `localhost`, a
 
 **NVMe not detected** — check that the NVMe HAT is seated properly and the drive is recognised: `ssh 10.0.0.50 'lsblk'`. The default device is `/dev/nvme0n1`.
 
-**Leader election not happening** — verify MinIO is running (`ssh 10.0.0.52 'docker compose -f ~/celeriant-infra/docker-compose.yml ps'`) and that both data nodes can reach it (`curl http://10.0.0.52:9000/minio/health/live` from a data node).
+**Leader election not happening** — verify MinIO is running (`docker compose -f ~/celeriant-infra/docker-compose.yml ps`) and that both data nodes can reach it (`curl http://10.0.0.1:9000/minio/health/live` from a data node).
 
 **Clock synchronization warning** — Celeriant checks for NTP sync on startup. Ensure `systemd-timesyncd` or `chrony` is running: `timedatectl status`.
 

@@ -117,7 +117,7 @@ Rules the system enforces. Breaking any of these is a bug. Provide this to LLMs 
 ## Memory Management
 
 - Total memory is bounded by `detected_memory * CELERIANT_MEMORY_CONSUMPTION_PERCENT / 100` (default 80%, range 1-95%). Respects cgroup limits.
-- Per-shard budget = total / num_shards. Five categories consume exactly 100% via fixed ratios: recent_write 71.5%, aggregate_snapshots 9%, client_snapshots 9%, schema_cache 9%, WAL index 1.5%.
+- Per-shard budget = total / num_shards. Six categories consume exactly 100%: aggregate_snapshots 9%, client_snapshots 9%, schema_cache 9%, WAL index 1.5%, replication_high_water 10% (floored at 128MB), recent_write ~61.5% (residual after fixed allocations).
 - LRU capacity is derived from byte budget divided by per-entry size estimate — bounded by memory, not cardinality.
 - Recent write cache is bounded by bytes with FIFO eviction before each insert.
 - `aggregate_queue_positions` and `pending_append_queue` are intentionally unbounded (transient in-flight state that drains every fsync cycle).
@@ -177,7 +177,7 @@ Rules the system enforces. Breaking any of these is a bug. Provide this to LLMs 
 - Each client has a bounded channel of 10,000 pending events (`MAX_PENDING_EVENTS`). This is a hard cap.
 - The write path uses non-blocking `try_send()`. If the channel is full, the client is immediately removed from the watcher list. No backpressure propagates to the writer.
 - Broadcast filtering (operation type, org, aggregate type, aggregate ID) runs before `try_send()`. The write hot path never blocks on watch consumers.
-- Clients cannot request a watch latency exceeding `max_requested_latency` (default 100ms). Rejected with `WatchLatencyTooHigh`.
+- Clients cannot request a watch latency exceeding `max_requested_latency` (default 2000ms). Rejected with `WatchLatencyTooHigh`.
 - Watch subscriptions are not included in the per-shard memory budget. Bounded per-client (10K events) but unbounded in total subscriber count.
 
 ## State Machine Transitions
@@ -191,7 +191,7 @@ These checks run before the server accepts connections. Fatal checks abort the p
 
 - Direct I/O is verified by attempting an unaligned write with `O_DIRECT`. If it succeeds, the filesystem is silently falling back to buffered I/O — fatal. `EINVAL` confirms DIO is enforced.
 - `adjtimex()` checks the kernel clock is NTP-disciplined. Warning only — does not abort.
-- Four immutable config parameters are persisted to `server_meta.toml` on first startup and must never change: `num_shards`, `timestamp_precision`, `timestamp_epoch_offset_secs`, `routing_rule`. Mismatch is fatal.
+- Five immutable config parameters are persisted to `server_meta.toml` on first startup and must never change: `num_shards`, `timestamp_precision`, `timestamp_epoch_offset_secs`, `routing_rule`, `reserve_coordinator_shard`. Mismatch is fatal.
 - If `compaction_temp_dir` is configured, it must be on the same filesystem as `data_root` (validated via `st_dev`). Cross-device `rename(2)` is not atomic. Fatal.
 - Both client and replication ports are probed via TCP connect to `127.0.0.1`. Glommio uses `SO_REUSEPORT` so `bind()` alone cannot detect a running instance. Fatal.
 - If TLS is enabled, kTLS kernel support is verified via `setsockopt(SOL_TCP, TCP_ULP, "tls")`. Fatal if missing.

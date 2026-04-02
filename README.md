@@ -4,6 +4,10 @@ A fast, distributed, append-only write-ahead log built specifically for event so
 
 Not a relational database. Not a message broker. Just the write side of event sourcing, done properly.
 
+## Release Status
+
+Celeriant is new. Really new. It's ready to experiment with, in non-production workloads. A lot might change in the next few months, and we won't be supporting backwards compatibility until 1.0. Use at your own risk.
+
 ## Why Celeriant
 
 PostgreSQL gives you correctness but not throughput. Kafka gives you throughput but not correctness. Celeriant gives you both.
@@ -207,16 +211,22 @@ Clients connect to any shard. Requests are redirected to the owning shard automa
 
 ## When Not to Use Celeriant
 
-- You need ad-hoc queries over aggregate state - use a read database
-- You need transactions across arbitrary keys - use a relational database
+- You need ad-hoc queries over aggregate state - use an OLAP database
+- You have IoT data and need live data analysis/dashboards - use a time-series database
+- You need transactions across arbitrary keys - use an OLTP relational database
+- Your data patterns are state-first and map to a single primary key - use a key-value database
 - You want server-managed consumer groups - use Kafka
 - You need to pipe large amounts of messages between unrelated systems - use Kafka
 
-## Position on Responsible LLM Use
+## Celeriant Author
 
 Celeriant is built by [Tyson Brown](https://www.linkedin.com/in/tyson-brown-208b88b6/). 20yrs XP in enterprise, high performance systems. Based in Australia.
 
-Celeriant is not built with agentic coding agents. It is overwhelmingly hand-crafted, a solo dev project which went through 7 iterations over 3 years. Claude Code is used to accelerate boilerplate output, explore ideas, prototype and review work, but it never writes large blocks of production code autonomously. LLM's don't perform well when working on complex, distributed systems with complex invariants.
+LLM's don't perform well when working on complex, distributed systems with complex invariants that have a time dimension. Celeriant is overwhelmingly hand-crafted, it's not written via autonomous agentic systems.
+
+LLMs to prototype; automate the boilerplate; critical analysis and retrospective.
+
+Humans still write the critical components by hand; Always read the code; Unit and integration tests are mandatory; Humans always in the loop.
 
 ## License
 
