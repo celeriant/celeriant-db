@@ -155,16 +155,16 @@ run-test: ## Run rpi_cluster_pool_bench integration test against the cluster
 # ---------------------------------------------------------------------------
 
 teardown: stop ## Stop all services (Celeriant + infra)
-	@printf "$(BOLD)>>> Stopping infra on $(INFRA_HOST)$(RESET)\n"
-	@ssh $(INFRA_HOST) 'cd ~/celeriant-infra && docker compose down'
+	@printf "$(BOLD)>>> Stopping infra locally$(RESET)\n"
+	@cd ~/celeriant-infra && docker compose down
 	@printf "$(GREEN)All services stopped.$(RESET)\n"
 
 teardown-data: teardown ## Stop all services AND wipe all data (DESTRUCTIVE)
 	@printf "$(RED)$(BOLD)This will delete ALL Celeriant data on $(LEADER_HOST) and $(FOLLOWER_HOST),$(RESET)\n"
-	@printf "$(RED)$(BOLD)and all MinIO/Prometheus/Loki/Grafana data on $(INFRA_HOST).$(RESET)\n"
+	@printf "$(RED)$(BOLD)and all MinIO/Prometheus/Loki/Grafana data locally.$(RESET)\n"
 	@read -p "Type 'yes' to confirm: " confirm && [ "$$confirm" = "yes" ] || exit 1
 	@for HOST in $(DATA_NODES); do \
 		ssh $$HOST 'sudo rm -rf $(REMOTE_DATA_ROOT)/*'; \
 	done
-	@ssh $(INFRA_HOST) 'cd ~/celeriant-infra && docker compose down -v'
+	@cd ~/celeriant-infra && docker compose down -v
 	@printf "$(GREEN)All data wiped.$(RESET)\n"
