@@ -102,6 +102,7 @@ pub fn startup(args: Vec<String>) -> Result<(), std::io::Error> {
         }.to_string(),
         timestamp_epoch_offset_secs: server_config.timestamp_epoch_offset_secs,
         routing_rule: server_config.routing_rule.to_string(),
+        reserve_coordinator_shard: server_config.reserve_coordinator_shard,
     };
     if let Err(e) = server_meta::validate_or_create(&server_config.data_root, &current_meta) {
         error!("{}", e);

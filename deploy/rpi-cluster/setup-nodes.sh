@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # One-time OS prep for a Celeriant data node (RPi 5).
-# Usage: setup-nodes.sh <hostname> <infra_hostname>
+# Usage: setup-nodes.sh <hostname> <infra_hostname> <memory_pct> <log_prealloc> <reserve_shard>
 set -euo pipefail
 
 HOST="$1"
 INFRA_HOST="$2"
+MEMORY_CONSUMPTION_PERCENT="$3"
+SHARD_LOG_PREALLOCATE_BYTES="$4"
+RESERVE_COORDINATOR_SHARD="$5"
 
 printf "\n=== OS prep on %s ===\n" "$HOST"
 
@@ -89,9 +92,9 @@ Environment=CELERIANT_TLS_CLIENT_CERT=/etc/celeriant/certs/client-server.crt
 Environment=CELERIANT_TLS_CLIENT_KEY=/etc/celeriant/certs/client-server.key
 Environment=CELERIANT_TLS_CLIENT_AUTH=require
 
-Environment=CELERIANT_MEMORY_CONSUMPTION_PERCENT=60
-Environment=CELERIANT_SHARD_LOG_PREALLOCATE_BYTES=134217728
-Environment=CELERIANT_RESERVE_COORDINATOR_SHARD=true
+Environment=CELERIANT_MEMORY_CONSUMPTION_PERCENT=${MEMORY_CONSUMPTION_PERCENT}
+Environment=CELERIANT_SHARD_LOG_PREALLOCATE_BYTES=${SHARD_LOG_PREALLOCATE_BYTES}
+Environment=CELERIANT_RESERVE_COORDINATOR_SHARD=${RESERVE_COORDINATOR_SHARD}
 
 [Install]
 WantedBy=multi-user.target

@@ -10,6 +10,8 @@ pub struct ServerMeta {
     pub timestamp_precision: String,
     pub timestamp_epoch_offset_secs: i64,
     pub routing_rule: String,
+    #[serde(default)]
+    pub reserve_coordinator_shard: bool,
 }
 
 /// Validate that immutable config hasn't changed since initial setup.
@@ -58,6 +60,12 @@ pub fn validate_or_create(data_root: &Path, current: &ServerMeta) -> Result<(), 
             saved.routing_rule, current.routing_rule
         ));
     }
+    if saved.reserve_coordinator_shard != current.reserve_coordinator_shard {
+        mismatches.push(format!(
+            "reserve_coordinator_shard: saved={}, configured={}",
+            saved.reserve_coordinator_shard, current.reserve_coordinator_shard
+        ));
+    }
 
     if mismatches.is_empty() {
         Ok(())
@@ -81,6 +89,7 @@ mod tests {
             timestamp_precision: "milliseconds".to_string(),
             timestamp_epoch_offset_secs: 0,
             routing_rule: "aggregate_id".to_string(),
+            reserve_coordinator_shard: false,
         }
     }
 
@@ -160,6 +169,7 @@ mod tests {
             timestamp_precision: "nanoseconds".to_string(),
             timestamp_epoch_offset_secs: 100,
             routing_rule: "org_id".to_string(),
+            reserve_coordinator_shard: false,
         };
         let err = validate_or_create(dir.path(), &changed).unwrap_err();
         assert!(err.contains("num_shards"));

@@ -79,6 +79,7 @@ pub struct ShardConfig {
     pub replication_delay: Duration,
     pub recent_write_cache_bytes: u64,
     pub routing_rule: RoutingRule,
+    pub reserve_coordinator_shard: bool,
     pub aggregate_client_snapshots_cache_bytes: u64,
     pub aggregate_snapshots_cache_bytes: u64,
     pub timestamp_config: TimestampConfig,

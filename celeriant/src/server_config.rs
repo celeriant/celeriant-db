@@ -140,6 +140,9 @@ pub struct ServerConfig {
     )]
     pub num_shards: Option<usize>,
 
+    #[arg(long, default_value_t = false, env = "CELERIANT_RESERVE_COORDINATOR_SHARD", help = "Reserve shard 0 for cluster coordination (heartbeat, schema). Client data routes to shards 1..n-1. Requires num_shards >= 2.")]
+    pub reserve_coordinator_shard: bool,
+
     #[arg(
         long,
         default_value = "1000",
@@ -797,6 +800,7 @@ impl ServerConfig {
             heartbeat_interval_duration: Duration::from_millis(self.heartbeat_interval_ms),
             heartbeat_timeout: Duration::from_millis(self.heartbeat_timeout_ms.unwrap_or(self.heartbeat_interval_ms)),
             heartbeat_lease_duration: Duration::from_millis(self.heartbeat_lease_duration_ms),
+            reserve_coordinator_shard: self.reserve_coordinator_shard,
         }
     }
 
@@ -828,6 +832,7 @@ impl ServerConfig {
         check_field!(standalone);
         check_field!(mesh_channel_size);
         check_field!(num_shards);
+        check_field!(reserve_coordinator_shard);
         check_field!(max_open_files);
         check_field!(read_max_chunk_size);
         check_field!(write_max_chunk_size);
@@ -912,6 +917,7 @@ impl Default for ServerConfig {
             standalone: false,
             mesh_channel_size: 8192,
             num_shards: None,
+            reserve_coordinator_shard: false,
             read_max_chunk_size: 32 * 1024,
             write_max_chunk_size: 32 * 1024,
             max_open_files: 1000,

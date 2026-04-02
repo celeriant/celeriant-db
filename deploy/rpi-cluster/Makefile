@@ -37,7 +37,7 @@ setup-all: setup-nodes setup-nvme certs setup-infra deploy ## First-time full se
 setup-nodes: ## One-time OS prep on data nodes (limits, systemd, promtail) — runs in parallel
 	@for HOST in $(DATA_NODES); do \
 		printf "$(BOLD)>>> Setting up $$HOST$(RESET)\n"; \
-		bash setup-nodes.sh $$HOST $(INFRA_HOST) &\
+		bash setup-nodes.sh $$HOST $(INFRA_HOST) $(MEMORY_CONSUMPTION_PERCENT) $(SHARD_LOG_PREALLOCATE_BYTES) $(RESERVE_COORDINATOR_SHARD) &\
 	done; \
 	wait
 	@printf "$(GREEN)All nodes configured.$(RESET)\n"

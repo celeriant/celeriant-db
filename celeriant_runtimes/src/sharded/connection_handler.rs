@@ -631,6 +631,18 @@ async fn check_cluster_redirect<R: ReplicationClient + 'static, D: S3Downloader 
     ClusterRedirectResult::ProcessLocally(request, tcp_stream)
 }
 
+/// Route a routing_id to a data shard. When `reserve_coordinator_shard` is true,
+/// shard 0 is reserved for coordination and data routes to shards 1..num_shards-1.
+fn data_shard(routing_id: u128, config: &ShardConfig) -> usize {
+    let num_shards = config.num_shards as u128;
+    if config.reserve_coordinator_shard {
+        let data_shards = num_shards - 1;
+        (routing_id % data_shards + 1) as usize
+    } else {
+        (routing_id % num_shards) as usize
+    }
+}
+
 pub fn determine_client_shard(
     request: &ClientRequest,
     config: &ShardConfig,
@@ -647,7 +659,7 @@ pub fn determine_client_shard(
         ClientRequest::ListAggregates(req) => validate_shard_id(req.shard_id, num_shards),
         other => {
             let routing_id = config.routing_rule.routing_id_for_client_request(other);
-            Ok((routing_id % num_shards) as usize)
+            Ok(data_shard(routing_id, config))
         }
     }
 }
@@ -693,7 +705,7 @@ fn determine_shard_write(
     let mut shard_id: Option<usize> = None;
     for aggregate_key in req.writes.keys() {
         let routing_id = config.routing_rule.routing_id_for_rule(aggregate_key);
-        let id = (routing_id % num_shards) as usize;
+        let id = data_shard(routing_id, config);
         match shard_id {
             None => shard_id = Some(id),
             Some(first) if first != id => {
@@ -728,7 +740,7 @@ fn determine_shard_delete(
     let mut shard_id: Option<usize> = None;
     for aggregate_key in req.deletes.keys() {
         let routing_id = config.routing_rule.routing_id_for_rule(aggregate_key);
-        let id = (routing_id % num_shards) as usize;
+        let id = data_shard(routing_id, config);
         match shard_id {
             None => shard_id = Some(id),
             Some(first) if first != id => {
@@ -765,7 +777,7 @@ fn determine_shard_watch(
                     num_shards: num_shards as u64,
                 });
             }
-            collect_unique_shard_id(num_shards, &req.orgs)
+            collect_unique_shard_id(config, &req.orgs)
         }
         crate::RoutingRule::AggregateTypeId => {
             if req.aggregate_types.is_none() || req.aggregate_types.as_ref().unwrap().is_empty() {
@@ -774,7 +786,7 @@ fn determine_shard_watch(
                     num_shards: num_shards as u64,
                 });
             }
-            collect_unique_shard_id(num_shards, &req.aggregate_types)
+            collect_unique_shard_id(config, &req.aggregate_types)
         }
         crate::RoutingRule::AggregateId => {
             if req.aggregates.is_none() || req.aggregates.as_ref().unwrap().is_empty() {
@@ -783,24 +795,24 @@ fn determine_shard_watch(
                     num_shards: num_shards as u64,
                 });
             }
-            collect_unique_shard_id(num_shards, &req.aggregates)
+            collect_unique_shard_id(config, &req.aggregates)
         }
     }
 }
 
 fn collect_unique_shard_id(
-    num_shards: u128,
+    config: &ShardConfig,
     sources: &Option<std::collections::HashSet<u128>>,
 ) -> Result<usize, ShardRoutingError> {
     let set = sources.as_ref().ok_or(ShardRoutingError::NoRoutingKeyProvided)?;
     let mut shard_id: Option<usize> = None;
 
     for &routing_key in set.iter() {
-        let computed_shard = (routing_key % num_shards) as usize;
+        let computed_shard = data_shard(routing_key, config);
         match shard_id {
             None => shard_id = Some(computed_shard),
             Some(existing) if existing != computed_shard => {
-                return Err(ShardRoutingError::MultipleShardRoutes { num_shards: num_shards as u64 });
+                return Err(ShardRoutingError::MultipleShardRoutes { num_shards: config.num_shards as u64 });
             }
             Some(_) => {}
         }
