@@ -26,9 +26,9 @@ macro_rules! leader_route {
                 return $try_addr!(&new_addr);
             }
             Err(ClientError::NotLeader { leader_address: None, .. }) => {}
-            Err(ClientError::ConnectionFailed(_)) => {}
-            Err(ClientError::ConnectionTimeout) => {}
-            Err(ClientError::RequestTimeout) => {}
+            Err(ClientError::ConnectionFailed(_)) => { pool.clear_leader(); }
+            Err(ClientError::ConnectionTimeout) => { pool.clear_leader(); }
+            Err(e @ ClientError::RequestTimeout) => { return Err(e); }
             Err(ClientError::ServerBusy) => {}
             Err(e) => return Err(e),
         }
@@ -190,8 +190,8 @@ impl Default for PoolOptions {
             tls_config: None,
             identity_config: None,
             max_connections_per_node: 10,
-            connection_timeout: Duration::from_secs(5),
-            request_timeout: Duration::from_secs(30),
+            connection_timeout: Duration::from_secs(2),
+            request_timeout: Duration::from_secs(2),
             max_request_size: 10_000_000,
             max_response_size: 64 * 1024 * 1024,
             idle_timeout: Duration::from_secs(25),
@@ -307,11 +307,27 @@ fn err_all_unreachable() -> ClientError {
 // NodePool (internal)
 // ---------------------------------------------------------------------------
 
+/// How long to fast-fail after a connection attempt to a node fails.
+/// Prevents thousands of tasks from each independently timing out on a dead host.
+const CIRCUIT_BREAKER_COOLDOWN: Duration = Duration::from_secs(2);
+
+/// Maximum concurrent TCP connection attempts per node. Limits waste when a node
+/// is down (at most this many tasks block on TCP connect before the circuit breaker
+/// trips), while still allowing parallel connections to healthy nodes.
+const MAX_CONCURRENT_CONNECTS: usize = 32;
+
 struct NodePool {
     address: String,
     connections: Mutex<VecDeque<(CeleriantClient, Instant)>>,
     semaphore: Arc<tokio::sync::Semaphore>,
     options: Arc<PoolOptions>,
+    /// Limits concurrent TCP connection attempts. Tasks beyond this limit queue
+    /// and re-check the circuit breaker when they wake up.
+    connect_semaphore: tokio::sync::Semaphore,
+    /// Last time a connection attempt to this node failed. Tasks that arrive
+    /// within `CIRCUIT_BREAKER_COOLDOWN` of this timestamp fail immediately
+    /// instead of blocking on TCP connect to a potentially dead host.
+    last_connect_failure: Mutex<Option<Instant>>,
 }
 
 impl NodePool {
@@ -322,28 +338,37 @@ impl NodePool {
             connections: Mutex::new(VecDeque::new()),
             semaphore,
             options,
+            connect_semaphore: tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTS),
+            last_connect_failure: Mutex::new(None),
         }
     }
 
+    fn is_circuit_open(&self) -> bool {
+        let guard = self.last_connect_failure.lock().unwrap();
+        matches!(*guard, Some(failed_at) if failed_at.elapsed() < CIRCUIT_BREAKER_COOLDOWN)
+    }
+
     async fn get(self: &Arc<Self>) -> Result<PooledConnection, ClientError> {
-        // Acquire a permit first — this enforces max_connections_per_node as a
-        // hard cap on total in-flight connections (idle + active).
+        if self.is_circuit_open() {
+            return Err(ClientError::ConnectionFailed(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                format!("circuit breaker open for {}", self.address),
+            )));
+        }
+
+        // Acquire a permit — enforces max_connections_per_node as a hard cap.
         let permit = tokio::time::timeout(
             self.options.connection_timeout,
             Arc::clone(&self.semaphore).acquire_owned(),
         )
         .await
         .map_err(|_| ClientError::ConnectionTimeout)?
-        // Semaphore::acquire_owned only errors if the semaphore is closed,
-        // which never happens here since we hold an Arc to it.
         .expect("semaphore closed unexpectedly");
 
         // Evict stale connections and pop the first fresh one.
         let reuse = {
             let mut guard = self.connections.lock().unwrap();
             let idle_timeout = self.options.idle_timeout;
-            // Drain stale entries from the front; they are ordered oldest-first
-            // because return_connection appends to the back.
             while let Some((_, ts)) = guard.front() {
                 if ts.elapsed() >= idle_timeout {
                     guard.pop_front();
@@ -363,13 +388,52 @@ impl NodePool {
             });
         }
 
-        let client = Self::create_client(&self.address, &self.options).await?;
-        Ok(PooledConnection {
-            client: Some(client),
-            broken: false,
-            return_to: Arc::clone(self),
-            _permit: permit,
-        })
+        // Limit concurrent TCP connection attempts. Tasks beyond the limit queue
+        // and re-check the circuit breaker (which may have tripped) when they wake.
+        let _connect_permit = tokio::time::timeout(
+            self.options.connection_timeout,
+            self.connect_semaphore.acquire(),
+        )
+        .await
+        .map_err(|_| ClientError::ConnectionTimeout)?
+        .expect("connect semaphore closed unexpectedly");
+
+        // Re-check circuit breaker — may have tripped while we waited.
+        if self.is_circuit_open() {
+            return Err(ClientError::ConnectionFailed(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                format!("circuit breaker open for {}", self.address),
+            )));
+        }
+
+        // Re-check pool — someone ahead of us may have returned a connection.
+        {
+            let mut guard = self.connections.lock().unwrap();
+            if let Some((client, _)) = guard.pop_front() {
+                return Ok(PooledConnection {
+                    client: Some(client),
+                    broken: false,
+                    return_to: Arc::clone(self),
+                    _permit: permit,
+                });
+            }
+        }
+
+        match Self::create_client(&self.address, &self.options).await {
+            Ok(client) => {
+                *self.last_connect_failure.lock().unwrap() = None;
+                Ok(PooledConnection {
+                    client: Some(client),
+                    broken: false,
+                    return_to: Arc::clone(self),
+                    _permit: permit,
+                })
+            }
+            Err(e) => {
+                *self.last_connect_failure.lock().unwrap() = Some(Instant::now());
+                Err(e)
+            }
+        }
     }
 
     fn return_connection(&self, client: CeleriantClient) {
@@ -634,20 +698,21 @@ impl CeleriantPool {
     // 3. On NotLeader { None } / ConnectionFailed → try each seed address.
 
     async fn write_leader(&self, request: WriteRequest) -> Result<SuccessResponse, ClientError> {
-        // Inline macro captures `self` and `request` from the enclosing scope.
         macro_rules! try_addr {
             ($addr:expr) => {{
                 let node = self.get_or_create_node($addr);
                 match node.get().await {
-                    Err(ClientError::ConnectionFailed(e)) => Err(ClientError::ConnectionFailed(e)),
-                    Err(e) => return Err(e),
                     Ok(mut conn) => match conn.client().write(request.clone()).await {
-                        Err(ClientError::ConnectionFailed(e)) => {
-                            conn.mark_broken();
-                            Err(ClientError::ConnectionFailed(e))
-                        }
+                        Err(ClientError::ConnectionFailed(e)) => { conn.mark_broken(); Err(ClientError::ConnectionFailed(e)) }
+                        Err(ClientError::ConnectionTimeout) => { conn.mark_broken(); Err(ClientError::ConnectionTimeout) }
+                        Err(e @ ClientError::RequestTimeout) => { conn.mark_broken(); return Err(e); }
                         other => other,
                     },
+                    Err(e @ ClientError::ConnectionFailed(_))
+                    | Err(e @ ClientError::ConnectionTimeout)
+                    | Err(e @ ClientError::RequestTimeout)
+                    | Err(e @ ClientError::ServerBusy) => Err(e),
+                    Err(e) => return Err(e),
                 }
             }};
         }
@@ -659,15 +724,17 @@ impl CeleriantPool {
             ($addr:expr) => {{
                 let node = self.get_or_create_node($addr);
                 match node.get().await {
-                    Err(ClientError::ConnectionFailed(e)) => Err(ClientError::ConnectionFailed(e)),
-                    Err(e) => return Err(e),
                     Ok(mut conn) => match conn.client().delete(request.clone()).await {
-                        Err(ClientError::ConnectionFailed(e)) => {
-                            conn.mark_broken();
-                            Err(ClientError::ConnectionFailed(e))
-                        }
+                        Err(ClientError::ConnectionFailed(e)) => { conn.mark_broken(); Err(ClientError::ConnectionFailed(e)) }
+                        Err(ClientError::ConnectionTimeout) => { conn.mark_broken(); Err(ClientError::ConnectionTimeout) }
+                        Err(e @ ClientError::RequestTimeout) => { conn.mark_broken(); return Err(e); }
                         other => other,
                     },
+                    Err(e @ ClientError::ConnectionFailed(_))
+                    | Err(e @ ClientError::ConnectionTimeout)
+                    | Err(e @ ClientError::RequestTimeout)
+                    | Err(e @ ClientError::ServerBusy) => Err(e),
+                    Err(e) => return Err(e),
                 }
             }};
         }
@@ -679,15 +746,17 @@ impl CeleriantPool {
             ($addr:expr) => {{
                 let node = self.get_or_create_node($addr);
                 match node.get().await {
-                    Err(ClientError::ConnectionFailed(e)) => Err(ClientError::ConnectionFailed(e)),
-                    Err(e) => return Err(e),
                     Ok(mut conn) => match conn.client().trim_start(request.clone()).await {
-                        Err(ClientError::ConnectionFailed(e)) => {
-                            conn.mark_broken();
-                            Err(ClientError::ConnectionFailed(e))
-                        }
+                        Err(ClientError::ConnectionFailed(e)) => { conn.mark_broken(); Err(ClientError::ConnectionFailed(e)) }
+                        Err(ClientError::ConnectionTimeout) => { conn.mark_broken(); Err(ClientError::ConnectionTimeout) }
+                        Err(e @ ClientError::RequestTimeout) => { conn.mark_broken(); return Err(e); }
                         other => other,
                     },
+                    Err(e @ ClientError::ConnectionFailed(_))
+                    | Err(e @ ClientError::ConnectionTimeout)
+                    | Err(e @ ClientError::RequestTimeout)
+                    | Err(e @ ClientError::ServerBusy) => Err(e),
+                    Err(e) => return Err(e),
                 }
             }};
         }
@@ -702,15 +771,17 @@ impl CeleriantPool {
             ($addr:expr) => {{
                 let node = self.get_or_create_node($addr);
                 match node.get().await {
-                    Err(ClientError::ConnectionFailed(e)) => Err(ClientError::ConnectionFailed(e)),
-                    Err(e) => return Err(e),
                     Ok(mut conn) => match conn.client().register_schema(request.clone()).await {
-                        Err(ClientError::ConnectionFailed(e)) => {
-                            conn.mark_broken();
-                            Err(ClientError::ConnectionFailed(e))
-                        }
+                        Err(ClientError::ConnectionFailed(e)) => { conn.mark_broken(); Err(ClientError::ConnectionFailed(e)) }
+                        Err(ClientError::ConnectionTimeout) => { conn.mark_broken(); Err(ClientError::ConnectionTimeout) }
+                        Err(e @ ClientError::RequestTimeout) => { conn.mark_broken(); return Err(e); }
                         other => other,
                     },
+                    Err(e @ ClientError::ConnectionFailed(_))
+                    | Err(e @ ClientError::ConnectionTimeout)
+                    | Err(e @ ClientError::RequestTimeout)
+                    | Err(e @ ClientError::ServerBusy) => Err(e),
+                    Err(e) => return Err(e),
                 }
             }};
         }
@@ -745,6 +816,19 @@ impl CeleriantPool {
 
     fn update_leader(&self, address: String) {
         *self.leader_address.write().unwrap() = Some(address);
+    }
+
+    /// Mark the current leader as suspect. If a cached leader was set, clear it
+    /// so the next attempt falls through to the seed retry loop. If no cached
+    /// leader was set (i.e., the primary itself failed), pick the first seed
+    /// address to avoid retrying the dead primary.
+    fn clear_leader(&self) {
+        let mut guard = self.leader_address.write().unwrap();
+        if guard.is_some() {
+            *guard = None;
+        } else if let Some(seed) = self.options.seed_addresses.first() {
+            *guard = Some(seed.clone());
+        }
     }
 
     fn get_or_create_node(&self, address: &str) -> Arc<NodePool> {
