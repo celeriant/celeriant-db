@@ -242,6 +242,7 @@ mod tests {
             wal_index: 0x0FED_CBA9_8765_4321,
             aggregate_bloom: vec![],
             tip_hash: GENESIS_HASH,
+            last_received_replication_wal_index: 0,
         };
 
         let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
@@ -277,6 +278,7 @@ mod tests {
             wal_index: 13,
             aggregate_bloom: vec![],
             tip_hash,
+            last_received_replication_wal_index: 0,
         };
 
         let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
@@ -298,6 +300,7 @@ mod tests {
             wal_index: 13,
             aggregate_bloom: vec![],
             tip_hash: GENESIS_HASH,
+            last_received_replication_wal_index: 0,
         };
 
         let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
@@ -318,6 +321,7 @@ mod tests {
             wal_index: 0x3333_3333_3333_3333,
             aggregate_bloom: vec![],
             tip_hash: GENESIS_HASH,
+            last_received_replication_wal_index: 0,
         };
 
         let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
@@ -341,6 +345,7 @@ mod tests {
             wal_index: 13,
             aggregate_bloom: vec![],
             tip_hash: GENESIS_HASH,
+            last_received_replication_wal_index: 0,
         };
 
         let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
@@ -364,6 +369,7 @@ mod tests {
             wal_index: 13,
             aggregate_bloom: vec![],
             tip_hash: GENESIS_HASH,
+            last_received_replication_wal_index: 0,
         };
 
         let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
@@ -387,6 +393,7 @@ mod tests {
             wal_index: 13,
             aggregate_bloom: vec![],
             tip_hash: GENESIS_HASH,
+            last_received_replication_wal_index: 0,
         };
 
         let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
@@ -412,6 +419,7 @@ mod tests {
             wal_index: 13,
             aggregate_bloom: vec![],
             tip_hash: GENESIS_HASH,
+            last_received_replication_wal_index: 0,
         };
 
         let mut buffer = vec![0u8; HEADER_BLOCK_SIZE_BYTES];

@@ -30,13 +30,14 @@ impl LogSegmentCursor {
         }
     }
 
-    pub fn to_shard_log_header(&self) -> ShardLogHeader {
+    pub fn to_shard_log_header(&self, last_received_replication_wal_index: u64) -> ShardLogHeader {
         ShardLogHeader {
             metablocks_position: self.metablocks_position,
             datablocks_position: self.datablocks_position,
             wal_index: self.wal_index,
             aggregate_bloom: self.aggregate_key_bloom.to_bytes(),
             tip_hash: self.tip_hash,
+            last_received_replication_wal_index,
         }
     }
 }

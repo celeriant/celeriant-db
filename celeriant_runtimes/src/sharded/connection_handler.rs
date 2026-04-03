@@ -1421,6 +1421,7 @@ mod tests {
             compaction_min_reclaimable_ratio: 0.20,
             compaction_temp_dir: None,
             cache_warmup_max_duration: None,
+            reserve_coordinator_shard: false,
         }
     }
 

@@ -679,6 +679,7 @@ async fn build_compacted_file(
         wal_index: original_wal_index,
         tip_hash: original_tip_hash,
         aggregate_bloom: bloom.to_bytes(),
+        last_received_replication_wal_index: 0,
     };
 
     write_dual_shard_log_header(&new_file, tail_header_pos, &header)

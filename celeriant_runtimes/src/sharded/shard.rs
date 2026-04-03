@@ -500,6 +500,13 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
         if !run_s3_catchup(ctx, &rx).await {
             return Err(celeriant_distributed::lease_store::LeaseStoreError::Unavailable { message: "Could not catch up WAL via S3".to_string() });
         }
+
+        // Upload the last TCP-replicated batch to S3 before accepting writes.
+        // Covers the partition scenario where the old leader rolled back this batch
+        // but we (the follower) kept it — without this, S3 would have a gap.
+        if let Err(e) = ctx.shard_wal.upload_s3_promotion_batch().await {
+            tracing::warn!(error = ?e, "Failed to upload promotion batch to S3 — old leader may not be able to catch up via S3");
+        }
     }
 
     // Do we have a peer? It tells us where to replicate or where to direct clients if this node isn't the leader
@@ -636,16 +643,19 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
 
                 match set_node_role_via_s3(&lease_manager, &ctx, &rx).await {
                     Ok(outcome) => {
-                        if outcome.peer_info.is_some() {
+                        if let Some(ref peer) = outcome.peer_info {
+                            info!(peer_replication_address = %peer.replication_address, "Peer discovered via S3");
                             has_peer = true;
                             peer_discovery_backoff = Duration::from_secs(1);
                         } else {
+                            warn!(next_backoff_ms = peer_discovery_backoff.as_millis() as u64, "No peer found in S3 membership");
                             has_peer = false;
                             last_peer_discovery_attempt = std::time::Instant::now();
                             peer_discovery_backoff = (peer_discovery_backoff * 2).min(half_s3_lease);
                         }
                     }
                     Err(e) => {
+                        error!(error = %e, "S3 lease renewal/election failed, panic");
                         panic!("Election failed after retries: {e}");
                     }
                 }

@@ -7,7 +7,7 @@ use celeriant_msg::request::requests::ReplicationBatchItem;
 use celeriant_rotating_log::log_segment_file::log_segment_file::{read_datablocks_carry_over_bytes, write_dual_shard_log_header};
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
 use celeriant_wal::compression_type::CompressionType;
-use celeriant_wal::constants::{FIXED_BLOCK_SIZE_BYTES, GENESIS_HASH, HEADER_BLOCK_SIZE_BYTES};
+use celeriant_wal::constants::{FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES};
 use celeriant_wal::metablocks::datablock_storage_kind::DatablockStorageKind;
 use celeriant_wire::disk::serialised_datablock::SerialisedDatablock;
 use celeriant_wire::disk::versioned_block::{deserialise_fallback_batch, deserialise_metablock};
@@ -225,9 +225,8 @@ async fn catchup_round<D: S3Downloader>(
         match apply_external_batch(log_segments_cache, shard_mem_cache, items) {
             Ok(()) => {}
             Err(ApplyBatchError::TipHashMismatch { current_wal_index, batch_wal_index, .. }) => {
-                // Try the fast path first: use the already-downloaded batch's overlapping
-                // entries to find the common ancestor (zero additional S3 calls).
-                // Falls back to targeted S3 search if the batch doesn't overlap local WAL.
+                // Local WAL diverged from S3 (hash chain mismatch).
+                // Find the common ancestor and truncate divergent local entries.
                 let (common_ancestor_hash, divergent_wal_index, divergent_entry_position) =
                     match find_divergence_from_batch(log_segments_cache, &all_items).await {
                         Ok(result) => result,
@@ -237,9 +236,7 @@ async fn catchup_round<D: S3Downloader>(
                     };
 
                 tracing::warn!(
-                    current_wal_index,
-                    batch_wal_index,
-                    divergent_wal_index,
+                    shard_id, current_wal_index, batch_wal_index, divergent_wal_index,
                     "TipHashMismatch detected, truncating divergent WAL entries"
                 );
                 truncate_wal(
@@ -248,6 +245,19 @@ async fn catchup_round<D: S3Downloader>(
                 ).await.map_err(S3CatchupError::TruncationFailed)?;
 
                 return Ok(RoundApplied { batches: round.batches, bytes: round.bytes, truncated: true });
+            }
+            Err(ApplyBatchError::WalIndexMismatch { current: current_wal_index, batch_first: batch_wal_index }) => {
+                // Batch starts ahead of local WAL. The follower has orphaned entries
+                // from a leader rollback that were TCP-replicated but never committed
+                // to S3. S3 cannot fill this gap — only the leader has those entries.
+                // Stop this catchup round and let TCP replication fill the gap once
+                // the follower reconnects to the leader.
+                tracing::warn!(
+                    shard_id, current_wal_index, batch_wal_index,
+                    gap = batch_wal_index - current_wal_index - 1,
+                    "S3 batch starts ahead of local WAL (leader rollback gap), deferring to TCP replication"
+                );
+                return Ok(RoundApplied { batches: round.batches, bytes: round.bytes, truncated: false });
             }
             Err(e) => return Err(S3CatchupError::ApplyFailed(e)),
         }
@@ -270,6 +280,11 @@ async fn catchup_round<D: S3Downloader>(
 }
 
 /// Validate WAL continuity and queue entries. Does not fsync.
+///
+/// Handles mid-batch resume: if the batch contains entries at or before the
+/// current WAL index (from a previous partial application that crashed before
+/// completing the full batch), those entries are skipped and application
+/// resumes from `current_wal_index + 1`.
 pub(crate) fn apply_external_batch(
     log_segments_cache: &Rc<LogSegmentsCache>,
     shard_mem_cache: &Rc<RefCell<MemCache>>,
@@ -280,10 +295,19 @@ pub(crate) fn apply_external_batch(
         let metadata = active.metadata.borrow();
         (metadata.write.tip_hash, metadata.write.wal_index)
     };
-    let (batch_tip_hash, batch_wal_index) = items
-        .first()
-        .map(|b| (b.metablock.previous_tip_hash, b.metablock.wal_index))
-        .unwrap_or((GENESIS_HASH, 0));
+
+    // Skip entries already applied (mid-batch resume after crash)
+    let skip = items.iter()
+        .position(|item| item.metablock.wal_index > current_wal_index)
+        .unwrap_or(items.len());
+    let items = &items[skip..];
+
+    if items.is_empty() {
+        return Ok(());
+    }
+
+    let batch_wal_index = items[0].metablock.wal_index;
+    let batch_tip_hash = items[0].metablock.previous_tip_hash;
 
     if current_wal_index.saturating_add(1) != batch_wal_index {
         return Err(ApplyBatchError::WalIndexMismatch {
@@ -583,7 +607,7 @@ mod tests {
 
     use celeriant_distributed::paths::fallback_batch_path;
     use celeriant_wal::aggregate_key::AggregateKey;
-    use celeriant_wal::constants::WIRE_VERSION_S3_FALLBACK_BATCH;
+    use celeriant_wal::constants::{GENESIS_HASH, WIRE_VERSION_S3_FALLBACK_BATCH};
     use celeriant_wal::metablocks::metablock::Metablock;
     use celeriant_wal::s3::fallback_batch::{FallbackBatch, FallbackItem};
     use celeriant_wire::disk::versioned_block::serialize_versioned_message_heap;
@@ -802,6 +826,66 @@ mod tests {
             };
             apply_external_batch(&tc.log_segments_cache, &tc.shard_mem_cache, &[item]).unwrap();
             assert!(!tc.shard_mem_cache.borrow().pending_append_queue_is_empty());
+
+            tc.close().await;
+        });
+    }
+
+    #[test]
+    fn apply_skips_already_applied_entries_mid_batch() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+
+            // Apply entry 1 to advance WAL
+            let item1 = ReplicationBatchItem {
+                metablock: test_metablock(1, GENESIS_HASH),
+                datablock: None,
+            };
+            apply_external_batch(&tc.log_segments_cache, &tc.shard_mem_cache, &[item1]).unwrap();
+            // Flush the pending queue so WAL index advances
+            sync_applied_batch(
+                &tc.log_segments_cache, &tc.shard_mem_cache,
+                &tc.fsync_coordinator, &tc.watched_aggregates, 0,
+            ).await.unwrap();
+            assert_eq!(tc.wal_index(), 1);
+
+            // Now send a batch [1, 2] — entry 1 should be skipped, entry 2 applied
+            let tip = tc.tip_hash();
+            let stale = ReplicationBatchItem {
+                metablock: test_metablock(1, GENESIS_HASH),
+                datablock: None,
+            };
+            let fresh = ReplicationBatchItem {
+                metablock: test_metablock(2, tip),
+                datablock: None,
+            };
+            apply_external_batch(&tc.log_segments_cache, &tc.shard_mem_cache, &[stale, fresh]).unwrap();
+
+            tc.close().await;
+        });
+    }
+
+    #[test]
+    fn apply_returns_ok_when_batch_fully_applied() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+
+            // Apply entry 1
+            let item = ReplicationBatchItem {
+                metablock: test_metablock(1, GENESIS_HASH),
+                datablock: None,
+            };
+            apply_external_batch(&tc.log_segments_cache, &tc.shard_mem_cache, &[item.clone()]).unwrap();
+            sync_applied_batch(
+                &tc.log_segments_cache, &tc.shard_mem_cache,
+                &tc.fsync_coordinator, &tc.watched_aggregates, 0,
+            ).await.unwrap();
+            assert_eq!(tc.wal_index(), 1);
+
+            // Re-send same entry — should be a no-op
+            apply_external_batch(&tc.log_segments_cache, &tc.shard_mem_cache, &[item]).unwrap();
 
             tc.close().await;
         });

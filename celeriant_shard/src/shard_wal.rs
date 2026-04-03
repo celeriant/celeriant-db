@@ -1938,7 +1938,6 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             })));
         }
 
-        //It would be a rare scenario, maybe an invariant we can enforce during compaction
         match shard_wal_s3_catchup::apply_external_batch(
             &self.log_segments_cache, &self.shard_mem_cache, &request.batches,
         ) {
@@ -1970,6 +1969,14 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             }
         }
 
+        // Track the first WAL index of this batch so we can upload it to S3 on promotion.
+        // Covers the case where the leader rolled back this batch but we (the follower) kept it.
+        {
+            let active = self.log_segments_cache.active();
+            active.metadata.borrow_mut().last_received_replication_wal_index =
+                request.batches[0].metablock.wal_index;
+        }
+
         self.sync_durable().await
             .map_err(FollowerReplicationWriteError::ShardFSyncError)?;
 
@@ -1981,6 +1988,81 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         Ok(response(ReplicationResult::Success {
             last_follower_metablock: None,
         }))
+    }
+
+    /// Upload the last TCP-replicated batch to S3 on promotion to leader.
+    ///
+    /// When this node was a follower, the leader may have rolled back its last batch
+    /// after failing to get our ACK (partition). We kept the batch. On promotion,
+    /// upload it to S3 so the old leader can catch up without a gap.
+    pub async fn upload_s3_promotion_batch(&self) -> Result<(), crate::error::replication_to_s3_error::ReplicateToS3Error> {
+        let (start_wal_index, current_wal_index) = {
+            let active = self.log_segments_cache.active();
+            let metadata = active.metadata.borrow();
+            (metadata.last_received_replication_wal_index, metadata.write.wal_index)
+        };
+
+        if start_wal_index == 0 || start_wal_index > current_wal_index {
+            return Ok(());
+        }
+
+        let shard_id = self.config.shard_id;
+        let read_max_chunk_size = self.config.read_max_chunk_size;
+
+        // Scan backwards from WAL tip to collect entries from start_wal_index onward
+        let current_log_id = self.log_segments_cache.active_log_id();
+        let mut scanner = ReverseMetablockScanner::new(
+            &self.log_segments_cache, current_log_id, None, read_max_chunk_size,
+        );
+
+        let mut items: Vec<EventBatchFromLogSegmentFile> = vec![];
+        let _scan_result = scanner
+            .scan(|log_id, _pos, bytes| {
+                let wal_index = metablock_bytes::read_wal_index(bytes);
+                if wal_index < start_wal_index {
+                    return Ok(Some(()));
+                }
+                let metablock = deserialise_metablock(bytes)?;
+                items.push(EventBatchFromLogSegmentFile { log_id, metablock, datablock: None });
+                Ok::<Option<()>, DiskFormatError>(None)
+            })
+            .await
+            .map_err(|e| crate::error::replication_to_s3_error::ReplicateToS3Error::SerializationFailed(
+                format!("Failed to scan WAL for promotion batch: {e:?}"),
+            ))?;
+
+        if items.is_empty() {
+            return Ok(());
+        }
+
+        items.reverse();
+
+        fetch_datablocks_for_metablocks(&mut items, read_max_chunk_size, &self.log_segments_cache)
+            .await
+            .map_err(|e| crate::error::replication_to_s3_error::ReplicateToS3Error::SerializationFailed(
+                format!("Failed to fetch datablocks for promotion batch: {e:?}"),
+            ))?;
+
+        let batch_items: Vec<celeriant_msg::request::requests::ReplicationBatchItem> = items
+            .into_iter()
+            .map(|e| celeriant_msg::request::requests::ReplicationBatchItem {
+                metablock: e.metablock,
+                datablock: e.datablock,
+            })
+            .collect();
+
+        let batch_count = batch_items.len();
+        info!(shard_id, batch_count, start_wal_index, current_wal_index, "Uploading promotion batch to S3");
+
+        self.replication_client.replicate_to_s3(batch_items).await?;
+
+        // Clear the field now that S3 has the data
+        {
+            let active = self.log_segments_cache.active();
+            active.metadata.borrow_mut().last_received_replication_wal_index = 0;
+        }
+
+        Ok(())
     }
 }
 
@@ -3492,6 +3574,173 @@ mod tests {
             };
             let resp = unwrap_replication(shard.handle_replication_batch(stale_request).await);
             assert!(matches!(resp.result, ReplicationResult::Rejected(FollowerRejection::TimeDriftTooHigh { .. })));
+
+            shard.close().await;
+        });
+    }
+
+    // ── Promotion batch upload ──
+
+    struct CapturingReplicationClient {
+        s3_uploads: RefCell<Vec<Vec<ReplicationBatchItem>>>,
+    }
+
+    impl CapturingReplicationClient {
+        fn new() -> Self {
+            Self { s3_uploads: RefCell::new(vec![]) }
+        }
+    }
+
+    impl ReplicationClient for CapturingReplicationClient {
+        fn set_follower_address(&self, _address: Option<String>) {}
+        async fn replicate_to_follower(&self, _batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError> { Ok(()) }
+        async fn replicate_to_s3(&self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToS3Error> {
+            self.s3_uploads.borrow_mut().push(batches);
+            Ok(())
+        }
+        async fn send_heartbeat(&self, unix_epoch_now_ms: u64, _lease_index: u64) -> Result<celeriant_msg::response::responses::HeartbeatResult, crate::error::send_heartbeat_error::SendHeartbeatError> {
+            Ok(celeriant_msg::response::responses::HeartbeatResult::Ack { follower_timestamp_ms: unix_epoch_now_ms + 10 })
+        }
+        async fn send_kick(&self) -> Result<bool, crate::error::send_heartbeat_error::SendHeartbeatError> { Ok(true) }
+    }
+
+    async fn open_follower_shard_capturing(dir: &std::path::Path, client: CapturingReplicationClient) -> ShardWal<CapturingReplicationClient, StubS3Downloader> {
+        ShardWal::open(test_config(dir), ValidatedNodeStatus::create_custom_status(NodeStatus::Follower { leader_lease_index: 0 }, 500, now_ms() + 10_000), client, StubS3Downloader)
+            .await
+            .unwrap()
+    }
+
+    /// Metablock with no datablock — avoids deserialization failures in promotion upload tests
+    fn test_metablock_no_datablock(wal_index: u64, previous_tip_hash: [u8; 32]) -> Metablock {
+        let mut mb = test_metablock(wal_index, previous_tip_hash);
+        mb.datablock = DatablockStorageKind::None;
+        mb
+    }
+
+    fn replication_item_no_datablock(wal_index: u64, tip_hash: [u8; 32]) -> ReplicationBatchItem {
+        ReplicationBatchItem {
+            metablock: test_metablock_no_datablock(wal_index, tip_hash),
+            datablock: None,
+        }
+    }
+
+    #[test]
+    fn replication_sets_last_received_wal_index() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_follower_shard(&dir).await;
+
+            let resp = unwrap_replication(
+                shard.handle_replication_batch(replication_batch_req(vec![replication_item(1, GENESIS_HASH)])).await,
+            );
+            assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+
+            let idx = shard.log_segments_cache.active().metadata.borrow().last_received_replication_wal_index;
+            assert_eq!(idx, 1, "should track wal_index of replicated batch");
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn replication_overwrites_last_received_wal_index_on_subsequent_batch() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_follower_shard(&dir).await;
+
+            let resp = unwrap_replication(
+                shard.handle_replication_batch(replication_batch_req(vec![replication_item(1, GENESIS_HASH)])).await,
+            );
+            assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+
+            let tip = shard.log_segments_cache.active().metadata.borrow().write.tip_hash;
+            let resp = unwrap_replication(
+                shard.handle_replication_batch(replication_batch_req(vec![replication_item(2, tip)])).await,
+            );
+            assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+
+            let idx = shard.log_segments_cache.active().metadata.borrow().last_received_replication_wal_index;
+            assert_eq!(idx, 2, "should overwrite to latest batch wal_index");
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn upload_promotion_batch_noop_when_field_zero() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let client = CapturingReplicationClient::new();
+            let shard = open_follower_shard_capturing(&dir, client).await;
+
+            // No replication happened, field is 0
+            shard.upload_s3_promotion_batch().await.unwrap();
+
+            assert!(shard.replication_client.s3_uploads.borrow().is_empty(), "should not upload when no pending batch");
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn upload_promotion_batch_uploads_and_clears() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let client = CapturingReplicationClient::new();
+            let shard = open_follower_shard_capturing(&dir, client).await;
+
+            let resp = unwrap_replication(
+                shard.handle_replication_batch(replication_batch_req(vec![replication_item_no_datablock(1, GENESIS_HASH)])).await,
+            );
+            assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+
+            shard.upload_s3_promotion_batch().await.unwrap();
+
+            let uploads = shard.replication_client.s3_uploads.borrow();
+            assert_eq!(uploads.len(), 1, "should upload exactly one batch");
+            assert_eq!(uploads[0].len(), 1, "batch should contain one item");
+            assert_eq!(uploads[0][0].metablock.wal_index, 1);
+            drop(uploads);
+
+            // Field should be cleared
+            let idx = shard.log_segments_cache.active().metadata.borrow().last_received_replication_wal_index;
+            assert_eq!(idx, 0, "field should be cleared after upload");
+
+            // Second call should be a noop
+            shard.upload_s3_promotion_batch().await.unwrap();
+            assert_eq!(shard.replication_client.s3_uploads.borrow().len(), 1, "should not re-upload");
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn upload_promotion_batch_after_multiple_replications() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let client = CapturingReplicationClient::new();
+            let shard = open_follower_shard_capturing(&dir, client).await;
+
+            // Replicate batch 1
+            let resp = unwrap_replication(
+                shard.handle_replication_batch(replication_batch_req(vec![replication_item_no_datablock(1, GENESIS_HASH)])).await,
+            );
+            assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+
+            // Replicate batch 2
+            let tip = shard.log_segments_cache.active().metadata.borrow().write.tip_hash;
+            let resp = unwrap_replication(
+                shard.handle_replication_batch(replication_batch_req(vec![replication_item_no_datablock(2, tip)])).await,
+            );
+            assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+
+            // Upload should contain only entries from wal_index 2 onward (last batch)
+            shard.upload_s3_promotion_batch().await.unwrap();
+
+            let uploads = shard.replication_client.s3_uploads.borrow();
+            assert_eq!(uploads.len(), 1);
+            assert_eq!(uploads[0].len(), 1, "should only upload from last_received index");
+            assert_eq!(uploads[0][0].metablock.wal_index, 2);
 
             shard.close().await;
         });

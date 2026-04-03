@@ -124,6 +124,7 @@ fn test_pending_commit_data() -> PendingCommitData {
         wal_index: 0,
         aggregate_bloom: vec![0u64; 4],
         tip_hash: GENESIS_HASH,
+        last_received_replication_wal_index: 0,
     };
     PendingCommitData {
         log_metadata: LogSegmentFileMetadata::new(1, 4 * 1024 * 1024, None, &header, true),

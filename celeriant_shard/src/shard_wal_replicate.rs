@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
 
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use celeriant_msg::request::requests::ReplicationBatchItem;
 use celeriant_rotating_log::log_segment_file::aggregate_key_bloom::AggregateKeyBloom;
@@ -138,6 +138,9 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
         // and needs to catch up itself first, or the follower is completely offline
         if follower_falling_behind_or_offline {
             metrics::counter!("celeriant_replication_s3_fallbacks_total", &shard_label).increment(1);
+            let first_wal = batches.first().map(|b| b.metablock.wal_index).unwrap_or(0);
+            let last_wal = batches.last().map(|b| b.metablock.wal_index).unwrap_or(0);
+            warn!(shard_id, batch_count = batches.len(), first_wal, last_wal, workset_size_bytes, "S3 fallback: uploading batch");
             match replication_client.replicate_to_s3(std::mem::take(&mut batches)).await {
                 Ok(()) => {
                     if !kick_sent {
@@ -670,6 +673,7 @@ mod tests {
                     write: LogSegmentCursor::default(),
                     read: None,
                     datablocks_carry_over: None,
+                    last_received_replication_wal_index: 0,
                 },
                 pending_queue: items,
             }],

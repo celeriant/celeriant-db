@@ -5,7 +5,7 @@ use crate::constants::{AGGREGATE_BLOOM_BYTES, EntryHashBytes, GENESIS_HASH, HEAD
 
 /// The header is written at the start and end of the fixed size log segment file.
 /// Writing both, protected by crc checks, allows recovery on torn writes.
-/// Header uses HEADER_BLOCK_SIZE_BYTES (16KB) to accommodate the bloom filter.
+/// Header uses HEADER_BLOCK_SIZE_BYTES (512KB) to accommodate the bloom filter.
 #[derive(Debug, Clone, Encode, Decode, DeepSizeOf)]
 pub struct ShardLogHeader {
     /// A metablock is 512 byte fixed size, written from the start of the file
@@ -27,6 +27,12 @@ pub struct ShardLogHeader {
     /// Used to quickly skip log segments during aggregate existence checks.
     /// A "definitely not in set" result means no metablocks for that aggregate exist.
     pub aggregate_bloom: Vec<u64>,
+
+    /// First WAL index of the last batch received via TCP replication while this node
+    /// was a follower. On promotion to leader, entries from this index onward are uploaded
+    /// to S3 so the old leader (which may have rolled back this batch) can catch up.
+    /// Zero means no pending promotion upload is needed.
+    pub last_received_replication_wal_index: u64,
 }
 
 impl ShardLogHeader {
@@ -38,10 +44,11 @@ impl ShardLogHeader {
     const WIRE_SIZE_WAL_INDEX: usize = 8;
     const WIRE_SIZE_TIP_HASH: usize = 32;
     const WIRE_SIZE_AGGREGATE_BLOOM: usize = AGGREGATE_BLOOM_BYTES;
+    const WIRE_SIZE_LAST_RECEIVED_REPLICATION_WAL_INDEX: usize = 8;
 
     pub const OFFSET_METABLOCKS_POSITION: usize = 0;
 
-    pub const OFFSET_DATABLOCKS_POSITION: usize = 
+    pub const OFFSET_DATABLOCKS_POSITION: usize =
         Self::OFFSET_METABLOCKS_POSITION + Self::WIRE_SIZE_METABLOCKS_POSITION;
 
     pub const OFFSET_WAL_INDEX: usize =
@@ -53,9 +60,12 @@ impl ShardLogHeader {
     pub const OFFSET_AGGREGATE_BLOOM: usize =
         Self::OFFSET_TIP_HASH + Self::WIRE_SIZE_TIP_HASH;
 
-    /// Total wire size of ShardLogHeader
-    pub const WIRE_SIZE_TOTAL: usize = 
+    pub const OFFSET_LAST_RECEIVED_REPLICATION_WAL_INDEX: usize =
         Self::OFFSET_AGGREGATE_BLOOM + Self::WIRE_SIZE_AGGREGATE_BLOOM;
+
+    /// Total wire size of ShardLogHeader
+    pub const WIRE_SIZE_TOTAL: usize =
+        Self::OFFSET_LAST_RECEIVED_REPLICATION_WAL_INDEX + Self::WIRE_SIZE_LAST_RECEIVED_REPLICATION_WAL_INDEX;
         
     pub fn new(file_len: u64) -> Self {
         Self {
@@ -64,6 +74,7 @@ impl ShardLogHeader {
             wal_index: 0,
             tip_hash: GENESIS_HASH,
             aggregate_bloom: vec![],
+            last_received_replication_wal_index: 0,
         }
     }
 
@@ -132,6 +143,7 @@ mod tests {
             wal_index: 0,
             tip_hash: GENESIS_HASH,
             aggregate_bloom: vec![],
+            last_received_replication_wal_index: 0,
         };
 
         assert_eq!(header.available_space(), 0); // saturating_sub prevents underflow

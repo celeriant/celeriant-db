@@ -15,6 +15,9 @@ pub struct LogSegmentFileMetadata {
     pub read: Option<LogSegmentCursor>,
     /// Used in write path as datablock file writes are not Direct I/O aligned
     pub datablocks_carry_over: Option<Vec<u8>>,
+    /// First WAL index of the last batch received via TCP replication while follower.
+    /// On promotion to leader, entries from this index onward are uploaded to S3.
+    pub last_received_replication_wal_index: u64,
 }
 
 impl LogSegmentFileMetadata {
@@ -29,12 +32,13 @@ impl LogSegmentFileMetadata {
             write: LogSegmentCursor::from_shard_log_header(log_id, shard_log_header),
             read: if advance_read { Some(LogSegmentCursor::from_shard_log_header(log_id, shard_log_header)) } else { None },
             datablocks_carry_over,
+            last_received_replication_wal_index: shard_log_header.last_received_replication_wal_index,
         }
     }
 
     #[must_use]
     pub fn to_shard_log_header(&self) -> ShardLogHeader {
-        self.write.to_shard_log_header()
+        self.write.to_shard_log_header(self.last_received_replication_wal_index)
     }
 
     /// Advance visible position after successful replication (write -> read)
@@ -71,6 +75,7 @@ mod tests {
             wal_index: wal_idx,
             tip_hash: [0u8; 32],
             aggregate_bloom: AggregateKeyBloom::new().to_bytes(),
+            last_received_replication_wal_index: 0,
         }
     }
 
