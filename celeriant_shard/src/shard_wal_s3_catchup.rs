@@ -246,19 +246,21 @@ async fn catchup_round<D: S3Downloader>(
 
                 return Ok(RoundApplied { batches: round.batches, bytes: round.bytes, truncated: true });
             }
-            Err(ApplyBatchError::WalIndexMismatch { current: current_wal_index, batch_first: batch_wal_index }) => {
-                // Batch starts ahead of local WAL. The follower has orphaned entries
-                // from a leader rollback that were TCP-replicated but never committed
-                // to S3. S3 cannot fill this gap — only the leader has those entries.
-                // Stop this catchup round and let TCP replication fill the gap once
-                // the follower reconnects to the leader.
-                tracing::warn!(
-                    shard_id, current_wal_index, batch_wal_index,
-                    gap = batch_wal_index - current_wal_index - 1,
-                    "S3 batch starts ahead of local WAL (leader rollback gap), deferring to TCP replication"
-                );
-                return Ok(RoundApplied { batches: round.batches, bytes: round.bytes, truncated: false });
-            }
+            // TODO: Defence in depth - a bug the makes it impossible to catchup via s3
+            // Can fallback to TCP. Need to enhance tcp replication side to allow larger catchups in this scenario
+            // Err(ApplyBatchError::WalIndexMismatch { current: current_wal_index, batch_first: batch_wal_index }) => {
+            //     // Batch starts ahead of local WAL. The follower has orphaned entries
+            //     // from a leader rollback that were TCP-replicated but never committed
+            //     // to S3. S3 cannot fill this gap — only the leader has those entries.
+            //     // Stop this catchup round and let TCP replication fill the gap once
+            //     // the follower reconnects to the leader.
+            //     tracing::warn!(
+            //         shard_id, current_wal_index, batch_wal_index,
+            //         gap = batch_wal_index - current_wal_index - 1,
+            //         "S3 batch starts ahead of local WAL (leader rollback gap), deferring to TCP replication"
+            //     );
+            //     return Ok(RoundApplied { batches: round.batches, bytes: round.bytes, truncated: false });
+            // }
             Err(e) => return Err(S3CatchupError::ApplyFailed(e)),
         }
 
