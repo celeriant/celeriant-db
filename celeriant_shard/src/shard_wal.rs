@@ -1117,6 +1117,10 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             }
         };
 
+        if self.shard_mem_cache.borrow().is_replication_queue_pressured() {
+            return Err(ShardWriteError::ReplicationBackpressure);
+        }
+
         // Make sure we have at least one aggregate to write
         if write_request.writes.is_empty() {
             return Err(ShardWriteError::EmptyEventsList);
@@ -3315,6 +3319,9 @@ mod tests {
     }
 
     impl ReplicationClient for FailThenSucceedReplicationClient {
+        fn set_follower_reachable(&self, _: bool) {}
+        fn is_follower_reachable(&self) -> bool { true }
+
         async fn replicate_to_follower(&self, _batches: Vec<celeriant_msg::request::requests::ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError> {
             let remaining = self.follower_failures_remaining.get();
             if remaining > 0 {
@@ -3347,6 +3354,89 @@ mod tests {
         ShardWal::open(test_config(dir), ValidatedNodeStatus::create_custom_status(NodeStatus::Leader { lease_index: 0 }, 500, now_ms() + 10_000), client, StubS3Downloader)
             .await
             .unwrap()
+    }
+
+    /// Replication client with a flag to switch from success to permanent failure.
+    struct SwitchableReplicationClient {
+        should_fail: Cell<bool>,
+    }
+
+    impl SwitchableReplicationClient {
+        fn new() -> Self {
+            Self { should_fail: Cell::new(false) }
+        }
+    }
+
+    impl ReplicationClient for SwitchableReplicationClient {
+        fn set_follower_address(&self, _: Option<String>) {}
+        fn set_follower_reachable(&self, _: bool) {}
+        fn is_follower_reachable(&self) -> bool { true }
+
+        async fn replicate_to_follower(&self, _: Vec<celeriant_msg::request::requests::ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError> {
+            if self.should_fail.get() {
+                return Err(ReplicateToFollowerError::FollowerUnexpectedResponse);
+            }
+            Ok(())
+        }
+
+        async fn replicate_to_s3(&self, _: Vec<celeriant_msg::request::requests::ReplicationBatchItem>) -> Result<(), ReplicateToS3Error> {
+            if self.should_fail.get() {
+                return Err(ReplicateToS3Error::S3NotConfigured);
+            }
+            Ok(())
+        }
+
+        async fn send_heartbeat(&self, unix_epoch_now_ms: u64, _: u64) -> Result<celeriant_msg::response::responses::HeartbeatResult, crate::error::send_heartbeat_error::SendHeartbeatError> {
+            Ok(celeriant_msg::response::responses::HeartbeatResult::Ack { follower_timestamp_ms: unix_epoch_now_ms + 10 })
+        }
+
+        async fn send_kick(&self) -> Result<bool, crate::error::send_heartbeat_error::SendHeartbeatError> { Ok(true) }
+    }
+
+    #[test]
+    fn rollback_after_rotation_does_not_panic() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let temp_dir = dir.join("compaction_temp");
+            std::fs::create_dir_all(&temp_dir).unwrap();
+
+            let config = InternalShardConfig {
+                shard_log_preallocate_bytes: 3 * 512 * 1024, // 1.5MB — smallest valid segment
+                compaction_temp_dir: temp_dir,
+                ..test_config(&dir)
+            };
+
+            let client = SwitchableReplicationClient::new();
+            let shard = ShardWal::open(
+                config,
+                ValidatedNodeStatus::create_custom_status(NodeStatus::Leader { lease_index: 0 }, 500, now_ms() + 30_000),
+                client,
+                StubS3Downloader,
+            ).await.unwrap();
+
+            let agg = key(1, 1, 1);
+            let old_log_id = shard.log_segments_cache.active_log_id();
+
+            // Fill the segment with fat writes until rotation occurs (replication succeeds)
+            let mut i = 1u64;
+            while shard.log_segments_cache.active_log_id() == old_log_id {
+                write_ok(&shard, write_req(agg.clone(), fat_event(i))).await;
+                i += 1;
+            }
+
+            // Now on a fresh segment with read: None. Flip to fail mode.
+            shard.replication_client.should_fail.set(true);
+
+            // This write triggers replication failure → rollback on the new segment.
+            // Before the fix, this panics with unwrap() on metadata.read which is None.
+            let result = process(&shard, write_req(agg.clone(), fat_event(i))).await;
+            assert!(
+                matches!(result, Err(ShardError::Write(ShardWriteError::ReplicationError(_)))),
+                "expected ReplicationError from rollback, got {:?}", result
+            );
+
+            shard.close().await;
+        });
     }
 
     #[test]
@@ -3593,6 +3683,8 @@ mod tests {
 
     impl ReplicationClient for CapturingReplicationClient {
         fn set_follower_address(&self, _address: Option<String>) {}
+        fn set_follower_reachable(&self, _: bool) {}
+        fn is_follower_reachable(&self) -> bool { true }
         async fn replicate_to_follower(&self, _batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError> { Ok(()) }
         async fn replicate_to_s3(&self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToS3Error> {
             self.s3_uploads.borrow_mut().push(batches);

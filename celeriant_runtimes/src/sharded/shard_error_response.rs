@@ -123,6 +123,7 @@ fn write_error(e: ShardWriteError) -> (u32, String) {
         ShardWriteError::CacheAggregateClientError(e) => cache_load_error(WRITE_CACHE_AGGREGATE_CLIENT_ERROR, WRITE_CACHE_AGGREGATE_CLIENT_ERROR, e),
         ShardWriteError::AggregateExistsAndCacheError(e) => cache_load_error(WRITE_AGGREGATE_EXISTS_CACHE_ERROR, WRITE_AGGREGATE_EXISTS_CACHE_ERROR, e),
         ShardWriteError::ShardCannotAcceptWrites { leader_address } => (WRITE_NOT_LEADER, cannot_accept_writes_message(leader_address)),
+        ShardWriteError::ReplicationBackpressure => (WRITE_REPLICATION_BACKPRESSURE, "{}".into()),
         ShardWriteError::SchemaValidationFailed { event_type_major, event_type_minor, client_event_index, validation_error } => (
             WRITE_SCHEMA_VALIDATION_FAILED,
             format!(

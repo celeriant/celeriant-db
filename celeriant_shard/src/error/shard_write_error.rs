@@ -41,6 +41,9 @@ pub enum ShardWriteError {
     AggregateExistsAndCacheError(ShardCacheLoadError),
     ShardCannotAcceptWrites { leader_address: Option<String> },
 
+    /// Replication queue is above the high-water mark. Client should retry.
+    ReplicationBackpressure,
+
     /// Event payload failed schema validation.
     SchemaValidationFailed {
         event_type_major: u64,
@@ -73,6 +76,7 @@ impl ShardWriteError {
             Self::CacheAggregateClientError(_) => "cache_load_error",
             Self::AggregateExistsAndCacheError(_) => "cache_load_error",
             Self::ShardCannotAcceptWrites { .. } => "shard_cannot_accept_writes",
+            Self::ReplicationBackpressure => "replication_backpressure",
             Self::SchemaValidationFailed { .. } => "schema_validation_failed",
             Self::SchemaCompilationFailed { .. } => "schema_compilation_failed",
         }

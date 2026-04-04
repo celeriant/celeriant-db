@@ -103,7 +103,8 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
     // Because we are paginating data to the follower, we have a loop
     // At any point we might have to fallback to s3. Also the follower
     // can push back and require additional entries to be sent
-    let mut follower_falling_behind_or_offline = replication_captured_data.follower_falling_behind_or_offline;
+    let mut follower_falling_behind_or_offline = replication_captured_data.follower_falling_behind_or_offline
+        || !replication_client.is_follower_reachable();
     let mut added_additional_entries = false;
     let mut kick_sent = false;
 
@@ -143,7 +144,7 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
             warn!(shard_id, batch_count = batches.len(), first_wal, last_wal, workset_size_bytes, "S3 fallback: uploading batch");
             match replication_client.replicate_to_s3(std::mem::take(&mut batches)).await {
                 Ok(()) => {
-                    if !kick_sent {
+                    if !kick_sent && replication_client.is_follower_reachable() {
                         let _ = replication_client.send_kick().await;
                         kick_sent = true;
                     }
@@ -151,7 +152,7 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
                 }
                 Err(replication_err) => {
                     error!(shard_id, error = ?replication_err, "S3 fallback upload failed — triggering replication rollback");
-                    return match rollback_replicate(
+                    return match rollback_or_requeue(
                         &fsync_coordinator,
                         &log_segments_cache,
                         &shard_mem_cache,
@@ -162,7 +163,7 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
                     {
                         Ok(()) => Err(ReplicationError::ReplicateToS3Error(replication_err)),
                         Err(rollback_err) => {
-                            error!(shard_id, error = ?rollback_err, "Replication rollback itself failed — node is in inconsistent state");
+                            error!(shard_id, error = ?rollback_err, "Replication rollback itself failed — entries re-queued for next cycle");
                             Err(ReplicationError::RollbackFailed(rollback_err))
                         }
                     };
@@ -189,6 +190,13 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
                 }
 
                 match replication_err {
+                    // Network errors and lock timeouts: follower is unreachable.
+                    // Go straight to S3 — don't retry TCP, it will just hold the
+                    // replication_conn lock for another request_timeout cycle.
+                    ReplicateToFollowerError::FollowerNetworkError(_) | ReplicateToFollowerError::LockTimeout => {
+                        _replication_details = ReplicationDetails::RepliatedToS3(replication_err);
+                        follower_falling_behind_or_offline = true;
+                    }
                     ReplicateToFollowerError::FollowerRejected(ref follower_rejection) => {
                         match follower_rejection {
                             celeriant_msg::response::responses::FollowerRejection::WalIndexMismatch { max_follower_wal_index } => {
@@ -225,7 +233,7 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
                                             _ => {
                                                 // The rare scenario where our local disk has failed to read the entries
                                                 // In this case we rollback the writes and notify all clients to stop using this node
-                                                return match rollback_replicate(
+                                                return match rollback_or_requeue(
                                                     &fsync_coordinator,
                                                     &log_segments_cache,
                                                     &shard_mem_cache,
@@ -236,7 +244,7 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
                                                 {
                                                     Ok(()) => Err(ReplicationError::ExtendedCatchupFailure(e)),
                                                     Err(rollback_err) => {
-                                                        error!(shard_id, error = ?rollback_err, "Replication rollback itself failed — node is in inconsistent state");
+                                                        error!(shard_id, error = ?rollback_err, "Replication rollback itself failed — entries re-queued for next cycle");
                                                         Err(ReplicationError::RollbackFailed(rollback_err))
                                                     }
                                                 };
@@ -405,11 +413,31 @@ fn commit_replication(
     sealed_ready
 }
 
-async fn rollback_replicate(
+/// Attempt rollback; if it fails, return entries to the pending replication queue
+/// so the next replication cycle can retry S3 upload. Entries must never be silently dropped.
+async fn rollback_or_requeue(
     fsync_coordinator: &Rc<Coordinator<ShardFsyncError>>,
     log_segments_cache: &Rc<LogSegmentsCache>,
     shard_mem_cache: &Rc<RefCell<MemCache>>,
     replication_snapshot: Vec<PendingCommitData>,
+    shard_id: u32,
+) -> Result<(), ReplicationRollbackFailure> {
+    match rollback_replicate(fsync_coordinator, log_segments_cache, shard_mem_cache, &replication_snapshot, shard_id).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let batch_count = replication_snapshot.len();
+            error!(shard_id, batch_count, error = ?e, "Rollback failed — returning entries to pending replication queue");
+            shard_mem_cache.borrow_mut().return_to_pending_replication(replication_snapshot);
+            Err(e)
+        }
+    }
+}
+
+async fn rollback_replicate(
+    fsync_coordinator: &Rc<Coordinator<ShardFsyncError>>,
+    log_segments_cache: &Rc<LogSegmentsCache>,
+    shard_mem_cache: &Rc<RefCell<MemCache>>,
+    replication_snapshot: &[PendingCommitData],
     shard_id: u32,
 ) -> Result<(), ReplicationRollbackFailure> {
     let batches_to_rollback = replication_snapshot.len();
@@ -442,6 +470,8 @@ async fn rollback_replicate(
                 // while still having uncommitted data in the previous log segment file
                 // *or* this is the first log file ever for this shard and we have to rollback the first batch
                 if metadata.read.is_none() {
+                    // Segment was never replicated (e.g. freshly rotated on a leader).
+                    // Reset write cursor to empty state — nothing to roll back to.
                     metadata.write.datablocks_position = shard_log_header_end_pos;
                     metadata.write.metablocks_position = HEADER_BLOCK_SIZE_BYTES as u64;
                     metadata.write.aggregate_key_bloom = AggregateKeyBloom::new();
@@ -453,10 +483,10 @@ async fn rollback_replicate(
                         metadata.write.wal_index = 0;
                         metadata.write.tip_hash = GENESIS_HASH;
                     }
+                } else {
+                    // Roll write cursor back to last replicated position.
+                    metadata.write = metadata.read.as_ref().unwrap().clone();
                 }
-
-                // The in-memory position needs updating
-                metadata.write = metadata.read.as_ref().unwrap().clone();
 
                 (metadata.to_shard_log_header(), shard_log_header_end_pos)
             };
@@ -635,6 +665,10 @@ mod tests {
     }
 
     impl ReplicationClient for RecordingReplicationClient {
+        fn set_follower_address(&self, _: Option<String>) {}
+        fn set_follower_reachable(&self, _: bool) {}
+        fn is_follower_reachable(&self) -> bool { false }
+
         async fn replicate_to_follower(&self, _: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError> {
             unreachable!("s3 path should not call replicate_to_follower")
         }
@@ -643,8 +677,6 @@ mod tests {
             self.s3_item_counts.borrow_mut().push(batches.len());
             Ok(())
         }
-
-        fn set_follower_address(&self, _address: Option<String>) {}
 
         async fn send_heartbeat(&self, _unix_epoch_now_ms: u64, _lease_index: u64) -> Result<celeriant_msg::response::responses::HeartbeatResult, crate::error::send_heartbeat_error::SendHeartbeatError> {
             unreachable!("s3 replication test should not call send_heartbeat")

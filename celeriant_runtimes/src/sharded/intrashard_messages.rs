@@ -26,6 +26,7 @@ pub enum IntrashardMessages {
     StatusUpdate { status: ValidatedNodeStatus },
     UpdatePeerNodeId { peer_node_id: Option<u128> },
     UpdateFollower { replication_address: Option<String>, peer_node_id: Option<u128> },
+    FollowerReachable { reachable: bool },
     UpdateLeaderClientAddress { client_address: Option<String> },
     SchemaRegistration {
         request: RegisterSchemaRequest,

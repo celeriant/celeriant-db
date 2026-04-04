@@ -846,6 +846,16 @@ impl<V: Validate> ShardMemCache<V> {
         std::mem::take(&mut self.pending_replication_batches)
     }
 
+    /// Return batches to the front of the pending queue after a failed replication
+    /// cycle. Preserves WAL order: returned batches will be replicated before any
+    /// new batches that arrived while the failed cycle was in progress.
+    pub fn return_to_pending_replication(&mut self, mut batches: Vec<PendingCommitData>) {
+        let returned_bytes: u64 = batches.iter().map(|b| b.size_bytes()).sum();
+        batches.append(&mut self.pending_replication_batches);
+        self.pending_replication_batches = batches;
+        self.pending_replication_bytes = self.pending_replication_bytes.saturating_add(returned_bytes);
+    }
+
     /// Peek at oldest batch (for timeout checking)
     pub fn peek_pending_replication(&self) -> Option<&PendingCommitData> {
         self.pending_replication_batches.first()

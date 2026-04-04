@@ -612,6 +612,8 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                 if let Ok(HeartbeatResult::Ack { .. }) = result {
                     has_peer = true;
                     peer_discovery_backoff = Duration::from_secs(1);
+                    ctx.shard_wal.replication_client.set_follower_reachable(true);
+                    broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::FollowerReachable { reachable: true }, ctx.intrashard_sender.clone()).await;
                     let refreshed = ValidatedNodeStatus::create_custom_status(
                         ctx.shard_wal.node_status.get().raw(), ctx.config.max_clock_drift_ms, unix_epoch_now_ms + ctx.config.heartbeat_lease_duration.as_millis() as u64);
                     ctx.shard_wal.node_status.set(refreshed);
@@ -619,6 +621,8 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                     continue;
                 }
 
+                ctx.shard_wal.replication_client.set_follower_reachable(false);
+                broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::FollowerReachable { reachable: false }, ctx.intrashard_sender.clone()).await;
                 metrics::counter!("celeriant_heartbeat_failures_total").increment(1);
 
                 // Decide whether to check S3: either for peer discovery (no known peer)
@@ -793,6 +797,9 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
         IntrashardMessages::UpdateFollower { replication_address, peer_node_id } => {
             ctx.shard_wal.replication_client.set_follower_address(replication_address);
             ctx.shard_wal.peer_node_id.set(peer_node_id);
+        }
+        IntrashardMessages::FollowerReachable { reachable } => {
+            ctx.shard_wal.replication_client.set_follower_reachable(reachable);
         }
         IntrashardMessages::UpdateLeaderClientAddress { client_address } => {
             *ctx.shard_wal.leader_client_address.borrow_mut() = client_address;

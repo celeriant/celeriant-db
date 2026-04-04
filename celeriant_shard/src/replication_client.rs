@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -22,6 +22,8 @@ use crate::s3_uploader::S3Uploader;
 #[allow(async_fn_in_trait)]
 pub trait ReplicationClient {
     fn set_follower_address(&self, address: Option<String>);
+    fn set_follower_reachable(&self, reachable: bool);
+    fn is_follower_reachable(&self) -> bool;
     async fn replicate_to_follower(&self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError>;
     async fn replicate_to_s3(&self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToS3Error>;
     async fn send_heartbeat(&self, unix_epoch_now_ms: u64, lease_index: u64) -> Result<HeartbeatResult, SendHeartbeatError>;
@@ -32,6 +34,8 @@ pub struct StubReplicationClient;
 
 impl ReplicationClient for StubReplicationClient {
     fn set_follower_address(&self, _address: Option<String>) {}
+    fn set_follower_reachable(&self, _reachable: bool) {}
+    fn is_follower_reachable(&self) -> bool { true }
 
     async fn replicate_to_follower(&self, _batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError> {
         glommio::timer::sleep(std::time::Duration::from_millis(30)).await;
@@ -117,6 +121,7 @@ impl ConnState {
 /// Manage follower communication with split internal locks
 pub struct FollowerConnection<S: S3Uploader> {
     follower_address: RefCell<Option<String>>,
+    follower_reachable: Cell<bool>,
     node_id: u128,
     shard_id: u64,
     replication_conn: RwLock<ConnState>,
@@ -146,6 +151,7 @@ impl<S: S3Uploader> FollowerConnection<S> {
         assert!(shard_id <= u32::MAX as u64, "shard_id {} exceeds u32::MAX", shard_id);
         Self {
             follower_address: RefCell::new(follower_address),
+            follower_reachable: Cell::new(false),
             node_id,
             shard_id,
             replication_conn: RwLock::new(ConnState::new()),
@@ -164,6 +170,14 @@ impl<S: S3Uploader> FollowerConnection<S> {
 impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
     fn set_follower_address(&self, address: Option<String>) {
         *self.follower_address.borrow_mut() = address;
+    }
+
+    fn set_follower_reachable(&self, reachable: bool) {
+        self.follower_reachable.set(reachable);
+    }
+
+    fn is_follower_reachable(&self) -> bool {
+        self.follower_reachable.get()
     }
 
     async fn replicate_to_follower(&self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError> {
