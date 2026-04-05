@@ -47,6 +47,8 @@ impl<V: Validate> DeepSizeOf for CachedValidator<V> {
 pub enum CachedSchema<V: Validate> {
     Validated(CachedValidator<V>),
     CompilationFailed(String),
+    /// Slot reserved during WAL scan — datablock not yet fetched from disk.
+    NotYetLoaded,
 }
 
 impl<V: Validate> Clone for CachedSchema<V> {
@@ -54,6 +56,7 @@ impl<V: Validate> Clone for CachedSchema<V> {
         match self {
             Self::Validated(v) => Self::Validated(v.clone()),
             Self::CompilationFailed(e) => Self::CompilationFailed(e.clone()),
+            Self::NotYetLoaded => Self::NotYetLoaded,
         }
     }
 }
@@ -63,6 +66,7 @@ impl<V: Validate> std::fmt::Debug for CachedSchema<V> {
         match self {
             Self::Validated(v) => f.debug_tuple("Validated").field(v).finish(),
             Self::CompilationFailed(e) => f.debug_tuple("CompilationFailed").field(e).finish(),
+            Self::NotYetLoaded => write!(f, "NotYetLoaded"),
         }
     }
 }
@@ -72,6 +76,7 @@ impl<V: Validate> DeepSizeOf for CachedSchema<V> {
         match self {
             Self::Validated(v) => v.deep_size_of_children(context),
             Self::CompilationFailed(e) => e.deep_size_of_children(context),
+            Self::NotYetLoaded => 0,
         }
     }
 }

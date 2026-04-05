@@ -336,6 +336,8 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             config.read_max_chunk_size,
         );
 
+        let mut deferred_schema_blocks: Vec<(u64, SchemaKey, Metablock)> = Vec::new();
+
         scanner
             .scan::<(), ReadyUpError>(|log_id, metablock_absolute_pos, metablock_bytes| {
                 if agg_cache_full && client_cache_full {
@@ -402,6 +404,22 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                     return Ok(None);
                 }
 
+                if metablock_bytes::is_metablock_kind_schema_registration(metablock_bytes) {
+                    if let Ok(metablock) = deserialise_metablock(metablock_bytes) {
+                        if log_id == starting_log_id {
+                            active_segment_metablocks.push(metablock.clone());
+                        }
+                        if let MetablockKind::SchemaRegistration(ref schema_reg) = metablock.wal_metablock_type {
+                            let mut cache = shard_mem_cache.borrow_mut();
+                            if !cache.is_schema_cache_full() && !cache.schema_cache_contains(&schema_reg.schema_key) {
+                                cache.schema_cache_insert(schema_reg.schema_key.clone(), celeriant_memcache::cached_schema::CachedSchema::NotYetLoaded);
+                                deferred_schema_blocks.push((log_id, schema_reg.schema_key.clone(), metablock.clone()));
+                            }
+                        }
+                    }
+                    return Ok(None);
+                }
+
                 if !metablock_bytes::is_metablock_kind_event_batch_metadata(metablock_bytes) {
                     return Ok(None);
                 }
@@ -458,6 +476,37 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                     source: std::io::Error::new(std::io::ErrorKind::NotFound, "no file handle"),
                 },
             })?;
+
+        // Fetch deferred schema datablocks (inline or from disk) and compile into cache
+        if !deferred_schema_blocks.is_empty() {
+            let mut batches: Vec<crate::collect_from_disk::EventBatchFromLogSegmentFile> = deferred_schema_blocks.iter()
+                .map(|(log_id, _, metablock)| crate::collect_from_disk::EventBatchFromLogSegmentFile {
+                    log_id: *log_id,
+                    metablock: metablock.clone(),
+                    datablock: None,
+                })
+                .collect();
+
+            crate::collect_from_disk::fetch_datablocks_for_metablocks(&mut batches, config.read_max_chunk_size, log_segments_cache)
+                .await
+                .map_err(|e| ReadyUpError::UnableToAccessDirectory {
+                    directory: format!("schema datablock fetch: {e:?}"),
+                    source: std::io::Error::new(std::io::ErrorKind::Other, format!("{e:?}")),
+                })?;
+
+            let mut cache = shard_mem_cache.borrow_mut();
+            for (batch, (_, schema_key, _)) in batches.into_iter().zip(deferred_schema_blocks.iter()) {
+                if let Some(datablock) = batch.datablock {
+                    if let DatablockKind::SchemaRegistration(schema_data) = datablock.datablock_kind {
+                        let cached = match crate::schema_validator::CompiledValidator::compile(schema_data.schema_type, &schema_data.schema) {
+                            Ok(validator) => celeriant_memcache::cached_schema::CachedSchema::Validated(validator),
+                            Err(e) => celeriant_memcache::cached_schema::CachedSchema::CompilationFailed(e),
+                        };
+                        cache.schema_cache_insert(schema_key.clone(), cached);
+                    }
+                }
+            }
+        }
 
         // Replay active segment metablocks in forward (write) order for correct summary state.
         // The reverse scan collected them newest-first; reversing gives chronological order.
@@ -1192,6 +1241,14 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         }
 
         // Phase 2: Append all prepared writes to queue - cannot fail
+        tracing::debug!(
+            shard_id = self.config.shard_id,
+            client_id = write_request.client_id,
+            aggregate_count = prepared_writes.len(),
+            total_events,
+            total_payload_bytes,
+            "Write request accepted",
+        );
         self.append_prepared_writes_to_queue(prepared_writes);
 
         // Wait on disk write, it's batched for performance
@@ -1455,8 +1512,8 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         )
         .with_bloom_filter_hash(schema_key.hash_bytes());
 
-        let found_schema = scanner
-            .scan::<Option<(celeriant_wal::SchemaType, String)>, ()>(|_log_id, _metablock_absolute_pos, metablock_bytes| {
+        let found_metablock = scanner
+            .scan::<(u64, Metablock), ()>(|log_id, _metablock_absolute_pos, metablock_bytes| {
                 if !metablock_bytes::is_schema_registration_for_key(metablock_bytes, schema_key) {
                     return Ok(None);
                 }
@@ -1465,18 +1522,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                     .map_err(|_| ())?;
 
                 if let MetablockKind::SchemaRegistration(_) = metablock.wal_metablock_type {
-                    let datablock = celeriant_wire::disk::serialised_datablock::deserialise_datablock(
-                        metablock.uncompressed_size,
-                        metablock.compressed_size,
-                        metablock.datablock_version,
-                        metablock.datablock_compression_type,
-                        &metablock.datablock,
-                        None,
-                    ).map_err(|_| ())?;
-
-                    if let DatablockKind::SchemaRegistration(schema_reg) = datablock.datablock_kind {
-                        return Ok(Some(Some((schema_reg.schema_type, schema_reg.schema))));
-                    }
+                    return Ok(Some((log_id, metablock)));
                 }
 
                 Ok(None)
@@ -1484,17 +1530,32 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             .await
             .map_err(ShardCacheLoadError::FileScanningError)?;
 
-        let mut cache = self.shard_mem_cache.borrow_mut();
-        match found_schema.flatten() {
-            Some((schema_type, schema)) => {
-                let cached = match crate::schema_validator::CompiledValidator::compile(schema_type, &schema) {
-                    Ok(validator) => celeriant_memcache::cached_schema::CachedSchema::Validated(validator),
-                    Err(e) => celeriant_memcache::cached_schema::CachedSchema::CompilationFailed(e),
-                };
-                cache.schema_cache_insert(schema_key.clone(), cached);
+        match found_metablock {
+            Some((log_id, metablock)) => {
+                let mut batch = [crate::collect_from_disk::EventBatchFromLogSegmentFile {
+                    log_id,
+                    metablock,
+                    datablock: None,
+                }];
+
+                crate::collect_from_disk::fetch_datablocks_for_metablocks(&mut batch, self.config.read_max_chunk_size, &self.log_segments_cache)
+                    .await
+                    .map_err(|e| ShardCacheLoadError::DatablockReadError(format!("{e:?}")))?;
+
+                let [batch] = batch;
+                let mut cache = self.shard_mem_cache.borrow_mut();
+                if let Some(datablock) = batch.datablock {
+                    if let DatablockKind::SchemaRegistration(schema_data) = datablock.datablock_kind {
+                        let cached = match crate::schema_validator::CompiledValidator::compile(schema_data.schema_type, &schema_data.schema) {
+                            Ok(validator) => celeriant_memcache::cached_schema::CachedSchema::Validated(validator),
+                            Err(e) => celeriant_memcache::cached_schema::CachedSchema::CompilationFailed(e),
+                        };
+                        cache.schema_cache_insert(schema_key.clone(), cached);
+                    }
+                }
             }
             None => {
-                cache.no_schema_cache_insert(schema_key.clone());
+                self.shard_mem_cache.borrow_mut().no_schema_cache_insert(schema_key.clone());
             }
         }
 
@@ -1893,10 +1954,17 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             return Ok(());
         }
 
+        let follower_reachable = replication_client.is_follower_reachable();
+        let delay = if follower_reachable {
+            self.config.replication_delay
+        } else {
+            self.config.s3_replication_delay
+        };
+
         let mc_capture = shard_mem_cache.clone();
         self.replication_coordinator
             .request_sync_two_phase(
-                Some(self.config.replication_delay),
+                Some(delay),
                 move || async move { capture_replication_snapshot(&mc_capture) },
                 move |captured| commit_replication_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates, captured, max_catchup_gap_bytes, max_request_size, read_max_chunk_size, shard_id),
             )
@@ -2465,6 +2533,17 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 }
 
 #[cfg(test)]
+impl<R: crate::replication_client::ReplicationClient, D: crate::s3_downloader::S3Downloader> ShardWal<R, D> {
+    fn schema_cache_has_schema(&self, key: &SchemaKey) -> bool {
+        self.shard_mem_cache.borrow().schema_cache_has_schema(key)
+    }
+
+    fn schema_cache_clear(&self) {
+        self.shard_mem_cache.borrow_mut().schema_cache_clear();
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::error::replication_to_follower_error::ReplicateToFollowerError;
@@ -2507,6 +2586,7 @@ mod tests {
             shard_log_preallocate_bytes: 4 * 1024 * 1024,
             fsync_delay: Duration::ZERO,
             replication_delay: Duration::ZERO,
+            s3_replication_delay: Duration::from_millis(500),
             recent_write_cache_bytes: 64 * 1024 * 1024,
             shard_dir: dir.to_path_buf(),
             max_response_size: 16 * 1024 * 1024,
@@ -4226,6 +4306,76 @@ mod tests {
                 let invalid = json_events(&[br#"{"name":"bob"}"#], 1, 0);
                 let result = process(&shard, write_req(key(1, 1, 2), invalid)).await;
                 assert!(matches!(result, Err(ShardError::Write(ShardWriteError::SchemaValidationFailed { .. }))));
+
+                shard.close().await;
+            }
+        });
+    }
+
+    #[test]
+    fn schema_prewarm_recovers_inline_and_block_datablocks() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+
+            // Build a schema large enough to exceed MINIBATCH_SIZE_BYTES (512)
+            // and force block storage. ~20 properties at ~28 bytes each = ~560+ bytes.
+            let mut large_schema = String::from(r#"{"type":"object","properties":{"#);
+            for i in 0..20 {
+                if i > 0 { large_schema.push(','); }
+                large_schema.push_str(&format!(r#""field_{i:02}":{{ "type":"string"}}"#));
+            }
+            large_schema.push_str(r#"},"required":["field_00"]}"#);
+            assert!(large_schema.len() > 512, "schema must exceed inline threshold");
+
+            // Register both an inline schema (event type 1,0) and a block schema (event type 2,0)
+            {
+                let shard = open_shard(&dir).await;
+                process(&shard, schema_req(1, 1, 1, 0, NAME_AGE_SCHEMA)).await.unwrap();
+                process(&shard, schema_req(1, 1, 2, 0, &large_schema)).await.unwrap();
+                shard.close().await;
+            }
+
+            // Reopen — pre_warm_cache must recover both inline and block schemas
+            {
+                let shard = open_shard(&dir).await;
+
+                let inline_key = SchemaKey::new(1, 1, 1, 0);
+                let block_key = SchemaKey::new(1, 1, 2, 0);
+
+                // Both schemas must be in cache immediately after open, before any writes
+                assert!(shard.schema_cache_has_schema(&inline_key), "inline schema not pre-warmed");
+                assert!(shard.schema_cache_has_schema(&block_key), "block schema not pre-warmed");
+
+                // Inline schema: validation works
+                let valid = json_events(&[br#"{"name":"bob","age":25}"#], 1, 0);
+                write_ok(&shard, write_req(key(1, 1, 1), valid)).await;
+
+                let invalid = json_events(&[br#"{"name":"bob"}"#], 1, 0);
+                let result = process(&shard, write_req(key(1, 1, 2), invalid)).await;
+                assert!(matches!(result, Err(ShardError::Write(ShardWriteError::SchemaValidationFailed { .. }))));
+
+                // Block schema: validation works
+                let valid = json_events(&[br#"{"field_00":"hello"}"#], 2, 0);
+                write_ok(&shard, write_req(key(1, 1, 3), valid)).await;
+
+                let invalid = json_events(&[br#"{"field_00": 42}"#], 2, 0);
+                let result = process(&shard, write_req(key(1, 1, 4), invalid)).await;
+                assert!(matches!(result, Err(ShardError::Write(ShardWriteError::SchemaValidationFailed { .. }))));
+
+                // Force-clear the schema cache to test ensure_schema_cached (cold-cache WAL scan)
+                shard.schema_cache_clear();
+                assert!(!shard.schema_cache_has_schema(&inline_key), "inline schema should be cleared");
+                assert!(!shard.schema_cache_has_schema(&block_key), "block schema should be cleared");
+
+                // Write triggers ensure_schema_cached which must WAL-scan and recover inline schema
+                let valid = json_events(&[br#"{"name":"alice","age":40}"#], 1, 0);
+                write_ok(&shard, write_req(key(1, 1, 5), valid)).await;
+                assert!(shard.schema_cache_has_schema(&inline_key), "inline schema not recovered by ensure_schema_cached");
+
+                // Write triggers ensure_schema_cached which must WAL-scan and recover block schema
+                let valid = json_events(&[br#"{"field_00":"world"}"#], 2, 0);
+                write_ok(&shard, write_req(key(1, 1, 6), valid)).await;
+                assert!(shard.schema_cache_has_schema(&block_key), "block schema not recovered by ensure_schema_cached");
 
                 shard.close().await;
             }

@@ -236,6 +236,12 @@ pub fn handle_redirected_client_connection<R: ReplicationClient + 'static, D: S3
 ) {
     let _ = tcp_stream.set_nodelay(true);
 
+    debug!(
+        shard_id = ctx.current_shard_id,
+        request_type = ?request.request_type(),
+        "Client connection redirected to shard",
+    );
+
     glommio::spawn_local(async move {
         let conn_state = ConnectionState { verified_client_id, access_level };
         handle_client_pipelining(tcp_stream, Some(request), max_response_size, server_compression_algorithm, message_version, ctx, conn_state).await;
@@ -1103,6 +1109,14 @@ async fn process_client_request<R: ReplicationClient + 'static, D: S3Downloader 
 ) {
     let correlation_id = request.correlation_id();
 
+    if matches!(request, ClientRequest::Write(_) | ClientRequest::Delete(_) | ClientRequest::TrimStart(_) | ClientRequest::RegisterSchema(_)) {
+        debug!(
+            shard_id = ctx.current_shard_id,
+            request_type = ?request.request_type(),
+            "Processing mutating client request",
+        );
+    }
+
     let response = if let ClientRequest::RegisterSchema(ref schema_request) = request {
         match handle_schema_registration_coordination(ctx, schema_request.clone()).await {
             Ok(success) => ClientResponse::RegisterSchema(success),
@@ -1422,6 +1436,7 @@ mod tests {
             compaction_temp_dir: None,
             cache_warmup_max_duration: None,
             reserve_coordinator_shard: false,
+            s3_replication_delay: Duration::from_millis(500),
         }
     }
 

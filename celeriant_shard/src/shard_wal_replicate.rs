@@ -103,8 +103,9 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
     // Because we are paginating data to the follower, we have a loop
     // At any point we might have to fallback to s3. Also the follower
     // can push back and require additional entries to be sent
+    let reachable_at_commit = replication_client.is_follower_reachable();
     let mut follower_falling_behind_or_offline = replication_captured_data.follower_falling_behind_or_offline
-        || !replication_client.is_follower_reachable();
+        || !reachable_at_commit;
     let mut added_additional_entries = false;
     let mut kick_sent = false;
 
@@ -174,6 +175,8 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
         // The happy low latency path - batched replication to follower
         let end_idx = batch_end_index(&batches, max_request_size);
 
+        let tcp_start = std::time::Instant::now();
+        debug!(shard_id, batch_count = end_idx, "TCP replication attempt starting");
         match replication_client.replicate_to_follower(batches[..end_idx].to_vec()).await {
             Ok(()) => {
                 // Success means we can drain out the replicated entries and go again
@@ -182,6 +185,15 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
                 batches.drain(..end_idx);
             }
             Err(replication_err) => {
+                let err_kind = match &replication_err {
+                    ReplicateToFollowerError::FollowerNetworkError(_) => "NetworkError",
+                    ReplicateToFollowerError::FollowerRejected(_) => "Rejected",
+                    ReplicateToFollowerError::FollowerUnexpectedResponse => "UnexpectedResponse",
+                    ReplicateToFollowerError::FollowerTooFarBehind => "TooFarBehind",
+                    ReplicateToFollowerError::LockTimeout => "LockTimeout",
+                    ReplicateToFollowerError::SystemTimeError(_) => "SystemTimeError",
+                };
+                debug!(shard_id, elapsed_ms = tcp_start.elapsed().as_millis() as u64, err_kind, "TCP replication failed");
                 // Already got a rejection once, this is second or more. nothing leader can do here, just fallback to s3
                 if added_additional_entries {
                     _replication_details = ReplicationDetails::RepliatedToS3(replication_err);
@@ -193,7 +205,12 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
                     // Network errors and lock timeouts: follower is unreachable.
                     // Go straight to S3 — don't retry TCP, it will just hold the
                     // replication_conn lock for another request_timeout cycle.
+                    // Also mark follower unreachable locally so subsequent replication
+                    // cycles skip TCP immediately, without waiting for shard 0's
+                    // heartbeat broadcast (which has propagation delay).
                     ReplicateToFollowerError::FollowerNetworkError(_) | ReplicateToFollowerError::LockTimeout => {
+                        replication_client.set_follower_reachable(false);
+                        debug!(shard_id, "Set follower_reachable=false locally after TCP failure");
                         _replication_details = ReplicationDetails::RepliatedToS3(replication_err);
                         follower_falling_behind_or_offline = true;
                     }

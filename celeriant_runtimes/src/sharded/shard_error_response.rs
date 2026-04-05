@@ -250,6 +250,10 @@ fn cache_load_error(lock_code: u32, scan_code: u32, e: ShardCacheLoadError) -> (
             scan_code,
             format!(r#"{{"detail":{}}}"#, json_string(&format!("{:?}", scan))),
         ),
+        ShardCacheLoadError::DatablockReadError(detail) => (
+            scan_code,
+            format!(r#"{{"detail":{}}}"#, json_string(&detail)),
+        ),
     }
 }
 

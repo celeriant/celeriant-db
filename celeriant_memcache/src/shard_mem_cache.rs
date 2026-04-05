@@ -822,9 +822,18 @@ impl<V: Validate> ShardMemCache<V> {
         self.schema_cache.contains(key)
     }
 
+    pub fn is_schema_cache_full(&self) -> bool {
+        self.schema_cache.len() == self.schema_cache.cap().get()
+    }
+
     /// Check if a schema registration is pending fsync (D4)
     pub fn schema_is_pending(&self, key: &SchemaKey) -> bool {
         self.pending_schema_registrations.contains(key)
+    }
+
+    pub fn schema_cache_clear(&mut self) {
+        self.schema_cache.clear();
+        self.no_schema_cache.clear();
     }
 
     /// Mark a schema as pending fsync (D4)

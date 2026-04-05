@@ -240,15 +240,15 @@ pub struct ServerConfig {
         long,
         env = "CELERIANT_INTERNODE_CONNECTION_TIMEOUT_MS",
         help = "Timeout for inter-node TCP connection establishment in milliseconds",
-        default_value_t = 5_000
+        default_value_t = 1_000
     )]
     pub internode_connection_timeout_ms: u64,
 
     #[arg(
         long,
-        default_value_t = 10_000,
+        default_value_t = 2_000,
         env = "CELERIANT_INTERNODE_REQUEST_TIMEOUT_MS",
-        help = "Timeout for inter-node request/response round-trips in milliseconds (10s)"
+        help = "Timeout for inter-node request/response round-trips in milliseconds (2s)"
     )]
     pub internode_request_timeout_ms: u64,
 
@@ -282,6 +282,14 @@ pub struct ServerConfig {
         help = "Amortised replication send duration block (17ms)"
     )]
     pub replication_delay_us: u64,
+
+    #[arg(
+        long,
+        default_value_t = 500000,
+        env = "CELERIANT_S3_REPLICATION_DELAY_US",
+        help = "Amortised replication delay during S3 fallback (500ms). Longer than TCP delay to batch more entries per S3 upload, reducing cost and avoiding slow-shard starvation."
+    )]
+    pub s3_replication_delay_us: u64,
 
     #[arg(
         long,
@@ -729,6 +737,7 @@ impl ServerConfig {
             max_requested_latency: Duration::from_millis(self.max_requested_latency_ms),
             fsync_delay: Duration::from_micros(self.fsync_delay_us),
             replication_delay: Duration::from_micros(self.replication_delay_us),
+            s3_replication_delay: Duration::from_micros(self.s3_replication_delay_us),
             routing_rule: self.routing_rule,
             aggregate_client_snapshots_cache_bytes: memory_budget.aggregate_client_snapshots_cache_bytes,
             aggregate_snapshots_cache_bytes: memory_budget.aggregate_snapshots_cache_bytes,
@@ -853,6 +862,7 @@ impl ServerConfig {
         check_field!(server_compression_level);
         check_field!(fsync_delay_us);
         check_field!(replication_delay_us);
+        check_field!(s3_replication_delay_us);
         check_field!(log_level);
         check_field!(s3_enabled);
         check_field!(s3_region);
@@ -936,6 +946,7 @@ impl Default for ServerConfig {
             max_catchup_gap_bytes: None,
             fsync_delay_us: 17000,
             replication_delay_us: 17000,
+            s3_replication_delay_us: 500000,
             client_connection_timeout_ms: 30000,
             routing_rule: RoutingRule::AggregateId,
             timestamp_precision: ConfigTimestampPrecision::Milliseconds,
@@ -948,8 +959,8 @@ impl Default for ServerConfig {
             s3_endpoint_override: None,
             s3_skip_signature: false,
             s3_allow_http: false,
-            internode_connection_timeout_ms: 5_000,
-            internode_request_timeout_ms: 10_000,
+            internode_connection_timeout_ms: 1_000,
+            internode_request_timeout_ms: 2_000,
             server_compression_algorithm: ConfigCompressionType::Snappy,
             server_compression_level: None,
             s3_catchup_max_rounds: 3,
