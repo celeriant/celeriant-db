@@ -133,6 +133,7 @@ Rules the system enforces. Breaking any of these is a bug. Provide this to LLMs 
 - Each segment carries a 256KB bloom filter (10 hashes, <1% FP rate for 200k aggregates). Bloom is persisted in the header and used by the reverse scanner.
 - Sealed segments produce a sidecar summary file. On a leader, the sidecar is deferred until the segment is fully replicated.
 - Listing scans newest-to-oldest, bounded by `list_max_duration` and `list_page_size`. A `deleted_barrier` prevents re-appearance of deleted aggregates from older segments.
+- Storage files can be copied to a new node. There are no node-specific entries in storage files and they are safe to backup and copy to any node in the cluster.
 
 ## Disk Serialization
 
