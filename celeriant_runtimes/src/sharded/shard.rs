@@ -476,7 +476,9 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
     rx: &LocalReceiver<CatchupCompletionMsg>,
 ) -> Result<ElectionOutcome, celeriant_distributed::lease_store::LeaseStoreError> {
 
-    let is_currently_leader = ctx.shard_wal.node_status.get().raw().is_leader();
+    let previous_status = ctx.shard_wal.node_status.get();
+    let is_currently_leader = previous_status.raw().is_leader();
+    let previous_lease_index = previous_status.raw().lease_index().unwrap_or(0);
 
     let outcome = retry_s3_operation(ctx.config.s3_retry_max_duration, "renew_s3_lease", || lease_manager.run_election_to_acquire_s3_lease()).await?;
 
@@ -493,10 +495,18 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
         ctx.intrashard_sender.clone()
     ).await;
 
-    // We took over the leadership. Catch up from S3 as a sanity check
-    // Unlikely to have previous leader race condition here, but possible
-    if !is_currently_leader && outcome.status.is_leader() {
-        info!("Starting post-election S3 catchup");
+    let new_lease_index = outcome.status.raw().lease_index().unwrap_or(0);
+    // A lease_index gap (e.g. 6 → 8) means another node held the lease in between.
+    // That node may have uploaded S3 fallback batches we haven't seen.
+    let lease_changed_hands = new_lease_index > previous_lease_index + 1;
+    let became_leader = !is_currently_leader && outcome.status.is_leader();
+
+    if outcome.status.is_leader() && (became_leader || lease_changed_hands) {
+        if lease_changed_hands {
+            info!(previous_lease_index, new_lease_index, "Lease changed hands during partition — running S3 catchup");
+        } else {
+            info!("Starting post-election S3 catchup");
+        }
         if !run_s3_catchup(ctx, &rx).await {
             return Err(celeriant_distributed::lease_store::LeaseStoreError::Unavailable { message: "Could not catch up WAL via S3".to_string() });
         }
@@ -504,8 +514,10 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
         // Upload the last TCP-replicated batch to S3 before accepting writes.
         // Covers the partition scenario where the old leader rolled back this batch
         // but we (the follower) kept it — without this, S3 would have a gap.
-        if let Err(e) = ctx.shard_wal.upload_s3_promotion_batch().await {
-            tracing::warn!(error = ?e, "Failed to upload promotion batch to S3 — old leader may not be able to catch up via S3");
+        if became_leader {
+            if let Err(e) = ctx.shard_wal.upload_s3_promotion_batch().await {
+                tracing::warn!(error = ?e, "Failed to upload promotion batch to S3 — old leader may not be able to catch up via S3");
+            }
         }
     }
 
