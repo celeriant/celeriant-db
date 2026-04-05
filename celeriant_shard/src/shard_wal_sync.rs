@@ -265,8 +265,22 @@ fn commit_sync(
                     pending_commit_data.pending_queue.push(PendingCacheItem::new(queue_item));
                 }
             }
-            MetablockKind::SchemaRegistration(_) => {
-                if node_status.is_leader() {
+            MetablockKind::SchemaRegistration(schema_reg) => {
+                if !node_status.is_leader() {
+                    // Follower: compile and cache schema now that it's durable
+                    if let Some(ref datablock) = queue_item.datablock {
+                        crate::shard_wal::compile_and_cache_schema(&mut shard_mem_cache, &schema_reg.schema_key, datablock);
+                    } else if let Ok(datablock) = celeriant_wire::disk::serialised_datablock::deserialise_datablock(
+                        queue_item.metablock.uncompressed_size,
+                        queue_item.metablock.compressed_size,
+                        queue_item.metablock.datablock_version,
+                        queue_item.metablock.datablock_compression_type,
+                        &queue_item.metablock.datablock,
+                        None,
+                    ) {
+                        crate::shard_wal::compile_and_cache_schema(&mut shard_mem_cache, &schema_reg.schema_key, &datablock);
+                    }
+                } else {
                     pending_commit_data.pending_queue.push(PendingCacheItem::new(queue_item));
                 }
             }

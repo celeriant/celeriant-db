@@ -81,6 +81,18 @@ use crate::shard_wal_replicate::{capture_replication_snapshot, commit_replicatio
 use crate::shard_wal_s3_catchup::{self, S3CatchupResult, catchup_from_s3};
 use crate::shard_wal_sync::{capture_fsync_snapshot, commit_fsync_with_rollback};
 
+/// Compile a schema datablock and insert into the cache.
+/// Shared by pre_warm_cache, ensure_schema_cached, and follower replication.
+pub(crate) fn compile_and_cache_schema(cache: &mut MemCache, schema_key: &SchemaKey, datablock: &Datablock) {
+    if let DatablockKind::SchemaRegistration(ref schema_data) = datablock.datablock_kind {
+        let cached = match crate::schema_validator::CompiledValidator::compile(schema_data.schema_type, &schema_data.schema) {
+            Ok(validator) => celeriant_memcache::cached_schema::CachedSchema::Validated(validator),
+            Err(e) => celeriant_memcache::cached_schema::CachedSchema::CompilationFailed(e),
+        };
+        cache.schema_cache_insert(schema_key.clone(), cached);
+    }
+}
+
 /// Write-ahead log for a single shard.
 ///
 /// Handles the complete lifecycle of reads and writes:
@@ -496,14 +508,8 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
             let mut cache = shard_mem_cache.borrow_mut();
             for (batch, (_, schema_key, _)) in batches.into_iter().zip(deferred_schema_blocks.iter()) {
-                if let Some(datablock) = batch.datablock {
-                    if let DatablockKind::SchemaRegistration(schema_data) = datablock.datablock_kind {
-                        let cached = match crate::schema_validator::CompiledValidator::compile(schema_data.schema_type, &schema_data.schema) {
-                            Ok(validator) => celeriant_memcache::cached_schema::CachedSchema::Validated(validator),
-                            Err(e) => celeriant_memcache::cached_schema::CachedSchema::CompilationFailed(e),
-                        };
-                        cache.schema_cache_insert(schema_key.clone(), cached);
-                    }
+                if let Some(ref datablock) = batch.datablock {
+                    compile_and_cache_schema(&mut cache, schema_key, datablock);
                 }
             }
         }
@@ -1544,14 +1550,8 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
                 let [batch] = batch;
                 let mut cache = self.shard_mem_cache.borrow_mut();
-                if let Some(datablock) = batch.datablock {
-                    if let DatablockKind::SchemaRegistration(schema_data) = datablock.datablock_kind {
-                        let cached = match crate::schema_validator::CompiledValidator::compile(schema_data.schema_type, &schema_data.schema) {
-                            Ok(validator) => celeriant_memcache::cached_schema::CachedSchema::Validated(validator),
-                            Err(e) => celeriant_memcache::cached_schema::CachedSchema::CompilationFailed(e),
-                        };
-                        cache.schema_cache_insert(schema_key.clone(), cached);
-                    }
+                if let Some(ref datablock) = batch.datablock {
+                    compile_and_cache_schema(&mut cache, schema_key, datablock);
                 }
             }
             None => {
