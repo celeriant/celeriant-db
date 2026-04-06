@@ -153,7 +153,7 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
                     if s3_ms > 500 {
                         warn!(shard_id, s3_ms, workset_size_bytes, "S3 fallback upload slow");
                     }
-                    if !kick_sent && replication_client.is_follower_reachable() {
+                    if !kick_sent {
                         let _ = replication_client.send_kick().await;
                         kick_sent = true;
                     }

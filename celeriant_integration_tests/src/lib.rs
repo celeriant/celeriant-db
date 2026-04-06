@@ -4,6 +4,7 @@ pub mod registry;
 
 pub mod api_key_test;
 pub mod batch;
+pub mod bug_kick_after_restart;
 pub mod batch_standalone_cleartext;
 pub mod chaos;
 pub mod chaos_delete;
@@ -1244,6 +1245,38 @@ pub async fn count_events(
             },
         }
     }
+}
+
+/// Poll a node until it has at least `expected` events for the given aggregate.
+///
+/// Connects fresh on each attempt (handles reconnects after restart).
+/// Returns the final event count, or panics after `timeout`.
+pub async fn poll_event_count(
+    address: &str,
+    aggregate_key: &AggregateKey,
+    expected: usize,
+    timeout: std::time::Duration,
+) -> usize {
+    let start = std::time::Instant::now();
+    let mut last_count = 0usize;
+    while start.elapsed() < timeout {
+        if let Ok(mut client) = CeleriantClient::connect(address).await {
+            if let Ok(c) = count_events(&mut client, aggregate_key).await {
+                last_count = c;
+                if c >= expected {
+                    return c;
+                }
+            }
+        }
+        sleep(std::time::Duration::from_secs(2)).await;
+    }
+    panic!(
+        "Timed out after {:.0}s waiting for {} events at {} (last seen: {})",
+        timeout.as_secs_f64(),
+        expected,
+        address,
+        last_count,
+    );
 }
 
 /// Benchmark-tuned shard count and fsync delay, overridable via env vars.

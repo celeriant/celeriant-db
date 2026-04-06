@@ -640,7 +640,7 @@ pub fn all_tests() -> &'static [TestEntry] {
         TestEntry {
             name: "schema_bank_bench",
             description: "Schema-validated atomic writes throughput and latency benchmark",
-            estimated_secs: 60,
+            estimated_secs: 180,
             categories: &[Schema, Performance],
             distributed: true,
         },
@@ -664,6 +664,14 @@ pub fn all_tests() -> &'static [TestEntry] {
             description: "Leader compaction doesn't corrupt follower data in replicated mode",
             estimated_secs: 50,
             categories: &[Compaction],
+            distributed: true,
+        },
+        // ── Bug reproductions ──
+        TestEntry {
+            name: "bug_kick_after_restart",
+            description: "BUG: kick not delivered after follower restart (follower_reachable=false)",
+            estimated_secs: 40,
+            categories: &[Replication, Edge],
             distributed: true,
         },
         // ── Debug ──

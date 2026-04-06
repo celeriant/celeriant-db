@@ -153,6 +153,7 @@ async fn dispatch_test(name: &str) -> Result<(), Box<dyn std::error::Error>> {
         "compaction_replicated" => compaction_replicated::run().await,
         "compaction_restart" => compaction_restart::run().await,
         "compaction_standalone" => compaction_standalone::run().await,
+        "bug_kick_after_restart" => bug_kick_after_restart::run().await,
         "connection_test" => connection_test::run().await,
         "debug_follower_pressure" => debug_follower_pressure::run().await,
         "edge_concurrent_heartbeat_replication_s3" => edge_concurrent_heartbeat_replication_s3::run().await,
@@ -249,6 +250,10 @@ fn build_filter(cli: &Cli) -> Result<TestFilter, String> {
     }
     if !cli.exclude.is_empty() {
         filter.exclude = parse_categories(&cli.exclude.join(","))?;
+    } else {
+        // Exclude Debug tests by default (they require external process launch).
+        // Use --include-or debug to opt-in.
+        filter.exclude_or = vec![Category::Debug];
     }
     if !cli.exclude_or.is_empty() {
         filter.exclude_or = parse_categories(&cli.exclude_or.join(","))?;

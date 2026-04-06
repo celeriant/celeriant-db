@@ -169,29 +169,19 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Parse batch names and verify monotonic WAL index ordering.
-    // Format: cluster/fallback/shard_XXX/batch_YYYYYYYYY_ZZZZZZZZZ.bin
+    // Format: cluster/fallback/shard_XXX/batch_XXXXXXXXX_XXXXXXXXX_UUID.bin
     let mut parsed_batches: Vec<(u64, u64)> = Vec::new();
     for obj in &objects_before_restart {
-        let filename = obj.rsplit('/').next().unwrap_or(obj);
-        let indices = filename
-            .strip_prefix("batch_")
-            .and_then(|s| s.strip_suffix(".bin"))
-            .and_then(|s| s.split_once('_'))
-            .and_then(|(start, end)| {
-                Some((start.parse::<u64>().ok()?, end.parse::<u64>().ok()?))
-            });
-        match indices {
-            Some((start, end)) => {
-                println!("    - {} (WAL {} → {})", obj, start, end);
-                assert!(
-                    end >= start,
-                    "Batch {} has end_index ({}) < start_index ({})",
-                    obj, end, start
-                );
-                parsed_batches.push((start, end));
-            }
-            None => panic!("Failed to parse batch name: {}", obj),
-        }
+        let (shard_id, start, end, _node_id) =
+            celeriant_distributed::paths::parse_fallback_path(obj)
+                .unwrap_or_else(|| panic!("Failed to parse batch name: {}", obj));
+        println!("    - {} (shard={}, WAL {} → {})", obj, shard_id, start, end);
+        assert!(
+            end >= start,
+            "Batch {} has end_index ({}) < start_index ({})",
+            obj, end, start
+        );
+        parsed_batches.push((start, end));
     }
 
     // Verify monotonically increasing start indices.

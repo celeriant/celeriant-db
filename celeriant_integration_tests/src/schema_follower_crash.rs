@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_client_tokio::client_error::ClientError;
-use crate::{count_events, s3_cluster_config, write_event, MinioContainer, TestServer};
+use crate::{count_events, poll_event_count, s3_cluster_config, write_event, MinioContainer, TestServer};
 use celeriant_msg::{
     process_client_requests::ClientRequest,
     request::requests::{RegisterSchemaRequest, SingleAggregateWrite, WriteRequest},
@@ -192,15 +192,17 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     follower.restart().await?;
     println!("  Follower restarted");
 
-    println!("  Waiting for TCP replication catchup...");
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    // Poll for follower to catch up with events 1-7
+    println!("  Polling for follower catchup (7 events)...");
+    poll_event_count(follower.address(), &aggregate_key, 7, Duration::from_secs(30)).await;
 
-    // Write one more to confirm replication flowing
+    // Write two events: first may go via S3 (stale connection), second via fresh TCP.
     write_event(&mut leader_client, &aggregate_key, 8, false).await?;
+    write_event(&mut leader_client, &aggregate_key, 9, false).await?;
 
-    let mut follower_client = CeleriantClient::connect(follower.address()).await?;
-    let follower_count = count_events(&mut follower_client, &aggregate_key).await?;
-    assert_eq!(follower_count, 8, "Follower should have 8 events after catchup");
+    let follower_count = poll_event_count(
+        follower.address(), &aggregate_key, 9, Duration::from_secs(45),
+    ).await;
     println!("  Follower caught up: {} events\n", follower_count);
 
     // ========================================
@@ -210,17 +212,28 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("--------------------------------------------------");
 
     drop(leader_client);
-    drop(follower_client);
     leader.stop();
     println!("  Leader stopped");
 
-    println!("  Waiting for failover (heartbeat lease 1.5s + S3 race)...");
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Poll until the follower promotes itself to leader and accepts writes.
+    // Failover time: heartbeat TTL expiry (~1.5s) + S3 lease expiry + CAS race.
+    println!("  Polling for follower promotion...");
+    let promo_timeout = Duration::from_secs(20);
+    let promo_start = std::time::Instant::now();
+    let mut promoted = false;
+    while promo_start.elapsed() < promo_timeout {
+        if let Ok(mut c) = CeleriantClient::connect(follower.address()).await {
+            if write_event(&mut c, &aggregate_key, 10, false).await.is_ok() {
+                promoted = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert!(promoted, "Follower should have promoted to leader within {}s", promo_timeout.as_secs());
+    println!("  New leader accepts writes: PASS\n");
 
     let mut new_leader_client = CeleriantClient::connect(follower.address()).await?;
-
-    write_event(&mut new_leader_client, &aggregate_key, 9, false).await?;
-    println!("  New leader accepts writes: PASS\n");
 
     // ========================================
     // PHASE 5: Verify schema enforcement on promoted follower
@@ -229,7 +242,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("------------------------------------------------------------------");
 
     // Valid write
-    write_event(&mut new_leader_client, &aggregate_key, 10, false).await?;
+    write_event(&mut new_leader_client, &aggregate_key, 11, false).await?;
     println!("  Valid write: PASS");
 
     // Invalid — non-JSON

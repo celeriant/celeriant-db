@@ -17,7 +17,7 @@
 //! Run with: cargo run --bin s3_stale_lease_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use crate::{count_events, write_event, MinioContainer, ServerConfig, TestServer};
+use crate::{count_events, poll_event_count, write_event, MinioContainer, ServerConfig, TestServer};
 use celeriant_runtimes::RoutingRule;
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wire::disk::versioned_block::deserialise_lease;
@@ -190,17 +190,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     for i in 5..=6 {
         write_event(&mut leader_client, &aggregate_key, i, false).await?;
     }
-    println!("  ✓ Leader accepted writes");
+    println!("  Leader accepted writes");
 
-    let mut restarted_follower_client = CeleriantClient::connect(follower.address()).await?;
-    let final_follower_count = count_events(&mut restarted_follower_client, &aggregate_key).await?;
+    // Poll follower until it has at least 5 events (3 persisted + events after rejoin)
+    let final_follower_count = poll_event_count(
+        follower.address(), &aggregate_key, 5, Duration::from_secs(30),
+    ).await;
     println!("  Follower has {} events", final_follower_count);
-
-    assert!(
-        final_follower_count >= 5,
-        "Follower should have at least 5 events (3 persisted + events after rejoin)"
-    );
-    println!("  ✓ Follower successfully replicated after restart with stale lease");
+    println!("  Follower successfully replicated after restart with stale lease");
 
     println!("\n=== All Tests Passed ===\n");
     println!("Key result: Restarting follower saw stale S3 lease (expired, different leader),");

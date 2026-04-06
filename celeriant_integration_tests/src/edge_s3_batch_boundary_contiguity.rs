@@ -100,20 +100,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("  This is OK: all events fit in a single batch.\n");
     } else {
         // Parse batch names to extract WAL index ranges
-        // Format: cluster/fallback/shard_NNN/batch_SSSSSSSSS_EEEEEEEEE.bin
+        // Format: cluster/fallback/shard_NNN/batch_SSSSSSSSS_EEEEEEEEE_UUID.bin
         let mut boundaries: Vec<(u64, u64)> = Vec::new();
         for obj in &objects {
-            let filename = obj.rsplit('/').next().unwrap_or(obj);
-            let parts: Vec<&str> = filename
-                .trim_start_matches("batch_")
-                .trim_end_matches(".bin")
-                .split('_')
-                .collect();
-            if parts.len() == 2 {
-                if let (Ok(start), Ok(end)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>()) {
-                    boundaries.push((start, end));
-                }
-            }
+            let (_shard_id, start, end, _node_id) =
+                celeriant_distributed::paths::parse_fallback_path(obj)
+                    .unwrap_or_else(|| panic!("Failed to parse batch name: {}", obj));
+            boundaries.push((start, end));
         }
 
         boundaries.sort_by_key(|&(start, _)| start);

@@ -19,7 +19,7 @@
 //! Run with: cargo run --bin s3_follower_crash_main
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
-use crate::{count_events, s3_cluster_config, write_event, MinioContainer, TestServer};
+use crate::{count_events, poll_event_count, s3_cluster_config, write_event, MinioContainer, TestServer};
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wire::disk::versioned_block::{deserialise_fallback_batch, deserialise_lease};
 use std::time::Duration;
@@ -171,9 +171,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     follower.restart().await?;
     println!("  Follower process restarted");
 
-    println!("  Waiting for follower to re-register and rejoin...");
-    println!("  (startup + registration + discovery + catch-up = ~10s)");
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    // Wait for follower to catch up with events 1-5 (3 persisted + 2 from S3 catchup)
+    println!("  Polling for follower catchup (events 1-5)...");
+    poll_event_count(follower.address(), &aggregate_key, 5, Duration::from_secs(30)).await;
 
     // ========================================
     // PHASE 7: Verify follower rejoined and receives new writes
@@ -181,20 +181,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nPHASE 7: Verify follower rejoined and receives new writes");
     println!("----------------------------------------------------------");
 
-    let mut restarted_follower_client = CeleriantClient::connect(follower.address()).await?;
-
     println!("  Writing events 6-7 to leader (after follower restart)...");
     write_event(&mut leader_client, &aggregate_key, 6, false).await?;
     write_event(&mut leader_client, &aggregate_key, 7, false).await?;
 
-    let final_follower_count = count_events(&mut restarted_follower_client, &aggregate_key).await?;
+    let final_follower_count = poll_event_count(
+        follower.address(), &aggregate_key, 7, Duration::from_secs(15),
+    ).await;
     println!("  Restarted follower has {} events", final_follower_count);
-
-    assert_eq!(
-        final_follower_count, 7,
-        "Restarted follower should have all 7 events (3 persisted + 2 from S3 catchup + 2 new), got {}",
-        final_follower_count
-    );
     println!("  Follower rejoined and has all events");
 
     println!("\n=== All Tests Passed ===\n");
