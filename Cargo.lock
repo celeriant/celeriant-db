@@ -583,6 +583,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "celeriant_bench"
+version = "0.1.0"
+dependencies = [
+ "celeriant_client_tokio",
+ "celeriant_crypto",
+ "celeriant_msg",
+ "celeriant_wal",
+ "clap",
+ "rustls-pki-types",
+ "tokio",
+]
+
+[[package]]
 name = "celeriant_cli"
 version = "0.1.0"
 dependencies = [

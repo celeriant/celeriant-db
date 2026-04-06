@@ -1,11 +1,10 @@
 # RPi kTLS Cluster
 
-Two RPi 5s run Celeriant (leader + follower) with NVMe storage. The build machine (Ubuntu PC) doubles as the infrastructure node, running MinIO, Prometheus, Loki, and Grafana via Docker.
+Two RPi 5s run Celeriant (leader + follower) with NVMe storage. A third Pi (or any always-on node) runs the infrastructure stack: MinIO, Prometheus, Loki, and Grafana via Docker.
 
 ```
 ┌──────────────────┐   ┌──────────────────┐   ┌──────────────────┐
-│  RPi 5 (cs1)     │   │  RPi 5 (cs2)     │   │  PC (infra)      │
-│  10.0.0.50       │   │  10.0.0.51       │   │  10.0.0.1        │
+│  RPi 5 (cs1)     │   │  RPi 5 (cs2)     │   │  RPi 4 (cluster) │
 │  Celeriant       │◄─►│  Celeriant       │   │  MinIO           │
 │  Leader          │   │  Follower        │   │  Prometheus      │
 │  NVMe + XFS      │   │  NVMe + XFS      │   │  Loki + Grafana  │
@@ -28,27 +27,27 @@ Two RPi 5s run Celeriant (leader + follower) with NVMe storage. The build machin
 | 2 | NVMe M.2 SSD (any capacity) | WAL storage — must be on XFS with O_DIRECT |
 | 2 | Pimoroni NVMe HAT for Pi 5 | Connects NVMe to Pi 5 via PCIe |
 | 2 | microSD cards (32 GB+) | OS boot (Raspberry Pi OS Lite 64-bit) |
-| 2 | USB-C power supplies (5V/5A) | |
+| 1 | Raspberry Pi 4+ (or any always-on node) | Infra node (MinIO, monitoring) |
+| 3 | USB-C power supplies (5V/5A for Pi 5, 5V/3A for Pi 4) | |
 | 1 | Ethernet switch + 3 cables (or direct connections) | |
-
-The infra stack (MinIO, monitoring) runs on the build machine via Docker, so no third Pi is needed.
 
 ### OS setup
 
 Flash **Raspberry Pi OS Lite (64-bit)** to each SD card using `rpi-imager`. During flashing:
 
-1. Set a hostname (e.g. `cs1`, `cs2`, `cluster`)
+1. Set a hostname (`cs1`, `cs2`, `cluster`)
 2. Enable SSH with your public key
 3. Set locale/timezone
 
-Boot both Pis and verify SSH access using their static IPs:
+Boot all Pis and verify SSH access using their IPs:
 
 ```sh
-ssh 10.0.0.50 'uname -a'   # cs1
-ssh 10.0.0.51 'uname -a'   # cs2
+ssh <cs1-ip> 'uname -a'
+ssh <cs2-ip> 'uname -a'
+ssh <cluster-ip> 'uname -a'
 ```
 
-**Important:** All deployment configs use static IP addresses, not hostnames. RPi cloud-init maps all hostnames to `127.0.1.1` in `/etc/hosts`, which breaks inter-node communication. Update `config.env` if your IPs differ from the defaults.
+**Important:** All deployment configs use IP addresses, not hostnames. RPi cloud-init maps all hostnames to `127.0.1.1` in `/etc/hosts`, which breaks inter-node communication. Update `config.env` with your actual IPs.
 
 ## Build machine prerequisites
 
@@ -75,9 +74,9 @@ Edit `config.env` to match your network:
 
 ```sh
 # config.env
-LEADER_HOST=10.0.0.50    # RPi 5 — will be Celeriant leader
-FOLLOWER_HOST=10.0.0.51  # RPi 5 — will be Celeriant follower
-INFRA_HOST=10.0.0.1      # Build machine — MinIO + monitoring
+LEADER_HOST=192.168.88.214    # RPi 5 — Celeriant data node
+FOLLOWER_HOST=192.168.88.213  # RPi 5 — Celeriant data node
+INFRA_HOST=192.168.88.218     # RPi 4 — MinIO + monitoring
 ```
 
 All other settings have sensible defaults. See the file for NVMe device paths, ports, and tuning parameters.
@@ -99,7 +98,7 @@ This runs four steps in sequence:
 | `setup-nodes` | Updates packages, sets file descriptor and memlock limits, installs xfsprogs, deploys the `celeriant` systemd service and Promtail (log shipper) to both data nodes. Runs in parallel on both Pis. |
 | `setup-nvme` | Partitions and formats the NVMe drive as XFS, mounts it at `/var/lib/celeriant`, adds an fstab entry. **Destructive** — prompts for confirmation per node. Sequential. |
 | `certs` | Generates two CA keypairs (client CA + intracluster CA), node certs, a client-facing server cert, and a benchmark client cert. Distributes to both data nodes. |
-| `setup-infra` | Installs Docker on the infra node, deploys the compose stack (MinIO, Prometheus, Loki, Grafana), and provisions Grafana dashboards. |
+| `setup-infra` | Installs Docker on the infra node (via SSH), deploys the compose stack (MinIO, Prometheus, Loki, Grafana), and provisions Grafana dashboards. |
 
 ### Step 2: Build kTLS kernel
 
@@ -114,15 +113,15 @@ The kernel branch is auto-detected from `uname -r` on each Pi (e.g. kernel `6.12
 After the build completes, **reboot both data nodes**:
 
 ```sh
-ssh 10.0.0.50 'sudo reboot now'
-ssh 10.0.0.51 'sudo reboot now'
+ssh $LEADER_HOST 'sudo reboot now'
+ssh $FOLLOWER_HOST 'sudo reboot now'
 ```
 
 Verify kTLS is available after reboot:
 
 ```sh
-ssh 10.0.0.50 'sudo modprobe tls && lsmod | grep tls'
-ssh 10.0.0.51 'sudo modprobe tls && lsmod | grep tls'
+ssh $LEADER_HOST 'sudo modprobe tls && lsmod | grep tls'
+ssh $FOLLOWER_HOST 'sudo modprobe tls && lsmod | grep tls'
 ```
 
 ### Step 3: Build and deploy Celeriant
@@ -172,7 +171,7 @@ Configuration (in `config.env`):
 The test uses the client certificates generated during setup (in `certs/`). Override with environment variables if needed:
 
 ```sh
-CLUSTER_ADDRESS_1=10.0.0.50:10000 \
+CLUSTER_ADDRESS_1=$LEADER_HOST:10000 \
 CLUSTER_THROUGHPUT_CONNECTIONS=4000 \
 make run-test
 ```
@@ -194,13 +193,13 @@ Once the infra stack is running:
 
 | Service | URL | Credentials |
 |---------|-----|-------------|
-| Grafana | `http://10.0.0.1:3000` | admin / admin |
-| Prometheus | `http://10.0.0.1:9090` | — |
-| Loki | `http://10.0.0.1:3100` | — |
-| MinIO Console | `http://10.0.0.1:9001` | minioadmin / minioadmin |
-| MinIO API | `http://10.0.0.1:9000` | minioadmin / minioadmin |
-| Celeriant metrics (leader) | `http://10.0.0.50:9090/metrics` | — |
-| Celeriant metrics (follower) | `http://10.0.0.51:9090/metrics` | — |
+| Grafana | `http://$INFRA_HOST:3000` | admin / admin |
+| Prometheus | `http://$INFRA_HOST:9090` | — |
+| Loki | `http://$INFRA_HOST:3100` | — |
+| MinIO Console | `http://$INFRA_HOST:9001` | minioadmin / minioadmin |
+| MinIO API | `http://$INFRA_HOST:9000` | minioadmin / minioadmin |
+| Celeriant metrics (leader) | `http://$LEADER_HOST:9090/metrics` | — |
+| Celeriant metrics (follower) | `http://$FOLLOWER_HOST:9090/metrics` | — |
 
 Grafana is pre-provisioned with Prometheus and Loki datasources. The cluster dashboard shows per-node and per-shard metrics. Use Explore → Loki to search server logs.
 
@@ -235,9 +234,9 @@ Certificates are generated with SANs covering both data node IPs, `localhost`, a
 
 **`Port 10000 is already in use`** — a previous Celeriant process is still running. Run `make stop` before `make start`.
 
-**NVMe not detected** — check that the NVMe HAT is seated properly and the drive is recognised: `ssh 10.0.0.50 'lsblk'`. The default device is `/dev/nvme0n1`.
+**NVMe not detected** — check that the NVMe HAT is seated properly and the drive is recognised: `ssh $LEADER_HOST 'lsblk'`. The default device is `/dev/nvme0n1`.
 
-**Leader election not happening** — verify MinIO is running (`docker compose -f ~/celeriant-infra/docker-compose.yml ps`) and that both data nodes can reach it (`curl http://10.0.0.1:9000/minio/health/live` from a data node).
+**Leader election not happening** — verify MinIO is running (`ssh $INFRA_HOST 'cd ~/celeriant-infra && docker compose ps'`) and that both data nodes can reach it (`curl http://$INFRA_HOST:9000/minio/health/live` from a data node).
 
 **Clock synchronization warning** — Celeriant checks for NTP sync on startup. Ensure `systemd-timesyncd` or `chrony` is running: `timedatectl status`.
 
@@ -250,7 +249,7 @@ Certificates are generated with SANs covering both data node IPs, `localhost`, a
 | `setup-nodes.sh` | OS prep, systemd service, Promtail install (runs via SSH on each data node) |
 | `setup-nvme.sh` | NVMe partition, XFS format, mount (runs via SSH, destructive) |
 | `setup-ktls.sh` | Kernel rebuild with `CONFIG_TLS=m` (runs ON the Pi) |
-| `setup-infra.sh` | Docker install, compose deploy on infra node |
+| `setup-infra.sh` | Docker install, compose deploy on infra node (via SSH) |
 | `gen-certs.sh` | Generates dual-CA TLS certs and distributes to data nodes |
 | `docker-compose.yml` | Infra stack: MinIO, Prometheus, Loki, Grafana |
 | `prometheus.yml` | Scrape config for both Celeriant nodes |

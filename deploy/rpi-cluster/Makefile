@@ -15,10 +15,12 @@ BOLD   := \033[1m
 RESET  := \033[0m
 
 .PHONY: help setup-all setup-nodes setup-nvme setup-ktls setup-infra certs \
-        deploy build ship restart stop start logs run-test teardown teardown-data
+        deploy build ship restart stop start logs run-test teardown teardown-data \
+        stop-cs1 stop-cs2 stop-minio kill-cs1 kill-cs2 kill-minio \
+        start-cs1 start-cs2 start-minio status
 
 help: ## Show this help
-	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
+	@grep -hE '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*## "}; {printf "  $(GREEN)%-18s$(RESET) %s\n", $$1, $$2}'
 
 # ---------------------------------------------------------------------------
@@ -115,6 +117,30 @@ stop: ## Stop Celeriant on all nodes
 		ssh $$HOST 'sudo systemctl stop celeriant 2>/dev/null || true'; \
 	done
 
+stop-cs1: ## Graceful stop cs1
+	@printf "$(BOLD)>>> Stopping celeriant on $(LEADER_HOST) (cs1)$(RESET)\n"
+	@ssh $(LEADER_HOST) 'sudo systemctl stop celeriant'
+
+stop-cs2: ## Graceful stop cs2
+	@printf "$(BOLD)>>> Stopping celeriant on $(FOLLOWER_HOST) (cs2)$(RESET)\n"
+	@ssh $(FOLLOWER_HOST) 'sudo systemctl stop celeriant'
+
+stop-minio: ## Graceful stop MinIO on infra node
+	@printf "$(BOLD)>>> Stopping MinIO on $(INFRA_HOST)$(RESET)\n"
+	@ssh $(INFRA_HOST) 'cd ~/celeriant-infra && docker compose stop minio'
+
+kill-cs1: ## Hard kill cs1 (SIGKILL)
+	@printf "$(RED)>>> Killing celeriant on $(LEADER_HOST) (cs1)$(RESET)\n"
+	@ssh $(LEADER_HOST) 'sudo systemctl kill -s KILL celeriant'
+
+kill-cs2: ## Hard kill cs2 (SIGKILL)
+	@printf "$(RED)>>> Killing celeriant on $(FOLLOWER_HOST) (cs2)$(RESET)\n"
+	@ssh $(FOLLOWER_HOST) 'sudo systemctl kill -s KILL celeriant'
+
+kill-minio: ## Hard kill MinIO on infra node
+	@printf "$(RED)>>> Killing MinIO on $(INFRA_HOST)$(RESET)\n"
+	@ssh $(INFRA_HOST) 'cd ~/celeriant-infra && docker compose kill minio'
+
 start: ## Start Celeriant (leader first, then follower)
 	@printf "$(BOLD)>>> Starting celeriant on $(LEADER_HOST) (leader)$(RESET)\n"
 	@ssh $(LEADER_HOST) 'sudo systemctl start celeriant'
@@ -124,11 +150,25 @@ start: ## Start Celeriant (leader first, then follower)
 	@ssh $(FOLLOWER_HOST) 'sudo systemctl start celeriant'
 	@printf "$(GREEN)Cluster started.$(RESET)\n"
 
+start-cs1: ## Start cs1
+	@printf "$(BOLD)>>> Starting celeriant on $(LEADER_HOST) (cs1)$(RESET)\n"
+	@ssh $(LEADER_HOST) 'sudo systemctl start celeriant'
+
+start-cs2: ## Start cs2
+	@printf "$(BOLD)>>> Starting celeriant on $(FOLLOWER_HOST) (cs2)$(RESET)\n"
+	@ssh $(FOLLOWER_HOST) 'sudo systemctl start celeriant'
+
+start-minio: ## Start MinIO on infra node
+	@printf "$(BOLD)>>> Starting MinIO on $(INFRA_HOST)$(RESET)\n"
+	@ssh $(INFRA_HOST) 'cd ~/celeriant-infra && docker compose start minio'
+
 status: ## Show service status on all nodes
 	@for HOST in $(DATA_NODES); do \
 		printf "$(BOLD)>>> $$HOST$(RESET)\n"; \
 		ssh $$HOST 'systemctl is-active celeriant 2>/dev/null || echo "not running"'; \
 	done
+	@printf "$(BOLD)>>> $(INFRA_HOST) (minio)$(RESET)\n"
+	@ssh $(INFRA_HOST) 'cd ~/celeriant-infra && docker compose ps minio --format "{{.State}}" 2>/dev/null || echo "not running"'
 
 logs: ## Tail logs from both data nodes (Ctrl+C to stop)
 	@printf "$(YELLOW)Tailing logs from $(LEADER_HOST) and $(FOLLOWER_HOST)... Ctrl+C to stop.$(RESET)\n"
@@ -140,31 +180,32 @@ logs: ## Tail logs from both data nodes (Ctrl+C to stop)
 # Integration tests
 # ---------------------------------------------------------------------------
 
-run-test: ## Run rpi_cluster_pool_bench integration test against the cluster
-	@printf "$(BOLD)>>> Running rpi_cluster_pool_bench against $(LEADER_HOST):$(CLIENT_PORT) + $(FOLLOWER_HOST):$(CLIENT_PORT)$(RESET)\n"
+run-test: ## Run cluster pool benchmark (builds on macOS/Windows/Linux)
+	@printf "$(BOLD)>>> Running celeriant-bench against $(LEADER_HOST):$(CLIENT_PORT) + $(FOLLOWER_HOST):$(CLIENT_PORT)$(RESET)\n"
 	cd $(PROJECT_ROOT) && \
-		CLUSTER_ADDRESS_1=$(LEADER_HOST):$(CLIENT_PORT) \
-		CLUSTER_ADDRESS_2=$(FOLLOWER_HOST):$(CLIENT_PORT) \
-		CLUSTER_SERVER_NAME=$(LEADER_HOST) \
-		CLUSTER_TASKS=$(CLUSTER_THROUGHPUT_CONNECTIONS) \
-		CLUSTER_DURATION=$(CLUSTER_DURATION) \
-		cargo run --release -p celeriant_integration_tests -- --test rpi_cluster_pool_bench
+		cargo run --release -p celeriant_bench -- \
+		--address1 $(LEADER_HOST):$(CLIENT_PORT) \
+		--address2 $(FOLLOWER_HOST):$(CLIENT_PORT) \
+		--server-name $(LEADER_HOST) \
+		--tasks $(CLUSTER_THROUGHPUT_CONNECTIONS) \
+		--duration $(CLUSTER_DURATION) \
+		--ca-cert deploy/rpi-cluster/certs/client-ca.crt \
+		--client-cert deploy/rpi-cluster/certs/client.crt \
+		--client-key deploy/rpi-cluster/certs/client.key
 
 # ---------------------------------------------------------------------------
 # Teardown
 # ---------------------------------------------------------------------------
 
 teardown: stop ## Stop all services (Celeriant + infra)
-	@printf "$(BOLD)>>> Stopping infra locally$(RESET)\n"
-	@cd ~/celeriant-infra && docker compose down
+	@printf "$(BOLD)>>> Stopping infra on $(INFRA_HOST)$(RESET)\n"
+	@ssh $(INFRA_HOST) 'cd ~/celeriant-infra && docker compose down'
 	@printf "$(GREEN)All services stopped.$(RESET)\n"
 
 teardown-data: teardown ## Stop all services AND wipe all data (DESTRUCTIVE)
-	@printf "$(RED)$(BOLD)This will delete ALL Celeriant data on $(LEADER_HOST) and $(FOLLOWER_HOST),$(RESET)\n"
-	@printf "$(RED)$(BOLD)and all MinIO/Prometheus/Loki/Grafana data locally.$(RESET)\n"
-	@read -p "Type 'yes' to confirm: " confirm && [ "$$confirm" = "yes" ] || exit 1
+	@printf "$(RED)$(BOLD)Wiping ALL Celeriant data on $(LEADER_HOST), $(FOLLOWER_HOST), and $(INFRA_HOST)$(RESET)\n"
 	@for HOST in $(DATA_NODES); do \
 		ssh $$HOST 'sudo rm -rf $(REMOTE_DATA_ROOT)/*'; \
 	done
-	@cd ~/celeriant-infra && docker compose down -v
+	@ssh $(INFRA_HOST) 'cd ~/celeriant-infra && docker compose down -v'
 	@printf "$(GREEN)All data wiped.$(RESET)\n"

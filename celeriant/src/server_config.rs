@@ -236,6 +236,12 @@ pub struct ServerConfig {
     #[arg(long, env = "CELERIANT_MAX_CATCHUP_GAP_BYTES", hide = true)]
     pub max_catchup_gap_bytes: Option<u64>,
 
+    #[arg(long, default_value_t = 2, env = "CELERIANT_S3_MAX_CONCURRENT_FALLBACK_UPLOADS", help = "Max concurrent S3 fallback uploads across all shards. Prevents MinIO saturation that can starve lease renewal.")]
+    pub s3_max_concurrent_fallback_uploads: u32,
+
+    #[arg(long, default_value_t = 4, env = "CELERIANT_HEARTBEAT_HARD_TIMEOUT_MULTIPLIER", help = "Hard timeout for heartbeat as a multiplier of heartbeat_timeout. Caps kernel-blocked kTLS sends that ignore the soft timeout.")]
+    pub heartbeat_hard_timeout_multiplier: u32,
+
     #[arg(
         long,
         env = "CELERIANT_INTERNODE_CONNECTION_TIMEOUT_MS",
@@ -808,6 +814,8 @@ impl ServerConfig {
             cache_warmup_max_duration: self.cache_warmup_max_secs.map(Duration::from_secs),
             heartbeat_interval_duration: Duration::from_millis(self.heartbeat_interval_ms),
             heartbeat_timeout: Duration::from_millis(self.heartbeat_timeout_ms.unwrap_or(self.heartbeat_interval_ms)),
+            heartbeat_hard_timeout_multiplier: self.heartbeat_hard_timeout_multiplier,
+            s3_max_concurrent_fallback_uploads: self.s3_max_concurrent_fallback_uploads,
             heartbeat_lease_duration: Duration::from_millis(self.heartbeat_lease_duration_ms),
             reserve_coordinator_shard: self.reserve_coordinator_shard,
         }
@@ -944,6 +952,7 @@ impl Default for ServerConfig {
             shard_log_preallocate_bytes: 1024 * 1024 * 1024,
             pending_replication_high_water_bytes: None,
             max_catchup_gap_bytes: None,
+            s3_max_concurrent_fallback_uploads: 2,
             fsync_delay_us: 17000,
             replication_delay_us: 17000,
             s3_replication_delay_us: 500000,
@@ -966,6 +975,7 @@ impl Default for ServerConfig {
             s3_catchup_max_rounds: 3,
             heartbeat_interval_ms: 500,
             heartbeat_timeout_ms: None,
+            heartbeat_hard_timeout_multiplier: 4,
             heartbeat_lease_duration_ms: 1500,
             s3_lease_duration_ms: 30000,
             max_clock_drift_ms: 500,

@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use glommio::sync::Semaphore;
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
 use celeriant_disk::files::rwlock_timeout::write_with_timeout;
 use celeriant_distributed::node_status::NodeStatus;
@@ -1258,11 +1258,26 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         self.append_prepared_writes_to_queue(prepared_writes);
 
         // Wait on disk write, it's batched for performance
+        let fsync_start = std::time::Instant::now();
         self.sync_durable().await?;
+        let fsync_ms = fsync_start.elapsed().as_millis() as u64;
 
         // Same deal for replication, if we are the leader,
         // wait on durable replication, also batched
+        let repl_start = std::time::Instant::now();
         self.replicate_durable().await?;
+        let repl_ms = repl_start.elapsed().as_millis() as u64;
+
+        let total_ms = fsync_ms + repl_ms;
+        if total_ms > 1000 {
+            warn!(
+                shard_id = self.config.shard_id,
+                fsync_ms,
+                repl_ms,
+                total_ms,
+                "Slow write: fsync + replication exceeded 1s",
+            );
+        }
 
         let shard_label = &self.metrics_shard_label;
         metrics::counter!("celeriant_write_events_total", shard_label).increment(total_events as u64);

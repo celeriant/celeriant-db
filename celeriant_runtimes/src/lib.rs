@@ -49,6 +49,7 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
         shard_failed.store(false, Ordering::SeqCst);
         let started_at = std::time::Instant::now();
         let mesh = MeshBuilder::<IntrashardMessages, Full>::full(num_shards, mesh_channel_size);
+        let s3_upload_inflight = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
         // Build per-core CpuSets for deterministic pinning. MaxSpread breaks on
         // platforms with fake NUMA nodes (e.g. RPi 5 exposes 8 NUMA nodes over 4
@@ -66,7 +67,7 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
         };
 
         let results = LocalExecutorPoolBuilder::new(placement)
-            .on_all_shards(enclose!((mesh, shard_config, sidecar_senders, shard_failed) move || async move {
+            .on_all_shards(enclose!((mesh, shard_config, sidecar_senders, shard_failed, s3_upload_inflight) move || async move {
 
                 let (sender, receivers) = mesh.join().await
                     .expect("Failed to join mesh - cannot initialize shard");
@@ -118,7 +119,7 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                     max_clock_drift_ms: shard_config.max_clock_drift_ms,
                     cache_warmup_max_duration: shard_config.cache_warmup_max_duration.unwrap_or(Duration::MAX),
                 };
-                let s3_uploader = SidecarS3Uploader::new(sidecar_senders.clone());
+                let s3_uploader = SidecarS3Uploader::new(sidecar_senders.clone(), s3_upload_inflight.clone(), shard_config.s3_max_concurrent_fallback_uploads);
                 let replication_client_config = shard_config.tls_config.as_ref()
                     .map(|t| t.replication_client_config.clone());
                 let replication_client = FollowerConnection::new(

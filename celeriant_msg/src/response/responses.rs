@@ -112,6 +112,7 @@ impl ErrorResponse {
 
     pub fn is_server_busy(&self) -> bool {
         self.error_code == crate::error_codes::SERVER_BUSY
+            || self.error_code == crate::error_codes::WRITE_REPLICATION_BACKPRESSURE
     }
 
     /// Extract leader address from error_message JSON like `{"leader_address":"host:port"}`.

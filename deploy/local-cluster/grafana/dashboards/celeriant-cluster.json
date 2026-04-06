@@ -15,7 +15,7 @@
       "title": "Node Role",
       "description": "1 = Leader, 0 = Follower",
       "type": "stat",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "datasource": { "type": "prometheus", "uid": "celeriant-prometheus" },
       "gridPos": { "h": 4, "w": 6, "x": 0, "y": 1 },
       "targets": [{ "expr": "celeriant_node_role", "legendFormat": "{{instance}}" }],
       "fieldConfig": {
@@ -29,21 +29,21 @@
     {
       "title": "Active Client Connections",
       "type": "stat",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "datasource": { "type": "prometheus", "uid": "celeriant-prometheus" },
       "gridPos": { "h": 4, "w": 6, "x": 6, "y": 1 },
       "targets": [{ "expr": "sum by (instance) (celeriant_client_connections_active)", "legendFormat": "{{instance}}" }]
     },
     {
       "title": "Leader Elections",
       "type": "stat",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "datasource": { "type": "prometheus", "uid": "celeriant-prometheus" },
       "gridPos": { "h": 4, "w": 6, "x": 12, "y": 1 },
       "targets": [{ "expr": "sum by (instance) (celeriant_leader_elections_total)", "legendFormat": "{{instance}}" }]
     },
     {
       "title": "Clock Drift (ms)",
       "type": "gauge",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "datasource": { "type": "prometheus", "uid": "celeriant-prometheus" },
       "gridPos": { "h": 4, "w": 6, "x": 18, "y": 1 },
       "targets": [{ "expr": "celeriant_clock_drift_ms", "legendFormat": "{{instance}}" }],
       "fieldConfig": {
@@ -68,7 +68,7 @@
     {
       "title": "Write Rate",
       "type": "timeseries",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "datasource": { "type": "prometheus", "uid": "celeriant-prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
       "targets": [{ "expr": "sum by (instance) (rate(celeriant_writes_total[$__rate_interval]))", "legendFormat": "{{instance}}" }],
       "fieldConfig": { "defaults": { "unit": "ops" } }
@@ -76,7 +76,7 @@
     {
       "title": "Read Rate",
       "type": "timeseries",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "datasource": { "type": "prometheus", "uid": "celeriant-prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
       "targets": [{ "expr": "sum by (instance) (rate(celeriant_reads_total[$__rate_interval]))", "legendFormat": "{{instance}}" }],
       "fieldConfig": { "defaults": { "unit": "ops" } }
@@ -84,7 +84,7 @@
     {
       "title": "Write Throughput (bytes/s)",
       "type": "timeseries",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "datasource": { "type": "prometheus", "uid": "celeriant-prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
       "targets": [{ "expr": "sum by (instance) (rate(celeriant_write_bytes_total[$__rate_interval]))", "legendFormat": "{{instance}}" }],
       "fieldConfig": { "defaults": { "unit": "Bps" } }
@@ -92,7 +92,7 @@
     {
       "title": "Read Throughput (bytes/s)",
       "type": "timeseries",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "datasource": { "type": "prometheus", "uid": "celeriant-prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
       "targets": [{ "expr": "sum by (instance) (rate(celeriant_read_bytes_total[$__rate_interval]))", "legendFormat": "{{instance}}" }],
       "fieldConfig": { "defaults": { "unit": "Bps" } }
@@ -106,7 +106,7 @@
     {
       "title": "Write Latency (p50 / p99)",
       "type": "timeseries",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "datasource": { "type": "prometheus", "uid": "celeriant-prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 23 },
       "targets": [
         { "expr": "histogram_quantile(0.50, sum by (le, instance) (rate(celeriant_write_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p50 {{instance}}" },
@@ -117,7 +117,7 @@
     {
       "title": "Read Latency (p50 / p99)",
       "type": "timeseries",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "datasource": { "type": "prometheus", "uid": "celeriant-prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 23 },
       "targets": [
         { "expr": "histogram_quantile(0.50, sum by (le, instance) (rate(celeriant_read_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p50 {{instance}}" },
@@ -128,7 +128,7 @@
     {
       "title": "Fsync Latency (p50 / p99)",
       "type": "timeseries",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "datasource": { "type": "prometheus", "uid": "celeriant-prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 31 },
       "targets": [
         { "expr": "histogram_quantile(0.50, sum by (le, instance) (rate(celeriant_fsync_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p50 {{instance}}" },
@@ -139,7 +139,7 @@
     {
       "title": "Replication Latency (p50 / p99)",
       "type": "timeseries",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "datasource": { "type": "prometheus", "uid": "celeriant-prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 31 },
       "targets": [
         { "expr": "histogram_quantile(0.50, sum by (le, instance) (rate(celeriant_replication_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p50 {{instance}}" },
@@ -156,14 +156,14 @@
     {
       "title": "Fsync Batch Size",
       "type": "timeseries",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "datasource": { "type": "prometheus", "uid": "celeriant-prometheus" },
       "gridPos": { "h": 8, "w": 8, "x": 0, "y": 40 },
       "targets": [{ "expr": "sum by (instance) (rate(celeriant_fsync_batch_size_sum[$__rate_interval])) / clamp_min(sum by (instance) (rate(celeriant_fsync_batch_size_count[$__rate_interval])), 1e-15)", "legendFormat": "avg {{instance}}" }]
     },
     {
       "title": "Replication Queue",
       "type": "gauge",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "datasource": { "type": "prometheus", "uid": "celeriant-prometheus" },
       "gridPos": { "h": 8, "w": 8, "x": 8, "y": 40 },
       "targets": [
         { "expr": "sum by (instance) (celeriant_replication_queue_bytes) / sum by (instance) (celeriant_replication_queue_high_water_bytes)", "legendFormat": "{{instance}}" }
@@ -186,7 +186,7 @@
     {
       "title": "S3 Fallbacks / Rollbacks",
       "type": "timeseries",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "datasource": { "type": "prometheus", "uid": "celeriant-prometheus" },
       "gridPos": { "h": 8, "w": 8, "x": 16, "y": 40 },
       "targets": [
         { "expr": "sum by (instance) (rate(celeriant_replication_s3_fallbacks_total[$__rate_interval]))", "legendFormat": "s3_fallback {{instance}}" },
@@ -202,7 +202,7 @@
     {
       "title": "Recent Write Cache Hit Rate",
       "type": "timeseries",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "datasource": { "type": "prometheus", "uid": "celeriant-prometheus" },
       "gridPos": { "h": 8, "w": 8, "x": 0, "y": 49 },
       "targets": [{
         "expr": "sum by (instance) (rate(celeriant_cache_recent_write_hits_total[$__rate_interval])) / clamp_min(sum by (instance) (rate(celeriant_cache_recent_write_hits_total[$__rate_interval])) + sum by (instance) (rate(celeriant_cache_recent_write_misses_total[$__rate_interval])), 1e-15)",
@@ -213,7 +213,7 @@
     {
       "title": "Aggregate Snapshot Cache Hit Rate",
       "type": "timeseries",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "datasource": { "type": "prometheus", "uid": "celeriant-prometheus" },
       "gridPos": { "h": 8, "w": 8, "x": 8, "y": 49 },
       "targets": [{
         "expr": "sum by (instance) (rate(celeriant_cache_aggregate_snapshot_hits_total[$__rate_interval])) / clamp_min(sum by (instance) (rate(celeriant_cache_aggregate_snapshot_hits_total[$__rate_interval])) + sum by (instance) (rate(celeriant_cache_aggregate_snapshot_misses_total[$__rate_interval])), 1e-15)",
@@ -224,7 +224,7 @@
     {
       "title": "Log File Cache Hit Rate",
       "type": "timeseries",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "datasource": { "type": "prometheus", "uid": "celeriant-prometheus" },
       "gridPos": { "h": 8, "w": 8, "x": 16, "y": 49 },
       "targets": [{
         "expr": "sum by (instance) (rate(celeriant_cache_log_file_hits_total[$__rate_interval])) / clamp_min(sum by (instance) (rate(celeriant_cache_log_file_hits_total[$__rate_interval])) + sum by (instance) (rate(celeriant_cache_log_file_misses_total[$__rate_interval])), 1e-15)",
@@ -241,21 +241,21 @@
     {
       "title": "WAL Index (per shard)",
       "type": "timeseries",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "datasource": { "type": "prometheus", "uid": "celeriant-prometheus" },
       "gridPos": { "h": 8, "w": 8, "x": 0, "y": 58 },
       "targets": [{ "expr": "celeriant_wal_index", "legendFormat": "{{instance}} shard={{shard_id}}" }]
     },
     {
       "title": "Log Segments",
       "type": "timeseries",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "datasource": { "type": "prometheus", "uid": "celeriant-prometheus" },
       "gridPos": { "h": 8, "w": 8, "x": 8, "y": 58 },
       "targets": [{ "expr": "sum by (instance) (celeriant_log_segments_total)", "legendFormat": "{{instance}}" }]
     },
     {
       "title": "Log Rotations Rate",
       "type": "timeseries",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "datasource": { "type": "prometheus", "uid": "celeriant-prometheus" },
       "gridPos": { "h": 8, "w": 8, "x": 16, "y": 58 },
       "targets": [{ "expr": "sum by (instance) (rate(celeriant_log_rotations_total[$__rate_interval]))", "legendFormat": "{{instance}}" }]
     },
@@ -268,7 +268,7 @@
     {
       "title": "Error Rates",
       "type": "timeseries",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "datasource": { "type": "prometheus", "uid": "celeriant-prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 67 },
       "targets": [
         { "expr": "sum by (instance, error_code) (rate(celeriant_write_errors_total[$__rate_interval]))", "legendFormat": "write_err {{error_code}} {{instance}}" },
@@ -278,7 +278,7 @@
     {
       "title": "Shard Panics & Restarts",
       "type": "timeseries",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "datasource": { "type": "prometheus", "uid": "celeriant-prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 67 },
       "targets": [
         { "expr": "sum by (instance) (celeriant_shard_panics_total)", "legendFormat": "panics {{instance}}" },
@@ -289,16 +289,7 @@
   "refresh": "5s",
   "schemaVersion": 39,
   "tags": ["celeriant"],
-  "templating": {
-    "list": [
-      {
-        "name": "DS_PROMETHEUS",
-        "type": "datasource",
-        "query": "prometheus",
-        "current": { "text": "Prometheus", "value": "Prometheus" }
-      }
-    ]
-  },
+  "templating": { "list": [] },
   "time": { "from": "now-15m", "to": "now" },
   "title": "Celeriant Cluster",
   "uid": "celeriant-cluster",

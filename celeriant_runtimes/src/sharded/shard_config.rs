@@ -58,6 +58,8 @@ pub struct ShardConfig {
     pub heartbeat_lease_duration: Duration,
     pub heartbeat_interval_duration: Duration,
     pub heartbeat_timeout: Duration,
+    pub heartbeat_hard_timeout_multiplier: u32,
+    pub s3_max_concurrent_fallback_uploads: u32,
     pub advertised_replication_address: Option<String>,
     pub data_root: PathBuf,
     pub listen_address: String,

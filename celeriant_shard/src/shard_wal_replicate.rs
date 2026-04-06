@@ -106,6 +106,9 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
     let reachable_at_commit = replication_client.is_follower_reachable();
     let mut follower_falling_behind_or_offline = replication_captured_data.follower_falling_behind_or_offline
         || !reachable_at_commit;
+    if !reachable_at_commit {
+        debug!(shard_id, "Replication commit: follower unreachable, will use S3 fallback");
+    }
     let mut added_additional_entries = false;
     let mut kick_sent = false;
 
@@ -143,8 +146,13 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
             let first_wal = batches.first().map(|b| b.metablock.wal_index).unwrap_or(0);
             let last_wal = batches.last().map(|b| b.metablock.wal_index).unwrap_or(0);
             warn!(shard_id, batch_count = batches.len(), first_wal, last_wal, workset_size_bytes, "S3 fallback: uploading batch");
+            let s3_start = std::time::Instant::now();
             match replication_client.replicate_to_s3(std::mem::take(&mut batches)).await {
                 Ok(()) => {
+                    let s3_ms = s3_start.elapsed().as_millis() as u64;
+                    if s3_ms > 500 {
+                        warn!(shard_id, s3_ms, workset_size_bytes, "S3 fallback upload slow");
+                    }
                     if !kick_sent && replication_client.is_follower_reachable() {
                         let _ = replication_client.send_kick().await;
                         kick_sent = true;
@@ -306,13 +314,24 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
         ReplicationDetails::ReplicatedToFollower => "tcp",
         ReplicationDetails::RepliatedToS3(_) => "s3",
     };
-    debug!(
-        shard_id,
-        batch_count = initial_batch_count,
-        path,
-        duration_ms = start.elapsed().as_millis() as u64,
-        "Replication batch committed"
-    );
+    let commit_ms = start.elapsed().as_millis() as u64;
+    if commit_ms > 1000 {
+        warn!(
+            shard_id,
+            batch_count = initial_batch_count,
+            path,
+            duration_ms = commit_ms,
+            "Slow replication commit (>1s)",
+        );
+    } else {
+        debug!(
+            shard_id,
+            batch_count = initial_batch_count,
+            path,
+            duration_ms = commit_ms,
+            "Replication batch committed"
+        );
+    }
 
     let sealed_ready = commit_replication(
         &log_segments_cache,

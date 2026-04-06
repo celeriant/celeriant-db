@@ -1388,6 +1388,8 @@ mod tests {
             heartbeat_lease_duration: Duration::from_millis(1500),
             heartbeat_interval_duration: Duration::from_millis(250),
             heartbeat_timeout: Duration::from_millis(500),
+            heartbeat_hard_timeout_multiplier: 4,
+            s3_max_concurrent_fallback_uploads: 2,
             s3_retry_max_duration: None,
             advertised_replication_address: None,
             data_root: "/tmp".into(),

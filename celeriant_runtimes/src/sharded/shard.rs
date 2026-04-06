@@ -604,12 +604,33 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                 let unix_epoch_now_ms = validated_node_status::unix_epoch_now_ms();
                 let lease_index = ctx.shard_wal.node_status.get().raw().lease_index().unwrap_or(0);
                 let hb_start = std::time::Instant::now();
-                let result = ctx.shard_wal.replication_client.send_heartbeat(unix_epoch_now_ms, lease_index).await;
+
+                // Hard timeout: the internal heartbeat_timeout (500ms) relies on the
+                // network stack cooperating, but under NIC saturation a kTLS send can
+                // block in the kernel for 20+ seconds (TCP retransmit timeout). This
+                // outer timeout ensures shard 0 isn't stuck and can proceed to lease
+                // renewal promptly. We use 4x the heartbeat timeout as the hard cap.
+                let hb_hard_timeout = ctx.config.heartbeat_timeout * ctx.config.heartbeat_hard_timeout_multiplier;
+                let hb_hard_timed_out;
+                let result = match glommio::timer::timeout(hb_hard_timeout, async {
+                    Ok::<_, glommio::GlommioError<()>>(
+                        ctx.shard_wal.replication_client.send_heartbeat(unix_epoch_now_ms, lease_index).await
+                    )
+                }).await {
+                    Ok(inner) => { hb_hard_timed_out = false; inner },
+                    Err(_) => {
+                        warn!(shard_id = ctx.current_shard_id, elapsed_ms = hb_start.elapsed().as_millis() as u64, timeout_ms = hb_hard_timeout.as_millis() as u64, "Heartbeat hard timeout — kernel TCP send blocked");
+                        hb_hard_timed_out = true;
+                        Err(SendHeartbeatError::UnexpectedResponse)
+                    }
+                };
                 let hb_elapsed_ms = hb_start.elapsed().as_millis() as u64;
 
-                if let Err(SendHeartbeatError::LockTimeout) = &result {
-                    warn!("Heartbeat lock contention, skipping heartbeat");
-                    continue;
+                if !hb_hard_timed_out {
+                    if let Err(SendHeartbeatError::LockTimeout) = &result {
+                        warn!("Heartbeat lock contention, skipping heartbeat");
+                        continue;
+                    }
                 }
 
                 if let Err(ref e) = result {
@@ -633,9 +654,27 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                     continue;
                 }
 
+                let was_reachable = ctx.shard_wal.replication_client.is_follower_reachable();
                 ctx.shard_wal.replication_client.set_follower_reachable(false);
                 broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::FollowerReachable { reachable: false }, ctx.intrashard_sender.clone()).await;
                 metrics::counter!("celeriant_heartbeat_failures_total").increment(1);
+
+                // Preemptive lease renewal: when follower just went unreachable, renew
+                // the lease immediately to get a fresh TTL before the S3 replication
+                // fallback storm from other shards saturates MinIO.
+                if was_reachable && has_peer {
+                    warn!("Follower just became unreachable — preemptive S3 lease renewal");
+                    match set_node_role_via_s3(&lease_manager, &ctx, &rx).await {
+                        Ok(outcome) => {
+                            if let Some(ref peer) = outcome.peer_info {
+                                info!(peer_replication_address = %peer.replication_address, "Preemptive renewal: peer confirmed via S3");
+                            }
+                        }
+                        Err(e) => {
+                            error!(error = %e, "Preemptive S3 lease renewal failed");
+                        }
+                    }
+                }
 
                 // Decide whether to check S3: either for peer discovery (no known peer)
                 // or for lease renewal (known peer but unreachable)
