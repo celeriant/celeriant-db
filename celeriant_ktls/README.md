@@ -35,26 +35,26 @@ Post-Handshake:                 ▼
                      └──────────────────────┘
 ```
 
+## Invariants
+
+- TLS 1.3 is the only permitted version. No fallback.
+- Session tickets are prohibited. They desync kernel TLS sequence counters.
+- Trailing bytes from the handshake must be processed before reading from the kernel-encrypted stream. Dropping them silently loses application data.
+- kTLS support is verified at startup via `setsockopt` probe. Fatal if missing.
+- Handshake buffer is capped at 128KB. Prevents unbounded allocation from oversized handshake messages.
+- All `unsafe` blocks are limited to Linux system calls. No pointer arithmetic, no aliasing.
+
 ## Key Types
 
 | Type | Purpose |
 |------|---------|
 | `KtlsError` | Error enum covering TLS, I/O, kernel support, cipher, and setsockopt failures |
 
-### Internal (C FFI) Structs
-
-| Type | Purpose |
-|------|---------|
-| `TlsCryptoInfo` | Base header: TLS version + cipher type |
-| `TlsCryptoInfoAesGcm128` | AES-128-GCM key material (16B key, 4B salt, 8B IV, 8B seq) |
-| `TlsCryptoInfoAesGcm256` | AES-256-GCM key material (32B key, 4B salt, 8B IV, 8B seq) |
-| `TlsCryptoInfoChacha20Poly1305` | ChaCha20-Poly1305 key material (32B key, 12B IV, 8B seq, no salt) |
-
 ## Key Functions
 
 | Function | Purpose |
 |----------|---------|
-| `verify_ktls_support` | Synchronous startup check — creates dummy socket to probe kTLS kernel module |
+| `verify_ktls_support` | Synchronous startup check - creates dummy socket to probe kTLS kernel module |
 | `ktls_accept` | Async server-side TLS 1.3 handshake → kernel TLS. Returns `(TcpStream, trailing_bytes)` |
 | `ktls_connect` | Async client-side TLS 1.3 handshake → kernel TLS. Returns `(TcpStream, trailing_bytes)` |
 
@@ -74,7 +74,7 @@ server_config.send_tls13_tickets = 0;
 // Accept a connection with kernel TLS
 let (stream, trailing) = ktls_accept(tcp_stream, Arc::new(server_config)).await?;
 // Handle trailing bytes (app data already decrypted during handshake)
-// Then use stream as normal — kernel handles encryption transparently
+// Then use stream as normal - kernel handles encryption transparently
 
 // Client config must enable secret extraction
 let mut client_config = rustls::ClientConfig::builder()
@@ -105,7 +105,7 @@ TCP buffer: [handshake records | app data records]
                                   but kernel TLS not yet installed
 ```
 
-During the handshake, `TcpStream::read` may pull application data records into the userspace buffer alongside the final handshake flight. Rustls decrypts these records, but kernel TLS hasn't been installed yet so the kernel doesn't know about them. These bytes are collected and returned as `trailing_bytes` — the caller must process them before reading from the now-kernel-encrypted stream.
+During the handshake, `TcpStream::read` may pull application data records into the userspace buffer alongside the final handshake flight. Rustls decrypts these records, but kernel TLS hasn't been installed yet so the kernel doesn't know about them. These bytes are collected and returned as `trailing_bytes`. The caller must process them before reading from the now-kernel-encrypted stream.
 
 ### Session tickets disabled for internode connections
 
@@ -145,11 +145,3 @@ Creates a dummy TCP socket and attempts `setsockopt(SOL_TCP, TCP_ULP, "tls")`. I
 
 All `unsafe` blocks wrap Linux system calls (`socket`, `setsockopt`, `close`, `__errno_location`). No pointer arithmetic, no aliasing, no lifetime tricks. The `#[repr(C)]` structs ensure correct ABI layout for the kernel interface.
 
-## Dependencies
-
-- `rustls` — TLS 1.3 handshake with unbuffered API and secret extraction
-- `rustls-pki-types` — TLS types (`ServerName`, certificates)
-- `glommio` — Async `TcpStream` / `TcpListener`
-- `libc` — Raw socket syscalls for kernel TLS configuration
-- `futures-lite` — `AsyncReadExt` / `AsyncWriteExt` for stream I/O
-- `tracing` — Debug logging at handshake milestones

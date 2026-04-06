@@ -31,6 +31,17 @@ LogSegmentFileMetadata
 **Dual file handles**: Separate reader/writer DmaFiles allow concurrent read/write without blocking.
 **Dual cursors**: `write` tracks in-progress writes; `read` tracks what is replicated and visible.
 
+## Invariants
+
+- Both the primary header (offset 0) and backup header (offset `file_len - 512KB`) are written on every fsync.
+- Separate reader/writer DmaFile handles via `dup()`. Readers never block writers.
+- Dual cursors: `write` tracks in-progress writes, `read` tracks replicated/visible data. The reverse scanner uses `read` exclusively.
+- After rotation, the new file's `read` cursor is `None` until the first successful replication.
+- Log segment rotation carries `wal_index` and `tip_hash` from the old file's write cursor into the new file's header. Hash chain and WAL sequence are unbroken across file boundaries.
+- Sealed segments produce a separate sidecar `.summary` file, never embedded in the WAL.
+- Log segments are preallocated at creation. Minimum valid size: 1.5MB (two 512KB headers + one usable block).
+- All lock acquisitions use 1-second timeout wrappers. Timeout returns `PotentialDeadlock`.
+
 ## Key Types
 
 | Type | Purpose |
@@ -45,101 +56,6 @@ LogSegmentFileMetadata
 | `ReadyUpError` | Errors during shard initialization |
 | `ScanError` | Errors during reverse metablock scanning |
 | `WriteDualHeaderError` | Errors writing primary/backup headers |
-
-## Key Functions
-
-| Function | Purpose |
-|----------|---------|
-| `LogSegmentsCache::ready_up` | Initialize shard, open/create active log file |
-| `LogSegmentsCache::active` | Get active log segment for writing |
-| `LogSegmentsCache::active_log_id` | Get the log_id of the active file |
-| `LogSegmentsCache::get` | Get log segment by ID (from cache or disk) |
-| `LogSegmentsCache::get_if_cached` | Non-async check if log_id is already cached, no I/O |
-| `LogSegmentsCache::evict_from_lru` | Evict a log segment from the LRU cache |
-| `LogSegmentsCache::rotate_to_next_log` | Create new active log, move current to LRU cache |
-| `LogSegmentsCache::rollback_write_position` | Rollback write cursor after failed replication |
-| `LogSegmentsCache::get_latest_read_cursor` | Get replicated read position (handles rotation boundary) |
-| `LogSegmentsCache::active_log_available_space` | Quick space check against write cursor |
-| `LogSegmentsCache::shard_dir` | Get the shard directory path |
-| `LogSegmentsCache::close` | Close all file handles |
-| `LogSegmentFile::open_or_create_first_file_for_shard` | Open existing or create new log file |
-| `LogSegmentFile::open_existing` | Open existing log file (errors if missing) |
-| `LogSegmentFile::lock_reader` | Acquire read lock on the DmaFile with timeout |
-| `LogSegmentFile::lock_writer` | Acquire write lock on the DmaFile with timeout |
-| `LogSegmentFile::close` | Close both reader and writer file handles |
-| `LogSegmentFileMetadata::advance_visible_position` | Promote write cursor to read (post-replication) |
-| `LogSegmentFileMetadata::is_pending_advance` | True if write cursor is ahead of read cursor |
-| `LogSegmentFileMetadata::to_shard_log_header` | Convert metadata to ShardLogHeader for persistence |
-| `LogSegmentFileMetadata::available_space` | Remaining bytes between metablocks and datablocks |
-| `LogSegmentFileMetadata::readable_metablocks_end` | End position of metablocks visible to readers |
-| `ReverseMetablockScanner::scan` | Scan metablocks in reverse with visitor |
-| `ReverseMetablockScanner::with_bloom_filter` | Skip segments where aggregate is definitely absent |
-| `ReverseMetablockScanner::with_bloom_filter_hash` | Same as above but with pre-computed hash bytes |
-| `write_dual_shard_log_header` | Write header to both start and end of file |
-| `read_datablocks_carry_over_bytes` | Read unaligned bytes at datablocks boundary on open |
-
-## Usage
-
-```rust
-// Initialize shard
-let cache = LogSegmentsCache::ready_up(
-    shard_dir,
-    1 << 30,        // 1GB preallocate (must be multiple of 512KB)
-    8,              // max cached files
-    shard_id,       // shard identifier for metrics labels
-).await?;
-
-// Write path: get active log
-let active = cache.active();
-let mut guard = active.lock_writer("append").await?;
-// ... write metablocks/datablocks ...
-drop(guard);
-
-// After successful replication: advance read cursor
-active.metadata.borrow_mut().advance_visible_position();
-
-// After failed replication: rollback write cursor
-cache.rollback_write_position();
-
-// Check space before writing
-let space = cache.active_log_available_space();
-
-// Rotate when space is insufficient (caller decides when)
-cache.rotate_to_next_log().await?;
-
-// Read path: get any log by ID
-let log_file = cache.get(log_id).await?;
-let guard = log_file.lock_reader("read").await?;
-// ... read data ...
-
-// Non-async cache check (no I/O)
-if let Some(file) = cache.get_if_cached(log_id) {
-    // already loaded
-}
-
-// Get the latest replicated position (safe to serve reads)
-let read_cursor = cache.get_latest_read_cursor();
-
-// Reverse scan with bloom filter optimization
-let mut scanner = ReverseMetablockScanner::new(
-    &cache,
-    cache.active_log_id(),
-    None,           // start from end
-    64 * 1024,      // chunk size
-).with_bloom_filter(&aggregate_key);
-
-let result = scanner.scan(|log_id, pos, block| {
-    // Process 1024-byte metablock
-    if found_what_we_need(block) {
-        Ok(Some(result))  // Stop scanning
-    } else {
-        Ok(None)          // Continue
-    }
-}).await?;
-
-// Cleanup
-cache.close().await;
-```
 
 ## Design Decisions
 
@@ -240,7 +156,7 @@ pub async fn rotate(&self, shard_dir: &PathBuf, preallocate_bytes: u64) -> Resul
 }
 ```
 
-This maintains the global WAL sequence and hash chain continuity across file boundaries. The new file's `read` cursor starts as `None`—readers see the previous file's data until replication confirms the new file's entries.
+This maintains the global WAL sequence and hash chain continuity across file boundaries. The new file's `read` cursor starts as `None`. Readers see the previous file's data until replication confirms the new file's entries.
 
 ### Rotation triggers
 
@@ -322,15 +238,3 @@ pub datablocks_carry_over: Option<Vec<u8>>
 
 This allows writers to continue appending at unaligned positions without losing data.
 
-## Dependencies
-
-- `glommio` - Thread-per-core async runtime with DMA support
-- `lru` - LRU cache implementation
-- `celeriant_wal` - WAL data structures (Metablock, ShardLogHeader, constants)
-- `celeriant_wire` - Serialization for headers
-- `celeriant_disk` - Low-level DMA read utilities
-- `fastbloom` - Bloom filter implementation
-- `bincode` - Binary serialization
-- `metrics` - Runtime metrics collection
-- `tracing` - Structured logging and diagnostics
-- `futures-lite` - Lightweight async utilities

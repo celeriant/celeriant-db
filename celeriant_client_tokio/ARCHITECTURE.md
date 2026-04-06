@@ -34,59 +34,36 @@ Watch:
   WatchConnection              - single or multi-shard real-time watch stream
 ```
 
+## Invariants
+
+- TCP_NODELAY is always set. Nagle buffering is never permitted.
+- Protocol version is set on the first message (Identify or first ClientRequest). No renegotiation.
+- Pool idle timeout (25s) must be shorter than the server's `slow_client_timeout` (30s) to prevent server-side disconnects.
+- Broken connections are discarded, never returned to the pool.
+- `identify()` handshake runs after connection establishment and before data operations.
+- Write operations route to the leader. On `NotLeader` redirect, the leader cache is updated and the request retried once at the new address.
+
 ## Key Types
 
 | Type | Purpose |
 |------|---------|
 | `CeleriantClient` | Single TCP/TLS connection; RAII-managed |
-| `CeleriantPool` | Topology-aware connection pool with leader routing and failover |
+| `CeleriantPool` | Topology-aware pool with leader routing, failover, and idle eviction |
 | `PoolOptions` | Pool configuration (timeouts, TLS, identity, compression, routing) |
-| `PooledConnection` | Borrowed connection from pool; returns on drop, discards if broken |
+| `PooledConnection` | Borrowed connection; returns on drop, discards if broken |
 | `CeleriantPoolApi` | Trait abstracting pool operations for testing/mocking |
-| `ClientTlsConfig` | TLS connector + server name for encrypted connections |
-| `ClientIdentityConfig` | Public/private key pair or API key for client identity verification |
-| `ClientError` | Error enum for client-level failures |
+| `ClientTlsConfig` | TLS connector + server name |
+| `ClientIdentityConfig` | Public/private key pair or API key for identity verification |
+| `ClientError` | Client-level error enum; promotes `NotLeader`, `IdentityRequired`, `ServerBusy` for routing |
 | `ServerError` | Strongly-typed server error with operation-specific variants |
-| `WriteEventsOptions` | Options for write_events: idempotency, optimistic concurrency, client_id |
+| `WriteEventsOptions` | Idempotency, optimistic concurrency, and client_id for writes |
 | `WatchConnection` | Real-time watch stream (single-shard or multi-shard) |
 | `WatchOptions` | Watch configuration (compression, timeout, shard hints, TLS, identity) |
-| `ListOptions` | Shared config for list iterators (compression, deleted, shard hints) |
-| `ReadAllIterator<'a>` | Streaming iterator over all event batches for an aggregate |
-| `ListOrgsIterator<'a>` | Streaming iterator over orgs across all shards |
-| `ListAggregateTypesIterator<'a>` | Streaming iterator over aggregate types across all shards |
-| `ListAggregatesIterator<'a>` | Streaming iterator over aggregates with merged stats |
-| `AggregateStats` | Merged stats for one aggregate (event counts, timestamps, sizes) |
-| `Pooled{ReadAll,ListOrgs,...}Iterator` | Pool-aware iterator variants that own the connection |
-
-## Key Functions
-
-| Function | Purpose |
-|----------|---------|
-| `CeleriantClient::connect` | Connect without timeout (plaintext) |
-| `CeleriantClient::connect_tls` | Connect with TLS |
-| `CeleriantClient::connect_with_timeout` | Connect with optional timeout and optional TLS |
-| `CeleriantClient::send_request` | Send `ClientRequest`, receive `ClientResponse`; applies timeout if set |
-| `CeleriantClient::identify` | Perform client identity verification handshake |
-| `CeleriantClient::read` | Read event batches for an aggregate |
-| `CeleriantClient::write` | Write events (auto-compresses above threshold) |
-| `CeleriantClient::write_events` | Convenience: write events to a single aggregate |
-| `CeleriantClient::write_events_with` | Write events with idempotency/OCC options |
-| `CeleriantClient::delete` | Delete aggregates |
-| `CeleriantClient::trim_start` | Trim event batches from start of an aggregate |
-| `CeleriantClient::aggregate_details` | Get aggregate metadata |
-| `CeleriantClient::register_schema` | Register a schema (auto-compresses above threshold) |
-| `CeleriantPool::new` | Create a pool from `PoolOptions` |
-| `CeleriantPool::read` | Read with round-robin across read-eligible nodes |
-| `CeleriantPool::write` | Write with leader routing and failover |
-| `CeleriantPool::watch` | Create a dedicated watch connection |
-| `CeleriantPool::read_all` | Create a pooled streaming read-all iterator |
-| `CeleriantPool::list_orgs` | Create a pooled streaming list-orgs iterator |
-| `CeleriantPool::list_aggregates` | Create a pooled streaming list-aggregates iterator |
-| `WatchConnection::connect` | Connect and establish watch (auto-discovers multi-shard) |
-| `WatchConnection::next` | Read next watch response |
-| `WatchConnection::next_timeout` | Read next watch response with timeout |
-| `json_event` | Create a `DatablockAggregateEvent` by JSON-serializing a value |
-| `from_json` | Deserialize event value bytes into a typed struct |
+| `ListOptions` | Shared config for list iterators |
+| `ReadAllIterator<'a>` | Streaming paginated reads for one aggregate |
+| `ListOrgsIterator<'a>` | Streaming orgs across all shards |
+| `ListAggregateTypesIterator<'a>` | Streaming aggregate types across all shards |
+| `ListAggregatesIterator<'a>` | Streaming aggregates with merged stats |
 
 ## Design Decisions
 
@@ -118,7 +95,7 @@ pub struct PoolOptions {
 }
 ```
 
-Each node gets its own pool of connections bounded by a `Semaphore`. Idle connections are evicted on checkout (oldest-first). Broken connections are discarded rather than returned. The idle timeout (25s) is intentionally shorter than the server's `slow_client_timeout` (30s) to prevent server-side disconnects.
+Each node gets its own pool bounded by a `Semaphore`. Idle connections are evicted on checkout (oldest-first). Broken connections are discarded rather than returned. The idle timeout (25s) is intentionally shorter than the server's `slow_client_timeout` (30s) to prevent server-side disconnects.
 
 ### Leader routing and failover
 
@@ -194,31 +171,3 @@ An aggregate can appear on multiple shards (replicated or migrated). `AggregateS
 ### Strongly-typed server errors
 
 Server error responses are parsed into operation-specific enums (`ReadError`, `WriteError`, `SchemaError`, `DeleteError`, `TrimError`, `WatchError`, `DetailsError`, `AuthError`) rather than exposing raw error codes. Each variant carries structured context (e.g., `OptimisticConcurrencyViolation` includes both expected and current batch indices). Three `ClientError` variants are promoted for routing: `NotLeader`, `IdentityRequired`, and `ServerBusy`.
-
-### ClientError variants
-
-| Variant | Cause |
-|---------|-------|
-| `ConnectionFailed(io::Error)` | TCP/TLS connect failed |
-| `ConnectionTimeout` | connect_with_timeout deadline exceeded |
-| `RequestTimeout` | send_request timeout exceeded |
-| `WireError(WireError)` | Framing/encoding failure |
-| `ReadError(ReadWireDataError)` | Response decode failure |
-| `ProtocolError` | Unexpected response variant |
-| `NotLeader { leader_address, error_message }` | Node is not leader; includes redirect address if known |
-| `Server(ServerError)` | Strongly-typed server error |
-| `IdentityRequired` | Server requires `identify()` before data operations |
-| `ServerBusy` | Server overloaded; retry after backoff |
-| `IdentityError(CryptoError)` | Nonce generation, signing, or verification failure |
-
-## Dependencies
-
-- `celeriant_msg` - Request/Response message types, wire protocol
-- `celeriant_wire` - Wire framing, protocol version constants, WireError
-- `celeriant_wal` - AggregateKey, AggregateTypeKey, CompressionType
-- `celeriant_crypto` - Key generation, nonce signing, identity verification
-- `tokio` - Async runtime, TcpStream, timeout, semaphore
-- `tokio-util` - Compat layer bridging Tokio AsyncRead/AsyncWrite to futures traits
-- `tokio-rustls`, `rustls`, `rustls-pki-types` - TLS support
-- `futures-util`, `futures-lite` - Async utility traits
-- `serde`, `serde_json` - Event serialization helpers

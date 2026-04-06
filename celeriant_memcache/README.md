@@ -74,98 +74,15 @@ Read Path:
 | `CachedValidator<V>` | Wraps an `Rc<V>` validator with size estimate |
 | `UniqueSchemaKeys` | Small-vec optimized set of schema keys (inline up to 2, then Vec) |
 
-## Key Functions
+## Invariants
 
-| Function | Purpose |
-|----------|---------|
-| `ShardMemCache::new` | Create cache with size limits including replication high water mark |
-| `add_to_pending_append_queue` | Queue write, update in-memory indexes |
-| `add_pending_delete_to_queue` | Queue soft delete |
-| `add_pending_trim_to_queue` | Queue trim operation |
-| `add_to_pending_queue` | Add prepared items directly (replication path, no index tracking) |
-| `take_sync_positions_snapshot` | Clone queue state for fsync |
-| `commit_sync_positions_snapshot` | Merge synced positions into write LRU; also updates read LRU on non-leader |
-| `execute_fsync_rollback` | Clear queue on fsync failure, set rollback flag |
-| `execute_replication_rollback` | Clear write snapshots and pending replication queue, set rollback flag |
-| `cache_recent_write` | Add to hot cache after durable write |
-| `get_cached_writes_from` | Iterate cached writes from batch index, filtered by `visible_wal_index` |
-| `aggregate_load_status` | Check if aggregate is in memory (takes `CachePath`) |
-| `aggregate_client_load_status` | Check if client has written to aggregate |
-| `get_write_event_indexes` | Get latest indexes (queue → write LRU), returns `EventIndexes` |
-| `get_client_event_index` | Get client's last event index (queue → write LRU) |
-| `get_aggregate_last_metablock_pos` | Get last known metablock position (takes `CachePath`) |
-| `get_aggregate_snapshot` | Retrieve cloned snapshot (takes `CachePath`) |
-| `put_aggregate_into_cache` | Insert snapshot with client tracking (takes `CachePath`) |
-| `put_aggregate_snapshot_only` | Insert snapshot without client tracking (takes `CachePath`) |
-| `put_aggregate_into_cache_as_not_found` | Mark aggregate as never created |
-| `put_aggregate_into_cache_as_deleted` | Mark as soft-deleted; clears recent writes on read path |
-| `put_aggregate_client_into_cache` | Insert client event index |
-| `commit_position_snapshot` | Update aggregate position in specified LRU (takes `CachePath`) |
-| `copy_write_to_read_snapshot` | Copy single aggregate write→read snapshot on commit |
-| `update_aggregate_min_event_batch_index` | Update trim position; evicts stale recent writes on read path |
-| `push_pending_replication` | Add batch to pending replication queue, returns true if high water mark exceeded |
-| `take_pending_replication` | Take all pending batches (clears queue and byte counter) |
-| `peek_pending_replication` | Peek at oldest batch (for timeout checking) |
-| `is_replication_queue_pressured` | Check if high water mark exceeded |
-| `take_fsync_rollback_flag` | Check and clear fsync rollback flag |
-| `take_replication_rollback_flag` | Check and clear replication rollback flag |
-| `cache_wal_index_position` | Cache WAL index → file position mapping |
-| `get_wal_index_position` | Retrieve exact cached position |
-| `find_nearest_wal_index_position` | Find nearest cached position ≤ target (for list pagination) |
-| `schema_cache_get` | Get cached schema (`Validated` or `CompilationFailed`) |
-| `schema_cache_insert` | Insert a compiled schema into cache |
-| `no_schema_cache_insert` | Cache that a schema key has no schema registered |
-| `schema_cache_contains` | Check if either schema or no-schema cache contains a key |
-| `schema_cache_has_schema` | Check if a real schema (not no-schema) exists |
-| `schema_is_pending` | Check if a schema registration is pending fsync |
-| `schema_mark_pending` | Mark a schema as pending fsync |
-| `clear_all_caches` | Clear all caches including read snapshots and recent writes |
-| `pending_replication_bytes` | Get current replication queue byte count |
-
-## Usage
-
-```rust
-// Initialize cache with size limits
-let cache = ShardMemCache::new(
-    64 * 1024 * 1024,  // 64MB recent write cache
-    16 * 1024 * 1024,  // 16MB aggregate snapshots (shared cap for read+write LRUs)
-    8 * 1024 * 1024,   // 8MB client snapshots
-    1024 * 1024,       // 1MB WAL index cache
-    4 * 1024 * 1024,   // 4MB schema cache
-    256 * 1024 * 1024, // 256MB replication high water mark
-);
-
-// Write path: queue → snapshot → fsync → commit
-cache.add_to_pending_append_queue(
-    &aggregate_key,
-    event_index,
-    event_batch_index,
-    min_event_batch_index,
-    client_id,
-    client_event_index,
-    queue_item,
-);
-
-let snapshot = cache.take_sync_positions_snapshot();
-// ... fsync to disk ...
-cache.commit_sync_positions_snapshot(node_status, snapshot);
-// On leader: push to pending replication queue
-// On non-leader: read snapshots updated immediately
-
-// Leader: after replication completes
-cache.commit_position_snapshot(&event_batch, log_id, metablock_absolute_pos, CachePath::Read);
-
-// Cache hot data after commit
-cache.cache_recent_write(aggregate_key, batch_index, metablock, datablock, size);
-
-// Read path: check appropriate cache before going to disk
-let (is_loaded, status) = cache.aggregate_load_status(&key, CachePath::Read);
-if is_loaded && status == AggregateStatus::Found {
-    for (batch_idx, write) in cache.get_cached_writes_from(&key, from_batch, visible_wal_index) {
-        // Use cached data
-    }
-}
-```
+- Two separate LRU caches exist: `aggregate_write_snapshots` (updated after fsync, used for OCC/idempotency) and `aggregate_read_snapshots` (updated after replication on leader, used by reads).
+- OCC checks use the write-ahead snapshot, not the read snapshot. A concurrent write fsynced but not yet replicated still triggers an OCC conflict.
+- The recent-write cache filters by `visible_wal_index`. Entries with `wal_index > visible_wal_index` are excluded from reads.
+- Rollback flags (`fsync_rollback_occurred`, `replication_rollback_occurred`) are one-time-consumption. The next capture phase reads and resets the flag.
+- Replication rollback is a superset of fsync rollback: it also wipes write snapshots because those positions are not yet visible to readers.
+- Low-priority LRU inserts (scan-driven) only populate spare capacity and immediately demote to LRU tail. Scans must not evict hot entries.
+- `aggregate_queue_positions` and `pending_append_queue` are intentionally unbounded (transient in-flight state that drains every fsync cycle).
 
 ## Design Decisions
 
@@ -191,7 +108,7 @@ pub struct ShardMemCache<V: Validate> {
 }
 ```
 
-After a successful fsync, data waits in `pending_replication_batches` until followers confirm receipt. `push_pending_replication` returns `true` when the high water mark is exceeded, signalling the replication coordinator to trigger an S3 fallback path rather than keep buffering. The queue is intentionally unbounded here—backpressure is applied at the coordinator level, not by eviction.
+After a successful fsync, data waits in `pending_replication_batches` until followers confirm receipt. `push_pending_replication` returns `true` when the high water mark is exceeded, signalling the replication coordinator to trigger an S3 fallback path rather than keep buffering. The queue is intentionally unbounded here. Backpressure is applied at the coordinator level, not by eviction.
 
 ### Rollback flags distinguish cause of empty queue
 
@@ -240,7 +157,7 @@ Low-priority inserts (eager caching during scans) only happen when there is spar
 | `aggregate_write_snapshots` | Bounded LRU | Committed to disk (write path) |
 | `aggregate_read_snapshots` | Bounded LRU | Confirmed replicated (read path) |
 
-Queue is checked first for write-path reads—it has the most recent uncommitted state. After fsync, positions move to the write LRU. After replication, they move to the read LRU.
+Queue is checked first for write-path reads. It has the most recent uncommitted state. After fsync, positions move to the write LRU. After replication, they move to the read LRU.
 
 ### Rollback on failure
 
@@ -270,7 +187,7 @@ Replication rollback is a superset of fsync rollback: it also wipes the write sn
 if client_event_index == 0 { None } else { Some(client_event_index) }
 ```
 
-Client event indexes are cached with a sentinel to distinguish "never wrote" from "not in cache". Enables idempotency checks without repeated disk scans. Client cache is only populated from the write path—`put_aggregate_into_cache` with `CachePath::Write` updates client tracking; `CachePath::Read` does not.
+Client event indexes are cached with a sentinel to distinguish "never wrote" from "not in cache". Enables idempotency checks without repeated disk scans. Client cache is only populated from the write path, `put_aggregate_into_cache` with `CachePath::Write` updates client tracking; `CachePath::Read` does not.
 
 ### WAL index position cache for list pagination
 
@@ -313,12 +230,3 @@ pending_schema_registrations: HashSet<SchemaKey>      // awaiting fsync
 ```
 
 Two-tier schema cache: `schema_cache` holds compiled validators (or compilation failures), while `no_schema_cache` records keys confirmed to have no schema. This avoids repeated disk lookups for unschema'd aggregates. `pending_schema_registrations` tracks registrations that are queued but not yet fsynced, preventing duplicate registrations within the same batch.
-
-## Dependencies
-
-- `celeriant_wal` - WAL data structures (Metablock, Datablock, keys, constants)
-- `celeriant_distributed` - `NodeStatus` for leader vs non-leader behavior in `commit_sync_positions_snapshot`
-- `celeriant_rotating_log` - `LogSegmentFileMetadata` stored in `PendingCommitData`
-- `lru` - LRU cache implementation
-- `deepsize` - Memory size estimation for queue items
-- `metrics` - Metrics collection

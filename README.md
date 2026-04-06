@@ -107,14 +107,14 @@ Celeriant is designed for very high aggregate cardinality without memory growth 
 
 ### 1. Start the server
 
-**Linux (bare metal)** — Celeriant runs natively on any Linux system with io_uring support (kernel 5.11+):
+**Linux (bare metal)** Celeriant runs natively on any Linux system with io_uring support (kernel 5.11+):
 
 ```bash
 cargo build --release -p celeriant
 ./target/release/celeriant --standalone --data-root /var/lib/celeriant --num-shards 1
 ```
 
-**macOS / Windows** — Use Docker (the container provides the Linux kernel):
+**macOS / Windows** Use Docker (the container provides the Linux kernel):
 
 ```bash
 docker build -t celeriant:local .
@@ -189,13 +189,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 For connection pooling, leader failover, TLS, multi-aggregate writes, watch API and production patterns, see the [client guide](docs/guide.md).
 
-**.NET** — A .NET client is available at [celeriant-dotnet-client](https://github.com/celeriant/celeriant-dotnet-client).
+**.NET** A .NET client is available at [celeriant-dotnet-client](https://github.com/celeriant/celeriant-dotnet-client).
 
 ### Next steps
 
-- **[Client Guide](docs/guide.md)** — connections, pooling, TLS, OCC, multi-aggregate writes, watch API, and production patterns
-- **[Demo App](celeriant_demo/README.md)** — browser-based banking demo showing basic read/write patterns, OCC conflicts, and live watch via SSE
-- **[Reference API](celeriant_reference/README.md)** — production-grade example with Postgres read projections, exactly-once writes, OCC retry loops, and HTTP idempotency
+- **[Client Guide](docs/guide.md)** connections, pooling, TLS, OCC, multi-aggregate writes, watch API, and production patterns
+- **[Demo App](celeriant_demo/README.md)** browser-based banking demo showing basic read/write patterns, OCC conflicts, and live watch via SSE
+- **[Reference API](celeriant_reference/README.md)** production-grade example with Postgres read projections, exactly-once writes, OCC retry loops, and HTTP idempotency
 
 ## Sharding
 

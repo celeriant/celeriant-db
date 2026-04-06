@@ -31,88 +31,49 @@ When they meet, file rotates. Files could be less than 1GB if they get trimmed a
 
 The header is duplicated at both start and end of file. On torn writes, CRC checks on both copies allow recovery.
 
+## Invariants
+
+- WAL entries are globally contiguous within a shard. Each new entry receives exactly `current_wal_index + 1`. Gaps are fatal.
+- Every metablock carries `previous_tip_hash`, forming a Blake3 hash chain over the entire WAL history.
+- Hash computation excludes `datablock_position` so leader and follower produce identical hashes despite different on-disk layouts.
+- Metablocks are fixed-size (1024 bytes). Unused trailing bytes are zero-padded.
+- Datablocks use dual storage: inline (up to 512 bytes, stored within the metablock) or external (written to end of file, growing backward). External datablocks carry their own CRC32C.
+- `AggregateKey` serializes as 3 contiguous u128 LE values (48 bytes). The in-memory `hash` field is never serialized.
+- Enum discriminants are 4-byte u32 (fixed-int encoding). `Option<T>` is 1-byte discriminant + T.
+- `lease_index` is strictly monotonically increasing and never reused. A fresh cluster starts at `lease_index = 1`.
+- Membership is a fixed 2-slot array in S3. A third node cannot join.
+
 ## Key Types
 
 ### Core WAL Types
 
-| Type | Layer | Purpose |
-|------|-------|---------|
-| `Metablock` | Meta | Container with wal_index, server_timestamp, lease_index, node_id, previous_tip_hash, compression info |
-| `MetablockKind` | Meta | Enum: EventBatchMetadata, SchemaRegistration, SoftDelete, SoftTrim |
-| `MetablockEventBatch` | Meta | Filtering metadata (min/max ranges, bloom filter, aggregate key, client/user ids) |
-| `MetablockSchemaRegistration` | Meta | Schema registration: schema_key, client_id, user_id |
-| `MetablockSoftDelete` | Meta | Marks aggregate deleted: allow_recreate, allow_index_continuation, last indexes |
-| `MetablockSoftTrim` | Meta | Marks minimum available batch: keep_from_event_batch_index |
-| `DatablockStorageKind` | Meta | Enum: None, Inline(DatablockInlineData), Block(DatablockBlockRef) |
-| `DatablockInlineData` | Meta | 512-byte inline payload stored within the metablock |
-| `DatablockBlockRef` | Meta | Reference to a separate datablock (crc32c checksum) |
-| `Datablock` | Data | Container wrapping a DatablockKind |
-| `DatablockKind` | Data | Enum: EventBatchItem, SchemaRegistration |
-| `DatablockAggregateEventBatch` | Data | Batch of events from one client |
-| `DatablockAggregateEvent` | Data | Single event with payload |
-| `DatablockSchemaRegistration` | Data | Schema definition: schema_type (Json/Avro/Protobuf), schema string |
-| `ShardLogHeader` | Header | metablocks_position, datablocks_position, wal_index, tip_hash, aggregate_bloom |
+| Type | Purpose |
+|------|---------|
+| `Metablock` | Container with wal_index, server_timestamp, lease_index, node_id, previous_tip_hash, compression info |
+| `MetablockKind` | Enum: EventBatchMetadata, SchemaRegistration, SoftDelete, SoftTrim |
+| `MetablockEventBatch` | Filtering metadata (min/max ranges, bloom filter, aggregate key, client/user ids) |
+| `DatablockStorageKind` | Enum: None, Inline(DatablockInlineData), Block(DatablockBlockRef) |
+| `Datablock` | Container wrapping a DatablockKind |
+| `DatablockKind` | Enum: EventBatchItem, SchemaRegistration |
+| `ShardLogHeader` | metablocks_position, datablocks_position, wal_index, tip_hash, aggregate_bloom |
 
-### Key Types
+### Composite Keys
 
 | Type | Wire Size | Purpose |
 |------|-----------|---------|
-| `AggregateKey` | 48 bytes | Composite key: (org_id, aggregate_type_id, aggregate_id). Hash pre-computed, not serialized |
+| `AggregateKey` | 48 bytes | (org_id, aggregate_type_id, aggregate_id). Hash pre-computed, not serialized |
 | `AggregateClientKey` | 64 bytes | AggregateKey + client_id. Hash pre-computed, not serialized |
 | `AggregateTypeKey` | 32 bytes | (org_id, aggregate_type_id). Hash pre-computed, not serialized |
 | `SchemaKey` | 48 bytes | (org_id, aggregate_type_id, event_type_major, event_type_minor). Hash pre-computed, not serialized |
-| `EntryHashBytes` | 32 bytes | Type alias `[u8; 32]` for Blake3 hash chain entries |
+| `EntryHashBytes` | 32 bytes | `[u8; 32]` alias for Blake3 hash chain entries |
 
-### Compression and Encoding
-
-| Type | Purpose |
-|------|---------|
-| `CompressionType` | Enum: None, Zstd{level}, Snappy, Brotli{level}, Gzip{level} |
-| `EventTypesKind` | Enum: Direct([u64; 4]) for ≤4 types, Bloom([u64; 4]) for more |
-| `SchemaType` | Enum: Json, Avro, Protobuf. Re-exported at crate root |
-
-## S3 / Cluster Types
-
-Stored in the `s3` module. Used for leader election and replication fallback.
+### S3 / Cluster Types
 
 | Type | S3 Path | Purpose |
 |------|---------|---------|
 | `Lease` | `cluster/lease.json` | Leader election state: leader_node_id, lease_index, acquired_at_ms, expires_at_ms |
 | `Membership` | `cluster/membership.json` | Two-node cluster state: array of 2 `Option<NodeInfo>` |
-| `NodeInfo` | — | Single node: node_id, client_address, replication_address |
 | `FallbackBatch` | — | S3 replication fallback: fallback_index, end_wal_index, shard_id, items |
-| `FallbackItem` | — | One entry in a FallbackBatch: metablock + optional datablock |
-
-Node IDs in `Lease` and `NodeInfo` are serialized as UUID strings in JSON via `serde_uuid`.
-
-### Lease Methods
-
-| Method | Description |
-|--------|-------------|
-| `new_initial(leader_node_id, now_ms, duration_ms)` | Create first lease with lease_index=1 |
-| `promote(new_leader_node_id, now_ms, duration_ms)` | Create successor lease with incremented index |
-| `is_expired(now_ms)` | True when now_ms >= expires_at_ms |
-| `remaining_millis(now_ms)` | Milliseconds until expiry (0 if expired) |
-| `supersedes(our_index, our_node_id)` | True if this lease has higher index and different leader |
-
-### Membership Methods
-
-| Method | Description |
-|--------|-------------|
-| `empty()` | Create membership with no nodes |
-| `register(info)` | Add or replace a node in the cluster |
-| `deregister(node_id)` | Remove a node from the cluster |
-| `is_fully_replicated()` | True when both slots are occupied |
-| `node_count()` | Number of registered nodes (0–2) |
-| `peer_of(node_id)` | Returns the other node in the cluster, if any |
-
-### FallbackBatch Methods
-
-| Method | Description |
-|--------|-------------|
-| `new(fallback_index, end_wal_index, shard_id)` | Create empty batch |
-| `push_item(item)` | Append a FallbackItem |
-| `is_empty()` / `len()` | Item count |
 
 ## Design Decisions
 
@@ -215,10 +176,3 @@ The `previous_tip_hash` field in each `Metablock` records the hash of the prior 
 ### `small-metablock` feature
 
 When enabled, reduces `FIXED_BLOCK_SIZE_BYTES` to 512 and `MINIBATCH_SIZE_BYTES` to 128. Used for testing.
-
-## Dependencies
-
-- `bincode` - Rust-native binary serialization
-- `serde` / `serde_bytes` / `serde_json` - Serialization framework and helpers
-- `deepsize` - Struct+heap sizes of objects in memory
-- `uuid` - UUID formatting for S3 JSON serialization

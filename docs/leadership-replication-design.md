@@ -148,9 +148,17 @@ sequenceDiagram
 - Follower challenges late: waits for full `expires_at` expiry (~1500ms)
 - This gap ensures the leader self-fences before the follower can win an election
 
+**Heartbeat hard timeout:**
+Each heartbeat send is wrapped in a hard timeout of `heartbeat_timeout * heartbeat_hard_timeout_multiplier`
+(default 500ms × 4 = 2s). This prevents kernel TCP retransmit delays (which can block kTLS send
+for 20+ seconds under network saturation) from starving the heartbeat task and causing
+unintended leadership loss.
+
 **Heartbeat failure path (leader side):**
 - No peer known: exponential backoff peer discovery (1s, 2s, 4s, capped at `s3_lease_duration / 2`)
-- Peer known but unreachable: check S3 only when `lease_time_remaining <= s3_lease_duration / 2`
+- Peer known, first failure (was previously reachable): **preemptive S3 lease renewal** immediately
+  via `set_node_role_via_s3()`. Extends lease before S3 fallback upload storm saturates MinIO.
+- Peer known but unreachable (subsequent failures): check S3 when `lease_time_remaining <= s3_lease_duration / 2`
 - While TCP heartbeats succeed, S3 lease is never renewed (cost saving)
 
 ---
@@ -169,7 +177,9 @@ vice versa.
 **Heartbeat connection:**
 - Used for: heartbeat messages only
 - Reuse: **always resets** (fresh TCP connection every attempt)
-- Timeout: `heartbeat_timeout` applies to both connection and request
+- Timeout: `heartbeat_timeout` applies to both connection and request, with a hard
+  outer timeout of `heartbeat_timeout * heartbeat_hard_timeout_multiplier` (default 2s)
+  to catch kernel-level TCP retransmit stalls
 - Rationale: a stale connection could block for `request_timeout` (10s) when the
   peer is unreachable, preventing timely self-fencing
 
@@ -242,6 +252,9 @@ mesh. Messages are sent via bounded channels with retry (10 attempts).
 | `UpdatePeerNodeId` | Shard 0 → all | Share discovered peer node ID |
 | `UpdateFollower` | Shard 0 → all | Share follower replication address |
 | `UpdateLeaderClientAddress` | Shard 0 → all | Share leader client address for redirects |
+| `FollowerReachable` | Shard 0 → all | Notify shards that follower TCP is reachable |
+| `SchemaRegistration` | Any → shard 0 | Register schema via coordinator shard |
+| `SchemaRegistrationComplete` | Shard 0 → requester | Schema registration result |
 | `Shutdown` | Shard 0 → all | Initiate graceful shutdown |
 
 **S3 catchup orchestration:**
@@ -382,7 +395,8 @@ to readers. Steps in order:
      cache recent write with metablock and datablock data
    - `SoftTrim`: update aggregate min event batch index on both write and read paths
    - `SoftDelete`: mark aggregate as deleted in read snapshot cache
-   - `SchemaRegistration`: no action
+   - `SchemaRegistration`: follower compiles and caches the schema on fsync
+     (leader caches at write time). Both nodes have schemas available for reads.
 
 3. **Finalize sealed segments:** If a non-active log segment is now fully replicated
    (`read.wal_index == write.wal_index`), extract its sealed segment summary from
@@ -465,7 +479,15 @@ S3 object named by shard, WAL range, and uploader node ID.
 - Second TCP rejection after catchup retry
 
 **After successful S3 upload, the leader sends a kick** (at most once per replication
-cycle). The kick transitions the follower from `Follower` to `FollowerCatchingUp`.
+cycle), regardless of whether the follower is currently marked as reachable. The kick
+is decoupled from the TCP-skip optimisation so that a stale TCP connection failure
+doesn't suppress kick delivery. The kick transitions the follower from `Follower` to
+`FollowerCatchingUp`.
+
+**S3 upload concurrency:** All shards share a global semaphore capped at
+`s3_max_concurrent_fallback_uploads` (default 2). This prevents MinIO saturation
+during follower outages, which could starve shard 0's S3 lease renewal and cause
+leadership loss.
 
 **FallbackBatch structure:**
 - `fallback_index` (u64): first WAL index in the batch
@@ -590,7 +612,7 @@ The loop has four mutually exclusive branches based on current node status.
 ```
 loop {
     sleep(heartbeat_interval)                           // 500ms default
-    send_heartbeat(timestamp, lease_index)
+    send_heartbeat(timestamp, lease_index)              // hard timeout: 2s default
 
     if Ack:
         has_peer = true
@@ -604,7 +626,9 @@ loop {
 
     if no peer known:
         should_check_s3 = backoff elapsed               // 1s, 2s, 4s... capped
-    else (peer known but unreachable):
+    else if peer was reachable, now unreachable (first failure):
+        should_check_s3 = true                          // preemptive lease renewal
+    else (peer known, still unreachable):
         should_check_s3 = lease_remaining < half_s3_lease OR expired
 
     if !should_check_s3: continue                       // retry next interval
@@ -851,9 +875,45 @@ to TCP replication.
 | `heartbeat_interval_ms` | 500 | Leader heartbeat send interval |
 | `heartbeat_lease_duration_ms` | 1500 | Follower TTL extension per heartbeat |
 | `max_clock_drift_ms` | 500 | Clock drift tolerance, early fencing margin |
+| `heartbeat_hard_timeout_multiplier` | 4 | Hard timeout = heartbeat_timeout × this (catches kernel TCP stalls) |
+| `s3_max_concurrent_fallback_uploads` | 2 | Global semaphore cap on concurrent S3 fallback uploads |
 | `fsync_delay` | 17ms | Batching window for fsync coordinator |
 | `max_request_size` | 16 MiB | TCP replication chunk size bound |
 | `max_response_size` | 64 MiB | Response size bound |
+
+---
+
+## Split-Brain Prevention
+
+Three overlapping mechanisms prevent two nodes from writing simultaneously:
+
+**1. Asymmetric TTL decay (leader self-fences early):**
+Every shard checks `effective_node_status()` before accepting a write. The leader
+fences at `expires_at - max_clock_drift` (default: 500ms early). The follower waits
+for the full `expires_at` before challenging. This creates a guaranteed window where
+the leader has stopped writing before the follower can win an election.
+
+**2. Monotonic `lease_index` on every batch:**
+Every metablock carries the leader's `lease_index`. A stale leader (whose lease
+expired and was superseded) cannot produce a `lease_index` >= the new leader's.
+The follower rejects `StaleLease` on both TCP replication and S3 catchup paths.
+
+**3. Write gating per-shard:**
+Every write path checks `effective_node_status()` synchronously before entering
+the pipeline. Once fenced, new writes are immediately rejected with
+`ShardCannotAcceptWrites`. In-flight writes that already passed the gate but
+haven't replicated yet will be rejected by the follower's `lease_index` check.
+
+**Historical failure mode (fixed):** S3 fallback upload storms during follower
+outages saturated MinIO, preventing shard 0 from renewing the S3 lease. The leader's
+lease expired while it was still writing. Fixed by: (a) preemptive S3 lease renewal
+on first heartbeat failure, (b) S3 upload semaphore limiting concurrent uploads,
+(c) heartbeat hard timeout preventing kernel TCP retransmit stalls from blocking
+the heartbeat task.
+
+**Remaining risk:** If clock drift exceeds `max_clock_drift_ms`, the asymmetric
+fencing window closes and both nodes could believe they are leader simultaneously.
+The `lease_index` check on the follower is the last line of defence in this case.
 
 ---
 

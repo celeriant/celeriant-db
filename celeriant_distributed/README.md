@@ -1,6 +1,6 @@
 # celeriant_distributed
 
-S3-based leader election and self-fencing for two-node HA. A single CAS-protected S3 object grants leader exclusivity — no Raft, no Paxos, no coordinator process.
+S3-based leader election and self-fencing for two-node HA. A single CAS-protected S3 object grants leader exclusivity - no Raft, no Paxos, no coordinator process.
 
 ## Architecture
 
@@ -39,8 +39,8 @@ S3-based leader election and self-fencing for two-node HA. A single CAS-protecte
 
 The core correctness property. Two thresholds derived from the same lease expiry:
 
-- **`must_fence()`** — triggers at `lease_expires_at_ms - max_clock_drift_ms`. Leaders use this: stop accepting writes early enough that even a clock-ahead follower cannot win the S3 race while writes are still in flight.
-- **`is_lease_expired()`** — triggers at `lease_expires_at_ms`. Followers use this: wait the full TTL before racing to acquire the lease.
+- **`must_fence()`** triggers at `lease_expires_at_ms - max_clock_drift_ms`. Leaders use this: stop accepting writes early enough that even a clock-ahead follower cannot win the S3 race while writes are still in flight.
+- **`is_lease_expired()`** triggers at `lease_expires_at_ms`. Followers use this: wait the full TTL before racing to acquire the lease.
 
 This asymmetry closes the window where a clock-ahead follower could win an S3 CAS race while the old leader still accepts writes.
 
@@ -53,30 +53,16 @@ The runtime calls `effective_node_status()`, not `raw()`, to get the current sta
 
 `can_accept_writes()` returns true only for `Leader` and `Standalone` (after TTL decay).
 
-## Module Structure
+## Invariants
 
-| Module | Purpose | Key Types/Functions |
-|--------|---------|---------------------|
-| `s3_lease_config` | Node identity and lease tuning | `S3LeaseConfig` |
-| `node_status` | State enum and transition validation | `NodeStatus`, `is_valid_transition_to()` |
-| `validated_node_status` | Asymmetric fencing wrapper | `ValidatedNodeStatus`, `effective_node_status()`, `must_fence()` |
-| `lease_store` | Storage backend trait | `LeaseStore`, `LeaseWithEtag`, `MembershipWithEtag`, `LeaseStoreError` |
-| `s3_lease_manager` | Election orchestrator | `S3LeaseManager<S>`, `ElectionOutcome` |
-| `paths` | S3 path constants and fallback batch paths | `LEASE_PATH`, `MEMBERSHIP_PATH`, `fallback_batch_path()` |
-
-## S3LeaseConfig
-
-```rust
-pub struct S3LeaseConfig {
-    pub node_id: u128,
-    pub advertised_client_address: String,
-    pub advertised_replication_address: String,
-    pub s3_lease_duration: Duration,
-    pub max_clock_drift: Duration,
-}
-```
-
-`advertised_*` fields are what gets published to the S3 membership object — not necessarily the local bind addresses.
+- Leader is determined by S3 CAS on a single `cluster/lease.json` object. No Raft, no quorum.
+- `lease_index` is strictly monotonically increasing and never reused. A fresh cluster starts at `lease_index = 1`.
+- A node seeing a valid (non-expired) lease from another node becomes follower unconditionally. No CAS attempt.
+- Membership is a fixed 2-slot array in S3. A third node cannot join.
+- The leader fences at `lease_expires_at_ms - max_clock_drift_ms`, which must always fire before the follower's TTL expires.
+- `FollowerCatchingUp` and `BootCatchup` states are TTL-exempt. They never decay to `Fenced`.
+- `FollowerCatchingUp` cannot transition directly to `Leader`. It must catch up and return to `Follower` first.
+- A newly elected leader runs S3 catchup before serving writes. Catchup also runs if the `lease_index` gap indicates the lease changed hands during a partition.
 
 ## NodeStatus
 
@@ -94,9 +80,9 @@ pub enum NodeStatus {
 ### Helper Methods
 
 - `is_leader()`, `is_follower()`, `is_fenced()`, `is_standalone()`, `is_catching_up()`
-- `is_any_follower_state()` — matches both `Follower` and `FollowerCatchingUp` (used by heartbeat handler and watchdog)
+- `is_any_follower_state()` matches both `Follower` and `FollowerCatchingUp` (used by heartbeat handler and watchdog)
 - `lease_index()` → `Some(u64)` for Leader and Standalone only
-- `is_valid_transition_to()` — validates state machine transitions
+- `is_valid_transition_to()` validates state machine transitions
 
 ### State Machine
 
@@ -118,22 +104,6 @@ FollowerCatchingUp → Follower (catchup complete)
 | `FollowerCatchingUp { leader_lease_index }` | Catching up from S3, rejects TCP replication | yes |
 | `BootCatchup` | Pre-election S3 catchup at boot | yes |
 | `Fenced` | Write-blocked; must re-run election to recover | yes |
-
-## ValidatedNodeStatus Construction
-
-TTL-exempt states have dedicated constructors (no lease expiry needed):
-
-```rust
-ValidatedNodeStatus::create_fenced()
-ValidatedNodeStatus::create_standalone()
-ValidatedNodeStatus::create_boot_catchup()
-```
-
-States with TTL use the general constructor:
-
-```rust
-ValidatedNodeStatus::create_custom_status(status, max_clock_drift_ms, lease_expires_at_ms)
-```
 
 ## LeaseStore Trait
 
@@ -178,13 +148,15 @@ pub enum LeaseStoreError {
 
 ### Fallback Batch Paths
 
-`fallback_batch_path(shard_id, start_index, end_index)` generates:
+`fallback_batch_path(shard_id, start_index, end_index, node_id)` generates:
 
 ```
-cluster/fallback/shard_{shard_id:03}/batch_{start_index:09}_{end_index:09}.bin
+cluster/fallback/shard_{shard_id:03}/batch_{start:09}_{end:09}_{node_uuid}.bin
 ```
 
-Zero-padded so lexicographic ordering = temporal ordering (S3 list operations return sorted results).
+Example: `cluster/fallback/shard_002/batch_000000005_000000010_00000000-0000-0000-0000-000000000000.bin`
+
+Zero-padded so lexicographic ordering = temporal ordering. The `node_uuid` suffix identifies the uploader (followers skip batches they uploaded themselves).
 
 ## Design Decisions
 
@@ -199,13 +171,3 @@ The S3 API's conditional write (`IfMatchETag`) guarantees exactly one winner per
 ### Membership CAS with retries
 
 `register_self_on_membership_s3_object` retries up to 5 times on `PreconditionFailed`. In a 2-node cluster one retry suffices; extras guard against transient S3 inconsistency. The S3 round-trip provides natural backoff.
-
-## Feature Flags
-
-| Feature | Default | Purpose |
-|---------|---------|---------|
-| `small-metablock` | off | Propagates to `celeriant_wal` for testing with smaller block sizes |
-
-## Dependencies
-
-- `celeriant_wal` — `Lease`, `Membership`, `NodeInfo` types (S3 lease/membership wire format)

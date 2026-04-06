@@ -28,6 +28,15 @@ ShardWriteAheadLog                    WatchSession (per client)
 **Hot path**: WAL write → notify_watchers → broadcast → filter → try_send (non-blocking)
 **Cold path**: Client accumulates events → waits for latency → flushes response
 
+## Invariants
+
+- Watch subscriptions are shard-local. No cross-shard fan-out at the server level.
+- Watch events fire after the write is durably replicated (leader) or after fsync (non-leader). Never before.
+- Each client has a bounded channel of 10,000 pending events (`MAX_PENDING_EVENTS`). This is a hard cap.
+- The write path uses non-blocking `try_send()`. If the channel is full, the client is immediately removed from the watcher list. No backpressure propagates to the writer.
+- Broadcast filtering runs before `try_send()`. The write hot path never blocks on watch consumers.
+- Watch subscriptions are not included in the per-shard memory budget.
+
 ## Key Types
 
 | Type | Purpose |
@@ -40,17 +49,6 @@ ShardWriteAheadLog                    WatchSession (per client)
 | `AggregateWatchEventOperation` | Enum of operation variants (Write, Read, Delete, TrimStart, AggregateDetails, Create) |
 | `WatchEventAccumulator` | Merges events by (AggregateKey, operation) before flattening to `WatchResponse` |
 | `WatchOutputType` | Session output: Response, Heartbeat, Done, Continue |
-
-## Key Functions
-
-| Function | Purpose |
-|----------|---------|
-| `AggregateWatchers::add_subscriber` | Register new watcher, returns (id, client) |
-| `AggregateWatchers::notify_watchers` | Primary WAL entry point: fan-out a batch of keyed operations |
-| `AggregateWatchers::broadcast` | Fan-out a single event to all matching subscribers |
-| `WatcherHandle::notify_of_event` | Filter check + try_send to channel |
-| `SubscribedClient::accumulate_watch_event` | Merge event into pending response |
-| `WatchSession::next` | Async poll: receive events or timeout for flush/heartbeat |
 
 ## Design Decisions
 
@@ -115,7 +113,7 @@ Compact representation for wire format and filter sets.
 
 ### Single-threaded design
 
-Uses `Rc<RefCell<_>>` and glommio `LocalSender`/`LocalReceiver`. Each shard runs on a dedicated CPU core—no cross-thread synchronization needed.
+Uses `Rc<RefCell<_>>` and glommio `LocalSender`/`LocalReceiver`. Each shard runs on a dedicated CPU core - no cross-thread synchronization needed.
 
 ### Session lifecycle
 
@@ -148,9 +146,3 @@ pub trait AggregateReader {
 
 Abstraction allowing `WatchSession` to work with any WAL implementation. Implemented by `ShardWriteAheadLog`.
 
-## Dependencies
-
-- `celeriant_msg` - WatchRequest/WatchResponse message types
-- `celeriant_wal` - AggregateKey, event batch types
-- `celeriant_wire` - Wire format errors (CodecError used in WatchReadError)
-- `glommio` - Async runtime, local channels, timers
