@@ -264,6 +264,7 @@ fn replication_message(e: ReplicationError) -> String {
         ReplicationError::ReplicationClientLockTimeoutError => format!(r#"{{"detail":{}}}"#, "ReplicationClientLockTimeoutError"),
         ReplicationError::ReplicateToS3Error(e) => format!(r#"{{"detail":{}}}"#, json_string(&format!("{:?}", e))),
         ReplicationError::ExtendedCatchupFailure(e) => format!(r#"{{"detail":{}}}"#, json_string(&format!("{:?}", e))),
+        ReplicationError::LeaderFenced => format!(r#"{{"detail":"LeaderFenced"}}"#),
     }
 }
 

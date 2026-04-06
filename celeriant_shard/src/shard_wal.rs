@@ -1960,6 +1960,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let rotating_log_cache = self.log_segments_cache.clone();
         let shard_mem_cache = self.shard_mem_cache.clone();
         let watched_aggregates = self.watched_aggregates.clone();
+        let node_status = self.node_status.clone();
         let max_catchup_gap_bytes = self.config.max_catchup_gap_bytes;
         let max_request_size = self.config.max_request_size;
         let read_max_chunk_size = self.config.read_max_chunk_size;
@@ -1981,7 +1982,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             .request_sync_two_phase(
                 Some(delay),
                 move || async move { capture_replication_snapshot(&mc_capture) },
-                move |captured| commit_replication_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates, captured, max_catchup_gap_bytes, max_request_size, read_max_chunk_size, shard_id),
+                move |captured| commit_replication_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates, node_status, captured, max_catchup_gap_bytes, max_request_size, read_max_chunk_size, shard_id),
             )
             .await
     }

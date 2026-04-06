@@ -7,4 +7,5 @@ pub enum ReplicationError {
     ReplicationClientLockTimeoutError,
     ReplicateToS3Error(ReplicateToS3Error),
     ExtendedCatchupFailure(FetchCatchupEntriesError),
+    LeaderFenced,
 }

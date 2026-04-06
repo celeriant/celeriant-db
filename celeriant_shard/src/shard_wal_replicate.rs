@@ -1,9 +1,10 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
 
 use tracing::{debug, error, warn};
 
+use celeriant_distributed::validated_node_status::ValidatedNodeStatus;
 use celeriant_msg::request::requests::ReplicationBatchItem;
 use celeriant_rotating_log::log_segment_file::aggregate_key_bloom::AggregateKeyBloom;
 use celeriant_rotating_log::log_segment_file::log_segment_file::{read_datablocks_carry_over_bytes, write_dual_shard_log_header};
@@ -91,6 +92,7 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
     log_segments_cache: Rc<LogSegmentsCache>,
     shard_mem_cache: Rc<RefCell<MemCache>>,
     watched_aggregates: Rc<AggregateWatchers>,
+    node_status: Rc<Cell<ValidatedNodeStatus>>,
     replication_captured_data: ReplicationCapturedData,
     max_catchup_gap_bytes: u64,
     max_request_size: u64,
@@ -99,6 +101,28 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
 ) -> Result<(), ReplicationError> {
     let start = std::time::Instant::now();
     let shard_label = [("shard_id", shard_id.to_string())];
+
+    // Fencing check: the write entered the pipeline when we were still leader,
+    // but fsync + coordinator delay may have pushed us past the lease TTL.
+    // Rollback now rather than replicating with an expired lease.
+    if !node_status.get().is_leader() {
+        warn!(shard_id, "Leader fenced before replication — rolling back");
+        return match rollback_or_requeue(
+            &fsync_coordinator,
+            &log_segments_cache,
+            &shard_mem_cache,
+            replication_captured_data.replication_snapshot,
+            shard_id,
+        )
+        .await
+        {
+            Ok(()) => Err(ReplicationError::LeaderFenced),
+            Err(rollback_err) => {
+                error!(shard_id, error = ?rollback_err, "Replication rollback after fencing failed — entries re-queued");
+                Err(ReplicationError::RollbackFailed(rollback_err))
+            }
+        };
+    }
 
     // Because we are paginating data to the follower, we have a loop
     // At any point we might have to fallback to s3. Also the follower
@@ -768,12 +792,19 @@ mod tests {
             let (client, s3_counts) = RecordingReplicationClient::new();
             let client = Rc::new(client);
 
+            let node_status = Rc::new(Cell::new(ValidatedNodeStatus::create_custom_status(
+                celeriant_distributed::node_status::NodeStatus::Leader { lease_index: 1 },
+                500,
+                u64::MAX / 2,
+            )));
+
             commit_replication_with_rollback(
                 client,
                 Rc::new(Coordinator::new()),
                 lsc.clone(),
                 smc,
                 Rc::new(AggregateWatchers::new()),
+                node_status,
                 make_captured_data(5),
                 u64::MAX,   // max_catchup_gap_bytes (irrelevant, already flagged)
                 u64::MAX,   // max_request_size (irrelevant, S3 path)
