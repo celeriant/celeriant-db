@@ -122,8 +122,12 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         (client, read_client, Some(server), None)
     };
 
+    // Both aggregates must route to the same shard for the atomic multi-write test.
+    // With aggregate_type_id routing: shard = type_id % num_shards.
+    // Use type_ids that are multiples of num_shards apart so they always land together.
+    let num_cpus = std::thread::available_parallelism().map(|n| n.get() as u128).unwrap_or(1);
     let aggregate_1 = AggregateKey::new(1, 2, 101);
-    let aggregate_2 = AggregateKey::new(1, 2 + 32, 201);
+    let aggregate_2 = AggregateKey::new(1, 2 + num_cpus, 201);
     let client_id: u128 = 999;
 
     // Verify nonexistent aggregates return error 7001
@@ -282,16 +286,17 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             agg_type.org_id, agg_type.aggregate_type_id
         );
     }
-    // Verify both aggregate types exist (2 and 34)
+    // Verify both aggregate types exist
+    let type_id_2 = aggregate_2.aggregate_type_id;
     assert!(
         agg_types.iter().any(|t| t.aggregate_type_id == 2),
         "Expected aggregate_type_id 2 to exist"
     );
     assert!(
-        agg_types.iter().any(|t| t.aggregate_type_id == 34),
-        "Expected aggregate_type_id 34 to exist"
+        agg_types.iter().any(|t| t.aggregate_type_id == type_id_2),
+        "Expected aggregate_type_id {} to exist", type_id_2
     );
-    println!("  Verified aggregate types 2 and 34 exist");
+    println!("  Verified aggregate types 2 and {} exist", type_id_2);
 
     println!("\n=== Listing Aggregates (before delete) ===");
     let options = ListOptions::default();
