@@ -353,7 +353,7 @@ pub fn all_tests() -> &'static [TestEntry] {
         TestEntry {
             name: "invariant_s3_fallback_dedup",
             description: "S3 boot catchup produces no duplicate events in multi-shard config",
-            estimated_secs: 36,
+            estimated_secs: 55,
             categories: &[Invariant, Replication],
             distributed: true,
         },
@@ -403,7 +403,7 @@ pub fn all_tests() -> &'static [TestEntry] {
         TestEntry {
             name: "edge_log_eviction_before_s3",
             description: "Evicted log files re-opened transparently for S3 upload",
-            estimated_secs: 18,
+            estimated_secs: 40,
             categories: &[Edge],
             distributed: true,
         },
@@ -431,7 +431,7 @@ pub fn all_tests() -> &'static [TestEntry] {
         TestEntry {
             name: "edge_s3_batch_boundary_contiguity",
             description: "S3 fallback batch boundaries contiguous under load (WalIndexGap bug)",
-            estimated_secs: 30,
+            estimated_secs: 45,
             categories: &[Edge, Replication],
             distributed: true,
         },

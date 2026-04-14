@@ -5,6 +5,10 @@ authors.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "celeriant_bench"
+path = "src/lib.rs"
+
 [[bin]]
 name = "celeriant-bench"
 path = "src/main.rs"

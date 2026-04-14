@@ -17,7 +17,7 @@ RESET  := \033[0m
 .PHONY: help setup-all setup-nodes setup-nvme setup-ktls setup-infra certs \
         deploy build ship restart stop start logs run-test teardown teardown-data \
         stop-cs1 stop-cs2 stop-minio kill-cs1 kill-cs2 kill-minio \
-        start-cs1 start-cs2 start-minio status
+        start-cs1 start-cs2 start-minio status start-infra
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -129,13 +129,78 @@ stop-minio: ## Graceful stop MinIO on infra node
 	@printf "$(BOLD)>>> Stopping MinIO on $(INFRA_HOST)$(RESET)\n"
 	@ssh $(INFRA_HOST) 'cd ~/celeriant-infra && docker compose stop minio'
 
-kill-cs1: ## Hard kill cs1 (SIGKILL)
+kill-cs1: ## Hard kill cs1 (SIGKILL). Note: systemd `Restart=on-failure` auto-restarts after RestartSec=3.
 	@printf "$(RED)>>> Killing celeriant on $(LEADER_HOST) (cs1)$(RESET)\n"
 	@ssh $(LEADER_HOST) 'sudo systemctl kill -s KILL celeriant'
 
-kill-cs2: ## Hard kill cs2 (SIGKILL)
+kill-cs2: ## Hard kill cs2 (SIGKILL). Note: systemd `Restart=on-failure` auto-restarts after RestartSec=3.
 	@printf "$(RED)>>> Killing celeriant on $(FOLLOWER_HOST) (cs2)$(RESET)\n"
 	@ssh $(FOLLOWER_HOST) 'sudo systemctl kill -s KILL celeriant'
+
+pause-cs1: ## SIGSTOP cs1 — freezes the process without terminating it. Pairs with resume-cs1.
+	@printf "$(RED)>>> Pausing celeriant on $(LEADER_HOST) (cs1) [SIGSTOP]$(RESET)\n"
+	@ssh $(LEADER_HOST) 'sudo systemctl kill -s STOP celeriant'
+
+pause-cs2: ## SIGSTOP cs2 — freezes the process without terminating it. Pairs with resume-cs2.
+	@printf "$(RED)>>> Pausing celeriant on $(FOLLOWER_HOST) (cs2) [SIGSTOP]$(RESET)\n"
+	@ssh $(FOLLOWER_HOST) 'sudo systemctl kill -s STOP celeriant'
+
+resume-cs1: ## SIGCONT cs1 — unfreezes a previously-SIGSTOPped cs1.
+	@printf "$(GREEN)>>> Resuming celeriant on $(LEADER_HOST) (cs1) [SIGCONT]$(RESET)\n"
+	@ssh $(LEADER_HOST) 'sudo systemctl kill -s CONT celeriant'
+
+resume-cs2: ## SIGCONT cs2 — unfreezes a previously-SIGSTOPped cs2.
+	@printf "$(GREEN)>>> Resuming celeriant on $(FOLLOWER_HOST) (cs2) [SIGCONT]$(RESET)\n"
+	@ssh $(FOLLOWER_HOST) 'sudo systemctl kill -s CONT celeriant'
+
+skew-clock: ## Shift HOST's system clock by OFFSET (e.g. OFFSET="+2 seconds" or "-2 seconds"). Disables NTP first so systemd-timesyncd doesn't immediately correct the jump. Requires HOST, OFFSET.
+	@if [ -z "$(HOST)" ] || [ -z "$(OFFSET)" ]; then \
+		printf "$(RED)ERROR: skew-clock requires HOST and OFFSET$(RESET)\n"; exit 2; \
+	fi
+	@printf "$(RED)>>> Skewing clock on $(HOST) by '$(OFFSET)'$(RESET)\n"
+	@ssh $(HOST) 'sudo timedatectl set-ntp false && sudo date -s "$(OFFSET)" >/dev/null'
+
+restore-clock: ## Re-enable NTP on HOST to restore correct time. Requires HOST.
+	@if [ -z "$(HOST)" ]; then \
+		printf "$(RED)ERROR: restore-clock requires HOST$(RESET)\n"; exit 2; \
+	fi
+	@printf "$(GREEN)>>> Restoring clock on $(HOST) (re-enabling NTP)$(RESET)\n"
+	@ssh $(HOST) 'sudo timedatectl set-ntp true'
+
+fill-disk: ## Fill HOST's data disk to within RESERVE_MB of full via fallocate. Requires HOST. Optional RESERVE_MB (default 50).
+	@if [ -z "$(HOST)" ]; then \
+		printf "$(RED)ERROR: fill-disk requires HOST$(RESET)\n"; exit 2; \
+	fi
+	$(eval RESERVE_MB ?= 50)
+	@printf "$(RED)>>> Filling data disk on $(HOST) to within $(RESERVE_MB) MiB of full$(RESET)\n"
+	@ssh $(HOST) "sudo sh -c 'FREE=\$$(df --output=avail -B1 /var/lib/celeriant | tail -n1); RESERVE=\$$(($(RESERVE_MB)*1024*1024)); FILL=\$$((FREE - RESERVE)); if [ \$$FILL -gt 0 ]; then fallocate -l \$$FILL /var/lib/celeriant/.chaos_filler && echo \"Allocated \$$FILL bytes\"; else echo \"Already at or below reserve threshold\"; fi'"
+
+clean-disk: ## Remove the chaos filler file from HOST. Safe to run repeatedly. Requires HOST.
+	@if [ -z "$(HOST)" ]; then \
+		printf "$(RED)ERROR: clean-disk requires HOST$(RESET)\n"; exit 2; \
+	fi
+	@printf "$(GREEN)>>> Removing chaos filler on $(HOST)$(RESET)\n"
+	@ssh $(HOST) 'sudo rm -f /var/lib/celeriant/.chaos_filler'
+
+partition-host: ## One-way nftables drop on SRC blocking outbound TCP to DST:PORT. Requires SRC, DST, PORT.
+	@if [ -z "$(SRC)" ] || [ -z "$(DST)" ] || [ -z "$(PORT)" ]; then \
+		printf "$(RED)ERROR: partition-host requires SRC, DST and PORT$(RESET)\n"; exit 2; \
+	fi
+	@printf "$(RED)>>> Partitioning $(SRC) -> $(DST):$(PORT) (nftables drop on SRC:output)$(RESET)\n"
+	@ssh $(SRC) "sudo nft 'add table inet celeriant_chaos' 2>/dev/null || true; \
+	             sudo nft 'add chain inet celeriant_chaos output { type filter hook output priority 0 ; }' 2>/dev/null || true; \
+	             sudo nft 'add rule inet celeriant_chaos output ip daddr $(DST) tcp dport $(PORT) drop'"
+
+heal-host: ## Remove the nftables drop rules for DST:PORT from SRC. Idempotent. Requires SRC, DST, PORT.
+	@if [ -z "$(SRC)" ] || [ -z "$(DST)" ] || [ -z "$(PORT)" ]; then \
+		printf "$(RED)ERROR: heal-host requires SRC, DST and PORT$(RESET)\n"; exit 2; \
+	fi
+	@printf "$(GREEN)>>> Healing $(SRC) -> $(DST):$(PORT)$(RESET)\n"
+	@ssh $(SRC) "sudo nft -a list chain inet celeriant_chaos output 2>/dev/null \
+	             | grep -F 'daddr $(DST)' | grep -F 'dport $(PORT)' \
+	             | grep -oP 'handle \K\d+' \
+	             | while read h; do sudo nft delete rule inet celeriant_chaos output handle \$$h; done; \
+	             true"
 
 kill-minio: ## Hard kill MinIO on infra node
 	@printf "$(RED)>>> Killing MinIO on $(INFRA_HOST)$(RESET)\n"
@@ -161,6 +226,18 @@ start-cs2: ## Start cs2
 start-minio: ## Start MinIO on infra node
 	@printf "$(BOLD)>>> Starting MinIO on $(INFRA_HOST)$(RESET)\n"
 	@ssh $(INFRA_HOST) 'cd ~/celeriant-infra && docker compose start minio'
+
+start-infra: ## Bring up the full infra stack and wait until MinIO is healthy
+	@printf "$(BOLD)>>> Starting infra stack on $(INFRA_HOST)$(RESET)\n"
+	@ssh $(INFRA_HOST) 'cd ~/celeriant-infra && docker compose up -d'
+	@printf "Waiting for MinIO to become healthy...\n"
+	@for i in $$(seq 1 60); do \
+		if ssh $(INFRA_HOST) 'curl -sf http://localhost:9000/minio/health/live >/dev/null 2>&1'; then \
+			printf "$(GREEN)MinIO healthy.$(RESET)\n"; exit 0; \
+		fi; \
+		sleep 1; \
+	done; \
+	printf "$(RED)MinIO failed to start within 60s$(RESET)\n"; exit 1
 
 status: ## Show service status on all nodes
 	@for HOST in $(DATA_NODES); do \

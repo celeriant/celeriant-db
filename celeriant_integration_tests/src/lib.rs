@@ -616,9 +616,6 @@ impl ServerConfigExt for ServerConfig {
                 args.push("--s3-allow-http".to_string());
             }
 
-            args.push("--s3-catchup-max-rounds".to_string());
-            args.push(self.s3_catchup_max_rounds.to_string());
-
         }
 
         if let Some(v) = self.pending_replication_high_water_bytes {

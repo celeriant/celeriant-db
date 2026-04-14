@@ -96,6 +96,16 @@ Environment=CELERIANT_MEMORY_CONSUMPTION_PERCENT=${MEMORY_CONSUMPTION_PERCENT}
 Environment=CELERIANT_SHARD_LOG_PREALLOCATE_BYTES=${SHARD_LOG_PREALLOCATE_BYTES}
 Environment=CELERIANT_RESERVE_COORDINATOR_SHARD=${RESERVE_COORDINATOR_SHARD}
 
+# NIC tuning for RPi + MinIO. The default concurrent upload count
+# saturates the Pi's 1GbE NIC + MinIO write path during S3 fallback
+# storms, causing partition_leader_minio to drop from ~23k req/s to
+# ~79 req/s (see status-log.md). Throttling uploads to 1-at-a-time
+# plus a 1ms inter-upload delay sits just below the saturation
+# threshold. Re-tune when moving to hardware with faster networking
+# or a dedicated S3 endpoint.
+Environment=CELERIANT_S3_MAX_CONCURRENT_FALLBACK_UPLOADS=1
+Environment=CELERIANT_S3_REPLICATION_DELAY_US=1000000
+
 [Install]
 WantedBy=multi-user.target
 EOF
