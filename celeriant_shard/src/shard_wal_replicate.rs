@@ -157,8 +157,28 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
 
     let mut workset_size_bytes = batches.iter().map(|c| c.size_bytes()).sum::<u64>();
     while !batches.is_empty() {
-        // If at any point the amount of data that we have to replicate to the
-        // follower becomes too large,  we skip the follower and send the data to S3 instead.
+        // Pipeline stalls (S3 upload, retry backoff, catchup fetch) routinely
+        // run longer than the ~1s lease TTL. Bail out and roll back locally.
+        if !node_status.get().is_leader() {
+            warn!(shard_id, "Leader fenced mid-replication, rolling back");
+            return match rollback_or_requeue(
+                &fsync_coordinator,
+                &log_segments_cache,
+                &shard_mem_cache,
+                replication_captured_data.replication_snapshot,
+                shard_id,
+            )
+            .await
+            {
+                Ok(()) => Err(ReplicationError::LeaderFenced),
+                Err(rollback_err) => {
+                    error!(shard_id, error = ?rollback_err, "Rollback after mid-replication fence failed, entries re-queued");
+                    Err(ReplicationError::RollbackFailed(rollback_err))
+                }
+            };
+        }
+
+        // Workset too large? Follower can't keep up. Skip it and go to S3.
         if workset_size_bytes > max_catchup_gap_bytes {
             follower_falling_behind_or_offline = true;
         }
@@ -184,7 +204,7 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
                     continue;
                 }
                 Err(replication_err) => {
-                    error!(shard_id, error = ?replication_err, "S3 fallback upload failed — triggering replication rollback");
+                    error!(shard_id, error = ?replication_err, "S3 fallback upload failed, rolling back");
                     return match rollback_or_requeue(
                         &fsync_coordinator,
                         &log_segments_cache,
@@ -196,7 +216,7 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
                     {
                         Ok(()) => Err(ReplicationError::ReplicateToS3Error(replication_err)),
                         Err(rollback_err) => {
-                            error!(shard_id, error = ?rollback_err, "Replication rollback itself failed — entries re-queued for next cycle");
+                            error!(shard_id, error = ?rollback_err, "Replication rollback itself failed, entries re-queued for next cycle");
                             Err(ReplicationError::RollbackFailed(rollback_err))
                         }
                     };
@@ -332,6 +352,27 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
                 }
             }
         }
+    }
+
+    // Last check before the read cursor advances and clients get ACKs. A slow
+    // S3 upload or TCP batch may have burned through the lease TTL
+    if !node_status.get().is_leader() {
+        warn!(shard_id, "Leader fenced before commit, rolling back");
+        return match rollback_or_requeue(
+            &fsync_coordinator,
+            &log_segments_cache,
+            &shard_mem_cache,
+            replication_captured_data.replication_snapshot,
+            shard_id,
+        )
+        .await
+        {
+            Ok(()) => Err(ReplicationError::LeaderFenced),
+            Err(rollback_err) => {
+                error!(shard_id, error = ?rollback_err, "Rollback after pre-commit fence failed, entries re-queued");
+                Err(ReplicationError::RollbackFailed(rollback_err))
+            }
+        };
     }
 
     let path = match &_replication_details {

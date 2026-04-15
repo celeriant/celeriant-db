@@ -82,6 +82,10 @@ Rules the system enforces. Breaking any of these is a bug. Provide this to LLMs 
 - The leader attempts one extended catchup (prepending missing entries) on WAL mismatch. If the second attempt also fails, it switches to S3 fallback unconditionally.
 - Empty replication batches are no-ops on both TCP and S3 paths.
 
+## S3 Object Lifecycle
+
+- A node never deletes an S3 object it uploaded. Deletion is only performed by the other node, once it has progressed past the object.
+
 ## Rollback
 
 - Rollback fires when both TCP and S3 replication fail. The goal is to revert to the last durably replicated state.
