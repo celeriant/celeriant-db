@@ -28,6 +28,9 @@ macro_rules! leader_route {
             Err(ClientError::NotLeader { leader_address: None, .. }) => {}
             Err(ClientError::ConnectionFailed(_)) => { pool.clear_leader(); }
             Err(ClientError::ConnectionTimeout) => { pool.clear_leader(); }
+            // Pooled conn died mid-request: leader probably gone.
+            Err(ClientError::WireError(_)) => { pool.clear_leader(); }
+            Err(ClientError::ReadError(_)) => { pool.clear_leader(); }
             Err(e @ ClientError::RequestTimeout) => { return Err(e); }
             Err(ClientError::ServerBusy) => {}
             Err(e) => return Err(e),
@@ -56,6 +59,8 @@ macro_rules! leader_route {
                 Err(ClientError::NotLeader { leader_address: None, .. }) => continue,
                 Err(ClientError::ConnectionFailed(_)) => continue,
                 Err(ClientError::ConnectionTimeout) => continue,
+                Err(ClientError::WireError(_)) => continue,
+                Err(ClientError::ReadError(_)) => continue,
                 Err(ClientError::RequestTimeout) => continue,
                 Err(ClientError::ServerBusy) => continue,
                 Err(e) => return Err(e),
@@ -101,6 +106,14 @@ macro_rules! read_route {
                             continue;
                         }
                         Err(ClientError::ConnectionTimeout) => {
+                            conn.mark_broken();
+                            continue;
+                        }
+                        Err(ClientError::WireError(_)) => {
+                            conn.mark_broken();
+                            continue;
+                        }
+                        Err(ClientError::ReadError(_)) => {
                             conn.mark_broken();
                             continue;
                         }
@@ -705,6 +718,8 @@ impl CeleriantPool {
                     Ok(mut conn) => match conn.client().write(request.clone()).await {
                         Err(ClientError::ConnectionFailed(e)) => { conn.mark_broken(); Err(ClientError::ConnectionFailed(e)) }
                         Err(ClientError::ConnectionTimeout) => { conn.mark_broken(); Err(ClientError::ConnectionTimeout) }
+                        Err(ClientError::WireError(e)) => { conn.mark_broken(); Err(ClientError::WireError(e)) }
+                        Err(ClientError::ReadError(e)) => { conn.mark_broken(); Err(ClientError::ReadError(e)) }
                         Err(e @ ClientError::RequestTimeout) => { conn.mark_broken(); return Err(e); }
                         other => other,
                     },
@@ -727,6 +742,8 @@ impl CeleriantPool {
                     Ok(mut conn) => match conn.client().delete(request.clone()).await {
                         Err(ClientError::ConnectionFailed(e)) => { conn.mark_broken(); Err(ClientError::ConnectionFailed(e)) }
                         Err(ClientError::ConnectionTimeout) => { conn.mark_broken(); Err(ClientError::ConnectionTimeout) }
+                        Err(ClientError::WireError(e)) => { conn.mark_broken(); Err(ClientError::WireError(e)) }
+                        Err(ClientError::ReadError(e)) => { conn.mark_broken(); Err(ClientError::ReadError(e)) }
                         Err(e @ ClientError::RequestTimeout) => { conn.mark_broken(); return Err(e); }
                         other => other,
                     },
@@ -749,6 +766,8 @@ impl CeleriantPool {
                     Ok(mut conn) => match conn.client().trim_start(request.clone()).await {
                         Err(ClientError::ConnectionFailed(e)) => { conn.mark_broken(); Err(ClientError::ConnectionFailed(e)) }
                         Err(ClientError::ConnectionTimeout) => { conn.mark_broken(); Err(ClientError::ConnectionTimeout) }
+                        Err(ClientError::WireError(e)) => { conn.mark_broken(); Err(ClientError::WireError(e)) }
+                        Err(ClientError::ReadError(e)) => { conn.mark_broken(); Err(ClientError::ReadError(e)) }
                         Err(e @ ClientError::RequestTimeout) => { conn.mark_broken(); return Err(e); }
                         other => other,
                     },
@@ -774,6 +793,8 @@ impl CeleriantPool {
                     Ok(mut conn) => match conn.client().register_schema(request.clone()).await {
                         Err(ClientError::ConnectionFailed(e)) => { conn.mark_broken(); Err(ClientError::ConnectionFailed(e)) }
                         Err(ClientError::ConnectionTimeout) => { conn.mark_broken(); Err(ClientError::ConnectionTimeout) }
+                        Err(ClientError::WireError(e)) => { conn.mark_broken(); Err(ClientError::WireError(e)) }
+                        Err(ClientError::ReadError(e)) => { conn.mark_broken(); Err(ClientError::ReadError(e)) }
                         Err(e @ ClientError::RequestTimeout) => { conn.mark_broken(); return Err(e); }
                         other => other,
                     },
