@@ -34,4 +34,5 @@ pub struct InternalShardConfig {
     pub compaction_temp_dir: PathBuf,
     pub max_clock_drift_ms: u64,
     pub cache_warmup_max_duration: Duration,
+    pub replication_rollback_cooldown: Duration,
 }

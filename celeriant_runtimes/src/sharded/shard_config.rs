@@ -80,6 +80,7 @@ pub struct ShardConfig {
     pub s3_download_max_rounds: u32,
     pub replication_delay: Duration,
     pub s3_replication_delay: Duration,
+    pub replication_rollback_cooldown: Duration,
     pub recent_write_cache_bytes: u64,
     pub routing_rule: RoutingRule,
     pub reserve_coordinator_shard: bool,

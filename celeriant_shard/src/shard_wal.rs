@@ -159,6 +159,11 @@ pub struct ShardWal<R: ReplicationClient + 'static, D: S3Downloader + 'static> {
     /// stale fallback batches from previous cluster generations.
     pub peer_node_id: Cell<Option<u128>>,
 
+    /// Monotonic timestamp of the most recent replication rollback. Used by
+    /// the write path to apply a cooldown window (ReplicationBackpressure error).
+    /// Happens if the network is slow or s3/minio having issues
+    pub last_rollback_at: Rc<Cell<Option<Instant>>>,
+
     /// Cached metrics label to avoid per-request String allocation
     metrics_shard_label: [(&'static str, String); 1],
 }
@@ -300,6 +305,9 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
         Self::pre_warm_cache(&log_segments_cache, &shard_mem_cache, &config).await?;
 
+        let recovered_wal_index = log_segments_cache.active().metadata.borrow().write.wal_index;
+        metrics::gauge!("celeriant_wal_index", &metrics_shard_label).set(recovered_wal_index as f64);
+
         Ok(Self {
             s3_downloader: Rc::new(s3_downloader),
             shard_mem_cache,
@@ -318,6 +326,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             replication_client: Rc::new(replication_client),
             leader_client_address: RefCell::new(None),
             peer_node_id: Cell::new(None),
+            last_rollback_at: Rc::new(Cell::new(None)),
             metrics_shard_label,
         })
     }
@@ -1176,6 +1185,12 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             return Err(ShardWriteError::ReplicationBackpressure);
         }
 
+        if let Some(t) = self.last_rollback_at.get() {
+            if t.elapsed() < self.config.replication_rollback_cooldown {
+                return Err(ShardWriteError::ReplicationBackpressure);
+            }
+        }
+
         // Make sure we have at least one aggregate to write
         if write_request.writes.is_empty() {
             return Err(ShardWriteError::EmptyEventsList);
@@ -1965,6 +1980,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let max_request_size = self.config.max_request_size;
         let read_max_chunk_size = self.config.read_max_chunk_size;
         let shard_id = self.config.shard_id;
+        let last_rollback_at = self.last_rollback_at.clone();
 
         if !self.node_status.get().raw().is_leader() {
             return Ok(());
@@ -1982,7 +1998,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             .request_sync_two_phase(
                 Some(delay),
                 move || async move { capture_replication_snapshot(&mc_capture) },
-                move |captured| commit_replication_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates, node_status, captured, max_catchup_gap_bytes, max_request_size, read_max_chunk_size, shard_id),
+                move |captured| commit_replication_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates, node_status, last_rollback_at, captured, max_catchup_gap_bytes, max_request_size, read_max_chunk_size, shard_id),
             )
             .await
     }
@@ -2603,6 +2619,7 @@ mod tests {
             fsync_delay: Duration::ZERO,
             replication_delay: Duration::ZERO,
             s3_replication_delay: Duration::from_millis(500),
+            replication_rollback_cooldown: Duration::ZERO,
             recent_write_cache_bytes: 64 * 1024 * 1024,
             shard_dir: dir.to_path_buf(),
             max_response_size: 16 * 1024 * 1024,

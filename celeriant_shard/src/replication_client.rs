@@ -24,6 +24,8 @@ pub trait ReplicationClient {
     fn set_follower_address(&self, address: Option<String>);
     fn set_follower_reachable(&self, reachable: bool);
     fn is_follower_reachable(&self) -> bool;
+    fn try_acquire_kick(&self) -> bool { true }
+    fn release_kick(&self) {}
     async fn replicate_to_follower(&self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError>;
     async fn replicate_to_s3(&self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToS3Error>;
     async fn send_heartbeat(&self, unix_epoch_now_ms: u64, lease_index: u64) -> Result<HeartbeatResult, SendHeartbeatError>;
@@ -122,6 +124,7 @@ impl ConnState {
 pub struct FollowerConnection<S: S3Uploader> {
     follower_address: RefCell<Option<String>>,
     follower_reachable: Cell<bool>,
+    kick_in_flight: Cell<bool>,
     node_id: u128,
     shard_id: u64,
     replication_conn: RwLock<ConnState>,
@@ -152,6 +155,7 @@ impl<S: S3Uploader> FollowerConnection<S> {
         Self {
             follower_address: RefCell::new(follower_address),
             follower_reachable: Cell::new(false),
+            kick_in_flight: Cell::new(false),
             node_id,
             shard_id,
             replication_conn: RwLock::new(ConnState::new()),
@@ -178,6 +182,19 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
 
     fn is_follower_reachable(&self) -> bool {
         self.follower_reachable.get()
+    }
+
+    fn try_acquire_kick(&self) -> bool {
+        if self.kick_in_flight.get() {
+            false
+        } else {
+            self.kick_in_flight.set(true);
+            true
+        }
+    }
+
+    fn release_kick(&self) {
+        self.kick_in_flight.set(false);
     }
 
     async fn replicate_to_follower(&self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError> {

@@ -1439,6 +1439,7 @@ mod tests {
             cache_warmup_max_duration: None,
             reserve_coordinator_shard: false,
             s3_replication_delay: Duration::from_millis(500),
+            replication_rollback_cooldown: Duration::from_millis(500),
         }
     }
 

@@ -299,6 +299,14 @@ pub struct ServerConfig {
 
     #[arg(
         long,
+        default_value_t = 500000,
+        env = "CELERIANT_REPLICATION_ROLLBACK_COOLDOWN_US",
+        help = "After a replication rollback, reject new writes with ReplicationBackpressure for this long (500ms). Gives the pending queue time to drain and prevents rollback storms."
+    )]
+    pub replication_rollback_cooldown_us: u64,
+
+    #[arg(
+        long,
         default_value = "info",
         env = "CELERIANT_LOG_LEVEL",
         help = "Log level (trace, debug, info, warn, error)"
@@ -744,6 +752,7 @@ impl ServerConfig {
             fsync_delay: Duration::from_micros(self.fsync_delay_us),
             replication_delay: Duration::from_micros(self.replication_delay_us),
             s3_replication_delay: Duration::from_micros(self.s3_replication_delay_us),
+            replication_rollback_cooldown: Duration::from_micros(self.replication_rollback_cooldown_us),
             routing_rule: self.routing_rule,
             aggregate_client_snapshots_cache_bytes: memory_budget.aggregate_client_snapshots_cache_bytes,
             aggregate_snapshots_cache_bytes: memory_budget.aggregate_snapshots_cache_bytes,
@@ -871,6 +880,7 @@ impl ServerConfig {
         check_field!(fsync_delay_us);
         check_field!(replication_delay_us);
         check_field!(s3_replication_delay_us);
+        check_field!(replication_rollback_cooldown_us);
         check_field!(log_level);
         check_field!(s3_enabled);
         check_field!(s3_region);
@@ -956,6 +966,7 @@ impl Default for ServerConfig {
             fsync_delay_us: 17000,
             replication_delay_us: 17000,
             s3_replication_delay_us: 500000,
+            replication_rollback_cooldown_us: 500000,
             client_connection_timeout_ms: 30000,
             routing_rule: RoutingRule::AggregateId,
             timestamp_precision: ConfigTimestampPrecision::Milliseconds,

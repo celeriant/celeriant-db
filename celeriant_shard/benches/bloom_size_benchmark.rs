@@ -62,6 +62,7 @@ fn create_config(shard_dir: PathBuf) -> InternalShardConfig {
         fsync_delay: FSYNC_DELAY,
         replication_delay: Duration::from_millis(17),
         s3_replication_delay: Duration::from_millis(500),
+        replication_rollback_cooldown: Duration::from_millis(500),
         recent_write_cache_bytes: 64 * 1024 * 1024,
         shard_dir,
         max_response_size: 16 * 1024 * 1024,

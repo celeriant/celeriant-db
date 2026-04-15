@@ -1,6 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::time::Instant;
 
 use tracing::{debug, error, warn};
 
@@ -86,13 +87,14 @@ pub enum ReplicationDetails {
 }
 
 /// Commit phase: replicate captured data and update caches.
-pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
+pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient + 'static>(
     replication_client: Rc<R>,
     fsync_coordinator: Rc<Coordinator<ShardFsyncError>>,
     log_segments_cache: Rc<LogSegmentsCache>,
     shard_mem_cache: Rc<RefCell<MemCache>>,
     watched_aggregates: Rc<AggregateWatchers>,
     node_status: Rc<Cell<ValidatedNodeStatus>>,
+    last_rollback_at: Rc<Cell<Option<Instant>>>,
     replication_captured_data: ReplicationCapturedData,
     max_catchup_gap_bytes: u64,
     max_request_size: u64,
@@ -111,6 +113,7 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
             &fsync_coordinator,
             &log_segments_cache,
             &shard_mem_cache,
+            &last_rollback_at,
             replication_captured_data.replication_snapshot,
             shard_id,
         )
@@ -134,7 +137,6 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
         debug!(shard_id, "Replication commit: follower unreachable, will use S3 fallback");
     }
     let mut added_additional_entries = false;
-    let mut kick_sent = false;
 
     // Final deets we send back to waiting callers
     let mut _replication_details = ReplicationDetails::ReplicatedToFollower;
@@ -165,6 +167,7 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
                 &fsync_coordinator,
                 &log_segments_cache,
                 &shard_mem_cache,
+                &last_rollback_at,
                 replication_captured_data.replication_snapshot,
                 shard_id,
             )
@@ -197,9 +200,13 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
                     if s3_ms > 500 {
                         warn!(shard_id, s3_ms, workset_size_bytes, "S3 fallback upload slow");
                     }
-                    if !kick_sent {
-                        let _ = replication_client.send_kick().await;
-                        kick_sent = true;
+                    // Throw kick onto another task to avoid blocking if follower network broke
+                    if replication_client.try_acquire_kick() {
+                        let rc = replication_client.clone();
+                        glommio::spawn_local(async move {
+                            let _ = rc.send_kick().await;
+                            rc.release_kick();
+                        }).detach();
                     }
                     continue;
                 }
@@ -209,6 +216,7 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
                         &fsync_coordinator,
                         &log_segments_cache,
                         &shard_mem_cache,
+                        &last_rollback_at,
                         replication_captured_data.replication_snapshot,
                         shard_id,
                     )
@@ -306,6 +314,7 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
                                                     &fsync_coordinator,
                                                     &log_segments_cache,
                                                     &shard_mem_cache,
+                                                    &last_rollback_at,
                                                     replication_captured_data.replication_snapshot,
                                                     shard_id,
                                                 )
@@ -362,6 +371,7 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient>(
             &fsync_coordinator,
             &log_segments_cache,
             &shard_mem_cache,
+            &last_rollback_at,
             replication_captured_data.replication_snapshot,
             shard_id,
         )
@@ -520,9 +530,11 @@ async fn rollback_or_requeue(
     fsync_coordinator: &Rc<Coordinator<ShardFsyncError>>,
     log_segments_cache: &Rc<LogSegmentsCache>,
     shard_mem_cache: &Rc<RefCell<MemCache>>,
+    last_rollback_at: &Rc<Cell<Option<Instant>>>,
     replication_snapshot: Vec<PendingCommitData>,
     shard_id: u32,
 ) -> Result<(), ReplicationRollbackFailure> {
+    last_rollback_at.set(Some(Instant::now()));
     match rollback_replicate(fsync_coordinator, log_segments_cache, shard_mem_cache, &replication_snapshot, shard_id).await {
         Ok(()) => Ok(()),
         Err(e) => {
@@ -846,6 +858,7 @@ mod tests {
                 smc,
                 Rc::new(AggregateWatchers::new()),
                 node_status,
+                Rc::new(Cell::new(None)),
                 make_captured_data(5),
                 u64::MAX,   // max_catchup_gap_bytes (irrelevant, already flagged)
                 u64::MAX,   // max_request_size (irrelevant, S3 path)
