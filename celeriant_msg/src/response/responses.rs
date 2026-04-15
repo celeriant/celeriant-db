@@ -198,7 +198,10 @@ pub struct ReplicationBatchResponse {
 /// The heartbeat is purely a liveness signal. Lease fencing is the replication path's job.
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub enum HeartbeatResult {
-    Ack { follower_timestamp_ms: u64 },
+    Ack {
+        follower_timestamp_ms: u64,
+        follower_can_accept_tcp_replication: bool,
+    },
     Rejected(HeartbeatRejection),
 }
 

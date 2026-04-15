@@ -7,7 +7,7 @@ use tracing::{debug, info, trace, warn};
 
 use celeriant_disk::files::rwlock_timeout::write_with_timeout;
 use celeriant_distributed::node_status::NodeStatus;
-use celeriant_distributed::validated_node_status::{self, ValidatedNodeStatus};
+use celeriant_distributed::validated_node_status::{self, ValidatedNodeStatus, set_node_status_and_metric};
 use celeriant_rotating_log::errors::ready_up_error::ReadyUpError;
 use celeriant_rotating_log::errors::scan_error::ScanError;
 use celeriant_wire::disk::disk_format_error::DiskFormatError;
@@ -2426,7 +2426,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             NodeStatus::BootCatchup => NodeStatus::BootCatchup,
             _ => NodeStatus::BootCatchup,
         };
-        self.node_status.set(ValidatedNodeStatus::create_custom_status(catchup_status, 0, 0));
+        set_node_status_and_metric(&self.node_status, ValidatedNodeStatus::create_custom_status(catchup_status, 0, 0), self.config.shard_id);
 
         catchup_from_s3(
             &self.log_segments_cache,
@@ -3457,7 +3457,7 @@ mod tests {
 
         async fn send_heartbeat(&self, unix_epoch_now_ms: u64, _lease_index: u64) -> Result<celeriant_msg::response::responses::HeartbeatResult, crate::error::send_heartbeat_error::SendHeartbeatError> {
             glommio::timer::sleep(std::time::Duration::from_millis(10)).await;
-            Ok(celeriant_msg::response::responses::HeartbeatResult::Ack { follower_timestamp_ms: unix_epoch_now_ms + 10 })
+            Ok(celeriant_msg::response::responses::HeartbeatResult::Ack { follower_timestamp_ms: unix_epoch_now_ms + 10, follower_can_accept_tcp_replication: true })
         }
 
         async fn send_kick(&self) -> Result<bool, crate::error::send_heartbeat_error::SendHeartbeatError> { Ok(true) }
@@ -3500,7 +3500,7 @@ mod tests {
         }
 
         async fn send_heartbeat(&self, unix_epoch_now_ms: u64, _: u64) -> Result<celeriant_msg::response::responses::HeartbeatResult, crate::error::send_heartbeat_error::SendHeartbeatError> {
-            Ok(celeriant_msg::response::responses::HeartbeatResult::Ack { follower_timestamp_ms: unix_epoch_now_ms + 10 })
+            Ok(celeriant_msg::response::responses::HeartbeatResult::Ack { follower_timestamp_ms: unix_epoch_now_ms + 10, follower_can_accept_tcp_replication: true })
         }
 
         async fn send_kick(&self) -> Result<bool, crate::error::send_heartbeat_error::SendHeartbeatError> { Ok(true) }
@@ -3804,7 +3804,7 @@ mod tests {
             Ok(())
         }
         async fn send_heartbeat(&self, unix_epoch_now_ms: u64, _lease_index: u64) -> Result<celeriant_msg::response::responses::HeartbeatResult, crate::error::send_heartbeat_error::SendHeartbeatError> {
-            Ok(celeriant_msg::response::responses::HeartbeatResult::Ack { follower_timestamp_ms: unix_epoch_now_ms + 10 })
+            Ok(celeriant_msg::response::responses::HeartbeatResult::Ack { follower_timestamp_ms: unix_epoch_now_ms + 10, follower_can_accept_tcp_replication: true })
         }
         async fn send_kick(&self) -> Result<bool, crate::error::send_heartbeat_error::SendHeartbeatError> { Ok(true) }
     }

@@ -51,7 +51,7 @@ impl ReplicationClient for StubReplicationClient {
 
     async fn send_heartbeat(&self, unix_epoch_now_ms: u64, _lease_index: u64) -> Result<HeartbeatResult, SendHeartbeatError> {
         glommio::timer::sleep(std::time::Duration::from_millis(100)).await;
-        Ok(HeartbeatResult::Ack { follower_timestamp_ms: unix_epoch_now_ms + 100 })
+        Ok(HeartbeatResult::Ack { follower_timestamp_ms: unix_epoch_now_ms + 100, follower_can_accept_tcp_replication: true })
     }
 
     async fn send_kick(&self) -> Result<bool, SendHeartbeatError> { Ok(true) }

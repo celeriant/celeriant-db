@@ -90,6 +90,18 @@ impl ValidatedNodeStatus {
     }
 }
 
+pub fn set_node_status_and_metric(
+    cell: &std::cell::Cell<ValidatedNodeStatus>,
+    status: ValidatedNodeStatus,
+    shard_id: u32,
+) {
+    cell.set(status);
+    if shard_id == 0 {
+        let role = if status.is_leader() || status.is_standalone() { 1.0 } else { 0.0 };
+        metrics::gauge!("celeriant_node_role").set(role);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

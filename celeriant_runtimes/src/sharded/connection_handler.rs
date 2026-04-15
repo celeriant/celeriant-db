@@ -3,7 +3,7 @@ use std::{cell::{Cell, RefCell}, collections::HashMap, fmt, future::Future, io, 
 use futures_lite::AsyncRead;
 
 use base64::Engine;
-use celeriant_distributed::{lease_store::LeaseStore, node_status::NodeStatus, s3_lease_manager::S3LeaseManager, validated_node_status::{self, ValidatedNodeStatus}};
+use celeriant_distributed::{lease_store::LeaseStore, node_status::NodeStatus, s3_lease_manager::S3LeaseManager, validated_node_status::{self, ValidatedNodeStatus, set_node_status_and_metric}};
 use celeriant_msg::{
     error_codes,
     process_client_requests::ClientRequest,
@@ -1215,7 +1215,7 @@ async fn handle_heartbeat<R: ReplicationClient + 'static, D: S3Downloader + 'sta
             "Clock drift too high, fencing all shards"
         );
         let fenced = ValidatedNodeStatus::create_fenced();
-        ctx.shard_wal.node_status.set(fenced);
+        set_node_status_and_metric(&ctx.shard_wal.node_status, fenced, ctx.current_shard_id as u32);
         broadcast_status(ctx, fenced).await;
 
         return ClusterResponse::Heartbeat(HeartbeatResponse {
@@ -1241,12 +1241,15 @@ async fn handle_heartbeat<R: ReplicationClient + 'static, D: S3Downloader + 'sta
         raw_status,
         ctx.config.max_clock_drift_ms,
         new_lease_expiry_ms);
-    ctx.shard_wal.node_status.set(refreshed);
+    set_node_status_and_metric(&ctx.shard_wal.node_status, refreshed, ctx.current_shard_id as u32);
     broadcast_status(ctx, refreshed).await;
 
     ClusterResponse::Heartbeat(HeartbeatResponse {
         correlation_id: req.correlation_id,
-        result: HeartbeatResult::Ack { follower_timestamp_ms: follower_ms },
+        result: HeartbeatResult::Ack {
+            follower_timestamp_ms: follower_ms,
+            follower_can_accept_tcp_replication: raw_status.is_follower(),
+        },
     })
 }
 
@@ -1270,7 +1273,7 @@ async fn handle_kick_follower<R: ReplicationClient + 'static, D: S3Downloader + 
         let catching_up = ValidatedNodeStatus::create_custom_status(
             NodeStatus::FollowerCatchingUp { leader_lease_index }, 0,0,
         );
-        ctx.shard_wal.node_status.set(catching_up);
+        set_node_status_and_metric(&ctx.shard_wal.node_status, catching_up, ctx.current_shard_id as u32);
         broadcast_status(ctx, catching_up).await;
         info!("Kicked by leader — transitioning to FollowerCatchingUp");
     }

@@ -727,6 +727,7 @@ dependencies = [
  "celeriant_wal",
  "celeriant_wire",
  "futures",
+ "metrics",
  "tracing",
  "uuid",
 ]

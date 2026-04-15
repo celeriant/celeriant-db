@@ -155,6 +155,7 @@ mod tests {
                 correlation_id: Some(0x7777_8888_9999_AAAA),
                 result: HeartbeatResult::Ack {
                     follower_timestamp_ms: 1234567890123,
+                    follower_can_accept_tcp_replication: true,
                 },
             }),
             ClusterResponseType::KickFollower => ClusterResponse::KickFollower(KickFollowerResponse {

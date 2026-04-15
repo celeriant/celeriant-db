@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use celeriant_distributed::{lease_store::LeaseStore, s3_lease_manager::{ElectionOutcome, S3LeaseManager}, validated_node_status::{self, ValidatedNodeStatus}};
+use celeriant_distributed::{lease_store::LeaseStore, s3_lease_manager::{ElectionOutcome, S3LeaseManager}, validated_node_status::{self, ValidatedNodeStatus, set_node_status_and_metric}};
 use celeriant_msg::response::responses::HeartbeatResult;
 use celeriant_shard::{error::send_heartbeat_error::SendHeartbeatError, replication_client::ReplicationClient, s3_downloader::S3Downloader, shard_wal::ShardWal};
 use glommio::{
@@ -483,7 +483,6 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
     let outcome = retry_s3_operation(ctx.config.s3_retry_max_duration, "renew_s3_lease", || lease_manager.run_election_to_acquire_s3_lease()).await?;
 
     metrics::counter!("celeriant_leader_elections_total").increment(1);
-    metrics::gauge!("celeriant_node_role").set(if outcome.status.raw().is_leader() { 1.0 } else { 0.0 });
 
     // Set peer_node_id early so S3 catchup can filter stale batches from old cluster generations.
     // Full UpdateFollower broadcast (with replication address) happens after catchup.
@@ -559,7 +558,7 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
             "Node status transition"
         );
     }
-    ctx.shard_wal.node_status.set(outcome.status);
+    set_node_status_and_metric(&ctx.shard_wal.node_status, outcome.status, ctx.current_shard_id as u32);
     broadcast_message_to_other_shards(
         ctx.current_shard_id,
         IntrashardMessages::StatusUpdate { status: outcome.status },
@@ -642,14 +641,16 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                     }
                 }
 
-                if let Ok(HeartbeatResult::Ack { .. }) = result {
+                if let Ok(HeartbeatResult::Ack { follower_can_accept_tcp_replication, .. }) = result {
                     has_peer = true;
                     peer_discovery_backoff = Duration::from_secs(1);
-                    ctx.shard_wal.replication_client.set_follower_reachable(true);
-                    broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::FollowerReachable { reachable: true }, ctx.intrashard_sender.clone()).await;
+                    // Node is there on network but still hasn't joined the cluster as follower
+                    let reachable = follower_can_accept_tcp_replication;
+                    ctx.shard_wal.replication_client.set_follower_reachable(reachable);
+                    broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::FollowerReachable { reachable }, ctx.intrashard_sender.clone()).await;
                     let refreshed = ValidatedNodeStatus::create_custom_status(
                         ctx.shard_wal.node_status.get().raw(), ctx.config.max_clock_drift_ms, unix_epoch_now_ms + ctx.config.heartbeat_lease_duration.as_millis() as u64);
-                    ctx.shard_wal.node_status.set(refreshed);
+                    set_node_status_and_metric(&ctx.shard_wal.node_status, refreshed, ctx.current_shard_id as u32);
                     broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::StatusUpdate { status: refreshed }, ctx.intrashard_sender.clone()).await;
                     continue;
                 }
@@ -840,7 +841,7 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
                     "Node status transition"
                 );
             }
-            ctx.shard_wal.node_status.set(status);
+            set_node_status_and_metric(&ctx.shard_wal.node_status, status, ctx.current_shard_id as u32);
         }
         IntrashardMessages::UpdatePeerNodeId { peer_node_id } => {
             ctx.shard_wal.peer_node_id.set(peer_node_id);
