@@ -136,6 +136,7 @@ pub struct FollowerConnection<S: S3Uploader> {
     max_response_size: u64,
     replication_client_config: Option<Arc<rustls::ClientConfig>>,
     s3_uploader: Option<S>,
+    s3_upload_sequence: Cell<u64>,
 }
 
 impl<S: S3Uploader> FollowerConnection<S> {
@@ -167,6 +168,7 @@ impl<S: S3Uploader> FollowerConnection<S> {
             max_response_size,
             replication_client_config,
             s3_uploader,
+            s3_upload_sequence: Cell::new(0),
         }
     }
 }
@@ -256,12 +258,16 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
             })
             .collect();
 
+        let seq = self.s3_upload_sequence.get().saturating_sub(1);
+        self.s3_upload_sequence.set(seq);
+
         let fallback_batch = FallbackBatch {
             fallback_index,
             end_wal_index,
             shard_id,
             uploaded_by_node_id: self.node_id,
             items,
+            upload_sequence: seq,
         };
 
         let batch_count = fallback_batch.items.len();
@@ -604,5 +610,40 @@ mod tests {
 
             assert!(matches!(result, Err(ReplicateToS3Error::S3PutFailed { .. })));
         });
+    }
+
+    fn test_follower_conn() -> FollowerConnection<MockS3Uploader> {
+        FollowerConnection::new(
+            Some("127.0.0.1:8080".to_string()),
+            None, None,
+            Duration::from_millis(500),
+            1024, 1024,
+            7, 1,
+            None, None,
+        )
+    }
+
+    #[test]
+    fn try_acquire_kick_is_exclusive() {
+        let client = test_follower_conn();
+        assert!(client.try_acquire_kick(), "first acquire must succeed");
+        assert!(!client.try_acquire_kick(), "second acquire must fail while in-flight");
+        assert!(!client.try_acquire_kick(), "still locked");
+    }
+
+    #[test]
+    fn release_kick_resets_latch() {
+        let client = test_follower_conn();
+        assert!(client.try_acquire_kick());
+        client.release_kick();
+        assert!(client.try_acquire_kick(), "acquire after release must succeed");
+        client.release_kick();
+    }
+
+    #[test]
+    fn release_without_acquire_is_noop() {
+        let client = test_follower_conn();
+        client.release_kick();
+        assert!(client.try_acquire_kick(), "latch still usable after spurious release");
     }
 }

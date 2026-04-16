@@ -220,6 +220,33 @@ mod tests {
     }
 
     #[test]
+    fn set_node_status_and_metric_updates_cell_on_shard_zero() {
+        let cell = std::cell::Cell::new(ValidatedNodeStatus::create_boot_catchup());
+        let target = ValidatedNodeStatus::create_custom_status(
+            NodeStatus::Leader { lease_index: 3 },
+            DRIFT,
+            FAR_FUTURE,
+        );
+        set_node_status_and_metric(&cell, target, 0);
+        assert_eq!(cell.get().raw(), NodeStatus::Leader { lease_index: 3 });
+    }
+
+    #[test]
+    fn set_node_status_and_metric_updates_cell_on_non_zero_shards() {
+        // Non-shard-0 callers must still update the cell. Only the gauge is gated.
+        let cell = std::cell::Cell::new(ValidatedNodeStatus::create_boot_catchup());
+        let target = ValidatedNodeStatus::create_custom_status(
+            NodeStatus::Follower { leader_lease_index: 7 },
+            DRIFT,
+            FAR_FUTURE,
+        );
+        set_node_status_and_metric(&cell, target, 1);
+        assert_eq!(cell.get().raw(), NodeStatus::Follower { leader_lease_index: 7 });
+        set_node_status_and_metric(&cell, target, 42);
+        assert_eq!(cell.get().raw(), NodeStatus::Follower { leader_lease_index: 7 });
+    }
+
+    #[test]
     fn standalone_ttl_exempt() {
         let status = ValidatedNodeStatus::create_custom_status(
             NodeStatus::Standalone,

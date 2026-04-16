@@ -91,7 +91,6 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                     shard_log_preallocate_bytes: shard_config.shard_log_preallocate_bytes,
                     node_id,
                     shard_id: current_shard_id as u32,
-                    s3_download_max_rounds: shard_config.s3_download_max_rounds,
                     fsync_delay: shard_config.fsync_delay,
                     replication_delay: shard_config.replication_delay,
                     s3_replication_delay: shard_config.s3_replication_delay,

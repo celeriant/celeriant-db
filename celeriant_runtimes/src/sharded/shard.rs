@@ -339,6 +339,7 @@ fn spawn_shard_zero_shutdown_handler<R: ReplicationClient + 'static, D: S3Downlo
             match signal_handler.poll_signal() {
                 Ok(Some(sig)) => {
                     info!("Received shutdown signal ({:?}). Initiating graceful shutdown...", sig);
+                    metrics::gauge!("celeriant_node_role").set(0.0);
                     ctx.shutdown_requested.set(true);
                     broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::Shutdown, ctx.intrashard_sender.clone()).await;
                     break;

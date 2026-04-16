@@ -380,14 +380,6 @@ pub struct ServerConfig {
     )]
     pub s3_allow_http: bool,
 
-    #[arg(
-        long,
-        default_value_t = 3,
-        env = "CELERIANT_S3_CATCHUP_MAX_ROUNDS",
-        help = "Maximum S3 List -> Download rounds performed in shard catchup (3)"
-    )]
-    pub s3_catchup_max_rounds: u32,
-
     #[arg(long, default_value_t = 500, env = "CELERIANT_HEARTBEAT_INTERVAL_MS", help = "Interval between leader heartbeats to followers (500ms)")]
     pub heartbeat_interval_ms: u64,
 
@@ -732,7 +724,6 @@ impl ServerConfig {
         ShardConfig {
             node_id,
             num_shards,
-            s3_download_max_rounds: self.s3_catchup_max_rounds,
             replication_config,
             advertised_replication_address: self.advertised_replication_address.clone(),
             data_root: std::path::absolute(&self.data_root)
@@ -891,7 +882,6 @@ impl ServerConfig {
         check_field!(s3_endpoint_override);
         check_field!(s3_skip_signature);
         check_field!(s3_allow_http);
-        check_field!(s3_catchup_max_rounds);
         check_field!(heartbeat_interval_ms);
         check_field!(heartbeat_lease_duration_ms);
         check_field!(s3_lease_duration_ms);
@@ -983,7 +973,6 @@ impl Default for ServerConfig {
             internode_request_timeout_ms: 2_000,
             server_compression_algorithm: ConfigCompressionType::Snappy,
             server_compression_level: None,
-            s3_catchup_max_rounds: 3,
             heartbeat_interval_ms: 500,
             heartbeat_timeout_ms: None,
             heartbeat_hard_timeout_multiplier: 4,

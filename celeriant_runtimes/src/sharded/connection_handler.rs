@@ -1386,7 +1386,6 @@ mod tests {
         ShardConfig {
             node_id: 1,
             num_shards,
-            s3_download_max_rounds: 3,
             replication_config: None,
             heartbeat_lease_duration: Duration::from_millis(1500),
             heartbeat_interval_duration: Duration::from_millis(250),

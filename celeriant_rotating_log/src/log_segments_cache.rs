@@ -242,6 +242,114 @@ impl LogSegmentsCache {
     pub fn shard_dir(&self) -> &Path {
         &self.shard_dir
     }
+
+    /// Discard the active segment and any intermediates, making the target
+    /// sealed segment the new active write target.
+    ///
+    /// Used during S3 catchup truncation when the common ancestor lives in a
+    /// sealed segment. After return:
+    ///
+    /// - The segment at `target_log_id` is the active file (removed from LRU)
+    /// - All segment files for ids in `(target_log_id, old_active_log_id]`
+    ///   are deleted from disk and evicted from the LRU
+    ///
+    /// The caller must hold the rollback lock to block concurrent writes.
+    /// In-flight reads on discarded segments are safe: Linux unlink semantics
+    /// keep the fd alive until the last Rc drops.
+    ///
+    /// The caller is responsible for rewriting `target_log_id`'s dual headers
+    /// to reflect the new write cursor.
+    pub async fn unwind_active_to_sealed(
+        &self,
+        target_log_id: u64,
+    ) -> Result<(), UnwindActiveError> {
+        let current_active_id = self.active_log_id();
+        if target_log_id >= current_active_id {
+            return Err(UnwindActiveError::NotOlderThanActive {
+                target: target_log_id,
+                active: current_active_id,
+            });
+        }
+
+        // Open the target (may already be in the LRU) and remove it from the
+        // LRU so we can move it into the active slot without aliasing.
+        let target = self
+            .get(target_log_id)
+            .await
+            .map_err(UnwindActiveError::OpenTarget)?;
+        self.lru_cache.borrow_mut().pop(&target_log_id);
+
+        // Collect every log_id that must be discarded (target+1..=current_active).
+        let discard_ids: Vec<u64> = (target_log_id + 1..=current_active_id).collect();
+
+        // Drop LRU references so file handles close when the old active Rc
+        // drops below. Active slot is replaced separately.
+        for id in &discard_ids {
+            if *id != current_active_id {
+                self.lru_cache.borrow_mut().pop(id);
+            }
+        }
+
+        // Swap the active slot. The old active file is closed here.
+        let old_active = {
+            let mut slot = self.active_file.borrow_mut();
+            std::mem::replace(&mut *slot, target)
+        };
+        old_active.close().await;
+        drop(old_active);
+
+        // Delete the discarded files from disk.
+        for id in &discard_ids {
+            let path = self.shard_dir.join(log_file_name(*id));
+            if let Err(e) = std::fs::remove_file(&path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(UnwindActiveError::DeleteSegment {
+                        log_id: *id,
+                        source: e.to_string(),
+                    });
+                }
+            }
+        }
+
+        metrics::gauge!("celeriant_log_segments_total", &self.shard_label)
+            .set((1 + self.lru_cache.borrow().len()) as f64);
+        tracing::warn!(
+            shard_id = %self.shard_label[0].1,
+            target_log_id,
+            previous_active_log_id = current_active_id,
+            discarded = discard_ids.len(),
+            "Unwound active log segment to sealed — discarded newer segments"
+        );
+
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub enum UnwindActiveError {
+    NotOlderThanActive { target: u64, active: u64 },
+    OpenTarget(OpenOrCreateError),
+    DeleteSegment { log_id: u64, source: String },
+}
+
+impl std::fmt::Display for UnwindActiveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotOlderThanActive { target, active } => {
+                write!(f, "target log_id {target} must be strictly less than active {active}")
+            }
+            Self::OpenTarget(e) => write!(f, "failed to open target segment: {e:?}"),
+            Self::DeleteSegment { log_id, source } => {
+                write!(f, "failed to delete segment log_{log_id}: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for UnwindActiveError {}
+
+fn log_file_name(log_id: u64) -> String {
+    format!("log_{log_id}.wal")
 }
 
 const FIRST_LOG_ID: u64 = 1;
@@ -496,6 +604,73 @@ mod tests {
             cache.rotate_to_next_log().await.unwrap();
 
             cache.close().await;
+            cache.close().await;
+        });
+    }
+
+    #[test]
+    fn unwind_rejects_active_or_newer() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let cache = LogSegmentsCache::ready_up(dir, FILE_SIZE, 4, 0).await.unwrap();
+            cache.rotate_to_next_log().await.unwrap();
+            assert_eq!(cache.active_log_id(), 2);
+
+            // Same as active
+            assert!(matches!(
+                cache.unwind_active_to_sealed(2).await,
+                Err(UnwindActiveError::NotOlderThanActive { target: 2, active: 2 })
+            ));
+            // Newer than active
+            assert!(matches!(
+                cache.unwind_active_to_sealed(99).await,
+                Err(UnwindActiveError::NotOlderThanActive { target: 99, active: 2 })
+            ));
+
+            cache.close().await;
+        });
+    }
+
+    #[test]
+    fn unwind_to_previous_segment() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let cache = LogSegmentsCache::ready_up(dir.clone(), FILE_SIZE, 4, 0).await.unwrap();
+            cache.rotate_to_next_log().await.unwrap();
+            assert_eq!(cache.active_log_id(), 2);
+
+            cache.unwind_active_to_sealed(1).await.unwrap();
+
+            assert_eq!(cache.active_log_id(), 1);
+            assert!(!dir.join("log_2.wal").exists(), "discarded segment should be deleted");
+            assert!(dir.join("log_1.wal").exists());
+
+            cache.close().await;
+        });
+    }
+
+    #[test]
+    fn unwind_discards_intermediates() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let cache = LogSegmentsCache::ready_up(dir.clone(), FILE_SIZE, 8, 0).await.unwrap();
+            for _ in 0..4 {
+                cache.rotate_to_next_log().await.unwrap();
+            }
+            assert_eq!(cache.active_log_id(), 5);
+
+            cache.unwind_active_to_sealed(2).await.unwrap();
+
+            assert_eq!(cache.active_log_id(), 2);
+            assert!(dir.join("log_1.wal").exists());
+            assert!(dir.join("log_2.wal").exists());
+            for id in 3..=5 {
+                assert!(!dir.join(format!("log_{id}.wal")).exists(), "log_{id}.wal should be deleted");
+            }
+            // LRU should only have log_1 (intermediates evicted)
+            assert!(cache.get_if_cached(1).is_some());
+            assert!(cache.get_if_cached(3).is_none());
+
             cache.close().await;
         });
     }

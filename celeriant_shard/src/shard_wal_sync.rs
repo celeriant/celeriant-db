@@ -462,7 +462,7 @@ pub(crate) async fn sync(
 
 /// Hash chain: blake3(previous_hash || metablock_bytes), skipping the CRC (which covers
 /// datablock_position) and the datablock_position field itself — both are node-local.
-fn compute_entry_hash(previous_hash: &EntryHashBytes, content: &[u8]) -> EntryHashBytes {
+pub(crate) fn compute_entry_hash(previous_hash: &EntryHashBytes, content: &[u8]) -> EntryHashBytes {
     const CRC_END: usize = versioned_block::CRC_SIZE;
     const SKIP_START: usize = versioned_block::HEADER_SIZE + Metablock::OFFSET_DATABLOCK_POSITION;
     const SKIP_END: usize = SKIP_START + Metablock::WIRE_SIZE_DATABLOCK_POSITION;

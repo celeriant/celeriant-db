@@ -82,7 +82,6 @@ fn create_config(shard_dir: PathBuf) -> InternalShardConfig {
         max_schema_size_bytes: 16384,
         pending_replication_high_water_bytes: 67_108_864, // 64MB
         max_catchup_gap_bytes: 104_857_600,
-        s3_download_max_rounds: 3,
         max_clock_drift_ms: 500,
         shard_id: 1,
         compaction_check_interval: Duration::from_secs(600),

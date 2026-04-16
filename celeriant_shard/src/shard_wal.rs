@@ -2437,7 +2437,8 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             self.config.shard_id,
             self.config.node_id,
             self.peer_node_id.get(),
-            self.config.s3_download_max_rounds).await
+            self.config.max_catchup_gap_bytes,
+        ).await
 
     }
 
@@ -2613,7 +2614,6 @@ mod tests {
         InternalShardConfig {
             node_id: 1,
             shard_id: 1,
-            s3_download_max_rounds: 3,
             max_open_files: 4,
             shard_log_preallocate_bytes: 4 * 1024 * 1024,
             fsync_delay: Duration::ZERO,
@@ -2996,6 +2996,61 @@ mod tests {
 
             let result = process(&shard, write_req(key(1, 1, 1), events(1))).await;
             assert!(matches!(result, Err(ShardError::Write(ShardWriteError::ShardCannotAcceptWrites { .. }))));
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn write_rejected_during_rollback_cooldown() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let mut cfg = test_config(&dir);
+            cfg.replication_rollback_cooldown = Duration::from_secs(10);
+            let shard = ShardWal::open(cfg, ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader).await.unwrap();
+
+            shard.last_rollback_at.set(Some(std::time::Instant::now()));
+
+            let result = process(&shard, write_req(key(1, 1, 1), events(1))).await;
+            assert!(matches!(result, Err(ShardError::Write(ShardWriteError::ReplicationBackpressure))),
+                "expected ReplicationBackpressure while inside cooldown, got {result:?}");
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn write_accepted_after_rollback_cooldown_expires() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let mut cfg = test_config(&dir);
+            cfg.replication_rollback_cooldown = Duration::from_millis(10);
+            let shard = ShardWal::open(cfg, ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader).await.unwrap();
+
+            // Arm the latch far enough in the past that elapsed > cooldown.
+            let past = std::time::Instant::now() - Duration::from_secs(60);
+            shard.last_rollback_at.set(Some(past));
+
+            let result = process(&shard, write_req(key(1, 1, 1), events(1))).await;
+            assert!(result.is_ok(), "expected write to succeed after cooldown, got {result:?}");
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn write_accepted_when_last_rollback_at_is_none() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let mut cfg = test_config(&dir);
+            cfg.replication_rollback_cooldown = Duration::from_secs(10);
+            let shard = ShardWal::open(cfg, ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader).await.unwrap();
+
+            // No rollback has fired — cooldown should not apply.
+            assert!(shard.last_rollback_at.get().is_none());
+
+            let result = process(&shard, write_req(key(1, 1, 1), events(1))).await;
+            assert!(result.is_ok(), "expected write to succeed when no rollback recorded, got {result:?}");
 
             shard.close().await;
         });
