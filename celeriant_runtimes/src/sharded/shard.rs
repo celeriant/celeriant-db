@@ -120,8 +120,9 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
 
         if let Some(rx) = rx {
             spawn_boot_orchestrator(self.ctx.clone(), rx);
-        } else {
-            // Standalone mode — no election, always leader
+        } else if self.ctx.config.replication_config.is_none() {
+            // Standalone mode — no election, always leader.
+            // In distributed mode only shard 0 owns a lease_manager
             metrics::gauge!("celeriant_node_role").set(1.0);
         }
 

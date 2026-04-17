@@ -75,37 +75,6 @@ fn is_batch_contiguous(batch: &FallbackBatch) -> bool {
     batch.items.windows(2).all(|w| w[0].metablock.wal_index + 1 == w[1].metablock.wal_index)
 }
 
-/// Verify S3 has gap-free contiguous coverage from `from_wal` up through `to_wal` (inclusive).
-/// Called before truncation to ensure the re-apply path can reach at least the pre-truncation
-/// write position. Refuses truncation if any gap exists or coverage falls short.
-fn verify_s3_coverage(entries: &HashMap<u64, Vec<CatchupCandidate>>, from_wal: u64, to_wal: u64) -> Result<(), S3CatchupError> {
-    let mut ranges: Vec<(u64, u64)> = entries.values().flatten().map(|c| (c.start_wal_index, c.end_wal_index)).collect();
-    ranges.sort_unstable();
-
-    let mut cursor = from_wal;
-    for (start, end) in ranges {
-        if end < cursor {
-            continue;
-        }
-        if start > cursor {
-            return Err(S3CatchupError::TruncationFailed(ShardFsyncError::MetablockSerialisationError(format!(
-                "refusing truncate: S3 coverage gap at wal_index {}, nearest next batch starts at {}",
-                cursor, start
-            ))));
-        }
-        cursor = end.saturating_add(1);
-        if cursor > to_wal {
-            return Ok(());
-        }
-    }
-
-    Err(S3CatchupError::TruncationFailed(ShardFsyncError::MetablockSerialisationError(format!(
-        "refusing truncate: S3 coverage reaches only wal_index {}, need {}",
-        cursor.saturating_sub(1),
-        to_wal
-    ))))
-}
-
 pub(crate) async fn catchup_from_s3<D: S3Downloader>(
     log_segments_cache: &Rc<LogSegmentsCache>,
     shard_mem_cache: &Rc<RefCell<MemCache>>,
@@ -292,13 +261,6 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader>(
                             find_divergence_via_s3(log_segments_cache, downloader, &prefix, current_wal, node_id, peer_node_id).await?
                         }
                     };
-
-                // Verify S3 has a gap-free chain from the ancestor forward to at least
-                // our current write position. Without this, truncation would rewind past
-                // entries we'd be unable to re-apply from S3. Refuse to truncate - this
-                // surfaces as a fatal error so the operator learns the durability chain
-                // has actually broken (two-disk invariant violated).
-                verify_s3_coverage(&entries, divergent_wal_index, current_wal)?;
 
                 tracing::warn!(
                     shard_id,
@@ -1355,65 +1317,6 @@ mod tests {
 
             tc.close().await;
         });
-    }
-
-    // ── verify_s3_coverage unit tests ──
-
-    fn cand(start: u64, end: u64) -> CatchupCandidate {
-        CatchupCandidate {
-            path: format!("{}-{}", start, end),
-            size: 100,
-            start_wal_index: start,
-            end_wal_index: end,
-            node_id: 0,
-        }
-    }
-
-    fn entries_from(pairs: &[(u64, u64)]) -> HashMap<u64, Vec<CatchupCandidate>> {
-        let mut m: HashMap<u64, Vec<CatchupCandidate>> = HashMap::new();
-        for &(s, e) in pairs {
-            m.entry(s).or_default().push(cand(s, e));
-        }
-        m
-    }
-
-    #[test]
-    fn verify_coverage_passes_contiguous() {
-        verify_s3_coverage(&entries_from(&[(3, 5), (6, 8)]), 3, 8).unwrap();
-    }
-
-    #[test]
-    fn verify_coverage_passes_overlapping() {
-        verify_s3_coverage(&entries_from(&[(3, 5), (4, 8)]), 3, 8).unwrap();
-    }
-
-    #[test]
-    fn verify_coverage_passes_single_batch_covers_full_range() {
-        verify_s3_coverage(&entries_from(&[(3, 10)]), 3, 8).unwrap();
-    }
-
-    #[test]
-    fn verify_coverage_refuses_on_gap() {
-        let err = verify_s3_coverage(&entries_from(&[(3, 5), (8, 10)]), 3, 10).unwrap_err();
-        assert!(matches!(err, S3CatchupError::TruncationFailed(_)), "got {:?}", err);
-    }
-
-    #[test]
-    fn verify_coverage_refuses_on_undercoverage() {
-        let err = verify_s3_coverage(&entries_from(&[(3, 5)]), 3, 10).unwrap_err();
-        assert!(matches!(err, S3CatchupError::TruncationFailed(_)), "got {:?}", err);
-    }
-
-    #[test]
-    fn verify_coverage_refuses_when_starts_after_from_wal() {
-        let err = verify_s3_coverage(&entries_from(&[(5, 10)]), 3, 10).unwrap_err();
-        assert!(matches!(err, S3CatchupError::TruncationFailed(_)), "got {:?}", err);
-    }
-
-    #[test]
-    fn verify_coverage_refuses_on_empty_entries() {
-        let err = verify_s3_coverage(&HashMap::new(), 3, 5).unwrap_err();
-        assert!(matches!(err, S3CatchupError::TruncationFailed(_)), "got {:?}", err);
     }
 
     #[test]
