@@ -137,9 +137,10 @@ sequenceDiagram
         F->>F: Check clock drift
         F->>F: Extend TTL = max(current, leader_ts + 1500ms)
         F->>F: Broadcast StatusUpdate to all shards
-        F-->>L: Ack(follower_timestamp)
+        F-->>L: Ack(follower_timestamp, follower_can_accept_tcp_replication)
+        L->>L: set follower_reachable = follower_can_accept_tcp_replication
         L->>L: Extend own TTL = now + 1500ms
-        L->>L: Broadcast StatusUpdate to all shards
+        L->>L: Broadcast StatusUpdate + FollowerReachable to all shards
     end
 ```
 
@@ -420,8 +421,10 @@ sequenceDiagram
     participant S3 as MinIO
 
     L->>L: Capture replication snapshot from memcache
+    L->>L: Check is_leader() — fence + rollback if expired
 
     loop For each chunk (≤ max_request_size)
+        L->>L: Re-check is_leader() (lease may expire mid-pipeline)
         L->>F: ReplicationBatch(items)
 
         alt Success
@@ -449,6 +452,13 @@ sequenceDiagram
 
     L->>L: commit_replication (advance read cursor, notify watchers)
 ```
+
+**Mid-commit fencing:** The commit loop re-checks `is_leader()` on every iteration
+and once more before the final `commit_replication`. Pipeline stalls (S3 upload,
+retry backoff, catchup fetch) routinely exceed the ~1s lease TTL. If the lease expired
+mid-pipeline, the loop rolls back local WAL and returns `LeaderFenced` instead of
+committing with an expired lease (which would be silent ACK forgery if a new leader
+has already taken over).
 
 **Follower validation on receive:**
 1. WAL index continuity: `current + 1 == batch[0].wal_index`
@@ -478,11 +488,11 @@ S3 object named by shard, WAL range, and uploader node ID.
 - `pending_replication_bytes > pending_replication_high_water_bytes` (queue pressure)
 - Second TCP rejection after catchup retry
 
-**After successful S3 upload, the leader sends a kick** (at most once per replication
-cycle), regardless of whether the follower is currently marked as reachable. The kick
-is decoupled from the TCP-skip optimisation so that a stale TCP connection failure
-doesn't suppress kick delivery. The kick transitions the follower from `Follower` to
-`FollowerCatchingUp`.
+**After successful S3 upload, the leader fires a kick** via `try_acquire_kick` /
+`release_kick` — a fire-and-forget `spawn_local` task, not awaited on the commit path.
+At most one kick task is in-flight per shard (latch-based, not per-cycle). This
+decouples commit latency from `internode_request_timeout` (~2s) when the follower is
+slow or dead. The kick transitions the follower from `Follower` to `FollowerCatchingUp`.
 
 **S3 upload concurrency:** All shards share a global semaphore capped at
 `s3_max_concurrent_fallback_uploads` (default 2). This prevents MinIO saturation
@@ -537,6 +547,11 @@ A non-follower node rejects with `acknowledged: false`.
 | Carries leader_lease_index | No | Yes |
 | Post-catchup action | S3 election | Resume as Follower |
 | TTL behavior | Exempt | Exempt |
+| Heartbeat Ack `follower_can_accept_tcp_replication` | `false` | `false` |
+
+During both catchup states, the follower ACKs heartbeats (it's alive) but signals
+`follower_can_accept_tcp_replication = false`. The leader uses this to route commits
+straight to S3 fallback without attempting TCP replication that would be rejected.
 
 **S3 catchup per-shard:**
 1. List S3 objects, filter by peer node ID (ignore self-uploads and stale generations)
@@ -571,7 +586,10 @@ flowchart TD
 - Rollback lock blocks all new writers. In-flight fsyncs complete before lock is granted.
 - Write cursor resets to read cursor (or file start if segment never replicated).
 - Dual headers are rewritten and fsynced before lock release. Rollback is durable.
-- After rollback, the node accepts writes immediately.
+- After rollback, writes are rejected with `ReplicationBackpressure` for
+  `replication_rollback_cooldown` (default 500ms). This gives the pending queue time to
+  drain via TCP/S3 before accepting new load, preventing the rollback → rewrite → rollback
+  storm that produces overlapping S3 batch generations under sigstop_leader.
 - Rollback flags (`fsync_rollback_occurred`, `replication_rollback_occurred`) are set
   and consumed once by the next capture phase.
 
@@ -607,6 +625,19 @@ The follower handles this via `WalIndexMismatch` deferral to TCP replication.
 After boot completes, the orchestrator loop continues running on shard 0.
 The loop has four mutually exclusive branches based on current node status.
 
+### Steady-State S3 Invariant
+
+In a healthy two-node cluster where both nodes are reachable and clocks are
+within drift tolerance, **S3 is never touched**. No lease renewal, no fallback
+replication, no S3 reads. All coordination flows over TCP heartbeats (shard 0),
+all data flows over TCP replication (all shards). The chaos baseline enforces
+this via `NoS3Fallbacks`, `NoRollbacks`, and `NoHeartbeatFailures`.
+
+S3 activates only on failure: follower unreachable (TCP replication fails →
+S3 fallback), lease renewal needed (heartbeat fails → S3 CAS), or node restart
+(boot catchup reads S3 fallback batches). This keeps steady-state latency
+independent of S3 round-trip time and avoids MinIO cost under normal load.
+
 ### Leader Steady State
 
 ```
@@ -614,9 +645,11 @@ loop {
     sleep(heartbeat_interval)                           // 500ms default
     send_heartbeat(timestamp, lease_index)              // hard timeout: 2s default
 
-    if Ack:
+    if Ack { follower_can_accept_tcp_replication }:
         has_peer = true
         reset peer_discovery_backoff to 1s
+        follower_reachable = follower_can_accept_tcp_replication
+        broadcast FollowerReachable to all shards
         extend own TTL = now + heartbeat_lease_duration
         broadcast StatusUpdate to all shards
         continue                                        // skip S3 check
@@ -933,7 +966,11 @@ The `lease_index` check on the follower is the last line of defence in this case
 3. **Multiple rapid rollbacks:** Under sustained dual failure (TCP + S3 both
    flaky), can multiple rollback cycles create a WAL state on the leader that
    diverges significantly from the follower's state? How far can the WAL
-   positions drift?
+   positions drift? *Partially mitigated:* `replication_rollback_cooldown` (500ms)
+   now rejects new writes after each rollback, breaking the tight rollback → rewrite
+   → rollback loop that produced overlapping S3 batch generations under sigstop_leader.
+   The underlying divergence question remains open — cooldown bounds the rate, not
+   the eventual drift.
 
 4. **Promotion batch upload failure:** If `upload_s3_promotion_batch` fails
    (S3 temporarily unavailable), the new leader proceeds without uploading.

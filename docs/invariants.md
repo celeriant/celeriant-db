@@ -60,12 +60,13 @@ Rules the system enforces. Breaking any of these is a bug. Provide this to LLMs 
 - A follower rejects a heartbeat and fences all local shards immediately if clock drift exceeds `max_clock_drift_ms`.
 - Heartbeat success extends the follower's TTL: `new_expiry = max(current_expiry, leader_timestamp_ms + heartbeat_lease_duration)`. TTL is never reduced by a heartbeat.
 - `FollowerCatchingUp` and `BootCatchup` states are TTL-exempt - they never decay to `Fenced`.
+- Heartbeat `Ack` carries `follower_can_accept_tcp_replication`. The flag is `true` only in plain `Follower` state; `false` in `FollowerCatchingUp`. The leader uses it to gate TCP replication — during follower catchup commits route straight to S3 fallback without paying the TCP-reject round-trip.
 
 ## Kick Follower
 
-- A kick is always attempted after S3 fallback replication succeeds, regardless of TCP reachability state. Delivery is best-effort.
+- A kick is attempted after S3 fallback replication succeeds, gated by `try_acquire_kick` (skipped if a previous kick is still in-flight). Delivery is best-effort.
 - Kick triggers when S3 fallback is used because: follower is offline, workset exceeds `max_catchup_gap_bytes`, or pending queue exceeds `pending_replication_high_water_bytes`.
-- `kick_sent` flag ensures at most one kick per S3 fallback cycle.
+- The commit path does not await `send_kick`. The kick is spawned fire-and-forget via `try_acquire_kick` / `release_kick`; at most one in-flight kick task per shard. Commits never pay `internode_request_timeout` waiting on a slow/dead follower.
 - Kick is always routed to shard 0. Shard 0 broadcasts the state change to all local shards.
 - On the follower: `Follower → FollowerCatchingUp`. If already catching up, the kick is acknowledged but is a no-op.
 - A non-follower node rejects a kick with `acknowledged: false`.
@@ -74,6 +75,7 @@ Rules the system enforces. Breaking any of these is a bug. Provide this to LLMs 
 
 ## Replication Protocol
 
+- In a healthy cluster where both nodes are reachable and clocks are within drift tolerance, S3 is never touched. No lease renewal, no fallback replication, no S3 reads. All coordination flows over TCP heartbeats, all data over TCP replication. Chaos baseline enforces this via `NoS3Fallbacks`, `NoRollbacks`, `NoHeartbeatFailures`.
 - TCP replication is the primary path. S3 fallback triggers when: the follower is offline, the workset exceeds `max_catchup_gap_bytes`, or the pending queue exceeds `pending_replication_high_water_bytes`.
 - S3 replication uploads a single file per batch. Splitting into sub-batches is prohibited - it creates WAL index gaps on the consumer.
 - S3 uploads are semaphore-limited to prevent network saturation. When replication backpressure exceeds `pending_replication_high_water_bytes`, clients receive `ServerBusy`.
@@ -95,19 +97,22 @@ Rules the system enforces. Breaking any of these is a bug. Provide this to LLMs 
 - Dual headers are rewritten at the rolled-back positions and `fdatasync()` completes before the lock is released. Rollback is durable before any new writes.
 - Datablocks carry-over bytes are re-read from the new write position to recalculate metablock padding alignment.
 - Rollback flags (`fsync_rollback_occurred`, `replication_rollback_occurred`) are one-time-consumption. The next capture phase reads and resets the flag.
-- After rollback, the node accepts new writes immediately. Rollback does not permanently disable the shard.
+- After rollback, writes are rejected with `ReplicationBackpressure` for `replication_rollback_cooldown` (default 500ms). Gives the pending queue time to drain via TCP/S3 before accepting new load; prevents the rollback → rewrite → rollback storm that produces overlapping S3 batch generations. Rollback does not permanently disable the shard — writes resume after the cooldown.
+- The leader re-checks `is_leader()` on every loop iteration in `commit_replication_with_rollback` and once more before the final `commit_replication`. If the lease expired mid-pipeline (slow S3 upload, retry backoff), rolls back local WAL and returns `LeaderFenced` instead of committing with an expired lease.
 - WAL divergence rollback (during S3 catchup): truncates both read and write cursors to the common ancestor, clears all caches including read-side, rewrites dual headers, and fsyncs. There is no window where read cursor is ahead of write cursor.
 
 ## S3 Catchup (Follower)
 
-- S3 batches are sorted by `start_wal_index` and deduplicated before apply. Duplicate starts keep the batch with the highest `end_wal_index`.
-- Contiguous WAL index across consecutive S3 batches is enforced: `batch[i].end + 1 == batch[i+1].start`. Gaps are fatal.
-- A node never applies a batch it uploaded itself (filtered by `node_id` in the filename).
-- On `TipHashMismatch`, the follower finds the common ancestor via hash chain traversal, truncates its WAL to the divergence point, then re-applies from S3.
-- S3 catchup handles mid-batch resume: entries at or before the current WAL index are skipped. Application resumes from `current_wal_index + 1`.
-- WAL truncation clears all caches, rewinds both cursors, rewrites dual headers, and fsyncs before returning.
-- After applying an S3 batch, the batch file is deleted from S3 immediately.
-- S3 catchup fsyncs as `Standalone` (read position advances immediately, no replication gate).
+- Among S3 batches sharing the same `start_wal_index`, only the one with the highest `upload_sequence` is authoritative. Lower `upload_sequence` values are stale generations from before a leader rollback and must never be applied.
+- A node never applies a batch it uploaded itself.
+- Inter-batch gaps do not fail catchup. The unresolved remainder is backfilled by TCP replication.
+- WAL truncation fires only when a common ancestor has been verified via local-metablock hash match. The follower never truncates without an ancestor; unresolved divergence is surfaced as an error.
+- Truncation is durable before writes resume: caches cleared, both cursors rewound, dual headers rewritten, and `fdatasync()` completes before the rollback lock is released.
+- Truncation never leaves orphan segments ahead of the active one. When the ancestor lies in a sealed segment, the active segment and any intermediate sealed segments are discarded from disk before the target segment's headers are rewritten.
+- S3 batches are not deleted during catchup. They remain available for divergence resolution until the follower returns to `Follower` state.
+- Never truncate unless a common hash tip is found on both local disk and in an s3 replicated file
+- Never truncate unless S3 has gap-free contiguous coverage from the ancestor's wal_index up through the current write position. Truncating into a range S3 cannot re-supply would destroy entries that cannot be reconstructed.
+- S3 catchup fsyncs as `Standalone`: read position advances with write position, no replication gate.
 - Post-catchup, the node must win an S3 CAS election before accepting writes.
 
 ## Sharding and Concurrency
