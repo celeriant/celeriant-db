@@ -244,6 +244,17 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
             return Ok(());
         }
 
+        // Refuse to upload a batch with internal wal_index gaps. A gap here means
+        // upstream code produced items from two chain generations in one workset —
+        // a latent bug that would plant an unrecoverable file in S3 and panic any
+        // follower that consumes it. Fail loudly at the source instead.
+        if let Some((i, w)) = batches.windows(2).enumerate().find(|(_, w)| w[0].metablock.wal_index + 1 != w[1].metablock.wal_index) {
+            let expected = w[0].metablock.wal_index + 1;
+            let actual = w[1].metablock.wal_index;
+            tracing::error!(shard_id = self.shard_id, at_index = i + 1, expected, actual, "refusing S3 upload: batch has internal wal_index gap");
+            return Err(ReplicateToS3Error::BatchNotContiguous { at_index: i + 1, expected_wal_index: expected, actual_wal_index: actual });
+        }
+
         let s3_uploader = self.s3_uploader.as_ref()
             .ok_or(ReplicateToS3Error::S3NotConfigured)?;
 
@@ -258,7 +269,7 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
             })
             .collect();
 
-        let seq = self.s3_upload_sequence.get().saturating_sub(1);
+        let seq = self.s3_upload_sequence.get().saturating_add(1);
         self.s3_upload_sequence.set(seq);
 
         let fallback_batch = FallbackBatch {

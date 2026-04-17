@@ -1,7 +1,9 @@
-//! Edge Case: Missing S3 Batches / Gap Detection
+//! Edge Case: Missing S3 Batches / Gap Handling
 //!
-//! Tests that the follower's S3 catchup correctly detects a gap when one or more
-//! fallback batches are absent from S3.
+//! Tests that the follower's S3 catchup survives a gap in S3 fallback batches
+//! (e.g. after a lifecycle-reap race) and still converges to the leader via
+//! leader-to-follower TCP replication, which extends back into the leader's
+//! WAL to fill the missing range.
 //!
 //! Scenario:
 //! 1. Start MinIO + two-node cluster (S3 enabled, small batch size to generate many batches)
@@ -9,14 +11,11 @@
 //! 3. Stop follower
 //! 4. Write ~50 large events to leader — enough to produce 5+ S3 fallback batches
 //! 5. Wait for S3 fallback writes to complete
-//! 6. Delete the middle batch from S3, creating a gap
-//! 7. Restart follower — catchup will encounter the gap
-//! 8. Verify: follower exits cleanly (status 0) — WalIndexGap is a fatal
-//!    non-retriable error that triggers graceful shutdown, not a crash
-//!
-//! This is test #5 in the integration test coverage report.
-//!
-//! Run with: cargo run --bin edge_s3_missing_batches_main
+//! 6. Delete a middle batch from S3, creating a gap
+//! 7. Restart follower — S3 catchup applies what it can up to the gap and stops
+//! 8. Verify: follower stays alive and converges to leader event count via TCP
+//!    extended catchup. Gaps in S3 are no longer fatal — durability rests on
+//!    leader WAL + TCP, with S3 as a best-effort accelerator.
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use crate::{
@@ -178,55 +177,56 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // ========================================
     // Phase 4: Restart follower — S3 catchup encounters the gap
     // ========================================
-    println!("PHASE 4: Restart follower — S3 catchup should encounter gap");
-    println!("-------------------------------------------------------------");
+    println!("PHASE 4: Restart follower — S3 catchup hits gap, TCP fills it");
+    println!("---------------------------------------------------------------");
 
     println!("  Restarting follower...");
     follower.restart().await?;
 
-    // WalIndexGap is a fatal (non-retriable) S3 catchup error. The server
-    // treats it as a data integrity concern and performs a graceful shutdown.
-    // Poll until the follower exits (boot + S3 list + gap detection).
-    println!("  Polling for follower exit (up to 30s)...");
-    let exit_timeout = Duration::from_secs(30);
-    let start = std::time::Instant::now();
-    let mut exited = false;
-    let mut exit_msg = String::new();
+    // S3 catchup stops at the gap without erroring. TCP extended catchup only
+    // fires when the leader attempts to replicate a fresh batch and the
+    // follower rejects it with WAL mismatch. Wait for the follower to settle
+    // into Follower state, then poke the leader with one more write so TCP
+    // gets exercised.
+    tokio::time::sleep(Duration::from_secs(3)).await;
 
-    while start.elapsed() < exit_timeout {
-        match follower.check_alive() {
-            Ok(()) => {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
-            Err(e) => {
-                exit_msg = e;
-                exited = true;
-                break;
-            }
+    // Reconnect: the leader_client may have idled out during the S3 writes.
+    let mut leader_client = CeleriantClient::connect(leader.address()).await?;
+    println!("  Poking leader with one more write to trigger TCP extended catchup...");
+    write_large_event(&mut leader_client, &aggregate_key, 52, 4096).await?;
+
+    let mut follower_client = CeleriantClient::connect(follower.address()).await?;
+    let converge_timeout = Duration::from_secs(30);
+    let start = std::time::Instant::now();
+    let mut converged = false;
+    let mut last_count = 0usize;
+
+    while start.elapsed() < converge_timeout {
+        follower
+            .check_alive()
+            .map_err(|e| format!("Follower should have stayed alive across gap: {}", e))?;
+        last_count = count_events(&mut follower_client, &aggregate_key).await?;
+        if last_count >= 52 {
+            converged = true;
+            break;
         }
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
     // ========================================
-    // Phase 5: Verify gap was detected — follower shuts down gracefully
+    // Phase 5: Verify gap was tolerated — follower converged via TCP
     // ========================================
-    println!("PHASE 5: Verify gap was detected");
-    println!("---------------------------------");
+    println!("PHASE 5: Verify follower converged to leader via TCP extended catchup");
+    println!("-----------------------------------------------------------------------");
 
-    assert!(
-        exited,
-        "Follower should have exited after encountering WAL index gap, but it is still running"
-    );
-    println!("  Follower exited as expected: {}", exit_msg);
-    // The critical property is that the follower STOPPED rather than silently
-    // applying data with a gap. Currently exits with status 1 (panic on fatal
-    // S3 catchup error at shard.rs:760). Ideally this would be a graceful
-    // shutdown (status 0), but the safety invariant (detection + stop) holds.
-    println!("  WAL index gap detected — follower shut down");
-
-    // Leader must still have all events (unaffected by follower's gap).
     let leader_count = count_events(&mut leader_client, &aggregate_key).await?;
-    println!("  Leader has {} total events (unaffected by follower gap)", leader_count);
-    assert_eq!(leader_count, 51, "Leader should have all 51 events (1 initial + 50 large)");
+    println!("  Leader has {} events, follower has {} events", leader_count, last_count);
+    assert_eq!(leader_count, 52, "Leader should have all 52 events (1 initial + 50 large + 1 poke)");
+    assert!(
+        converged,
+        "Follower should have converged to {} events via TCP after S3 gap, got {}",
+        leader_count, last_count
+    );
 
     println!("\n=== PASS ===\n");
 

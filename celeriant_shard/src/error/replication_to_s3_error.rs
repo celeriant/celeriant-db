@@ -8,4 +8,9 @@ pub enum ReplicateToS3Error {
     },
     SidecarUnavailable,
     SerializationFailed(String),
+    BatchNotContiguous {
+        at_index: usize,
+        expected_wal_index: u64,
+        actual_wal_index: u64,
+    },
 }

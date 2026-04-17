@@ -269,29 +269,11 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("  Follower and leader event counts match\n");
 
-    // ========================================
-    // Phase 6: Verify S3 fallback objects were cleaned up after successful catchup
-    // ========================================
-    println!("PHASE 6: Verify S3 fallback objects cleaned up");
-    println!("------------------------------------------------");
-
-    let objects_after_catchup = minio.list_objects(&shard_prefix).await?;
-    println!(
-        "  S3 fallback objects remaining: {}",
-        objects_after_catchup.len()
-    );
-    for obj in &objects_after_catchup {
-        println!("    - {}", obj);
-    }
-
-    assert!(
-        objects_after_catchup.is_empty(),
-        "Expected S3 fallback objects to be deleted after successful catchup, \
-         but {} remain: {:?}",
-        objects_after_catchup.len(),
-        objects_after_catchup
-    );
-    println!("  S3 fallback objects cleaned up after successful catchup");
+    // Phase 6 removed: the catchup path no longer deletes applied batches.
+    // An S3 bucket lifecycle policy reaps them later. The ordering invariant
+    // under test (batches applied in WAL-index order despite
+    // lexicographic-vs-numeric sort skew) is fully covered by the count
+    // convergence assertion in Phase 5.
 
     println!("\n=== PASS ===\n");
 

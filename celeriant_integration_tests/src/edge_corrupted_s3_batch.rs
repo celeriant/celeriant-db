@@ -1,26 +1,19 @@
 //! Edge Case: Corrupted S3 Batch Data
 //!
-//! Tests that S3 batch CRC32C checksum validation catches corruption and triggers
-//! a fatal shutdown on the follower rather than applying partial/wrong data.
+//! Tests that S3 batch CRC32C checksum validation catches corruption and skips
+//! the bad batch, letting leader→follower TCP extended catchup fill the range.
+//! Corruption of an S3 fallback batch is no longer fatal — durability rests on
+//! leader WAL + TCP, with S3 as a best-effort accelerator.
 //!
 //! Scenario:
 //! 1. Start MinIO + two-node cluster
 //! 2. Write events 1-3 with follower online (verify replication)
 //! 3. Stop follower
-//! 4. Write events 4-8 to leader — S3 fallback creates batch objects
+//! 4. Write events 4-13 to leader — S3 fallback creates batch objects
 //! 5. Wait for S3 fallback writes to complete
 //! 6. Corrupt a batch by overwriting it with garbage bytes via MinioContainer::put_object()
-//! 7. Restart follower — it attempts S3 catchup, encounters corrupted batch
-//! 8. Verify: follower shuts down (non-zero exit or process exits), does NOT
-//!    silently apply partial data or continue running
-//!
-//! The S3 batch format is: [CRC32C (4 bytes)][version (4 bytes)][bincode payload]
-//! Garbage bytes will fail the CRC32C check → DeserializationFailed → fatal error
-//! → graceful shutdown (exit 0).
-//!
-//! This is test #4 in the integration test coverage report.
-//!
-//! Run with: cargo run --bin edge_corrupted_s3_batch_main
+//! 7. Restart follower — S3 catchup detects the bad CRC32C and skips that batch
+//! 8. Verify: follower stays alive and converges to leader event count via TCP
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use crate::{
@@ -177,62 +170,59 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Confirmed: corrupted object has garbage bytes");
 
     // ========================================
-    // Phase 4: Restart follower — S3 catchup encounters corrupted batch
+    // Phase 4: Restart follower — S3 catchup skips corruption, TCP fills the gap
     // ========================================
-    println!("\nPHASE 4: Restart follower — S3 catchup should detect corruption");
-    println!("------------------------------------------------------------------");
+    println!("\nPHASE 4: Restart follower — S3 catchup skips corrupt batch, TCP fills it");
+    println!("--------------------------------------------------------------------------");
 
     println!("  Restarting follower...");
     follower.restart().await?;
 
-    // DeserializationFailed is a fatal (non-retriable) S3 catchup error.
-    // Poll until the follower exits rather than using a fixed sleep.
-    println!("  Polling for follower exit (up to 30s)...");
-    let exit_timeout = Duration::from_secs(30);
-    let start = std::time::Instant::now();
-    let mut exited = false;
-    let mut exit_msg = String::new();
+    // Corrupt batch is skipped with a warning; S3 catchup stops where the chain
+    // breaks. TCP extended catchup only fires when the leader attempts a fresh
+    // replication that the follower rejects on WAL mismatch — so after the
+    // follower has settled, poke the leader with one more write.
+    tokio::time::sleep(Duration::from_secs(3)).await;
 
-    while start.elapsed() < exit_timeout {
-        match follower.check_alive() {
-            Ok(()) => {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
-            Err(e) => {
-                exit_msg = e;
-                exited = true;
-                break;
-            }
+    let mut leader_client = CeleriantClient::connect(leader.address()).await?;
+    println!("  Poking leader with one more write to trigger TCP extended catchup...");
+    write_large_event(&mut leader_client, &aggregate_key, 14, 4096).await?;
+
+    let mut follower_client = CeleriantClient::connect(follower.address()).await?;
+    let converge_timeout = Duration::from_secs(30);
+    let start = std::time::Instant::now();
+    let mut converged = false;
+    let mut last_count = 0usize;
+
+    while start.elapsed() < converge_timeout {
+        follower
+            .check_alive()
+            .map_err(|e| format!("Follower should have stayed alive across corruption: {}", e))?;
+        last_count = count_events(&mut follower_client, &aggregate_key).await?;
+        if last_count >= 14 {
+            converged = true;
+            break;
         }
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
     // ========================================
-    // Phase 5: Verify corrupted batch was detected — follower shuts down
+    // Phase 5: Verify follower converged via TCP despite corrupted batch
     // ========================================
-    println!("\nPHASE 5: Verify corruption was detected");
-    println!("----------------------------------------");
+    println!("\nPHASE 5: Verify follower converged via TCP extended catchup");
+    println!("-------------------------------------------------------------");
 
-    assert!(
-        exited,
-        "Follower is still running after encountering corrupted S3 batch. \
-         Expected follower to exit."
-    );
-    println!("  Follower exited: {}", exit_msg);
-    // The server detects the problem and stops rather than silently applying
-    // corrupt data. Whether it exits cleanly (status 0) or via panic (non-zero)
-    // depends on the error propagation path — the critical thing is that it STOPPED.
-    println!("  Corruption detected — follower shut down");
-
-    // Leader must still be healthy.
     let leader_count = count_events(&mut leader_client, &aggregate_key).await?;
-    println!(
-        "  Leader has {} total events (unaffected by follower corruption)",
+    println!("  Leader has {} events, follower has {} events", leader_count, last_count);
+    assert_eq!(
+        leader_count, 14,
+        "Leader should have all 14 events (3 initial + 10 large + 1 poke), got {}",
         leader_count
     );
-    assert_eq!(
-        leader_count, 13,
-        "Leader should have all 13 events (3 initial + 10 large), got {}",
-        leader_count
+    assert!(
+        converged,
+        "Follower should have converged to {} events via TCP despite corrupt S3 batch, got {}",
+        leader_count, last_count
     );
 
     println!("\n=== PASS ===\n");

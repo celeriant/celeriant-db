@@ -264,29 +264,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Follower caught up!\n");
 
     // ========================================
-    // Phase 5: Verify S3 consumed + hammer to verify TCP resumes
+    // Phase 5: Hammer to verify TCP resumes (no new S3 fallback uploads)
     // ========================================
-    println!("PHASE 5: Verify S3 consumed + hammer to verify TCP resumes");
-    println!("----------------------------------------------------------");
+    println!("PHASE 5: Hammer to verify TCP resumes");
+    println!("-------------------------------------");
 
-    // S3 fallback files should be consumed (deleted by follower during catchup)
-    let mut remaining_s3 = 0;
-    for shard_id in 0..num_shards {
-        let objs = minio
-            .list_objects(&format!("cluster/fallback/shard_{:03}/", shard_id))
-            .await?;
-        remaining_s3 += objs.len();
-        if !objs.is_empty() {
-            println!("  shard_{:03}: {} objects remaining", shard_id, objs.len());
-        }
-    }
-    println!("  Remaining S3 fallback objects: {}", remaining_s3);
-    assert_eq!(
-        remaining_s3, 0,
-        "Follower should have consumed all S3 fallback objects during catchup"
-    );
-
-    // Record S3 state before hammering
+    // Record S3 state before hammering. Applied batches are left in place — an
+    // S3 lifecycle policy reaps them later. The important invariant is that no
+    // NEW uploads happen once TCP is healthy again, validated below.
     let s3_before: Vec<usize> = {
         let mut counts = Vec::new();
         for shard_id in 0..num_shards {
