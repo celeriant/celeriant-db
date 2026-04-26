@@ -151,7 +151,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader>(
 
         if !first_iteration && remaining_bytes < max_catchup_gap_bytes {
             result.fully_caught_up = true;
-            return Ok(result);
+            break;
         }
 
         loop {

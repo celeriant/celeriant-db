@@ -39,6 +39,13 @@ pub mod invariant_replication_convergence;
 pub mod invariant_replication_queue_pressure;
 pub mod invariant_s3_fallback_dedup;
 pub mod leader_read_visibility;
+pub mod metamorphic_common;
+pub mod metamorphic_divergence_recovery_parity;
+pub mod metamorphic_follower_crash_catchup_parity;
+pub mod metamorphic_leader_follower_parity;
+pub mod metamorphic_post_failover_parity;
+pub mod metamorphic_rollback_parity;
+pub mod metamorphic_standalone_vs_cluster;
 pub mod mtls_test;
 pub mod multi_shard_watch_test;
 pub mod p1_1_dcb_rollback;
@@ -97,7 +104,9 @@ use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use celeriant_msg::{
     process_client_requests::ClientRequest,
     process_client_responses::ClientResponse,
+    request::read_filters::ReadFilters,
     request::requests::{ReadRequest, SingleAggregateWrite, WriteRequest},
+    response::aggregate_event_batch::AggregateEventBatch,
 };
 use celeriant_wal::{
     aggregate_key::AggregateKey, compression_type::CompressionType,
@@ -701,6 +710,9 @@ impl ServerConfigExt for ServerConfig {
         args.push("--compaction-min-reclaimable-ratio".to_string());
         args.push(self.compaction_min_reclaimable_ratio.to_string());
 
+        args.push("--metrics-port".to_string());
+        args.push(self.metrics_port.to_string());
+
         args
     }
 }
@@ -1185,6 +1197,46 @@ pub async fn write_large_event(
     }
 }
 
+/// Read every event batch for an aggregate, paging through `next_event_batch_index`
+/// until exhausted. Returns the concatenated list in WAL order.
+///
+/// Prefer this over hand-rolled pagination — tests that stop after the first
+/// page silently miss data once the response exceeds `list_page_size`.
+pub async fn read_all_batches(
+    client: &mut CeleriantClient,
+    key: &AggregateKey,
+) -> Result<Vec<AggregateEventBatch>, Box<dyn std::error::Error>> {
+    let mut batches = Vec::new();
+    let mut from_batch: u64 = 1;
+    loop {
+        let req = ReadRequest {
+            correlation_id: Some(1),
+            aggregate_key: key.clone(),
+            filters: ReadFilters::new(from_batch),
+        };
+        let resp = client
+            .send_request(&ClientRequest::Read(req), CompressionType::None)
+            .await?;
+        match resp {
+            ClientResponse::Read(r) => {
+                batches.extend(r.event_batches);
+                match r.next_event_batch_index {
+                    Some(next) => from_batch = next,
+                    None => return Ok(batches),
+                }
+            }
+            other => return Err(format!("unexpected response reading {:?}: {:?}", key, other).into()),
+        }
+    }
+}
+
+/// Sleep long enough for S3 election to complete and the leader↔follower
+/// replication TCP connection to establish. Called after starting the second
+/// `TestServer` in a distributed test.
+pub async fn wait_for_election_and_replication() {
+    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+}
+
 /// Count the total number of events for an aggregate.
 ///
 /// Helper function for integration tests that need to verify replication.
@@ -1478,6 +1530,54 @@ pub fn verify_compacted_segment_sizes(
         );
     }
     Ok(())
+}
+
+/// Scrape a single Prometheus counter from a server's metrics sidecar.
+///
+/// Sums values across every label set, mirroring `celeriant_chaos::sample`
+/// semantics. Returns `Err` if the endpoint is unreachable or the body isn't
+/// parseable — propagate it so tests surface transport problems distinctly
+/// from "counter didn't increment".
+///
+/// The metrics sidecar binds `0.0.0.0:{metrics_port}` (default 9090). Every
+/// `TestServer` in one host/process pool inherits the same default, so only
+/// the first server started successfully binds it; later servers log a
+/// bind error but otherwise run. Scrape only the server that owns the port.
+pub async fn scrape_counter(
+    metrics_host: &str,
+    metrics_port: u16,
+    metric_name: &str,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let url = format!("http://{}:{}/metrics", metrics_host, metrics_port);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()?;
+    let resp = client.get(&url).send().await?;
+    if !resp.status().is_success() {
+        return Err(format!("metrics scrape {}: HTTP {}", url, resp.status()).into());
+    }
+    let body = resp.text().await?;
+
+    let mut total: u64 = 0;
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.splitn(3, ' ');
+        let name_part = match parts.next() { Some(p) => p, None => continue };
+        let value_str = match parts.next() { Some(v) => v, None => continue };
+        let name = match name_part.find('{') {
+            Some(i) => &name_part[..i],
+            None => name_part,
+        };
+        if name == metric_name
+            && let Ok(v) = value_str.parse::<f64>()
+        {
+            total = total.saturating_add(v as u64);
+        }
+    }
+    Ok(total)
 }
 
 /// Probe whether a node is the leader by attempting a write.

@@ -1,0 +1,45 @@
+# Integration test runner image.
+#
+# Builds both the celeriant server binary and the integration test harness
+# inside a Linux environment, so the suite can run from macOS / Windows via
+# Docker. On Linux this is also the easiest way to get a hermetic test run.
+#
+# Required run flags (see celeriant_integration_tests/run-mac.sh):
+#   --security-opt seccomp=unconfined   io_uring requires unrestricted seccomp
+#   --ulimit memlock=-1:-1              glommio pins memory for DMA
+#   --network host                      so 127.0.0.1:PORT inside the container
+#                                       reaches MinIO sibling containers
+#   -v /var/run/docker.sock:/var/run/docker.sock
+#                                       so MinioContainer can docker-run MinIO
+#
+# Build: docker build -f Dockerfile.tests -t celeriant-tests:local .
+# Run:   ./celeriant_integration_tests/run-mac.sh --test single
+
+FROM rust:latest AS builder
+
+# docker CLI (client only — talks to the mounted daemon socket from the host).
+# libssl3 is the runtime dep the production Dockerfile also installs.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+    docker.io \
+    docker-cli \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY . .
+
+# Build both binaries in a single invocation so the workspace target dir is
+# shared. BuildKit cache mounts keep the cargo registry and target dir warm
+# across image rebuilds — first build is slow, subsequent rebuilds are fast.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo build --release \
+    -p celeriant \
+    -p celeriant_integration_tests \
+    && cp /build/target/release/celeriant /usr/local/bin/celeriant \
+    && cp /build/target/release/celeriant-integration-tests /usr/local/bin/celeriant-integration-tests
+
+# The test harness resolves the server binary by sibling lookup on current_exe,
+# so both binaries must live in the same directory. /usr/local/bin/ works.
+ENTRYPOINT ["/usr/local/bin/celeriant-integration-tests"]

@@ -20,6 +20,25 @@ cargo run --release -p celeriant_integration_tests -- --test single
 cargo run --release -p celeriant_integration_tests -- --timeout 120
 ```
 
+## Running on macOS / Windows
+
+Celeriant uses `glommio` + io_uring, which are Linux-only. On macOS and
+Windows the test harness must run inside a Linux container. A helper script
+wraps `docker build` + `docker run` with the required flags:
+
+```bash
+# First run is slow (full release build inside Docker). Subsequent runs
+# re-use the BuildKit cache.
+./celeriant_integration_tests/run-mac.sh --list
+./celeriant_integration_tests/run-mac.sh --test single
+./celeriant_integration_tests/run-mac.sh --include-or correctness --standalone
+```
+
+The container is launched with `--network host`, the Docker socket mounted,
+`seccomp=unconfined`, and `memlock` unlimited — tests spawn sibling MinIO
+containers via the host's Docker daemon and reach them over `127.0.0.1`.
+Requires Docker Desktop 4.29+ on macOS (host networking support).
+
 ## Filtering
 
 Tests can be filtered by category, deployment mode, or name. Multiple filters compose together.
