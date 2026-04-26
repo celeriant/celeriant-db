@@ -48,6 +48,24 @@ EOF
     fi
 fi
 
+# Docker Desktop's LinuxKit kernel is built without CONFIG_TLS, so the
+# strict-mTLS tests that depend on kernel TLS cannot run on Mac. Auto-exclude
+# them via the `requires_ktls` category unless the caller already supplied
+# their own --exclude-or filter or pinned a specific test.
+EXTRA_TEST_ARGS=()
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    has_override=0
+    for arg in "$@"; do
+        case "$arg" in
+            --exclude-or|--exclude-or=*|--test|--test=*) has_override=1 ;;
+        esac
+    done
+    if [[ $has_override -eq 0 ]]; then
+        EXTRA_TEST_ARGS+=(--exclude-or requires_ktls)
+        echo "==> Mac detected: auto-excluding requires_ktls tests (LinuxKit lacks CONFIG_TLS)"
+    fi
+fi
+
 echo "==> Building $IMAGE_TAG (cached after first run)"
 DOCKER_BUILDKIT=1 docker build \
     -f "$REPO_ROOT/Dockerfile.tests" \
@@ -64,4 +82,4 @@ exec docker run --rm "${TTY_ARGS[@]}" \
     --security-opt seccomp=unconfined \
     --ulimit memlock=-1:-1 \
     -v /var/run/docker.sock:/var/run/docker.sock \
-    "$IMAGE_TAG" "$@"
+    "$IMAGE_TAG" "${EXTRA_TEST_ARGS[@]}" "$@"

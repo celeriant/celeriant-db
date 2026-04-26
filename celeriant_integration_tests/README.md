@@ -39,6 +39,11 @@ The container is launched with `--network host`, the Docker socket mounted,
 containers via the host's Docker daemon and reach them over `127.0.0.1`.
 Requires Docker Desktop 4.29+ on macOS (host networking support).
 
+On macOS, `run-mac.sh` auto-excludes tests tagged `requires_ktls` because
+Docker Desktop's LinuxKit kernel is built without `CONFIG_TLS`, so kernel TLS
+isn't available. Pass `--test <name>` or your own `--exclude-or` to override.
+Run these tests on real Linux for full coverage.
+
 ## Filtering
 
 Tests can be filtered by category, deployment mode, or name. Multiple filters compose together.
@@ -104,7 +109,12 @@ cargo run --release -p celeriant_integration_tests -- --list-categories
 | `security` | mTLS, client identity, API key auth |
 | `schema` | Schema registration, enforcement, failover, crash recovery |
 | `compaction` | Space reclamation, restart survival, replicated compaction |
-| `debug` | Follower pressure debugging (not part of regular suite) |
+| `debug` | Follower pressure debugging — **opt-in only** (`--include-or debug`) |
+| `rpi` | Benchmarks against a remote RPi cluster — **opt-in only** (requires provisioned PKI on disk + reachable hardware) |
+| `requires_ktls` | Tests that exercise kernel TLS — auto-excluded by `run-mac.sh` on Docker Desktop |
+
+Opt-in categories (`debug`, `rpi`) are excluded by default so a no-arg run is
+hermetic. Use `--include-or <cat>` or `--test <name>` to run them.
 
 ---
 

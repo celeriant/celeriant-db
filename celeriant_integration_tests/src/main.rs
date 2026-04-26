@@ -256,13 +256,22 @@ fn build_filter(cli: &Cli) -> Result<TestFilter, String> {
     }
     if !cli.exclude.is_empty() {
         filter.exclude = parse_categories(&cli.exclude.join(","))?;
-    } else {
-        // Exclude Debug tests by default (they require external process launch).
-        // Use --include-or debug to opt-in.
-        filter.exclude_or = vec![Category::Debug];
     }
     if !cli.exclude_or.is_empty() {
         filter.exclude_or = parse_categories(&cli.exclude_or.join(","))?;
+    }
+
+    // Opt-in categories — appended to exclude_or unless the user has explicitly
+    // opted in via --include-or / --include / --test. These need external setup:
+    //   Debug — requires external process launch
+    //   Rpi   — requires a remote hardware cluster + provisioned PKI
+    if cli.test.is_none() {
+        for cat in [Category::Debug, Category::Rpi] {
+            let opted_in = filter.include_or.contains(&cat) || filter.include.contains(&cat);
+            if !opted_in && !filter.exclude_or.contains(&cat) {
+                filter.exclude_or.push(cat);
+            }
+        }
     }
 
     Ok(filter)

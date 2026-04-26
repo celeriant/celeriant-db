@@ -17,6 +17,12 @@ pub enum Category {
     Schema,
     Compaction,
     Debug,
+    /// Requires kernel TLS (CONFIG_TLS). Excluded on Docker Desktop /
+    /// LinuxKit kernels where kTLS isn't compiled in.
+    RequiresKtls,
+    /// Requires a remote RPi hardware cluster + provisioned PKI on disk.
+    /// Opt-in only via `--include-or rpi`.
+    Rpi,
 }
 
 impl Category {
@@ -36,6 +42,8 @@ impl Category {
         Category::Schema,
         Category::Compaction,
         Category::Debug,
+        Category::RequiresKtls,
+        Category::Rpi,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -55,6 +63,8 @@ impl Category {
             Category::Schema => "schema",
             Category::Compaction => "compaction",
             Category::Debug => "debug",
+            Category::RequiresKtls => "requires_ktls",
+            Category::Rpi => "rpi",
         }
     }
 
@@ -75,6 +85,8 @@ impl Category {
             "schema" => Some(Category::Schema),
             "compaction" => Some(Category::Compaction),
             "debug" => Some(Category::Debug),
+            "requires_ktls" => Some(Category::RequiresKtls),
+            "rpi" => Some(Category::Rpi),
             _ => None,
         }
     }
@@ -109,7 +121,7 @@ pub fn all_tests() -> &'static [TestEntry] {
             name: "batch",
             description: "Write throughput and latency benchmark in standalone and replicated modes",
             estimated_secs: 210,
-            categories: &[Core, Performance],
+            categories: &[Core, Performance, RequiresKtls],
             distributed: true,
         },
         TestEntry {
@@ -130,14 +142,14 @@ pub fn all_tests() -> &'static [TestEntry] {
             name: "rpi_cluster_bench",
             description: "Write benchmark against a remote RPi cluster over mTLS",
             estimated_secs: 60,
-            categories: &[Performance],
+            categories: &[Performance, Rpi],
             distributed: true,
         },
         TestEntry {
             name: "rpi_cluster_pool_bench",
             description: "Pool-based write benchmark with automatic leader failover",
             estimated_secs: 60,
-            categories: &[Performance],
+            categories: &[Performance, Rpi],
             distributed: true,
         },
         TestEntry {
@@ -688,7 +700,7 @@ pub fn all_tests() -> &'static [TestEntry] {
             name: "schema_bank_bench",
             description: "Schema-validated atomic writes throughput and latency benchmark",
             estimated_secs: 180,
-            categories: &[Schema, Performance],
+            categories: &[Schema, Performance, RequiresKtls],
             distributed: true,
         },
         // ── Compaction ──
