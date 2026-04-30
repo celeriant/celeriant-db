@@ -8,13 +8,15 @@
 //! 1. Start MinIO + 2-node cluster with TcpProxy on the replication path
 //! 2. Write events to verify the cluster is healthy
 //! 3. Block the proxy (follower unreachable)
-//! 4. Wait a fixed observation window (15s)
-//! 5. Count the lease_index delta in S3
+//! 4. Poll the S3 lease object every 200ms for 15s, counting distinct
+//!    `acquired_at_ms` values (each renewal stamps a fresh `acquired_at_ms`).
 //!
 //! With the bug (no backoff): heartbeat_interval=500ms → ~20-30 renewals in 15s
 //! With the fix (s3_lease_duration/3 backoff): ~2-3 renewals in 15s
 //!
-//! The test asserts lease_index delta ≤ 5 over the window.
+//! The test asserts the count of distinct `acquired_at_ms` values is ≤ 5.
+//! Same-leader renewal does not bump `lease_index`, so the only authoritative
+//! signal of "a renewal happened" is the `acquired_at_ms` timestamp changing.
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use crate::{write_event, MinioContainer, ServerConfig, TestServer, TcpProxy};
@@ -92,56 +94,60 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Cluster healthy: leader accepted write\n");
 
     // ========================================
-    // PHASE 2: Record lease_index, block proxy
+    // PHASE 2: Block proxy, poll lease every 200ms for 15s
     // ========================================
-    println!("PHASE 2: Block proxy and observe S3 renewal rate");
-    println!("-------------------------------------------------");
+    println!("PHASE 2: Block proxy and sample S3 renewal rate");
+    println!("------------------------------------------------");
 
     let pre_lease_bytes = minio.get_object("cluster/lease.json").await?;
     let pre_lease = deserialise_lease(&pre_lease_bytes)
         .map_err(|e| format!("Failed to deserialise lease: {:?}", e))?;
-    let pre_index = pre_lease.lease_index;
-    println!("  Pre-block lease_index = {}", pre_index);
-
-    proxy.block();
-    println!("  Proxy blocked — follower unreachable");
-
-    // ========================================
-    // PHASE 3: Observation window
-    // ========================================
-    println!("\n  Waiting 15s observation window...");
-    let observation_secs = 15;
-    tokio::time::sleep(Duration::from_secs(observation_secs)).await;
-
-    // ========================================
-    // PHASE 4: Measure lease_index delta
-    // ========================================
-    println!("\nPHASE 3: Measure S3 lease renewal rate");
-    println!("--------------------------------------");
-
-    let post_lease_bytes = minio.get_object("cluster/lease.json").await?;
-    let post_lease = deserialise_lease(&post_lease_bytes)
-        .map_err(|e| format!("Failed to deserialise lease: {:?}", e))?;
-    let post_index = post_lease.lease_index;
-    let delta = post_index - pre_index;
-
-    println!("  Post-block lease_index = {}", post_index);
-    println!("  Delta over {}s = {} renewals", observation_secs, delta);
     println!(
-        "  Rate = {:.1} renewals/sec",
-        delta as f64 / observation_secs as f64
+        "  Pre-block lease_index={}, acquired_at_ms={}",
+        pre_lease.lease_index, pre_lease.acquired_at_ms
     );
 
-    // With heartbeat_interval=500ms and no backoff, we'd see ~20-30 renewals.
-    // With proper s3_lease_duration/3 backoff (5s cycles), we'd see ~3.
-    // Threshold of 5 gives margin while catching the ~20-30 case.
+    proxy.block();
+    println!("  Proxy blocked — follower unreachable\n");
+
+    let observation_secs: u64 = 15;
+    let poll_interval = Duration::from_millis(200);
+    let deadline = std::time::Instant::now() + Duration::from_secs(observation_secs);
+
+    let mut observed: Vec<u64> = vec![pre_lease.acquired_at_ms];
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(poll_interval).await;
+        let bytes = minio.get_object("cluster/lease.json").await?;
+        let lease = deserialise_lease(&bytes)
+            .map_err(|e| format!("Failed to deserialise lease: {:?}", e))?;
+        if Some(&lease.acquired_at_ms) != observed.last() {
+            observed.push(lease.acquired_at_ms);
+        }
+    }
+
+    // ========================================
+    // PHASE 3: Verify renewal rate is bounded
+    // ========================================
+    println!("PHASE 3: Verify renewal rate is bounded");
+    println!("---------------------------------------");
+
+    let renewals = observed.len() - 1;
+    println!(
+        "  Distinct acquired_at_ms values over {}s: {} (= {} renewals)",
+        observation_secs, observed.len(), renewals
+    );
+    println!(
+        "  Rate = {:.1} renewals/sec",
+        renewals as f64 / observation_secs as f64
+    );
+
     let max_allowed_renewals = 5;
     assert!(
-        delta <= max_allowed_renewals,
+        renewals <= max_allowed_renewals,
         "S3 lease renewed {} times in {}s (>{} allowed). \
          Leader is hammering S3 at heartbeat rate instead of backing off. \
          Expected ≤{} renewals with s3_lease_duration/3 backoff.",
-        delta,
+        renewals,
         observation_secs,
         max_allowed_renewals,
         max_allowed_renewals,
@@ -149,7 +155,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     println!(
         "  {} renewals in {}s — backed off correctly (≤{})",
-        delta, observation_secs, max_allowed_renewals
+        renewals, observation_secs, max_allowed_renewals
     );
 
     println!("\n=== S3 Lease Renewal Backoff Test Passed ===");

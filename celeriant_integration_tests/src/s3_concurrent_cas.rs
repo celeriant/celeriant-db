@@ -153,8 +153,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         post_race_leader_node_id, post_race_lease_index);
 
     assert!(
-        post_race_lease_index > initial_lease_index,
-        "lease_index should have increased after S3 races: was {}, now {}",
+        post_race_lease_index >= initial_lease_index,
+        "lease_index should not regress after S3 races: was {}, now {}",
         initial_lease_index, post_race_lease_index
     );
     assert!(
@@ -163,7 +163,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         initial_lease_index, post_race_lease_index
     );
     let lease_increments = post_race_lease_index - initial_lease_index;
-    println!("  S3 CAS resolved: lease_index {} -> {} ({} increments)\n",
+    println!("  S3 CAS resolved: lease_index {} -> {} ({} cross-node bumps)\n",
         initial_lease_index, post_race_lease_index, lease_increments);
 
     // ========================================

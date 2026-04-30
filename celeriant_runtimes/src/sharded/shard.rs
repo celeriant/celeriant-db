@@ -497,9 +497,9 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
     ).await;
 
     let new_lease_index = outcome.status.raw().lease_index().unwrap_or(0);
-    // A lease_index gap (e.g. 6 → 8) means another node held the lease in between.
-    // That node may have uploaded S3 fallback batches we haven't seen.
-    let lease_changed_hands = new_lease_index > previous_lease_index + 1;
+    // Same-leader renewals don't bump lease_index, so any increase means another
+    // node held the lease in between and may have uploaded S3 fallback batches.
+    let lease_changed_hands = new_lease_index > previous_lease_index;
     let became_leader = !is_currently_leader && outcome.status.is_leader();
 
     if outcome.status.is_leader() && (became_leader || lease_changed_hands) {

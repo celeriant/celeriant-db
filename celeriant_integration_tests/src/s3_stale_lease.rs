@@ -6,7 +6,7 @@
 //!
 //! Scenario:
 //! 1. Start cluster, establish leader/follower, verify healthy
-//! 2. Kill follower — leader self-heals (lease_index increments via S3 CAS renewals)
+//! 2. Kill follower — leader self-heals via S3 CAS renewals (lease_index unchanged, same leader)
 //! 3. Restart follower — it reads the stale S3 lease (different leader, expired)
 //! 4. Verify follower does NOT race to S3 — leader_node_id unchanged
 //! 5. Verify follower rejoins as follower and replication works
@@ -120,9 +120,11 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let leader_node_id = self_heal_lease.leader_node_id;
     let lease_index_after_heal = self_heal_lease.lease_index;
-    assert!(lease_index_after_heal >= 2, "lease_index should have incremented after self-heal");
+    assert!(
+        self_heal_lease.expires_at_ms > 0,
+        "self-heal should have produced a lease with expiry set"
+    );
 
-    // Verify leader still works
     write_event(&mut leader_client, &aggregate_key, 4, false).await?;
     println!("  ✓ Leader self-healed at lease_index={}\n", lease_index_after_heal);
 
@@ -172,13 +174,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         post_restart_lease.leader_node_id, leader_node_id,
         "leader_node_id should NOT have changed"
     );
-    assert!(
-        post_restart_lease.lease_index >= lease_index_after_heal,
-        "lease_index should not have gone backwards"
+    assert_eq!(
+        post_restart_lease.lease_index, lease_index_after_heal,
+        "lease_index should NOT change while same leader holds the lease"
     );
     println!("  ✓ Follower did NOT attempt takeover despite stale S3 lease");
-    println!("    (lease_index advanced {} → {} from leader self-renewal, same leader)\n",
-        lease_index_after_heal, post_restart_lease.lease_index);
+    println!("    (lease_index unchanged at {}, same leader self-renewing)\n",
+        post_restart_lease.lease_index);
 
     // ========================================
     // PHASE 5: Verify cluster works after follower rejoin

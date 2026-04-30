@@ -57,7 +57,8 @@ impl<S: LeaseStore> S3LeaseManager<S> {
     }
 
     /// Determine this node's role via S3 lease. No lease? Try create with self as leader.
-    /// Lease expired or still leader? CAS race update and with self as leader, extending lease.
+    /// Own lease (any expiry)? Renew via CAS, keeping the same lease_index.
+    /// Other node's expired lease? Promote via CAS, bumping lease_index.
     /// Other node still leader? Become follower, no lease.bin update.
     pub async fn run_election_to_acquire_s3_lease(&self) -> Result<ElectionOutcome, LeaseStoreError> {
         let now = validated_node_status::unix_epoch_now_ms();
@@ -101,18 +102,18 @@ impl<S: LeaseStore> S3LeaseManager<S> {
                     expired = lwe.lease.is_expired(now),
                     "Election: existing lease found — racing CAS"
                 );
-                // Add one to the lease index and set self as leader
-                let promoted = lwe.lease.promote(
-                    self.config.node_id,
-                    now,
-                    self.config.s3_lease_duration.as_millis() as u64,
-                );
+                let duration_ms = self.config.s3_lease_duration.as_millis() as u64;
+                let next = if lwe.lease.leader_node_id == self.config.node_id {
+                    lwe.lease.renew(now, duration_ms)
+                } else {
+                    lwe.lease.promote(self.config.node_id, now, duration_ms)
+                };
                 match self
                     .store
-                    .put_lease_conditional(&promoted, &lwe.etag)
+                    .put_lease_conditional(&next, &lwe.etag)
                     .await
                 {
-                    Ok(_) => self.become_leader(&promoted).await,
+                    Ok(_) => self.become_leader(&next).await,
                     Err(LeaseStoreError::PreconditionFailed) => {
                         let new_lwe = self.store.get_lease().await?.ok_or_else(|| {
                             LeaseStoreError::Unavailable {
@@ -367,7 +368,7 @@ mod tests {
 
         assert!(matches!(
             outcome.status.raw(),
-            NodeStatus::Leader { lease_index: 4 }
+            NodeStatus::Leader { lease_index: 3 }
         ));
     }
 
@@ -415,7 +416,6 @@ mod tests {
         let store = MockLeaseStore::new();
         let now = validated_node_status::unix_epoch_now_ms();
 
-        // Own expired lease — same CAS path, no special handling.
         store.push_get_lease(Ok(Some(make_lease_with_etag(1, 2, now - 10000, 5000))));
         store.push_put_lease_conditional(Ok("etag2".into()));
         store.push_get_membership(Ok(None));
@@ -425,7 +425,7 @@ mod tests {
 
         assert!(matches!(
             outcome.status.raw(),
-            NodeStatus::Leader { lease_index: 3 }
+            NodeStatus::Leader { lease_index: 2 }
         ));
     }
 

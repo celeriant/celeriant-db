@@ -26,7 +26,7 @@ use crate::amortisation::coordinator::Coordinator;
 use crate::error::apply_batch_error::ApplyBatchError;
 use crate::error::s3_catchup_error::S3CatchupError;
 use crate::error::shard_fsync_error::ShardFsyncError;
-use crate::s3_downloader::{S3Downloader, S3ObjectRef};
+use crate::s3_downloader::{S3Downloader};
 use crate::shard_wal_sync::{capture_fsync_snapshot, commit_fsync_with_rollback};
 
 #[derive(Debug, Clone)]

@@ -39,6 +39,15 @@ impl Lease {
         }
     }
 
+    pub fn renew(&self, now_millis: u64, duration_millis: u64) -> Self {
+        Self {
+            leader_node_id: self.leader_node_id,
+            lease_index: self.lease_index,
+            acquired_at_ms: now_millis,
+            expires_at_ms: now_millis + duration_millis,
+        }
+    }
+
     pub fn is_expired(&self, now_millis: u64) -> bool {
         now_millis >= self.expires_at_ms
     }

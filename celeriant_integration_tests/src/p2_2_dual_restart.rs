@@ -11,7 +11,7 @@
 //! 5. Start both nodes nearly simultaneously (100-500ms apart)
 //! 6. Wait for election (~8s)
 //! 7. Verify exactly one leader via is_leader() on both nodes
-//! 8. Verify lease_index incremented in S3
+//! 8. Verify lease_index did not regress in S3 (bumps only if a different node won the race)
 //! 9. Verify cluster is functional (write + read succeeds)
 //!
 //! Run with: cargo run --bin p2_2_dual_restart_main
@@ -179,11 +179,11 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         lease_final.leader_node_id, lease_final.lease_index);
 
     assert!(
-        lease_final.lease_index > initial_lease_index,
-        "lease_index should have incremented after dual restart: was {}, now {}",
+        lease_final.lease_index >= initial_lease_index,
+        "lease_index should not regress after dual restart: was {}, now {}",
         initial_lease_index, lease_final.lease_index
     );
-    println!("  ✓ Lease incremented: {} → {}\n", initial_lease_index, lease_final.lease_index);
+    println!("  ✓ Lease monotonic: {} → {}\n", initial_lease_index, lease_final.lease_index);
 
     // ========================================
     // PHASE 6: Verify cluster is functional

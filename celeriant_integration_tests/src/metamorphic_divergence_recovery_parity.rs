@@ -164,7 +164,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "\nPhase 3: B as distributed leader (with A's copied data), write events {}..={} × {} aggregates...",
         PHASE_1_EVENTS + 1, PHASE_1_EVENTS + PHASE_3_EVENTS, keys.len()
     );
-    let mut node_b = TestServer::start_with_existing_dir(
+    let node_b = TestServer::start_with_existing_dir(
         node_b_port, cluster_config_b, "node-b".into(), b_temp,
     ).await?;
 

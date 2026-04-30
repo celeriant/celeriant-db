@@ -195,8 +195,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let final_lease = deserialise_lease(&final_lease_bytes)
         .map_err(|e| format!("Failed to deserialise lease: {:?}", e))?;
     assert!(
-        final_lease.lease_index > initial_lease_index,
-        "lease_index should have increased: was {}, now {}",
+        final_lease.lease_index >= initial_lease_index,
+        "lease_index should not regress: was {}, now {}",
         initial_lease_index, final_lease.lease_index
     );
     println!("  lease_index {} -> {} (monotonic)", initial_lease_index, final_lease.lease_index);
@@ -206,7 +206,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("  1. Both nodes correctly rejected writes while Fenced (S3 + TCP down)");
     println!("  2. Write rejection consistent across multiple attempts");
     println!("  3. After recovery: exactly one leader emerged");
-    println!("  4. lease_index monotonically increased\n");
+    println!("  4. lease_index did not regress (bumps only if a different node won the race)\n");
 
     Ok(())
 }

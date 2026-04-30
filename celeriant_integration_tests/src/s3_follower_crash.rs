@@ -2,7 +2,8 @@
 //!
 //! Tests the follower crash failure mode: leader detects heartbeat loss,
 //! pre-renews its S3 lease without fencing (asymmetric behavior), continues
-//! serving writes with incremented lease_index. Then follower restarts and rejoins.
+//! serving writes. Same-leader renewal keeps lease_index unchanged but
+//! advances expires_at_ms. Then follower restarts and rejoins.
 //!
 //! Scenario:
 //! 1. Start MinIO, establish two-node cluster (leader + follower)
@@ -10,8 +11,8 @@
 //! 3. Read initial lease from S3, record lease_index
 //! 4. Kill follower process (simulate crash)
 //! 5. Wait for leader to detect heartbeat loss and self-heal via S3 pre-renewal
-//! 6. Verify leader still accepts writes, lease_index incremented
-//! 7. Verify S3 fallback batches carry the new lease_index
+//! 6. Verify leader still accepts writes, lease_index unchanged (same leader)
+//! 7. Verify S3 fallback batches carry the same lease_index
 //! 8. Restart follower process
 //! 9. Wait for follower to re-register and rejoin cluster
 //! 10. Verify follower receives replicated data from leader
@@ -127,14 +128,21 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("  New lease: leader_node_id={:x}, lease_index={}",
         new_lease.leader_node_id, new_lease.lease_index);
 
-    assert!(new_lease.lease_index > initial_lease.lease_index,
-        "lease_index should have increased after self-heal: was {}, now {}",
-        initial_lease.lease_index, new_lease.lease_index);
+    assert_eq!(
+        new_lease.lease_index, initial_lease.lease_index,
+        "lease_index should NOT change on same-leader self-heal: was {}, now {}",
+        initial_lease.lease_index, new_lease.lease_index
+    );
     assert_eq!(
         new_lease.leader_node_id, initial_lease.leader_node_id,
         "leader_node_id should NOT have changed (same leader self-healed)"
     );
-    println!("  Lease updated: lease_index={}, same leader", new_lease.lease_index);
+    assert!(
+        new_lease.expires_at_ms > initial_lease.expires_at_ms,
+        "expires_at_ms should advance on self-heal: was {}, now {}",
+        initial_lease.expires_at_ms, new_lease.expires_at_ms
+    );
+    println!("  Lease renewed: lease_index unchanged at {}, expires_at_ms advanced", new_lease.lease_index);
 
     // ========================================
     // PHASE 5.5: Verify S3 fallback batches carry new lease_index
@@ -154,9 +162,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let batch_lease_index = batch.items[0].metablock.lease_index;
     println!("  Fallback batch lease_index={}, initial lease_index={}",
         batch_lease_index, initial_lease.lease_index);
-    assert!(
-        batch_lease_index > initial_lease.lease_index,
-        "S3 fallback batch lease_index ({}) should be > initial ({}) — proves self-heal renewed before writing",
+    assert_eq!(
+        batch_lease_index, initial_lease.lease_index,
+        "S3 fallback batch lease_index ({}) should equal initial ({}) — same leader, same term",
         batch_lease_index, initial_lease.lease_index
     );
     println!("  lease_index correctly stamped on S3 fallback batches\n");

@@ -1,9 +1,9 @@
 //! S3 Lease Monotonicity Integration Test - Multiple consecutive failovers
 //!
-//! Tests that lease_index is strictly monotonically increasing across multiple failovers.
+//! Tests that lease_index strictly increases across cross-node failovers.
 //! Design spec (docs/s3-lease-high-level-design.md, invariant 1):
-//! "lease_index is monotonically increasing. Every Lease::promote() increments by 1.
-//!  Never decremented, never reused."
+//! "lease_index is monotonically increasing. Cross-node Lease::promote() bumps by 1;
+//!  same-leader Lease::renew() leaves it unchanged. Never decremented, never reused."
 //!
 //! Scenario:
 //! 1. Start cluster: leader A + follower B, verify healthy (lease_index=1)

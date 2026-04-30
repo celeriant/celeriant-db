@@ -9,7 +9,7 @@
 //! 2. Wait for election (leader wins CreateOnly on empty cluster)
 //! 3. Write events 1-3 (S3 fallback since no follower)
 //! 4. Verify S3 fallback objects exist
-//! 5. Verify lease has been renewed (lease_index > 1, leader extended during discovery)
+//! 5. Verify lease has been renewed (lease_index stays at 1; same-leader renewal does not bump)
 //! 6. Start follower (late start)
 //! 7. Wait for follower registration + leader discovery + boot catchup + heartbeat
 //! 8. Verify follower caught up from S3 (has events 1-3)
@@ -100,13 +100,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let lease = deserialise_lease(&lease_bytes)
         .map_err(|e| format!("Failed to deserialise lease: {:?}", e))?;
 
-    println!("  lease_index={}, leader_node_id={:x}", lease.lease_index, lease.leader_node_id);
-    assert!(
-        lease.lease_index > 1,
-        "lease_index should be > 1 (leader renews during discovery loop), got {}",
+    println!("  lease_index={}, leader_node_id={:x}, expires_at_ms={}",
+        lease.lease_index, lease.leader_node_id, lease.expires_at_ms);
+    assert_eq!(
+        lease.lease_index, 1,
+        "lease_index should stay at 1 (same-leader renewal does not bump), got {}",
         lease.lease_index
     );
-    println!("  Leader extended its lease during follower discovery loop");
+    println!("  Leader extended its lease during follower discovery loop (lease_index unchanged)");
 
     // ========================================
     // PHASE 5: Start follower (late join)

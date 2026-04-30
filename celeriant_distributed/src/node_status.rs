@@ -84,7 +84,8 @@ impl NodeStatus {
             // Catchup completes directly back to Follower
             (FollowerCatchingUp { .. }, Follower { .. }) => true,
 
-            // Leader can update lease_index (renewal) or become follower (lost S3 CAS)
+            // Leader -> Leader: TTL refresh after S3 renewal (lease_index unchanged).
+            // Leader -> Follower: lost S3 CAS during election.
             (Leader { .. }, Leader { .. }) | (Leader { .. }, Follower { .. }) => true,
 
             // Everything else is invalid
