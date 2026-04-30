@@ -41,7 +41,7 @@ Rules the system enforces. Breaking any of these is a bug. Provide this to LLMs 
 ## Leader Election
 
 - Leader is determined by S3 CAS on a single `cluster/lease.json` object. No Raft, no quorum.
-- `lease_index` is strictly monotonically increasing and never reused. A fresh cluster starts at `lease_index = 1`.
+- `lease_index` is strictly monotonically increasing and never reused. A fresh cluster starts at `lease_index = 1`. Same-leader S3 renewals refresh expiry without bumping the index; the index is a fencing token for cross-node handovers, not a renewal counter.
 - A node seeing a valid (non-expired) lease from another node becomes follower unconditionally - no CAS attempt.
 - A lease supersedes another if and only if `lease_index > our_lease_index AND leader_node_id != our_node_id`.
 - Membership is a fixed 2-slot array in S3. A third node cannot join.
@@ -49,8 +49,9 @@ Rules the system enforces. Breaking any of these is a bug. Provide this to LLMs 
 - Timing is asymmetric: the leader renews at `heartbeat_interval`, the follower's TTL extends in `heartbeat_lease_duration` chunks. The leader fences at `lease_expires_at_ms - max_clock_drift_ms`, which must always fire before the follower's TTL expires.
 - While TCP heartbeats succeed, the leader skips S3 lease renewal entirely. S3 is only checked when heartbeat fails AND either no peer is known or `lease_time_remaining <= s3_lease_duration / 2`.
 - When the follower is unreachable, S3 renewal backs off proportional to `s3_lease_duration`, not `heartbeat_interval`. Peer discovery uses exponential backoff capped at `s3_lease_duration / 2`.
-- A follower waits for its full TTL to expire before challenging for leadership via S3 CAS.
-- A newly elected leader runs S3 catchup before serving writes. Catchup also runs if the `lease_index` gap indicates the lease changed hands during a network partition (e.g. 6 to 8 means another node held it in between).
+- A follower waits for its full TTL to expire before challenging for leadership via S3 CAS. This applies to ALL paths that could result in promotion, including the post-`FollowerCatchingUp` CAS attempt — heartbeat-derived TTL is the "current leader is alive" signal, and a fresh heartbeat must override an apparently-expired S3 lease. (Happy-ops S3 lease silently expires while heartbeats keep extending the leader's TTL — S3 expiry alone is not sufficient evidence to promote.)
+- A node booting with no heartbeat TTL history (`lease_expires_at_ms == 0` after catchup) waits at least `heartbeat_lease_duration` before challenging via S3 CAS. This grace window gives any current leader a chance to claim the booting node as follower via heartbeat before it attempts promotion.
+- A newly elected leader runs S3 catchup before serving writes. Catchup also runs whenever the observed `lease_index` is higher than the previous one we held — same-leader renewals leave it unchanged, so any increase means another node held the lease in between (e.g. 6 to 7) and may have uploaded S3 fallback batches.
 - On promotion, the new leader uploads a "promotion batch" to S3 covering the last TCP-replicated batch. This closes the gap where the old leader rolled back a batch the follower kept.
 
 ## Heartbeat and Fencing
@@ -58,7 +59,8 @@ Rules the system enforces. Breaking any of these is a bug. Provide this to LLMs 
 - Heartbeats flow leader-to-follower only, handled exclusively by shard 0.
 - A leader fences itself early: when `now > lease_expires_at_ms - max_clock_drift_ms`.
 - A follower rejects a heartbeat and fences all local shards immediately if clock drift exceeds `max_clock_drift_ms`.
-- Heartbeat success extends the follower's TTL: `new_expiry = max(current_expiry, leader_timestamp_ms + heartbeat_lease_duration)`. TTL is never reduced by a heartbeat.
+- Heartbeat success extends BOTH the leader's and the follower's local TTL: `new_expiry = max(current_expiry, leader_timestamp_ms + heartbeat_lease_duration)`. **TTL is never reduced by a heartbeat.** The longer of the current TTL and the proposed extension wins. This is critical because the initial S3 CAS sets local TTL to `now + s3_lease_duration` (e.g. 30s); heartbeats arrive every `heartbeat_interval` proposing `leader_timestamp_ms + heartbeat_lease_duration` (e.g. 1.5s). Without max-merge, each heartbeat would shrink the TTL by ~28s, defeating the whole "TTL only ever extends" invariant.
+- TTL is **leader-controlled and pre-computed**: the leader stamps `leader_timestamp_ms` BEFORE sending the heartbeat (or before writing the S3 lease), and both sides use that pre-op timestamp to compute the new TTL. Recomputing TTL post-network-op (using `now()` after the heartbeat returns) bakes the network round-trip into the lease window — wasting potentially seconds of effective TTL and creating asymmetry between leader and follower views.
 - `FollowerCatchingUp` and `BootCatchup` states are TTL-exempt - they never decay to `Fenced`.
 - Heartbeat `Ack` carries `follower_can_accept_tcp_replication`. The flag is `true` only in plain `Follower` state; `false` in `FollowerCatchingUp`. The leader uses it to gate TCP replication — during follower catchup commits route straight to S3 fallback without paying the TCP-reject round-trip.
 
@@ -103,9 +105,11 @@ Rules the system enforces. Breaking any of these is a bug. Provide this to LLMs 
 
 ## S3 Catchup (Follower)
 
-- Among S3 batches sharing the same `start_wal_index`, only the one with the highest `upload_sequence` is authoritative. Lower `upload_sequence` values are stale generations from before a leader rollback and must never be applied.
+- Among S3 batches covering overlapping wal_index ranges, the authoritative chain is selected by `(lease_index, upload_sequence)` lexicographically. `lease_index` is globally monotonic via the S3 CAS election protocol and is the primary comparator: a batch from a higher-lease leader always supersedes one from a lower-lease leader regardless of `upload_sequence`. `upload_sequence` is per-process and serves only as a within-lease tiebreaker; it resets to zero on each leader handover, so it is not meaningful across leaders.
 - A node never applies a batch it uploaded itself.
-- Inter-batch gaps do not fail catchup. The unresolved remainder is backfilled by TCP replication.
+- A follower doesn't need to be caught-up to the WAL tip of the leader, just close enough to re-join as follower using TCP. It can catchup 'offline' via S3, and when close enough to the leader's WAL tip, it can rejoin.
+- Leader will always ensure S3 contains the data required to catch up. If there is no active TCP follower, the leader never ACKs to clients until it has replicated the WAL data to S3.
+- S3 files will not have gaps. There may be divergent paths though, due to leaders being overwhelmed and rolling back writes. Leader -> S3 involves a network hop and it may or may not be delivered, and S3 ACK may or may not return to the leader.
 - WAL truncation fires only when a common ancestor has been verified via local-metablock hash match. The follower never truncates without an ancestor; unresolved divergence is surfaced as an error.
 - Truncation is durable before writes resume: caches cleared, both cursors rewound, dual headers rewritten, and `fdatasync()` completes before the rollback lock is released.
 - Truncation never leaves orphan segments ahead of the active one. When the ancestor lies in a sealed segment, the active segment and any intermediate sealed segments are discarded from disk before the target segment's headers are rewritten.
