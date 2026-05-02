@@ -80,7 +80,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         routing_rule: RoutingRule::AggregateTypeId,
         // Very high water mark: this test is NOT about S3 fallback. Prevent the
         // replication queue from triggering S3 during the rapid Phase B writes.
-        pending_replication_high_water_bytes: Some(100_000_000),
+        internode_max_request_size: 100_000_000,
         ..base_config
     };
 

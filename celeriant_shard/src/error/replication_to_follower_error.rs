@@ -8,6 +8,7 @@ pub enum ReplicateToFollowerError {
     FollowerTooFarBehind,
     LockTimeout,
     SystemTimeError(std::time::SystemTimeError),
+    BudgetExhausted,
 }
 
 impl From<std::time::SystemTimeError> for ReplicateToFollowerError {

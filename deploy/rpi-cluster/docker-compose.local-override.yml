@@ -1,0 +1,7 @@
+# Used by setup-infra.sh in INFRA_MODE=local to remap the prometheus bind mount
+# to the generated config (prometheus.generated.yml) instead of the placeholder template.
+services:
+  prometheus:
+    volumes:
+      - ./prometheus.generated.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus

@@ -88,6 +88,7 @@ fn create_config(
         shard_dir,
         max_response_size: 16 * 1024 * 1024,
         max_request_size: 16 * 1024 * 1024,
+        internode_max_request_size: 64 * 1024 * 1024,
         aggregate_snapshots_cache_bytes: 64 * 1024 * 1024,
         aggregate_client_snapshots_cache_bytes: 32 * 1024 * 1024,
         read_max_chunk_size: 32 * 1024,
@@ -99,8 +100,7 @@ fn create_config(
         list_wal_index_cache_bytes: 12 * 1024 * 1024,
         schema_cache_bytes: 4 * 1024 * 1024,
         max_schema_size_bytes: 16384,
-        pending_replication_high_water_bytes: 67_108_864, // 64MB
-        max_catchup_gap_bytes: 104_857_600,
+        max_catchup_gap_bytes: Some(104_857_600),
         max_clock_drift_ms: 500,
         shard_id: 1,
         compaction_check_interval: Duration::from_secs(600),

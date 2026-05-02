@@ -1,17 +1,20 @@
-//! Replication Queue Pressure Integration Test
+//! Inflight Backpressure Under Throttled Replication
 //!
-//! Tests that `is_replication_queue_pressured()` triggers S3 fallback when a
-//! throttled follower causes the pending replication queue to exceed the high
-//! water mark (`pending_replication_high_water_bytes`).
+//! Verifies the post-refactor `internode_max_request_size` cap:
+//! when a slow follower stalls the in-flight queue, writes are rejected at
+//! entry with `ReplicationBackpressure` (wire: `ServerBusy`). Once the
+//! follower drains and the queue empties, writes are accepted again and
+//! both nodes converge.
 //!
-//! Unlike `s3_follower_kick_main` (which blocks the proxy to create a WAL gap
-//! triggering `max_catchup_gap_bytes`), this test throttles the proxy and uses
-//! concurrent writes. Many connections create bursts that span multiple fsync
-//! batches. The throttled replication can't drain the pending queue as fast as
-//! fsynced batches enter it, so the queue exceeds the high water mark → S3
-//! fallback → kick → follower catches up from S3 → TCP resumes.
-//!
-//! Run with: cargo run --bin invariant_replication_queue_pressure_main
+//! Phases:
+//!   1. Baseline TCP replication on shard 0 (sanity).
+//!   2. Throttle proxy + 100 concurrent writers on shard 1 → expect a
+//!      meaningful share of writes rejected with `ServerBusy`, scraped from
+//!      `celeriant_writes_rejected_backpressure_total{cause="inflight_pressure"}`.
+//!   3. Unthrottle, wait for the queue to drain, assert leader/follower
+//!      converge on every shard 1 aggregate.
+//!   4. Hammer shard 1 again — expect TCP to take every write (no more
+//!      `ServerBusy`) and follower to track leader.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,11 +22,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
+use celeriant_client_tokio::client_error::ClientError;
 use crate::{
-    count_events, s3_cluster_config, write_event, MinioContainer, TcpProxy, TestServer,
+    count_events, s3_cluster_config, scrape_counter, write_event, MinioContainer, TcpProxy, TestServer,
 };
 use celeriant_msg::process_client_requests::ClientRequest;
-use celeriant_msg::request::requests::{AggregateDetailsRequest, SingleAggregateWrite, WriteRequest};
+use celeriant_msg::request::requests::{SingleAggregateWrite, WriteRequest};
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::compression_type::CompressionType;
 use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
@@ -35,22 +39,19 @@ const NUM_AGGREGATES: usize = 50;
 const PRESSURE_DURATION_SECS: u64 = 10;
 const PAYLOAD_BYTES: usize = 3024;
 const CLIENTSIDE_TIMEOUT_S: u64 = 60;
-/// Proxy adds this delay per 8KB chunk forwarded — makes replication ~25x slower
-/// than unthrottled, giving fsync batches time to accumulate in the pending queue.
+/// Proxy adds this delay per 8KB chunk forwarded — slow enough that the leader's
+/// in-flight queue saturates within a single fsync cycle.
 const THROTTLE_MS_PER_CHUNK: u64 = 200;
 
-
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== Replication Queue Pressure Test (2 shards) ===\n");
+    println!("=== Inflight Backpressure Under Throttled Replication ===\n");
 
-    // ========================================
-    // Setup
-    // ========================================
     let port_base = 10700 + (std::process::id() % 100) as u16;
     let leader_port = port_base;
     let follower_port = port_base + 100;
     let minio_port = port_base + 10;
     let proxy_port = port_base + 200;
+    let leader_metrics_port = leader_port + 2;
 
     println!("Starting MinIO on port {}...", minio_port);
     let minio = MinioContainer::start_with_bucket(minio_port, "test-pressure").await?;
@@ -60,27 +61,26 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let num_shards = 2;
 
     let proxy = TcpProxy::start(proxy_port, format!("127.0.0.1:{}", follower_port + 1)).await?;
-    println!("  Proxy {} → follower replication port {}", proxy_port, follower_port + 1);
+    println!("  Proxy {} -> follower replication port {}", proxy_port, follower_port + 1);
 
     let mut config = s3_cluster_config(
         num_shards, &region, &bucket, &access_key, &secret_key, &endpoint, allow_http,
     );
-    // Low high water mark: triggers S3 fallback when pending replication queue
-    // accumulates > 256KB due to throttled follower. A single fsync batch from
-    // ~100 concurrent connections is ~100KB, so we need 3+ batches to accumulate.
-    config.pending_replication_high_water_bytes = Some(262144);
-    // High max_catchup_gap_bytes: we are NOT testing WAL gap detection, only queue pressure.
+    // Tight inflight cap so a handful of fsync batches saturate it under throttle.
+    // 256 KiB is well above one PCD (~3 KB payload * fsync window) but below the
+    // pile-up that 100 writers produce when replication is slowed 25x.
+    config.internode_max_request_size = 262144;
+    // Disable the catchup-gap shortcut: we want to exercise the inflight cap, not
+    // the workset-size S3 escape hatch.
     config.max_catchup_gap_bytes = Some(100_000_000);
-    // Long timeouts: no failover, just kick.
     config.heartbeat_lease_duration_ms = 30_000;
     config.s3_lease_duration_ms = 30_000;
-    // Generous internode timeout so the throttled connection stays open.
     config.internode_connection_timeout_ms = 60_000;
 
     let mut follower_config = config.clone();
     follower_config.advertised_replication_address = Some(proxy.address());
 
-    println!("Starting two-node cluster (2 shards, high_water=256KB, max_gap=100MB)...");
+    println!("Starting two-node cluster (2 shards, internode_max_request_size=256KB)...");
     let mut _leader = TestServer::start_with_config_labeled(leader_port, config, "leader".into()).await?;
     let mut _follower =
         TestServer::start_with_config_labeled(follower_port, follower_config, "follower".into())
@@ -90,13 +90,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("Waiting for election + discovery + replication connection...");
     tokio::time::sleep(Duration::from_secs(10)).await;
 
-    // Probe key on shard 0 (type_id=0, 0%2=0) for cross-shard verification
     let probe_shard0 = AggregateKey::new(1, 0, 999);
-    // All pressure writes target shard 1 (type_id=1, 1%2=1)
 
-    // ========================================
-    // Phase 1: Verify normal TCP replication
-    // ========================================
+    // ── Phase 1: baseline TCP ────────────────────────────────────────────
     println!("\nPHASE 1: Normal TCP replication");
     println!("-------------------------------");
 
@@ -111,22 +107,17 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Follower shard 0: {} events", fc);
     assert_eq!(fc, 3, "Follower should have 3 events on shard 0");
 
-    for shard_id in 0..num_shards {
-        let objs = minio
-            .list_objects(&format!("cluster/fallback/shard_{:03}/", shard_id))
-            .await?;
-        assert!(
-            objs.is_empty(),
-            "No S3 fallback objects during normal replication (shard {})",
-            shard_id
-        );
-    }
-    println!("  No S3 fallback objects (TCP working)\n");
+    let backpressure_before = scrape_counter(
+        "127.0.0.1",
+        leader_metrics_port,
+        "celeriant_writes_rejected_backpressure_total",
+    )
+    .await
+    .unwrap_or(0);
+    println!("  Backpressure rejections before pressure: {}", backpressure_before);
 
-    // ========================================
-    // Phase 2: Throttle proxy + pressure writes → S3 fallback
-    // ========================================
-    println!("PHASE 2: Throttle proxy + concurrent write pressure on shard 1");
+    // ── Phase 2: throttle + concurrent load → expect ServerBusy ───────────
+    println!("\nPHASE 2: Throttle proxy + concurrent write pressure on shard 1");
     println!("--------------------------------------------------------------");
 
     proxy.throttle(THROTTLE_MS_PER_CHUNK);
@@ -137,7 +128,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         NUM_CONNECTIONS, PAYLOAD_BYTES, PRESSURE_DURATION_SECS, NUM_AGGREGATES
     );
 
-    let total_written = run_pressure_writes(
+    let stats = run_pressure_writes(
         _leader.address(),
         NUM_CONNECTIONS,
         NUM_AGGREGATES,
@@ -145,50 +136,41 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    println!("  Total events written during pressure phase: {}", total_written);
+    println!(
+        "  Writes accepted: {}, ServerBusy rejections: {}, other errors: {}",
+        stats.accepted, stats.server_busy, stats.other_errors,
+    );
+    assert!(stats.accepted > 0, "throttled writes must still make some forward progress");
+    assert!(
+        stats.server_busy > 0,
+        "throttled load on a tight inflight cap must produce ServerBusy rejections; got 0",
+    );
 
-    // ========================================
-    // Phase 3: Verify S3 fallback triggered
-    // ========================================
-    // println!("\nPHASE 3: Verify S3 fallback triggered");
-    // println!("-------------------------------------");
+    let backpressure_after = scrape_counter(
+        "127.0.0.1",
+        leader_metrics_port,
+        "celeriant_writes_rejected_backpressure_total",
+    )
+    .await?;
+    let backpressure_delta = backpressure_after.saturating_sub(backpressure_before);
+    println!(
+        "  Backpressure rejections during pressure: +{} (total {})",
+        backpressure_delta, backpressure_after
+    );
+    assert!(
+        backpressure_delta as usize >= stats.server_busy,
+        "backpressure metric (+{}) must cover client-side ServerBusy count ({})",
+        backpressure_delta, stats.server_busy,
+    );
 
-    // tokio::time::sleep(Duration::from_secs(2)).await;
-
-    // let mut s3_objects = 0;
-    // for shard_id in 0..num_shards {
-    //     let objs = minio
-    //         .list_objects(&format!("cluster/fallback/shard_{:03}/", shard_id))
-    //         .await?;
-    //     if !objs.is_empty() {
-    //         println!("  shard_{:03}: {} S3 fallback objects", shard_id, objs.len());
-    //     }
-    //     s3_objects += objs.len();
-    // }
-    // println!("  Total S3 fallback objects: {}", s3_objects);
-    // assert!(
-    //     s3_objects > 0,
-    //     "S3 fallback should have triggered from replication queue pressure"
-    // );
-
-    // ========================================
-    // Phase 4: Unthrottle + wait for recovery + follower catchup
-    // ========================================
-    // After heavy throttling, the replication coordinator is stuck mid-send.
-    // We must wait for:
-    //   1. The in-flight replication batch to drain through the now-fast proxy
-    //   2. The kick to be delivered to the follower
-    //   3. The follower to download S3 fallback files and catch up
-    // Only after recovery can the shard accept new writes normally.
-    println!("\nPHASE 4: Unthrottle + wait for recovery + follower catchup");
-    println!("----------------------------------------------------------");
+    // ── Phase 3: unthrottle, wait for convergence ────────────────────────
+    println!("\nPHASE 3: Unthrottle + wait for queue drain + follower convergence");
+    println!("-----------------------------------------------------------------");
 
     proxy.unthrottle();
     println!("  Proxy UNTHROTTLED");
-    println!("  Waiting for replication pipeline to drain and kick to deliver...");
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
-    // Get leader counts for all shard 1 aggregates (no new writes yet)
     let leader_counts: Vec<(AggregateKey, usize)> = {
         let mut lc = CeleriantClient::connect(_leader.address()).await?;
         let mut counts = Vec::new();
@@ -199,24 +181,38 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         counts
     };
-
     let total_leader: usize = leader_counts.iter().map(|(_, c)| c).sum();
-    println!("  Leader total across {} aggregates: {} events", NUM_AGGREGATES, total_leader);
+    println!(
+        "  Leader total across {} aggregates: {} events",
+        NUM_AGGREGATES, total_leader
+    );
+    assert_eq!(
+        total_leader, stats.accepted,
+        "leader visible count must equal accepted writes",
+    );
 
-    // Poll until follower catches up on all Phase 2 data
-    let timeout = Duration::from_secs(120);
+    let timeout = Duration::from_secs(60);
     let start = std::time::Instant::now();
     let mut caught_up = false;
-
     while start.elapsed() < timeout {
         if let Err(msg) = _follower.check_alive() {
-            panic!("{} — check stderr ([follower] lines) for the root cause", msg);
+            panic!("{} — check stderr for the root cause", msg);
         }
-        let mut fc = match CeleriantClient::connect_with_timeout(_follower.address(), Some(Duration::from_secs(10)), None).await {
+        let mut fc = match CeleriantClient::connect_with_timeout(
+            _follower.address(),
+            Some(Duration::from_secs(10)),
+            None,
+        )
+        .await
+        {
             Ok(c) => c,
             Err(e) => {
-                println!("  Follower connect failed: {} ({:.0}s elapsed)", e, start.elapsed().as_secs_f64());
-                tokio::time::sleep(Duration::from_secs(3)).await;
+                println!(
+                    "  Follower connect failed: {} ({:.0}s elapsed)",
+                    e,
+                    start.elapsed().as_secs_f64()
+                );
+                tokio::time::sleep(Duration::from_secs(2)).await;
                 continue;
             }
         };
@@ -224,7 +220,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let mut all_match = true;
         let mut read_failed = false;
         for (key, leader_count) in &leader_counts {
-
             match count_events(&mut fc, key).await {
                 Ok(c) => {
                     follower_total += c;
@@ -240,167 +235,54 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         if read_failed {
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
             continue;
         }
         println!(
             "  Follower: {}/{} events ({:.0}s elapsed)",
-            follower_total,
-            total_leader,
-            start.elapsed().as_secs_f64()
+            follower_total, total_leader, start.elapsed().as_secs_f64()
         );
         if all_match {
             caught_up = true;
             break;
         }
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
     assert!(
         caught_up,
-        "Follower should have caught up from S3 within {}s",
+        "Follower should have converged within {}s after unthrottle",
         timeout.as_secs()
     );
-    println!("  Follower caught up!\n");
 
-    // ========================================
-    // Phase 5: Hammer to verify TCP resumes (no new S3 fallback uploads)
-    // ========================================
-    println!("PHASE 5: Hammer to verify TCP resumes");
-    println!("-------------------------------------");
+    // ── Phase 4: TCP resumes cleanly under post-recovery load ────────────
+    println!("\nPHASE 4: Post-recovery hammer — expect zero ServerBusy");
+    println!("------------------------------------------------------");
 
-    // Record S3 state before hammering. Applied batches are left in place — an
-    // S3 lifecycle policy reaps them later. The important invariant is that no
-    // NEW uploads happen once TCP is healthy again, validated below.
-    let s3_before: Vec<usize> = {
-        let mut counts = Vec::new();
-        for shard_id in 0..num_shards {
-            counts.push(
-                minio
-                    .list_objects(&format!("cluster/fallback/shard_{:03}/", shard_id))
-                    .await?
-                    .len(),
-            );
-        }
-        counts
-    };
-
-    // ── Diagnostic: is the leader process alive and can shards respond? ──
-    if let Err(msg) = _leader.check_alive() {
-        panic!("Leader process is dead before Phase 5 hammer: {}", msg);
-    }
-    println!("  Leader process: alive (OS process running)");
-
-    // Exists probes — reads bypass sync/replication coordinators
-    let probe_shard1_key = AggregateKey::new(1, 1, 0);
-    {
-        let probe_timeout = Duration::from_secs(10);
-        let mut probe = CeleriantClient::connect_with_timeout(_leader.address(), Some(probe_timeout), None).await?;
-
-        let exists_shard0 = probe.send_request(
-            &ClientRequest::AggregateDetails(AggregateDetailsRequest { correlation_id: Some(0), aggregate_key: probe_shard0.clone() }),
-            CompressionType::None,
-        ).await;
-        match &exists_shard0 {
-            Ok(_) => println!("  Leader shard 0: exists OK"),
-            Err(e) => println!("  Leader shard 0: exists FAILED: {}", e),
-        }
-
-        let exists_shard1 = probe.send_request(
-            &ClientRequest::AggregateDetails(AggregateDetailsRequest { correlation_id: Some(1), aggregate_key: probe_shard1_key.clone() }),
-            CompressionType::None,
-        ).await;
-        match &exists_shard1 {
-            Ok(_) => println!("  Leader shard 1: exists OK"),
-            Err(e) => println!("  Leader shard 1: exists FAILED: {}", e),
-        }
-    }
-
-    // Write probes — hit sync_durable + replicate_durable coordinators
-    // Shard 0 is the control (no pressure in Phase 2), shard 1 is the suspect.
-    {
-        let write_probe_timeout = Duration::from_secs(15);
-
-        println!("  Write probe shard 0 (15s timeout)...");
-        let mut probe0 = CeleriantClient::connect_with_timeout(_leader.address(), Some(write_probe_timeout), None).await?
-            .with_timeout(write_probe_timeout);
-        let t0 = std::time::Instant::now();
-        match write_event(&mut probe0, &probe_shard0, 100, false).await {
-            Ok(_) => println!("  Leader shard 0: write OK ({:.1}s)", t0.elapsed().as_secs_f64()),
-            Err(e) => println!("  Leader shard 0: write FAILED after {:.1}s: {}", t0.elapsed().as_secs_f64(), e),
-        }
-
-        println!("  Write probe shard 1 (15s timeout)...");
-        let mut probe1 = CeleriantClient::connect_with_timeout(_leader.address(), Some(write_probe_timeout), None).await?
-            .with_timeout(write_probe_timeout);
-        let t1 = std::time::Instant::now();
-        match write_event(&mut probe1, &probe_shard1_key, 100, true).await {
-            Ok(_) => println!("  Leader shard 1: write OK ({:.1}s)", t1.elapsed().as_secs_f64()),
-            Err(e) => println!("  Leader shard 1: write FAILED after {:.1}s: {}", t1.elapsed().as_secs_f64(), e),
-        }
-    }
-
-    // Now hammer shard 1 again — proxy is unthrottled, follower is caught up,
-    // so these should all replicate via TCP (no S3 fallback).
+    let post_stats = run_pressure_writes(_leader.address(), 10, NUM_AGGREGATES, 5).await?;
     println!(
-        "  Hammering shard 1 with 10 connections for 5s (should use TCP only)..."
+        "  Writes accepted: {}, ServerBusy rejections: {}, other errors: {}",
+        post_stats.accepted, post_stats.server_busy, post_stats.other_errors,
     );
-    let phase5_written = run_pressure_writes(
-        _leader.address(),
-        10,
-        NUM_AGGREGATES,
-        5,
-    )
-    .await?;
-    println!("  Events written: {}", phase5_written);
-    assert!(phase5_written > 0, "Post-recovery writes should succeed");
+    assert!(post_stats.accepted > 0, "post-recovery writes should succeed");
+    assert_eq!(
+        post_stats.server_busy, 0,
+        "post-recovery, unthrottled cluster must not surface ServerBusy",
+    );
 
-    // Verify follower received the new writes
     let mut leader_client = CeleriantClient::connect(_leader.address()).await?;
     let mut follower_client = CeleriantClient::connect(_follower.address()).await?;
     let verify_key = AggregateKey::new(1, 1, 0);
     let lc = count_events(&mut leader_client, &verify_key).await?;
     let fc = count_events(&mut follower_client, &verify_key).await?;
     println!("  Verify key (agg 0): leader={}, follower={}", lc, fc);
-    assert_eq!(fc, lc, "Follower should have all post-recovery events");
+    assert_eq!(fc, lc, "Follower should track leader on post-recovery writes");
 
-    // Verify no new S3 objects (TCP replication, not S3 fallback)
-    let mut new_s3 = false;
-    for shard_id in 0..num_shards {
-        let after = minio
-            .list_objects(&format!("cluster/fallback/shard_{:03}/", shard_id))
-            .await?
-            .len();
-        if after > s3_before[shard_id] {
-            new_s3 = true;
-            println!(
-                "  WARNING: shard_{:03} new S3 objects: {} → {}",
-                shard_id, s3_before[shard_id], after
-            );
-        }
-    }
-    assert!(
-        !new_s3,
-        "No new S3 objects should appear after catchup (TCP replication resumed)"
-    );
-    println!("  TCP replication resumed (no new S3 objects)");
-
-    // ========================================
-    // Phase 6: Final convergence
-    // ========================================
-    println!("\nPHASE 6: Final convergence verification");
-    println!("---------------------------------------");
-
-    let mut leader_client = CeleriantClient::connect(_leader.address()).await?;
-    let mut follower_client = CeleriantClient::connect(_follower.address()).await?;
-
-    // Shard 0 probe (should be unaffected by shard 1 pressure)
     let lc0 = count_events(&mut leader_client, &probe_shard0).await?;
     let fc0 = count_events(&mut follower_client, &probe_shard0).await?;
     println!("  Shard 0 probe: leader={}, follower={}", lc0, fc0);
     assert_eq!(lc0, fc0, "Shard 0 counts must match");
 
-    // All shard 1 aggregates
     let mut mismatches = 0;
     for agg_id in 0..NUM_AGGREGATES {
         let key = AggregateKey::new(1, 1, agg_id as u128);
@@ -415,20 +297,25 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "  Checked {} shard 1 aggregates: {} mismatches",
         NUM_AGGREGATES, mismatches
     );
-    assert_eq!(mismatches, 0, "All aggregates must have matching event counts");
+    assert_eq!(mismatches, 0, "All aggregates must converge");
 
     println!("\n=== All Tests Passed ===\n");
     Ok(())
 }
 
-/// Spawn concurrent connections that write ~1KB events to shard 1 aggregates
-/// for the given duration. Returns total successful writes.
+#[derive(Default, Debug)]
+struct PressureStats {
+    accepted: usize,
+    server_busy: usize,
+    other_errors: usize,
+}
+
 async fn run_pressure_writes(
     server_address: &str,
     num_connections: usize,
     num_aggregates: usize,
     duration_secs: u64,
-) -> Result<u64, Box<dyn std::error::Error>> {
+) -> Result<PressureStats, Box<dyn std::error::Error>> {
     let mut connection_tasks = Vec::with_capacity(num_connections);
     for id in 0..num_connections {
         let addr = server_address.to_string();
@@ -458,15 +345,19 @@ async fn run_pressure_writes(
         return Err("No connections established".into());
     }
 
-    let total_written = Arc::new(AtomicU64::new(0));
+    let accepted = Arc::new(AtomicU64::new(0));
+    let busy = Arc::new(AtomicU64::new(0));
+    let other = Arc::new(AtomicU64::new(0));
     let barrier = Arc::new(Barrier::new(clients.len()));
 
     let mut tasks = Vec::with_capacity(clients.len());
     for (id, client) in clients {
         let barrier = barrier.clone();
-        let counter = total_written.clone();
+        let acc = accepted.clone();
+        let bsy = busy.clone();
+        let oth = other.clone();
         tasks.push(tokio::spawn(async move {
-            pressure_writer(id, client, barrier, counter, num_aggregates, duration_secs).await;
+            pressure_writer(id, client, barrier, acc, bsy, oth, num_aggregates, duration_secs).await;
         }));
     }
 
@@ -474,14 +365,21 @@ async fn run_pressure_writes(
         let _ = task.await;
     }
 
-    Ok(total_written.load(Ordering::Relaxed))
+    Ok(PressureStats {
+        accepted: accepted.load(Ordering::Relaxed) as usize,
+        server_busy: busy.load(Ordering::Relaxed) as usize,
+        other_errors: other.load(Ordering::Relaxed) as usize,
+    })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn pressure_writer(
     id: usize,
     mut client: CeleriantClient,
     barrier: Arc<Barrier>,
-    counter: Arc<AtomicU64>,
+    accepted: Arc<AtomicU64>,
+    busy: Arc<AtomicU64>,
+    other: Arc<AtomicU64>,
     num_aggregates: usize,
     duration_secs: u64,
 ) {
@@ -489,7 +387,6 @@ async fn pressure_writer(
     let deadline = Instant::now() + Duration::from_secs(duration_secs);
     let mut count = 0u64;
 
-    // Pre-build the padding once
     let pad = "x".repeat(PAYLOAD_BYTES.saturating_sub(40));
 
     while Instant::now() < deadline {
@@ -530,13 +427,21 @@ async fn pressure_writer(
         });
 
         match client.send_request(&request, CompressionType::None).await {
-            Ok(_) => count += 1,
+            Ok(_) => {
+                count += 1;
+                accepted.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(ClientError::ServerBusy) => {
+                busy.fetch_add(1, Ordering::Relaxed);
+                // Brief backoff so we keep the connection alive and try again
+                // — this is the contract clients are expected to follow.
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
             Err(e) => {
-                eprintln!("    Writer {id} failed after {count} events: {e:?}");
+                other.fetch_add(1, Ordering::Relaxed);
+                eprintln!("    Writer {id} non-busy error after {count} writes: {e:?}");
                 break;
             }
         }
     }
-
-    counter.fetch_add(count, Ordering::Relaxed);
 }

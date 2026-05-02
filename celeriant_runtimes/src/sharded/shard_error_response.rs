@@ -265,6 +265,7 @@ fn replication_message(e: ReplicationError) -> String {
         ReplicationError::ReplicateToS3Error(e) => format!(r#"{{"detail":{}}}"#, json_string(&format!("{:?}", e))),
         ReplicationError::ExtendedCatchupFailure(e) => format!(r#"{{"detail":{}}}"#, json_string(&format!("{:?}", e))),
         ReplicationError::LeaderFenced => format!(r#"{{"detail":"LeaderFenced"}}"#),
+        ReplicationError::BudgetExhausted => format!(r#"{{"detail":"BudgetExhausted"}}"#),
     }
 }
 
@@ -293,6 +294,7 @@ fn fsync_message(e: ShardFsyncError) -> String {
         ShardFsyncError::FDataSyncError(msg) => format!(r#"{{"detail":{}}}"#, json_string(&msg)),
         ShardFsyncError::WriteDatablocksError(msg) => format!(r#"{{"detail":{}}}"#, json_string(&msg)),
         ShardFsyncError::SegmentSummarySidecarWriteError(msg) => format!(r#"{{"detail":{}}}"#, json_string(&msg)),
+        ShardFsyncError::BudgetExhausted => r#"{"detail":"BudgetExhausted"}"#.into(),
     }
 }
 

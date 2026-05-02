@@ -8,4 +8,5 @@ pub enum ReplicationError {
     ReplicateToS3Error(ReplicateToS3Error),
     ExtendedCatchupFailure(FetchCatchupEntriesError),
     LeaderFenced,
+    BudgetExhausted,
 }

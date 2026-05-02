@@ -4,6 +4,16 @@ use glommio::timer::Timer;
 use futures_lite::future::or;
 use tracing::warn;
 
+pub async fn with_budget<T>(budget: Duration, fut: impl std::future::Future<Output = T>) -> Option<T> {
+    or(
+        async { Some(fut.await) },
+        async {
+            Timer::new(budget).await;
+            None
+        },
+    ).await
+}
+
 const DEADLOCK_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]

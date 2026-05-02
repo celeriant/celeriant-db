@@ -50,6 +50,9 @@ pub enum ShardFsyncError {
 
     /// Failed to write the segment summary sidecar file at rotation time
     SegmentSummarySidecarWriteError(String),
+
+    /// Leader's lease budget was exhausted before fdatasync completed; write not acked.
+    BudgetExhausted,
 }
 
 impl ShardFsyncError {

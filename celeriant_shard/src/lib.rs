@@ -16,3 +16,7 @@ pub mod s3_uploader;
 pub mod s3_downloader;
 pub mod shard_wal_s3_catchup;
 pub mod shard_wal_compact;
+pub mod intra_batch_chain;
+pub mod replication_backpressure;
+pub mod fetch_catchup_entries;
+pub mod replicate_follower_catchup;

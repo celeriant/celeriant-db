@@ -164,6 +164,11 @@ pub struct ShardWal<R: ReplicationClient + 'static, D: S3Downloader + 'static> {
     /// Happens if the network is slow or s3/minio having issues
     pub last_rollback_at: Rc<Cell<Option<Instant>>>,
 
+    /// Mirror of `last_rollback_at` used for log rate-limiting: write path
+    /// emits one warn per rollback event when the cooldown rejects writes,
+    /// rather than a warn per rejected request (which would flood under load).
+    pub last_logged_rollback_at: Cell<Option<Instant>>,
+
     /// Cached metrics label to avoid per-request String allocation
     metrics_shard_label: [(&'static str, String); 1],
 }
@@ -282,7 +287,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             config.aggregate_client_snapshots_cache_bytes,
             config.list_wal_index_cache_bytes,
             config.schema_cache_bytes,
-            config.pending_replication_high_water_bytes,
+            config.internode_max_request_size,
         );
 
         let log_segments_cache = LogSegmentsCache::ready_up(
@@ -296,7 +301,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let list_semaphore = Rc::new(Semaphore::new(config.list_max_concurrent));
         let cache_load_semaphore = Rc::new(Semaphore::new(config.read_max_concurrent));
 
-        metrics::gauge!("celeriant_replication_queue_high_water_bytes").set(config.pending_replication_high_water_bytes as f64);
+        metrics::gauge!("celeriant_replication_queue_high_water_bytes").set(config.internode_max_request_size as f64);
 
         let metrics_shard_label = [("shard_id", config.shard_id.to_string())];
 
@@ -327,6 +332,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             leader_client_address: RefCell::new(None),
             peer_node_id: Cell::new(None),
             last_rollback_at: Rc::new(Cell::new(None)),
+            last_logged_rollback_at: Cell::new(None),
             metrics_shard_label,
         })
     }
@@ -1163,12 +1169,8 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     /// 1. Validate request (idempotency, optimistic concurrency)
     /// 2. Build datablock and metablock
     /// 3. Add to pending queue, assigning indexes (not yet visible for reads)
-    /// 4. Wait for durability (based on config)
+    /// 4. Wait for durability
     /// 5. Return response with assigned indexes
-    ///
-    /// # Arguments
-    /// * `lease_index` - Current lease for write authorization
-    /// * `request` - Write request with events to append
     pub async fn write(&self, write_request: WriteRequest) -> Result<SuccessResponse, ShardWriteError> {
         
         let status = self.node_status.get();
@@ -1181,7 +1183,29 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             }
         };
 
-        if self.shard_mem_cache.borrow().is_replication_queue_pressured() {
+        if let Some(cause) = crate::replication_backpressure::check_replication_backpressure(
+            self.shard_mem_cache.borrow().is_inflight_pressured(),
+            self.last_rollback_at.get(),
+            self.config.replication_rollback_cooldown,
+            std::time::Instant::now(),
+        ) {
+            metrics::counter!(
+                "celeriant_writes_rejected_backpressure_total",
+                &[("cause", cause.metric_label())],
+            ).increment(1);
+            // log only when we transition into the cooldown window
+            if let crate::replication_backpressure::BackpressureCause::RollbackCooldown { remaining_ms } = cause {
+                let rb_at = self.last_rollback_at.get();
+                if self.last_logged_rollback_at.get() != rb_at {
+                    self.last_logged_rollback_at.set(rb_at);
+                    warn!(
+                        shard_id = self.config.shard_id,
+                        remaining_ms,
+                        cooldown_ms = self.config.replication_rollback_cooldown.as_millis() as u64,
+                        "ReplicationBackpressure: rollback cooldown active — rejecting writes",
+                    );
+                }
+            }
             return Err(ShardWriteError::ReplicationBackpressure);
         }
 
@@ -2624,6 +2648,7 @@ mod tests {
             shard_dir: dir.to_path_buf(),
             max_response_size: 16 * 1024 * 1024,
             max_request_size: 16 * 1024 * 1024,
+            internode_max_request_size: 64 * 1024 * 1024,
             aggregate_snapshots_cache_bytes: 64 * 1024 * 1024,
             aggregate_client_snapshots_cache_bytes: 32 * 1024 * 1024,
             read_max_chunk_size: 32 * 1024,
@@ -2634,8 +2659,7 @@ mod tests {
             list_wal_index_cache_bytes: 1024 * 1024,
             schema_cache_bytes: 4 * 1024 * 1024,
             max_schema_size_bytes: 16384,
-            pending_replication_high_water_bytes: 64 * 1024 * 1024,
-            max_catchup_gap_bytes: 100 * 1024 * 1024,
+            max_catchup_gap_bytes: Some(100 * 1024 * 1024),
             compaction_check_interval: Duration::from_secs(600),
             compaction_min_reclaimable_ratio: 0.20,
             compaction_temp_dir: std::path::PathBuf::from("/tmp/test_compaction"),

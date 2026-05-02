@@ -67,6 +67,7 @@ pub mod read_list_benchmark;
 pub mod rpi_cluster_bench;
 pub mod rpi_cluster_pool_bench;
 pub mod s3_concurrent_cas;
+pub mod s3_degraded_segment_summaries;
 pub mod s3_election;
 pub mod s3_failover_and_recovery;
 pub mod s3_failover_latency;
@@ -241,6 +242,11 @@ impl TestServer {
         config.data_root = data_root.clone();
         config.client_port = port;
         config.replication_port = port + 1;
+        // Tests run multiple servers on one host; the default metrics_port (9090) collides.
+        // Only derive a unique port when the caller hasn't set one explicitly.
+        if config.metrics_port == 9090 {
+            config.metrics_port = port + 2;
+        }
 
         println!("  Starting test server on port {}...", port);
         println!("  Data directory: {:?}", data_root);
@@ -538,6 +544,9 @@ impl ServerConfigExt for ServerConfig {
         args.push("--max-request-size".to_string());
         args.push(self.max_request_size.to_string());
 
+        args.push("--internode-max-request-size".to_string());
+        args.push(self.internode_max_request_size.to_string());
+
         args.push("--max-response-size".to_string());
         args.push(self.max_response_size.to_string());
 
@@ -627,10 +636,6 @@ impl ServerConfigExt for ServerConfig {
 
         }
 
-        if let Some(v) = self.pending_replication_high_water_bytes {
-            args.push("--pending-replication-high-water-bytes".to_string());
-            args.push(v.to_string());
-        }
         if let Some(v) = self.max_catchup_gap_bytes {
             args.push("--max-catchup-gap-bytes".to_string());
             args.push(v.to_string());

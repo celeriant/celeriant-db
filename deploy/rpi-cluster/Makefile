@@ -17,6 +17,7 @@ RESET  := \033[0m
 .PHONY: help setup-all setup-nodes setup-nvme setup-ktls setup-infra certs \
         deploy build ship restart stop start logs run-test teardown teardown-data \
         stop-cs1 stop-cs2 stop-minio kill-cs1 kill-cs2 kill-minio \
+        kill-cs1-no-restart kill-cs2-no-restart \
         start-cs1 start-cs2 start-minio status start-infra
 
 help: ## Show this help
@@ -127,7 +128,7 @@ stop-cs2: ## Graceful stop cs2
 
 stop-minio: ## Graceful stop MinIO on infra node
 	@printf "$(BOLD)>>> Stopping MinIO on $(INFRA_HOST)$(RESET)\n"
-	@ssh $(INFRA_HOST) 'cd ~/celeriant-infra && docker compose stop minio'
+	@bash infra-exec.sh stop minio
 
 kill-cs1: ## Hard kill cs1 (SIGKILL). Note: systemd `Restart=on-failure` auto-restarts after RestartSec=3.
 	@printf "$(RED)>>> Killing celeriant on $(LEADER_HOST) (cs1)$(RESET)\n"
@@ -136,6 +137,14 @@ kill-cs1: ## Hard kill cs1 (SIGKILL). Note: systemd `Restart=on-failure` auto-re
 kill-cs2: ## Hard kill cs2 (SIGKILL). Note: systemd `Restart=on-failure` auto-restarts after RestartSec=3.
 	@printf "$(RED)>>> Killing celeriant on $(FOLLOWER_HOST) (cs2)$(RESET)\n"
 	@ssh $(FOLLOWER_HOST) 'sudo systemctl kill -s KILL celeriant'
+
+kill-cs1-no-restart: ## Hard kill cs1 (SIGKILL) and cancel systemd auto-restart. Pairs with start-cs1.
+	@printf "$(RED)>>> Killing celeriant on $(LEADER_HOST) (cs1) [no auto-restart]$(RESET)\n"
+	@ssh $(LEADER_HOST) 'sudo systemctl kill -s KILL celeriant; sudo systemctl stop celeriant'
+
+kill-cs2-no-restart: ## Hard kill cs2 (SIGKILL) and cancel systemd auto-restart. Pairs with start-cs2.
+	@printf "$(RED)>>> Killing celeriant on $(FOLLOWER_HOST) (cs2) [no auto-restart]$(RESET)\n"
+	@ssh $(FOLLOWER_HOST) 'sudo systemctl kill -s KILL celeriant; sudo systemctl stop celeriant'
 
 pause-cs1: ## SIGSTOP cs1 — freezes the process without terminating it. Pairs with resume-cs1.
 	@printf "$(RED)>>> Pausing celeriant on $(LEADER_HOST) (cs1) [SIGSTOP]$(RESET)\n"
@@ -204,7 +213,7 @@ heal-host: ## Remove the nftables drop rules for DST:PORT from SRC. Idempotent. 
 
 kill-minio: ## Hard kill MinIO on infra node
 	@printf "$(RED)>>> Killing MinIO on $(INFRA_HOST)$(RESET)\n"
-	@ssh $(INFRA_HOST) 'cd ~/celeriant-infra && docker compose kill minio'
+	@bash infra-exec.sh kill minio
 
 start: ## Start Celeriant (leader first, then follower)
 	@printf "$(BOLD)>>> Starting celeriant on $(LEADER_HOST) (leader)$(RESET)\n"
@@ -225,14 +234,20 @@ start-cs2: ## Start cs2
 
 start-minio: ## Start MinIO on infra node
 	@printf "$(BOLD)>>> Starting MinIO on $(INFRA_HOST)$(RESET)\n"
-	@ssh $(INFRA_HOST) 'cd ~/celeriant-infra && docker compose start minio'
+	@bash infra-exec.sh start minio
+
+ifeq ($(INFRA_MODE),local)
+MINIO_HEALTH_CMD = curl -sf http://localhost:9000/minio/health/live >/dev/null 2>&1
+else
+MINIO_HEALTH_CMD = ssh $(INFRA_HOST) 'curl -sf http://localhost:9000/minio/health/live >/dev/null 2>&1'
+endif
 
 start-infra: ## Bring up the full infra stack and wait until MinIO is healthy
 	@printf "$(BOLD)>>> Starting infra stack on $(INFRA_HOST)$(RESET)\n"
-	@ssh $(INFRA_HOST) 'cd ~/celeriant-infra && docker compose up -d'
+	@bash infra-exec.sh up -d
 	@printf "Waiting for MinIO to become healthy...\n"
 	@for i in $$(seq 1 60); do \
-		if ssh $(INFRA_HOST) 'curl -sf http://localhost:9000/minio/health/live >/dev/null 2>&1'; then \
+		if $(MINIO_HEALTH_CMD); then \
 			printf "$(GREEN)MinIO healthy.$(RESET)\n"; exit 0; \
 		fi; \
 		sleep 1; \
@@ -245,7 +260,7 @@ status: ## Show service status on all nodes
 		ssh $$HOST 'systemctl is-active celeriant 2>/dev/null || echo "not running"'; \
 	done
 	@printf "$(BOLD)>>> $(INFRA_HOST) (minio)$(RESET)\n"
-	@ssh $(INFRA_HOST) 'cd ~/celeriant-infra && docker compose ps minio --format "{{.State}}" 2>/dev/null || echo "not running"'
+	@bash infra-exec.sh ps minio --format "{{.State}}" 2>/dev/null || echo "not running"
 
 logs: ## Tail logs from both data nodes (Ctrl+C to stop)
 	@printf "$(YELLOW)Tailing logs from $(LEADER_HOST) and $(FOLLOWER_HOST)... Ctrl+C to stop.$(RESET)\n"
@@ -276,13 +291,18 @@ run-test: ## Run cluster pool benchmark (builds on macOS/Windows/Linux)
 
 teardown: stop ## Stop all services (Celeriant + infra)
 	@printf "$(BOLD)>>> Stopping infra on $(INFRA_HOST)$(RESET)\n"
-	@ssh $(INFRA_HOST) 'cd ~/celeriant-infra && docker compose down'
+	@bash infra-exec.sh down
 	@printf "$(GREEN)All services stopped.$(RESET)\n"
 
+# To wipe both local and remote infra before switching INFRA_MODE:
+#   1. make teardown-data          (wipes the currently active side)
+#   2. edit config.env, set the other INFRA_MODE
+#   3. make teardown-data          (wipes the other side)
+# Each run wipes only the side that INFRA_MODE currently points at.
 teardown-data: teardown ## Stop all services AND wipe all data (DESTRUCTIVE)
 	@printf "$(RED)$(BOLD)Wiping ALL Celeriant data on $(LEADER_HOST), $(FOLLOWER_HOST), and $(INFRA_HOST)$(RESET)\n"
 	@for HOST in $(DATA_NODES); do \
 		ssh $$HOST 'sudo rm -rf $(REMOTE_DATA_ROOT)/*'; \
 	done
-	@ssh $(INFRA_HOST) 'cd ~/celeriant-infra && docker compose down -v'
+	@bash infra-exec.sh down -v
 	@printf "$(GREEN)All data wiped.$(RESET)\n"

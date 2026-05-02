@@ -47,8 +47,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Test 3: Backward compatibility (no identity)
     test_backward_compatibility_no_identity(server.address()).await?;
 
-    // Server WITH require_client_identity = true
-    let enforcing_port = base_port + 2;
+    // Server WITH require_client_identity = true.
+    // Skip past the first server's metrics port (`base_port + 2`).
+    let enforcing_port = base_port + 4;
     println!("Starting test server (enforcement ON) on port {}...", enforcing_port);
     let enforcing_config = ServerConfig {
         num_shards: Some(1),

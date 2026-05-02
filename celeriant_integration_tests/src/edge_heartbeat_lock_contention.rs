@@ -66,9 +66,11 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // ~60 consecutive missed heartbeats to trigger failover. A healthy system should
     // not miss any; a regressed system will miss all of them during throttle.
     config.heartbeat_interval_ms = 500;
-    // High water mark: 10MB — intentionally high so that moderate throttle pressure
-    // does NOT trigger S3 fallback. We want to verify no false S3 fallback occurs.
-    config.pending_replication_high_water_bytes = Some(10 * 1024 * 1024);
+    // Inter-node cap: 10MB. The test writes 100 small events; with the throttled
+    // proxy, in-flight bytes stay well below this. If the cap were tight enough
+    // to reject writes with ServerBusy, the replication lock would never be
+    // exercised and the regression check would silently pass.
+    config.internode_max_request_size = 10 * 1024 * 1024;
     // Allow longer internode timeout so the throttled connection is not dropped.
     config.internode_connection_timeout_ms = 60_000;
 

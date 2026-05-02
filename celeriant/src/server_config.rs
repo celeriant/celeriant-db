@@ -165,8 +165,11 @@ pub struct ServerConfig {
     )]
     pub routing_rule: RoutingRule,
 
-    #[arg(long, default_value_t = 1024 * 1024 * 16, env = "CELERIANT_MAX_REQUEST_SIZE", help = "Maximum request message size (16 MiB)")]
+    #[arg(long, default_value_t = 1024 * 1024 * 16, env = "CELERIANT_MAX_REQUEST_SIZE", help = "Maximum client request message size (16 MiB)")]
     pub max_request_size: u64,
+
+    #[arg(long, default_value_t = 1024 * 1024 * 64, env = "CELERIANT_INTERNODE_MAX_REQUEST_SIZE", help = "Maximum inter-node request message size; also bounds a single PCD on the replication path (64 MiB)")]
+    pub internode_max_request_size: u64,
 
     #[arg(long, default_value_t = 1024 * 1024 * 64, env = "CELERIANT_MAX_RESPONSE_SIZE", help = "Maximum response message size (64 MiB)")]
     pub max_response_size: u64,
@@ -230,10 +233,7 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 1024 * 1024 * 1024, env = "CELERIANT_SHARD_LOG_PREALLOCATE_BYTES", help = "Size of each individual log file on disk (1GB)")]
     pub shard_log_preallocate_bytes: u64,
 
-    #[arg(long, env = "CELERIANT_PENDING_REPLICATION_HIGH_WATER_BYTES", hide = true)]
-    pub pending_replication_high_water_bytes: Option<u64>,
-
-    #[arg(long, env = "CELERIANT_MAX_CATCHUP_GAP_BYTES", hide = true)]
+    #[arg(long, env = "CELERIANT_MAX_CATCHUP_GAP_BYTES", hide = true, help = "Max bytes of historical WAL the leader will replay to catch up a behind follower over TCP. Unset means unlimited.")]
     pub max_catchup_gap_bytes: Option<u64>,
 
     #[arg(long, default_value_t = 2, env = "CELERIANT_S3_MAX_CONCURRENT_FALLBACK_UPLOADS", help = "Max concurrent S3 fallback uploads across all shards. Prevents MinIO saturation that can starve lease renewal.")]
@@ -735,6 +735,7 @@ impl ServerConfig {
             read_max_chunk_size: self.read_max_chunk_size,
             write_max_chunk_size: self.write_max_chunk_size,
             max_request_size: self.max_request_size,
+            internode_max_request_size: self.internode_max_request_size,
             max_response_size: self.max_response_size,
             shard_log_preallocate_bytes: self.shard_log_preallocate_bytes,
             recent_write_cache_bytes: memory_budget.recent_write_cache_bytes,
@@ -762,9 +763,8 @@ impl ServerConfig {
             list_wal_index_cache_bytes: memory_budget.list_wal_index_cache_bytes,
             schema_cache_bytes: memory_budget.schema_cache_bytes,
             max_schema_size_bytes: self.max_schema_size_bytes,
-            pending_replication_high_water_bytes: self.pending_replication_high_water_bytes.unwrap_or(memory_budget.replication_high_water_bytes),
             max_clock_drift_ms: self.max_clock_drift_ms,
-            max_catchup_gap_bytes: self.max_catchup_gap_bytes.unwrap_or(memory_budget.max_catchup_gap_bytes),
+            max_catchup_gap_bytes: self.max_catchup_gap_bytes,
             internode_connection_timeout: Some(Duration::from_millis(self.internode_connection_timeout_ms)),
             internode_request_timeout: Duration::from_millis(self.internode_request_timeout_ms),
             server_compression_algorithm: match self.server_compression_algorithm {
@@ -855,6 +855,7 @@ impl ServerConfig {
         check_field!(write_max_chunk_size);
         check_field!(routing_rule);
         check_field!(max_request_size);
+        check_field!(internode_max_request_size);
         check_field!(max_response_size);
         check_field!(max_requested_latency_ms);
         check_field!(list_max_duration_ms);
@@ -940,6 +941,7 @@ impl Default for ServerConfig {
             write_max_chunk_size: 32 * 1024,
             max_open_files: 1000,
             max_request_size: 16 * 1024 * 1024,
+            internode_max_request_size: 64 * 1024 * 1024,
             max_response_size: 64 * 1024 * 1024,
             max_requested_latency_ms: 2000,
             log_level: "info".to_string(),
@@ -950,7 +952,6 @@ impl Default for ServerConfig {
             s3_secret_access_key: None,
             s3_subfolder: None,
             shard_log_preallocate_bytes: 1024 * 1024 * 1024,
-            pending_replication_high_water_bytes: None,
             max_catchup_gap_bytes: None,
             s3_max_concurrent_fallback_uploads: 2,
             fsync_delay_us: 17000,

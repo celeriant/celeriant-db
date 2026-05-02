@@ -209,6 +209,7 @@ async fn dispatch_test(name: &str) -> Result<(), Box<dyn std::error::Error>> {
         "rpi_cluster_bench" => rpi_cluster_bench::run().await,
         "rpi_cluster_pool_bench" => rpi_cluster_pool_bench::run().await,
         "s3_concurrent_cas" => s3_concurrent_cas::run().await,
+        "s3_degraded_segment_summaries" => s3_degraded_segment_summaries::run().await,
         "s3_election" => s3_election::run().await,
         "s3_failover_and_recovery" => s3_failover_and_recovery::run().await,
         "s3_failover_latency" => s3_failover_latency::run().await,

@@ -224,6 +224,13 @@ pub fn all_tests() -> &'static [TestEntry] {
             distributed: true,
         },
         TestEntry {
+            name: "s3_degraded_segment_summaries",
+            description: "Sealed-segment .summary sidecars land on local NVMe across rotations on both TCP and S3 fallback paths",
+            estimated_secs: 70,
+            categories: &[Replication, Durability],
+            distributed: true,
+        },
+        TestEntry {
             name: "s3_follower_crash",
             description: "Leader detects heartbeat loss, pre-renews S3 lease, continues writes",
             estimated_secs: 25,
@@ -375,7 +382,7 @@ pub fn all_tests() -> &'static [TestEntry] {
         },
         TestEntry {
             name: "invariant_replication_queue_pressure",
-            description: "Throttled follower triggers S3 fallback at high water mark",
+            description: "Throttled follower saturates inflight cap, surfacing ServerBusy backpressure; cluster converges after unthrottle",
             estimated_secs: 37,
             categories: &[Invariant, Replication],
             distributed: true,

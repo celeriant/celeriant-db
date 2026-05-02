@@ -84,7 +84,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader>(
     shard_id: u32,
     node_id: u128,
     peer_node_id: Option<u128>,
-    max_catchup_gap_bytes: u64,
+    max_catchup_gap_bytes: Option<u64>,
 ) -> Result<S3CatchupResult, S3CatchupError> {
     let mut result = S3CatchupResult {
         batches_applied: 0,
@@ -149,7 +149,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader>(
             .map(|c| c.size)
             .sum();
 
-        if !first_iteration && remaining_bytes < max_catchup_gap_bytes {
+        if !first_iteration && max_catchup_gap_bytes.map_or(true, |cap| remaining_bytes < cap) {
             result.fully_caught_up = true;
             break;
         }
@@ -309,7 +309,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader>(
         if !truncated && result.batches_applied == inner_applied {
             // No progress this iteration. Check if remaining is small
             // enough for TCP to fill the gap.
-            if remaining_bytes < max_catchup_gap_bytes {
+            if max_catchup_gap_bytes.map_or(true, |cap| remaining_bytes < cap) {
                 result.fully_caught_up = true;
             }
             break;
@@ -835,7 +835,7 @@ mod tests {
                 shard_id,
                 99,
                 peer_node_id,
-                100, // max_catchup_gap_bytes
+                Some(100), // max_catchup_gap_bytes
             )
             .await
         }

@@ -30,6 +30,15 @@ impl ValidatedNodeStatus {
         Self { status: NodeStatus::Fenced, max_clock_drift_ms: 0, lease_expires_at_ms: 0 }
     }
 
+    pub fn current_budget(&self) -> Option<std::time::Duration> {
+        if !self.effective_node_status().is_leader() {
+            return None;
+        }
+        let now = unix_epoch_now_ms();
+        let safe_until = self.lease_expires_at_ms.saturating_sub(self.max_clock_drift_ms);
+        Some(std::time::Duration::from_millis(safe_until.saturating_sub(now)))
+    }
+
     pub fn create_standalone() -> Self {
         Self { status: NodeStatus::Standalone, max_clock_drift_ms: 0, lease_expires_at_ms: 0 }
     }
@@ -281,6 +290,35 @@ mod tests {
         for (status, expected) in cases {
             let vns = ValidatedNodeStatus::create_custom_status(status, DRIFT, FAR_FUTURE);
             assert_eq!(vns.can_accept_writes(), expected, "can_accept_writes wrong for {:?}", status);
+        }
+    }
+
+
+    #[test]
+    fn current_budget() {
+        let now = unix_epoch_now_ms();
+        // expected: None means no budget; Some((min, max)) is the allowed ms range.
+        let cases: [(NodeStatus, u64, Option<(u64, u64)>, &str); 8] = [
+            (NodeStatus::Follower { leader_lease_index: 1 }, FAR_FUTURE, None, "follower"),
+            (NodeStatus::Standalone, FAR_FUTURE, None, "standalone"),
+            (NodeStatus::BootCatchup, FAR_FUTURE, None, "boot catchup"),
+            (NodeStatus::Fenced, FAR_FUTURE, None, "fenced"),
+            (NodeStatus::FollowerCatchingUp { leader_lease_index: 1 }, FAR_FUTURE, None, "follower catching up"),
+            (NodeStatus::Leader { lease_index: 1 }, now + 100, None, "leader inside fence window"),
+            (NodeStatus::Leader { lease_index: 1 }, FAR_PAST, None, "leader lease fully expired"),
+            // safe_until = (now+5000) - 500 drift = now+4500; allow ±50ms for execution time
+            (NodeStatus::Leader { lease_index: 1 }, now + 5000, Some((4400, 4500)), "healthy leader"),
+        ];
+        for (status, expires_ms, expected, label) in cases {
+            let vns = ValidatedNodeStatus::create_custom_status(status, DRIFT, expires_ms);
+            match expected {
+                None => assert!(vns.current_budget().is_none(), "{label}: expected None"),
+                Some((min, max)) => {
+                    let budget = vns.current_budget().unwrap_or_else(|| panic!("{label}: expected Some"));
+                    let ms = u64::try_from(budget.as_millis()).expect("budget fits in u64");
+                    assert!(ms > min && ms <= max, "{label}: budget {ms}ms out of range ({min}, {max}]");
+                }
+            }
         }
     }
 }

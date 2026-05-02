@@ -7,9 +7,8 @@
 //! that lives outside the lock, and only briefly re-acquire the replication lock for
 //! `send_kick()` at the end.
 //!
-//! Scenario: heavily throttle the follower to build replication queue pressure beyond
-//! `pending_replication_high_water_bytes`, triggering S3 fallback. During fallback,
-//! verify that:
+//! Scenario: heavily throttle the follower so the in-flight workset exceeds
+//! `max_catchup_gap_bytes`, triggering S3 fallback. During fallback, verify that:
 //!   1. Heartbeats continue flowing (follower does not trigger failover)
 //!   2. S3 uploads complete successfully (fallback path is exercised)
 //!   3. No deadlock occurs (both nodes remain alive)
@@ -55,8 +54,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let num_shards = 2;
 
     // TcpProxy intercepts the follower's replication port.
-    // Heavy throttle will cause queue pressure, triggering S3 fallback.
-    // The test verifies heartbeats survive even while S3 uploads are in flight.
+    // Heavy throttle plus a small `max_catchup_gap_bytes` forces the leader to
+    // fall back to S3 when the workset exceeds the gap. The test verifies
+    // heartbeats survive even while S3 uploads are in flight.
     let proxy = TcpProxy::start(proxy_port, format!("127.0.0.1:{}", follower_port + 1)).await?;
     println!("  Proxy {} -> follower replication port {}", proxy_port, follower_port + 1);
 
@@ -69,11 +69,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // entirely — not just slowed. Missing all heartbeats for >lease_duration causes failover.
     config.heartbeat_lease_duration_ms = 30_000;
     config.s3_lease_duration_ms = 30_000;
-    // Low high water mark: 32KB triggers S3 fallback when concurrent writes accumulate.
-    // With 20 concurrent writers × 4KB events in one fsync window, the pending queue
-    // reaches ~240KB, far above this threshold. Must be above ~12KB (single event pending
-    // size with 3x memory multiplier) so post-recovery serial writes use TCP, not S3.
-    config.pending_replication_high_water_bytes = Some(32_768); // 32KB
+    // Low inter-node cap: 32KB. Combined with the small catchup gap below, the
+    // throttled-replication workset trips the gap → S3 fallback. Must be above
+    // single-event size so post-recovery serial writes use TCP, not S3.
+    config.internode_max_request_size = 32_768; // 32KB
     // Low max_catchup_gap_bytes: forces a kick after a small gap so the follower receives
     // the S3 pointer promptly after unthrottle.
     config.max_catchup_gap_bytes = Some(4096);

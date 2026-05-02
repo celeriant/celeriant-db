@@ -900,7 +900,7 @@ async fn read_cluster_request<R: ReplicationClient + 'static, D: S3Downloader + 
     // detects dead peers at the OS level. An idle replication connection is
     // normal between write bursts and should not be closed.
     let result: Result<(ClusterRequest, u32), ReadWireDataError> = async {
-        let header = WireHeader::from_reader(tcp_stream, ctx.config.max_request_size).await
+        let header = WireHeader::from_reader(tcp_stream, ctx.config.internode_max_request_size).await
             .map_err(ReadWireDataError::ReadHeaderFailure)?;
         let version = header.version;
         let req = ClusterRequest::read_from_header(header, tcp_stream).await?;
@@ -969,7 +969,7 @@ async fn read_cluster_request_from<Rd: futures_lite::AsyncReadExt + Unpin, R: Re
     ctx: &ConnectionContext<R, D, S>,
 ) -> Option<(ClusterRequest, u32)> {
     let result: Result<(ClusterRequest, u32), ReadWireDataError> = async {
-        let header = WireHeader::from_reader(reader, ctx.config.max_request_size).await
+        let header = WireHeader::from_reader(reader, ctx.config.internode_max_request_size).await
             .map_err(ReadWireDataError::ReadHeaderFailure)?;
         let version = header.version;
         let req = ClusterRequest::read_from_header(header, reader).await?;
@@ -1402,6 +1402,7 @@ mod tests {
             read_max_chunk_size: 1024,
             write_max_chunk_size: 1024,
             max_request_size: 1024,
+            internode_max_request_size: 64 * 1024 * 1024,
             max_response_size: 1024,
             server_compression_algorithm: CompressionType::Snappy,
             slow_client_timeout: Duration::from_secs(30),
@@ -1423,10 +1424,9 @@ mod tests {
             list_wal_index_cache_bytes: 1024,
             schema_cache_bytes: 4_194_304, // 4MB
             max_schema_size_bytes: 16384,
-            pending_replication_high_water_bytes: 67_108_864, // 64MB
             replication_delay: Duration::from_millis(20),
             max_clock_drift_ms: 5000,
-            max_catchup_gap_bytes: 104_857_600,
+            max_catchup_gap_bytes: Some(104_857_600),
             internode_connection_timeout: None,
             internode_request_timeout: Duration::from_secs(10),
             tls_config: None,

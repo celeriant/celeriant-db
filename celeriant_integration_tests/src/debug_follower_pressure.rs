@@ -73,7 +73,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = s3_cluster_config(
         num_shards, &region, &bucket, &access_key, &secret_key, &endpoint, allow_http,
     );
-    config.pending_replication_high_water_bytes = Some(262144);
+    config.internode_max_request_size = 262144;
     config.max_catchup_gap_bytes = Some(100_000_000);
     // 10-minute lease: plenty of time for debugging, prevents follower takeover
     config.heartbeat_lease_duration_ms = 600_000;

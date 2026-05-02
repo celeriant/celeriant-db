@@ -1,3 +1,5 @@
+use crate::intra_batch_chain::IntraBatchChainBreak;
+
 #[derive(Debug, Clone)]
 pub enum ReplicateToS3Error {
     S3NotConfigured,
@@ -13,4 +15,5 @@ pub enum ReplicateToS3Error {
         expected_wal_index: u64,
         actual_wal_index: u64,
     },
+    IntraBatchChainBreak(IntraBatchChainBreak),
 }

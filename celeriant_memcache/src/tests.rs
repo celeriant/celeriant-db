@@ -37,7 +37,7 @@ fn cache_with(
     agg_write_snap_bytes: u64,
     agg_client_snap_bytes: u64,
     list_wal_index_bytes: u64,
-    replication_high_water: u64,
+    internode_max_request_size: u64,
 ) -> ShardMemCache<StubValidator> {
     ShardMemCache::new(
         recent_write_bytes,
@@ -45,7 +45,7 @@ fn cache_with(
         agg_client_snap_bytes,
         list_wal_index_bytes,
         4 * 1024 * 1024, // schema_cache_bytes
-        replication_high_water,
+        internode_max_request_size,
     )
 }
 
@@ -1106,15 +1106,14 @@ fn peek_pending_replication() {
 }
 
 #[test]
-fn replication_high_water_mark() {
-    let mut c = cache_with(64 * 1024, 64 * 1024, 64 * 1024, 64 * 1024, 1); // 1 byte high water
+fn inflight_pressure_check() {
+    let mut c = cache_with(64 * 1024, 64 * 1024, 64 * 1024, 64 * 1024, 1); // 1 byte cap
 
-    assert!(!c.is_replication_queue_pressured());
+    assert!(!c.is_inflight_pressured());
 
-    let exceeded = c.push_pending_replication(test_pending_commit_data());
+    c.push_pending_replication(test_pending_commit_data());
 
-    assert!(exceeded);
-    assert!(c.is_replication_queue_pressured());
+    assert!(c.is_inflight_pressured());
 }
 
 // ── WAL Index Position Cache ──

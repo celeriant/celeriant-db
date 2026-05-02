@@ -74,17 +74,26 @@ pub struct ShardMemCache<V: Validate> {
     /// Cleared on fsync rollback.
     pending_schema_registrations: HashSet<SchemaKey>,
 
-    /// Batches awaiting replication (post-fsync, pre-commit)
-    /// Intentionally unbounded (like pending_append_queue) - high water mark triggers
-    /// S3 fallback at ReplicationCoordinator level rather than eviction here.
-    /// Queue pressure is detected via pending_replication_high_water_bytes.
+    /// Batches awaiting replication (post-fsync, pre-commit). Bounded indirectly
+    /// by the inflight cap: writes are rejected at entry when
+    /// `pending_append_bytes + pending_replication_bytes >= internode_max_request_size`,
+    /// so the snapshot captured from this queue always fits in one TCP request.
     pending_replication_batches: Vec<PendingCommitData>,
 
     /// Total bytes in pending replication queue
     pending_replication_bytes: u64,
 
-    /// High water mark - when exceeded, trigger S3 fallback
-    pending_replication_high_water_bytes: u64,
+    /// Total bytes in the pre-fsync queue (`pending_append_queue`). Updated on
+    /// every push and reset to zero in `take_sync_positions_snapshot` when fsync
+    /// drains the queue into a PCD.
+    pending_append_bytes: u64,
+
+    /// Inflight cap. The sum `pending_append_bytes + pending_replication_bytes`
+    /// must stay below this value; checked at write entry and surfaced as
+    /// `ReplicationBackpressure` (wire: ServerBusy) when reached. Equal to the
+    /// inter-node TCP request cap so the next replication snapshot always fits
+    /// in one TCP request.
+    internode_max_request_size: u64,
 
     /// Flag set when fsync rollback occurs, cleared by following leader
     /// Used to distinguish "empty queue due to rollback" from "empty queue due to race".
@@ -254,6 +263,7 @@ impl<V: Validate> ShardMemCache<V> {
             aggregate.min_event_batch_index = keep_from_event_batch_index;
         }
 
+        self.pending_append_bytes = self.pending_append_bytes.saturating_add(shard_log_queue_item.size_bytes());
         self.pending_append_queue.push(shard_log_queue_item);
     }
 
@@ -308,6 +318,8 @@ impl<V: Validate> ShardMemCache<V> {
     /// Add prepared items directly to the pending queue (used for replication).
     /// Does not update aggregate/client tracking - those are handled on commit.
     pub fn add_to_pending_queue(&mut self, items: Vec<ShardLogQueueItem>) {
+        let added: u64 = items.iter().map(|i| i.size_bytes()).sum();
+        self.pending_append_bytes = self.pending_append_bytes.saturating_add(added);
         self.pending_append_queue.extend(items);
     }
 
@@ -332,6 +344,7 @@ impl<V: Validate> ShardMemCache<V> {
         aggregate.event_batch_index = event_batch_index;
         aggregate.event_index = event_index;
 
+        self.pending_append_bytes = self.pending_append_bytes.saturating_add(shard_log_queue_item.size_bytes());
         self.pending_append_queue.push(shard_log_queue_item);
     }
 
@@ -374,6 +387,7 @@ impl<V: Validate> ShardMemCache<V> {
             })
             .or_insert(client_event_index);
 
+        self.pending_append_bytes = self.pending_append_bytes.saturating_add(shard_log_queue_item.size_bytes());
         self.pending_append_queue.push(shard_log_queue_item);
     }
 
@@ -388,6 +402,7 @@ impl<V: Validate> ShardMemCache<V> {
         // Clear out the pending queue immediately, leaving it ready for new writes to be queued
         let mut pending_append_queue = vec![];
         std::mem::swap(&mut pending_append_queue, &mut self.pending_append_queue);
+        self.pending_append_bytes = 0;
 
         // Drain pending schemas — schema_cache is the primary duplicate guard from here
         let mut pending_schema_registrations = HashSet::new();
@@ -429,6 +444,7 @@ impl<V: Validate> ShardMemCache<V> {
         self.no_schema_cache.clear();
         if !self.pending_append_queue.is_empty() {
             self.pending_append_queue.clear();
+            self.pending_append_bytes = 0;
             self.fsync_rollback_occurred = true;
         }
     }
@@ -843,10 +859,9 @@ impl<V: Validate> ShardMemCache<V> {
 
     /// Add a batch to the pending replication queue
     /// Returns true if high water mark exceeded
-    pub fn push_pending_replication(&mut self, batch: PendingCommitData) -> bool {
+    pub fn push_pending_replication(&mut self, batch: PendingCommitData) {
         self.pending_replication_bytes = self.pending_replication_bytes.saturating_add(batch.size_bytes());
         self.pending_replication_batches.push(batch);
-        self.is_replication_queue_pressured()
     }
 
     /// Take all pending batches for replication
@@ -874,9 +889,25 @@ impl<V: Validate> ShardMemCache<V> {
         self.pending_replication_bytes
     }
 
-    /// Check if high water mark exceeded
-    pub fn is_replication_queue_pressured(&self) -> bool {
-        self.pending_replication_bytes > self.pending_replication_high_water_bytes
+    pub fn pending_replication_count(&self) -> usize {
+        self.pending_replication_batches.len()
+    }
+
+    pub fn pending_append_bytes(&self) -> u64 {
+        self.pending_append_bytes
+    }
+
+    /// Combined inflight bytes: PCDs awaiting replication plus uncommitted
+    /// pre-fsync queue. Both contribute to the next replication snapshot.
+    pub fn inflight_bytes(&self) -> u64 {
+        self.pending_append_bytes.saturating_add(self.pending_replication_bytes)
+    }
+
+    /// True when combined inflight bytes have reached the inter-node TCP cap.
+    /// Reactive: a slight overshoot of one write is possible because the
+    /// rejected write is already inflight when it's checked.
+    pub fn is_inflight_pressured(&self) -> bool {
+        self.inflight_bytes() >= self.internode_max_request_size
     }
 
     /// Clear caches that may contain un-replicated data (used during rollback).
@@ -911,7 +942,7 @@ impl<V: Validate> ShardMemCache<V> {
         aggregate_client_snapshots_cache_bytes: u64,
         list_wal_index_cache_bytes: u64,
         schema_cache_bytes: u64,
-        pending_replication_high_water_bytes: u64,
+        internode_max_request_size: u64,
     ) -> Self {
         let aggregate_cap = NonZeroUsize::new((aggregate_write_snapshots_cache_bytes / 112) as usize).unwrap_or(NonZeroUsize::new(10_000).unwrap());
         let client_cap = NonZeroUsize::new((aggregate_client_snapshots_cache_bytes / 128) as usize).unwrap_or(NonZeroUsize::new(100_000).unwrap());
@@ -938,7 +969,8 @@ impl<V: Validate> ShardMemCache<V> {
             pending_schema_registrations: HashSet::new(),
             pending_replication_batches: Vec::new(),
             pending_replication_bytes: 0,
-            pending_replication_high_water_bytes,
+            pending_append_bytes: 0,
+            internode_max_request_size,
             fsync_rollback_occurred: false,
             replication_rollback_occurred: false,
             segment_summary: HashMap::new(),
@@ -1082,6 +1114,13 @@ impl<V: Validate> ShardMemCache<V> {
             }
             MetablockKind::SchemaRegistration(_) => {}
         }
+    }
+
+    /// Snapshot the log_ids of sealed segments whose summary is staged in memcache and
+    /// awaiting sidecar write. Caller decides eligibility against read/write cursors and
+    /// then calls `take_sealed_segment_summary` for each accepted id.
+    pub fn pending_sealed_summary_log_ids(&self) -> Vec<u64> {
+        self.sealed_segment_summaries.keys().copied().collect()
     }
 
     /// Take the sealed segment summary, converting to SegmentSummaryPayload for sidecar write.
