@@ -75,6 +75,10 @@ fn is_batch_contiguous(batch: &FallbackBatch) -> bool {
     batch.items.windows(2).all(|w| w[0].metablock.wal_index + 1 == w[1].metablock.wal_index)
 }
 
+fn is_batch_lease_consistent(batch: &FallbackBatch) -> bool {
+    batch.items.iter().all(|i| i.metablock.lease_index == batch.lease_index)
+}
+
 pub(crate) async fn catchup_from_s3<D: S3Downloader>(
     log_segments_cache: &Rc<LogSegmentsCache>,
     shard_mem_cache: &Rc<RefCell<MemCache>>,
@@ -189,31 +193,35 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader>(
                     continue;
                 }
 
+                if !is_batch_lease_consistent(&batch) {
+                    tracing::warn!(shard_id, path = %candidate.path, batch_lease = batch.lease_index, "skipping S3 batch with inconsistent per-item lease_index");
+                    continue;
+                }
+
                 downloaded.push((batch, candidate));
             }
 
-            // Dedupe per start_wal_index: among batches sharing a start, only the one with the
-            // highest upload_sequence is authoritative. Lower-sequence siblings are pre-rollback
-            // generations and must never contribute to the chain - drop them from consideration.
+            // Dedupe per start_wal_index by (lease_index, upload_sequence) lex. lease_index is
+            // globally monotonic via S3 CAS election; upload_sequence is per-process and resets
+            // on handover, so it is only a within-lease tiebreaker.
             let mut by_start: HashMap<u64, (FallbackBatch, &CatchupCandidate)> = HashMap::new();
             for (batch, cand) in downloaded {
                 let start = cand.start_wal_index;
+                let key = (batch.lease_index, batch.upload_sequence);
                 let replace = match by_start.get(&start) {
-                    Some((prev, _)) => batch.upload_sequence > prev.upload_sequence,
+                    Some((prev, _)) => key > (prev.lease_index, prev.upload_sequence),
                     None => true,
                 };
                 if replace {
                     if let Some((prev_batch, prev_cand)) = by_start.insert(start, (batch, cand)) {
-                        tracing::debug!(shard_id, path = %prev_cand.path, stale_seq = prev_batch.upload_sequence, "excluded stale same-start batch");
+                        tracing::debug!(shard_id, path = %prev_cand.path, stale_lease = prev_batch.lease_index, stale_seq = prev_batch.upload_sequence, "excluded stale same-start batch");
                     }
                 } else if let Some((winner_batch, _)) = by_start.get(&start) {
-                    tracing::debug!(shard_id, path = %cand.path, stale_seq = batch.upload_sequence, winner_seq = winner_batch.upload_sequence, "excluded stale same-start batch");
+                    tracing::debug!(shard_id, path = %cand.path, stale_lease = batch.lease_index, stale_seq = batch.upload_sequence, winner_lease = winner_batch.lease_index, winner_seq = winner_batch.upload_sequence, "excluded stale same-start batch");
                 }
             }
 
-            // Among surviving per-start winners, pick the one with highest upload_sequence -
-            // the most recent authoritative write covering next_wal_index.
-            let best = by_start.into_values().max_by_key(|(batch, _)| batch.upload_sequence);
+            let best = by_start.into_values().max_by_key(|(batch, _)| (batch.lease_index, batch.upload_sequence));
 
             let (batch, candidate) = match best {
                 Some(b) => b,
@@ -696,10 +704,16 @@ mod tests {
     }
 
     fn make_fallback_batch_with_seq(shard_id: u32, start: u64, end: u64, tip_hash: [u8; 32], node_id: u128, upload_sequence: u64) -> (String, Bytes) {
-        let mut batch = FallbackBatch::new(start, end, shard_id, node_id, upload_sequence);
+        make_fallback_batch_with_lease_seq(shard_id, start, end, tip_hash, node_id, upload_sequence, 0)
+    }
+
+    fn make_fallback_batch_with_lease_seq(shard_id: u32, start: u64, end: u64, tip_hash: [u8; 32], node_id: u128, upload_sequence: u64, lease_index: u64) -> (String, Bytes) {
+        let mut batch = FallbackBatch::new(start, end, shard_id, node_id, upload_sequence, lease_index);
         for wal_index in start..=end {
+            let mut mb = test_metablock(wal_index, tip_hash);
+            mb.lease_index = lease_index;
             batch.push_item(FallbackItem {
-                metablock: test_metablock(wal_index, tip_hash),
+                metablock: mb,
                 datablock: None,
             });
         }
@@ -1412,7 +1426,7 @@ mod tests {
 
     #[test]
     fn test_fallback_batch_s3_path() {
-        let batch = FallbackBatch::new(5, 10, 2, 0, 0);
+        let batch = FallbackBatch::new(5, 10, 2, 0, 0, 0);
         assert_eq!(
             fallback_batch_path(batch.shard_id, batch.fallback_index, batch.end_wal_index, batch.uploaded_by_node_id),
             "cluster/fallback/shard_002/batch_000000005_000000010_00000000-0000-0000-0000-000000000000.bin"
@@ -1492,6 +1506,7 @@ mod tests {
             shard_id: 7,
             uploaded_by_node_id: 1,
             upload_sequence: 0,
+            lease_index: 0,
             items: vec![
                 FallbackItem {
                     metablock: metablock1,
@@ -1569,6 +1584,7 @@ mod tests {
             shard_id: 5,
             uploaded_by_node_id: 1,
             upload_sequence: 0,
+            lease_index: 0,
             items: vec![
                 FallbackItem {
                     metablock: metablock_first,
@@ -1587,7 +1603,7 @@ mod tests {
 
     #[test]
     fn test_shard_id_narrowing() {
-        let batch_0 = FallbackBatch::new(1, 5, 0, 0, 0);
+        let batch_0 = FallbackBatch::new(1, 5, 0, 0, 0, 0);
         assert_eq!(
             fallback_batch_path(
                 batch_0.shard_id,
@@ -1598,7 +1614,7 @@ mod tests {
             "cluster/fallback/shard_000/batch_000000001_000000005_00000000-0000-0000-0000-000000000000.bin"
         );
 
-        let batch_999 = FallbackBatch::new(1, 10, 999, 0, 0);
+        let batch_999 = FallbackBatch::new(1, 10, 999, 0, 0, 0);
         assert_eq!(
             fallback_batch_path(
                 batch_999.shard_id,
@@ -1632,6 +1648,52 @@ mod tests {
             assert_eq!(tc.wal_index(), 5, "winner (seq=2, end=5) should be applied, not stale (seq=1, end=3)");
             assert_eq!(result.batches_applied, 1);
             assert!(dl.deleted_paths().is_empty());
+
+            tc.close().await;
+        });
+    }
+
+    #[test]
+    fn divergent_s3_paths_higher_lease_index_wins() {
+        // Cross-leader scenario: prior leader (lease=1) uploaded chain A with seq=5.
+        // New leader (lease=2) just uploaded chain B with seq=1. Under upload_sequence
+        // alone the stale chain A would win (seq=5 > seq=1) and we'd diverge.
+        // (lease_index, upload_sequence) lex must pick B because lease_index is
+        // globally monotonic via S3 CAS.
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+            let dl = Rc::new(MockDownloader::new());
+
+            let (path_a, data_a) = make_fallback_batch_with_lease_seq(0, 1, 3, GENESIS_HASH, 1, 5, 1);
+            let (path_b, data_b) = make_fallback_batch_with_lease_seq(0, 1, 5, GENESIS_HASH, 2, 1, 2);
+            dl.insert(path_a, data_a);
+            dl.insert(path_b, data_b);
+
+            let result = tc.catchup(&dl, 0, 10).await.unwrap();
+            assert_eq!(tc.wal_index(), 5, "higher-lease chain B (lease=2, seq=1, end=5) must win over stale chain A (lease=1, seq=5, end=3)");
+            assert_eq!(result.batches_applied, 1);
+
+            tc.close().await;
+        });
+    }
+
+    #[test]
+    fn divergent_s3_paths_same_lease_higher_upload_sequence_wins() {
+        // Within a single lease, upload_sequence remains the tiebreaker.
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+            let dl = Rc::new(MockDownloader::new());
+
+            let (path_a, data_a) = make_fallback_batch_with_lease_seq(0, 1, 3, GENESIS_HASH, 1, 2, 1);
+            let (path_b, data_b) = make_fallback_batch_with_lease_seq(0, 1, 5, GENESIS_HASH, 2, 5, 1);
+            dl.insert(path_a, data_a);
+            dl.insert(path_b, data_b);
+
+            let result = tc.catchup(&dl, 0, 10).await.unwrap();
+            assert_eq!(tc.wal_index(), 5, "within-lease tiebreaker: seq=5 wins over seq=2");
+            assert_eq!(result.batches_applied, 1);
 
             tc.close().await;
         });

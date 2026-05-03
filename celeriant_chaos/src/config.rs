@@ -34,8 +34,14 @@ impl ClusterConfig {
     /// - `certs/{client-ca.crt, client.crt, client.key}` for the bench mTLS client
     ///
     /// Required env keys: `LEADER_HOST`, `FOLLOWER_HOST`. Optional with
-    /// defaults: `CLIENT_PORT` (10000), `METRICS_PORT` (9090), `INFRA_HOST`
-    /// (None — deploys without a dedicated infra node simply omit it).
+    /// defaults: `CLIENT_PORT` (10000), `METRICS_PORT` (9090).
+    ///
+    /// Infra host resolution: if `INFRA_HOST` is set literally, use it.
+    /// Otherwise, derive from `INFRA_MODE` ∈ {`local`,`remote`} +
+    /// `INFRA_HOST_LOCAL` / `INFRA_HOST_REMOTE`. Mirrors the Makefile's
+    /// derivation so config.env stays the single source of truth.
+    /// Deploys without a dedicated infra node (e.g. EC2/real-S3) simply
+    /// omit all of these.
     pub fn load(deploy_dir: PathBuf) -> Result<Self, String> {
         let env_path = pick_env_file(&deploy_dir)?;
         let raw = fs::read_to_string(&env_path)
@@ -58,7 +64,7 @@ impl ClusterConfig {
         Ok(Self {
             leader_host: get_required("LEADER_HOST")?,
             follower_host: get_required("FOLLOWER_HOST")?,
-            infra_host: map.get("INFRA_HOST").filter(|s| !s.is_empty()).cloned(),
+            infra_host: resolve_infra_host(&map),
             client_port: parse_port("CLIENT_PORT", 10000)?,
             replication_port: parse_port("REPLICATION_PORT", 10001)?,
             metrics_port: parse_port("METRICS_PORT", 9090)?,
@@ -96,6 +102,18 @@ fn pick_env_file(deploy_dir: &PathBuf) -> Result<PathBuf, String> {
         "neither config.env nor .cluster-env found in {}",
         deploy_dir.display()
     ))
+}
+
+fn resolve_infra_host(map: &HashMap<String, String>) -> Option<String> {
+    if let Some(v) = map.get("INFRA_HOST").filter(|s| !s.is_empty()) {
+        return Some(v.clone());
+    }
+    let key = match map.get("INFRA_MODE").map(String::as_str) {
+        Some("local") => "INFRA_HOST_LOCAL",
+        Some("remote") => "INFRA_HOST_REMOTE",
+        _ => return None,
+    };
+    map.get(key).filter(|s| !s.is_empty()).cloned()
 }
 
 /// Strict-enough parser for the bash-style config.env.

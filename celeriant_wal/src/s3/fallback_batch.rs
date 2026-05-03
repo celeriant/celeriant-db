@@ -10,6 +10,7 @@ pub struct FallbackBatch {
     pub uploaded_by_node_id: u128,
     pub items: Vec<FallbackItem>,
     pub upload_sequence: u64,
+    pub lease_index: u64,
 }
 
 #[derive(Debug, Clone, Encode, Decode)]
@@ -19,7 +20,7 @@ pub struct FallbackItem {
 }
 
 impl FallbackBatch {
-    pub fn new(fallback_index: u64, end_wal_index: u64, shard_id: u32, uploaded_by_node_id: u128, upload_sequence: u64) -> Self {
+    pub fn new(fallback_index: u64, end_wal_index: u64, shard_id: u32, uploaded_by_node_id: u128, upload_sequence: u64, lease_index: u64) -> Self {
         Self {
             fallback_index,
             end_wal_index,
@@ -27,6 +28,7 @@ impl FallbackBatch {
             uploaded_by_node_id,
             items: Vec::new(),
             upload_sequence,
+            lease_index,
         }
     }
 

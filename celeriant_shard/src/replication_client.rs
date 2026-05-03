@@ -265,6 +265,11 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
 
         let fallback_index = batches[0].metablock.wal_index;
         let end_wal_index = batches.last().unwrap().metablock.wal_index;
+        let lease_index = batches[0].metablock.lease_index;
+        if let Some((i, b)) = batches.iter().enumerate().skip(1).find(|(_, b)| b.metablock.lease_index != lease_index) {
+            tracing::error!(shard_id = self.shard_id, at_index = i, first = lease_index, found = b.metablock.lease_index, "refusing S3 upload: batch spans multiple lease_indexes");
+            return Err(ReplicateToS3Error::LeaseIndexInconsistent { at_index: i, first: lease_index, found: b.metablock.lease_index });
+        }
         let shard_id = self.shard_id as u32;
 
         let items: Vec<FallbackItem> = batches.into_iter()
@@ -284,6 +289,7 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
             uploaded_by_node_id: self.node_id,
             items,
             upload_sequence: seq,
+            lease_index,
         };
 
         let batch_count = fallback_batch.items.len();
@@ -595,6 +601,42 @@ mod tests {
             assert_eq!(deserialized.items[0].metablock.wal_index, 100);
             assert_eq!(deserialized.items[1].metablock.wal_index, 101);
             assert_eq!(deserialized.items[2].metablock.wal_index, 102);
+        });
+    }
+
+    #[test]
+    fn replicate_to_s3_rejects_cross_lease_items() {
+        LocalExecutor::default().run(async {
+            let (mock_uploader, calls) = MockS3Uploader::new();
+
+            let client = FollowerConnection::new(
+                Some("127.0.0.1:8080".to_string()),
+                None, None,
+                Duration::from_millis(500),
+                None,
+                1024, 1024,
+                7, 1,
+                None,
+                Some(mock_uploader),
+            );
+
+            let mut mb_a = create_test_metablock(42);
+            mb_a.lease_index = 5;
+            let mut mb_b = create_test_metablock(43);
+            mb_b.lease_index = 6;
+
+            let batches = vec![
+                ReplicationBatchItem { metablock: mb_a, datablock: None },
+                ReplicationBatchItem { metablock: mb_b, datablock: None },
+            ];
+
+            let result = client.replicate_to_s3(batches).await;
+
+            assert!(matches!(
+                result,
+                Err(ReplicateToS3Error::LeaseIndexInconsistent { at_index: 1, first: 5, found: 6 })
+            ), "got {:?}", result);
+            assert_eq!(calls.borrow().len(), 0, "no upload should have happened");
         });
     }
 

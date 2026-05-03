@@ -7,6 +7,17 @@ include $(CONFIG)
 PROJECT_ROOT := $(shell cd ../.. && pwd)
 DATA_NODES := $(LEADER_HOST) $(FOLLOWER_HOST)
 
+# Resolve INFRA_HOST from INFRA_MODE so config.env is the only edit point
+# when flipping between local docker-compose and the remote rpi4 'cluster'.
+ifeq ($(INFRA_MODE),local)
+INFRA_HOST := $(INFRA_HOST_LOCAL)
+else ifeq ($(INFRA_MODE),remote)
+INFRA_HOST := $(INFRA_HOST_REMOTE)
+else
+$(error INFRA_MODE must be 'local' or 'remote' (got '$(INFRA_MODE)'))
+endif
+export INFRA_HOST
+
 # Colours
 RED    := \033[0;31m
 GREEN  := \033[0;32m
@@ -16,6 +27,7 @@ RESET  := \033[0m
 
 .PHONY: help setup-all setup-nodes setup-nvme setup-ktls setup-infra certs \
         deploy build ship restart stop start logs run-test teardown teardown-data \
+        update-service \
         stop-cs1 stop-cs2 stop-minio kill-cs1 kill-cs2 kill-minio \
         kill-cs1-no-restart kill-cs2-no-restart \
         start-cs1 start-cs2 start-minio status start-infra
@@ -84,7 +96,14 @@ certs: ## Generate and distribute TLS certificates
 # Build & deploy (recurring)
 # ---------------------------------------------------------------------------
 
-deploy: build ship restart ## Build, ship binary, and restart services
+deploy: build ship update-service restart ## Build, ship binary, refresh systemd unit (picks up INFRA_MODE), restart
+
+update-service: ## Refresh the systemd unit + promtail config on data nodes (re-runnable; called by `deploy`)
+	@for HOST in $(DATA_NODES); do \
+		printf "$(BOLD)>>> Refreshing service config on $$HOST (S3 endpoint: $(INFRA_HOST))$(RESET)\n"; \
+		bash update-service.sh $$HOST $(INFRA_HOST) $(MEMORY_CONSUMPTION_PERCENT) $(SHARD_LOG_PREALLOCATE_BYTES) $(RESERVE_COORDINATOR_SHARD); \
+	done
+	@printf "$(GREEN)Service config refreshed on all data nodes.$(RESET)\n"
 
 build: ## Cross-compile Celeriant for ARM64
 	@printf "$(BOLD)>>> Cross-compiling for $(CARGO_TARGET)$(RESET)\n"
@@ -294,11 +313,8 @@ teardown: stop ## Stop all services (Celeriant + infra)
 	@bash infra-exec.sh down
 	@printf "$(GREEN)All services stopped.$(RESET)\n"
 
-# To wipe both local and remote infra before switching INFRA_MODE:
-#   1. make teardown-data          (wipes the currently active side)
-#   2. edit config.env, set the other INFRA_MODE
-#   3. make teardown-data          (wipes the other side)
-# Each run wipes only the side that INFRA_MODE currently points at.
+# Wipes only the side INFRA_MODE currently points at. To clean both:
+#   make teardown-data; edit config.env to flip INFRA_MODE; make teardown-data.
 teardown-data: teardown ## Stop all services AND wipe all data (DESTRUCTIVE)
 	@printf "$(RED)$(BOLD)Wiping ALL Celeriant data on $(LEADER_HOST), $(FOLLOWER_HOST), and $(INFRA_HOST)$(RESET)\n"
 	@for HOST in $(DATA_NODES); do \
