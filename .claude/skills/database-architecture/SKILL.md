@@ -71,3 +71,7 @@ No `info!` or `debug!` in hot paths. This generates gigabytes of logs and degrad
 - `trace!`: per-request detail, disabled by default
 
 Use structured fields (`aggregate_key = ?key, error = %err, "Write failed"`) not string interpolation.
+
+## Metrics
+
+Every new metric must get a `describe_counter!`/`describe_gauge!`/`describe_histogram!` line in `register_metric_descriptions()` at `celeriant_runtimes/src/sidecar/metrics_server.rs`. Prometheus exposes the metric without it, but the `/metrics` HELP text — and Grafana's tooltips/autocomplete — go missing. This is the single source of truth for what the cluster ships; if a metric is fired anywhere, it has a line here.

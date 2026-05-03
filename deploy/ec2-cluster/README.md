@@ -118,22 +118,17 @@ make build-arm      # ARM64 (i4g, c7g) — requires QEMU binfmt
 # 2. Deploy infrastructure (NVMe instance store required — see instance types above)
 make infra CDK_ARGS="-c keyPair=my-key"
 
-# Storage-optimized with separate compute-optimized client:
+# Canonical 32-core x86 benchmark shape (matches docs/benchmark-results/ec2-benchmark.md):
+#   2x i4i.8xlarge data + 3x c7i.4xlarge clients
+make infra PROFILE=i4i-32c CDK_ARGS="-c keyPair=my-key"
+
+# ARM equivalent (20% cheaper):
+make infra PROFILE=i4g-32c CDK_ARGS="-c keyPair=my-key"
+
+# Custom shape — pass flags directly:
 make infra CDK_ARGS="-c keyPair=my-key \
-  -c instanceType=i4i.8xlarge \
+  -c instanceType=i4i.4xlarge \
   -c clientInstanceType=c7i.4xlarge"
-
-# Multi-client for high concurrency testing (tasks split across clients):
-make infra CDK_ARGS="-c keyPair=my-key \
-  -c instanceType=i4i.8xlarge \
-  -c clientInstanceType=c7i.4xlarge \
-  -c clientCount=3"
-
-# ARM variant (20% cheaper):
-make infra CDK_ARGS="-c keyPair=my-key \
-  -c instanceType=i4g.8xlarge \
-  -c clientInstanceType=c7g.4xlarge \
-  -c clientCount=3"
 
 # 3. Generate certs and deploy everything
 make certs
@@ -202,6 +197,16 @@ make run-benchmark BENCH_TASKS=4000 BENCH_CONNS=4000 BENCH_DURATION=30
 
 Results are saved to `results/<timestamp>_<instance-type>_<storage-type>.txt` with
 metadata headers for easy comparison across instance types.
+
+### Cluster profiles
+
+`PROFILE=` selects a named cluster shape; the flags are appended to `CDK_ARGS`.
+
+| `PROFILE` | Data nodes | Client nodes | Notes |
+|---|---|---|---|
+| `default` *(unset)* | per `instanceType` | per `clientInstanceType` | one-off / custom shapes |
+| `i4i-32c` | 2x i4i.8xlarge | 3x c7i.4xlarge | matches `docs/benchmark-results/ec2-benchmark.md` 32-core sweep |
+| `i4g-32c` | 2x i4g.8xlarge | 3x c7g.4xlarge | ARM equivalent — use `make build-arm` |
 
 ### CDK context overrides
 

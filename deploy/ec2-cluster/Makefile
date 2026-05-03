@@ -26,6 +26,18 @@ BENCH_DURATION ?= 15
 
 REPO_ROOT := $(shell cd ../.. && pwd)
 
+# Cluster profile — encodes the canonical benchmark shapes from README/docs.
+# Override individual flags with CDK_ARGS for one-offs (e.g. CDK_ARGS="-c keyPair=my-key").
+PROFILE ?= default
+
+ifeq ($(PROFILE),i4i-32c)
+  override CDK_ARGS += -c instanceType=i4i.8xlarge -c clientInstanceType=c7i.4xlarge -c clientCount=3
+else ifeq ($(PROFILE),i4g-32c)
+  override CDK_ARGS += -c instanceType=i4g.8xlarge -c clientInstanceType=c7g.4xlarge -c clientCount=3
+else ifneq ($(PROFILE),default)
+  $(error Unknown PROFILE '$(PROFILE)'. Valid: default, i4i-32c, i4g-32c)
+endif
+
 .PHONY: help build build-arm infra certs deploy start stop restart status logs \
         dashboard run-benchmark run-sweep sync-env teardown teardown-data
 
@@ -58,7 +70,7 @@ build-arm: ## Build ARM64 release binaries in Docker (for i4g, c7g, etc. — req
 		cargo build --release -p celeriant -p celeriant_integration_tests -p celeriant_cli'
 	@printf "$(GREEN)Build complete (arm64).$(RESET)\n"
 
-infra: ## Deploy CDK stack (use CDK_ARGS for extra flags, e.g. CDK_ARGS="-c keyPair=my-key")
+infra: ## Deploy CDK stack (PROFILE=i4i-32c|i4g-32c|default; CDK_ARGS for extra flags, e.g. -c keyPair=my-key)
 	npx cdk deploy --require-approval never $(CDK_ARGS)
 
 # ---------------------------------------------------------------------------

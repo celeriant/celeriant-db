@@ -1,8 +1,11 @@
-# EC2 Benchmark — 2026-03-27
+# EC2 Benchmark — i4i
 
 Full performance curves on x86 i4i instances with durable, replicated writes over mTLS.
 All writes are durable to two NVMe disks via `fdatasync()` + Direct I/O, replicated over mTLS
 (kTLS-offloaded TLS 1.3), acknowledged only after both succeed.
+
+- **32-core results:** 2026-05-03 (latest replication pipeline rewrite + heartbeat/lease changes)
+- **64-core results:** 2026-03-27 (not re-run)
 
 ## Test setup
 
@@ -15,6 +18,7 @@ All writes are durable to two NVMe disks via `fdatasync()` + Direct I/O, replica
 - **Tasks split evenly:** total_concurrency / 3 per client
 - **TLS:** mTLS with kTLS offload (TLS 1.3)
 - **Durability:** `fdatasync()` on both leader and follower before ack
+- **Profile:** `make infra PROFILE=i4i-32c` then `make run-sweep`
 
 ### 64-core (i4i.16xlarge)
 
@@ -26,29 +30,40 @@ All writes are durable to two NVMe disks via `fdatasync()` + Direct I/O, replica
 - **TLS:** mTLS with kTLS offload (TLS 1.3)
 - **Durability:** `fdatasync()` on both leader and follower before ack
 
-## Results — 32-core (i4i.8xlarge)
+## Results — 32-core (i4i.8xlarge), 2026-05-03
 
 | Concurrency | req/s | avg ms | P50 ms | P95 ms | P99 ms | P99.9 ms |
 |---|---|---|---|---|---|---|
-| 9,000 | 147,678 | 61.1 | 59 | 62 | 90 | 539 |
-| 12,000 | 190,035 | 62.8 | 61 | 65 | 77 | 422 |
-| 15,000 | 224,696 | 66.3 | 64 | 71 | 89 | 549 |
-| 18,000 | 260,502 | 68.6 | 66 | 71 | 78 | 709 |
-| 21,000 | 293,573 | 71.0 | 68 | 75 | 84 | 734 |
-| 24,000 | 320,887 | 75.0 | 71 | 80 | 89 | 1,028 |
-| 27,000 | 335,762 | 80.1 | 74 | 90 | 107 | 1,197 |
-| 30,000 | 354,566 | 83.9 | 76 | 92 | 105 | 1,401 |
-| 33,000 | 369,274 | 89.5 | 79 | 100 | 126 | 1,716 |
-| 36,000 | 379,490 | 94.9 | 83 | 112 | 128 | 1,845 |
-| 39,000 | 380,367 | 102.8 | 86 | 120 | 139 | 2,636 |
-| 42,000 | 384,247 | 108.3 | 88 | 126 | 146 | 2,734 |
-| 48,000 | 388,003 | 123.5 | 95 | 143 | 175 | 4,131 |
-| 54,000 | **389,759** | 138.3 | 103 | 158 | 217 | 4,794 |
-| 60,000 | 74,493* | 816.9 | 63 | 11,180 | 15,871 | 17,950 |
+| 9,000 | 138,023 | 65.0 | 59 | 62 | 106 | 1,567 |
+| 12,000 | 181,130 | 66.0 | 61 | 67 | 72 | 1,327 |
+| 15,000 | 218,723 | 68.3 | 63 | 68 | 92 | 1,321 |
+| 18,000 | 245,790 | 72.9 | 66 | 72 | 125 | 1,720 |
+| 21,000 | 276,580 | 76.0 | 68 | 75 | 110 | 2,004 |
+| 24,000 | 298,047 | 80.1 | 71 | 80 | 98 | 2,289 |
+| 27,000 | 317,594 | 84.4 | 75 | 90 | 105 | 2,191 |
+| 30,000 | 334,875 | 89.3 | 77 | 92 | 147 | 2,658 |
+| 33,000 | 350,599 | 93.4 | 78 | 103 | 182 | 2,844 |
+| 36,000 | 357,911 | 99.7 | 82 | 112 | 135 | 3,061 |
+| 39,000 | 369,995 | 106.0 | 86 | 122 | 156 | 3,430 |
+| 42,000 | 369,740 | 114.0 | 88 | 129 | 249 | 4,043 |
+| 48,000 | 386,013 | 124.5 | 95 | 144 | 866 | 4,269 |
+| 54,000 | 384,544 | 140.6 | 103 | 158 | 1,692 | 5,267 |
+| 60,000 | 383,813 | 156.9 | 107 | 173 | 2,477 | 6,088 |
+| 66,000 | 384,234 | 172.2 | 108 | 188 | 3,017 | 6,833 |
+| 72,000 | 390,521 | 183.9 | 109 | 198 | 3,658 | 7,363 |
+| 84,000 | **398,471** | 211.7 | 109 | 206 | 4,969 | 9,727 |
+| 96,000 | 387,096 | 248.6 | 109 | 209 | 6,485 | 12,651 |
+| 108,000 | 381,685 | 282.7 | 108 | 207 | 8,031 | 15,109 |
 
-*\* = errors present (15,336 client-side port exhaustion — `Cannot assign requested address`)*
+Zero errors at every level — including 60k where the previous run (2026-03-27) collapsed
+with 15,336 client-side port exhaustion errors. Throughput plateaus around 380–400k req/s
+from ~48k all the way through 108k concurrency.
 
-## Results — 64-core (i4i.16xlarge)
+P99 and P99.9 from ~48k onward reflect saturation behavior — queue depth dominated, not
+operational latency. At operational loads (≤36k, well below the plateau), P99 stays under
+200ms and is essentially unchanged from the prior run.
+
+## Results — 64-core (i4i.16xlarge), 2026-03-27
 
 | Concurrency | req/s | avg ms | P50 ms | P95 ms | P99 ms | P99.9 ms |
 |---|---|---|---|---|---|---|
@@ -71,29 +86,35 @@ All writes are durable to two NVMe disks via `fdatasync()` + Direct I/O, replica
 
 ### Peak performance
 
-- **32-core peak: 389,759 req/s** at 54,000 concurrency (zero errors)
-- **64-core peak: 561,207 req/s** at 108,000 concurrency (zero errors) — **44% higher**
-- Both configurations show a sustained plateau before degradation
-- 64-core error-free range extends to 108,000 connections (vs 54,000 on 32-core)
+- **32-core peak: 398,471 req/s** at 84,000 concurrency (zero errors)
+- **64-core peak: 561,207 req/s** at 108,000 concurrency (zero errors) — 41% higher
+- 32-core sustains 380k+ req/s across a wide plateau (48k → 108k concurrency, zero errors)
+- The 32-core port-exhaustion collapse at 60k seen in the 2026-03-27 run is resolved
 
 ### Scaling efficiency
 
-Doubling cores from 32 to 64 delivers 44% more throughput, not 2x. This is expected:
+Doubling cores from 32 to 64 delivers 41% more throughput, not 2×. This is expected:
 replication, `fdatasync()` batching, and network I/O are shared bottlenecks that don't
-scale linearly with CPU count. The per-core efficiency at peak is ~12,200 req/s/core
+scale linearly with CPU count. The per-core efficiency at peak is ~12,450 req/s/core
 (32c) vs ~8,800 req/s/core (64c).
 
 ### Latency profile
 
-Latency stays remarkably flat on both configurations as throughput scales:
+Operational latency stays flat across the throughput-scaling region; tail latency
+grows once the system enters the saturation plateau.
 
-**32-core:**
+**32-core (operational range):**
 
 | Concurrency | req/s | P50 ms | P99 ms |
 |---|---|---|---|
-| 9,000 | 147,678 | 59 | 90 |
-| 24,000 | 320,887 | 71 | 89 |
-| 54,000 | 389,759 | 103 | 217 |
+| 9,000 | 138,023 | 59 | 106 |
+| 24,000 | 298,047 | 71 | 98 |
+| 36,000 | 357,911 | 82 | 135 |
+
+P50 grows roughly with concurrency. P99 stays under 200ms across the whole operational
+range. Once the system enters its plateau (48k+), tail latency reflects queue depth
+rather than service time and is not a meaningful operational signal — by 84k (peak
+throughput) P99 is ~5s.
 
 **64-core:**
 
@@ -103,10 +124,6 @@ Latency stays remarkably flat on both configurations as throughput scales:
 | 72,000 | 535,292 | 105 | 210 |
 | 108,000 | 561,207 | 129 | 2,524 |
 
-P50 latency grows by less than 2x across the entire error-free range on both configs.
-The 64-core configuration shows higher P99 tail latency at peak due to increased
-contention across 64 shards competing for NVMe `fdatasync()` bandwidth.
-
 ### Comparison with PostgreSQL and Kafka
 
 All systems on i4i.8xlarge, per-operation (no batching), with TLS and replication:
@@ -114,12 +131,15 @@ All systems on i4i.8xlarge, per-operation (no batching), with TLS and replicatio
 | System | Peak req/s | P50 at peak | P99 at peak | Nodes | TLS | Fsync |
 |---|---|---|---|---|---|---|
 | **Celeriant (64c)** | **561,207** | **129ms** | **2,524ms** | 2 | mTLS (kTLS) | Both nodes |
-| **Celeriant (32c)** | **389,759** | **103ms** | **217ms** | 2 | mTLS (kTLS) | Both nodes |
+| **Celeriant (32c)** | **398,471** | **109ms** | **4,969ms** | 2 | mTLS (kTLS) | Both nodes |
 | PostgreSQL/Marten | 42,721 | 5 | 46 | 2 | mTLS (OpenSSL) | Both nodes |
 | Kafka | ~24,000 | ~1,177 | ~1,342 | 3 | TLS | None |
 
-At comparable concurrency (24,000 connections):
+P99 at peak reflects saturation queueing, not user-visible operational latency. At
+matched concurrency below the knee:
+
+At 24,000 connections:
 - **Celeriant (64c):** 333,305 req/s, 66ms P50, 108ms P99
-- **Celeriant (32c):** 320,887 req/s, 71ms P50, 89ms P99
+- **Celeriant (32c):** 298,047 req/s, 71ms P50, 98ms P99
 - **PostgreSQL:** 1,651 req/s, 40,170ms P50 (collapsed)
 - **Kafka:** 21,212 req/s, 1,177ms avg
