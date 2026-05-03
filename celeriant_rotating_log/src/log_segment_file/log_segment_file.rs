@@ -1,4 +1,4 @@
-use std::{cell::RefCell, path::PathBuf, rc::Rc};
+use std::{cell::RefCell, path::{Path, PathBuf}, rc::Rc};
 
 use celeriant_disk::files::{open_dma_files::{create_file_dma, existing_file_dma}, rwlock_timeout::{LockTimeoutError, read_with_timeout, write_with_timeout}};
 use celeriant_wal::{
@@ -65,14 +65,78 @@ impl LogSegmentFile {
         };
 
         let log_path = shard_dir.join(log_file_name(new_log_id));
-        let writer = create_file_dma(&log_path, Some(preallocate_bytes))
-            .await
-            .map_err(|e| OpenOrCreateError::UnableToCreateLogSegmentFile {
-                log_id: new_log_id,
-                path: log_path.to_string_lossy().into_owned(),
-                preallocate_bytes,
-                source: e.to_string(),
-            })?;
+
+        if log_path.exists() {
+            match is_zero_dual_header_orphan(&log_path) {
+                Ok(true) => {
+                    tracing::warn!(
+                        path = %log_path.display(),
+                        new_log_id,
+                        "Rotation target exists with zero dual-headers — deleting orphan from prior aborted rotation"
+                    );
+                    metrics::counter!("celeriant_orphan_segment_recovered_total").increment(1);
+                    std::fs::remove_file(&log_path).map_err(|e| OpenOrCreateError::RotationTargetUnsafe {
+                        log_id: new_log_id,
+                        path: log_path.to_string_lossy().into_owned(),
+                        source: format!("orphan delete failed: {e}"),
+                    })?;
+                }
+                Ok(false) => {
+                    return Err(OpenOrCreateError::RotationTargetUnsafe {
+                        log_id: new_log_id,
+                        path: log_path.to_string_lossy().into_owned(),
+                        source: "file exists with non-zero header(s) — possible live data".into(),
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %log_path.display(),
+                        error = ?e,
+                        "Failed to inspect rotation target — refusing to overwrite"
+                    );
+                    return Err(OpenOrCreateError::RotationTargetUnsafe {
+                        log_id: new_log_id,
+                        path: log_path.to_string_lossy().into_owned(),
+                        source: format!("header inspection failed: {e}"),
+                    });
+                }
+            }
+        }
+
+        let writer = match create_file_dma(&log_path, Some(preallocate_bytes)).await {
+            Ok(w) => w,
+            Err(e) => {
+                if log_path.exists() {
+                    if let Err(rm_err) = std::fs::remove_file(&log_path) {
+                        tracing::warn!(
+                            path = %log_path.display(),
+                            error = ?rm_err,
+                            "Failed to remove partial file left by failed create_file_dma"
+                        );
+                    }
+                }
+                let io_err: Option<&std::io::Error> = match &e {
+                    GlommioError::IoError(io_err) => Some(io_err),
+                    GlommioError::EnhancedIoError { source, .. } => Some(source),
+                    _ => None,
+                };
+                if let Some(io_err) = io_err {
+                    if io_err.kind() == std::io::ErrorKind::StorageFull {
+                        panic!(
+                            "rotation failed: ENOSPC on {} (preallocate {} bytes) — physical NVMe is not resizable, requires operator intervention",
+                            log_path.display(),
+                            preallocate_bytes
+                        );
+                    }
+                }
+                return Err(OpenOrCreateError::UnableToCreateLogSegmentFile {
+                    log_id: new_log_id,
+                    path: log_path.to_string_lossy().into_owned(),
+                    preallocate_bytes,
+                    source: e.to_string(),
+                });
+            }
+        };
 
         create_new_file(new_log_id, &log_path, writer, preallocate_bytes, shard_dir, false, wal_index, tip_hash, last_received_replication_wal_index).await
     }
@@ -186,8 +250,35 @@ async fn create_new_file(
     build_log_segment(log_id, log_path, writer, file_len, &header, advance_read).await
 }
 
-fn log_file_name(log_id: u64) -> String {
+pub(crate) fn log_file_name(log_id: u64) -> String {
     format!("log_{log_id}.wal")
+}
+
+pub fn is_zero_dual_header_orphan(path: &Path) -> Result<bool, std::io::Error> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+
+    let file_len = f.metadata()?.len();
+    if file_len < HEADER_BLOCK_SIZE_BYTES as u64 * 2 {
+        return Ok(true);
+    }
+
+    let mut buf = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
+
+    f.seek(SeekFrom::Start(0))?;
+    f.read_exact(&mut buf)?;
+    if !buf.iter().all(|&b| b == 0) {
+        return Ok(false);
+    }
+
+    f.seek(SeekFrom::Start(file_len - HEADER_BLOCK_SIZE_BYTES as u64))?;
+    f.read_exact(&mut buf)?;
+    Ok(buf.iter().all(|&b| b == 0))
 }
 
 /// Tries to load the header. Will try the front of the file first,
@@ -494,6 +585,93 @@ mod tests {
 
             file.close().await;
             rotated.close().await;
+        });
+    }
+
+    fn make_zero_file(path: &std::path::Path, size: u64) {
+        let f = std::fs::OpenOptions::new().create_new(true).write(true).open(path).unwrap();
+        f.set_len(size).unwrap();
+    }
+
+    fn write_nonzero_at(path: &std::path::Path, offset: u64) {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        let mut buf = vec![0u8; HEADER_BLOCK_SIZE_BYTES];
+        buf[0] = 0xAB;
+        f.seek(SeekFrom::Start(offset)).unwrap();
+        f.write_all(&buf).unwrap();
+    }
+
+    #[test]
+    fn is_zero_dual_header_orphan_classifies_all_layouts() {
+        let (_tmp, dir) = test_dir();
+        let front_off = 0;
+        let rear_off = MIN_FILE_SIZE - HEADER_BLOCK_SIZE_BYTES as u64;
+
+        // (size, writes, expected, label)
+        let cases: &[(u64, &[u64], bool, &str)] = &[
+            (MIN_FILE_SIZE, &[], true, "zero/zero is orphan"),
+            (MIN_FILE_SIZE, &[front_off], false, "front nonzero is not orphan"),
+            (MIN_FILE_SIZE, &[rear_off], false, "rear nonzero is not orphan"),
+            (MIN_FILE_SIZE, &[front_off, rear_off], false, "both nonzero is not orphan"),
+            (HEADER_BLOCK_SIZE_BYTES as u64, &[], true, "too-short is orphan"),
+            (0, &[], true, "0-byte is orphan"),
+        ];
+
+        for (i, (size, writes, expected, label)) in cases.iter().enumerate() {
+            let path = dir.join(format!("log_{i}.wal"));
+            make_zero_file(&path, *size);
+            for off in *writes {
+                write_nonzero_at(&path, *off);
+            }
+            assert_eq!(is_zero_dual_header_orphan(&path).unwrap(), *expected, "{label}");
+        }
+
+        let missing = dir.join("does_not_exist.wal");
+        assert_eq!(is_zero_dual_header_orphan(&missing).unwrap(), false, "missing file is not orphan");
+    }
+
+    #[test]
+    fn rotate_handles_existing_target() {
+        glommio_test!({
+            // case 1: orphan at target is deleted, rotation succeeds
+            {
+                let (_tmp, dir) = test_dir();
+                let file = LogSegmentFile::open_or_create_first_file_for_shard(&dir, MIN_FILE_SIZE, 1, true).await.unwrap();
+                make_zero_file(&dir.join("log_2.wal"), MIN_FILE_SIZE);
+
+                let rotated = file.rotate(&dir, MIN_FILE_SIZE).await.unwrap();
+                assert_eq!(rotated.metadata.borrow().log_id, 2);
+                file.close().await;
+                rotated.close().await;
+            }
+
+            // case 2: target with non-zero header is refused, file preserved
+            {
+                let (_tmp, dir) = test_dir();
+                let file = LogSegmentFile::open_or_create_first_file_for_shard(&dir, MIN_FILE_SIZE, 1, true).await.unwrap();
+                let target = dir.join("log_2.wal");
+                make_zero_file(&target, MIN_FILE_SIZE);
+                write_nonzero_at(&target, 0);
+
+                let result = file.rotate(&dir, MIN_FILE_SIZE).await;
+                assert!(matches!(result, Err(OpenOrCreateError::RotationTargetUnsafe { log_id: 2, .. })));
+                assert!(target.exists());
+                file.close().await;
+            }
+
+            // case 3: inspection failure (target is a directory) is refused
+            {
+                let (_tmp, dir) = test_dir();
+                let file = LogSegmentFile::open_or_create_first_file_for_shard(&dir, MIN_FILE_SIZE, 1, true).await.unwrap();
+                let target = dir.join("log_2.wal");
+                std::fs::create_dir_all(&target).unwrap();
+
+                let result = file.rotate(&dir, MIN_FILE_SIZE).await;
+                assert!(matches!(result, Err(OpenOrCreateError::RotationTargetUnsafe { log_id: 2, .. })));
+                assert!(target.exists());
+                file.close().await;
+            }
         });
     }
 

@@ -2,7 +2,7 @@ use celeriant_wal::constants::HEADER_BLOCK_SIZE_BYTES;
 use lru::LruCache;
 use std::{cell::RefCell, num::NonZeroUsize, path::{Path, PathBuf}, rc::Rc};
 
-use crate::{errors::{open_or_create_error::OpenOrCreateError, ready_up_error::ReadyUpError}, log_segment_file::{log_segment_cursor::LogSegmentCursor, log_segment_file::LogSegmentFile}};
+use crate::{errors::{open_or_create_error::OpenOrCreateError, ready_up_error::ReadyUpError}, log_segment_file::{log_segment_cursor::LogSegmentCursor, log_segment_file::{is_zero_dual_header_orphan, log_file_name, LogSegmentFile}}};
 
 /// Manages DmaFile handles for a shard with LRU caching.
 /// "Active File" file is the current log being written to
@@ -138,15 +138,62 @@ impl LogSegmentsCache {
                 source,
             })?;
 
-        let active_log_id = find_latest_log_file(&shard_dir)
+        let mut active_log_id = find_latest_log_file(&shard_dir)
             .map_err(|source| ReadyUpError::UnableToAccessDirectory {
                 directory: shard_dir.to_string_lossy().to_string(),
                 source,
             })?
             .unwrap_or(FIRST_LOG_ID);
 
-        let active_file = LogSegmentFile::open_or_create_first_file_for_shard(&shard_dir, preallocate_bytes, active_log_id, true).await
-            .map_err(|source| ReadyUpError::ActiveFileError(source))?;
+        let active_file = loop {
+            match LogSegmentFile::open_or_create_first_file_for_shard(&shard_dir, preallocate_bytes, active_log_id, true).await {
+                Ok(f) => break f,
+                Err(e @ OpenOrCreateError::LogSegmentFileCorrupted { .. }) => {
+                    let orphan_path = shard_dir.join(log_file_name(active_log_id));
+                    let is_orphan = match is_zero_dual_header_orphan(&orphan_path) {
+                        Ok(v) => v,
+                        Err(io_err) => {
+                            tracing::warn!(
+                                path = %orphan_path.display(),
+                                error = ?io_err,
+                                "is_zero_dual_header_orphan I/O error during recovery — refusing to delete, treating as fatal"
+                            );
+                            return Err(ReadyUpError::ActiveFileError(e));
+                        }
+                    };
+
+                    if !is_orphan {
+                        return Err(ReadyUpError::ActiveFileError(e));
+                    }
+
+                    tracing::warn!(
+                        log_id = active_log_id,
+                        path = %orphan_path.display(),
+                        "Detected zero-dual-header orphan from crashed rotation; deleting and falling back to log_id-1"
+                    );
+
+                    std::fs::remove_file(&orphan_path)
+                        .map_err(|source| ReadyUpError::UnableToDeleteOrphanSegment {
+                            path: orphan_path.to_string_lossy().to_string(),
+                            source,
+                        })?;
+
+                    metrics::counter!("celeriant_orphan_segment_recovered_total").increment(1);
+
+                    if active_log_id == FIRST_LOG_ID {
+                        // Just removed the floor segment; next iteration creates a fresh one.
+                        // If THAT also returns corrupted, the disk is fundamentally broken.
+                        match LogSegmentFile::open_or_create_first_file_for_shard(&shard_dir, preallocate_bytes, FIRST_LOG_ID, true).await {
+                            Ok(f) => break f,
+                            Err(e) => return Err(ReadyUpError::ActiveFileError(e)),
+                        }
+                    }
+
+                    active_log_id -= 1;
+                }
+                Err(e) => return Err(ReadyUpError::ActiveFileError(e)),
+            }
+        };
 
         let cache_cap = NonZeroUsize::new(max_cached_files.max(1)).unwrap();
         let shard_label = [("shard_id", shard_id.to_string())];
@@ -347,10 +394,6 @@ impl std::fmt::Display for UnwindActiveError {
 }
 
 impl std::error::Error for UnwindActiveError {}
-
-fn log_file_name(log_id: u64) -> String {
-    format!("log_{log_id}.wal")
-}
 
 const FIRST_LOG_ID: u64 = 1;
 
@@ -605,6 +648,59 @@ mod tests {
 
             cache.close().await;
             cache.close().await;
+        });
+    }
+
+    fn make_zero_file(path: &std::path::Path, size: u64) {
+        let f = std::fs::OpenOptions::new().create_new(true).write(true).open(path).unwrap();
+        f.set_len(size).unwrap();
+    }
+
+    #[test]
+    fn ready_up_recovers_zero_dual_header_orphans() {
+        glommio_test!({
+            use crate::log_segment_file::log_segment_file::LogSegmentFile;
+
+            // case 1: single orphan after valid log_1 → falls back to log_1
+            {
+                let (_tmp, dir) = test_dir();
+                std::fs::create_dir_all(&dir).unwrap();
+                LogSegmentFile::open_or_create_first_file_for_shard(&dir, FILE_SIZE, 1, true).await.unwrap().close().await;
+                make_zero_file(&dir.join("log_2.wal"), FILE_SIZE);
+
+                let cache = LogSegmentsCache::ready_up(dir.clone(), FILE_SIZE, 2, 0).await.unwrap();
+                assert_eq!(cache.active_log_id(), 1);
+                assert!(!dir.join("log_2.wal").exists());
+                assert!(dir.join("log_1.wal").exists());
+                cache.close().await;
+            }
+
+            // case 2: two consecutive orphans after valid log_1 → walks past both
+            {
+                let (_tmp, dir) = test_dir();
+                std::fs::create_dir_all(&dir).unwrap();
+                LogSegmentFile::open_or_create_first_file_for_shard(&dir, FILE_SIZE, 1, true).await.unwrap().close().await;
+                make_zero_file(&dir.join("log_2.wal"), FILE_SIZE);
+                make_zero_file(&dir.join("log_3.wal"), FILE_SIZE);
+
+                let cache = LogSegmentsCache::ready_up(dir.clone(), FILE_SIZE, 2, 0).await.unwrap();
+                assert_eq!(cache.active_log_id(), 1);
+                assert!(!dir.join("log_2.wal").exists());
+                assert!(!dir.join("log_3.wal").exists());
+                cache.close().await;
+            }
+
+            // case 3: orphan at FIRST_LOG_ID → deleted and replaced with fresh segment
+            {
+                let (_tmp, dir) = test_dir();
+                std::fs::create_dir_all(&dir).unwrap();
+                make_zero_file(&dir.join("log_1.wal"), FILE_SIZE);
+
+                let cache = LogSegmentsCache::ready_up(dir.clone(), FILE_SIZE, 2, 0).await.unwrap();
+                assert_eq!(cache.active_log_id(), FIRST_LOG_ID);
+                assert!(dir.join("log_1.wal").exists());
+                cache.close().await;
+            }
         });
     }
 

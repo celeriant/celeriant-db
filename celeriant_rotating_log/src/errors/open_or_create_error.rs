@@ -45,6 +45,11 @@ pub enum OpenOrCreateError {
         path: String,
         step: String,
     },
+    RotationTargetUnsafe {
+        log_id: u64,
+        path: String,
+        source: String,
+    },
 }
 
 impl fmt::Display for OpenOrCreateError {
@@ -73,6 +78,9 @@ impl fmt::Display for OpenOrCreateError {
             }
             Self::DirectoryFSyncErrorOnNewFile { log_id, source, path, step } => {
                 write!(f, "Directory fsync error on new file: log_id={log_id}, path={path}, step={step}, source={source}")
+            }
+            Self::RotationTargetUnsafe { log_id, path, source } => {
+                write!(f, "Rotation target unsafe to overwrite: log_id={log_id}, path={path}, source={source}")
             }
         }
     }

@@ -8,6 +8,7 @@ pub enum ReadyUpError {
     ActiveFileError(OpenOrCreateError),
     UnableToAccessDirectory { directory: String, source: std::io::Error },
     UnableToCreateDirectory { directory: String, source: std::io::Error },
+    UnableToDeleteOrphanSegment { path: String, source: std::io::Error },
 }
 
 impl fmt::Display for ReadyUpError {
@@ -24,6 +25,9 @@ impl fmt::Display for ReadyUpError {
             }
             Self::UnableToCreateDirectory { directory, source } => {
                 write!(f, "Unable to create directory: {directory}, source={source}")
+            }
+            Self::UnableToDeleteOrphanSegment { path, source } => {
+                write!(f, "Unable to delete orphan segment: {path}, source={source}")
             }
         }
     }

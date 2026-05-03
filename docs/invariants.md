@@ -149,6 +149,9 @@ Rules the system enforces. Breaking any of these is a bug. Provide this to LLMs 
 - Log segments are preallocated at creation. Minimum valid size: 1.5MB (two 512KB headers + one usable block).
 - Rotation is caller-driven (checked before each fsync). A batch that cannot fit in a fresh segment is rejected with `BatchesTooLarge`.
 - After rotation, the new file's read cursor is `None` until the first successful replication.
+- A log segment is safe to auto-delete as an orphan iff BOTH the front and rear `HEADER_BLOCK_SIZE_BYTES` regions are all zero (or the file is shorter than `HEADER_BLOCK_SIZE_BYTES * 2`, including 0-byte partial-create remnants). Either header non-zero is treated as possible live data and is fatal.
+- A pre-existing file at the rotation target is handled defensively: if it is a zero-dual-header orphan it is deleted and rotation proceeds; otherwise rotation fails with `RotationTargetUnsafe` (no overwrite).
+- ENOSPC during rotation panics rather than retries. Celeriant runs on physical NVMe, which is not resizable, so retrying a write into a full disk would silently mask the condition. The 0-byte file left by a failed `create_file_dma` (Glommio creates the file before `pre_allocate`) is removed before the panic so startup orphan recovery can proceed.
 - Each segment carries a 256KB bloom filter (10 hashes, <1% FP rate for 200k aggregates). Bloom is persisted in the header and used by the reverse scanner.
 - Sealed segments produce a separate sidecar `.summary` file, never embedded in the WAL. Summary data is node-dependent (rotation timing differs between leader and follower) and would break hash chain integrity if serialised into the WAL. On a leader, the sidecar is deferred until the segment is fully replicated.
 - Listing scans newest-to-oldest, bounded by `list_max_duration` and `list_page_size`. A `deleted_barrier` prevents re-appearance of deleted aggregates from older segments.
