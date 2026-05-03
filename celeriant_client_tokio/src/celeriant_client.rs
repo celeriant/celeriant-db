@@ -118,11 +118,15 @@ pub(crate) async fn connect_stream(
     match tls_config {
         None => Ok(ClientStream::Plain(tcp.compat())),
         Some(cfg) => {
-            let tls = cfg
-                .connector
-                .connect(cfg.server_name.clone(), tcp)
-                .await
-                .map_err(ClientError::ConnectionFailed)?;
+            let handshake = cfg.connector.connect(cfg.server_name.clone(), tcp);
+            let tls = if let Some(duration) = connection_timeout {
+                timeout(duration, handshake)
+                    .await
+                    .map_err(|_| ClientError::ConnectionTimeout)?
+                    .map_err(ClientError::ConnectionFailed)?
+            } else {
+                handshake.await.map_err(ClientError::ConnectionFailed)?
+            };
             Ok(ClientStream::Tls(tls.compat()))
         }
     }
@@ -340,6 +344,98 @@ impl CeleriantClient {
 mod tests {
     use super::*;
     use celeriant_crypto::Crypto;
+    use std::time::Duration;
+
+    async fn silent_server() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut sockets = Vec::new();
+            loop {
+                if let Ok((socket, _)) = listener.accept().await {
+                    sockets.push(socket);
+                }
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn tls_handshake_times_out_when_server_unresponsive() {
+        let addr = silent_server().await;
+        let address = addr.to_string();
+
+        let ring_provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+
+        #[derive(Debug)]
+        struct AcceptAny(Vec<rustls::SignatureScheme>);
+        impl rustls::client::danger::ServerCertVerifier for AcceptAny {
+            fn verify_server_cert(
+                &self,
+                _end_entity: &rustls_pki_types::CertificateDer<'_>,
+                _intermediates: &[rustls_pki_types::CertificateDer<'_>],
+                _server_name: &rustls_pki_types::ServerName<'_>,
+                _ocsp_response: &[u8],
+                _now: rustls_pki_types::UnixTime,
+            ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+                Ok(rustls::client::danger::ServerCertVerified::assertion())
+            }
+
+            fn verify_tls12_signature(
+                &self,
+                _message: &[u8],
+                _cert: &rustls_pki_types::CertificateDer<'_>,
+                _dss: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+            }
+
+            fn verify_tls13_signature(
+                &self,
+                _message: &[u8],
+                _cert: &rustls_pki_types::CertificateDer<'_>,
+                _dss: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+            }
+
+            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+                self.0.clone()
+            }
+        }
+
+        let schemes = ring_provider
+            .signature_verification_algorithms
+            .supported_schemes();
+
+        let client_config = rustls::ClientConfig::builder_with_provider(ring_provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(AcceptAny(schemes)))
+            .with_no_client_auth();
+
+        let tls_config = ClientTlsConfig::new(
+            std::sync::Arc::new(client_config),
+            rustls_pki_types::ServerName::try_from("localhost").unwrap().to_owned(),
+        );
+
+        let start = std::time::Instant::now();
+        let result = connect_stream(
+            &address,
+            Some(Duration::from_millis(500)),
+            Some(&tls_config),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(ClientError::ConnectionTimeout)),
+            "expected ConnectionTimeout, got {:?}",
+            result.map(|_| ())
+        );
+        assert!(elapsed < Duration::from_millis(1500), "timed out too slowly: {elapsed:?}");
+    }
 
     #[test]
     fn identity_config_can_be_created() {

@@ -3,7 +3,7 @@ use std::{cell::{Cell, RefCell}, collections::HashMap, fmt, future::Future, io, 
 use futures_lite::AsyncRead;
 
 use base64::Engine;
-use celeriant_distributed::{lease_store::LeaseStore, node_status::NodeStatus, s3_lease_manager::S3LeaseManager, validated_node_status::{self, ValidatedNodeStatus, set_node_status_and_metric}};
+use celeriant_distributed::{lease_store::LeaseStore, node_status::NodeStatus, node_status_logic::compute_new_ttl, s3_lease_manager::S3LeaseManager, validated_node_status::{self, ValidatedNodeStatus, set_node_status_and_metric}};
 use celeriant_msg::{
     error_codes,
     process_client_requests::ClientRequest,
@@ -1230,13 +1230,12 @@ async fn handle_heartbeat<R: ReplicationClient + 'static, D: S3Downloader + 'sta
 
     // Extend the lease due to the live heartbeat
     let current_lease_expiry_ms = ctx.shard_wal.node_status.get().lease_expires_at_ms();
-    let proposed_lease_expiry_ms = req.leader_timestamp_ms + ctx.config.heartbeat_lease_duration.as_millis() as u64;
-    let new_lease_expiry_ms = if proposed_lease_expiry_ms > current_lease_expiry_ms {
-        proposed_lease_expiry_ms
-    } else {
-        current_lease_expiry_ms
-    };
-    
+    let new_lease_expiry_ms = compute_new_ttl(
+        current_lease_expiry_ms,
+        req.leader_timestamp_ms,
+        ctx.config.heartbeat_lease_duration.as_millis() as u64,
+    );
+
     let refreshed = ValidatedNodeStatus::create_custom_status(
         raw_status,
         ctx.config.max_clock_drift_ms,

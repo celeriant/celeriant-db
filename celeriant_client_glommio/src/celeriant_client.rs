@@ -109,7 +109,7 @@ impl CeleriantClient {
         max_request_size: u64,
         max_response_size: u64,
     ) -> Result<Self, ClientError> {
-        Self::connect_with_timeout_tls(address, connection_timeout, max_request_size, max_response_size, None).await
+        Self::connect_with_timeout_tls(address, connection_timeout, max_request_size, max_response_size, None, None).await
     }
 
     pub async fn connect_with_timeout_tls(
@@ -118,6 +118,7 @@ impl CeleriantClient {
         max_request_size: u64,
         max_response_size: u64,
         tls_config: Option<GlommioTlsConfig>,
+        tcp_user_timeout: Option<Duration>,
     ) -> Result<Self, ClientError> {
         let stream = if let Some(duration) = connection_timeout {
             TcpStream::connect_timeout(address, duration)
@@ -142,8 +143,6 @@ impl CeleriantClient {
             .set_nodelay(true)
             .map_err(ClientError::SetNoDelayError)?;
 
-        // Enable TCP keepalive so idle connections (e.g. replication between
-        // write bursts) are not silently dropped by the remote end.
         {
             use std::os::unix::io::AsRawFd;
             let fd = stream.as_raw_fd();
@@ -154,6 +153,12 @@ impl CeleriantClient {
                 libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, &enabled as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t);
                 libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, &idle_secs as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t);
                 libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, &interval_secs as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+            }
+            if let Some(user_timeout) = tcp_user_timeout {
+                let user_timeout_ms: libc::c_uint = user_timeout.as_millis().min(u32::MAX as u128) as libc::c_uint;
+                unsafe {
+                    libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_USER_TIMEOUT, &user_timeout_ms as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_uint>() as libc::socklen_t);
+                }
             }
         }
 

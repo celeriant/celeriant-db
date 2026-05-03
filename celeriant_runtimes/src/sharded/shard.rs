@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use celeriant_distributed::{lease_store::LeaseStore, s3_lease_manager::{ElectionOutcome, S3LeaseManager}, validated_node_status::{self, ValidatedNodeStatus, set_node_status_and_metric}};
+use celeriant_distributed::{lease_store::LeaseStore, node_status_logic::compute_new_ttl, s3_lease_manager::{ElectionOutcome, S3LeaseManager}, validated_node_status::{self, ValidatedNodeStatus, set_node_status_and_metric}};
 use celeriant_msg::response::responses::HeartbeatResult;
 use celeriant_shard::{error::send_heartbeat_error::SendHeartbeatError, replication_client::ReplicationClient, s3_downloader::S3Downloader, shard_wal::ShardWal};
 use glommio::{
@@ -650,8 +650,22 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                     let reachable = follower_can_accept_tcp_replication;
                     ctx.shard_wal.replication_client.set_follower_reachable(reachable);
                     broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::FollowerReachable { reachable }, ctx.intrashard_sender.clone()).await;
+                    let prev_expires_at_ms = ctx.shard_wal.node_status.get().lease_expires_at_ms();
+                    let new_expires_at_ms = compute_new_ttl(
+                        prev_expires_at_ms,
+                        unix_epoch_now_ms,
+                        ctx.config.heartbeat_lease_duration.as_millis() as u64,
+                    );
+                    debug!(
+                        shard_id = ctx.current_shard_id,
+                        prev_expires_at_ms,
+                        new_expires_at_ms,
+                        delta_ms = new_expires_at_ms as i64 - prev_expires_at_ms as i64,
+                        now_ms = unix_epoch_now_ms,
+                        "HeartbeatTtlRefresh: max-merging local lease via heartbeat ack (S3 lease NOT touched)",
+                    );
                     let refreshed = ValidatedNodeStatus::create_custom_status(
-                        ctx.shard_wal.node_status.get().raw(), ctx.config.max_clock_drift_ms, unix_epoch_now_ms + ctx.config.heartbeat_lease_duration.as_millis() as u64);
+                        ctx.shard_wal.node_status.get().raw(), ctx.config.max_clock_drift_ms, new_expires_at_ms);
                     set_node_status_and_metric(&ctx.shard_wal.node_status, refreshed, ctx.current_shard_id as u32);
                     broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::StatusUpdate { status: refreshed }, ctx.intrashard_sender.clone()).await;
                     continue;

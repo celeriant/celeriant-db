@@ -80,6 +80,7 @@ impl ConnState {
         max_request_size: u64,
         max_response_size: u64,
         replication_client_config: Option<&Arc<rustls::ClientConfig>>,
+        tcp_user_timeout: Option<Duration>,
     ) -> Result<(), ClientError> {
         if self.connected_to.as_ref() != address.as_ref() {
             self.client = None;
@@ -107,6 +108,7 @@ impl ConnState {
                 max_request_size,
                 max_response_size,
                 tls_config,
+                tcp_user_timeout,
             )
             .await?;
             debug!(addr, "internode: connected");
@@ -132,6 +134,7 @@ pub struct FollowerConnection<S: S3Uploader> {
     connection_timeout: Option<Duration>,
     request_timeout: Option<Duration>,
     heartbeat_timeout: Duration,
+    tcp_user_timeout: Option<Duration>,
     max_request_size: u64,
     max_response_size: u64,
     replication_client_config: Option<Arc<rustls::ClientConfig>>,
@@ -145,6 +148,7 @@ impl<S: S3Uploader> FollowerConnection<S> {
         connection_timeout: Option<Duration>,
         request_timeout: Option<Duration>,
         heartbeat_timeout: Duration,
+        tcp_user_timeout: Option<Duration>,
         max_request_size: u64,
         max_response_size: u64,
         shard_id: u64,
@@ -164,6 +168,7 @@ impl<S: S3Uploader> FollowerConnection<S> {
             connection_timeout,
             request_timeout,
             heartbeat_timeout,
+            tcp_user_timeout,
             max_request_size,
             max_response_size,
             replication_client_config,
@@ -210,7 +215,7 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
         let address = self.follower_address.borrow().clone();
         let shard_id = self.shard_id;
 
-        guard.ensure_connected(&address, false, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref()).await?;
+        guard.ensure_connected(&address, false, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref(), self.tcp_user_timeout).await?;
 
         let mut request = ClusterRequest::ReplicationBatch(ReplicationBatchRequest {
             correlation_id: None,
@@ -222,7 +227,7 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
         let response = match guard.client.as_mut().unwrap().send_cluster_request(&request, CompressionType::Snappy).await {
             Ok(r) => r,
             Err(_) => {
-                guard.ensure_connected(&address, true, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref()).await?;
+                guard.ensure_connected(&address, true, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref(), self.tcp_user_timeout).await?;
                 if let ClusterRequest::ReplicationBatch(ref mut req) = request {
                     req.leader_timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
                 }
@@ -308,7 +313,7 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
         // Always reset: forces a fresh TCP connection on each heartbeat attempt.
         // This avoids stale connections hanging for the full internode_request_timeout
         // (10s) when the peer is unreachable, which would prevent timely self-fencing.
-        guard.ensure_connected(&address, true, hb_timeout, hb_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref()).await?;
+        guard.ensure_connected(&address, true, hb_timeout, hb_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref(), self.tcp_user_timeout).await?;
 
         let request = ClusterRequest::Heartbeat(HeartbeatRequest {
             correlation_id: None,
@@ -331,7 +336,7 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
 
         let address = self.follower_address.borrow().clone();
 
-        guard.ensure_connected(&address, false, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref()).await?;
+        guard.ensure_connected(&address, false, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref(), self.tcp_user_timeout).await?;
 
         let request = ClusterRequest::KickFollower(KickFollowerRequest {
             correlation_id: None,
@@ -340,7 +345,7 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
         let response = match guard.client.as_mut().unwrap().send_cluster_request(&request, CompressionType::None).await {
             Ok(r) => r,
             Err(_) => {
-                guard.ensure_connected(&address, true, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref()).await?;
+                guard.ensure_connected(&address, true, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref(), self.tcp_user_timeout).await?;
                 guard.client.as_mut().unwrap().send_cluster_request(&request, CompressionType::None).await?
             }
         };
@@ -444,6 +449,7 @@ mod tests {
                 None,
                 None,
                 Duration::from_millis(500),
+                None,
                 1024,
                 1024,
                 7,
@@ -467,6 +473,7 @@ mod tests {
                 None,
                 None,
                 Duration::from_millis(500),
+                None,
                 1024,
                 1024,
                 7,
@@ -496,6 +503,7 @@ mod tests {
                 None,
                 None,
                 Duration::from_millis(500),
+                None,
                 1024,
                 1024,
                 7,
@@ -545,6 +553,7 @@ mod tests {
                 None,
                 None,
                 Duration::from_millis(500),
+                None,
                 1024,
                 1024,
                 5,
@@ -604,6 +613,7 @@ mod tests {
                 None,
                 None,
                 Duration::from_millis(500),
+                None,
                 1024,
                 1024,
                 7,
@@ -628,6 +638,7 @@ mod tests {
             Some("127.0.0.1:8080".to_string()),
             None, None,
             Duration::from_millis(500),
+            None,
             1024, 1024,
             7, 1,
             None, None,
