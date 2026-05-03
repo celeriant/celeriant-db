@@ -763,7 +763,7 @@ mod tests {
             if test_serialize(&mb, TEST_WIRE_VERSION, &mut buf).is_ok() {
                 prev_tip = test_hash(&prev_tip, &buf);
             }
-            out.push(PendingCacheItem { metablock: mb, datablock: None, metablock_absolute_pos: 0 });
+            out.push(PendingCacheItem::from_parts(mb, None, 0, 0));
         }
         (out, prev_tip)
     }

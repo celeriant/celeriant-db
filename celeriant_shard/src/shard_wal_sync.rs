@@ -162,12 +162,17 @@ fn commit_sync(
     // On the follower replication path, aggregate_queue_positions is empty (items arrive
     // via add_to_pending_queue which skips position tracking), so we fall back to the
     // queue item's own metablock_absolute_pos set during sync().
-    let deleted_positions: std::collections::HashMap<_, _> = sync_positions_snapshot
-        .aggregate_queue_positions
-        .iter()
-        .filter(|(_, pos)| pos.pending_delete)
-        .map(|(key, pos)| (key.clone(), (pos.log_id, pos.metablock_absolute_pos)))
-        .collect();
+    let has_deletes = sync_positions_snapshot.aggregate_queue_positions.values().any(|pos| pos.pending_delete);
+    let deleted_positions: std::collections::HashMap<_, _> = if has_deletes {
+        sync_positions_snapshot
+            .aggregate_queue_positions
+            .iter()
+            .filter(|(_, pos)| pos.pending_delete)
+            .map(|(key, pos)| (key.clone(), (pos.log_id, pos.metablock_absolute_pos)))
+            .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
 
     shard_mem_cache.commit_sync_positions_snapshot(node_status, sync_positions_snapshot);
 

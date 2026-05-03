@@ -1183,11 +1183,12 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             }
         };
 
+        let now_if_needed = self.last_rollback_at.get().map(|_| std::time::Instant::now());
         if let Some(cause) = crate::replication_backpressure::check_replication_backpressure(
             self.shard_mem_cache.borrow().is_inflight_pressured(),
             self.last_rollback_at.get(),
             self.config.replication_rollback_cooldown,
-            std::time::Instant::now(),
+            now_if_needed,
         ) {
             metrics::counter!(
                 "celeriant_writes_rejected_backpressure_total",
@@ -1207,12 +1208,6 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                 }
             }
             return Err(ShardWriteError::ReplicationBackpressure);
-        }
-
-        if let Some(t) = self.last_rollback_at.get() {
-            if t.elapsed() < self.config.replication_rollback_cooldown {
-                return Err(ShardWriteError::ReplicationBackpressure);
-            }
         }
 
         // Make sure we have at least one aggregate to write
@@ -1994,6 +1989,13 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     }
 
     async fn replicate_durable(&self) -> Result<(), ReplicationError> {
+        if !self.node_status.get().raw().is_leader() {
+            return Ok(());
+        }
+        Box::pin(self.replicate_durable_leader()).await
+    }
+
+    async fn replicate_durable_leader(&self) -> Result<(), ReplicationError> {
         let replication_client = self.replication_client.clone();
         let fsync_coordinator = self.fsync_coordinator.clone();
         let rotating_log_cache = self.log_segments_cache.clone();
@@ -2005,10 +2007,6 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let read_max_chunk_size = self.config.read_max_chunk_size;
         let shard_id = self.config.shard_id;
         let last_rollback_at = self.last_rollback_at.clone();
-
-        if !self.node_status.get().raw().is_leader() {
-            return Ok(());
-        }
 
         let follower_reachable = replication_client.is_follower_reachable();
         let delay = if follower_reachable {

@@ -21,16 +21,18 @@ impl BackpressureCause {
     }
 }
 
+/// `now` must be `Some` when `last_rollback_at` is `Some`; callers that have
+/// no recorded rollback can pass `None` to skip the `Instant::now()` syscall.
 pub fn check_replication_backpressure(
     inflight_pressured: bool,
     last_rollback_at: Option<Instant>,
     rollback_cooldown: Duration,
-    now: Instant,
+    now: Option<Instant>,
 ) -> Option<BackpressureCause> {
     if inflight_pressured {
         return Some(BackpressureCause::InflightPressure);
     }
-    if let Some(t) = last_rollback_at {
+    if let (Some(t), Some(now)) = (last_rollback_at, now) {
         let elapsed = now.saturating_duration_since(t);
         if elapsed < rollback_cooldown {
             let remaining_ms = (rollback_cooldown - elapsed).as_millis() as u64;
@@ -46,9 +48,8 @@ mod tests {
 
     #[test]
     fn accepts_when_no_pressure_and_no_recent_rollback() {
-        let now = Instant::now();
         assert_eq!(
-            check_replication_backpressure(false, None, Duration::from_millis(500), now),
+            check_replication_backpressure(false, None, Duration::from_millis(500), None),
             None
         );
     }
@@ -60,7 +61,7 @@ mod tests {
             true,
             Some(now - Duration::from_millis(10)),
             Duration::from_millis(500),
-            now,
+            Some(now),
         );
         assert_eq!(cause, Some(BackpressureCause::InflightPressure));
     }
@@ -73,7 +74,7 @@ mod tests {
             false,
             Some(last_rollback),
             Duration::from_millis(500),
-            now,
+            Some(now),
         );
         assert!(matches!(
             cause,
@@ -90,7 +91,7 @@ mod tests {
                 false,
                 Some(last_rollback),
                 Duration::from_millis(500),
-                now,
+                Some(now),
             ),
             None
         );
@@ -106,7 +107,7 @@ mod tests {
                 false,
                 Some(last_rollback),
                 Duration::from_millis(500),
-                now,
+                Some(now),
             ),
             None
         );
@@ -114,9 +115,8 @@ mod tests {
 
     #[test]
     fn no_rollback_recorded_skips_cooldown_check() {
-        let now = Instant::now();
         assert_eq!(
-            check_replication_backpressure(false, None, Duration::from_millis(500), now),
+            check_replication_backpressure(false, None, Duration::from_millis(500), None),
             None
         );
     }
