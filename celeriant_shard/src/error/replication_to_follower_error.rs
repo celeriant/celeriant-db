@@ -1,6 +1,7 @@
 use celeriant_client_glommio::ClientError;
 use celeriant_msg::response::responses::FollowerRejection;
 
+#[derive(Debug)]
 pub enum ReplicateToFollowerError {
     FollowerNetworkError(ClientError),
     FollowerRejected(FollowerRejection),

@@ -7,7 +7,7 @@ use std::{
 
 use celeriant_distributed::{lease_store::LeaseStore, node_status_logic::compute_new_ttl, s3_lease_manager::{ElectionOutcome, S3LeaseManager}, validated_node_status::{self, ValidatedNodeStatus, set_node_status_and_metric}};
 use celeriant_msg::response::responses::HeartbeatResult;
-use celeriant_shard::{error::send_heartbeat_error::SendHeartbeatError, replication_client::ReplicationClient, s3_downloader::S3Downloader, shard_wal::ShardWal};
+use celeriant_shard::{error::send_heartbeat_error::SendHeartbeatError, replication_client::ReplicationClient, s3_downloader::S3Downloader, shard_wal::ShardWal, shard_wal_s3_catchup::CatchupCompletion};
 use glommio::{
     channels::{
         channel_mesh::{Receivers, Senders},
@@ -395,16 +395,27 @@ async fn run_s3_catchup<R: ReplicationClient + 'static, D: S3Downloader + 'stati
 
         for msg in &results {
             match &msg.result {
-                Ok(r) => {
-                    info!(
-                        shard_id = msg.shard_id,
-                        batches_applied = r.batches_applied,
-                        bytes_downloaded = r.bytes_downloaded,
-                        rounds = r.rounds,
-                        fully_caught_up = r.fully_caught_up,
-                        "S3 catchup complete for shard"
-                    );
-                }
+                Ok(r) => match r.completion {
+                    CatchupCompletion::Caught => {
+                        info!(
+                            shard_id = msg.shard_id,
+                            batches_applied = r.batches_applied,
+                            bytes_downloaded = r.bytes_downloaded,
+                            rounds = r.rounds,
+                            "S3 catchup caught up for shard"
+                        );
+                    }
+                    CatchupCompletion::Retry => {
+                        warn!(
+                            shard_id = msg.shard_id,
+                            batches_applied = r.batches_applied,
+                            bytes_downloaded = r.bytes_downloaded,
+                            rounds = r.rounds,
+                            "S3 catchup did not drain for shard, will retry"
+                        );
+                        has_retriable = true;
+                    }
+                },
                 Err(e) if e.is_retriable() => {
                     warn!(shard_id = msg.shard_id, error = ?e, "S3 catchup retriable error, will retry");
                     has_retriable = true;
@@ -584,9 +595,21 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
     let lease_manager = ctx.lease_manager.clone().unwrap();
     glommio::spawn_local(async move {
 
-        // Node registration only needs to be done once on boot
-        if let Err(e) = lease_manager.register_self_on_membership_s3_object().await {
-            panic!("Failed to register node in membership (IAM or network issue): {e}");
+        // Node registration only needs to be done once on boot. Retry with 2s
+        // backoff until S3 is reachable; transient MinIO unavailability (e.g.,
+        // partition healing, restart in progress) shouldn't crash-loop systemd.
+        // Termination is shutdown-driven, not a bounded retry count.
+        loop {
+            if ctx.shutdown_requested.get() {
+                return;
+            }
+            match lease_manager.register_self_on_membership_s3_object().await {
+                Ok(()) => break,
+                Err(e) => {
+                    warn!(error = ?e, "Failed to register node in membership; retrying in 2s");
+                    glommio::timer::sleep(Duration::from_secs(2)).await;
+                }
+            }
         }
 
         let half_s3_lease = ctx.config.replication_config.as_ref().unwrap().s3_lease_duration / 2;
@@ -648,7 +671,18 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                     peer_discovery_backoff = Duration::from_secs(1);
                     // Node is there on network but still hasn't joined the cluster as follower
                     let reachable = follower_can_accept_tcp_replication;
+                    let was_reachable = ctx.shard_wal.replication_client.is_follower_reachable();
                     ctx.shard_wal.replication_client.set_follower_reachable(reachable);
+                    // Reconciliation probe on false→true transition. Shard 0 is the
+                    // heartbeat sender; broadcast_message_to_other_shards skips this
+                    // shard, so its probe fires here directly. Shards 1..N receive the
+                    // broadcast and fire their own in the IntrashardMessages handler.
+                    if !was_reachable && reachable && ctx.shard_wal.node_status.get().is_leader() {
+                        let shard_wal = ctx.shard_wal.clone();
+                        glommio::spawn_local(async move {
+                            shard_wal.probe_follower_for_drift().await;
+                        }).detach();
+                    }
                     broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::FollowerReachable { reachable }, ctx.intrashard_sender.clone()).await;
                     let prev_expires_at_ms = ctx.shard_wal.node_status.get().lease_expires_at_ms();
                     let new_expires_at_ms = compute_new_ttl(
@@ -867,7 +901,19 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
             ctx.shard_wal.peer_node_id.set(peer_node_id);
         }
         IntrashardMessages::FollowerReachable { reachable } => {
+            let was_reachable = ctx.shard_wal.replication_client.is_follower_reachable();
             ctx.shard_wal.replication_client.set_follower_reachable(reachable);
+            // Fast-path drift detection on false→true. Without this the follower
+            // sits stuck at its pre-unreachability wal_index until the next S3 kick,
+            // because real-time TCP replication can't bridge the gap of entries
+            // written during the unreachable window. Probe is shard-local — fires
+            // on every shard that receives the broadcast.
+            if !was_reachable && reachable && ctx.shard_wal.node_status.get().is_leader() {
+                let shard_wal = ctx.shard_wal.clone();
+                glommio::spawn_local(async move {
+                    shard_wal.probe_follower_for_drift().await;
+                }).detach();
+            }
         }
         IntrashardMessages::UpdateLeaderClientAddress { client_address } => {
             *ctx.shard_wal.leader_client_address.borrow_mut() = client_address;

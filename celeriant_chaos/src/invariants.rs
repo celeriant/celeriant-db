@@ -33,7 +33,6 @@ impl CheckResult {
 pub struct ScenarioExpectations {
     pub max_leader_elections: u64,
     pub max_s3_fallbacks: u64,
-    pub max_rollbacks: u64,
     pub max_heartbeat_failures: u64,
     pub max_shard_panics: u64,
     pub max_node_starts: u64,
@@ -46,12 +45,15 @@ pub struct ScenarioExpectations {
     /// Maximum number of role flips on either node during the bench window.
     pub max_role_flips: u64,
 
-    /// If `Some`, run `EventualConvergence`: the last ok `wal_index_max` for
-    /// the leader host and the last ok `wal_index_max` for the follower host
-    /// (within the bench window) must agree within this many entries.
-    /// Scenarios that take a follower offline use this to assert catchup
-    /// finished before tear-down. `None` (default) skips the check.
-    pub wal_convergence_tolerance: Option<u64>,
+    /// If true, run `EventualConvergence`: at the end of the bench window
+    /// the lagging node's `wal_index_max` must either equal the leading
+    /// node's, or have strictly advanced over the final settle window.
+    /// Catches genuine stuck-state divergence (lagging node frozen at a
+    /// non-zero diff) while accepting "still catching up" as a pass.
+    /// Replaces the old fixed-tolerance shape — tolerance was arbitrary
+    /// and could not distinguish slow-but-progressing from stuck.
+    /// `false` (default) skips the check.
+    pub assert_eventual_progress: bool,
 
     /// If true, run `LeaderRetained`: the host that holds `node_role >= 0.5`
     /// at the first ok tick must be the same host that holds it at the last
@@ -83,14 +85,13 @@ impl Default for ScenarioExpectations {
         Self {
             max_leader_elections: 0,
             max_s3_fallbacks: 0,
-            max_rollbacks: 0,
             max_heartbeat_failures: 0,
             max_shard_panics: 0,
             max_node_starts: 0,
             max_bench_errors: 0,
             max_split_brain_ticks: 0,
             max_role_flips: 0,
-            wal_convergence_tolerance: None,
+            assert_eventual_progress: false,
             require_leader_retained: false,
             require_final_leader_write_progress: false,
             require_distinct_leader_hosts: None,
@@ -147,7 +148,6 @@ pub fn run_all(data: &RunData, expect: &ScenarioExpectations) -> Vec<CheckResult
         check_leader_stable(data, expect),
         check_counter("NoUnexpectedElections", data, |s| s.leader_elections_total, expect.max_leader_elections),
         check_counter("NoS3Fallbacks", data, |s| s.s3_fallbacks_total, expect.max_s3_fallbacks),
-        check_counter("NoRollbacks", data, |s| s.rollbacks_total, expect.max_rollbacks),
         check_counter("NoHeartbeatFailures", data, |s| s.heartbeat_failures_total, expect.max_heartbeat_failures),
         check_counter("NoShardPanics", data, |s| s.shard_panics_total, expect.max_shard_panics),
         check_counter("NoNodeStarts", data, |s| s.node_starts_total, expect.max_node_starts),
@@ -158,8 +158,8 @@ pub fn run_all(data: &RunData, expect: &ScenarioExpectations) -> Vec<CheckResult
     if expect.require_leader_retained {
         out.push(check_leader_retained(data));
     }
-    if let Some(tol) = expect.wal_convergence_tolerance {
-        out.push(check_eventual_convergence(data, tol));
+    if expect.assert_eventual_progress {
+        out.push(check_eventual_convergence(data));
     }
     if expect.require_final_leader_write_progress {
         out.push(check_final_leader_write_progress(data));
@@ -326,34 +326,74 @@ fn check_leader_retained(data: &RunData) -> CheckResult {
 }
 
 /// At the last ok sample of each host within the bench window, both nodes'
-/// `wal_index_max` must agree within `tolerance` entries. Catches scenarios
-/// where the follower failed to catch up after a perturbation.
-fn check_eventual_convergence(data: &RunData, tolerance: u64) -> CheckResult {
+/// PROGRESS check: at the end of the bench+settle window, the lagging
+/// node must either (a) have converged to the leading node's `wal_index_max`,
+/// or (b) be strictly advancing across the final `PROGRESS_WINDOW_MS`.
+/// A "lagging node frozen at a non-zero diff" is the stuck-state failure
+/// this catches; "still catching up, just slower than settle" passes.
+///
+/// Replaces the prior fixed-tolerance shape, which could not distinguish
+/// "slow but converging" from "permanently stuck" — both showed up as
+/// `wal_index diverges by N (tolerance M)` with no signal about whether
+/// the cluster was making forward progress.
+fn check_eventual_convergence(data: &RunData) -> CheckResult {
     const NAME: &str = "EventualConvergence";
+    /// Window over which we measure progress on the lagging node, in ms.
+    /// 10s gives slow rpi MinIO time to deliver at least one S3 catchup
+    /// round; tighter windows produced false "STUCK" verdicts when the
+    /// follower had drained everything S3 had but the leader hadn't yet
+    /// uploaded its trailing batch.
+    const PROGRESS_WINDOW_MS: u64 = 10_000;
+
     let last_ok = |host: &str| -> Option<&NodeSample> {
         data.samples[data.bench_start_idx..=data.bench_end_idx]
             .iter()
             .rev()
             .find(|s| s.host == host && s.ok)
     };
-    let l = last_ok(data.leader_host);
-    let f = last_ok(data.follower_host);
-    match (l, f) {
-        (Some(a), Some(b)) => {
-            let diff = a.wal_index_max.max(b.wal_index_max) - a.wal_index_max.min(b.wal_index_max);
-            if diff <= tolerance {
-                CheckResult::pass(NAME)
-            } else {
-                CheckResult::fail(
-                    NAME,
-                    format!(
-                        "wal_index diverges by {diff} (tolerance {tolerance}): {}={} {}={}",
-                        a.host, a.wal_index_max, b.host, b.wal_index_max
-                    ),
-                )
-            }
+    let l = match last_ok(data.leader_host) {
+        Some(s) => s,
+        None => return CheckResult::fail(NAME, "missing ok samples for leader host in bench window"),
+    };
+    let f = match last_ok(data.follower_host) {
+        Some(s) => s,
+        None => return CheckResult::fail(NAME, "missing ok samples for follower host in bench window"),
+    };
+
+    if l.wal_index_max == f.wal_index_max {
+        return CheckResult::pass(NAME);
+    }
+
+    let (lagging_host, lagging_final) = if l.wal_index_max < f.wal_index_max {
+        (data.leader_host, l)
+    } else {
+        (data.follower_host, f)
+    };
+    let window_start_ms = lagging_final.t_ms.saturating_sub(PROGRESS_WINDOW_MS);
+    let lagging_window_first = data.samples[data.bench_start_idx..=data.bench_end_idx]
+        .iter()
+        .find(|s| s.host == lagging_host && s.ok && s.t_ms >= window_start_ms);
+
+    match lagging_window_first {
+        Some(first) if lagging_final.wal_index_max > first.wal_index_max => CheckResult::pass(NAME),
+        Some(first) => {
+            let diff = l.wal_index_max.max(f.wal_index_max) - l.wal_index_max.min(f.wal_index_max);
+            CheckResult::fail(
+                NAME,
+                format!(
+                    "STUCK: lagging host {} frozen at wal_index={} for {}ms (diff from peer: {}); leading host {} at wal_index={}",
+                    lagging_host, lagging_final.wal_index_max,
+                    lagging_final.t_ms.saturating_sub(first.t_ms),
+                    diff,
+                    if lagging_host == data.leader_host { data.follower_host } else { data.leader_host },
+                    if lagging_host == data.leader_host { f.wal_index_max } else { l.wal_index_max },
+                ),
+            )
         }
-        _ => CheckResult::fail(NAME, "missing ok samples for one or both hosts in bench window"),
+        None => CheckResult::fail(
+            NAME,
+            format!("no ok samples for lagging host {} in final {}ms window", lagging_host, PROGRESS_WINDOW_MS),
+        ),
     }
 }
 

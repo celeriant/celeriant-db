@@ -5,7 +5,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use glommio::sync::Semaphore;
 use tracing::{debug, info, trace, warn};
 
-use celeriant_disk::files::rwlock_timeout::write_with_timeout;
+use celeriant_disk::files::rwlock_timeout::{with_budget, write_with_timeout};
 use celeriant_distributed::node_status::NodeStatus;
 use celeriant_distributed::validated_node_status::{self, ValidatedNodeStatus, set_node_status_and_metric};
 use celeriant_rotating_log::errors::ready_up_error::ReadyUpError;
@@ -2436,6 +2436,176 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         }
 
         event_batches
+    }
+
+    pub async fn probe_follower_for_drift(&self) {
+        if !self.node_status.get().is_leader() {
+            return;
+        }
+        if !self.replication_client.is_follower_reachable() {
+            return;
+        }
+        let probe_start = Instant::now();
+        metrics::counter!("celeriant_probe_total").increment(1);
+
+        let probe_wal_index = {
+            let active = self.log_segments_cache.active();
+            let metadata = active.metadata.borrow();
+            if metadata.write.wal_index == 0 {
+                return;
+            }
+            metadata.write.wal_index
+        };
+
+        let mut probe_entries = match crate::fetch_catchup_entries::fetch_catchup_entries(
+            &self.log_segments_cache,
+            probe_wal_index.saturating_sub(1),
+            probe_wal_index.saturating_add(1),
+            Some(self.config.max_request_size),
+            self.config.read_max_chunk_size,
+        ).await {
+            Ok(e) => e,
+            Err(e) => {
+                debug!(shard_id = self.config.shard_id, error = ?e, "probe_follower_for_drift: failed to read local entry, skipping");
+                return;
+            }
+        };
+
+        if probe_entries.is_empty() {
+            return;
+        }
+
+        if let Err(e) = fetch_datablocks_for_metablocks(&mut probe_entries, self.config.read_max_chunk_size, &self.log_segments_cache).await {
+            debug!(shard_id = self.config.shard_id, error = ?e, "probe_follower_for_drift: failed to fetch datablock, skipping");
+            return;
+        }
+
+        let probe_items: Vec<celeriant_msg::request::requests::ReplicationBatchItem> = probe_entries
+            .into_iter()
+            .map(|e| celeriant_msg::request::requests::ReplicationBatchItem {
+                metablock: e.metablock,
+                datablock: e.datablock,
+            })
+            .collect();
+
+        info!(shard_id = self.config.shard_id, probe_wal_index, "Sending reconciliation probe to follower");
+        let probe_budget = match self.node_status.get().current_budget() {
+            None => return,
+            Some(b) if b.is_zero() => {
+                metrics::counter!("celeriant_lease_budget_exhausted_total", &[("op", "probe")]).increment(1);
+                return;
+            }
+            Some(b) => b,
+        };
+        let probe_rpc_result = match with_budget(probe_budget, self.replication_client.replicate_to_follower(probe_items)).await {
+            Some(r) => r,
+            None => {
+                metrics::counter!("celeriant_lease_budget_exhausted_total", &[("op", "probe")]).increment(1);
+                return;
+            }
+        };
+
+        match probe_rpc_result {
+            Ok(()) => {
+                metrics::counter!("celeriant_probe_outcome_current_total").increment(1);
+                debug!(shard_id = self.config.shard_id, probe_wal_index, "Reconciliation probe: follower already current");
+            }
+            Err(crate::error::replication_to_follower_error::ReplicateToFollowerError::FollowerRejected(rejection)) => {
+                if let FollowerRejection::WalIndexMismatch { max_follower_wal_index } = rejection {
+                    let gap_size = probe_wal_index.saturating_sub(max_follower_wal_index);
+                    metrics::counter!("celeriant_probe_outcome_gap_detected_total").increment(1);
+                    metrics::histogram!("celeriant_probe_gap_size").record(gap_size as f64);
+                    info!(
+                        shard_id = self.config.shard_id,
+                        follower_wal = max_follower_wal_index,
+                        leader_wal = probe_wal_index,
+                        gap = gap_size,
+                        "Reconciliation probe: follower behind, sending catchup gap"
+                    );
+                    let gap = match crate::fetch_catchup_entries::fetch_catchup_entries(
+                        &self.log_segments_cache,
+                        max_follower_wal_index,
+                        probe_wal_index.saturating_add(1),
+                        self.config.max_catchup_gap_bytes,
+                        self.config.read_max_chunk_size,
+                    ).await {
+                        Ok(e) => e,
+                        Err(e) => {
+                            warn!(shard_id = self.config.shard_id, error = ?e, "probe gap fetch failed");
+                            return;
+                        }
+                    };
+                    if gap.is_empty() {
+                        return;
+                    }
+                    let mut gap = gap;
+                    if let Err(e) = fetch_datablocks_for_metablocks(&mut gap, self.config.read_max_chunk_size, &self.log_segments_cache).await {
+                        debug!(shard_id = self.config.shard_id, error = ?e, "probe gap datablock fetch failed, sending without datablocks (may fail on external datablocks)");
+                    }
+                    let gap_items: Vec<_> = gap.into_iter()
+                        .map(|e| celeriant_msg::request::requests::ReplicationBatchItem {
+                            metablock: e.metablock,
+                            datablock: e.datablock,
+                        })
+                        .collect();
+                    let n_items = gap_items.len();
+                    let gap_budget = match self.node_status.get().current_budget() {
+                        None => return,
+                        Some(b) if b.is_zero() => {
+                            metrics::counter!("celeriant_lease_budget_exhausted_total", &[("op", "probe")]).increment(1);
+                            return;
+                        }
+                        Some(b) => b,
+                    };
+                    let gap_result = match with_budget(gap_budget, self.replication_client.replicate_to_follower(gap_items)).await {
+                        Some(r) => r,
+                        None => {
+                            metrics::counter!("celeriant_lease_budget_exhausted_total", &[("op", "probe")]).increment(1);
+                            return;
+                        }
+                    };
+                    if let Err(e) = gap_result {
+                        metrics::counter!("celeriant_probe_gap_send_failed_total").increment(1);
+                        warn!(shard_id = self.config.shard_id, error = ?e, n_items, "Reconciliation probe gap send failed; normal paths will retry");
+                    } else {
+                        metrics::counter!("celeriant_probe_gap_send_success_total").increment(1);
+                        info!(shard_id = self.config.shard_id, n_items, "Reconciliation probe gap delivered to follower");
+                    }
+                } else if let FollowerRejection::StaleLease { follower_lease_index, received_lease_index } = rejection {
+                    metrics::counter!("celeriant_probe_outcome_stale_lease_total").increment(1);
+                    let current = self.node_status.get();
+                    let raw = current.raw();
+                    let our_lease = raw.lease_index().unwrap_or(0);
+                    if raw.is_leader() && our_lease < follower_lease_index {
+                        warn!(
+                            shard_id = self.config.shard_id,
+                            our_lease,
+                            received_lease_index,
+                            follower_lease_index,
+                            "Reconciliation probe: cluster has moved on (split-brain) — fencing self"
+                        );
+                        let fenced = ValidatedNodeStatus::create_custom_status(raw, self.config.max_clock_drift_ms, 0);
+                        set_node_status_and_metric(&self.node_status, fenced, self.config.shard_id);
+                    } else {
+                        debug!(
+                            shard_id = self.config.shard_id,
+                            our_lease,
+                            received_lease_index,
+                            follower_lease_index,
+                            "Reconciliation probe got StaleLease for old metablock — leadership still valid, no action"
+                        );
+                    }
+                } else {
+                    metrics::counter!("celeriant_probe_outcome_other_rejection_total").increment(1);
+                    debug!(shard_id = self.config.shard_id, ?rejection, "Reconciliation probe rejected (not WalIndexMismatch/StaleLease); normal kick/catchup paths will handle");
+                }
+            }
+            Err(e) => {
+                metrics::counter!("celeriant_probe_outcome_network_error_total").increment(1);
+                warn!(shard_id = self.config.shard_id, error = ?e, "Reconciliation probe network error; will retry on next FollowerReachable transition");
+            }
+        }
+        metrics::histogram!("celeriant_probe_duration_seconds").record(probe_start.elapsed().as_secs_f64());
     }
 
     pub async fn enter_s3_catchup(&self) -> Result<S3CatchupResult, S3CatchupError> {

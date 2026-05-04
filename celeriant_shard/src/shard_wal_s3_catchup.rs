@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use celeriant_distributed::node_status::NodeStatus;
@@ -29,12 +29,18 @@ use crate::error::shard_fsync_error::ShardFsyncError;
 use crate::s3_downloader::{S3Downloader};
 use crate::shard_wal_sync::{capture_fsync_snapshot, commit_fsync_with_rollback};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatchupCompletion {
+    Caught,
+    Retry,
+}
+
 #[derive(Debug, Clone)]
 pub struct S3CatchupResult {
     pub batches_applied: u64,
     pub bytes_downloaded: u64,
     pub rounds: u32,
-    pub fully_caught_up: bool,
+    pub completion: CatchupCompletion,
 }
 
 struct FallbackBatchRef {
@@ -94,7 +100,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader>(
         batches_applied: 0,
         bytes_downloaded: 0,
         rounds: 0,
-        fully_caught_up: false,
+        completion: CatchupCompletion::Retry,
     };
     let current_wal_index = {
         let active = log_segments_cache.active();
@@ -106,13 +112,10 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader>(
     let prefix = fallback_shard_prefix(shard_id);
 
     let mut first_iteration = true;
+    let mut applied_paths: HashSet<String> = HashSet::new();
 
     loop {
         result.rounds += 1;
-        if result.rounds > 50 {
-            tracing::error!("catchup_from_s3 hit safety cap");
-            break;
-        }
 
         let inner_applied = result.batches_applied;
         let mut truncated = false;
@@ -154,7 +157,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader>(
             .sum();
 
         if !first_iteration && max_catchup_gap_bytes.map_or(true, |cap| remaining_bytes < cap) {
-            result.fully_caught_up = true;
+            result.completion = CatchupCompletion::Caught;
             break;
         }
 
@@ -166,6 +169,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader>(
                 .values()
                 .flatten()
                 .filter(|c| c.start_wal_index <= next_wal_index && c.end_wal_index >= next_wal_index)
+                .filter(|c| !applied_paths.contains(&c.path))
                 .collect();
 
             if covering.is_empty() {
@@ -262,13 +266,28 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader>(
                 // already-downloaded batch first (no extra I/O); fall back to
                 // scanning earlier S3 batches if the triggering batch doesn't
                 // overlap our local data.
-                let (ancestor_hash, ancestor_log_id, divergent_wal_index, divergent_position) =
-                    match find_divergence_from_batch(log_segments_cache, &all_items).await {
-                        Ok(result) => result,
-                        Err(_) => {
-                            find_divergence_via_s3(log_segments_cache, downloader, &prefix, current_wal, node_id, peer_node_id).await?
-                        }
-                    };
+                let divergence = match find_divergence_from_batch(log_segments_cache, &all_items).await {
+                    Ok(r) => Some(r),
+                    Err(_) => find_divergence_via_s3(log_segments_cache, downloader, &prefix, current_wal, node_id, peer_node_id).await.ok(),
+                };
+                let (ancestor_hash, ancestor_log_id, divergent_wal_index, divergent_position) = match divergence {
+                    Some(r) => r,
+                    None => {
+                        // No common ancestor in any S3 batch we can see right now.
+                        // Could be transient (new leader hasn't uploaded enough yet) or
+                        // structural (operator-territory). Either way: not safe to
+                        // truncate, not fatal — skip this batch and let the loop bail to
+                        // Retry. The caller's retry will re-list S3 next round.
+                        tracing::warn!(
+                            shard_id,
+                            current_wal,
+                            path = %candidate.path,
+                            "Chain mismatch with no common ancestor — skipping batch, will retry catchup"
+                        );
+                        applied_paths.insert(candidate.path.clone());
+                        break;
+                    }
+                };
 
                 tracing::warn!(
                     shard_id,
@@ -303,6 +322,8 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader>(
                 .await
                 .map_err(S3CatchupError::FsyncFailed)?;
 
+            applied_paths.insert(candidate.path.clone());
+
             let shard_label = [("shard_id", shard_id.to_string())];
             let applied_bytes: u64 = items.iter().map(|i| i.metablock.uncompressed_size).sum();
             metrics::counter!("celeriant_replication_applied_events_total", &shard_label).increment(items.len() as u64);
@@ -315,10 +336,11 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader>(
         }
 
         if !truncated && result.batches_applied == inner_applied {
-            // No progress this iteration. Check if remaining is small
-            // enough for TCP to fill the gap.
+            // No progress this iteration. If the remaining gap is small,
+            // TCP replication can bridge it once we exit catchup. Otherwise
+            // leave the default Retry; leader is likely still uploading.
             if max_catchup_gap_bytes.map_or(true, |cap| remaining_bytes < cap) {
-                result.fully_caught_up = true;
+                result.completion = CatchupCompletion::Caught;
             }
             break;
         }
@@ -993,7 +1015,7 @@ mod tests {
 
             let result = tc.catchup(&dl, 0, 10).await.unwrap();
             assert_eq!(result.batches_applied, 0);
-            assert!(result.fully_caught_up);
+            assert_eq!(result.completion, CatchupCompletion::Caught);
 
             tc.close().await;
         });
@@ -1011,7 +1033,7 @@ mod tests {
 
             let result = tc.catchup(&dl, 0, 10).await.unwrap();
             assert_eq!(result.batches_applied, 1);
-            assert!(result.fully_caught_up);
+            assert_eq!(result.completion, CatchupCompletion::Caught);
             assert_eq!(tc.wal_index(), 1);
 
             tc.close().await;
@@ -1031,7 +1053,7 @@ mod tests {
             let result = tc.catchup(&dl, 0, 10).await.unwrap();
             assert_eq!(result.batches_applied, 1);
             assert_eq!(tc.wal_index(), 5);
-            assert!(result.fully_caught_up);
+            assert_eq!(result.completion, CatchupCompletion::Caught);
 
             tc.close().await;
         });
@@ -1051,7 +1073,7 @@ mod tests {
             dl.insert(path, data);
 
             // Gaps are handled gracefully - apply [1-2], stop at gap.
-            // remaining gap is small enough for TCP, so fully_caught_up is true.
+            // remaining gap is small enough for TCP, so completion is Caught.
             let result = tc.catchup(&dl, 0, 10).await.unwrap();
             assert_eq!(tc.wal_index(), 2);
             assert_eq!(result.batches_applied, 1);
@@ -1152,7 +1174,7 @@ mod tests {
             let result = tc.catchup(&dl, 0, 10).await.unwrap();
             assert_eq!(result.batches_applied, 1);
             assert_eq!(tc.wal_index(), 6);
-            assert!(result.fully_caught_up);
+            assert_eq!(result.completion, CatchupCompletion::Caught);
 
             tc.close().await;
         });
@@ -1181,7 +1203,7 @@ mod tests {
             let result = tc.catchup(&dl, 0, 10).await.unwrap();
             assert_eq!(result.batches_applied, 2);
             assert_eq!(tc.wal_index(), 6);
-            assert!(result.fully_caught_up);
+            assert_eq!(result.completion, CatchupCompletion::Caught);
 
             tc.close().await;
         });
@@ -1220,7 +1242,7 @@ mod tests {
             // Step 4: Catchup detects TipHashMismatch, truncates entry 6, re-applies 6-8
             let result = tc.catchup(&dl, 0, 10).await.unwrap();
             assert_eq!(tc.wal_index(), 8, "Should catch up to wal_index 8 after truncation");
-            assert!(result.fully_caught_up);
+            assert_eq!(result.completion, CatchupCompletion::Caught);
 
             tc.close().await;
         });
@@ -1295,7 +1317,7 @@ mod tests {
 
             let result = tc.catchup(&dl, 0, 10).await.unwrap();
             assert_eq!(tc.wal_index(), 12);
-            assert!(result.fully_caught_up);
+            assert_eq!(result.completion, CatchupCompletion::Caught);
 
             tc.close().await;
         });
@@ -1327,7 +1349,7 @@ mod tests {
 
             let result = tc.catchup(&dl, 0, 10).await.unwrap();
             assert_eq!(tc.wal_index(), 14);
-            assert!(result.fully_caught_up);
+            assert_eq!(result.completion, CatchupCompletion::Caught);
 
             tc.close().await;
         });
@@ -1352,13 +1374,16 @@ mod tests {
             tc.catchup(&dl, 0, 10).await.unwrap();
 
             // S3 has batch 4-6 with a completely unknown previous_tip_hash.
-            // No local metablock will match - divergence is unrecoverable.
+            // No local metablock will match — divergence is unrecoverable in
+            // this round. Catchup should bail with Retry (caller can re-list
+            // S3 next round; if the chain still doesn't reconcile, it's
+            // surfaced via a persistent Retry signal, not a fatal panic).
             dl.objects.borrow_mut().clear();
             let (path, data) = make_fallback_batch(0, 4, 6, [0xFF; 32]);
             dl.insert(path, data);
 
-            let err = tc.catchup(&dl, 0, 10).await.unwrap_err();
-            assert!(matches!(err, S3CatchupError::TruncationFailed(_)));
+            let result = tc.catchup(&dl, 0, 10).await.unwrap();
+            assert_eq!(result.completion, CatchupCompletion::Retry);
 
             tc.close().await;
         });
@@ -1409,7 +1434,7 @@ mod tests {
 
             let result = tc.catchup(&dl, 0, 10).await.unwrap();
             assert_eq!(tc.wal_index(), 9);
-            assert!(result.fully_caught_up);
+            assert_eq!(result.completion, CatchupCompletion::Caught);
 
             // Verify the S3 fallback downloaded batch 6-6 to find the ancestor
             let downloads = dl.downloaded_paths();
@@ -1774,7 +1799,7 @@ mod tests {
             // Catchup should filter all self-uploaded batches and report nothing to apply
             let result = tc.catchup(&dl, 0, 10).await.unwrap();
             assert_eq!(result.batches_applied, 0);
-            assert!(result.fully_caught_up);
+            assert_eq!(result.completion, CatchupCompletion::Caught);
 
             // Self-uploaded batches must NOT be deleted - the other node may need them
             assert!(dl.deleted_paths().is_empty(), "Self-uploaded batches must not be deleted from S3");
