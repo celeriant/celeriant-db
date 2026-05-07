@@ -14,6 +14,7 @@ pub struct ValidatedNodeStatus {
     status: NodeStatus,
     lease_expires_at_ms: u64,
     max_clock_drift_ms: u64,
+    leader_since_ms: u64,
 }
 
 impl ValidatedNodeStatus {
@@ -27,7 +28,7 @@ impl ValidatedNodeStatus {
     }
 
     pub fn create_fenced() -> Self {
-        Self { status: NodeStatus::Fenced, max_clock_drift_ms: 0, lease_expires_at_ms: 0 }
+        Self { status: NodeStatus::Fenced, max_clock_drift_ms: 0, lease_expires_at_ms: 0, leader_since_ms: 0 }
     }
 
     pub fn current_budget(&self) -> Option<std::time::Duration> {
@@ -40,15 +41,21 @@ impl ValidatedNodeStatus {
     }
 
     pub fn create_standalone() -> Self {
-        Self { status: NodeStatus::Standalone, max_clock_drift_ms: 0, lease_expires_at_ms: 0 }
+        Self { status: NodeStatus::Standalone, max_clock_drift_ms: 0, lease_expires_at_ms: 0, leader_since_ms: 0 }
     }
 
     pub fn create_boot_catchup() -> Self {
-        Self { status: NodeStatus::BootCatchup, max_clock_drift_ms: 0, lease_expires_at_ms: 0 }
+        Self { status: NodeStatus::BootCatchup, max_clock_drift_ms: 0, lease_expires_at_ms: 0, leader_since_ms: 0 }
     }
 
     pub fn create_custom_status(status: NodeStatus, max_clock_drift_ms: u64, lease_expires_at_ms: u64) -> Self {
-        Self { status, max_clock_drift_ms, lease_expires_at_ms }
+        Self { status, max_clock_drift_ms, lease_expires_at_ms, leader_since_ms: 0 }
+    }
+
+    /// Unix-epoch ms when this node became leader; 0 if never. Stable across
+    /// same-node lease renewals — only resets on a real Follower->Leader edge.
+    pub fn leader_since_ms(&self) -> u64 {
+        self.leader_since_ms
     }
 
     pub fn effective_node_status(&self) -> NodeStatus {
@@ -101,9 +108,15 @@ impl ValidatedNodeStatus {
 
 pub fn set_node_status_and_metric(
     cell: &std::cell::Cell<ValidatedNodeStatus>,
-    status: ValidatedNodeStatus,
+    mut status: ValidatedNodeStatus,
     shard_id: u32,
 ) {
+    let prev = cell.get();
+    status.leader_since_ms = if status.is_leader() && !prev.is_leader() {
+        unix_epoch_now_ms()
+    } else {
+        prev.leader_since_ms
+    };
     cell.set(status);
     if shard_id == 0 {
         let role = if status.is_leader() || status.is_standalone() { 1.0 } else { 0.0 };
@@ -130,7 +143,7 @@ mod tests {
         let status = ValidatedNodeStatus::create_custom_status(
             NodeStatus::Leader { lease_index: 1 },
             DRIFT,
-            now + 200, // 200ms left < 500ms drift → must_fence() fires
+            now + 200, // 200ms left < 500ms drift -> must_fence() fires
         );
         assert_eq!(status.effective_node_status(), NodeStatus::Fenced,
             "Leader should fence when remaining time < max_clock_drift");
@@ -253,6 +266,89 @@ mod tests {
         assert_eq!(cell.get().raw(), NodeStatus::Follower { leader_lease_index: 7 });
         set_node_status_and_metric(&cell, target, 42);
         assert_eq!(cell.get().raw(), NodeStatus::Follower { leader_lease_index: 7 });
+    }
+
+    #[test]
+    fn leader_since_ms_stamped_on_follower_to_leader_transition() {
+        let cell = std::cell::Cell::new(ValidatedNodeStatus::create_custom_status(
+            NodeStatus::Follower { leader_lease_index: 1 }, DRIFT, FAR_FUTURE,
+        ));
+        assert_eq!(cell.get().leader_since_ms(), 0, "follower starts at 0");
+
+        let promoted = ValidatedNodeStatus::create_custom_status(
+            NodeStatus::Leader { lease_index: 2 }, DRIFT, FAR_FUTURE,
+        );
+        let before = unix_epoch_now_ms();
+        set_node_status_and_metric(&cell, promoted, 0);
+        let after = unix_epoch_now_ms();
+        let stamped = cell.get().leader_since_ms();
+        assert!(stamped >= before && stamped <= after, "stamp must be now (got {stamped}, range {before}..={after})");
+    }
+
+    #[test]
+    fn leader_since_ms_preserved_across_heartbeat_refresh() {
+        let cell = std::cell::Cell::new(ValidatedNodeStatus::create_custom_status(
+            NodeStatus::Follower { leader_lease_index: 1 }, DRIFT, FAR_FUTURE,
+        ));
+        // Promote -> stamps leader_since_ms.
+        set_node_status_and_metric(&cell, ValidatedNodeStatus::create_custom_status(
+            NodeStatus::Leader { lease_index: 2 }, DRIFT, FAR_FUTURE,
+        ), 0);
+        let stamped = cell.get().leader_since_ms();
+        assert!(stamped > 0);
+
+        // Heartbeat refresh: same role, fresh expires_at. leader_since_ms must persist.
+        let refreshed = ValidatedNodeStatus::create_custom_status(
+            NodeStatus::Leader { lease_index: 2 }, DRIFT, FAR_FUTURE,
+        );
+        set_node_status_and_metric(&cell, refreshed, 0);
+        assert_eq!(cell.get().leader_since_ms(), stamped, "refresh must preserve stamp");
+    }
+
+    #[test]
+    fn leader_since_ms_preserved_across_same_node_lease_bump() {
+        let cell = std::cell::Cell::new(ValidatedNodeStatus::create_custom_status(
+            NodeStatus::Follower { leader_lease_index: 1 }, DRIFT, FAR_FUTURE,
+        ));
+        set_node_status_and_metric(&cell, ValidatedNodeStatus::create_custom_status(
+            NodeStatus::Leader { lease_index: 2 }, DRIFT, FAR_FUTURE,
+        ), 0);
+        let stamped = cell.get().leader_since_ms();
+
+        // Same-node lease re-issue at lease=3 (still leader, no Follower->Leader edge).
+        set_node_status_and_metric(&cell, ValidatedNodeStatus::create_custom_status(
+            NodeStatus::Leader { lease_index: 3 }, DRIFT, FAR_FUTURE,
+        ), 0);
+        assert_eq!(cell.get().leader_since_ms(), stamped, "same-node lease bump must preserve stamp");
+    }
+
+    #[test]
+    fn leader_since_ms_preserved_through_demotion() {
+        let cell = std::cell::Cell::new(ValidatedNodeStatus::create_custom_status(
+            NodeStatus::Follower { leader_lease_index: 1 }, DRIFT, FAR_FUTURE,
+        ));
+        set_node_status_and_metric(&cell, ValidatedNodeStatus::create_custom_status(
+            NodeStatus::Leader { lease_index: 2 }, DRIFT, FAR_FUTURE,
+        ), 0);
+        let stamped = cell.get().leader_since_ms();
+
+        // Demote to follower. Value can stay or reset; the gate predicate also
+        // checks is_leader, so what matters is that a *new* Follower->Leader
+        // edge later re-stamps. Here we just assert the cell still holds a
+        // known value, and the next promotion overwrites with a fresh stamp.
+        set_node_status_and_metric(&cell, ValidatedNodeStatus::create_custom_status(
+            NodeStatus::Follower { leader_lease_index: 4 }, DRIFT, FAR_FUTURE,
+        ), 0);
+        assert_eq!(cell.get().leader_since_ms(), stamped, "demotion preserves prior stamp (irrelevant while not leader)");
+
+        // Re-promote -> fresh stamp.
+        let before = unix_epoch_now_ms();
+        // Sleep-free test — just assert >= stamped (and same-or-later than `before`).
+        set_node_status_and_metric(&cell, ValidatedNodeStatus::create_custom_status(
+            NodeStatus::Leader { lease_index: 5 }, DRIFT, FAR_FUTURE,
+        ), 0);
+        let new_stamp = cell.get().leader_since_ms();
+        assert!(new_stamp >= before, "re-promotion stamps fresh leader_since_ms");
     }
 
     #[test]

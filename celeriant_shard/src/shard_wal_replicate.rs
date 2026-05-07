@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 use celeriant_disk::files::rwlock_timeout::with_budget;
 
-use celeriant_distributed::validated_node_status::ValidatedNodeStatus;
+use celeriant_distributed::validated_node_status::{ValidatedNodeStatus, set_node_status_and_metric};
 use celeriant_msg::request::requests::ReplicationBatchItem;
 use celeriant_rotating_log::log_segment_file::aggregate_key_bloom::AggregateKeyBloom;
 use celeriant_rotating_log::log_segment_file::log_segment_file::{read_datablocks_carry_over_bytes, write_dual_shard_log_header};
@@ -33,6 +33,16 @@ use crate::error::shard_fsync_error::ShardFsyncError;
 use crate::replication_client::ReplicationClient;
 use crate::watch_event_collector::WatchEventCollector;
 
+/// What kicked off this replication cycle. `Probe` lets the coordinator path
+/// run with an empty pending-replication queue: when the snapshot is empty,
+/// `replicate_loop` synthesises a single-entry batch from the latest local
+/// wal_index to flush out a follower drift gap.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ReplicationTrigger {
+    Write,
+    Probe,
+}
+
 /// Captured data from the replication snapshot phase.
 pub(crate) struct ReplicationCapturedData {
     pub replication_snapshot: Vec<PendingCommitData>,
@@ -40,7 +50,10 @@ pub(crate) struct ReplicationCapturedData {
 
 /// Capture phase: take replication snapshot from memcache.
 /// Must be called while the coordinator still holds the orchestrator event.
-pub(crate) fn capture_replication_snapshot(shard_mem_cache: &Rc<RefCell<MemCache>>) -> CaptureResult<ReplicationCapturedData, ReplicationError> {
+pub(crate) fn capture_replication_snapshot(
+    shard_mem_cache: &Rc<RefCell<MemCache>>,
+    trigger: ReplicationTrigger,
+) -> CaptureResult<ReplicationCapturedData, ReplicationError> {
     let mut cache = shard_mem_cache.borrow_mut();
 
     metrics::gauge!("celeriant_replication_queue_bytes").set(cache.pending_replication_bytes() as f64);
@@ -50,7 +63,7 @@ pub(crate) fn capture_replication_snapshot(shard_mem_cache: &Rc<RefCell<MemCache
         return CaptureResult::Failed(ReplicationError::RollbackInProgress);
     }
 
-    if replication_snapshot.is_empty() {
+    if replication_snapshot.is_empty() && matches!(trigger, ReplicationTrigger::Write) {
         return CaptureResult::NoCaptureRaceButOk;
     }
 
@@ -89,9 +102,11 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient + 'sta
     node_status: Rc<Cell<ValidatedNodeStatus>>,
     last_rollback_at: Rc<Cell<Option<Instant>>>,
     replication_captured_data: ReplicationCapturedData,
+    trigger: ReplicationTrigger,
     max_catchup_gap_bytes: Option<u64>,
     max_request_size: u64,
     read_max_chunk_size: u64,
+    max_clock_drift_ms: u64,
     shard_id: u32,
 ) -> Result<(), ReplicationError> {
     let start = Instant::now();
@@ -101,8 +116,8 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient + 'sta
 
     let outcome = replicate_loop(
         &replication_client, &log_segments_cache, &shard_mem_cache, &watched_aggregates, &node_status,
-        &mut replication_snapshot,
-        max_catchup_gap_bytes, max_request_size, read_max_chunk_size, shard_id,
+        &mut replication_snapshot, 
+        max_catchup_gap_bytes, max_request_size, read_max_chunk_size, max_clock_drift_ms, shard_id,
     ).await;
 
     // Sweep memcache for any rotated-and-sealed segments whose read cursor has now caught up
@@ -115,7 +130,13 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient + 'sta
 
     let details = match outcome {
         Ok(d) => d,
-        Err(e) => return finish_with_rollback(&fsync_coordinator, &log_segments_cache, &shard_mem_cache, &last_rollback_at, replication_snapshot, e, shard_id).await,
+        Err(e) => {
+            // Probes don't need to rollback, zero fsync batch captures
+            if matches!(trigger, ReplicationTrigger::Probe) {
+                return Err(e);
+            }
+            return finish_with_rollback(&fsync_coordinator, &log_segments_cache, &shard_mem_cache, &last_rollback_at, replication_snapshot, e, shard_id).await;
+        }
     };
 
     log_replication_outcome(initial_batch_count, &details, start, shard_id);
@@ -125,9 +146,6 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient + 'sta
     Ok(())
 }
 
-/// Send the snapshot to the follower in one TCP request, with at most one
-/// catchup retry on `WalIndexMismatch`. On success, commit every PCD in the
-/// snapshot. On any failure, drain the snapshot through S3.
 async fn replicate_loop<R: ReplicationClient + 'static>(
     replication_client: &Rc<R>,
     log_segments_cache: &Rc<LogSegmentsCache>,
@@ -138,6 +156,7 @@ async fn replicate_loop<R: ReplicationClient + 'static>(
     max_catchup_gap_bytes: Option<u64>,
     max_request_size: u64,
     read_max_chunk_size: u64,
+    max_clock_drift_ms: u64,
     shard_id: u32,
 ) -> Result<ReplicationDetails, ReplicationError> {
     if !node_status.get().is_leader() {
@@ -146,6 +165,15 @@ async fn replicate_loop<R: ReplicationClient + 'static>(
     }
 
     let reachable_at_commit = replication_client.is_follower_reachable();
+
+    if snapshot.is_empty() {
+        return run_probe_send(
+            replication_client, log_segments_cache, node_status,
+            reachable_at_commit, max_catchup_gap_bytes, max_request_size,
+            read_max_chunk_size, max_clock_drift_ms, shard_id,
+        ).await;
+    }
+
     if !reachable_at_commit {
         debug!(shard_id, "Follower unreachable, will use S3 fallback");
     }
@@ -164,7 +192,7 @@ async fn replicate_loop<R: ReplicationClient + 'static>(
 
     match tcp_send_snapshot(
         replication_client, log_segments_cache, node_status, snapshot,
-        max_request_size, max_catchup_gap_bytes, read_max_chunk_size, shard_id,
+        max_request_size, max_catchup_gap_bytes, read_max_chunk_size, max_clock_drift_ms, shard_id,
     ).await? {
         SnapshotSendOutcome::Sent => {
             let pcds = std::mem::take(snapshot);
@@ -181,6 +209,98 @@ async fn replicate_loop<R: ReplicationClient + 'static>(
             Ok(ReplicationDetails::ReplicatedToS3)
         }
     }
+}
+
+async fn run_probe_send<R: ReplicationClient + 'static>(
+    replication_client: &Rc<R>,
+    log_segments_cache: &Rc<LogSegmentsCache>,
+    node_status: &Rc<Cell<ValidatedNodeStatus>>,
+    reachable: bool,
+    max_catchup_gap_bytes: Option<u64>,
+    max_request_size: u64,
+    read_max_chunk_size: u64,
+    max_clock_drift_ms: u64,
+    shard_id: u32,
+) -> Result<ReplicationDetails, ReplicationError> {
+    if !reachable {
+        return Ok(ReplicationDetails::ReplicatedToFollower);
+    }
+
+    let leader_wal_index = {
+        let active = log_segments_cache.active();
+        let metadata = active.metadata.borrow();
+        if metadata.write.wal_index == 0 {
+            return Ok(ReplicationDetails::ReplicatedToFollower);
+        }
+        metadata.write.wal_index
+    };
+
+    metrics::counter!("celeriant_probe_total").increment(1);
+    let probe_start = Instant::now();
+
+    let mut probe_entries = match crate::fetch_catchup_entries::fetch_catchup_entries(
+        log_segments_cache,
+        leader_wal_index.saturating_sub(1),
+        leader_wal_index.saturating_add(1),
+        Some(max_request_size),
+        read_max_chunk_size,
+    ).await {
+        Ok(e) => e,
+        Err(e) => {
+            debug!(shard_id, error = ?e, "probe: failed to read local entry, skipping");
+            return Ok(ReplicationDetails::ReplicatedToFollower);
+        }
+    };
+    if probe_entries.is_empty() {
+        return Ok(ReplicationDetails::ReplicatedToFollower);
+    }
+    if let Err(e) = crate::collect_from_disk::fetch_datablocks_for_metablocks(
+        &mut probe_entries, read_max_chunk_size, log_segments_cache,
+    ).await {
+        debug!(shard_id, error = ?e, "probe: datablock fetch failed, skipping");
+        return Ok(ReplicationDetails::ReplicatedToFollower);
+    }
+
+    let probe_items: Vec<ReplicationBatchItem> = probe_entries.into_iter()
+        .map(|e| ReplicationBatchItem { metablock: e.metablock, datablock: e.datablock })
+        .collect();
+    info!(shard_id, leader_wal_index, "Sending reconciliation probe to follower");
+
+    let outcome = single_send(replication_client, node_status, probe_items, max_clock_drift_ms, shard_id).await?;
+    match outcome {
+        SingleSendOutcome::Ok => {
+            metrics::counter!("celeriant_probe_outcome_current_total").increment(1);
+            debug!(shard_id, leader_wal_index, "Probe: follower already current");
+        }
+        SingleSendOutcome::WalIndexMismatch { max_follower_wal_index } => {
+            let gap_size = leader_wal_index.saturating_sub(max_follower_wal_index);
+            metrics::counter!("celeriant_probe_outcome_gap_detected_total").increment(1);
+            metrics::histogram!("celeriant_probe_gap_size").record(gap_size as f64);
+            info!(
+                shard_id, follower_wal = max_follower_wal_index, leader_wal = leader_wal_index,
+                gap = gap_size, "Probe: follower behind, running catchup",
+            );
+            match crate::replicate_follower_catchup::replicate_follower_catchup(
+                replication_client, log_segments_cache, node_status,
+                max_follower_wal_index, leader_wal_index.saturating_add(1),
+                max_catchup_gap_bytes, max_request_size, read_max_chunk_size, shard_id,
+            ).await? {
+                crate::replicate_follower_catchup::CatchupOutcome::Caught => {
+                    metrics::counter!("celeriant_probe_gap_send_success_total").increment(1);
+                }
+                crate::replicate_follower_catchup::CatchupOutcome::FallbackToS3 => {
+                    metrics::counter!("celeriant_probe_gap_send_failed_total").increment(1);
+                    debug!(shard_id, "Probe catchup needs S3 fallback; next real write will route through S3");
+                }
+            }
+        }
+        SingleSendOutcome::Failed => {
+            metrics::counter!("celeriant_probe_outcome_network_error_total").increment(1);
+            debug!(shard_id, "Probe send failed; normal paths will retry");
+        }
+    }
+    metrics::histogram!("celeriant_probe_duration_seconds").record(probe_start.elapsed().as_secs_f64());
+    Ok(ReplicationDetails::ReplicatedToFollower)
 }
 
 /// Drain every remaining PCD into one S3 batch. On success, commit each PCD inline so
@@ -256,6 +376,7 @@ async fn tcp_send_snapshot<R: ReplicationClient + 'static>(
     max_request_size: u64,
     max_catchup_gap_bytes: Option<u64>,
     read_max_chunk_size: u64,
+    max_clock_drift_ms: u64,
     shard_id: u32,
 ) -> Result<SnapshotSendOutcome, ReplicationError> {
     debug_assert!(!snapshot.is_empty());
@@ -269,7 +390,7 @@ async fn tcp_send_snapshot<R: ReplicationClient + 'static>(
         .collect();
     let leader_first_wal = items.first().map(|i| i.metablock.wal_index).unwrap_or(0);
 
-    match single_send(replication_client, node_status, items.clone(), shard_id).await? {
+    match single_send(replication_client, node_status, items.clone(), max_clock_drift_ms, shard_id).await? {
         SingleSendOutcome::Ok => return Ok(SnapshotSendOutcome::Sent),
         SingleSendOutcome::Failed => return Ok(SnapshotSendOutcome::FallbackToS3),
         SingleSendOutcome::WalIndexMismatch { max_follower_wal_index } => {
@@ -289,7 +410,7 @@ async fn tcp_send_snapshot<R: ReplicationClient + 'static>(
 
     // Retry the original send exactly once. A second WalIndexMismatch means
     // local-WAL replay can't fix this follower in one cycle; escalate to S3.
-    match single_send(replication_client, node_status, items, shard_id).await? {
+    match single_send(replication_client, node_status, items, max_clock_drift_ms, shard_id).await? {
         SingleSendOutcome::Ok => Ok(SnapshotSendOutcome::Sent),
         SingleSendOutcome::Failed | SingleSendOutcome::WalIndexMismatch { .. } => {
             Ok(SnapshotSendOutcome::FallbackToS3)
@@ -300,11 +421,13 @@ async fn tcp_send_snapshot<R: ReplicationClient + 'static>(
 /// One TCP round-trip against the follower. Maps low-level errors into the
 /// caller's three-way outcome. `TipHashMismatch` short-circuits to `Failed`
 /// after spawning a follower kick, since local-WAL catchup cannot fix a
-/// divergent tip.
+/// divergent tip. `StaleLease` self-fences when the follower's known leader
+/// lease has moved past ours (genuine split-brain).
 async fn single_send<R: ReplicationClient + 'static>(
     replication_client: &Rc<R>,
     node_status: &Rc<Cell<ValidatedNodeStatus>>,
     items: Vec<ReplicationBatchItem>,
+    max_clock_drift_ms: u64,
     shard_id: u32,
 ) -> Result<SingleSendOutcome, ReplicationError> {
     if !node_status.get().is_leader() {
@@ -347,6 +470,35 @@ async fn single_send<R: ReplicationClient + 'static>(
             warn!(shard_id, follower_wal_index, leader_wal_index, "Follower TipHashMismatch; kicking into S3 catchup");
             metrics::counter!("celeriant_replication_tip_hash_mismatch_kick_total").increment(1);
             spawn_kick(replication_client, node_status);
+            Ok(SingleSendOutcome::Failed)
+        }
+        FollowerRejection::StaleLease { follower_lease_index, received_lease_index } => {
+            // (a) our_lease < follower_lease_index — genuine split-brain. Some
+            //     other node took leadership and the follower learned about it;
+            //     fence self so we stop writing under a dead lease.
+            // (b) our_lease >= follower_lease_index — benign rejection of an
+            //     OLD metablock (queued under a previous leader / lease).
+            //     Leadership is still valid, no action.
+            let current = node_status.get();
+            let raw = current.raw();
+            let our_lease = raw.lease_index().unwrap_or(0);
+            metrics::counter!("celeriant_replicate_stale_lease_total").increment(1);
+            if raw.is_leader() && our_lease < follower_lease_index {
+                warn!(
+                    shard_id, our_lease, received_lease_index, follower_lease_index,
+                    "StaleLease: cluster has moved on (split-brain) — fencing self",
+                );
+                // Technically shard-0 controlled for source-of-truth
+                // But we can get away with the eventual convergance and better than
+                // shard still thinking its leader
+                let fenced = ValidatedNodeStatus::create_custom_status(raw, max_clock_drift_ms, 0);
+                set_node_status_and_metric(node_status, fenced, shard_id);
+            } else {
+                debug!(
+                    shard_id, our_lease, received_lease_index, follower_lease_index,
+                    "StaleLease for old metablock — leadership still valid, no action",
+                );
+            }
             Ok(SingleSendOutcome::Failed)
         }
         _ => Ok(SingleSendOutcome::Failed),
@@ -617,6 +769,15 @@ async fn rollback_replicate(
     // Failure to rollback of a file stops entire process
     for log_id in log_ids {
         if let Some(log_segment) = log_segments_cache.get_if_cached(log_id) {
+            let predecessor_cursor: Option<(u64, [u8; 32])> = if trailing_shard_log_header.is_none() && log_id > 1 {
+                log_segments_cache.get_if_cached(log_id - 1).map(|pred| {
+                    let m = pred.metadata.borrow();
+                    (m.write.wal_index, m.write.tip_hash)
+                })
+            } else {
+                None
+            };
+
             let (header, header_end_start_pos) = {
                 let mut metadata = log_segment.metadata.borrow_mut();
                 let shard_log_header_end_pos = metadata.file_len.saturating_sub(HEADER_BLOCK_SIZE_BYTES as u64);
@@ -634,7 +795,13 @@ async fn rollback_replicate(
                     if let Some(trailing_shard_log_header) = trailing_shard_log_header {
                         metadata.write.wal_index = trailing_shard_log_header.wal_index;
                         metadata.write.tip_hash = trailing_shard_log_header.tip_hash;
+                    } else if let Some((pred_wal_index, pred_tip_hash)) = predecessor_cursor {
+                        metadata.write.wal_index = pred_wal_index;
+                        metadata.write.tip_hash = pred_tip_hash;
                     } else {
+                        if log_id > 1 {
+                            error!(shard_id, log_id, "Rollback predecessor not in cache; wal_index reset to 0 — probe will skip this shard until fresh write");
+                        }
                         metadata.write.wal_index = 0;
                         metadata.write.tip_hash = GENESIS_HASH;
                     }
@@ -769,9 +936,13 @@ mod tests {
     }
 
     fn make_pcd(items: Vec<PendingCacheItem>) -> PendingCommitData {
+        make_pcd_for_log(items, 999_999)
+    }
+
+    fn make_pcd_for_log(items: Vec<PendingCacheItem>, log_id: u64) -> PendingCommitData {
         PendingCommitData {
             log_metadata: LogSegmentFileMetadata {
-                log_id: 999_999,
+                log_id,
                 file_len: 0,
                 write: LogSegmentCursor::default(),
                 read: None,
@@ -878,6 +1049,11 @@ mod tests {
             self
         }
 
+        fn with_s3(self, f: impl FnMut(usize) -> Result<(), ReplicateToS3Error> + 'static) -> Self {
+            *self.s3.borrow_mut() = Box::new(f);
+            self
+        }
+
         fn unreachable(self) -> Self {
             self.follower_reachable.set(false);
             self
@@ -947,6 +1123,16 @@ mod tests {
             captured: ReplicationCapturedData,
             max_request_size: u64,
         ) -> Result<(), ReplicationError> {
+            self.commit_with_trigger(client, captured, ReplicationTrigger::Write, max_request_size).await
+        }
+
+        async fn commit_with_trigger<R: ReplicationClient + 'static>(
+            &self,
+            client: Rc<R>,
+            captured: ReplicationCapturedData,
+            trigger: ReplicationTrigger,
+            max_request_size: u64,
+        ) -> Result<(), ReplicationError> {
             commit_replication_with_rollback(
                 client,
                 self.coordinator.clone(),
@@ -956,9 +1142,11 @@ mod tests {
                 self.node_status.clone(),
                 self.last_rollback_at.clone(),
                 captured,
+                trigger,
                 None,
                 max_request_size,
                 64 * 1024,
+                500,
                 0,
             ).await
         }
@@ -971,12 +1159,24 @@ mod tests {
     // --- capture phase ---
 
     #[test]
-    fn capture_returns_no_capture_when_queue_empty() {
+    fn capture_write_returns_no_capture_when_queue_empty() {
         let smc = Rc::new(RefCell::new(fresh_memcache()));
-        match capture_replication_snapshot(&smc) {
+        match capture_replication_snapshot(&smc, ReplicationTrigger::Write) {
             CaptureResult::NoCaptureRaceButOk => {}
-            CaptureResult::Captured(_) => panic!("empty queue must not produce a capture"),
+            CaptureResult::Captured(_) => panic!("empty queue must not produce a capture under Write"),
             CaptureResult::Failed(e) => panic!("expected NoCapture, got Failed({e:?})"),
+        }
+    }
+
+    #[test]
+    fn capture_probe_returns_captured_empty_when_queue_empty() {
+        let smc = Rc::new(RefCell::new(fresh_memcache()));
+        match capture_replication_snapshot(&smc, ReplicationTrigger::Probe) {
+            CaptureResult::Captured(d) => {
+                assert!(d.replication_snapshot.is_empty(), "Probe with empty queue must produce empty Captured");
+            }
+            CaptureResult::NoCaptureRaceButOk => panic!("Probe must NOT short-circuit on empty queue"),
+            CaptureResult::Failed(e) => panic!("expected Captured(empty), got Failed({e:?})"),
         }
     }
 
@@ -987,7 +1187,7 @@ mod tests {
         let pcd = make_captured(&[1]).replication_snapshot.remove(0);
         smc.borrow_mut().push_pending_replication(pcd);
         smc.borrow_mut().execute_replication_rollback();
-        match capture_replication_snapshot(&smc) {
+        match capture_replication_snapshot(&smc, ReplicationTrigger::Write) {
             CaptureResult::Failed(ReplicationError::RollbackInProgress) => {}
             CaptureResult::Failed(e) => panic!("expected RollbackInProgress, got Failed({e:?})"),
             CaptureResult::NoCaptureRaceButOk => panic!("expected RollbackInProgress, got NoCapture"),
@@ -1000,7 +1200,7 @@ mod tests {
         let smc = Rc::new(RefCell::new(fresh_memcache()));
         let pcd = make_captured(&[3]).replication_snapshot.remove(0);
         smc.borrow_mut().push_pending_replication(pcd);
-        match capture_replication_snapshot(&smc) {
+        match capture_replication_snapshot(&smc, ReplicationTrigger::Write) {
             CaptureResult::Captured(d) => {
                 assert_eq!(d.replication_snapshot.len(), 1);
                 assert_eq!(d.replication_snapshot[0].pending_queue.len(), 3);
@@ -1244,5 +1444,210 @@ mod tests {
                 h.close().await;
             });
         }
+    }
+
+    // --- probe path (empty snapshot + Probe trigger) ---
+
+    /// Probe with empty queue synthesises a one-item batch from the latest
+    /// local entry and pings the follower. Follower current → no further work.
+    #[test]
+    fn probe_with_empty_snapshot_pings_latest_local() {
+        glommio_test!({
+            let h = Harness::new().await;
+            seed_disk_at_wal(&h.lsc, &[1, 2, 3]).await;
+
+            let (mock, tcp_calls, s3_calls) = MockClient::build();
+            let client = Rc::new(mock);
+            let captured = ReplicationCapturedData { replication_snapshot: vec![] };
+
+            let result = h.commit_with_trigger(client, captured, ReplicationTrigger::Probe, u64::MAX).await;
+            assert!(result.is_ok(), "probe + follower-current returns Ok; got {result:?}");
+            assert_eq!(tcp_calls.borrow().as_slice(), &[1], "probe ships one synthesised entry");
+            assert!(s3_calls.borrow().is_empty(), "probe never falls back to S3");
+            h.close().await;
+        });
+    }
+
+    /// Probe + WalIndexMismatch delegates to replicate_follower_catchup;
+    /// gap-fill goes through the chunked path, not the probe's old inline send.
+    #[test]
+    fn probe_runs_catchup_on_wal_index_mismatch() {
+        glommio_test!({
+            let h = Harness::new().await;
+            seed_disk_at_wal(&h.lsc, &[1, 2, 3]).await;
+
+            let (mock, tcp_calls, s3_calls) = MockClient::build();
+            // First call = probe ping → mismatch at follower=1; second call = catchup chunk → ok.
+            let client = Rc::new(mock.with_tcp(programmed_tcp(vec![Err(wal_mismatch(1)), Ok(())])));
+            let captured = ReplicationCapturedData { replication_snapshot: vec![] };
+
+            let result = h.commit_with_trigger(client, captured, ReplicationTrigger::Probe, u64::MAX).await;
+            assert!(result.is_ok(), "probe + catchup-success returns Ok; got {result:?}");
+            assert_eq!(
+                tcp_calls.borrow().as_slice(),
+                &[1, 2],
+                "probe ping (1 entry) + catchup gap (entries 2..=3, 2 items)",
+            );
+            assert!(s3_calls.borrow().is_empty(), "probe catchup runs over TCP");
+            h.close().await;
+        });
+    }
+
+    /// Probe + unreachable follower no-ops without touching TCP or S3.
+    #[test]
+    fn probe_with_unreachable_follower_is_noop() {
+        glommio_test!({
+            let h = Harness::new().await;
+            seed_disk_at_wal(&h.lsc, &[1, 2, 3]).await;
+
+            let (mock, tcp_calls, s3_calls) = MockClient::build();
+            let client = Rc::new(mock.unreachable());
+            let captured = ReplicationCapturedData { replication_snapshot: vec![] };
+
+            let result = h.commit_with_trigger(client, captured, ReplicationTrigger::Probe, u64::MAX).await;
+            assert!(result.is_ok(), "probe + unreachable returns Ok cleanly; got {result:?}");
+            assert!(tcp_calls.borrow().is_empty(), "probe must not contact follower when unreachable");
+            assert!(s3_calls.borrow().is_empty(), "probe never falls back to S3");
+            h.close().await;
+        });
+    }
+
+    /// Probe with empty disk (wal_index=0) bails silently.
+    #[test]
+    fn probe_with_empty_disk_is_noop() {
+        glommio_test!({
+            let h = Harness::new().await;
+            // No seed_disk_at_wal — active segment's write.wal_index is 0.
+            let (mock, tcp_calls, s3_calls) = MockClient::build();
+            let client = Rc::new(mock);
+            let captured = ReplicationCapturedData { replication_snapshot: vec![] };
+
+            let result = h.commit_with_trigger(client, captured, ReplicationTrigger::Probe, u64::MAX).await;
+            assert!(result.is_ok());
+            assert!(tcp_calls.borrow().is_empty());
+            assert!(s3_calls.borrow().is_empty());
+            h.close().await;
+        });
+    }
+
+    // --- StaleLease split-brain detection in single_send ---
+
+    /// Case (a): our_lease (1) < follower's known leader_lease (5) → fence self.
+    /// The write path (not just the probe) must self-fence on genuine split-brain.
+    #[test]
+    fn stale_lease_split_brain_fences_self_on_write() {
+        glommio_test!({
+            let h = Harness::new().await;
+            // Default leader_status() has lease_index=1.
+            let (mock, tcp_calls, _s3) = MockClient::build();
+            let client = Rc::new(mock.with_tcp(programmed_tcp(vec![
+                Err(ReplicateToFollowerError::FollowerRejected(FollowerRejection::StaleLease {
+                    follower_lease_index: 5, received_lease_index: 1,
+                })),
+            ])));
+
+            assert!(h.node_status.get().is_leader(), "must start as leader");
+            let result = h.commit(client, make_captured(&[1]), u64::MAX).await;
+            assert!(result.is_err(), "commit must error after self-fence; got {result:?}");
+            assert_eq!(tcp_calls.borrow().len(), 1, "one TCP attempt → StaleLease → fence");
+            assert!(!h.node_status.get().is_leader(), "split-brain must fence self");
+            h.close().await;
+        });
+    }
+
+    /// Case (b): our_lease (2) >= follower's known leader_lease (2), metablock
+    /// tagged at lease 1 → benign rejection of an OLD metablock; leadership intact.
+    #[test]
+    fn stale_lease_old_metablock_keeps_leadership() {
+        glommio_test!({
+            let h = Harness::new().await;
+            let bumped = ValidatedNodeStatus::create_custom_status(
+                celeriant_distributed::node_status::NodeStatus::Leader { lease_index: 2 },
+                500, u64::MAX / 2,
+            );
+            h.node_status.set(bumped);
+
+            let (mock, _tcp_calls, s3_calls) = MockClient::build();
+            let client = Rc::new(mock.with_tcp(programmed_tcp(vec![
+                Err(ReplicateToFollowerError::FollowerRejected(FollowerRejection::StaleLease {
+                    follower_lease_index: 2, received_lease_index: 1,
+                })),
+            ])));
+
+            let result = h.commit(client, make_captured(&[1]), u64::MAX).await;
+            assert!(result.is_ok(), "case (b) falls through to S3; got {result:?}");
+            assert_eq!(*s3_calls.borrow(), vec![1], "case (b) reaches S3 fallback");
+            assert!(h.node_status.get().is_leader(), "leadership stays on case (b)");
+            h.close().await;
+        });
+    }
+
+    /// Regression test for the fresh-rotation rollback bug:
+    /// when the only log_id in the rollback batch is a segment with `read=None` and no predecessor
+    /// was in the same batch, wal_index must be recovered from the predecessor in the cache —
+    /// NOT reset to 0.
+    #[test]
+    fn rollback_fresh_rotation_preserves_wal_index_from_predecessor() {
+        glommio_test!({
+            let h = Harness::new().await;
+
+            // Seed predecessor (log_id=1) with a known replicated position.
+            let predecessor_wal_index: u64 = 260_000;
+            let predecessor_tip: [u8; 32] = [0xAA; 32];
+            {
+                let seg1 = h.lsc.get_if_cached(1).expect("log_id=1 must be active initially");
+                let mut m = seg1.metadata.borrow_mut();
+                m.write.wal_index = predecessor_wal_index;
+                m.write.tip_hash = predecessor_tip;
+                // Mark as replicated so rotation is valid.
+                m.read = Some(m.write.clone());
+            }
+
+            // Rotate: log_id=1 moves to LRU, log_id=2 becomes active (read=None).
+            h.lsc.rotate_to_next_log().await.unwrap();
+            assert_eq!(h.lsc.active_log_id(), 2);
+
+            // Confirm log_id=2 starts with read=None and wal_index from predecessor cursor.
+            {
+                let seg2 = h.lsc.active();
+                let m = seg2.metadata.borrow();
+                assert!(m.read.is_none(), "fresh segment must have read=None");
+            }
+
+            // Build a PCD whose log_id matches the active segment so rollback processes it.
+            let (items, _) = chained_items(vec![event_kind(); 3], predecessor_wal_index + 1, predecessor_tip);
+            let captured = ReplicationCapturedData {
+                replication_snapshot: vec![make_pcd_for_log(items, 2)],
+            };
+
+            // Trigger rollback: follower unreachable + S3 fails.
+            let (mock, _tcp, _s3) = MockClient::build();
+            let client = Rc::new(
+                mock.unreachable()
+                    .with_s3(|_| Err(ReplicateToS3Error::S3Unavailable)),
+            );
+
+            // Rollback must succeed (no panic / Err from the rollback path itself).
+            let result = h.commit(client, captured, u64::MAX).await;
+            // Expect an error from the replication (both paths failed), but rollback itself ran.
+            assert!(
+                matches!(result, Err(ReplicationError::RollbackFailed(_)) | Err(ReplicationError::ReplicateToS3Error(_))),
+                "unexpected result: {result:?}",
+            );
+
+            // The critical assertion: wal_index must not have been zeroed.
+            let seg2 = h.lsc.active();
+            let m = seg2.metadata.borrow();
+            assert_eq!(
+                m.write.wal_index, predecessor_wal_index,
+                "rollback of fresh segment must restore predecessor wal_index, not zero it",
+            );
+            assert_eq!(
+                m.write.tip_hash, predecessor_tip,
+                "rollback of fresh segment must restore predecessor tip_hash, not GENESIS_HASH",
+            );
+
+            h.close().await;
+        });
     }
 }

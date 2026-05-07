@@ -673,17 +673,18 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                     let reachable = follower_can_accept_tcp_replication;
                     let was_reachable = ctx.shard_wal.replication_client.is_follower_reachable();
                     ctx.shard_wal.replication_client.set_follower_reachable(reachable);
-                    // Reconciliation probe on false→true transition. Shard 0 is the
-                    // heartbeat sender; broadcast_message_to_other_shards skips this
-                    // shard, so its probe fires here directly. Shards 1..N receive the
-                    // broadcast and fire their own in the IntrashardMessages handler.
-                    if !was_reachable && reachable && ctx.shard_wal.node_status.get().is_leader() {
+
+                    let leader_for_ms = unix_epoch_now_ms.saturating_sub(ctx.shard_wal.node_status.get().leader_since_ms());
+                    if should_fire_reachability_probe(was_reachable, reachable, ctx.shard_wal.node_status.get().is_leader(), leader_for_ms, MIN_PROBE_AFTER_LEADER_MS) {
                         let shard_wal = ctx.shard_wal.clone();
                         glommio::spawn_local(async move {
-                            shard_wal.probe_follower_for_drift().await;
+                            if let Err(e) = shard_wal.probe_replicate().await {
+                                debug!(error = ?e, "Reconciliation probe replication errored");
+                            }
                         }).detach();
                     }
-                    broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::FollowerReachable { reachable }, ctx.intrashard_sender.clone()).await;
+                    broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::FollowerReachable { reachable, was_reachable }, ctx.intrashard_sender.clone()).await;
+                    
                     let prev_expires_at_ms = ctx.shard_wal.node_status.get().lease_expires_at_ms();
                     let new_expires_at_ms = compute_new_ttl(
                         prev_expires_at_ms,
@@ -707,7 +708,7 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
 
                 let was_reachable = ctx.shard_wal.replication_client.is_follower_reachable();
                 ctx.shard_wal.replication_client.set_follower_reachable(false);
-                broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::FollowerReachable { reachable: false }, ctx.intrashard_sender.clone()).await;
+                broadcast_message_to_other_shards(ctx.current_shard_id, IntrashardMessages::FollowerReachable { reachable: false, was_reachable }, ctx.intrashard_sender.clone()).await;
                 metrics::counter!("celeriant_heartbeat_failures_total").increment(1);
 
                 // Preemptive lease renewal: when follower just went unreachable, renew
@@ -900,18 +901,22 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
             ctx.shard_wal.replication_client.set_follower_address(replication_address);
             ctx.shard_wal.peer_node_id.set(peer_node_id);
         }
-        IntrashardMessages::FollowerReachable { reachable } => {
-            let was_reachable = ctx.shard_wal.replication_client.is_follower_reachable();
+        IntrashardMessages::FollowerReachable { reachable, was_reachable } => {
+            // Use the leader's pre-transition view (was_reachable) rather than
+            // this shard's local is_follower_reachable(), which may be out of
+            // sync due to per-shard replication client state updates. This
+            // ensures all shards fire the probe on the same transition edge.
+            // leader_since_ms comes from node_status (propagated to every shard
+            // via the StatusUpdate broadcast that fires on every heartbeat-ack).
             ctx.shard_wal.replication_client.set_follower_reachable(reachable);
-            // Fast-path drift detection on false→true. Without this the follower
-            // sits stuck at its pre-unreachability wal_index until the next S3 kick,
-            // because real-time TCP replication can't bridge the gap of entries
-            // written during the unreachable window. Probe is shard-local — fires
-            // on every shard that receives the broadcast.
-            if !was_reachable && reachable && ctx.shard_wal.node_status.get().is_leader() {
+            let leader_for_ms = validated_node_status::unix_epoch_now_ms()
+                .saturating_sub(ctx.shard_wal.node_status.get().leader_since_ms());
+            if should_fire_reachability_probe(was_reachable, reachable, ctx.shard_wal.node_status.get().is_leader(), leader_for_ms, MIN_PROBE_AFTER_LEADER_MS) {
                 let shard_wal = ctx.shard_wal.clone();
                 glommio::spawn_local(async move {
-                    shard_wal.probe_follower_for_drift().await;
+                    if let Err(e) = shard_wal.probe_replicate().await {
+                        debug!(error = ?e, "Reconciliation probe replication errored");
+                    }
                 }).detach();
             }
         }
@@ -971,6 +976,53 @@ async fn maybe_ktls_accept(
                     std::io::Error::new(std::io::ErrorKind::TimedOut, "TLS handshake timed out"),
                 )),
             }
+        }
+    }
+}
+
+const MIN_PROBE_AFTER_LEADER_MS: u64 = 2000;
+
+/// Returns true when a reconciliation probe should fire after a reachability update.
+fn should_fire_reachability_probe(
+    was_reachable: bool,
+    reachable: bool,
+    is_leader: bool,
+    leader_for_ms: u64,
+    min_leader_warmup_ms: u64,
+) -> bool {
+    !was_reachable && reachable && is_leader && leader_for_ms >= min_leader_warmup_ms
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_fire_reachability_probe_truth_table() {
+        // Only the false→true transition on a warm leader must fire.
+        // (was_reachable, reachable, is_leader, leader_for_ms, min_warmup_ms, expected)
+        let cases: &[(bool, bool, bool, u64, u64, bool)] = &[
+            // Core transition cases (warm leader, 5s > 2s threshold)
+            (false, true,  true,  5000, 2000, true),   // false→true, warm leader: FIRE
+            (false, true,  false, 5000, 2000, false),  // false→true, follower: no fire
+            (false, false, true,  5000, 2000, false),  // false→false, leader: no fire
+            (false, false, false, 5000, 2000, false),  // false→false, follower: no fire
+            (true,  true,  true,  5000, 2000, false),  // true→true (already reachable): no fire
+            (true,  true,  false, 5000, 2000, false),  // true→true, follower: no fire
+            (true,  false, true,  5000, 2000, false),  // true→false (going unreachable): no fire
+            (true,  false, false, 5000, 2000, false),  // true→false, follower: no fire
+            // Warmup gate cases
+            (false, true,  true,     0, 2000, false),  // just-promoted (0ms): skip
+            (false, true,  true,  1999, 2000, false),  // just under threshold: skip
+            (false, true,  true,  2000, 2000, true),   // at threshold: FIRE
+            (false, true,  true,  5000, 2000, true),   // warm: FIRE
+        ];
+        for &(was, now, leader, leader_for_ms, min_warmup_ms, expected) in cases {
+            assert_eq!(
+                should_fire_reachability_probe(was, now, leader, leader_for_ms, min_warmup_ms),
+                expected,
+                "was_reachable={was} reachable={now} is_leader={leader} leader_for_ms={leader_for_ms}",
+            );
         }
     }
 }

@@ -450,8 +450,13 @@ pub async fn run_follower_sigkill(
         bench_result.p99_ms,
     );
 
-    println!("[{SCEN}] settle 10s for follower catchup");
-    sleep(Duration::from_secs(10)).await;
+    // Settle bumped 10s → 90s: on rpi+MinIO-on-SD-card the follower's S3
+    // catchup of the in-flight TCP batch + lock-contended replication storm
+    // can take tens of seconds to drain. With bench halted, 90s of idle
+    // gives the cluster time to reach acked-write convergence on slow infra.
+    // EC2+S3 converges in <5s; this is a slow-infra accommodation.
+    println!("[{SCEN}] settle 90s for follower catchup (slow-infra liveness window)");
+    sleep(Duration::from_secs(90)).await;
     let bench_window_end_ms = up.elapsed_ms();
 
     // Expectations mirror SCEN-2. The one material difference from SCEN-2
@@ -1688,8 +1693,13 @@ pub async fn run_partition_then_kill_minio(
         bench_result.p99_ms,
     );
 
-    println!("[{SCEN}] settle 20s for catchup + role re-stabilisation");
-    sleep(Duration::from_secs(20)).await;
+    // Settle bumped 20s → 90s: this scenario kills MinIO and the follower
+    // simultaneously, leaving cs1 in dual-failure state (no S3, no follower).
+    // Once both are restored, cs1 must drain backlog via S3 fallback while
+    // cs2 boots and runs S3 catchup. On rpi+SD-card MinIO this is a 60s+
+    // window. EC2+S3 converges in <10s.
+    println!("[{SCEN}] settle 90s for catchup + role re-stabilisation (slow-infra liveness window)");
+    sleep(Duration::from_secs(90)).await;
     let bench_window_end_ms = up.elapsed_ms();
 
     // Defensive cleanup in case a later failure path leaves MinIO stopped.
@@ -1983,8 +1993,13 @@ pub async fn run_sigstop_leader(
     // have a paused process. Always try to resume before tear-down.
     let _ = executor.run(&resume);
 
-    println!("[{SCEN}] settle 15s for catchup + role re-stabilisation");
-    sleep(Duration::from_secs(15)).await;
+    // Settle bumped 15s → 90s: SIGSTOP-then-SIGCONT triggers a leadership
+    // reshuffle plus a TipHashMismatch resolution cycle on the demoted
+    // node. On rpi+MinIO-on-SD-card S3 catchup pulls ~5 batches/s, so
+    // bridging an in-flight gap can take tens of seconds with bench halted.
+    // EC2+S3 converges in <5s.
+    println!("[{SCEN}] settle 90s for catchup + role re-stabilisation (slow-infra liveness window)");
+    sleep(Duration::from_secs(90)).await;
     let bench_window_end_ms = up.elapsed_ms();
 
     let expectations = ScenarioExpectations {
@@ -2266,8 +2281,14 @@ pub async fn run_follower_disk_full(
         bench_result.p99_ms,
     );
 
-    println!("[{SCEN}] settle 15s for catchup + disk-pressure recovery");
-    sleep(Duration::from_secs(15)).await;
+    // Settle bumped 15s → 90s: ENOSPC panics shards 1/2 on cs2; in-process
+    // shard restart drops the active TCP replication, leaving the last
+    // in-flight batch (~1333 entries / 4MB) stranded. cs1's reconciliation
+    // probe gets LockTimeout under the S3 fallback storm. With bench halted,
+    // 90s of idle gives the storm time to clear and normal TCP replication
+    // to resume the gap-fill. EC2+S3 converges in <5s.
+    println!("[{SCEN}] settle 90s for catchup + disk-pressure recovery (slow-infra liveness window)");
+    sleep(Duration::from_secs(90)).await;
     let bench_window_end_ms = up.elapsed_ms();
 
     // Defensive final cleanup.
@@ -2275,8 +2296,11 @@ pub async fn run_follower_disk_full(
 
     let expectations = ScenarioExpectations {
         // Leader may renew S3 lease during follower stress but no
-        // real election should happen.
-        max_leader_elections: 15,
+        // real election should happen. The metric counts every S3 CAS
+        // (including same-leader renewals); during the 90s slow-infra
+        // settle the renewal counter accumulates ~1/sec while the
+        // follower is recovering, so headroom must scale with settle.
+        max_leader_elections: 40,
         // If the follower's fsync fails, the leader falls back to S3
         // for every commit during the outage window.
         max_s3_fallbacks: 500,
