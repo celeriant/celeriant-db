@@ -24,6 +24,9 @@ pub trait ReplicationClient {
     fn set_follower_address(&self, address: Option<String>);
     fn set_follower_reachable(&self, reachable: bool);
     fn is_follower_reachable(&self) -> bool;
+    fn current_heartbeat_started_at_unix_ms(&self) -> Option<u64>;
+    fn set_heartbeat_in_flight(&self, unix_ms: Option<u64>);
+    fn reset_heartbeat_state(&self);
     fn try_acquire_kick(&self) -> bool { true }
     fn release_kick(&self) {}
     async fn replicate_to_follower(&self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError>;
@@ -38,6 +41,9 @@ impl ReplicationClient for StubReplicationClient {
     fn set_follower_address(&self, _address: Option<String>) {}
     fn set_follower_reachable(&self, _reachable: bool) {}
     fn is_follower_reachable(&self) -> bool { true }
+    fn current_heartbeat_started_at_unix_ms(&self) -> Option<u64> { None }
+    fn set_heartbeat_in_flight(&self, _unix_ms: Option<u64>) {}
+    fn reset_heartbeat_state(&self) {}
 
     async fn replicate_to_follower(&self, _batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError> {
         glommio::timer::sleep(std::time::Duration::from_millis(30)).await;
@@ -140,6 +146,7 @@ pub struct FollowerConnection<S: S3Uploader> {
     replication_client_config: Option<Arc<rustls::ClientConfig>>,
     s3_uploader: Option<S>,
     s3_upload_sequence: Cell<u64>,
+    heartbeat_in_flight_since_unix_ms: Cell<Option<u64>>,
 }
 
 impl<S: S3Uploader> FollowerConnection<S> {
@@ -174,6 +181,7 @@ impl<S: S3Uploader> FollowerConnection<S> {
             replication_client_config,
             s3_uploader,
             s3_upload_sequence: Cell::new(0),
+            heartbeat_in_flight_since_unix_ms: Cell::new(None),
         }
     }
 }
@@ -189,6 +197,18 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
 
     fn is_follower_reachable(&self) -> bool {
         self.follower_reachable.get()
+    }
+
+    fn current_heartbeat_started_at_unix_ms(&self) -> Option<u64> {
+        self.heartbeat_in_flight_since_unix_ms.get()
+    }
+
+    fn set_heartbeat_in_flight(&self, unix_ms: Option<u64>) {
+        self.heartbeat_in_flight_since_unix_ms.set(unix_ms);
+    }
+
+    fn reset_heartbeat_state(&self) {
+        self.heartbeat_in_flight_since_unix_ms.set(None);
     }
 
     fn try_acquire_kick(&self) -> bool {

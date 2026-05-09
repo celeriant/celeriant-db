@@ -307,6 +307,14 @@ pub struct ServerConfig {
 
     #[arg(
         long,
+        default_value_t = 500,
+        env = "CELERIANT_HEARTBEAT_STARVE_THRESHOLD_MS",
+        help = "When a heartbeat to the follower has been in flight longer than this, reject new writes (FollowerHeartbeatStarved) so the NIC has bandwidth for the in-flight ack to land before the follower auto-fences. Skipped when the follower is unreachable so genuine drops flow into S3 fallback. Default matches heartbeat_interval_ms (500ms). 0 disables."
+    )]
+    pub heartbeat_starve_threshold_ms: u64,
+
+    #[arg(
+        long,
         default_value = "info",
         env = "CELERIANT_LOG_LEVEL",
         help = "Log level (trace, debug, info, warn, error)"
@@ -745,6 +753,7 @@ impl ServerConfig {
             replication_delay: Duration::from_micros(self.replication_delay_us),
             s3_replication_delay: Duration::from_micros(self.s3_replication_delay_us),
             replication_rollback_cooldown: Duration::from_micros(self.replication_rollback_cooldown_us),
+            heartbeat_starve_threshold: Duration::from_millis(self.heartbeat_starve_threshold_ms),
             routing_rule: self.routing_rule,
             aggregate_client_snapshots_cache_bytes: memory_budget.aggregate_client_snapshots_cache_bytes,
             aggregate_snapshots_cache_bytes: memory_budget.aggregate_snapshots_cache_bytes,
@@ -873,6 +882,7 @@ impl ServerConfig {
         check_field!(replication_delay_us);
         check_field!(s3_replication_delay_us);
         check_field!(replication_rollback_cooldown_us);
+        check_field!(heartbeat_starve_threshold_ms);
         check_field!(log_level);
         check_field!(s3_enabled);
         check_field!(s3_region);
@@ -958,6 +968,7 @@ impl Default for ServerConfig {
             replication_delay_us: 17000,
             s3_replication_delay_us: 500000,
             replication_rollback_cooldown_us: 500000,
+            heartbeat_starve_threshold_ms: 500,
             client_connection_timeout_ms: 30000,
             routing_rule: RoutingRule::AggregateId,
             timestamp_precision: ConfigTimestampPrecision::Milliseconds,

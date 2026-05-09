@@ -169,6 +169,13 @@ pub struct ShardWal<R: ReplicationClient + 'static, D: S3Downloader + 'static> {
     /// rather than a warn per rejected request (which would flood under load).
     pub last_logged_rollback_at: Cell<Option<Instant>>,
 
+    /// One-shot guard for heartbeat-starved logging. Stores the unix_ms of
+    /// the in-flight heartbeat at the moment we last emitted a starve warn.
+    /// A starvation episode logs once per in-flight heartbeat that crosses
+    /// the threshold; the next heartbeat has a fresh unix_ms, so a
+    /// subsequent starve cycle re-arms.
+    pub last_logged_starve_at: Cell<Option<u64>>,
+
     /// Cached metrics label to avoid per-request String allocation
     metrics_shard_label: [(&'static str, String); 1],
 }
@@ -333,6 +340,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             peer_node_id: Cell::new(None),
             last_rollback_at: Rc::new(Cell::new(None)),
             last_logged_rollback_at: Cell::new(None),
+            last_logged_starve_at: Cell::new(None),
             metrics_shard_label,
         })
     }
@@ -1183,29 +1191,59 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             }
         };
 
-        let now_if_needed = self.last_rollback_at.get().map(|_| std::time::Instant::now());
+        let hb_started_unix_ms = self.replication_client.current_heartbeat_started_at_unix_ms();
+        let (now_for_rollback, now_unix_ms) = if hb_started_unix_ms.is_some() || self.last_rollback_at.get().is_some() {
+            (
+                Some(std::time::Instant::now()),
+                Some(validated_node_status::unix_epoch_now_ms()),
+            )
+        } else {
+            (None, None)
+        };
         if let Some(cause) = crate::replication_backpressure::check_replication_backpressure(
             self.shard_mem_cache.borrow().is_inflight_pressured(),
             self.last_rollback_at.get(),
             self.config.replication_rollback_cooldown,
-            now_if_needed,
+            hb_started_unix_ms,
+            now_unix_ms,
+            self.replication_client.is_follower_reachable(),
+            self.config.heartbeat_starve_threshold,
+            now_for_rollback,
         ) {
             metrics::counter!(
                 "celeriant_writes_rejected_backpressure_total",
                 &[("cause", cause.metric_label())],
             ).increment(1);
             // log only when we transition into the cooldown window
-            if let crate::replication_backpressure::BackpressureCause::RollbackCooldown { remaining_ms } = cause {
-                let rb_at = self.last_rollback_at.get();
-                if self.last_logged_rollback_at.get() != rb_at {
-                    self.last_logged_rollback_at.set(rb_at);
-                    warn!(
-                        shard_id = self.config.shard_id,
-                        remaining_ms,
-                        cooldown_ms = self.config.replication_rollback_cooldown.as_millis() as u64,
-                        "ReplicationBackpressure: rollback cooldown active — rejecting writes",
-                    );
+            match cause {
+                crate::replication_backpressure::BackpressureCause::RollbackCooldown { remaining_ms } => {
+                    let rb_at = self.last_rollback_at.get();
+                    if self.last_logged_rollback_at.get() != rb_at {
+                        self.last_logged_rollback_at.set(rb_at);
+                        warn!(
+                            shard_id = self.config.shard_id,
+                            remaining_ms,
+                            cooldown_ms = self.config.replication_rollback_cooldown.as_millis() as u64,
+                            "ReplicationBackpressure: rollback cooldown active — rejecting writes",
+                        );
+                    }
                 }
+                crate::replication_backpressure::BackpressureCause::FollowerHeartbeatStarved { in_flight_ms } => {
+                    // One-shot per starvation episode: log once per in-flight
+                    // heartbeat that crosses the threshold. The next heartbeat
+                    // starts at a different unix_ms, so a fresh starvation
+                    // cycle re-arms the warn.
+                    if self.last_logged_starve_at.get() != hb_started_unix_ms {
+                        self.last_logged_starve_at.set(hb_started_unix_ms);
+                        warn!(
+                            shard_id = self.config.shard_id,
+                            in_flight_ms,
+                            threshold_ms = self.config.heartbeat_starve_threshold.as_millis() as u64,
+                            "ReplicationBackpressure: follower heartbeat in flight too long — rejecting writes",
+                        );
+                    }
+                }
+                crate::replication_backpressure::BackpressureCause::InflightPressure => {}
             }
             return Err(ShardWriteError::ReplicationBackpressure);
         }
@@ -2055,10 +2093,28 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             .expect("System time before Unix epoch")
             .as_millis() as u64;
 
-        let response = |result| ReplicationBatchResponse {
-            correlation_id: request.correlation_id,
-            follower_timestamp_ms,
-            result,
+        let shard_id_label = self.metrics_shard_label[0].1.clone();
+        let response = |result: ReplicationResult| {
+            if let ReplicationResult::Rejected(ref r) = result {
+                let reason = match r {
+                    FollowerRejection::NotAFollower => "not_follower",
+                    FollowerRejection::TimeDriftTooHigh { .. } => "time_drift",
+                    FollowerRejection::WalIndexMismatch { .. } => "wal_index_mismatch",
+                    FollowerRejection::TipHashMismatch { .. } => "tip_hash_mismatch",
+                    FollowerRejection::EmptyBatch => "empty_batch",
+                    FollowerRejection::MissingDatablock => "missing_datablock",
+                    FollowerRejection::StaleLease { .. } => "stale_lease",
+                };
+                metrics::counter!(
+                    "celeriant_replication_batch_rejected_total",
+                    &[("shard_id", shard_id_label.clone()), ("reason", reason.to_string())],
+                ).increment(1);
+            }
+            ReplicationBatchResponse {
+                correlation_id: request.correlation_id,
+                follower_timestamp_ms,
+                result,
+            }
         };
 
         let leader_lease_index = match self.node_status.get().effective_node_status() {
@@ -2664,6 +2720,7 @@ mod tests {
             replication_delay: Duration::ZERO,
             s3_replication_delay: Duration::from_millis(500),
             replication_rollback_cooldown: Duration::ZERO,
+            heartbeat_starve_threshold: Duration::ZERO,
             recent_write_cache_bytes: 64 * 1024 * 1024,
             shard_dir: dir.to_path_buf(),
             max_response_size: 16 * 1024 * 1024,
@@ -3533,6 +3590,9 @@ mod tests {
     impl ReplicationClient for FailThenSucceedReplicationClient {
         fn set_follower_reachable(&self, _: bool) {}
         fn is_follower_reachable(&self) -> bool { true }
+        fn current_heartbeat_started_at_unix_ms(&self) -> Option<u64> { None }
+        fn set_heartbeat_in_flight(&self, _unix_ms: Option<u64>) {}
+        fn reset_heartbeat_state(&self) {}
 
         async fn replicate_to_follower(&self, _batches: Vec<celeriant_msg::request::requests::ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError> {
             let remaining = self.follower_failures_remaining.get();
@@ -3583,6 +3643,9 @@ mod tests {
         fn set_follower_address(&self, _: Option<String>) {}
         fn set_follower_reachable(&self, _: bool) {}
         fn is_follower_reachable(&self) -> bool { true }
+        fn current_heartbeat_started_at_unix_ms(&self) -> Option<u64> { None }
+        fn set_heartbeat_in_flight(&self, _unix_ms: Option<u64>) {}
+        fn reset_heartbeat_state(&self) {}
 
         async fn replicate_to_follower(&self, _: Vec<celeriant_msg::request::requests::ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError> {
             if self.should_fail.get() {
@@ -3897,6 +3960,9 @@ mod tests {
         fn set_follower_address(&self, _address: Option<String>) {}
         fn set_follower_reachable(&self, _: bool) {}
         fn is_follower_reachable(&self) -> bool { true }
+        fn current_heartbeat_started_at_unix_ms(&self) -> Option<u64> { None }
+        fn set_heartbeat_in_flight(&self, _unix_ms: Option<u64>) {}
+        fn reset_heartbeat_state(&self) {}
         async fn replicate_to_follower(&self, _batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError> { Ok(()) }
         async fn replicate_to_s3(&self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToS3Error> {
             self.s3_uploads.borrow_mut().push(batches);

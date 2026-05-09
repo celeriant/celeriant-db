@@ -844,6 +844,14 @@ async fn rollback_replicate(
         }
     }
 
+    // Resync celeriant_wal_index gauge to the rolled-back active write cursor.
+    // The fsync path is the only other writer of this gauge, so without this
+    // line the gauge stays pinned to the pre-rollback high-water mark until
+    // the next fresh write. That stale value makes EventualConvergence look
+    // like a stuck-follower bug when the cluster has actually converged.
+    let active_wal_index = log_segments_cache.active().metadata.borrow().write.wal_index;
+    metrics::gauge!("celeriant_wal_index", &[("shard_id", shard_id.to_string())]).set(active_wal_index as f64);
+
     Ok(())
 }
 
@@ -1064,6 +1072,9 @@ mod tests {
         fn set_follower_address(&self, _: Option<String>) {}
         fn set_follower_reachable(&self, r: bool) { self.follower_reachable.set(r); }
         fn is_follower_reachable(&self) -> bool { self.follower_reachable.get() }
+        fn current_heartbeat_started_at_unix_ms(&self) -> Option<u64> { None }
+        fn set_heartbeat_in_flight(&self, _unix_ms: Option<u64>) {}
+        fn reset_heartbeat_state(&self) {}
 
         async fn replicate_to_follower(&self, b: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError> {
             let n = b.len();

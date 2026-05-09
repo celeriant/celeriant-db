@@ -81,6 +81,7 @@ pub struct ShardConfig {
     pub replication_delay: Duration,
     pub s3_replication_delay: Duration,
     pub replication_rollback_cooldown: Duration,
+    pub heartbeat_starve_threshold: Duration,
     pub recent_write_cache_bytes: u64,
     pub routing_rule: RoutingRule,
     pub reserve_coordinator_shard: bool,

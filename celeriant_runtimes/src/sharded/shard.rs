@@ -570,6 +570,12 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
             expires_at_ms = outcome.status.lease_expires_at_ms(),
             "Node status transition"
         );
+        // Clear any stale in-flight heartbeat timestamp left from a previous
+        // Leader stint, so back-pressure doesn't fire spuriously based on a
+        // phantom in-flight heartbeat carried across the role transition.
+        if outcome.status.raw().is_leader() {
+            ctx.shard_wal.replication_client.reset_heartbeat_state();
+        }
     }
     set_node_status_and_metric(&ctx.shard_wal.node_status, outcome.status, ctx.current_shard_id as u32);
     broadcast_message_to_other_shards(
@@ -616,6 +622,7 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
         let mut has_peer = false;
         let mut peer_discovery_backoff = Duration::from_secs(1);
         let mut last_peer_discovery_attempt = std::time::Instant::now();
+        let mut last_auto_fence_warn: Option<std::time::Instant> = None;
 
         loop {
             if ctx.shutdown_requested.get() {
@@ -628,6 +635,17 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                 let unix_epoch_now_ms = validated_node_status::unix_epoch_now_ms();
                 let lease_index = ctx.shard_wal.node_status.get().raw().lease_index().unwrap_or(0);
                 let hb_start = std::time::Instant::now();
+
+                // Mark heartbeat in-flight locally and broadcast to peers so any
+                // shard's write path can back-pressure when the heartbeat hangs.
+                // The mirror lives in each shard's local Cell — no cross-core
+                // atomic on the hot read path.
+                ctx.shard_wal.replication_client.set_heartbeat_in_flight(Some(unix_epoch_now_ms));
+                broadcast_message_to_other_shards(
+                    ctx.current_shard_id,
+                    IntrashardMessages::HeartbeatInFlightStarted { unix_ms: unix_epoch_now_ms },
+                    ctx.intrashard_sender.clone(),
+                ).await;
 
                 // Hard timeout: the internal heartbeat_timeout (500ms) relies on the
                 // network stack cooperating, but under NIC saturation a kTLS send can
@@ -644,11 +662,21 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                     Ok(inner) => { hb_hard_timed_out = false; inner },
                     Err(_) => {
                         warn!(shard_id = ctx.current_shard_id, elapsed_ms = hb_start.elapsed().as_millis() as u64, timeout_ms = hb_hard_timeout.as_millis() as u64, "Heartbeat hard timeout — kernel TCP send blocked");
+                        metrics::counter!("celeriant_heartbeat_kernel_blocked_total", &[("shard_id", ctx.current_shard_id.to_string())]).increment(1);
                         hb_hard_timed_out = true;
                         Err(SendHeartbeatError::UnexpectedResponse)
                     }
                 };
                 let hb_elapsed_ms = hb_start.elapsed().as_millis() as u64;
+
+                // Heartbeat path concluded (Ack/Reject/timeout/Err) — clear the
+                // in-flight signal locally and broadcast.
+                ctx.shard_wal.replication_client.set_heartbeat_in_flight(None);
+                broadcast_message_to_other_shards(
+                    ctx.current_shard_id,
+                    IntrashardMessages::HeartbeatInFlightCleared,
+                    ctx.intrashard_sender.clone(),
+                ).await;
 
                 if !hb_hard_timed_out {
                     if let Err(SendHeartbeatError::LockTimeout) = &result {
@@ -774,7 +802,14 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                 let effective = ctx.shard_wal.node_status.get().effective_node_status();
                 let raw = ctx.shard_wal.node_status.get().raw();
                 if effective != raw {
-                    warn!(shard_id = ctx.current_shard_id, ?raw, ?effective, "Heartbeat TTL expired — auto-fenced");
+                    metrics::counter!("celeriant_follower_auto_fence_total", &[("shard_id", ctx.current_shard_id.to_string())]).increment(1);
+                    let should_warn = last_auto_fence_warn.is_none_or(|t| t.elapsed() >= Duration::from_secs(1));
+                    if should_warn {
+                        warn!(shard_id = ctx.current_shard_id, ?raw, ?effective, "Heartbeat TTL expired — auto-fenced");
+                        last_auto_fence_warn = Some(std::time::Instant::now());
+                    }
+                } else {
+                    last_auto_fence_warn = None;
                 }
 
                 // If we are a happy follower of just fenced, we can challenge the lease at the expiry time
@@ -919,6 +954,12 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
                     }
                 }).detach();
             }
+        }
+        IntrashardMessages::HeartbeatInFlightStarted { unix_ms } => {
+            ctx.shard_wal.replication_client.set_heartbeat_in_flight(Some(unix_ms));
+        }
+        IntrashardMessages::HeartbeatInFlightCleared => {
+            ctx.shard_wal.replication_client.set_heartbeat_in_flight(None);
         }
         IntrashardMessages::UpdateLeaderClientAddress { client_address } => {
             *ctx.shard_wal.leader_client_address.borrow_mut() = client_address;

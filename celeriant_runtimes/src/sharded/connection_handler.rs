@@ -1441,6 +1441,7 @@ mod tests {
             reserve_coordinator_shard: false,
             s3_replication_delay: Duration::from_millis(500),
             replication_rollback_cooldown: Duration::from_millis(500),
+            heartbeat_starve_threshold: Duration::ZERO,
         }
     }
 

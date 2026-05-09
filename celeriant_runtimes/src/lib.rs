@@ -95,6 +95,7 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                     replication_delay: shard_config.replication_delay,
                     s3_replication_delay: shard_config.s3_replication_delay,
                     replication_rollback_cooldown: shard_config.replication_rollback_cooldown,
+                    heartbeat_starve_threshold: shard_config.heartbeat_starve_threshold,
                     shard_dir,
                     max_open_files: shard_config.max_open_files,
                     recent_write_cache_bytes: shard_config.recent_write_cache_bytes,
