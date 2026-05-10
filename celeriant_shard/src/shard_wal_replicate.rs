@@ -341,7 +341,7 @@ async fn run_s3_fallback<R: ReplicationClient + 'static>(
     let upload = with_budget(s3_budget, replication_client.replicate_to_s3(items))
         .await
         .ok_or_else(|| {
-            metrics::counter!("celeriant_lease_budget_exhausted_total", &[("op", "s3_fallback")]).increment(1);
+            metrics::counter!("celeriant_lease_budget_exhausted_total", &[("op", "s3_fallback".to_string()), ("shard_id", shard_id.to_string())]).increment(1);
             ReplicationError::BudgetExhausted
         })?;
     upload.map_err(|e| {
@@ -353,7 +353,7 @@ async fn run_s3_fallback<R: ReplicationClient + 'static>(
     if s3_ms > 500 {
         warn!(shard_id, s3_ms, workset_size_bytes, "S3 fallback upload slow");
     }
-    spawn_kick(replication_client, node_status);
+    spawn_kick(replication_client, node_status, shard_id);
 
     // S3 owns durability for the entire workset now. Commit every PCD in order so that read
     // cursors advance and downstream consumers see the new visible state.
@@ -440,7 +440,7 @@ async fn single_send<R: ReplicationClient + 'static>(
     let send = with_budget(tcp_budget, replication_client.replicate_to_follower(items))
         .await
         .ok_or_else(|| {
-            metrics::counter!("celeriant_lease_budget_exhausted_total", &[("op", "replicate")]).increment(1);
+            metrics::counter!("celeriant_lease_budget_exhausted_total", &[("op", "replicate".to_string()), ("shard_id", shard_id.to_string())]).increment(1);
             replication_client.set_follower_reachable(false);
             ReplicationError::BudgetExhausted
         })?;
@@ -468,8 +468,8 @@ async fn single_send<R: ReplicationClient + 'static>(
         }
         FollowerRejection::TipHashMismatch { follower_wal_index, leader_wal_index, .. } => {
             warn!(shard_id, follower_wal_index, leader_wal_index, "Follower TipHashMismatch; kicking into S3 catchup");
-            metrics::counter!("celeriant_replication_tip_hash_mismatch_kick_total").increment(1);
-            spawn_kick(replication_client, node_status);
+            metrics::counter!("celeriant_replication_tip_hash_mismatch_kick_total", &[("shard_id", shard_id.to_string())]).increment(1);
+            spawn_kick(replication_client, node_status, shard_id);
             Ok(SingleSendOutcome::Failed)
         }
         FollowerRejection::StaleLease { follower_lease_index, received_lease_index } => {
@@ -482,7 +482,7 @@ async fn single_send<R: ReplicationClient + 'static>(
             let current = node_status.get();
             let raw = current.raw();
             let our_lease = raw.lease_index().unwrap_or(0);
-            metrics::counter!("celeriant_replicate_stale_lease_total").increment(1);
+            metrics::counter!("celeriant_replicate_stale_lease_total", &[("shard_id", shard_id.to_string())]).increment(1);
             if raw.is_leader() && our_lease < follower_lease_index {
                 warn!(
                     shard_id, our_lease, received_lease_index, follower_lease_index,
@@ -517,7 +517,7 @@ fn acquire_lease_budget(
         }
         Some(b) if b.is_zero() => {
             warn!(shard_id, op, "Lease budget exhausted before lease-bounded op");
-            metrics::counter!("celeriant_lease_budget_exhausted_total", &[("op", op)]).increment(1);
+            metrics::counter!("celeriant_lease_budget_exhausted_total", &[("op", op.to_string()), ("shard_id", shard_id.to_string())]).increment(1);
             Err(ReplicationError::BudgetExhausted)
         }
         Some(b) => Ok(b),
@@ -531,7 +531,7 @@ fn validate_chain_or_err(
     match validate_intra_batch_chain(batches) {
         Ok(()) => Ok(()),
         Err(crate::intra_batch_chain::ValidateChainError::ChainBreak(chain_err)) => {
-            metrics::counter!("celeriant_replication_intra_batch_chain_break_total").increment(1);
+            metrics::counter!("celeriant_replication_intra_batch_chain_break_total", &[("shard_id", shard_id.to_string())]).increment(1);
             let first_wal = batches.first().map(|b| b.metablock.wal_index).unwrap_or(0);
             let last_wal = batches.last().map(|b| b.metablock.wal_index).unwrap_or(0);
             error!(
@@ -553,6 +553,7 @@ fn validate_chain_or_err(
 fn spawn_kick<R: ReplicationClient + 'static>(
     replication_client: &Rc<R>,
     node_status: &Rc<Cell<ValidatedNodeStatus>>,
+    shard_id: u32,
 ) {
     if !replication_client.try_acquire_kick() {
         return;
@@ -563,11 +564,11 @@ fn spawn_kick<R: ReplicationClient + 'static>(
         match kick_budget {
             Some(b) if !b.is_zero() => {
                 if with_budget(b, rc.send_kick()).await.is_none() {
-                    metrics::counter!("celeriant_lease_budget_exhausted_total", &[("op", "kick")]).increment(1);
+                    metrics::counter!("celeriant_lease_budget_exhausted_total", &[("op", "kick".to_string()), ("shard_id", shard_id.to_string())]).increment(1);
                 }
             }
             _ => {
-                metrics::counter!("celeriant_lease_budget_exhausted_total", &[("op", "kick")]).increment(1);
+                metrics::counter!("celeriant_lease_budget_exhausted_total", &[("op", "kick".to_string()), ("shard_id", shard_id.to_string())]).increment(1);
             }
         }
         rc.release_kick();

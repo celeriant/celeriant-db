@@ -178,7 +178,7 @@ impl LogSegmentsCache {
                             source,
                         })?;
 
-                    metrics::counter!("celeriant_orphan_segment_recovered_total").increment(1);
+                    metrics::counter!("celeriant_orphan_segment_recovered_total", &[("shard_id", shard_id.to_string())]).increment(1);
 
                     if active_log_id == FIRST_LOG_ID {
                         // Just removed the floor segment; next iteration creates a fresh one.

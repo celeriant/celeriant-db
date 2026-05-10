@@ -69,7 +69,7 @@ pub(crate) async fn replicate_follower_catchup<R: ReplicationClient + 'static>(
         let budget = match node_status.get().current_budget() {
             None => return Err(ReplicationError::LeaderFenced),
             Some(b) if b.is_zero() => {
-                metrics::counter!("celeriant_lease_budget_exhausted_total", &[("op", "catchup")]).increment(1);
+                metrics::counter!("celeriant_lease_budget_exhausted_total", &[("op", "catchup".to_string()), ("shard_id", shard_id.to_string())]).increment(1);
                 return Err(ReplicationError::BudgetExhausted);
             }
             Some(b) => b,
@@ -79,7 +79,7 @@ pub(crate) async fn replicate_follower_catchup<R: ReplicationClient + 'static>(
         let send_result = with_budget(budget, replication_client.replicate_to_follower(chunk))
             .await
             .ok_or_else(|| {
-                metrics::counter!("celeriant_lease_budget_exhausted_total", &[("op", "catchup")]).increment(1);
+                metrics::counter!("celeriant_lease_budget_exhausted_total", &[("op", "catchup".to_string()), ("shard_id", shard_id.to_string())]).increment(1);
                 replication_client.set_follower_reachable(false);
                 ReplicationError::BudgetExhausted
             })?;
