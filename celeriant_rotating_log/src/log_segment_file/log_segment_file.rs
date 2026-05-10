@@ -42,6 +42,9 @@ impl LogSegmentFile {
     }
 
     pub async fn close(&self) {
+        let log_id = self.metadata.borrow().log_id;
+        metrics::counter!("celeriant_log_segment_close_total", "log_id" => log_id.to_string()).increment(1);
+        tracing::warn!(log_id, "LogSegmentFile::close invoked");
         if let Ok(mut guard) = write_with_timeout(&self.writer, "close_writer").await {
             if let Some(rc) = guard.take() {
                 if let Ok(writer) = Rc::try_unwrap(rc) {

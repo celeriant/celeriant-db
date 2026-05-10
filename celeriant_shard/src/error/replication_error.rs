@@ -9,4 +9,5 @@ pub enum ReplicationError {
     ExtendedCatchupFailure(FetchCatchupEntriesError),
     LeaderFenced,
     BudgetExhausted,
+    GateTimeout,
 }

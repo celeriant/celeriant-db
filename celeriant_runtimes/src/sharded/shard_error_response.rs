@@ -266,6 +266,7 @@ fn replication_message(e: ReplicationError) -> String {
         ReplicationError::ExtendedCatchupFailure(e) => format!(r#"{{"detail":{}}}"#, json_string(&format!("{:?}", e))),
         ReplicationError::LeaderFenced => format!(r#"{{"detail":"LeaderFenced"}}"#),
         ReplicationError::BudgetExhausted => format!(r#"{{"detail":"BudgetExhausted"}}"#),
+        ReplicationError::GateTimeout => format!(r#"{{"detail":"GateTimeout"}}"#),
     }
 }
 

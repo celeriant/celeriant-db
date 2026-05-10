@@ -562,7 +562,8 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
 
     // Finally open up writes if leader or accept replication if follower
     let previous = ctx.shard_wal.node_status.get();
-    if !previous.raw().same_role(&outcome.status.raw()) {
+    let role_changed = !previous.raw().same_role(&outcome.status.raw());
+    if role_changed {
         warn!(
             shard_id = ctx.current_shard_id,
             previous = ?previous.raw(),
@@ -577,7 +578,12 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
             ctx.shard_wal.replication_client.reset_heartbeat_state();
         }
     }
+    let was_leader = previous.raw().is_leader();
+    let now_leader = outcome.status.raw().is_leader();
     set_node_status_and_metric(&ctx.shard_wal.node_status, outcome.status, ctx.current_shard_id as u32);
+    if role_changed && was_leader && !now_leader {
+        ctx.shard_wal.drain_pending_replication_on_role_change().await;
+    }
     broadcast_message_to_other_shards(
         ctx.current_shard_id,
         IntrashardMessages::StatusUpdate { status: outcome.status },
@@ -918,7 +924,8 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
         }
         IntrashardMessages::StatusUpdate { status } => {
             let previous = ctx.shard_wal.node_status.get();
-            if !previous.raw().same_role(&status.raw()) {
+            let role_changed = !previous.raw().same_role(&status.raw());
+            if role_changed {
                 warn!(
                     shard_id = ctx.current_shard_id,
                     previous = ?previous.raw(),
@@ -927,7 +934,23 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
                     "Node status transition"
                 );
             }
+            let was_leader = previous.raw().is_leader();
+            let now_leader = status.raw().is_leader();
             set_node_status_and_metric(&ctx.shard_wal.node_status, status, ctx.current_shard_id as u32);
+            if role_changed && was_leader && !now_leader {
+                ctx.shard_wal.drain_pending_replication_on_role_change().await;
+            }
+            // Mirror the lease-handler's promotion-batch upload (shard.rs:530) for
+            // shards 1..N which inherit lease via this broadcast. Without this,
+            // entries received over TCP from the previous leader (and never
+            // uploaded to S3) are stranded on this node's local disk: the old
+            // leader rolled them back on resume, S3 has no record, and catchup
+            // wedges with `Chain mismatch with no common ancestor`.
+            if role_changed && !was_leader && now_leader {
+                if let Err(e) = ctx.shard_wal.upload_s3_promotion_batch().await {
+                    tracing::warn!(shard_id = ctx.current_shard_id, error = ?e, "Failed to upload promotion batch to S3 — old leader may not be able to catch up via S3");
+                }
+            }
         }
         IntrashardMessages::UpdatePeerNodeId { peer_node_id } => {
             ctx.shard_wal.peer_node_id.set(peer_node_id);

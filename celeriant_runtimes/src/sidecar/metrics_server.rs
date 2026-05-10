@@ -76,9 +76,26 @@ fn register_metric_descriptions() {
     describe_gauge!("celeriant_replication_follower_pressured", "1 when follower is falling behind (S3 fallback imminent)");
     describe_counter!("celeriant_replication_s3_fallbacks_total", "Replication S3 fallbacks");
     describe_counter!("celeriant_replication_rollbacks_total", "Replication rollbacks");
+    describe_counter!("celeriant_replication_rollback_retries_total", "Replication rollback retry attempts");
+    describe_counter!("celeriant_replication_rollback_io_error_total", "Replication rollback I/O failures");
+    describe_counter!("celeriant_replication_rollback_lock_timeout_total", "Replication rollback aborted: could not acquire lock");
+    describe_counter!("celeriant_replication_intra_batch_chain_break_total", "Chain break detected within a single replication batch");
+    describe_counter!("celeriant_replication_tip_hash_mismatch_kick_total", "Follower tip-hash mismatch; kicked into S3 catchup");
+    describe_counter!("celeriant_replicate_stale_lease_total", "Replication rejected by follower: stale leader lease");
+    describe_counter!("celeriant_coordinator_gate_timeout_total", "Replication coordinator two-phase gate timeout");
     describe_counter!("celeriant_s3_catchup_rounds_total", "S3 catchup rounds executed");
     describe_counter!("celeriant_replication_applied_events_total", "Events applied via replication or S3 catchup");
     describe_counter!("celeriant_replication_applied_bytes_total", "Payload bytes applied via replication or S3 catchup");
+
+    // Probe (reachability / gap-fill)
+    describe_counter!("celeriant_probe_total", "Replication probe attempts");
+    describe_counter!("celeriant_probe_outcome_current_total", "Probe outcome: follower at expected tip");
+    describe_counter!("celeriant_probe_outcome_gap_detected_total", "Probe outcome: follower behind, gap to fill");
+    describe_counter!("celeriant_probe_outcome_network_error_total", "Probe outcome: network error");
+    describe_counter!("celeriant_probe_gap_send_success_total", "Probe gap-fill batch sent successfully");
+    describe_counter!("celeriant_probe_gap_send_failed_total", "Probe gap-fill batch send failed");
+    describe_histogram!("celeriant_probe_duration_seconds", "Probe round-trip duration");
+    describe_histogram!("celeriant_probe_gap_size", "Detected probe gap size in WAL entries");
 
     // Cache
     describe_gauge!("celeriant_cache_recent_write_bytes", "Recent write cache usage");
@@ -93,6 +110,8 @@ fn register_metric_descriptions() {
     describe_gauge!("celeriant_wal_index", "Current WAL index");
     describe_gauge!("celeriant_log_segments_total", "Active log segment count");
     describe_counter!("celeriant_log_rotations_total", "Log file rotations");
+    describe_counter!("celeriant_log_segment_close_total", "Log segment file close events");
+    describe_counter!("celeriant_orphan_segment_recovered_total", "Orphaned log segments cleaned up on boot");
 
     // Connections
     describe_gauge!("celeriant_client_connections_active", "Open client TCP connections");
@@ -103,7 +122,10 @@ fn register_metric_descriptions() {
     // Cluster
     describe_gauge!("celeriant_node_role", "1 = leader, 0 = follower");
     describe_counter!("celeriant_heartbeat_failures_total", "Failed heartbeats");
+    describe_counter!("celeriant_heartbeat_kernel_blocked_total", "Heartbeat hard-timeout (kernel TCP send blocked)");
     describe_counter!("celeriant_leader_elections_total", "Leadership transitions");
+    describe_counter!("celeriant_follower_auto_fence_total", "Follower self-fenced (lease ownership lost mid-flight)");
+    describe_counter!("celeriant_lease_budget_exhausted_total", "Lease-bounded operation aborted: budget exhausted");
     describe_gauge!("celeriant_clock_drift_ms", "Observed clock drift between nodes");
 
     // Stability

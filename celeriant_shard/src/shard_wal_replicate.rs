@@ -608,10 +608,8 @@ async fn finish_with_rollback(
     err: ReplicationError,
     shard_id: u32,
 ) -> Result<(), ReplicationError> {
-    match rollback_or_requeue(fsync_coordinator, log_segments_cache, shard_mem_cache, last_rollback_at, snapshot, shard_id).await {
-        Ok(()) => Err(err),
-        Err(rb) => Err(ReplicationError::RollbackFailed(rb)),
-    }
+    rollback_or_panic(fsync_coordinator, log_segments_cache, shard_mem_cache, last_rollback_at, snapshot, shard_id).await;
+    Err(err)
 }
 
 /// Advance the read cursor in-memory, update caches, broadcast watch events
@@ -714,24 +712,57 @@ fn collect_eligible_sealed_summaries(
     ready
 }
 
-/// Attempt rollback; if it fails, return entries to the pending replication queue
-/// so the next replication cycle can retry S3 upload. Entries must never be silently dropped.
-async fn rollback_or_requeue(
+/// Roll back the WAL write cursor or terminate the process.
+///
+/// Replication rollback exists because the local fsync advanced `write.wal_index`
+/// for entries that ultimately could not be durably committed (replication and S3
+/// fallback both failed).
+async fn rollback_or_panic(
     fsync_coordinator: &Rc<Coordinator<ShardFsyncError>>,
     log_segments_cache: &Rc<LogSegmentsCache>,
     shard_mem_cache: &Rc<RefCell<MemCache>>,
     last_rollback_at: &Rc<Cell<Option<Instant>>>,
     replication_snapshot: Vec<PendingCommitData>,
     shard_id: u32,
-) -> Result<(), ReplicationRollbackFailure> {
+) {
     last_rollback_at.set(Some(Instant::now()));
-    match rollback_replicate(fsync_coordinator, log_segments_cache, shard_mem_cache, &replication_snapshot, shard_id).await {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let batch_count = replication_snapshot.len();
-            error!(shard_id, batch_count, error = ?e, "Rollback failed; returning entries to pending replication queue");
-            shard_mem_cache.borrow_mut().return_to_pending_replication(replication_snapshot);
-            Err(e)
+
+    const MAX_IO_ATTEMPTS: u32 = 3;
+    let mut io_attempts: u32 = 0;
+    let mut total_attempts: u32 = 0;
+    let shard_label = [("shard_id", shard_id.to_string())];
+
+    loop {
+        total_attempts += 1;
+        match rollback_replicate(fsync_coordinator, log_segments_cache, shard_mem_cache, &replication_snapshot, shard_id).await {
+            Ok(()) => {
+                if total_attempts > 1 {
+                    warn!(shard_id, total_attempts, "Replication rollback succeeded after retries");
+                    metrics::counter!("celeriant_replication_rollback_retries_total", &shard_label).increment((total_attempts - 1) as u64);
+                }
+                return;
+            }
+            Err(ReplicationRollbackFailure::LogSegmentFileUnavailable { log_id }) => {
+                warn!(shard_id, log_id, "Replication rollback skipped: active segment closing (process shutting down)");
+                return;
+            }
+            Err(e @ ReplicationRollbackFailure::FsyncAmortisedBatchLockTimeout)
+            | Err(e @ ReplicationRollbackFailure::WriteLockTimeout { .. }) => {
+                warn!(shard_id, attempt = total_attempts, error = ?e, "Replication rollback contended on lock, retrying");
+                metrics::counter!("celeriant_replication_rollback_lock_timeout_total", &shard_label).increment(1);
+                glommio::timer::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => {
+                io_attempts += 1;
+                error!(shard_id, io_attempt = io_attempts, error = ?e, "Replication rollback I/O failure");
+                metrics::counter!("celeriant_replication_rollback_io_error_total", &shard_label).increment(1);
+                if io_attempts >= MAX_IO_ATTEMPTS {
+                    panic!(
+                        "Replication rollback failed irrecoverably on shard {shard_id} after {io_attempts} I/O retries: {e:?} — WAL durability invariant breached, aborting so the boot path can re-validate on-disk state"
+                    );
+                }
+                glommio::timer::sleep(Duration::from_millis(100 * io_attempts as u64)).await;
+            }
         }
     }
 }
@@ -751,7 +782,7 @@ async fn rollback_replicate(
     let _fsync_gate = fsync_coordinator
         .acquire_rollback_lock()
         .await
-        .ok_or_else(|| ReplicationRollbackFailure::FsyncAmortisedBatchLockTimeout)?;
+        .ok_or(ReplicationRollbackFailure::FsyncAmortisedBatchLockTimeout)?;
 
     // We nuke all the in-memory caches at this step at let everything rebuild naturally
     // this failure mode is rare - follower and S3 must both be down

@@ -2020,6 +2020,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         self.fsync_coordinator
             .request_sync_two_phase(
                 Some(self.config.fsync_delay),
+                ShardFsyncError::WriteLockTimeout,
                 move || async move { capture_fsync_snapshot(&mc_capture) },
                 move |captured| commit_fsync_with_rollback(node_status, rotating_log_cache, shard_mem_cache, watched_aggregates, captured, shard_id),
             )
@@ -2027,7 +2028,11 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     }
 
     async fn replicate_durable(&self) -> Result<(), ReplicationError> {
-        if !self.node_status.get().raw().is_leader() {
+        // Genuine followers don't need replication. 
+        // Check pending replication in-mem just to be sure we are follower.
+        if !self.node_status.get().raw().is_leader()
+            && self.shard_mem_cache.borrow().pending_replication_bytes() == 0
+        {
             return Ok(());
         }
         Box::pin(self.replicate_durable_leader()).await
@@ -2057,6 +2062,21 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         self.run_replication_through_coordinator(ReplicationTrigger::Probe, None).await
     }
 
+    /// Force any pending unreplicated tail to be rolled back.
+    /// Call at Leader→Follower role transition. Drives the replicate path; with
+    /// node_status now non-Leader, replicate_loop returns LeaderFenced and the
+    /// captured snapshot flows into rollback_or_panic, resetting write.wal back
+    /// to read.wal. Without this hook, the fence is only detected on the next
+    /// replicate trigger; which may never fire on a passive follower, leaving
+    /// an orphan tail that wedges S3 catchup at the next lease handover.
+    /// The Err is expected (it IS the fence) and ignored.
+    pub async fn drain_pending_replication_on_role_change(&self) {
+        if self.node_status.get().is_leader() {
+            return;
+        }
+        let _ = self.run_replication_through_coordinator(ReplicationTrigger::Write, None).await;
+    }
+
     async fn run_replication_through_coordinator(
         &self,
         trigger: ReplicationTrigger,
@@ -2079,6 +2099,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         self.replication_coordinator
             .request_sync_two_phase(
                 delay,
+                ReplicationError::GateTimeout,
                 move || async move { capture_replication_snapshot(&mc_capture, trigger) },
                 move |captured| commit_replication_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates, node_status, last_rollback_at, captured, trigger, max_catchup_gap_bytes, max_request_size, read_max_chunk_size, max_clock_drift_ms, shard_id),
             )

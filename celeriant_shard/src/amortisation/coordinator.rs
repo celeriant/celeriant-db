@@ -1,7 +1,9 @@
 use crate::amortisation::local_event::LocalEvent;
-use celeriant_disk::files::rwlock_timeout::{read_with_timeout, write_with_timeout};
+use celeriant_disk::files::rwlock_timeout::{read_with_timeout, with_budget, write_with_timeout};
 use glommio::sync::RwLock;
 use std::{rc::Rc, time::Duration};
+
+const GATE_BUDGET: Duration = Duration::from_secs(60);
 
 /// Result of a sync operation.
 pub type SyncResult<E> = Result<(), E>;
@@ -52,11 +54,16 @@ impl<E: Clone> Coordinator<E> {
 
     /// Acquire rollback lock. Waits for any in-flight fsync to complete,
     /// then blocks new fsyncs until the guard is dropped.
+    /// Budget is a bit larger here to handle when server is under extreme load
     pub async fn acquire_rollback_lock(&self) -> Option<glommio::sync::RwLockWriteGuard<'_, ()>> {
-        write_with_timeout(&self.sync_gate, "acquire_rollback_lock").await.ok()
+        match with_budget(GATE_BUDGET, self.sync_gate.write()).await {
+            Some(Ok(g)) => Some(g),
+            Some(Err(_)) => None,
+            None => None,
+        }
     }
 
-    pub async fn request_sync<F, Fut>(&self, delay: Option<Duration>, sync_fn: F) -> SyncResult<E>
+    pub async fn request_sync<F, Fut>(&self, delay: Option<Duration>, gate_timeout_err: E, sync_fn: F) -> SyncResult<E>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = SyncResult<E>>,
@@ -101,7 +108,15 @@ impl<E: Clone> Coordinator<E> {
                         guard.take();
                     }
 
-                    let _sync_guard = write_with_timeout(&self.sync_gate, "fsync_sync_gate").await.ok();
+                    let _sync_guard = match with_budget(GATE_BUDGET, self.sync_gate.write()).await {
+                        Some(Ok(g)) => g,
+                        _ => {
+                            metrics::counter!("celeriant_coordinator_gate_timeout_total", "path" => "request_sync").increment(1);
+                            let result: SyncResult<E> = Err(gate_timeout_err);
+                            event.notify(result.clone());
+                            return result;
+                        }
+                    };
                     let result = sync_fn().await;
                     drop(_sync_guard);
 
@@ -125,6 +140,7 @@ impl<E: Clone> Coordinator<E> {
     pub async fn request_sync_two_phase<C, S, T, Fut1, Fut2>(
         &self,
         delay: Option<Duration>,
+        gate_timeout_err: E,
         capture_fn: C,
         sync_fn: S,
     ) -> SyncResult<E>
@@ -174,17 +190,36 @@ impl<E: Clone> Coordinator<E> {
                     // momentarily free between busy syncs.
                     // Slow path: sleep for delay, then acquire the gate. The gate wait itself
                     // also provides implicit batching under high load.
-                    let _sync_guard = if Rc::strong_count(&event) == 1 {
+                    let acquire_with_budget = || async {
+                        match with_budget(GATE_BUDGET, self.sync_gate.write()).await {
+                            Some(Ok(g)) => Some(g),
+                            _ => None,
+                        }
+                    };
+                    let sync_guard_opt = if Rc::strong_count(&event) == 1 {
                         match self.sync_gate.try_write() {
                             Ok(guard) => Some(guard),
                             Err(_) => {
                                 glommio::timer::sleep(delay).await;
-                                write_with_timeout(&self.sync_gate, "two_phase_sync_gate").await.ok()
+                                acquire_with_budget().await
                             }
                         }
                     } else {
                         glommio::timer::sleep(delay).await;
-                        write_with_timeout(&self.sync_gate, "two_phase_sync_gate").await.ok()
+                        acquire_with_budget().await
+                    };
+                    let _sync_guard = match sync_guard_opt {
+                        Some(g) => g,
+                        None => {
+                            metrics::counter!("celeriant_coordinator_gate_timeout_total", "path" => "two_phase").increment(1);
+                            // Clear orchestrator before returning so the next leader can register.
+                            if let Ok(mut guard) = write_with_timeout(&self.lock_orchestrator, "two_phase_clear_on_timeout").await {
+                                guard.take();
+                            }
+                            let result: SyncResult<E> = Err(gate_timeout_err);
+                            event.notify(result.clone());
+                            return result;
+                        }
                     };
 
                     // Phase 1: Capture snapshot FIRST (while orchestrator still has our event)
@@ -243,7 +278,7 @@ mod tests {
 
             let cc = call_count.clone();
             let result = coordinator
-                .request_sync(Some(Duration::from_millis(1)), || async move {
+                .request_sync(Some(Duration::from_millis(1)), "gate-timeout".to_string(), || async move {
                     cc.set(cc.get() + 1);
                     Ok(())
                 })
@@ -263,7 +298,7 @@ mod tests {
             // None delay
             let cc = call_count.clone();
             let result = coordinator
-                .request_sync(None, || async move {
+                .request_sync(None, "gate-timeout".to_string(), || async move {
                     cc.set(cc.get() + 1);
                     Ok(())
                 })
@@ -274,7 +309,7 @@ mod tests {
             // Zero duration delay
             let cc = call_count.clone();
             let result = coordinator
-                .request_sync(Some(Duration::ZERO), || async move {
+                .request_sync(Some(Duration::ZERO), "gate-timeout".to_string(), || async move {
                     cc.set(cc.get() + 1);
                     Ok(())
                 })
@@ -297,7 +332,7 @@ mod tests {
                 let cc = call_count.clone();
                 handles.push(spawn_local(async move {
                     coord
-                        .request_sync(None, || async move {
+                        .request_sync(None, "gate-timeout".to_string(), || async move {
                             cc.set(cc.get() + 1);
                             Ok(())
                         })
@@ -331,7 +366,7 @@ mod tests {
             let leader_handle = spawn_local(async move {
                 lid.set(1);
                 coord
-                    .request_sync(Some(Duration::from_millis(10)), || async move {
+                    .request_sync(Some(Duration::from_millis(10)), "gate-timeout".to_string(), || async move {
                         scb.set(1);
                         Ok(())
                     })
@@ -346,7 +381,7 @@ mod tests {
             // Second request - should become follower
             let follower_handle = spawn_local(async move {
                 coord
-                    .request_sync(Some(Duration::from_millis(10)), || async move {
+                    .request_sync(Some(Duration::from_millis(10)), "gate-timeout".to_string(), || async move {
                         scb.set(2); // Should NOT be called
                         Ok(())
                     })
@@ -379,7 +414,7 @@ mod tests {
 
                 handles.push(spawn_local(async move {
                     coord
-                        .request_sync(Some(Duration::from_millis(5)), || async move {
+                        .request_sync(Some(Duration::from_millis(5)), "gate-timeout".to_string(), || async move {
                             let current = cs.get() + 1;
                             cs.set(current);
                             if current > mc.get() {
@@ -424,7 +459,7 @@ mod tests {
                 let res = results.clone();
 
                 handles.push(spawn_local(async move {
-                    let result = coord.request_sync(Some(Duration::from_millis(5)), || async { Ok(()) }).await;
+                    let result = coord.request_sync(Some(Duration::from_millis(5)), "gate-timeout".to_string(), || async { Ok(()) }).await;
                     res.borrow_mut().push(result);
                 }));
 
@@ -463,7 +498,7 @@ mod tests {
 
                 handles.push(spawn_local(async move {
                     coord
-                        .request_sync(Some(Duration::from_millis(10)), || async move {
+                        .request_sync(Some(Duration::from_millis(10)), "gate-timeout".to_string(), || async move {
                             sc.set(sc.get() + 1);
                             Ok(())
                         })
@@ -500,7 +535,7 @@ mod tests {
                     let sc = sync_count.clone();
                     handles.push(spawn_local(async move {
                         coord
-                            .request_sync(Some(Duration::from_millis(5)), || async move {
+                            .request_sync(Some(Duration::from_millis(5)), "gate-timeout".to_string(), || async move {
                                 sc.set(sc.get() + 1);
                                 Ok(())
                             })
@@ -526,7 +561,7 @@ mod tests {
                     let sc = sync_count.clone();
                     handles.push(spawn_local(async move {
                         coord
-                            .request_sync(Some(Duration::from_millis(5)), || async move {
+                            .request_sync(Some(Duration::from_millis(5)), "gate-timeout".to_string(), || async move {
                                 sc.set(sc.get() + 1);
                                 Ok(())
                             })
@@ -552,7 +587,7 @@ mod tests {
             let coordinator: Coordinator<String> = Coordinator::new();
 
             let result = coordinator
-                .request_sync(Some(Duration::from_millis(1)), || async { Err("sync failed".to_string()) })
+                .request_sync(Some(Duration::from_millis(1)), "gate-timeout".to_string(), || async { Err("sync failed".to_string()) })
                 .await;
 
             assert!(result.is_err());
@@ -574,7 +609,7 @@ mod tests {
 
                 handles.push(spawn_local(async move {
                     let result = coord
-                        .request_sync(Some(Duration::from_millis(5)), || async move { Err(format!("error from task {}", i)) })
+                        .request_sync(Some(Duration::from_millis(5)), "gate-timeout".to_string(), || async move { Err(format!("error from task {}", i)) })
                         .await;
                     res.borrow_mut().push(result);
                 }));
@@ -607,7 +642,7 @@ mod tests {
             let coord = coordinator.clone();
             let sf = should_fail.clone();
             let result = coord
-                .request_sync(Some(Duration::from_millis(1)), || async move {
+                .request_sync(Some(Duration::from_millis(1)), "gate-timeout".to_string(), || async move {
                     if sf.get() { Err("first failure".to_string()) } else { Ok(()) }
                 })
                 .await;
@@ -617,7 +652,7 @@ mod tests {
             should_fail.set(false);
             glommio::timer::sleep(Duration::from_millis(5)).await;
 
-            let result = coordinator.request_sync(Some(Duration::from_millis(1)), || async { Ok(()) }).await;
+            let result = coordinator.request_sync(Some(Duration::from_millis(1)), "gate-timeout".to_string(), || async { Ok(()) }).await;
             assert!(result.is_ok());
         });
     }
@@ -635,7 +670,7 @@ mod tests {
             let sc = sync_count.clone();
             let h1 = spawn_local(async move {
                 coord
-                    .request_sync(Some(Duration::from_micros(100)), || async move {
+                    .request_sync(Some(Duration::from_micros(100)), "gate-timeout".to_string(), || async move {
                         sc.set(sc.get() + 1);
                         Ok(())
                     })
@@ -650,7 +685,7 @@ mod tests {
             let sc = sync_count.clone();
             let h2 = spawn_local(async move {
                 coord
-                    .request_sync(Some(Duration::from_micros(100)), || async move {
+                    .request_sync(Some(Duration::from_micros(100)), "gate-timeout".to_string(), || async move {
                         sc.set(sc.get() + 1);
                         Ok(())
                     })
@@ -679,7 +714,7 @@ mod tests {
                 let tc = total_completed.clone();
 
                 coord
-                    .request_sync(Some(Duration::from_micros(100)), || async move {
+                    .request_sync(Some(Duration::from_micros(100)), "gate-timeout".to_string(), || async move {
                         sc.set(sc.get() + 1);
                         Ok(())
                     })
@@ -714,7 +749,7 @@ mod tests {
 
                 handles.push(spawn_local(async move {
                     coord
-                        .request_sync(Some(Duration::from_millis(2)), || async move {
+                        .request_sync(Some(Duration::from_millis(2)), "gate-timeout".to_string(), || async move {
                             sc.set(sc.get() + 1);
                             // Simulate some sync work
                             yield_now().await;
@@ -744,7 +779,7 @@ mod tests {
             let follower_sync_called = Rc::new(Cell::new(false));
 
             let coord = coordinator.clone();
-            let leader = spawn_local(async move { coord.request_sync(Some(Duration::from_millis(10)), || async { Ok(()) }).await });
+            let leader = spawn_local(async move { coord.request_sync(Some(Duration::from_millis(10)), "gate-timeout".to_string(), || async { Ok(()) }).await });
 
             yield_now().await;
 
@@ -755,7 +790,7 @@ mod tests {
                 let fsc = follower_sync_called.clone();
                 followers.push(spawn_local(async move {
                     coord
-                        .request_sync(Some(Duration::from_millis(10)), || async move {
+                        .request_sync(Some(Duration::from_millis(10)), "gate-timeout".to_string(), || async move {
                             fsc.set(true);
                             Ok(())
                         })
@@ -780,7 +815,7 @@ mod tests {
             let coordinator: Coordinator<String> = Coordinator::new();
 
             for i in 0..5 {
-                let result = coordinator.request_sync(Some(Duration::from_millis(1)), || async { Ok(()) }).await;
+                let result = coordinator.request_sync(Some(Duration::from_millis(1)), "gate-timeout".to_string(), || async { Ok(()) }).await;
                 assert!(result.is_ok(), "Iteration {} failed", i);
 
                 glommio::timer::sleep(Duration::from_millis(5)).await;
@@ -803,7 +838,7 @@ mod tests {
 
                 handles.push(spawn_local(async move {
                     let result = coord
-                        .request_sync(Some(Duration::from_millis(5)), || async move {
+                        .request_sync(Some(Duration::from_millis(5)), "gate-timeout".to_string(), || async move {
                             // Only leader (first one) sets this
                             Ok(())
                         })
@@ -849,7 +884,7 @@ mod tests {
 
                 handles.push(spawn_local(async move {
                     coord
-                        .request_sync(Some(Duration::from_millis(2)), || async move {
+                        .request_sync(Some(Duration::from_millis(2)), "gate-timeout".to_string(), || async move {
                             let current = al.get() + 1;
                             al.set(current);
 
@@ -896,7 +931,7 @@ mod tests {
 
                 handles.push(spawn_local(async move {
                     let _ = coord
-                        .request_sync(Some(Duration::from_millis(5)), || async { Err("intentional error".to_string()) })
+                        .request_sync(Some(Duration::from_millis(5)), "gate-timeout".to_string(), || async { Err("intentional error".to_string()) })
                         .await;
                     // This should still execute
                     cc.set(cc.get() + 1);
@@ -930,7 +965,7 @@ mod tests {
                 let sc = sync_count.clone();
                 handles.push(spawn_local(async move {
                     coord
-                        .request_sync(Some(Duration::from_millis(1)), || async move {
+                        .request_sync(Some(Duration::from_millis(1)), "gate-timeout".to_string(), || async move {
                             sc.set(sc.get() + 1);
                             Ok(())
                         })
@@ -962,7 +997,7 @@ mod tests {
             let done = sync_done.clone();
             let sync_handle = spawn_local(async move {
                 coord
-                    .request_sync(Some(Duration::from_millis(1)), || async move {
+                    .request_sync(Some(Duration::from_millis(1)), "gate-timeout".to_string(), || async move {
                         started.set(true);
                         glommio::timer::sleep(Duration::from_millis(50)).await;
                         done.set(true);

@@ -50,6 +50,13 @@ struct FallbackBatchRef {
     node_id: u128,
 }
 
+fn hex_short(h: &[u8; 32]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(16);
+    for b in &h[..8] { write!(s, "{:02x}", b).unwrap(); }
+    s
+}
+
 /// Keep only batches uploaded by the peer node. Filters out self-uploaded
 /// batches (leader must not consume its own fallback) AND batches from
 /// unknown node_ids (stale data from a previous cluster generation).
@@ -278,12 +285,41 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader>(
                         // structural (operator-territory). Either way: not safe to
                         // truncate, not fatal — skip this batch and let the loop bail to
                         // Retry. The caller's retry will re-list S3 next round.
+                        let batch_first_wal = all_items.first().map(|i| i.metablock.wal_index).unwrap_or(0);
+                        let batch_first_prev_hash = all_items.first().map(|i| hex_short(&i.metablock.previous_tip_hash)).unwrap_or_default();
+                        // Re-fetch live state at warn-time. `current_wal`/`current_tip`
+                        // captured earlier may be stale because we awaited S3 downloads
+                        // and other futures can run on this executor in between.
+                        let local_active_log_id = log_segments_cache.active_log_id();
+                        let (live_write_wal, live_write_tip, local_read_wal, local_read_tip_hash) = {
+                            let active = log_segments_cache.active();
+                            let m = active.metadata.borrow();
+                            let (rw, rt) = match &m.read {
+                                Some(r) => (r.wal_index, hex_short(&r.tip_hash)),
+                                None => (0u64, "none".to_string()),
+                            };
+                            (m.write.wal_index, hex_short(&m.write.tip_hash), rw, rt)
+                        };
                         tracing::warn!(
                             shard_id,
-                            current_wal,
+                            stale_current_wal = current_wal,
+                            stale_current_tip = %hex_short(&current_tip),
+                            local_active_log_id,
+                            live_write_wal,
+                            live_write_tip = %live_write_tip,
+                            local_read_wal,
+                            local_read_tip_hash = %local_read_tip_hash,
+                            batch_first_wal,
+                            batch_first_prev_hash = %batch_first_prev_hash,
+                            batch_lease = batch.lease_index,
+                            batch_seq = batch.upload_sequence,
                             path = %candidate.path,
                             "Chain mismatch with no common ancestor — skipping batch, will retry catchup"
                         );
+                        metrics::counter!(
+                            "celeriant_s3_catchup_no_common_ancestor_total",
+                            "shard_id" => shard_id.to_string()
+                        ).increment(1);
                         applied_paths.insert(candidate.path.clone());
                         break;
                     }
@@ -459,6 +495,7 @@ async fn sync_applied_batch(
     fsync_coordinator
         .request_sync_two_phase(
             None,
+            ShardFsyncError::WriteLockTimeout,
             move || async move { capture_fsync_snapshot(&mc_capture) },
             move |captured| commit_fsync_with_rollback(NodeStatus::Standalone, lsc, smc, wa, captured, shard_id),
         )
@@ -513,28 +550,73 @@ async fn find_divergence_via_s3<D: S3Downloader>(
         .filter(|b| b.start_wal_index <= current_wal_index)
         .collect();
 
+    let earlier_total_unfiltered = earlier_batches.len();
     let mut earlier_batches = retain_peer_batches(earlier_batches, node_id, peer_node_id);
+    let earlier_total_after_peer_filter = earlier_batches.len();
 
     earlier_batches.sort_by(|a, b| b.start_wal_index.cmp(&a.start_wal_index));
 
+    let mut tried = 0u64;
     for batch_ref in &earlier_batches {
-        let data = downloader.download(&batch_ref.path).await?;
-        let fallback_batch = deserialise_fallback_batch(&data).map_err(|e| S3CatchupError::DeserializationFailed {
-            path: batch_ref.path.clone(),
-            source: e,
-        })?;
+        tried += 1;
+        let data = match downloader.download(&batch_ref.path).await {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(path = %batch_ref.path, error = ?e, "find_divergence_via_s3: download failed, skipping");
+                metrics::counter!("celeriant_s3_catchup_via_s3_step_total", "outcome" => "download_err").increment(1);
+                continue;
+            }
+        };
+        let fallback_batch = match deserialise_fallback_batch(&data) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(path = %batch_ref.path, error = ?e, "find_divergence_via_s3: deserialise failed, skipping");
+                metrics::counter!("celeriant_s3_catchup_via_s3_step_total", "outcome" => "deserialise_err").increment(1);
+                continue;
+            }
+        };
 
-        let candidate_hash = fallback_batch
-            .items
-            .first()
-            .ok_or_else(|| S3CatchupError::TruncationFailed(ShardFsyncError::MetablockSerialisationError("empty S3 batch".into())))?
-            .metablock
-            .previous_tip_hash;
+        let candidate_hash = match fallback_batch.items.first() {
+            Some(i) => i.metablock.previous_tip_hash,
+            None => {
+                tracing::warn!(path = %batch_ref.path, "find_divergence_via_s3: empty batch, skipping");
+                metrics::counter!("celeriant_s3_catchup_via_s3_step_total", "outcome" => "empty_batch").increment(1);
+                continue;
+            }
+        };
 
-        if let Ok(result) = scan_local_metablocks_for_hash(log_segments_cache, candidate_hash).await {
-            return Ok(result);
+        match scan_local_metablocks_for_hash(log_segments_cache, candidate_hash).await {
+            Ok(result) => {
+                tracing::info!(
+                    path = %batch_ref.path,
+                    batch_start_wal = batch_ref.start_wal_index,
+                    candidate_hash = %hex_short(&candidate_hash),
+                    tried,
+                    "find_divergence_via_s3: ancestor found"
+                );
+                metrics::counter!("celeriant_s3_catchup_via_s3_step_total", "outcome" => "match").increment(1);
+                return Ok(result);
+            }
+            Err(_) => {
+                tracing::debug!(
+                    path = %batch_ref.path,
+                    batch_start_wal = batch_ref.start_wal_index,
+                    candidate_hash = %hex_short(&candidate_hash),
+                    "find_divergence_via_s3: scan miss"
+                );
+                metrics::counter!("celeriant_s3_catchup_via_s3_step_total", "outcome" => "scan_miss").increment(1);
+            }
         }
     }
+
+    tracing::warn!(
+        earlier_total_unfiltered,
+        earlier_total_after_peer_filter,
+        tried,
+        current_wal_index,
+        "find_divergence_via_s3: exhausted all earlier batches without match"
+    );
+    metrics::counter!("celeriant_s3_catchup_via_s3_exhausted_total").increment(1);
 
     Err(S3CatchupError::TruncationFailed(ShardFsyncError::MetablockSerialisationError(
         "no S3 batch shares common ancestor with local WAL".into(),
@@ -592,7 +674,10 @@ async fn truncate_wal(
     divergent_entry_position: u64,
 ) -> Result<u64, ShardFsyncError> {
     // Step 1: Acquire rollback lock to block concurrent writes
-    let _fsync_gate = fsync_coordinator.acquire_rollback_lock().await.ok_or(ShardFsyncError::WriteLockTimeout)?;
+    let _fsync_gate = fsync_coordinator
+        .acquire_rollback_lock()
+        .await
+        .ok_or(ShardFsyncError::WriteLockTimeout)?;
 
     // Step 2: Clear all caches (including read snapshots and recent writes)
     shard_mem_cache.borrow_mut().clear_all_caches();
