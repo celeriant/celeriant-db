@@ -940,6 +940,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "celeriant_wal_inspect"
+version = "0.1.0"
+dependencies = [
+ "celeriant_wal",
+ "celeriant_wire",
+]
+
+[[package]]
 name = "celeriant_watch"
 version = "0.1.0"
 dependencies = [

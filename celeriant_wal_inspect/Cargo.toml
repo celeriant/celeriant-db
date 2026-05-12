@@ -1,0 +1,15 @@
+[package]
+name = "celeriant_wal_inspect"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "celeriant-wal-inspect"
+path = "src/main.rs"
+
+[dependencies]
+celeriant_wal = { path = "../celeriant_wal" }
+celeriant_wire = { path = "../celeriant_wire" }

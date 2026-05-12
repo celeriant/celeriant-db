@@ -77,7 +77,7 @@ use crate::replication_client::ReplicationClient;
 use crate::s3_downloader::S3Downloader;
 use crate::shard_wal_compact::{CompactionResult, compact_segment};
 use crate::error::compaction_error::CompactionError;
-use crate::shard_wal_replicate::{capture_replication_snapshot, commit_replication_with_rollback, ReplicationTrigger};
+use crate::shard_wal_replicate::{capture_replication_snapshot, commit_replication_with_rollback, wal_positions, ReplicationTrigger};
 use crate::shard_wal_s3_catchup::{self, S3CatchupResult, catchup_from_s3};
 use crate::shard_wal_sync::{capture_fsync_snapshot, commit_fsync_with_rollback};
 
@@ -2074,7 +2074,26 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         if self.node_status.get().is_leader() {
             return;
         }
-        let _ = self.run_replication_through_coordinator(ReplicationTrigger::Write, None).await;
+        let drain_started_at = Instant::now();
+        let (write_wal_before, read_wal_before) = wal_positions(&self.log_segments_cache);
+        let result = self.run_replication_through_coordinator(ReplicationTrigger::Write, None).await;
+        let (write_wal_after, read_wal_after) = wal_positions(&self.log_segments_cache);
+        let elapsed_ms = drain_started_at.elapsed().as_millis() as u64;
+        let invariant_holds = write_wal_after == read_wal_after;
+        let err_kind = result.as_ref().err().map(|e| format!("{e:?}"));
+        tracing::info!(
+            shard_id = self.config.shard_id,
+            write_wal_after, read_wal_after,
+            write_wal_before, read_wal_before,
+            elapsed_ms,
+            invariant_holds,
+            err_kind = err_kind.as_deref().unwrap_or(""),
+            "drain_pending_replication_on_role_change: complete"
+        );
+        metrics::counter!(
+            "celeriant_drain_role_change_total",
+            &[("shard_id", self.config.shard_id.to_string()), ("invariant_holds", invariant_holds.to_string())],
+        ).increment(1);
     }
 
     async fn run_replication_through_coordinator(
@@ -2163,16 +2182,33 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             })));
         }
 
+        let shard_id = self.config.shard_id;
         match shard_wal_s3_catchup::apply_external_batch(
             &self.log_segments_cache, &self.shard_mem_cache, &request.batches,
         ) {
             Ok(()) => {}
-            Err(ApplyBatchError::WalIndexMismatch { current, .. }) => {
+            Err(ApplyBatchError::WalIndexMismatch { current, batch_first }) => {
+                tracing::warn!(
+                    shard_id,
+                    follower_wal = current,
+                    batch_first_wal = batch_first,
+                    batch_lease = batch_lease_index,
+                    "Replication batch rejected: WalIndexMismatch"
+                );
                 return Ok(response(ReplicationResult::Rejected(FollowerRejection::WalIndexMismatch {
                     max_follower_wal_index: current,
                 })));
             }
             Err(ApplyBatchError::TipHashMismatch { current, current_wal_index, batch, batch_wal_index }) => {
+                tracing::warn!(
+                    shard_id,
+                    follower_wal = current_wal_index,
+                    follower_tip = ?current,
+                    batch_first_wal = batch_wal_index,
+                    batch_first_prev = ?batch,
+                    batch_lease = batch_lease_index,
+                    "Replication batch rejected: TipHashMismatch (follower's tip at follower_wal != batch's prev_hash)"
+                );
                 return Ok(response(ReplicationResult::Rejected(FollowerRejection::TipHashMismatch {
                     follower: current,
                     follower_wal_index: current_wal_index,
@@ -2194,12 +2230,15 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             }
         }
 
-        // Track the first WAL index of this batch so we can upload it to S3 on promotion.
-        // Covers the case where the leader rolled back this batch but we (the follower) kept it.
+        // Promotion-batch floor: bounds the range we'd upload if we became leader.
+        // Monotonic max guards against retries / out-of-order arrival.
         {
+            let new_floor = request.leader_confirmed_wal_index.saturating_add(1);
             let active = self.log_segments_cache.active();
-            active.metadata.borrow_mut().last_received_replication_wal_index =
-                request.batches[0].metablock.wal_index;
+            let mut meta = active.metadata.borrow_mut();
+            if new_floor > meta.last_received_replication_wal_index {
+                meta.last_received_replication_wal_index = new_floor;
+            }
         }
 
         self.sync_durable().await
@@ -2233,28 +2272,27 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
         let shard_id = self.config.shard_id;
         let read_max_chunk_size = self.config.read_max_chunk_size;
+        let max_bytes = self.config.max_promotion_batch_bytes;
 
-        // Scan backwards from WAL tip to collect entries from start_wal_index onward
-        let current_log_id = self.log_segments_cache.active_log_id();
-        let mut scanner = ReverseMetablockScanner::new(
-            &self.log_segments_cache, current_log_id, None, read_max_chunk_size,
-        );
-
-        let mut items: Vec<EventBatchFromLogSegmentFile> = vec![];
-        let _scan_result = scanner
-            .scan(|log_id, _pos, bytes| {
-                let wal_index = metablock_bytes::read_wal_index(bytes);
-                if wal_index < start_wal_index {
-                    return Ok(Some(()));
-                }
-                let metablock = deserialise_metablock(bytes)?;
-                items.push(EventBatchFromLogSegmentFile { log_id, metablock, datablock: None });
-                Ok::<Option<()>, DiskFormatError>(None)
-            })
-            .await
-            .map_err(|e| crate::error::replication_to_s3_error::ReplicateToS3Error::SerializationFailed(
-                format!("Failed to scan WAL for promotion batch: {e:?}"),
-            ))?;
+        let mut items = match scan_for_promotion_batch(
+            &self.log_segments_cache, start_wal_index, max_bytes, read_max_chunk_size,
+        ).await? {
+            PromotionBatchScan::Collected(items) => items,
+            PromotionBatchScan::BudgetExceeded => {
+                tracing::warn!(
+                    shard_id, start_wal_index, current_wal_index, max_bytes = ?max_bytes,
+                    "Promotion batch exceeds max_promotion_batch_bytes — skipping upload; demoted peer must catch up via leader-side S3 fallback"
+                );
+                metrics::counter!(
+                    "celeriant_promotion_batch_budget_exceeded_total",
+                    &[("shard_id", shard_id.to_string())]
+                ).increment(1);
+                // Clear so we don't re-scan the same unbridgeable range next role change.
+                let active = self.log_segments_cache.active();
+                active.metadata.borrow_mut().last_received_replication_wal_index = 0;
+                return Ok(());
+            }
+        };
 
         if items.is_empty() {
             return Ok(());
@@ -2308,6 +2346,58 @@ struct MetablockCollection {
     kept_metablocks: Vec<EventBatchFromLogSegmentFile>,
     /// If we hit the size limit, this is the next batch index to continue from
     next_event_batch_index: Option<u64>,
+}
+
+/// Outcome of `scan_for_promotion_batch`.
+enum PromotionBatchScan {
+    Collected(Vec<EventBatchFromLogSegmentFile>),
+    BudgetExceeded,
+}
+
+/// Scan the active segment backwards for metablocks at or above `start_wal_index`,
+/// tallying `uncompressed_size`. Returns `BudgetExceeded` if the running sum overshoots
+/// `max_bytes`. Items are in reverse-WAL order; caller must `.reverse()` before use.
+async fn scan_for_promotion_batch(
+    log_segments_cache: &LogSegmentsCache,
+    start_wal_index: u64,
+    max_bytes: Option<u64>,
+    read_max_chunk_size: u64,
+) -> Result<PromotionBatchScan, crate::error::replication_to_s3_error::ReplicateToS3Error> {
+    let current_log_id = log_segments_cache.active_log_id();
+    let mut scanner = ReverseMetablockScanner::new(
+        log_segments_cache, current_log_id, None, read_max_chunk_size,
+    );
+
+    let mut items: Vec<EventBatchFromLogSegmentFile> = vec![];
+    let mut acc_bytes: u64 = 0;
+    let mut budget_exceeded = false;
+    scanner
+        .scan(|log_id, _pos, bytes| {
+            let wal_index = metablock_bytes::read_wal_index(bytes);
+            if wal_index < start_wal_index {
+                return Ok(Some(()));
+            }
+            let metablock = deserialise_metablock(bytes)?;
+            acc_bytes = acc_bytes.saturating_add(metablock.uncompressed_size);
+            if let Some(cap) = max_bytes {
+                if acc_bytes > cap {
+                    budget_exceeded = true;
+                    return Ok(Some(()));
+                }
+            }
+            items.push(EventBatchFromLogSegmentFile { log_id, metablock, datablock: None });
+            Ok::<Option<()>, DiskFormatError>(None)
+        })
+        .await
+        .map_err(|e| crate::error::replication_to_s3_error::ReplicateToS3Error::SerializationFailed(
+            format!("Failed to scan WAL for promotion batch: {e:?}"),
+        ))?;
+
+    if budget_exceeded {
+        Ok(PromotionBatchScan::BudgetExceeded)
+    } else {
+        Ok(PromotionBatchScan::Collected(items))
+    }
 }
 
 impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
@@ -2758,6 +2848,7 @@ mod tests {
             schema_cache_bytes: 4 * 1024 * 1024,
             max_schema_size_bytes: 16384,
             max_catchup_gap_bytes: Some(100 * 1024 * 1024),
+            max_promotion_batch_bytes: None,
             compaction_check_interval: Duration::from_secs(600),
             compaction_min_reclaimable_ratio: 0.20,
             compaction_temp_dir: std::path::PathBuf::from("/tmp/test_compaction"),
@@ -3615,7 +3706,7 @@ mod tests {
         fn set_heartbeat_in_flight(&self, _unix_ms: Option<u64>) {}
         fn reset_heartbeat_state(&self) {}
 
-        async fn replicate_to_follower(&self, _batches: Vec<celeriant_msg::request::requests::ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError> {
+        async fn replicate_to_follower(&self, _batches: Vec<celeriant_msg::request::requests::ReplicationBatchItem>, _leader_confirmed_wal_index: u64) -> Result<(), ReplicateToFollowerError> {
             let remaining = self.follower_failures_remaining.get();
             if remaining > 0 {
                 self.follower_failures_remaining.set(remaining - 1);
@@ -3668,7 +3759,7 @@ mod tests {
         fn set_heartbeat_in_flight(&self, _unix_ms: Option<u64>) {}
         fn reset_heartbeat_state(&self) {}
 
-        async fn replicate_to_follower(&self, _: Vec<celeriant_msg::request::requests::ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError> {
+        async fn replicate_to_follower(&self, _: Vec<celeriant_msg::request::requests::ReplicationBatchItem>, _: u64) -> Result<(), ReplicateToFollowerError> {
             if self.should_fail.get() {
                 return Err(ReplicateToFollowerError::FollowerUnexpectedResponse);
             }
@@ -3817,10 +3908,21 @@ mod tests {
     }
 
     fn replication_batch_req(batches: Vec<ReplicationBatchItem>) -> ReplicationBatchRequest {
+        let leader_confirmed_wal_index = batches.first()
+            .map(|b| b.metablock.wal_index.saturating_sub(1))
+            .unwrap_or(0);
+        replication_batch_req_with_leader_confirmed(batches, leader_confirmed_wal_index)
+    }
+
+    fn replication_batch_req_with_leader_confirmed(
+        batches: Vec<ReplicationBatchItem>,
+        leader_confirmed_wal_index: u64,
+    ) -> ReplicationBatchRequest {
         ReplicationBatchRequest {
             correlation_id: None,
             shard_id: 0,
             leader_timestamp_ms: now_ms(),
+            leader_confirmed_wal_index,
             batches,
         }
     }
@@ -3956,6 +4058,7 @@ mod tests {
                 correlation_id: None,
                 shard_id: 0,
                 leader_timestamp_ms: 1000, // ancient timestamp
+                leader_confirmed_wal_index: 0,
                 batches: vec![replication_item(1, GENESIS_HASH)],
             };
             let resp = unwrap_replication(shard.handle_replication_batch(stale_request).await);
@@ -3984,7 +4087,7 @@ mod tests {
         fn current_heartbeat_started_at_unix_ms(&self) -> Option<u64> { None }
         fn set_heartbeat_in_flight(&self, _unix_ms: Option<u64>) {}
         fn reset_heartbeat_state(&self) {}
-        async fn replicate_to_follower(&self, _batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError> { Ok(()) }
+        async fn replicate_to_follower(&self, _batches: Vec<ReplicationBatchItem>, _leader_confirmed_wal_index: u64) -> Result<(), ReplicateToFollowerError> { Ok(()) }
         async fn replicate_to_s3(&self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToS3Error> {
             self.s3_uploads.borrow_mut().push(batches);
             Ok(())
@@ -4001,6 +4104,16 @@ mod tests {
             .unwrap()
     }
 
+    async fn open_follower_shard_capturing_with_promotion_cap(
+        dir: &std::path::Path, client: CapturingReplicationClient, cap_bytes: u64,
+    ) -> ShardWal<CapturingReplicationClient, StubS3Downloader> {
+        let mut cfg = test_config(dir);
+        cfg.max_promotion_batch_bytes = Some(cap_bytes);
+        ShardWal::open(cfg, ValidatedNodeStatus::create_custom_status(NodeStatus::Follower { leader_lease_index: 0 }, 500, now_ms() + 10_000), client, StubS3Downloader)
+            .await
+            .unwrap()
+    }
+
     /// Metablock with no datablock — avoids deserialization failures in promotion upload tests
     fn test_metablock_no_datablock(wal_index: u64, previous_tip_hash: [u8; 32]) -> Metablock {
         let mut mb = test_metablock(wal_index, previous_tip_hash);
@@ -4013,6 +4126,12 @@ mod tests {
             metablock: test_metablock_no_datablock(wal_index, tip_hash),
             datablock: None,
         }
+    }
+
+    fn replication_item_with_size(wal_index: u64, tip_hash: [u8; 32], uncompressed_size: u64) -> ReplicationBatchItem {
+        let mut mb = test_metablock_no_datablock(wal_index, tip_hash);
+        mb.uncompressed_size = uncompressed_size;
+        ReplicationBatchItem { metablock: mb, datablock: None }
     }
 
     #[test]
@@ -4034,7 +4153,7 @@ mod tests {
     }
 
     #[test]
-    fn replication_overwrites_last_received_wal_index_on_subsequent_batch() {
+    fn replication_advances_last_received_wal_index_on_subsequent_batch() {
         glommio_test!({
             let (_tmp, dir) = test_dir();
             let shard = open_follower_shard(&dir).await;
@@ -4051,7 +4170,74 @@ mod tests {
             assert!(matches!(resp.result, ReplicationResult::Success { .. }));
 
             let idx = shard.log_segments_cache.active().metadata.borrow().last_received_replication_wal_index;
-            assert_eq!(idx, 2, "should overwrite to latest batch wal_index");
+            assert_eq!(idx, 2, "subsequent batch should advance floor");
+
+            shard.close().await;
+        });
+    }
+
+    /// Floor is `leader_confirmed + 1`, not `batch[0].wal_index`. They coincide
+    /// on contiguous replication and diverge when the leader's confirmed range
+    /// runs ahead of what this single batch covers.
+    #[test]
+    fn floor_uses_leader_confirmed_plus_one_not_batch_first_wal() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_follower_shard(&dir).await;
+
+            let resp = unwrap_replication(
+                shard.handle_replication_batch(replication_batch_req(vec![replication_item(1, GENESIS_HASH)])).await,
+            );
+            assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+
+            let tip = shard.log_segments_cache.active().metadata.borrow().write.tip_hash;
+            // Second batch: contiguous (wal=2 chained from wal=1) but leader claims it
+            // has confirmed all the way to wal=100. Floor must follow the leader's claim.
+            let resp = unwrap_replication(
+                shard.handle_replication_batch(
+                    replication_batch_req_with_leader_confirmed(vec![replication_item(2, tip)], 100)
+                ).await,
+            );
+            assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+
+            let idx = shard.log_segments_cache.active().metadata.borrow().last_received_replication_wal_index;
+            assert_eq!(idx, 101, "floor = leader_confirmed_wal_index + 1, not batch[0].wal_index");
+
+            shard.close().await;
+        });
+    }
+
+    /// Floor is monotonic max. A later batch with a lower `leader_confirmed_wal_index`
+    /// (stale message, retry from before a leader rollback, etc.) must NOT regress
+    /// the floor — that would shrink the promotion-batch upload range and risk
+    /// dropping in-flight history the demoted peer still needs.
+    #[test]
+    fn floor_does_not_regress_on_lower_leader_confirmed() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_follower_shard(&dir).await;
+
+            let resp = unwrap_replication(
+                shard.handle_replication_batch(
+                    replication_batch_req_with_leader_confirmed(vec![replication_item(1, GENESIS_HASH)], 100)
+                ).await,
+            );
+            assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+            assert_eq!(
+                shard.log_segments_cache.active().metadata.borrow().last_received_replication_wal_index,
+                101,
+            );
+
+            let tip = shard.log_segments_cache.active().metadata.borrow().write.tip_hash;
+            let resp = unwrap_replication(
+                shard.handle_replication_batch(
+                    replication_batch_req_with_leader_confirmed(vec![replication_item(2, tip)], 50)
+                ).await,
+            );
+            assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+
+            let idx = shard.log_segments_cache.active().metadata.borrow().last_received_replication_wal_index;
+            assert_eq!(idx, 101, "monotonic guard must hold floor at previous high-water mark");
 
             shard.close().await;
         });
@@ -4132,6 +4318,50 @@ mod tests {
             assert_eq!(uploads.len(), 1);
             assert_eq!(uploads[0].len(), 1, "should only upload from last_received index");
             assert_eq!(uploads[0][0].metablock.wal_index, 2);
+
+            shard.close().await;
+        });
+    }
+
+    /// Scan exceeds `max_promotion_batch_bytes` → skip upload, clear the floor, return Ok.
+    /// Demoted peer recovers via the leader-side S3 fallback path.
+    #[test]
+    fn upload_promotion_batch_skips_and_clears_when_budget_exceeded() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let client = CapturingReplicationClient::new();
+            let shard = open_follower_shard_capturing_with_promotion_cap(&dir, client, 100).await;
+
+            // Three chained replicated batches, 50 bytes each → 150 bytes total, well past the 100-byte cap.
+            let resp = unwrap_replication(
+                shard.handle_replication_batch(replication_batch_req(vec![replication_item_with_size(1, GENESIS_HASH, 50)])).await,
+            );
+            assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+            let tip = shard.log_segments_cache.active().metadata.borrow().write.tip_hash;
+            let resp = unwrap_replication(
+                shard.handle_replication_batch(replication_batch_req(vec![replication_item_with_size(2, tip, 50)])).await,
+            );
+            assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+            let tip = shard.log_segments_cache.active().metadata.borrow().write.tip_hash;
+            let resp = unwrap_replication(
+                shard.handle_replication_batch(replication_batch_req(vec![replication_item_with_size(3, tip, 50)])).await,
+            );
+            assert!(matches!(resp.result, ReplicationResult::Success { .. }));
+
+            // Pin the floor at 1 so the scan covers all three metablocks.
+            shard.log_segments_cache.active().metadata.borrow_mut().last_received_replication_wal_index = 1;
+
+            shard.upload_s3_promotion_batch().await.unwrap();
+
+            assert!(
+                shard.replication_client.s3_uploads.borrow().is_empty(),
+                "no S3 upload when scan exceeds max_promotion_batch_bytes",
+            );
+            assert_eq!(
+                shard.log_segments_cache.active().metadata.borrow().last_received_replication_wal_index,
+                0,
+                "floor must be cleared so subsequent role changes don't re-scan the same range",
+            );
 
             shard.close().await;
         });

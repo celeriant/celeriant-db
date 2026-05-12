@@ -20,6 +20,7 @@ members = [
     "kafka_bench",
     "celeriant_bench",
     "celeriant_chaos",
+    "celeriant_wal_inspect",
 ]
 
 resolver = "2"

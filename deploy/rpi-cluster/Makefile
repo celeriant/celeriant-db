@@ -287,6 +287,9 @@ logs: ## Tail logs from both data nodes (Ctrl+C to stop)
 	@ssh $(FOLLOWER_HOST) 'journalctl -u celeriant -f --no-pager' &
 	@wait
 
+vitals: ## Snapshot SoC temp, throttle bitmask, CPU freq for data nodes + infra rpi
+	@bash vitals.sh $(DATA_NODES) $(INFRA_HOST)
+
 # ---------------------------------------------------------------------------
 # Integration tests
 # ---------------------------------------------------------------------------

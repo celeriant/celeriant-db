@@ -236,7 +236,10 @@ pub struct ServerConfig {
     #[arg(long, env = "CELERIANT_MAX_CATCHUP_GAP_BYTES", hide = true, help = "Max bytes of historical WAL the leader will replay to catch up a behind follower over TCP. Unset means unlimited.")]
     pub max_catchup_gap_bytes: Option<u64>,
 
-    #[arg(long, default_value_t = 2, env = "CELERIANT_S3_MAX_CONCURRENT_FALLBACK_UPLOADS", help = "Max concurrent S3 fallback uploads across all shards. Prevents MinIO saturation that can starve lease renewal.")]
+    #[arg(long, default_value = "1073741824", env = "CELERIANT_MAX_PROMOTION_BATCH_BYTES", hide = true, help = "Memory cap (bytes) for the one-shot S3 promotion batch a newly-elected leader uploads to bridge a freshly-demoted peer's drained tail. Counts uncompressed metablock+datablock size as we scan. Defaults to 1 GiB — a defensive backstop for the reconciliation window where the floor stops tracking the tip; steady-state delta is bounded by internode_max_request_size (one TCP batch). If the range exceeds this cap, the upload is skipped with a warn + metric and the peer falls back to the leader-side S3 path.")]
+    pub max_promotion_batch_bytes: Option<u64>,
+
+    #[arg(long, default_value_t = 128, env = "CELERIANT_S3_MAX_CONCURRENT_FALLBACK_UPLOADS", help = "Max concurrent S3 fallback uploads across all shards. Sized for AWS S3; lower for MinIO/local-LAN deployments where saturation can starve lease renewal.")]
     pub s3_max_concurrent_fallback_uploads: u32,
 
     #[arg(long, default_value_t = 4, env = "CELERIANT_HEARTBEAT_HARD_TIMEOUT_MULTIPLIER", help = "Hard timeout for heartbeat as a multiplier of heartbeat_timeout. Caps kernel-blocked kTLS sends that ignore the soft timeout.")]
@@ -774,6 +777,7 @@ impl ServerConfig {
             max_schema_size_bytes: self.max_schema_size_bytes,
             max_clock_drift_ms: self.max_clock_drift_ms,
             max_catchup_gap_bytes: self.max_catchup_gap_bytes,
+            max_promotion_batch_bytes: self.max_promotion_batch_bytes,
             internode_connection_timeout: Some(Duration::from_millis(self.internode_connection_timeout_ms)),
             internode_request_timeout: Duration::from_millis(self.internode_request_timeout_ms),
             server_compression_algorithm: match self.server_compression_algorithm {
@@ -963,6 +967,7 @@ impl Default for ServerConfig {
             s3_subfolder: None,
             shard_log_preallocate_bytes: 1024 * 1024 * 1024,
             max_catchup_gap_bytes: None,
+            max_promotion_batch_bytes: None,
             s3_max_concurrent_fallback_uploads: 2,
             fsync_delay_us: 17000,
             replication_delay_us: 17000,

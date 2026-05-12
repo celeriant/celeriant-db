@@ -114,6 +114,7 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                     schema_cache_bytes: shard_config.schema_cache_bytes,
                     max_schema_size_bytes: shard_config.max_schema_size_bytes,
                     max_catchup_gap_bytes: shard_config.max_catchup_gap_bytes,
+                    max_promotion_batch_bytes: shard_config.max_promotion_batch_bytes,
                     compaction_check_interval: shard_config.compaction_check_interval,
                     compaction_min_reclaimable_ratio: shard_config.compaction_min_reclaimable_ratio,
                     compaction_temp_dir,

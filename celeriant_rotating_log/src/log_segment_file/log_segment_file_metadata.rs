@@ -15,8 +15,9 @@ pub struct LogSegmentFileMetadata {
     pub read: Option<LogSegmentCursor>,
     /// Used in write path as datablock file writes are not Direct I/O aligned
     pub datablocks_carry_over: Option<Vec<u8>>,
-    /// First WAL index of the last batch received via TCP replication while follower.
-    /// On promotion to leader, entries from this index onward are uploaded to S3.
+    /// Promotion-batch floor: `leader_confirmed_wal_index + 1` from the highest-confirmed
+    /// batch received via TCP replication while follower (monotonic max). On promotion to
+    /// leader, entries from this index onward are uploaded to S3.
     pub last_received_replication_wal_index: u64,
 }
 

@@ -28,10 +28,11 @@ pub struct ShardLogHeader {
     /// A "definitely not in set" result means no metablocks for that aggregate exist.
     pub aggregate_bloom: Vec<u64>,
 
-    /// First WAL index of the last batch received via TCP replication while this node
-    /// was a follower. On promotion to leader, entries from this index onward are uploaded
-    /// to S3 so the old leader (which may have rolled back this batch) can catch up.
-    /// Zero means no pending promotion upload is needed.
+    /// Promotion-batch floor: `leader_confirmed_wal_index + 1` from the highest-confirmed
+    /// batch received via TCP replication while follower (monotonic max). On promotion to
+    /// leader, entries from this index onward are uploaded to S3 so the old leader (which
+    /// may have rolled back data above its confirmed point) can catch up. Zero means no
+    /// pending promotion upload.
     pub last_received_replication_wal_index: u64,
 }
 

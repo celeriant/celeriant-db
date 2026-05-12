@@ -132,6 +132,7 @@ mod tests {
                 correlation_id: Some(0x4444_5555_6666_7777),
                 shard_id: 2,
                 leader_timestamp_ms: 9999999,
+                leader_confirmed_wal_index: 12345,
                 batches: vec![],
             }),
             ClusterRequestType::Heartbeat => ClusterRequest::Heartbeat(HeartbeatRequest {

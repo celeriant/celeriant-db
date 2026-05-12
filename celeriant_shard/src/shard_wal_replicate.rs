@@ -131,8 +131,15 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient + 'sta
     let details = match outcome {
         Ok(d) => d,
         Err(e) => {
-            // Probes don't need to rollback, zero fsync batch captures
             if matches!(trigger, ReplicationTrigger::Probe) {
+                return Err(e);
+            }
+            // BudgetExhausted: PUT may be on the wire; rollback would re-fsync with fresh
+            // server_ts and race S3 with a different payload. Re-queue for idempotent retry.
+            if matches!(e, ReplicationError::BudgetExhausted) {
+                warn!(shard_id, trigger = ?trigger, snapshot_pcds = replication_snapshot.len(), "BudgetExhausted — returning snapshot to pending queue for retry");
+                metrics::counter!("celeriant_replication_snapshot_returned_to_queue_total", &[("shard_id", shard_id.to_string())]).increment(1);
+                shard_mem_cache.borrow_mut().return_to_pending_replication(replication_snapshot);
                 return Err(e);
             }
             return finish_with_rollback(&fsync_coordinator, &log_segments_cache, &shard_mem_cache, &last_rollback_at, replication_snapshot, e, shard_id).await;
@@ -160,7 +167,17 @@ async fn replicate_loop<R: ReplicationClient + 'static>(
     shard_id: u32,
 ) -> Result<ReplicationDetails, ReplicationError> {
     if !node_status.get().is_leader() {
-        warn!(shard_id, "Leader fenced before replication");
+        let snapshot_count = snapshot.len();
+        let snapshot_first_wal = snapshot.iter().flat_map(|c| c.pending_queue.iter())
+            .map(|i| i.metablock.wal_index).next().unwrap_or(0);
+        let snapshot_last_wal = snapshot.iter().flat_map(|c| c.pending_queue.iter())
+            .map(|i| i.metablock.wal_index).last().unwrap_or(0);
+        let (write_wal_at_fence, read_wal_at_fence) = wal_positions(log_segments_cache);
+        warn!(
+            shard_id, snapshot_count, snapshot_first_wal, snapshot_last_wal,
+            write_wal_at_fence, read_wal_at_fence,
+            "Leader fenced before replication"
+        );
         return Err(ReplicationError::LeaderFenced);
     }
 
@@ -266,7 +283,8 @@ async fn run_probe_send<R: ReplicationClient + 'static>(
         .collect();
     info!(shard_id, leader_wal_index, "Sending reconciliation probe to follower");
 
-    let outcome = single_send(replication_client, node_status, probe_items, max_clock_drift_ms, shard_id).await?;
+    let leader_confirmed_wal_index = current_leader_confirmed_wal_index(log_segments_cache);
+    let outcome = single_send(replication_client, node_status, probe_items, leader_confirmed_wal_index, max_clock_drift_ms, shard_id).await?;
     match outcome {
         SingleSendOutcome::Ok => {
             metrics::counter!("celeriant_probe_outcome_current_total").increment(1);
@@ -390,7 +408,8 @@ async fn tcp_send_snapshot<R: ReplicationClient + 'static>(
         .collect();
     let leader_first_wal = items.first().map(|i| i.metablock.wal_index).unwrap_or(0);
 
-    match single_send(replication_client, node_status, items.clone(), max_clock_drift_ms, shard_id).await? {
+    let leader_confirmed_wal_index = current_leader_confirmed_wal_index(log_segments_cache);
+    match single_send(replication_client, node_status, items.clone(), leader_confirmed_wal_index, max_clock_drift_ms, shard_id).await? {
         SingleSendOutcome::Ok => return Ok(SnapshotSendOutcome::Sent),
         SingleSendOutcome::Failed => return Ok(SnapshotSendOutcome::FallbackToS3),
         SingleSendOutcome::WalIndexMismatch { max_follower_wal_index } => {
@@ -410,7 +429,9 @@ async fn tcp_send_snapshot<R: ReplicationClient + 'static>(
 
     // Retry the original send exactly once. A second WalIndexMismatch means
     // local-WAL replay can't fix this follower in one cycle; escalate to S3.
-    match single_send(replication_client, node_status, items, max_clock_drift_ms, shard_id).await? {
+    // Re-read confirmed index: catchup may have advanced read.wal_index meanwhile.
+    let leader_confirmed_wal_index_retry = current_leader_confirmed_wal_index(log_segments_cache);
+    match single_send(replication_client, node_status, items, leader_confirmed_wal_index_retry, max_clock_drift_ms, shard_id).await? {
         SingleSendOutcome::Ok => Ok(SnapshotSendOutcome::Sent),
         SingleSendOutcome::Failed | SingleSendOutcome::WalIndexMismatch { .. } => {
             Ok(SnapshotSendOutcome::FallbackToS3)
@@ -427,6 +448,7 @@ async fn single_send<R: ReplicationClient + 'static>(
     replication_client: &Rc<R>,
     node_status: &Rc<Cell<ValidatedNodeStatus>>,
     items: Vec<ReplicationBatchItem>,
+    leader_confirmed_wal_index: u64,
     max_clock_drift_ms: u64,
     shard_id: u32,
 ) -> Result<SingleSendOutcome, ReplicationError> {
@@ -437,7 +459,7 @@ async fn single_send<R: ReplicationClient + 'static>(
     let tcp_budget = acquire_lease_budget(node_status, "replicate", shard_id)?;
     let tcp_start = Instant::now();
     debug!(shard_id, batch_count = items.len(), "TCP replication attempt starting");
-    let send = with_budget(tcp_budget, replication_client.replicate_to_follower(items))
+    let send = with_budget(tcp_budget, replication_client.replicate_to_follower(items, leader_confirmed_wal_index))
         .await
         .ok_or_else(|| {
             metrics::counter!("celeriant_lease_budget_exhausted_total", &[("op", "replicate".to_string()), ("shard_id", shard_id.to_string())]).increment(1);
@@ -503,6 +525,21 @@ async fn single_send<R: ReplicationClient + 'static>(
         }
         _ => Ok(SingleSendOutcome::Failed),
     }
+}
+
+/// Highest wal_index the leader has confirmed-committed locally (its `read.wal_index`).
+/// Sent to followers as the promotion-batch floor.
+pub(crate) fn current_leader_confirmed_wal_index(log_segments_cache: &LogSegmentsCache) -> u64 {
+    let active = log_segments_cache.active();
+    let m = active.metadata.borrow();
+    m.read.as_ref().map(|r| r.wal_index).unwrap_or(0)
+}
+
+/// `(write.wal_index, read.wal_index)` — diagnostic snapshot for fence/drain/rollback logs.
+pub(crate) fn wal_positions(log_segments_cache: &LogSegmentsCache) -> (u64, u64) {
+    let active = log_segments_cache.active();
+    let m = active.metadata.borrow();
+    (m.write.wal_index, m.read.as_ref().map(|r| r.wal_index).unwrap_or(0))
 }
 
 fn acquire_lease_budget(
@@ -776,7 +813,17 @@ async fn rollback_replicate(
     shard_id: u32,
 ) -> Result<(), ReplicationRollbackFailure> {
     let batches_to_rollback = replication_snapshot.len();
-    error!(shard_id, batches_to_rollback, "Replication failed to both follower and S3, rolling back");
+    let (write_wal_before, write_tip_before, read_wal_before) = {
+        let active = log_segments_cache.active();
+        let m = active.metadata.borrow();
+        let read_wal = m.read.as_ref().map(|r| r.wal_index).unwrap_or(0);
+        (m.write.wal_index, m.write.tip_hash, read_wal)
+    };
+    error!(
+        shard_id, batches_to_rollback,
+        write_wal_before, read_wal_before, write_tip_before = ?write_tip_before,
+        "Replication failed to both follower and S3, rolling back"
+    );
     metrics::counter!("celeriant_replication_rollbacks_total").increment(1);
     // In replication rollback, we modify the write positions in the file header
     // So we must drain and block any more writes to disk until rollback completes
@@ -881,8 +928,19 @@ async fn rollback_replicate(
     // line the gauge stays pinned to the pre-rollback high-water mark until
     // the next fresh write. That stale value makes EventualConvergence look
     // like a stuck-follower bug when the cluster has actually converged.
-    let active_wal_index = log_segments_cache.active().metadata.borrow().write.wal_index;
+    let (active_wal_index, write_tip_after) = {
+        let active = log_segments_cache.active();
+        let m = active.metadata.borrow();
+        (m.write.wal_index, m.write.tip_hash)
+    };
     metrics::gauge!("celeriant_wal_index", &[("shard_id", shard_id.to_string())]).set(active_wal_index as f64);
+    info!(
+        shard_id,
+        write_wal_after = active_wal_index,
+        write_tip_after = ?write_tip_after,
+        invariant_holds = active_wal_index == read_wal_before,
+        "Replication rollback complete"
+    );
 
     Ok(())
 }
@@ -1068,6 +1126,7 @@ mod tests {
         s3: RefCell<S3Responder>,
         tcp_calls: Rc<RefCell<Vec<usize>>>,
         s3_calls: Rc<RefCell<Vec<usize>>>,
+        tcp_pre_delay: Cell<Option<Duration>>,
     }
 
     impl MockClient {
@@ -1080,6 +1139,7 @@ mod tests {
                 s3: RefCell::new(Box::new(|_| Ok(()))),
                 tcp_calls: tcp_calls.clone(),
                 s3_calls: s3_calls.clone(),
+                tcp_pre_delay: Cell::new(None),
             };
             (mc, tcp_calls, s3_calls)
         }
@@ -1098,6 +1158,13 @@ mod tests {
             self.follower_reachable.set(false);
             self
         }
+
+        /// Sleep this long before the TCP responder fires, so `with_budget` can race
+        /// the future against the lease timer.
+        fn with_tcp_delay(self, d: Duration) -> Self {
+            self.tcp_pre_delay.set(Some(d));
+            self
+        }
     }
 
     impl ReplicationClient for MockClient {
@@ -1108,7 +1175,10 @@ mod tests {
         fn set_heartbeat_in_flight(&self, _unix_ms: Option<u64>) {}
         fn reset_heartbeat_state(&self) {}
 
-        async fn replicate_to_follower(&self, b: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError> {
+        async fn replicate_to_follower(&self, b: Vec<ReplicationBatchItem>, _leader_confirmed_wal_index: u64) -> Result<(), ReplicateToFollowerError> {
+            if let Some(d) = self.tcp_pre_delay.get() {
+                glommio::timer::sleep(d).await;
+            }
             let n = b.len();
             self.tcp_calls.borrow_mut().push(n);
             (self.tcp.borrow_mut())(n)
@@ -1425,6 +1495,46 @@ mod tests {
             assert!(result.is_ok(), "got {result:?}");
             assert_eq!(tcp_calls.borrow().as_slice(), &[5], "one TCP attempt with all 5 items");
             assert!(s3_calls.borrow().is_empty(), "no S3 fallback on success");
+            h.close().await;
+        });
+    }
+
+    // --- BudgetExhausted re-queue (no rollback) ---
+
+    /// BudgetExhausted must re-queue the snapshot for retry, NOT rollback. Rollback
+    /// re-fsyncs with fresh server_ts and would race any in-flight S3 PUT with a
+    /// different payload, wedging catchup on "no common ancestor".
+    #[test]
+    fn budget_exhausted_returns_snapshot_to_pending_queue() {
+        glommio_test!({
+            let h = Harness::new().await;
+            // Leader with ~50ms of lease budget, in a far-future lease window so
+            // is_leader() stays true throughout. with_budget loses the race against
+            // the mock's 500ms tcp pre-delay → ReplicationError::BudgetExhausted.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+            let far_future = 1_000_000_000u64;
+            h.node_status.set(ValidatedNodeStatus::create_custom_status(
+                celeriant_distributed::node_status::NodeStatus::Leader { lease_index: 1 },
+                far_future - 50,
+                now + far_future,
+            ));
+
+            let (mock, tcp_calls, s3_calls) = MockClient::build();
+            let client = Rc::new(mock.with_tcp_delay(Duration::from_millis(500)));
+            let captured = make_captured(&[2, 1]);
+
+            let result = h.commit(client, captured, u64::MAX).await;
+            assert!(matches!(result, Err(ReplicationError::BudgetExhausted)), "got {result:?}");
+            assert_eq!(tcp_calls.borrow().len(), 0, "tcp body cancelled before pushing call record");
+            assert!(s3_calls.borrow().is_empty(), "must not reach S3 fallback");
+            assert_eq!(
+                h.smc.borrow().pending_replication_count(),
+                2,
+                "both PCDs must be returned to pending queue",
+            );
+            assert!(h.last_rollback_at.get().is_none(), "BudgetExhausted must not trigger rollback");
+
             h.close().await;
         });
     }

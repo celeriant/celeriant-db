@@ -97,6 +97,7 @@ pub struct ShardConfig {
     pub max_schema_size_bytes: u64,
     pub max_clock_drift_ms: u64,
     pub max_catchup_gap_bytes: Option<u64>,
+    pub max_promotion_batch_bytes: Option<u64>,
     pub tls_config: Option<Arc<TlsConfig>>,
     pub tls_cert_paths: Option<TlsCertPaths>,
     pub tls_client_auth: ClientAuthMode,

@@ -287,6 +287,9 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader>(
                         // Retry. The caller's retry will re-list S3 next round.
                         let batch_first_wal = all_items.first().map(|i| i.metablock.wal_index).unwrap_or(0);
                         let batch_first_prev_hash = all_items.first().map(|i| hex_short(&i.metablock.previous_tip_hash)).unwrap_or_default();
+                        // Post-skip values — the chain check uses items[0], not all_items[0].
+                        let mismatch_wal = items.first().map(|i| i.metablock.wal_index).unwrap_or(0);
+                        let mismatch_prev_hash = items.first().map(|i| hex_short(&i.metablock.previous_tip_hash)).unwrap_or_default();
                         // Re-fetch live state at warn-time. `current_wal`/`current_tip`
                         // captured earlier may be stale because we awaited S3 downloads
                         // and other futures can run on this executor in between.
@@ -311,6 +314,8 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader>(
                             local_read_tip_hash = %local_read_tip_hash,
                             batch_first_wal,
                             batch_first_prev_hash = %batch_first_prev_hash,
+                            mismatch_wal,
+                            mismatch_prev_hash = %mismatch_prev_hash,
                             batch_lease = batch.lease_index,
                             batch_seq = batch.upload_sequence,
                             path = %candidate.path,

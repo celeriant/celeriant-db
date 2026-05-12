@@ -13,6 +13,7 @@ use crate::error::replication_error::ReplicationError;
 use crate::error::replication_to_follower_error::ReplicateToFollowerError;
 use crate::fetch_catchup_entries::fetch_catchup_entries;
 use crate::replication_client::ReplicationClient;
+use crate::shard_wal_replicate::current_leader_confirmed_wal_index;
 
 pub(crate) enum CatchupOutcome {
     /// Follower is now caught up to (but not including) `leader_wal_index`.
@@ -76,7 +77,8 @@ pub(crate) async fn replicate_follower_catchup<R: ReplicationClient + 'static>(
         };
 
         let chunk = items[sent..sent + end_idx].to_vec();
-        let send_result = with_budget(budget, replication_client.replicate_to_follower(chunk))
+        let leader_confirmed_wal_index = current_leader_confirmed_wal_index(log_segments_cache);
+        let send_result = with_budget(budget, replication_client.replicate_to_follower(chunk, leader_confirmed_wal_index))
             .await
             .ok_or_else(|| {
                 metrics::counter!("celeriant_lease_budget_exhausted_total", &[("op", "catchup".to_string()), ("shard_id", shard_id.to_string())]).increment(1);

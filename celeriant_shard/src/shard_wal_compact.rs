@@ -444,9 +444,9 @@ async fn build_compacted_file(
     // -------------------------------------------------------------------------
     let src_segment = log_segments_cache.get(target_log_id).await?;
 
-    let (metablocks_end, original_tip_hash, original_wal_index) = {
+    let (metablocks_end, original_tip_hash, original_wal_index, original_last_received_replication_wal_index) = {
         let meta = src_segment.metadata.borrow();
-        (meta.readable_metablocks_end(), meta.write.tip_hash, meta.write.wal_index)
+        (meta.readable_metablocks_end(), meta.write.tip_hash, meta.write.wal_index, meta.last_received_replication_wal_index)
     };
     let metablocks_start = HEADER_BLOCK_SIZE_BYTES as u64;
 
@@ -679,7 +679,7 @@ async fn build_compacted_file(
         wal_index: original_wal_index,
         tip_hash: original_tip_hash,
         aggregate_bloom: bloom.to_bytes(),
-        last_received_replication_wal_index: 0,
+        last_received_replication_wal_index: original_last_received_replication_wal_index,
     };
 
     write_dual_shard_log_header(&new_file, tail_header_pos, &header)

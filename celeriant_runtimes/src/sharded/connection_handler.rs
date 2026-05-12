@@ -1426,6 +1426,7 @@ mod tests {
             replication_delay: Duration::from_millis(20),
             max_clock_drift_ms: 5000,
             max_catchup_gap_bytes: Some(104_857_600),
+            max_promotion_batch_bytes: None,
             internode_connection_timeout: None,
             internode_request_timeout: Duration::from_secs(10),
             tls_config: None,
@@ -1490,6 +1491,7 @@ mod tests {
             correlation_id: None,
             shard_id: 2,
             leader_timestamp_ms: 0,
+            leader_confirmed_wal_index: 0,
             batches: vec![],
         });
         let shard = determine_cluster_shard(&request, &config).unwrap();
@@ -1503,6 +1505,7 @@ mod tests {
             correlation_id: None,
             shard_id: 10,
             leader_timestamp_ms: 0,
+            leader_confirmed_wal_index: 0,
             batches: vec![],
         });
         let result = determine_cluster_shard(&request, &config);

@@ -29,7 +29,7 @@ pub trait ReplicationClient {
     fn reset_heartbeat_state(&self);
     fn try_acquire_kick(&self) -> bool { true }
     fn release_kick(&self) {}
-    async fn replicate_to_follower(&self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError>;
+    async fn replicate_to_follower(&self, batches: Vec<ReplicationBatchItem>, leader_confirmed_wal_index: u64) -> Result<(), ReplicateToFollowerError>;
     async fn replicate_to_s3(&self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToS3Error>;
     async fn send_heartbeat(&self, unix_epoch_now_ms: u64, lease_index: u64) -> Result<HeartbeatResult, SendHeartbeatError>;
     async fn send_kick(&self) -> Result<bool, SendHeartbeatError>;
@@ -45,7 +45,7 @@ impl ReplicationClient for StubReplicationClient {
     fn set_heartbeat_in_flight(&self, _unix_ms: Option<u64>) {}
     fn reset_heartbeat_state(&self) {}
 
-    async fn replicate_to_follower(&self, _batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError> {
+    async fn replicate_to_follower(&self, _batches: Vec<ReplicationBatchItem>, _leader_confirmed_wal_index: u64) -> Result<(), ReplicateToFollowerError> {
         glommio::timer::sleep(std::time::Duration::from_millis(30)).await;
         Ok(())
     }
@@ -224,7 +224,7 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
         self.kick_in_flight.set(false);
     }
 
-    async fn replicate_to_follower(&self, batches: Vec<ReplicationBatchItem>) -> Result<(), ReplicateToFollowerError> {
+    async fn replicate_to_follower(&self, batches: Vec<ReplicationBatchItem>, leader_confirmed_wal_index: u64) -> Result<(), ReplicateToFollowerError> {
         if batches.is_empty() {
             return Ok(());
         }
@@ -241,6 +241,7 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
             correlation_id: None,
             shard_id,
             leader_timestamp_ms: SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64,
+            leader_confirmed_wal_index,
             batches,
         });
 
@@ -322,8 +323,9 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
         let path = fallback_batch_path(shard_id, fallback_index, end_wal_index, self.node_id);
 
         debug!(
-            "S3 fallback triggered: shard_id={}, batch_count={}, bytes={}, fallback_index={}, end_wal_index={}, path={}",
-            shard_id, batch_count, total_bytes, fallback_index, end_wal_index, path
+            shard_id, batch_count, total_bytes, fallback_index, end_wal_index,
+            lease_index, upload_seq = seq, path = %path,
+            "S3 fallback upload"
         );
 
         s3_uploader.upload(path, Bytes::from(serialized)).await

@@ -86,6 +86,9 @@ fn register_metric_descriptions() {
     describe_counter!("celeriant_s3_catchup_rounds_total", "S3 catchup rounds executed");
     describe_counter!("celeriant_replication_applied_events_total", "Events applied via replication or S3 catchup");
     describe_counter!("celeriant_replication_applied_bytes_total", "Payload bytes applied via replication or S3 catchup");
+    describe_counter!("celeriant_replication_snapshot_returned_to_queue_total", "Replication snapshot re-queued after BudgetExhausted (avoids rollback racing in-flight S3 PUT)");
+    describe_counter!("celeriant_drain_role_change_total", "Pending-replication drain attempts on role change (labels: invariant_holds=true|false)");
+    describe_counter!("celeriant_promotion_batch_budget_exceeded_total", "Promotion-batch upload skipped: scan exceeded max_promotion_batch_bytes");
 
     // Probe (reachability / gap-fill)
     describe_counter!("celeriant_probe_total", "Replication probe attempts");

@@ -69,7 +69,7 @@ Environment=CELERIANT_RESERVE_COORDINATOR_SHARD=${RESERVE_COORDINATOR_SHARD}
 # plus a 1ms inter-upload delay sits just below the saturation
 # threshold. Re-tune when moving to hardware with faster networking
 # or a dedicated S3 endpoint.
-Environment=CELERIANT_S3_MAX_CONCURRENT_FALLBACK_UPLOADS=1
+Environment=CELERIANT_S3_MAX_CONCURRENT_FALLBACK_UPLOADS=8
 Environment=CELERIANT_S3_REPLICATION_DELAY_US=1000000
 
 [Install]

@@ -28,6 +28,7 @@ pub struct InternalShardConfig {
     pub schema_cache_bytes: u64,
     pub max_schema_size_bytes: u64,
     pub max_catchup_gap_bytes: Option<u64>,
+    pub max_promotion_batch_bytes: Option<u64>,
     pub compaction_check_interval: Duration,
     pub compaction_min_reclaimable_ratio: f64,
     pub compaction_temp_dir: PathBuf,

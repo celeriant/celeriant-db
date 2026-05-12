@@ -124,6 +124,9 @@ pub struct ReplicationBatchRequest {
     pub shard_id: u64,
     /// Leader provides its current time to follower to catch clock drift
     pub leader_timestamp_ms: u64,
+    /// Leader's `read.wal_index` at send time. Follower uses this as the
+    /// promotion-batch upload floor (sets `last_received_replication_wal_index = this + 1`).
+    pub leader_confirmed_wal_index: u64,
     /// If there are batches to replicate, they are provided to the follower
     /// Otherwise it's just a heartbeat message
     pub batches: Vec<ReplicationBatchItem>,
