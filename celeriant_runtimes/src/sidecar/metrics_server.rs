@@ -126,6 +126,15 @@ fn register_metric_descriptions() {
     describe_gauge!("celeriant_node_role", "1 = leader, 0 = follower");
     describe_counter!("celeriant_heartbeat_failures_total", "Failed heartbeats");
     describe_counter!("celeriant_heartbeat_kernel_blocked_total", "Heartbeat hard-timeout (kernel TCP send blocked)");
+    describe_counter!("celeriant_heartbeat_attempts_total", "Heartbeat loop iterations (every send attempt, including happy ACKs)");
+    describe_counter!("celeriant_heartbeat_acks_total", "Heartbeat ACKs received (happy path, no log emitted)");
+    describe_counter!("celeriant_heartbeat_outcomes_total", "Heartbeat send outcomes by category (labels: shard_id, outcome=ack|rejected_not_follower|rejected_clock_drift|network_error|lock_timeout|hard_timeout)");
+    describe_counter!("celeriant_heartbeat_received_total", "Heartbeats received on the follower path (counted before any classification)");
+    describe_counter!("celeriant_heartbeat_received_outcomes_total", "Heartbeat receive outcomes (labels: shard_id, outcome=accepted_extended|accepted_no_extension|rejected_not_follower|rejected_clock_drift). Compare with celeriant_heartbeat_outcomes_total{outcome=ack} on the leader to detect asymmetries.");
+    describe_counter!("celeriant_s3_lease_writes_total", "S3 lease record writes (labels: shard_id, reason=preemptive|proactive|discovery|challenge|post_catchup)");
+    describe_gauge!("celeriant_s3_lease_age_seconds", "Informational: seconds since last successful S3 lease write. By design this drifts unbounded while heartbeats succeed (steady-state invariant — S3 is not touched).");
+    describe_gauge!("celeriant_lease_remaining_ms", "Local lease TTL remaining in ms. Goes to zero when must_fence fires (labels: shard_id, role=leader|follower)");
+    describe_counter!("celeriant_leader_self_fence_total", "Times the leader observed must_fence firing while raw status was still Leader (TTL exhausted before next renewal)");
     describe_counter!("celeriant_leader_elections_total", "Leadership transitions");
     describe_counter!("celeriant_follower_auto_fence_total", "Follower self-fenced (lease ownership lost mid-flight)");
     describe_counter!("celeriant_lease_budget_exhausted_total", "Lease-bounded operation aborted: budget exhausted");

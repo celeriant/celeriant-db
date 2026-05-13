@@ -487,6 +487,7 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
     lease_manager: &S3LeaseManager<S>,
     ctx: &ConnectionContext<R, D, S>,
     rx: &LocalReceiver<CatchupCompletionMsg>,
+    reason: &'static str,
 ) -> Result<ElectionOutcome, celeriant_distributed::lease_store::LeaseStoreError> {
 
     let previous_status = ctx.shard_wal.node_status.get();
@@ -496,6 +497,10 @@ async fn set_node_role_via_s3<R: ReplicationClient + 'static, D: S3Downloader + 
     let outcome = retry_s3_operation(ctx.config.s3_retry_max_duration, "renew_s3_lease", || lease_manager.run_election_to_acquire_s3_lease()).await?;
 
     metrics::counter!("celeriant_leader_elections_total").increment(1);
+    metrics::counter!(
+        "celeriant_s3_lease_writes_total",
+        &[("shard_id", ctx.current_shard_id.to_string()), ("reason", reason.to_string())],
+    ).increment(1);
 
     // Set peer_node_id early so S3 catchup can filter stale batches from old cluster generations.
     // Full UpdateFollower broadcast (with replication address) happens after catchup.
@@ -629,6 +634,7 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
         let mut peer_discovery_backoff = Duration::from_secs(1);
         let mut last_peer_discovery_attempt = std::time::Instant::now();
         let mut last_auto_fence_warn: Option<std::time::Instant> = None;
+        let mut last_s3_lease_write_at_ms: Option<u64> = None;
 
         loop {
             if ctx.shutdown_requested.get() {
@@ -641,6 +647,22 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                 let unix_epoch_now_ms = validated_node_status::unix_epoch_now_ms();
                 let lease_index = ctx.shard_wal.node_status.get().raw().lease_index().unwrap_or(0);
                 let hb_start = std::time::Instant::now();
+                let shard_label = ctx.current_shard_id.to_string();
+                metrics::counter!("celeriant_heartbeat_attempts_total", &[("shard_id", shard_label.clone())]).increment(1);
+                if let Some(at_ms) = last_s3_lease_write_at_ms {
+                    let age_s = unix_epoch_now_ms.saturating_sub(at_ms) as f64 / 1000.0;
+                    metrics::gauge!("celeriant_s3_lease_age_seconds", &[("shard_id", shard_label.clone())]).set(age_s);
+                }
+                let lease_expires_at_ms = ctx.shard_wal.node_status.get().lease_expires_at_ms();
+                let lease_remaining_ms = lease_expires_at_ms.saturating_sub(unix_epoch_now_ms) as f64;
+                metrics::gauge!("celeriant_lease_remaining_ms", &[("shard_id", shard_label.clone()), ("role", "leader".to_string())]).set(lease_remaining_ms);
+                // Detect leader self-fence (must_fence fired but raw still says Leader)
+                let raw_status = ctx.shard_wal.node_status.get().raw();
+                let effective_status = ctx.shard_wal.node_status.get().effective_node_status();
+                if raw_status.is_leader() && !effective_status.is_leader() {
+                    metrics::counter!("celeriant_leader_self_fence_total", &[("shard_id", shard_label.clone())]).increment(1);
+                    warn!(shard_id = ctx.current_shard_id, ?raw_status, ?effective_status, lease_remaining_ms, "Leader self-fenced (must_fence fired) — TTL exhausted before next renewal");
+                }
 
                 // Mark heartbeat in-flight locally and broadcast to peers so any
                 // shard's write path can back-pressure when the heartbeat hangs.
@@ -684,11 +706,23 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                     ctx.intrashard_sender.clone(),
                 ).await;
 
+                if hb_hard_timed_out {
+                    metrics::counter!("celeriant_heartbeat_outcomes_total", &[("shard_id", shard_label.clone()), ("outcome", "hard_timeout".to_string())]).increment(1);
+                } else if let Err(SendHeartbeatError::LockTimeout) = &result {
+                    metrics::counter!("celeriant_heartbeat_outcomes_total", &[("shard_id", shard_label.clone()), ("outcome", "lock_timeout".to_string())]).increment(1);
+                    warn!("Heartbeat lock contention, skipping heartbeat");
+                    continue;
+                }
+
+                let outcome_label = match &result {
+                    Ok(HeartbeatResult::Ack { .. }) => "ack",
+                    Ok(HeartbeatResult::Rejected(celeriant_msg::response::responses::HeartbeatRejection::NotAFollower)) => "rejected_not_follower",
+                    Ok(HeartbeatResult::Rejected(celeriant_msg::response::responses::HeartbeatRejection::ClockDriftTooHigh { .. })) => "rejected_clock_drift",
+                    Err(SendHeartbeatError::LockTimeout) => "lock_timeout",
+                    Err(_) => "network_error",
+                };
                 if !hb_hard_timed_out {
-                    if let Err(SendHeartbeatError::LockTimeout) = &result {
-                        warn!("Heartbeat lock contention, skipping heartbeat");
-                        continue;
-                    }
+                    metrics::counter!("celeriant_heartbeat_outcomes_total", &[("shard_id", shard_label.clone()), ("outcome", outcome_label.to_string())]).increment(1);
                 }
 
                 if let Err(ref e) = result {
@@ -701,6 +735,7 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                 }
 
                 if let Ok(HeartbeatResult::Ack { follower_can_accept_tcp_replication, .. }) = result {
+                    metrics::counter!("celeriant_heartbeat_acks_total", &[("shard_id", shard_label.clone())]).increment(1);
                     has_peer = true;
                     peer_discovery_backoff = Duration::from_secs(1);
                     // Node is there on network but still hasn't joined the cluster as follower
@@ -750,8 +785,9 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                 // fallback storm from other shards saturates MinIO.
                 if was_reachable && has_peer {
                     warn!("Follower just became unreachable — preemptive S3 lease renewal");
-                    match set_node_role_via_s3(&lease_manager, &ctx, &rx).await {
+                    match set_node_role_via_s3(&lease_manager, &ctx, &rx, "preemptive").await {
                         Ok(outcome) => {
+                            last_s3_lease_write_at_ms = Some(validated_node_status::unix_epoch_now_ms());
                             if let Some(ref peer) = outcome.peer_info {
                                 info!(peer_replication_address = %peer.replication_address, "Preemptive renewal: peer confirmed via S3");
                             }
@@ -782,8 +818,9 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
 
                 warn!(has_peer, "Heartbeat failure, attempting S3 lease extension and membership discovery");
 
-                match set_node_role_via_s3(&lease_manager, &ctx, &rx).await {
+                match set_node_role_via_s3(&lease_manager, &ctx, &rx, if has_peer { "proactive" } else { "discovery" }).await {
                     Ok(outcome) => {
+                        last_s3_lease_write_at_ms = Some(validated_node_status::unix_epoch_now_ms());
                         if let Some(ref peer) = outcome.peer_info {
                             info!(peer_replication_address = %peer.replication_address, "Peer discovered via S3");
                             has_peer = true;
@@ -807,6 +844,9 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
             if ctx.shard_wal.node_status.get().is_follower() || ctx.shard_wal.node_status.get().is_fenced() {
                 let effective = ctx.shard_wal.node_status.get().effective_node_status();
                 let raw = ctx.shard_wal.node_status.get().raw();
+                let now_ms_for_gauge = validated_node_status::unix_epoch_now_ms();
+                let lease_remaining_ms = ctx.shard_wal.node_status.get().lease_expires_at_ms().saturating_sub(now_ms_for_gauge) as f64;
+                metrics::gauge!("celeriant_lease_remaining_ms", &[("shard_id", ctx.current_shard_id.to_string()), ("role", "follower".to_string())]).set(lease_remaining_ms);
                 if effective != raw {
                     metrics::counter!("celeriant_follower_auto_fence_total", &[("shard_id", ctx.current_shard_id.to_string())]).increment(1);
                     let should_warn = last_auto_fence_warn.is_none_or(|t| t.elapsed() >= Duration::from_secs(1));
@@ -838,9 +878,10 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
 
                 info!(node_status = ?ctx.shard_wal.node_status.get(), "Follower or fenced node detected expired lease, challenging for leadership");
 
-                if let Err(e) = set_node_role_via_s3(&lease_manager, &ctx, &rx).await {
+                if let Err(e) = set_node_role_via_s3(&lease_manager, &ctx, &rx, "challenge").await {
                     panic!("Election failed after retries: {e}");
                 }
+                last_s3_lease_write_at_ms = Some(validated_node_status::unix_epoch_now_ms());
 
                 continue;
             }
@@ -854,9 +895,10 @@ fn spawn_boot_orchestrator<R: ReplicationClient + 'static, D: S3Downloader + 'st
                 }
 
                 // WAL is caught up — now determine our role via S3 election
-                if let Err(e) = set_node_role_via_s3(&lease_manager, &ctx, &rx).await {
+                if let Err(e) = set_node_role_via_s3(&lease_manager, &ctx, &rx, "post_catchup").await {
                     panic!("Post-catchup election failed after retries: {e}");
                 }
+                last_s3_lease_write_at_ms = Some(validated_node_status::unix_epoch_now_ms());
 
                 continue;
             }

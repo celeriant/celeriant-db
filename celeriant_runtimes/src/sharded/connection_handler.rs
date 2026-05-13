@@ -1163,6 +1163,8 @@ async fn handle_heartbeat<R: ReplicationClient + 'static, D: S3Downloader + 'sta
     ctx: &ConnectionContext<R, D, S>,
 ) -> ClusterResponse {
     let follower_ms = validated_node_status::unix_epoch_now_ms();
+    let shard_label = ctx.current_shard_id.to_string();
+    metrics::counter!("celeriant_heartbeat_received_total", &[("shard_id", shard_label.clone())]).increment(1);
 
     let current_status = ctx.shard_wal.node_status.get();
     let local_lease_index = current_status.raw().lease_index().unwrap_or(0);
@@ -1195,6 +1197,7 @@ async fn handle_heartbeat<R: ReplicationClient + 'static, D: S3Downloader + 'sta
     } else {
         // Stale heartbeat (lower/equal lease_index from old leader), or
         // BootCatchup/Standalone — reject.
+        metrics::counter!("celeriant_heartbeat_received_outcomes_total", &[("shard_id", shard_label.clone()), ("outcome", "rejected_not_follower".to_string())]).increment(1);
         return ClusterResponse::Heartbeat(HeartbeatResponse {
             correlation_id: req.correlation_id,
             result: HeartbeatResult::Rejected(HeartbeatRejection::NotAFollower),
@@ -1217,6 +1220,7 @@ async fn handle_heartbeat<R: ReplicationClient + 'static, D: S3Downloader + 'sta
         let fenced = ValidatedNodeStatus::create_fenced();
         set_node_status_and_metric(&ctx.shard_wal.node_status, fenced, ctx.current_shard_id as u32);
         broadcast_status(ctx, fenced).await;
+        metrics::counter!("celeriant_heartbeat_received_outcomes_total", &[("shard_id", shard_label.clone()), ("outcome", "rejected_clock_drift".to_string())]).increment(1);
 
         return ClusterResponse::Heartbeat(HeartbeatResponse {
             correlation_id: req.correlation_id,
@@ -1235,6 +1239,12 @@ async fn handle_heartbeat<R: ReplicationClient + 'static, D: S3Downloader + 'sta
         req.leader_timestamp_ms,
         ctx.config.heartbeat_lease_duration.as_millis() as u64,
     );
+    let outcome_label = if new_lease_expiry_ms > current_lease_expiry_ms {
+        "accepted_extended"
+    } else {
+        "accepted_no_extension"
+    };
+    metrics::counter!("celeriant_heartbeat_received_outcomes_total", &[("shard_id", shard_label.clone()), ("outcome", outcome_label.to_string())]).increment(1);
 
     let refreshed = ValidatedNodeStatus::create_custom_status(
         raw_status,

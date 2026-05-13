@@ -92,7 +92,7 @@ fn is_batch_lease_consistent(batch: &FallbackBatch) -> bool {
     batch.items.iter().all(|i| i.metablock.lease_index == batch.lease_index)
 }
 
-pub(crate) async fn catchup_from_s3<D: S3Downloader>(
+pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
     log_segments_cache: &Rc<LogSegmentsCache>,
     shard_mem_cache: &Rc<RefCell<MemCache>>,
     fsync_coordinator: &Rc<Coordinator<ShardFsyncError>>,
@@ -523,15 +523,15 @@ async fn find_divergence_from_batch(
         .metablock
         .previous_tip_hash;
 
-    scan_local_metablocks_for_hash(log_segments_cache, candidate_hash).await
+    let mut set = HashSet::with_capacity(1);
+    set.insert(candidate_hash);
+    // Single-batch fast path: no floor available, miss falls through to find_divergence_via_s3.
+    scan_local_metablocks_for_hashes(log_segments_cache, &set, 0).await
 }
 
-/// Fallback: find common ancestor by downloading earlier S3 batches one at a time.
-///
-/// Used when the triggering batch doesn't overlap local data (e.g. batch starts
-/// after the local WAL index). Downloads batches backward from the divergence
-/// point, stopping as soon as the common ancestor is found.
-async fn find_divergence_via_s3<D: S3Downloader>(
+/// Fallback: download earlier S3 batches in parallel, scan local WAL once against
+/// the union of their previous_tip_hashes. Scan floor is `min(candidate.start) - 1`.
+async fn find_divergence_via_s3<D: S3Downloader + 'static>(
     log_segments_cache: &Rc<LogSegmentsCache>,
     downloader: &Rc<D>,
     prefix: &str,
@@ -561,91 +561,124 @@ async fn find_divergence_via_s3<D: S3Downloader>(
 
     earlier_batches.sort_by(|a, b| b.start_wal_index.cmp(&a.start_wal_index));
 
+    // 16-way pipeline: must outpace leader's concurrent fallback uploads or follower never closes the gap.
+    const PARALLEL_DOWNLOADS: usize = 16;
+    let mut candidate_hashes: HashSet<[u8; 32]> = HashSet::new();
+    let mut hash_to_batch_path: HashMap<[u8; 32], (String, u64)> = HashMap::new();
     let mut tried = 0u64;
-    for batch_ref in &earlier_batches {
-        tried += 1;
-        let data = match downloader.download(&batch_ref.path).await {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!(path = %batch_ref.path, error = ?e, "find_divergence_via_s3: download failed, skipping");
-                metrics::counter!("celeriant_s3_catchup_via_s3_step_total", "outcome" => "download_err").increment(1);
-                continue;
-            }
-        };
-        let fallback_batch = match deserialise_fallback_batch(&data) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(path = %batch_ref.path, error = ?e, "find_divergence_via_s3: deserialise failed, skipping");
-                metrics::counter!("celeriant_s3_catchup_via_s3_step_total", "outcome" => "deserialise_err").increment(1);
-                continue;
-            }
-        };
-
-        let candidate_hash = match fallback_batch.items.first() {
-            Some(i) => i.metablock.previous_tip_hash,
-            None => {
-                tracing::warn!(path = %batch_ref.path, "find_divergence_via_s3: empty batch, skipping");
-                metrics::counter!("celeriant_s3_catchup_via_s3_step_total", "outcome" => "empty_batch").increment(1);
-                continue;
-            }
-        };
-
-        match scan_local_metablocks_for_hash(log_segments_cache, candidate_hash).await {
-            Ok(result) => {
-                tracing::info!(
-                    path = %batch_ref.path,
-                    batch_start_wal = batch_ref.start_wal_index,
-                    candidate_hash = %hex_short(&candidate_hash),
-                    tried,
-                    "find_divergence_via_s3: ancestor found"
-                );
-                metrics::counter!("celeriant_s3_catchup_via_s3_step_total", "outcome" => "match").increment(1);
-                return Ok(result);
-            }
-            Err(_) => {
-                tracing::debug!(
-                    path = %batch_ref.path,
-                    batch_start_wal = batch_ref.start_wal_index,
-                    candidate_hash = %hex_short(&candidate_hash),
-                    "find_divergence_via_s3: scan miss"
-                );
-                metrics::counter!("celeriant_s3_catchup_via_s3_step_total", "outcome" => "scan_miss").increment(1);
+    for chunk in earlier_batches.chunks(PARALLEL_DOWNLOADS) {
+        let mut handles = Vec::with_capacity(chunk.len());
+        for batch_ref in chunk {
+            let downloader = downloader.clone();
+            let path = batch_ref.path.clone();
+            let start_wal = batch_ref.start_wal_index;
+            handles.push(glommio::spawn_local(async move {
+                let data = match downloader.download(&path).await {
+                    Ok(d) => d,
+                    Err(e) => return Err((path, start_wal, format!("download: {e:?}"))),
+                };
+                let batch = match deserialise_fallback_batch(&data) {
+                    Ok(b) => b,
+                    Err(e) => return Err((path, start_wal, format!("deserialise: {e:?}"))),
+                };
+                let hash = match batch.items.first() {
+                    Some(i) => i.metablock.previous_tip_hash,
+                    None => return Err((path, start_wal, "empty batch".into())),
+                };
+                Ok((path, start_wal, hash))
+            }));
+        }
+        for handle in handles {
+            tried += 1;
+            match handle.await {
+                Ok((path, start_wal, hash)) => {
+                    candidate_hashes.insert(hash);
+                    hash_to_batch_path.entry(hash).or_insert((path, start_wal));
+                    metrics::counter!("celeriant_s3_catchup_via_s3_step_total", "outcome" => "downloaded").increment(1);
+                }
+                Err((path, _start_wal, reason)) => {
+                    tracing::warn!(path = %path, reason = %reason, "find_divergence_via_s3: candidate skipped");
+                    metrics::counter!("celeriant_s3_catchup_via_s3_step_total", "outcome" => "skip").increment(1);
+                }
             }
         }
     }
 
-    tracing::warn!(
-        earlier_total_unfiltered,
-        earlier_total_after_peer_filter,
-        tried,
-        current_wal_index,
-        "find_divergence_via_s3: exhausted all earlier batches without match"
-    );
-    metrics::counter!("celeriant_s3_catchup_via_s3_exhausted_total").increment(1);
+    if candidate_hashes.is_empty() {
+        tracing::warn!(
+            earlier_total_unfiltered,
+            earlier_total_after_peer_filter,
+            tried,
+            current_wal_index,
+            "find_divergence_via_s3: no usable candidates"
+        );
+        metrics::counter!("celeriant_s3_catchup_via_s3_exhausted_total").increment(1);
+        return Err(S3CatchupError::TruncationFailed(ShardFsyncError::MetablockSerialisationError(
+            "no S3 batch shares common ancestor with local WAL".into(),
+        )));
+    }
 
-    Err(S3CatchupError::TruncationFailed(ShardFsyncError::MetablockSerialisationError(
-        "no S3 batch shares common ancestor with local WAL".into(),
-    )))
+    // A candidate hash at batch start S can only match local wal_index = S, so floor at min - 1.
+    let min_candidate_start = hash_to_batch_path.values().map(|(_, s)| *s).min().unwrap_or(0);
+    let scan_floor_wal_index = min_candidate_start.saturating_sub(1);
+    let result = scan_local_metablocks_for_hashes(log_segments_cache, &candidate_hashes, scan_floor_wal_index).await;
+
+    if let Ok((hash, log_id, wal_index, position)) = &result {
+        let path = hash_to_batch_path.get(hash).map(|(p, _)| p.as_str()).unwrap_or("<unknown>");
+        let batch_start_wal = hash_to_batch_path.get(hash).map(|(_, s)| *s).unwrap_or(0);
+        tracing::info!(
+            path = %path,
+            batch_start_wal,
+            candidate_hash = %hex_short(hash),
+            divergent_wal_index = wal_index,
+            divergent_log_id = log_id,
+            divergent_position = position,
+            tried,
+            candidates = candidate_hashes.len(),
+            "find_divergence_via_s3: ancestor found"
+        );
+        metrics::counter!("celeriant_s3_catchup_via_s3_step_total", "outcome" => "match").increment(1);
+    } else {
+        tracing::warn!(
+            earlier_total_unfiltered,
+            earlier_total_after_peer_filter,
+            tried,
+            candidates = candidate_hashes.len(),
+            current_wal_index,
+            "find_divergence_via_s3: no candidate hash matched any local metablock in unconfirmed suffix"
+        );
+        metrics::counter!("celeriant_s3_catchup_via_s3_exhausted_total").increment(1);
+    }
+
+    result
 }
 
-/// Scan backward through local metablocks looking for one whose `previous_tip_hash`
-/// matches the candidate. Walks the active segment and every sealed segment back to
-/// log_id 1 via `ReverseMetablockScanner`. Returns (hash, log_id, divergent_wal_index, divergent_position).
-async fn scan_local_metablocks_for_hash(
+/// Reverse-scan local WAL for a metablock whose `previous_tip_hash` is in `candidate_hashes`.
+/// Stops at `scan_floor_wal_index` (0 disables). First match is the divergence boundary.
+async fn scan_local_metablocks_for_hashes(
     log_segments_cache: &Rc<LogSegmentsCache>,
-    candidate_hash: [u8; 32],
+    candidate_hashes: &HashSet<[u8; 32]>,
+    scan_floor_wal_index: u64,
 ) -> Result<([u8; 32], u64, u64, u64), S3CatchupError> {
     const READ_CHUNK_SIZE: u64 = 64 * 1024;
     let active_log_id = log_segments_cache.active_log_id();
     let mut scanner = ReverseMetablockScanner::new(log_segments_cache, active_log_id, None, READ_CHUNK_SIZE);
 
+    enum ScanHit {
+        Match([u8; 32], u64, u64, u64),
+        BelowFloor,
+    }
+
     let result = scanner
-        .scan(|log_id, pos, block| -> Result<Option<(u64, u64, u64)>, ()> {
+        .scan(|log_id, pos, block| -> Result<Option<ScanHit>, ()> {
             let Ok(metablock) = deserialise_metablock(block) else {
                 return Ok(None);
             };
-            if metablock.previous_tip_hash == candidate_hash {
-                Ok(Some((log_id, metablock.wal_index, pos)))
+            if scan_floor_wal_index > 0 && metablock.wal_index < scan_floor_wal_index {
+                return Ok(Some(ScanHit::BelowFloor));
+            }
+            if candidate_hashes.contains(&metablock.previous_tip_hash) {
+                Ok(Some(ScanHit::Match(metablock.previous_tip_hash, log_id, metablock.wal_index, pos)))
             } else {
                 Ok(None)
             }
@@ -654,9 +687,9 @@ async fn scan_local_metablocks_for_hash(
         .map_err(|e| S3CatchupError::TruncationFailed(ShardFsyncError::MetablockSerialisationError(format!("scan error: {:?}", e))))?;
 
     match result {
-        Some((log_id, wal_index, position)) => Ok((candidate_hash, log_id, wal_index, position)),
-        None => Err(S3CatchupError::TruncationFailed(ShardFsyncError::MetablockSerialisationError(
-            "candidate hash not found in local metablocks".into(),
+        Some(ScanHit::Match(hash, log_id, wal_index, position)) => Ok((hash, log_id, wal_index, position)),
+        Some(ScanHit::BelowFloor) | None => Err(S3CatchupError::TruncationFailed(ShardFsyncError::MetablockSerialisationError(
+            "candidate hash not found in local metablocks above scan floor".into(),
         ))),
     }
 }
@@ -757,7 +790,7 @@ async fn truncate_wal(
 mod tests {
     use super::*;
     use std::cell::Cell;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
 
     use bytes::Bytes;
@@ -841,6 +874,7 @@ mod tests {
         delete_log: RefCell<Vec<String>>,
         list_call_count: Cell<u32>,
         on_list_hooks: RefCell<HashMap<u32, Vec<Box<dyn Fn(&MockDownloader)>>>>,
+        fail_paths: RefCell<HashSet<String>>,
     }
 
     impl MockDownloader {
@@ -851,11 +885,16 @@ mod tests {
                 delete_log: RefCell::new(Vec::new()),
                 list_call_count: Cell::new(0),
                 on_list_hooks: RefCell::new(HashMap::new()),
+                fail_paths: RefCell::new(HashSet::new()),
             }
         }
 
         fn insert(&self, path: String, data: Bytes) {
             self.objects.borrow_mut().insert(path, data);
+        }
+
+        fn fail_download(&self, path: String) {
+            self.fail_paths.borrow_mut().insert(path);
         }
 
         fn downloaded_paths(&self) -> Vec<String> {
@@ -894,6 +933,12 @@ mod tests {
 
         async fn download(&self, path: &str) -> Result<Bytes, S3CatchupError> {
             self.download_log.borrow_mut().push(path.to_string());
+            if self.fail_paths.borrow().contains(path) {
+                return Err(S3CatchupError::S3GetFailed {
+                    path: path.to_string(),
+                    message: "injected failure".to_string(),
+                });
+            }
             self.objects.borrow().get(path).cloned().ok_or_else(|| S3CatchupError::S3GetFailed {
                 path: path.to_string(),
                 message: "not found".to_string(),
@@ -969,6 +1014,40 @@ mod tests {
         async fn close(&self) {
             self.log_segments_cache.close().await;
         }
+
+        /// Apply 1..=end. Returns the tip captured at wal=end-1, which equals
+        /// local @ wal=end's previous_tip_hash.
+        async fn seed_chain(&self, end: u64) -> [u8; 32] {
+            assert!(end >= 2);
+            let dl = Rc::new(MockDownloader::new());
+            let (p, d) = make_fallback_batch(0, 1, end - 1, GENESIS_HASH);
+            dl.insert(p, d);
+            self.catchup(&dl, 0, 10).await.unwrap();
+            let prev = self.tip_hash();
+            let (p, d) = make_fallback_batch(0, end, end, prev);
+            dl.insert(p, d);
+            self.catchup(&dl, 0, 10).await.unwrap();
+            prev
+        }
+    }
+
+    /// After find_divergence_via_s3 truncates, drop the stale trigger and plant a fresh
+    /// one anchored at the live local tip so catchup can converge.
+    fn resume_after_truncate(
+        dl: &Rc<MockDownloader>,
+        lsc: Rc<LogSegmentsCache>,
+        bad_trigger_path: String,
+        resume_start: u64,
+        resume_end: u64,
+    ) {
+        dl.on_list(2, move |dl| {
+            dl.objects.borrow_mut().remove(&bad_trigger_path);
+        });
+        dl.on_list(3, move |dl| {
+            let tip = lsc.active().metadata.borrow().write.tip_hash;
+            let (p, d) = make_fallback_batch(0, resume_start, resume_end, tip);
+            dl.insert(p, d);
+        });
     }
 
     // ── apply_external_batch tests ──
@@ -1536,6 +1615,157 @@ mod tests {
             );
 
             tc.close().await;
+        });
+    }
+
+    #[test]
+    fn s3_fallback_downloads_multiple_candidates_and_finds_match() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+            let tip_5 = tc.seed_chain(6).await;
+
+            let dl = Rc::new(MockDownloader::new());
+            let (trigger_path, trigger_data) = make_fallback_batch(0, 7, 9, [0xEE; 32]);
+            dl.insert(trigger_path.clone(), trigger_data);
+            for (start, prev) in [(2u64, [0xBB; 32]), (4, [0xCC; 32]), (6, tip_5)] {
+                let (p, d) = make_fallback_batch(0, start, start, prev);
+                dl.insert(p, d);
+            }
+
+            resume_after_truncate(&dl, tc.log_segments_cache.clone(), trigger_path, 7, 9);
+
+            let result = tc.catchup(&dl, 0, 10).await.unwrap();
+            assert_eq!(tc.wal_index(), 9);
+            assert_eq!(result.completion, CatchupCompletion::Caught);
+
+            let downloads = dl.downloaded_paths();
+            for start in [2u64, 4, 6] {
+                let p = fallback_batch_path(0, start, start, 0);
+                assert!(downloads.contains(&p), "candidate at start={start} should have been downloaded");
+            }
+        });
+    }
+
+    #[test]
+    fn s3_fallback_picks_most_recent_among_multiple_matching_candidates() {
+        // If the older anchor at wal=2 wins, truncate-to-1 stops 6-6 (prev=tip_5) from ever applying.
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+
+            let dl_setup = Rc::new(MockDownloader::new());
+            let (p, d) = make_fallback_batch(0, 1, 1, GENESIS_HASH);
+            dl_setup.insert(p, d);
+            tc.catchup(&dl_setup, 0, 10).await.unwrap();
+            let tip_1 = tc.tip_hash();
+            let (p, d) = make_fallback_batch(0, 2, 5, tip_1);
+            dl_setup.insert(p, d);
+            tc.catchup(&dl_setup, 0, 10).await.unwrap();
+            let tip_5 = tc.tip_hash();
+            let (p, d) = make_fallback_batch(0, 6, 6, tip_5);
+            dl_setup.insert(p, d);
+            tc.catchup(&dl_setup, 0, 10).await.unwrap();
+            assert_eq!(tc.wal_index(), 6);
+
+            let dl = Rc::new(MockDownloader::new());
+            let (trigger_path, trigger_data) = make_fallback_batch(0, 7, 9, [0xEE; 32]);
+            dl.insert(trigger_path.clone(), trigger_data);
+            for (start, prev) in [(2u64, tip_1), (6, tip_5)] {
+                let (p, d) = make_fallback_batch(0, start, start, prev);
+                dl.insert(p, d);
+            }
+
+            resume_after_truncate(&dl, tc.log_segments_cache.clone(), trigger_path, 7, 9);
+
+            tc.catchup(&dl, 0, 10).await.unwrap();
+            assert_eq!(tc.wal_index(), 9);
+        });
+    }
+
+    #[test]
+    fn s3_fallback_scan_floor_prevents_match_below_min_candidate_start() {
+        // Without the floor, the candidate at start=10 (prev=tip_1) falsely matches local @ wal=2.
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+
+            let dl_setup = Rc::new(MockDownloader::new());
+            let (p, d) = make_fallback_batch(0, 1, 1, GENESIS_HASH);
+            dl_setup.insert(p, d);
+            tc.catchup(&dl_setup, 0, 10).await.unwrap();
+            let tip_1 = tc.tip_hash();
+            let (p, d) = make_fallback_batch(0, 2, 15, tip_1);
+            dl_setup.insert(p, d);
+            tc.catchup(&dl_setup, 0, 10).await.unwrap();
+            let tip_15 = tc.tip_hash();
+            let (p, d) = make_fallback_batch(0, 16, 16, tip_15);
+            dl_setup.insert(p, d);
+            tc.catchup(&dl_setup, 0, 10).await.unwrap();
+            assert_eq!(tc.wal_index(), 16);
+
+            let dl = Rc::new(MockDownloader::new());
+            let (p, d) = make_fallback_batch(0, 17, 19, [0xEE; 32]);
+            dl.insert(p, d);
+            let (p, d) = make_fallback_batch(0, 10, 12, tip_1);
+            dl.insert(p, d);
+
+            let result = tc.catchup(&dl, 0, 10).await.unwrap();
+            assert_eq!(result.completion, CatchupCompletion::Retry);
+            assert_eq!(tc.wal_index(), 16, "scan floor must block the collisional match at wal=2");
+        });
+    }
+
+    #[test]
+    fn s3_fallback_succeeds_when_some_downloads_fail() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+            let tip_5 = tc.seed_chain(6).await;
+
+            let dl = Rc::new(MockDownloader::new());
+            let (trigger_path, trigger_data) = make_fallback_batch(0, 7, 9, [0xEE; 32]);
+            dl.insert(trigger_path.clone(), trigger_data);
+            for (start, prev) in [(2u64, [0xBB; 32]), (4, [0xCC; 32]), (6, tip_5)] {
+                let (p, d) = make_fallback_batch(0, start, start, prev);
+                dl.insert(p, d);
+            }
+            dl.fail_download(fallback_batch_path(0, 2, 2, 0));
+            dl.fail_download(fallback_batch_path(0, 4, 4, 0));
+
+            resume_after_truncate(&dl, tc.log_segments_cache.clone(), trigger_path, 7, 9);
+
+            let result = tc.catchup(&dl, 0, 10).await.unwrap();
+            assert_eq!(tc.wal_index(), 9);
+            assert_eq!(result.completion, CatchupCompletion::Caught);
+        });
+    }
+
+    #[test]
+    fn s3_fallback_chunks_candidates_above_parallel_limit() {
+        // 18 candidates straddle two chunks of PARALLEL_DOWNLOADS=16. None match by design.
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let tc = TestComponents::new(&dir).await;
+            tc.seed_chain(18).await;
+
+            let dl = Rc::new(MockDownloader::new());
+            let (p, d) = make_fallback_batch(0, 19, 21, [0xEE; 32]);
+            dl.insert(p, d);
+            for start in 1..=18u64 {
+                let (p, d) = make_fallback_batch(0, start, start, [start as u8; 32]);
+                dl.insert(p, d);
+            }
+
+            let result = tc.catchup(&dl, 0, 10).await.unwrap();
+            assert_eq!(result.completion, CatchupCompletion::Retry);
+            assert_eq!(tc.wal_index(), 18, "no candidate matched; local must not be truncated");
+
+            let downloads = dl.downloaded_paths();
+            for start in 1..=18u64 {
+                let p = fallback_batch_path(0, start, start, 0);
+                assert!(downloads.contains(&p), "missing parallel download of start={start}");
+            }
         });
     }
 

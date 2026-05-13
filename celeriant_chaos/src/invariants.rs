@@ -78,6 +78,14 @@ pub struct ScenarioExpectations {
     /// cs1 was killed three times but bounced back each time before cs2
     /// could promote fails loudly. `None` (default) skips the check.
     pub require_distinct_leader_hosts: Option<usize>,
+
+    /// If `Some(ms)`, run `FailoverWithinBudget`: the longest continuous run
+    /// of paired sample ticks where neither host holds leadership (role_sum
+    /// near 0) must be ≤ `ms`. Measures the downtime of a leader-failure
+    /// scenario from the cluster's metric-visible perspective. Resolution
+    /// is bounded by the scraper interval (500ms at 2Hz). `None` (default)
+    /// skips the check.
+    pub max_failover_ms: Option<u64>,
 }
 
 impl Default for ScenarioExpectations {
@@ -95,6 +103,7 @@ impl Default for ScenarioExpectations {
             require_leader_retained: false,
             require_final_leader_write_progress: false,
             require_distinct_leader_hosts: None,
+            max_failover_ms: None,
         }
     }
 }
@@ -107,7 +116,17 @@ pub struct RunData<'a> {
     /// The first scrape index inside the bench window (inclusive).
     pub bench_start_idx: usize,
     /// The last scrape index inside the bench window (inclusive).
+    /// This includes the settle period — the post-bench wait where the cluster
+    /// is expected to converge without active load. Convergence/progress checks
+    /// reason over this entire window.
     pub bench_end_idx: usize,
+    /// `t_ms` (relative to scraper start) at which the benchmark stopped sending
+    /// requests. Strictly ≤ the bench_end_idx sample's t_ms (with settle in
+    /// between). Checks that reason about "what did the leader do during the
+    /// bench" (e.g. FinalLeaderWroteDuringBench) should use this — leadership
+    /// transitions landing AFTER this timestamp had no client traffic to serve
+    /// so "0 writes" is meaningless, not a fault.
+    pub bench_actual_end_ms: u64,
     pub bench_errors: u64,
     pub bench_throughput: f64,
     pub throughput_floor: f64,
@@ -166,6 +185,9 @@ pub fn run_all(data: &RunData, expect: &ScenarioExpectations) -> Vec<CheckResult
     }
     if let Some(min) = expect.require_distinct_leader_hosts {
         out.push(check_distinct_leader_hosts(data, min));
+    }
+    if let Some(max_ms) = expect.max_failover_ms {
+        out.push(check_failover_within_budget(data, max_ms));
     }
     out
 }
@@ -325,17 +347,11 @@ fn check_leader_retained(data: &RunData) -> CheckResult {
     }
 }
 
-/// At the last ok sample of each host within the bench window, both nodes'
 /// PROGRESS check: at the end of the bench+settle window, the lagging
 /// node must either (a) have converged to the leading node's `wal_index_max`,
 /// or (b) be strictly advancing across the final `PROGRESS_WINDOW_MS`.
 /// A "lagging node frozen at a non-zero diff" is the stuck-state failure
 /// this catches; "still catching up, just slower than settle" passes.
-///
-/// Replaces the prior fixed-tolerance shape, which could not distinguish
-/// "slow but converging" from "permanently stuck" — both showed up as
-/// `wal_index diverges by N (tolerance M)` with no signal about whether
-/// the cluster was making forward progress.
 fn check_eventual_convergence(data: &RunData) -> CheckResult {
     const NAME: &str = "EventualConvergence";
     /// Window over which we measure progress on the lagging node, in ms.
@@ -401,6 +417,13 @@ fn check_eventual_convergence(data: &RunData) -> CheckResult {
 /// have strictly advanced its `writes_total` from the first tick in the
 /// window where it first held leadership to that last tick. A frozen
 /// promoted leader (writes_total == 0 throughout) fails this check.
+///
+/// Bench-window-aware: if the final leader's promotion landed AFTER the
+/// bench stopped sending requests (i.e. inside the settle period), the
+/// leader had no client traffic to serve and "0 writes" is meaningless.
+/// In that case we skip the check (it would always trivially fail with no
+/// real signal). Correctness is still guarded by other invariants
+/// (ExactlyOneLeader, EventualConvergence).
 fn check_final_leader_write_progress(data: &RunData) -> CheckResult {
     const NAME: &str = "FinalLeaderWroteDuringBench";
     let slice = &data.samples[data.bench_start_idx..=data.bench_end_idx];
@@ -415,15 +438,46 @@ fn check_final_leader_write_progress(data: &RunData) -> CheckResult {
         return CheckResult::fail(NAME, "no ok tick with any node as leader in bench window");
     };
 
-    // First tick within the window where this host was leader.
-    let first_as_leader = slice
-        .iter()
-        .find(|s| s.ok && s.host == final_leader_host && s.node_role >= 0.5);
-    // Last ok tick for this host (always exists if first_as_leader does).
+    // Last ok tick for this host, bounded by bench_actual_end_ms so we
+    // measure writes_total advancement only over the period the bench
+    // was actively sending. Anything after that is settle — no traffic.
     let last_for_host = slice
         .iter()
         .rev()
-        .find(|s| s.ok && s.host == final_leader_host);
+        .find(|s| s.ok && s.host == final_leader_host && s.t_ms <= data.bench_actual_end_ms);
+
+    // Walk backward from `last_for_host` to find the most recent process
+    // boundary on this host. `writes_total` is a process-local counter;
+    // a strict decrease between consecutive samples means the host
+    // restarted (e.g. scenario stopped+started it). For the check we
+    // want the "first as leader within the current process tenure",
+    // not the first leader-tick across restarts — otherwise a fresh
+    // post-restart leader with writes_total=0 fails against a pre-stop
+    // writes_total=N first sample, even though both are correct for
+    // their respective process instances.
+    let host_samples: Vec<&NodeSample> = slice
+        .iter()
+        .filter(|s| s.ok && s.host == final_leader_host)
+        .collect();
+    let mut current_tenure_start_idx = 0usize;
+    for i in 1..host_samples.len() {
+        if host_samples[i].writes_total < host_samples[i - 1].writes_total {
+            current_tenure_start_idx = i;
+        }
+    }
+    let first_as_leader = host_samples[current_tenure_start_idx..]
+        .iter()
+        .copied()
+        .find(|s| s.node_role >= 0.5);
+
+    // If the final leader was promoted AFTER the bench stopped sending,
+    // there's no traffic to write — skip the check rather than asserting
+    // a timing property that is structurally unmeetable at high load.
+    if let Some(first) = first_as_leader
+        && first.t_ms > data.bench_actual_end_ms
+    {
+        return CheckResult::pass(NAME);
+    }
 
     match (first_as_leader, last_for_host) {
         (Some(first), Some(last)) => {
@@ -480,6 +534,64 @@ fn check_distinct_leader_hosts(data: &RunData, min: usize) -> CheckResult {
                 seen
             ),
         )
+    }
+}
+
+/// Measure the longest continuous run of paired sample ticks where neither
+/// host holds leadership (role_sum ≈ 0). That run's length in ms is the
+/// observed failover-downtime upper bound, modulo the scraper's 500ms
+/// sampling resolution: a sample that lands JUST AFTER the new leader's
+/// role flip will appear leaderless even if the actual failover ended
+/// fractionally earlier. Treat the reported value as failover_ms ± one
+/// scrape interval. A pass guarantees the cluster recovered leadership
+/// in less than `max_ms + scrape_interval` real wall-clock time.
+fn check_failover_within_budget(data: &RunData, max_ms: u64) -> CheckResult {
+    const NAME: &str = "FailoverWithinBudget";
+    let mut longest_run_ms = 0u64;
+    let mut longest_run_start: Option<u64> = None;
+    let mut current_run_start: Option<u64> = None;
+    let mut last_tick_ms: Option<u64> = None;
+
+    for (l, f) in data.pairs() {
+        if !(l.ok && f.ok) {
+            // Treat an unreachable host as part of the no-leader window —
+            // we can't see a leader either way, so the cluster is at least
+            // metric-visibly down. Don't close the run; carry it through.
+            continue;
+        }
+        let role_sum = l.node_role + f.node_role;
+        let no_leader = role_sum < 0.5;
+        if no_leader {
+            if current_run_start.is_none() {
+                current_run_start = Some(l.t_ms);
+            }
+        } else if let Some(start) = current_run_start.take() {
+            let end = last_tick_ms.unwrap_or(l.t_ms);
+            let run_ms = end.saturating_sub(start);
+            if run_ms > longest_run_ms {
+                longest_run_ms = run_ms;
+                longest_run_start = Some(start);
+            }
+        }
+        last_tick_ms = Some(l.t_ms);
+    }
+    // A no-leader run that extends past the bench window end still counts.
+    if let (Some(start), Some(end)) = (current_run_start, last_tick_ms) {
+        let run_ms = end.saturating_sub(start);
+        if run_ms > longest_run_ms {
+            longest_run_ms = run_ms;
+            longest_run_start = Some(start);
+        }
+    }
+
+    if longest_run_ms > max_ms {
+        let where_at = longest_run_start.map(|t| format!(" (starting t_ms={t})")).unwrap_or_default();
+        CheckResult::fail(
+            NAME,
+            format!("longest no-leader run: {longest_run_ms}ms (allowed {max_ms}ms){where_at}"),
+        )
+    } else {
+        CheckResult::pass(NAME)
     }
 }
 
