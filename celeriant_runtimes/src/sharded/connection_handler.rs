@@ -17,7 +17,7 @@ use celeriant_msg::{
 use celeriant_shard::{
     error::{s3_catchup_error::S3CatchupError, watch_session_error::WatchSessionError}, replication_client::ReplicationClient, s3_downloader::S3Downloader, shard_wal::ShardWal, shard_wal_s3_catchup::S3CatchupResult
 };
-use celeriant_wal::compression_type::CompressionType;
+use celeriant_wire::codec::compression::DictCodec;
 use celeriant_watch::{watch_output_type::WatchOutputType, watch_session::WatchSession};
 use celeriant_msg::read_wire_data_error::ReadWireDataError;
 use celeriant_wire::network::wire_error::WireError;
@@ -64,12 +64,14 @@ pub struct ConnectionContext<R: ReplicationClient + 'static, D: S3Downloader + '
     pub catchup_completion_tx: Option<Rc<LocalSender<CatchupCompletionMsg>>>,
     pub schema_registration_pending: Option<Rc<RefCell<HashMap<u64, LocalSender<SchemaRegistrationCompletionMsg>>>>>,
     pub lease_manager: Option<Rc<S3LeaseManager<S>>>,
+    pub dict_codec: Rc<DictCodec>,
 }
 
 /// Connection-level state for identity verification and access control
 struct ConnectionState {
     verified_client_id: Option<u128>,
     access_level: Option<celeriant_msg::response::responses::AccessLevel>,
+    client_has_dict: bool,
 }
 
 impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static> Clone for ConnectionContext<R, D, S> {
@@ -83,6 +85,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
             catchup_completion_tx: self.catchup_completion_tx.clone(),
             schema_registration_pending: self.schema_registration_pending.clone(),
             lease_manager: self.lease_manager.clone(),
+            dict_codec: self.dict_codec.clone(),
         }
     }
 }
@@ -137,6 +140,7 @@ pub fn handle_new_connection<R: ReplicationClient + 'static, D: S3Downloader + '
                 let mut conn_state = ConnectionState {
                     verified_client_id: None,
                     access_level: None,
+                    client_has_dict: false,
                 };
 
                 let first_message = if trailing.is_empty() {
@@ -155,13 +159,17 @@ pub fn handle_new_connection<R: ReplicationClient + 'static, D: S3Downloader + '
                 let (request, message_version) = match first_message {
                     FirstMessage::Identify(identify_req, version) => {
                         if let Err(response) = handle_identify(&identify_req, &mut conn_state, &ctx.config) {
-                            let _ = write_client_response_with_timeout(&mut tcp_stream, &response, ctx.config.max_response_size, ctx.config.server_compression_algorithm, version, ctx.config.slow_client_timeout).await;
+                            let _ = write_client_response_with_timeout(&mut tcp_stream, &response, ctx.config.max_response_size, conn_state.client_has_dict, &ctx.dict_codec, version, ctx.config.slow_client_timeout).await;
                             return;
                         }
+                        let (compression_dict_sha256, compression_dict_bytes) =
+                            build_identify_dict_fields(&identify_req.known_dict_sha256, &ctx.config);
                         let res = IdentifyResponse {
                             correlation_id: identify_req.correlation_id,
                             client_id: conn_state.verified_client_id,
                             access_level: conn_state.access_level,
+                            compression_dict_sha256,
+                            compression_dict_bytes,
                         };
                         if write_identify_response(&mut tcp_stream, &res, version).await.is_err() {
                             return;
@@ -178,20 +186,20 @@ pub fn handle_new_connection<R: ReplicationClient + 'static, D: S3Downloader + '
                                 error_code: error_codes::IDENTIFY_REQUIRED,
                                 error_message: "Server requires client identity verification".to_string(),
                             });
-                            let _ = write_client_response_with_timeout(&mut tcp_stream, &response, ctx.config.max_response_size, ctx.config.server_compression_algorithm, version, ctx.config.slow_client_timeout).await;
+                            let _ = write_client_response_with_timeout(&mut tcp_stream, &response, ctx.config.max_response_size, conn_state.client_has_dict, &ctx.dict_codec, version, ctx.config.slow_client_timeout).await;
                             return;
                         }
                         (request, version)
                     }
                 };
 
-                match check_client_redirect(tcp_stream, request, ctx.config.max_response_size, ctx.config.server_compression_algorithm, message_version, &ctx, &conn_state).await {
+                match check_client_redirect(tcp_stream, request, ctx.config.max_response_size, message_version, &ctx, &conn_state).await {
                     ClientRedirectResult::ProcessLocally(request, tcp_stream) => {
-                        handle_client_pipelining(tcp_stream, Some(request), ctx.config.max_response_size, ctx.config.server_compression_algorithm, message_version, ctx, conn_state).await;
+                        handle_client_pipelining(tcp_stream, Some(request), ctx.config.max_response_size, message_version, ctx, conn_state).await;
                     }
                     ClientRedirectResult::Redirected => {}
                     ClientRedirectResult::ErrorSentContinue(tcp_stream) => {
-                        handle_client_pipelining(tcp_stream, None, ctx.config.max_response_size, ctx.config.server_compression_algorithm, message_version, ctx, conn_state).await;
+                        handle_client_pipelining(tcp_stream, None, ctx.config.max_response_size, message_version, ctx, conn_state).await;
                     }
                 }
             }
@@ -209,13 +217,13 @@ pub fn handle_new_connection<R: ReplicationClient + 'static, D: S3Downloader + '
                     }
                 };
 
-                match check_cluster_redirect(tcp_stream, request, ctx.config.max_response_size, ctx.config.server_compression_algorithm, message_version, &ctx).await {
+                match check_cluster_redirect(tcp_stream, request, ctx.config.max_response_size, message_version, &ctx).await {
                     ClusterRedirectResult::ProcessLocally(request, tcp_stream) => {
-                        handle_cluster_pipelining(tcp_stream, Some(request), ctx.config.max_response_size, ctx.config.server_compression_algorithm, message_version, ctx).await;
+                        handle_cluster_pipelining(tcp_stream, Some(request), ctx.config.max_response_size, message_version, ctx).await;
                     }
                     ClusterRedirectResult::Redirected => {}
                     ClusterRedirectResult::ErrorSentContinue(tcp_stream) => {
-                        handle_cluster_pipelining(tcp_stream, None, ctx.config.max_response_size, ctx.config.server_compression_algorithm, message_version, ctx).await;
+                        handle_cluster_pipelining(tcp_stream, None, ctx.config.max_response_size, message_version, ctx).await;
                     }
                 }
             }
@@ -228,7 +236,6 @@ pub fn handle_redirected_client_connection<R: ReplicationClient + 'static, D: S3
     tcp_stream: TcpStream,
     request: ClientRequest,
     max_response_size: u64,
-    server_compression_algorithm: CompressionType,
     message_version: u32,
     ctx: ConnectionContext<R, D, S>,
     verified_client_id: Option<u128>,
@@ -243,8 +250,8 @@ pub fn handle_redirected_client_connection<R: ReplicationClient + 'static, D: S3
     );
 
     glommio::spawn_local(async move {
-        let conn_state = ConnectionState { verified_client_id, access_level };
-        handle_client_pipelining(tcp_stream, Some(request), max_response_size, server_compression_algorithm, message_version, ctx, conn_state).await;
+        let conn_state = ConnectionState { verified_client_id, access_level, client_has_dict: false };
+        handle_client_pipelining(tcp_stream, Some(request), max_response_size, message_version, ctx, conn_state).await;
     })
     .detach();
 }
@@ -253,14 +260,13 @@ pub fn handle_redirected_cluster_connection<R: ReplicationClient + 'static, D: S
     tcp_stream: TcpStream,
     request: ClusterRequest,
     max_response_size: u64,
-    server_compression_algorithm: CompressionType,
     message_version: u32,
     ctx: ConnectionContext<R, D, S>,
 ) {
     let _ = tcp_stream.set_nodelay(true);
 
     glommio::spawn_local(async move {
-        handle_cluster_pipelining(tcp_stream, Some(request), max_response_size, server_compression_algorithm, message_version, ctx).await;
+        handle_cluster_pipelining(tcp_stream, Some(request), max_response_size, message_version, ctx).await;
     })
     .detach();
 }
@@ -285,7 +291,6 @@ async fn handle_client_pipelining<R: ReplicationClient + 'static, D: S3Downloade
     mut tcp_stream: TcpStream,
     request: Option<ClientRequest>,
     max_response_size: u64,
-    server_compression_algorithm: CompressionType,
     mut message_version: u32,
     ctx: ConnectionContext<R, D, S>,
     conn_state: ConnectionState,
@@ -299,7 +304,7 @@ async fn handle_client_pipelining<R: ReplicationClient + 'static, D: S3Downloade
 
         if let Some(request) = optional_request.take() {
             if let Err(response) = validate_client_id(&request, conn_state.verified_client_id) {
-                let _ = write_client_response_with_timeout(&mut tcp_stream, &response, max_response_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
+                let _ = write_client_response_with_timeout(&mut tcp_stream, &response, max_response_size, conn_state.client_has_dict, &ctx.dict_codec, message_version, ctx.config.slow_client_timeout).await;
                 continue;
             }
 
@@ -309,16 +314,16 @@ async fn handle_client_pipelining<R: ReplicationClient + 'static, D: S3Downloade
                     error_code: error_codes::AUTH_INSUFFICIENT_PERMISSIONS,
                     error_message: "Insufficient permissions for this operation".to_string(),
                 });
-                let _ = write_client_response_with_timeout(&mut tcp_stream, &response, max_response_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
+                let _ = write_client_response_with_timeout(&mut tcp_stream, &response, max_response_size, conn_state.client_has_dict, &ctx.dict_codec, message_version, ctx.config.slow_client_timeout).await;
                 continue;
             }
 
             if let ClientRequest::Watch(watch_request) = request {
-                handle_watch(tcp_stream, watch_request, max_response_size, server_compression_algorithm, message_version, &ctx).await;
+                handle_watch(tcp_stream, watch_request, max_response_size, conn_state.client_has_dict, &ctx.dict_codec, message_version, &ctx).await;
                 return;
             }
 
-            process_client_request(&mut tcp_stream, &ctx, request, max_response_size, server_compression_algorithm, message_version).await;
+            process_client_request(&mut tcp_stream, &ctx, request, max_response_size, conn_state.client_has_dict, message_version).await;
         }
 
         if ctx.shutdown_requested.get() {
@@ -338,7 +343,7 @@ async fn handle_client_pipelining<R: ReplicationClient + 'static, D: S3Downloade
         }
 
         if let Some(request) = optional_request.take() {
-            match check_client_redirect(tcp_stream, request, max_response_size, server_compression_algorithm, message_version, &ctx, &conn_state).await {
+            match check_client_redirect(tcp_stream, request, max_response_size, message_version, &ctx, &conn_state).await {
                 ClientRedirectResult::ProcessLocally(req, stream) => {
                     optional_request = Some(req);
                     tcp_stream = stream;
@@ -357,7 +362,6 @@ async fn handle_cluster_pipelining<R: ReplicationClient + 'static, D: S3Download
     mut tcp_stream: TcpStream,
     request: Option<ClusterRequest>,
     max_response_size: u64,
-    server_compression_algorithm: CompressionType,
     mut message_version: u32,
     ctx: ConnectionContext<R, D, S>,
 ) {
@@ -369,7 +373,7 @@ async fn handle_cluster_pipelining<R: ReplicationClient + 'static, D: S3Download
         }
 
         if let Some(request) = optional_request.take() {
-            process_cluster_request(&mut tcp_stream, &ctx, request, max_response_size, server_compression_algorithm, message_version).await;
+            process_cluster_request(&mut tcp_stream, &ctx, request, max_response_size, message_version).await;
         }
 
         if ctx.shutdown_requested.get() {
@@ -389,7 +393,7 @@ async fn handle_cluster_pipelining<R: ReplicationClient + 'static, D: S3Download
         }
 
         if let Some(request) = optional_request.take() {
-            match check_cluster_redirect(tcp_stream, request, max_response_size, server_compression_algorithm, message_version, &ctx).await {
+            match check_cluster_redirect(tcp_stream, request, max_response_size, message_version, &ctx).await {
                 ClusterRedirectResult::ProcessLocally(req, stream) => {
                     optional_request = Some(req);
                     tcp_stream = stream;
@@ -480,7 +484,27 @@ fn handle_identify(req: &celeriant_msg::request::requests::IdentifyRequest, conn
         conn_state.access_level = None;
     }
 
+    conn_state.client_has_dict = true;
+
     Ok(())
+}
+
+/// Returns (compression_dict_sha256, compression_dict_bytes) for the IdentifyResponse.
+///
+/// Always includes the sha. Includes bytes only when the client doesn't already have
+/// this exact dict version.
+fn build_identify_dict_fields(
+    known_dict_sha256: &Option<String>,
+    config: &ShardConfig,
+) -> (Option<String>, Option<Vec<u8>>) {
+    let cluster_sha = &config.dict_sha256;
+    let client_already_has_it = known_dict_sha256.as_deref() == Some(cluster_sha.as_ref());
+    let bytes = if client_already_has_it {
+        None
+    } else {
+        Some(config.dict_bytes.to_vec())
+    };
+    (Some(cluster_sha.to_string()), bytes)
 }
 
 fn validate_client_id(request: &ClientRequest, verified_client_id: Option<u128>) -> Result<(), ClientResponse> {
@@ -530,7 +554,6 @@ async fn check_client_redirect<R: ReplicationClient + 'static, D: S3Downloader +
     mut tcp_stream: TcpStream,
     request: ClientRequest,
     max_message_size: u64,
-    server_compression_algorithm: CompressionType,
     message_version: u32,
     ctx: &ConnectionContext<R, D, S>,
     conn_state: &ConnectionState,
@@ -544,7 +567,7 @@ async fn check_client_redirect<R: ReplicationClient + 'static, D: S3Downloader +
                 error_code,
                 error_message,
             });
-            let _ = write_client_response_with_timeout(&mut tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
+            let _ = write_client_response_with_timeout(&mut tcp_stream, &response, max_message_size, conn_state.client_has_dict, &ctx.dict_codec, message_version, ctx.config.slow_client_timeout).await;
             return ClientRedirectResult::ErrorSentContinue(tcp_stream);
         }
     };
@@ -575,7 +598,7 @@ async fn check_client_redirect<R: ReplicationClient + 'static, D: S3Downloader +
                         error_code: error_codes::SERVER_BUSY,
                         error_message: "{}".into(),
                     });
-                    let _ = write_client_response_with_timeout(&mut stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
+                    let _ = write_client_response_with_timeout(&mut stream, &response, max_message_size, conn_state.client_has_dict, &ctx.dict_codec, message_version, ctx.config.slow_client_timeout).await;
                     return ClientRedirectResult::ErrorSentContinue(stream);
                 }
             }
@@ -590,7 +613,6 @@ async fn check_cluster_redirect<R: ReplicationClient + 'static, D: S3Downloader 
     mut tcp_stream: TcpStream,
     request: ClusterRequest,
     max_message_size: u64,
-    server_compression_algorithm: CompressionType,
     message_version: u32,
     ctx: &ConnectionContext<R, D, S>,
 ) -> ClusterRedirectResult {
@@ -603,7 +625,7 @@ async fn check_cluster_redirect<R: ReplicationClient + 'static, D: S3Downloader 
                 error_code,
                 error_message,
             });
-            let _ = write_cluster_response_with_timeout(&mut tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
+            let _ = write_cluster_response_with_timeout(&mut tcp_stream, &response, max_message_size, message_version, ctx.config.slow_client_timeout).await;
             return ClusterRedirectResult::ErrorSentContinue(tcp_stream);
         }
     };
@@ -626,7 +648,7 @@ async fn check_cluster_redirect<R: ReplicationClient + 'static, D: S3Downloader 
                         error_code: error_codes::SERVER_BUSY,
                         error_message: "{}".into(),
                     });
-                    let _ = write_cluster_response_with_timeout(&mut stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
+                    let _ = write_cluster_response_with_timeout(&mut stream, &response, max_message_size, message_version, ctx.config.slow_client_timeout).await;
                     return ClusterRedirectResult::ErrorSentContinue(stream);
                 }
             }
@@ -872,7 +894,7 @@ async fn read_first_message<R: ReplicationClient + 'static, D: S3Downloader + 's
             let req = read_identify_request(header, tcp_stream).await?;
             Ok(FirstMessage::Identify(req, version))
         } else {
-            let req = ClientRequest::read_from_header(header, tcp_stream).await?;
+            let req = ClientRequest::read_from_header(header, tcp_stream, &ctx.dict_codec).await?;
             Ok(FirstMessage::ClientRequest(req, version))
         }
     }).await
@@ -886,7 +908,7 @@ async fn read_client_request<R: ReplicationClient + 'static, D: S3Downloader + '
         let header = WireHeader::from_reader(tcp_stream, ctx.config.max_request_size).await
             .map_err(ReadWireDataError::ReadHeaderFailure)?;
         let version = header.version;
-        let req = ClientRequest::read_from_header(header, tcp_stream).await?;
+        let req = ClientRequest::read_from_header(header, tcp_stream, &ctx.dict_codec).await?;
         Ok((req, version))
     }).await
 }
@@ -903,7 +925,7 @@ async fn read_cluster_request<R: ReplicationClient + 'static, D: S3Downloader + 
         let header = WireHeader::from_reader(tcp_stream, ctx.config.internode_max_request_size).await
             .map_err(ReadWireDataError::ReadHeaderFailure)?;
         let version = header.version;
-        let req = ClusterRequest::read_from_header(header, tcp_stream).await?;
+        let req = ClusterRequest::read_from_header(header, tcp_stream, &ctx.dict_codec).await?;
         Ok((req, version))
     }.await;
     match result {
@@ -958,7 +980,7 @@ async fn read_first_message_from<Rd: futures_lite::AsyncReadExt + Unpin, R: Repl
             let req = read_identify_request(header, reader).await?;
             Ok(FirstMessage::Identify(req, version))
         } else {
-            let req = ClientRequest::read_from_header(header, reader).await?;
+            let req = ClientRequest::read_from_header(header, reader, &ctx.dict_codec).await?;
             Ok(FirstMessage::ClientRequest(req, version))
         }
     }).await
@@ -972,7 +994,7 @@ async fn read_cluster_request_from<Rd: futures_lite::AsyncReadExt + Unpin, R: Re
         let header = WireHeader::from_reader(reader, ctx.config.internode_max_request_size).await
             .map_err(ReadWireDataError::ReadHeaderFailure)?;
         let version = header.version;
-        let req = ClusterRequest::read_from_header(header, reader).await?;
+        let req = ClusterRequest::read_from_header(header, reader, &ctx.dict_codec).await?;
         Ok((req, version))
     }.await;
     match result {
@@ -986,33 +1008,52 @@ async fn read_cluster_request_from<Rd: futures_lite::AsyncReadExt + Unpin, R: Re
     }
 }
 
-macro_rules! write_response_with_timeout_fn {
-    ($name:ident, $response_type:ty) => {
-        async fn $name(
-            tcp_stream: &mut TcpStream,
-            response: &$response_type,
-            max_message_size: u64,
-            server_compression_algorithm: CompressionType,
-            message_version: u32,
-            timeout_duration: Duration,
-        ) -> Result<(), WireError> {
-            let compression = <$response_type>::determine_compression_type(response, server_compression_algorithm);
-            match glommio::timer::timeout(timeout_duration, async {
-                let result = <$response_type>::write_response(tcp_stream, response, compression, max_message_size, message_version).await;
-                Ok::<_, glommio::GlommioError<()>>(result)
-            })
-            .await
-            {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(e)) => Err(e),
-                Err(_) => Err(WireError::NetworkError(std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out"))),
-            }
-        }
-    };
+async fn write_client_response_with_timeout(
+    tcp_stream: &mut TcpStream,
+    response: &ClientResponse,
+    max_message_size: u64,
+    client_has_dict: bool,
+    dict_codec: &DictCodec,
+    message_version: u32,
+    timeout_duration: Duration,
+) -> Result<(), WireError> {
+    match glommio::timer::timeout(timeout_duration, async {
+        let result = ClientResponse::write_response(
+            tcp_stream, response,
+            client_has_dict, dict_codec,
+            max_message_size, message_version,
+        ).await;
+        Ok::<_, glommio::GlommioError<()>>(result)
+    })
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(WireError::NetworkError(std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out"))),
+    }
 }
 
-write_response_with_timeout_fn!(write_client_response_with_timeout, ClientResponse);
-write_response_with_timeout_fn!(write_cluster_response_with_timeout, ClusterResponse);
+async fn write_cluster_response_with_timeout(
+    tcp_stream: &mut TcpStream,
+    response: &ClusterResponse,
+    max_message_size: u64,
+    message_version: u32,
+    timeout_duration: Duration,
+) -> Result<(), WireError> {
+    // Cluster (replication) responses use None — Inv 7.
+    match glommio::timer::timeout(timeout_duration, async {
+        let result = ClusterResponse::write_response(
+            tcp_stream, response, max_message_size, message_version,
+        ).await;
+        Ok::<_, glommio::GlommioError<()>>(result)
+    })
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(WireError::NetworkError(std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out"))),
+    }
+}
 
 async fn handle_schema_registration_coordination<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
     ctx: &ConnectionContext<R, D, S>,
@@ -1104,7 +1145,7 @@ async fn process_client_request<R: ReplicationClient + 'static, D: S3Downloader 
     ctx: &ConnectionContext<R, D, S>,
     request: ClientRequest,
     max_message_size: u64,
-    server_compression_algorithm: CompressionType,
+    client_has_dict: bool,
     message_version: u32,
 ) {
     let correlation_id = request.correlation_id();
@@ -1129,7 +1170,7 @@ async fn process_client_request<R: ReplicationClient + 'static, D: S3Downloader 
         }
     };
 
-    let _ = write_client_response_with_timeout(tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
+    let _ = write_client_response_with_timeout(tcp_stream, &response, max_message_size, client_has_dict, &ctx.dict_codec, message_version, ctx.config.slow_client_timeout).await;
 }
 
 async fn process_cluster_request<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 'static>(
@@ -1137,7 +1178,6 @@ async fn process_cluster_request<R: ReplicationClient + 'static, D: S3Downloader
     ctx: &ConnectionContext<R, D, S>,
     request: ClusterRequest,
     max_message_size: u64,
-    server_compression_algorithm: CompressionType,
     message_version: u32,
 ) {
     let response = match request {
@@ -1151,7 +1191,7 @@ async fn process_cluster_request<R: ReplicationClient + 'static, D: S3Downloader
             }
         }
     };
-    let _ = write_cluster_response_with_timeout(tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
+    let _ = write_cluster_response_with_timeout(tcp_stream, &response, max_message_size, message_version, ctx.config.slow_client_timeout).await;
 }
 
 /// Follower shard 0 heartbeat handler.
@@ -1314,7 +1354,8 @@ async fn handle_watch<R: ReplicationClient + 'static, D: S3Downloader + 'static,
     mut tcp_stream: TcpStream,
     watch_request: WatchRequest,
     max_message_size: u64,
-    server_compression_algorithm: CompressionType,
+    client_has_dict: bool,
+    dict_codec: &DictCodec,
     message_version: u32,
     ctx: &ConnectionContext<R, D, S>,
 ) {
@@ -1324,7 +1365,7 @@ async fn handle_watch<R: ReplicationClient + 'static, D: S3Downloader + 'static,
         Ok(session) => session,
         Err(error) => {
             let response = watch_session_error_to_client_response(correlation_id, error);
-            let _ = write_client_response_with_timeout(&mut tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
+            let _ = write_client_response_with_timeout(&mut tcp_stream, &response, max_message_size, client_has_dict, dict_codec, message_version, ctx.config.slow_client_timeout).await;
             return;
         }
     };
@@ -1336,20 +1377,20 @@ async fn handle_watch<R: ReplicationClient + 'static, D: S3Downloader + 'static,
             Ok(WatchOutputType::Continue) => continue,
             Ok(WatchOutputType::Response(watch_response)) => {
                 let response = ClientResponse::Watch(watch_response);
-                if write_client_response_with_timeout(&mut tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await.is_err() {
+                if write_client_response_with_timeout(&mut tcp_stream, &response, max_message_size, client_has_dict, dict_codec, message_version, ctx.config.slow_client_timeout).await.is_err() {
                     break;
                 }
             }
             Ok(WatchOutputType::Heartbeat) => {
                 let response = ClientResponse::Watch(WatchResponse::default());
-                if write_client_response_with_timeout(&mut tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await.is_err() {
+                if write_client_response_with_timeout(&mut tcp_stream, &response, max_message_size, client_has_dict, dict_codec, message_version, ctx.config.slow_client_timeout).await.is_err() {
                     break;
                 }
             }
             Ok(WatchOutputType::Done) => break,
             Err(error) => {
                 let response = watch_read_error_to_client_response(correlation_id, error);
-                let _ = write_client_response_with_timeout(&mut tcp_stream, &response, max_message_size, server_compression_algorithm, message_version, ctx.config.slow_client_timeout).await;
+                let _ = write_client_response_with_timeout(&mut tcp_stream, &response, max_message_size, client_has_dict, dict_codec, message_version, ctx.config.slow_client_timeout).await;
                 break;
             }
         }
@@ -1388,7 +1429,7 @@ mod tests {
         },
     };
     use celeriant_shard::timestamp_config::TimestampPrecision;
-    use celeriant_wal::{aggregate_key::AggregateKey, compression_type::CompressionType};
+    use celeriant_wal::aggregate_key::AggregateKey;
     use std::collections::HashMap;
 
     fn test_config(num_shards: u32, routing_rule: crate::RoutingRule) -> ShardConfig {
@@ -1413,7 +1454,6 @@ mod tests {
             max_request_size: 1024,
             internode_max_request_size: 64 * 1024 * 1024,
             max_response_size: 1024,
-            server_compression_algorithm: CompressionType::Snappy,
             slow_client_timeout: Duration::from_secs(30),
             max_requested_latency: Duration::from_millis(100),
             shard_log_preallocate_bytes: 1024,
@@ -1453,6 +1493,9 @@ mod tests {
             s3_replication_delay: Duration::from_millis(500),
             replication_rollback_cooldown: Duration::from_millis(500),
             heartbeat_starve_threshold: Duration::ZERO,
+            dict_bytes: std::sync::Arc::from(celeriant_wal::builtin_dict::BUILTIN_DICT_BYTES),
+            dict_sha256: std::sync::Arc::from("test-sha256"),
+            wal_compression_level: 3,
         }
     }
 
@@ -1611,8 +1654,6 @@ mod tests {
             expected_event_batch_index: None,
             allow_create: true,
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
             events: vec![],
         });
         let request = ClientRequest::Write(WriteRequest {
@@ -1635,8 +1676,6 @@ mod tests {
                 expected_event_batch_index: None,
                 allow_create: true,
                 enforce_client_idempotency: false,
-                compression_type_id: 0,
-            compression_level: None,
                 events: vec![],
             },
         );
@@ -1646,8 +1685,6 @@ mod tests {
                 expected_event_batch_index: None,
                 allow_create: true,
                 enforce_client_idempotency: false,
-                compression_type_id: 0,
-            compression_level: None,
                 events: vec![],
             },
         );
@@ -1671,8 +1708,6 @@ mod tests {
                 expected_event_batch_index: None,
                 allow_create: true,
                 enforce_client_idempotency: false,
-                compression_type_id: 0,
-            compression_level: None,
                 events: vec![],
             },
         );
@@ -1682,8 +1717,6 @@ mod tests {
                 expected_event_batch_index: None,
                 allow_create: true,
                 enforce_client_idempotency: false,
-                compression_type_id: 0,
-            compression_level: None,
                 events: vec![],
             },
         );
@@ -1937,8 +1970,6 @@ mod tests {
             expected_event_batch_index: None,
             allow_create: true,
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
             events: vec![],
         });
         let req = ClientRequest::Write(WriteRequest {
@@ -1958,8 +1989,6 @@ mod tests {
             expected_event_batch_index: None,
             allow_create: true,
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
             events: vec![],
         });
         let req = ClientRequest::Write(WriteRequest {
@@ -1979,8 +2008,6 @@ mod tests {
             expected_event_batch_index: None,
             allow_create: true,
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
             events: vec![],
         });
         let req = ClientRequest::Write(WriteRequest {
@@ -2041,4 +2068,75 @@ mod tests {
         assert!(super::validate_client_id(&req, Some(555)).is_ok());
         assert!(super::validate_client_id(&req, Some(444)).is_err());
     }
+
+    // --- build_identify_dict_fields ---
+
+    fn base_identify_request() -> celeriant_msg::request::requests::IdentifyRequest {
+        celeriant_msg::request::requests::IdentifyRequest {
+            correlation_id: None,
+            public_key: None,
+            nonce: None,
+            signature: None,
+            api_key: None,
+            known_dict_sha256: None,
+        }
+    }
+
+    fn config_with_dict(sha: &str, bytes: &[u8]) -> ShardConfig {
+        let mut cfg = test_config(1, crate::RoutingRule::AggregateId);
+        cfg.dict_sha256 = std::sync::Arc::from(sha);
+        cfg.dict_bytes = std::sync::Arc::from(bytes);
+        cfg
+    }
+
+    #[test]
+    fn identify_dict_fields_ships_bytes_when_client_has_no_dict() {
+        let sha = "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111";
+        let bytes = vec![0xFFu8; 100];
+        let cfg = config_with_dict(sha, &bytes);
+        let req = base_identify_request(); // known_dict_sha256 = None
+        let (out_sha, out_bytes) = super::build_identify_dict_fields(&req.known_dict_sha256, &cfg);
+        assert_eq!(out_sha.as_deref(), Some(sha));
+        assert_eq!(out_bytes.as_deref(), Some(bytes.as_slice()));
+    }
+
+    #[test]
+    fn identify_dict_fields_omits_bytes_when_client_sha_matches() {
+        let sha = "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222";
+        let bytes = vec![0xEEu8; 100];
+        let cfg = config_with_dict(sha, &bytes);
+        let mut req = base_identify_request();
+        req.known_dict_sha256 = Some(sha.to_string());
+        let (out_sha, out_bytes) = super::build_identify_dict_fields(&req.known_dict_sha256, &cfg);
+        assert_eq!(out_sha.as_deref(), Some(sha));
+        assert_eq!(out_bytes, None); // bytes skipped: client already has this dict
+    }
+
+    #[test]
+    fn identify_dict_fields_ships_new_bytes_when_client_sha_mismatches() {
+        let sha = "cccc3333cccc3333cccc3333cccc3333cccc3333cccc3333cccc3333cccc3333";
+        let bytes = vec![0xDDu8; 100];
+        let cfg = config_with_dict(sha, &bytes);
+        let mut req = base_identify_request();
+        req.known_dict_sha256 = Some("stale0000stale0000stale0000stale0000stale0000stale0000stale00000".to_string());
+        let (out_sha, out_bytes) = super::build_identify_dict_fields(&req.known_dict_sha256, &cfg);
+        assert_eq!(out_sha.as_deref(), Some(sha));
+        assert_eq!(out_bytes.as_deref(), Some(bytes.as_slice())); // bytes shipped: sha mismatch
+    }
+
+    #[test]
+    fn handle_identify_sets_client_has_dict_true_when_cluster_has_dict() {
+        let sha = "dddd4444dddd4444dddd4444dddd4444dddd4444dddd4444dddd4444dddd4444";
+        let cfg = config_with_dict(sha, &[1, 2, 3]);
+        let req = base_identify_request();
+        let mut conn_state = ConnectionState {
+            verified_client_id: None,
+            access_level: None,
+            client_has_dict: false,
+        };
+        let result = super::handle_identify(&req, &mut conn_state, &cfg);
+        assert!(result.is_ok());
+        assert!(conn_state.client_has_dict);
+    }
+
 }

@@ -6,6 +6,7 @@ use celeriant_wal::{
     datablocks::datablock::Datablock,
     metablocks::{datablock_storage_kind::DatablockStorageKind, metablock::Metablock},
 };
+use celeriant_wire::codec::compression::DictCodec;
 use celeriant_wire::disk::{serialised_datablock::deserialise_datablock};
 
 use crate::error::fetch_datablock_error::FetchDatablockError;
@@ -43,12 +44,13 @@ impl LogSegmentDatablockPositions {
     }
 }
 
-/// Populates the datablock in-memory representations in kept_metablocks, 
-/// either a simple deserialise or by pulling it efficiently from disk
+/// Populates the datablock in-memory representations in kept_metablocks,
+/// either a simple deserialise or by pulling it efficiently from disk.
 pub async fn fetch_datablocks_for_metablocks(
     kept_metablocks: &mut [EventBatchFromLogSegmentFile],
     read_max_chunk_size: u64,
     log_segments_cache: &LogSegmentsCache,
+    dict_codec: &DictCodec,
 ) -> Result<(), FetchDatablockError> {
     let mut disk_fetches_by_log_id: HashMap<u64, LogSegmentDatablockPositions> = HashMap::new();
 
@@ -69,6 +71,7 @@ pub async fn fetch_datablocks_for_metablocks(
                     kept.metablock.datablock_compression_type,
                     &kept.metablock.datablock,
                     None,
+                    dict_codec,
                 )
                 .map_err(|source| FetchDatablockError::DatablockError {
                     log_id: kept.log_id,
@@ -123,6 +126,7 @@ pub async fn fetch_datablocks_for_metablocks(
                 kept.metablock.datablock_compression_type,
                 &kept.metablock.datablock,
                 Some(blob),
+                dict_codec,
             )
             .map_err(|source| FetchDatablockError::DatablockError {
                 log_id: kept.log_id,

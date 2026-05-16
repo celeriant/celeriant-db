@@ -27,7 +27,7 @@ use celeriant_lib::server_config::{ConfigClientAuth, ConfigTlsMode};
 use celeriant_msg::request::requests::WriteRequest;
 use celeriant_msg::{process_client_requests::ClientRequest, request::requests::SingleAggregateWrite};
 use celeriant_wal::{
-    aggregate_key::AggregateKey, compression_type::CompressionType,
+    aggregate_key::AggregateKey,
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
 };
 use std::fs;
@@ -1070,8 +1070,6 @@ async fn run_connection_benchmark(
                 allow_create: true,
                 expected_event_batch_index: None,
                 enforce_client_idempotency: false,
-                compression_type_id: 0,
-                compression_level: None,
             },
         );
 
@@ -1085,7 +1083,7 @@ async fn run_connection_benchmark(
         let req_start = Instant::now();
 
         match client
-            .send_request(&request, CompressionType::None)
+            .send_request(&request)
             .await
         {
             Ok(_) => {

@@ -77,6 +77,36 @@ pub enum Commands {
 
     /// Register a schema for an aggregate type
     RegisterSchema(RegisterSchemaArgs),
+
+    /// Dictionary training and management tools
+    Dict(DictArgs),
+}
+
+#[derive(Args, Clone)]
+pub struct DictArgs {
+    #[command(subcommand)]
+    pub command: DictCommands,
+}
+
+#[derive(Subcommand, Clone)]
+pub enum DictCommands {
+    /// Train a zstd dictionary from a JSONL corpus
+    Train(DictTrainArgs),
+}
+
+#[derive(Args, Clone)]
+pub struct DictTrainArgs {
+    /// JSONL file or directory of JSONL files (one sample per line)
+    #[arg(long)]
+    pub corpus: PathBuf,
+
+    /// Output path for the trained dictionary
+    #[arg(long)]
+    pub output: PathBuf,
+
+    /// Maximum dictionary size in bytes
+    #[arg(long, default_value = "65536")]
+    pub max_dict_size: usize,
 }
 
 #[derive(Args, Clone)]
@@ -231,9 +261,6 @@ pub struct WriteArgs {
     #[arg(long)]
     pub enforce_idempotency: bool,
 
-    /// Compression type
-    #[arg(long, value_enum, default_value = "none")]
-    pub compression: CompressionArg,
 }
 
 #[derive(Args, Clone)]
@@ -381,20 +408,3 @@ pub enum OutputFormat {
     Compact,
 }
 
-#[derive(ValueEnum, Clone, Copy, Default)]
-pub enum CompressionArg {
-    #[default]
-    None,
-    Snappy,
-    Zstd,
-}
-
-impl From<CompressionArg> for celeriant_wal::compression_type::CompressionType {
-    fn from(val: CompressionArg) -> Self {
-        match val {
-            CompressionArg::None => celeriant_wal::compression_type::CompressionType::None,
-            CompressionArg::Snappy => celeriant_wal::compression_type::CompressionType::Snappy,
-            CompressionArg::Zstd => celeriant_wal::compression_type::CompressionType::Zstd { level: 6 },
-        }
-    }
-}

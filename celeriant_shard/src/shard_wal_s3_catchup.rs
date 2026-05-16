@@ -10,9 +10,10 @@ use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
 use celeriant_rotating_log::reverse_metablock_scanner::ReverseMetablockScanner;
 use celeriant_wal::compression_type::CompressionType;
 use celeriant_wal::constants::HEADER_BLOCK_SIZE_BYTES;
+use celeriant_wire::codec::compression::DictCodec;
 use celeriant_wal::metablocks::datablock_storage_kind::DatablockStorageKind;
 use celeriant_wal::s3::fallback_batch::FallbackBatch;
-use celeriant_wire::disk::serialised_datablock::SerialisedDatablock;
+use celeriant_wire::disk::serialised_datablock::{CompressionPolicy, SerialisedDatablock};
 use celeriant_wire::disk::versioned_block::{deserialise_fallback_batch, deserialise_metablock};
 
 use crate::schema_validator::CompiledValidator;
@@ -46,7 +47,6 @@ pub struct S3CatchupResult {
 struct FallbackBatchRef {
     path: String,
     start_wal_index: u64,
-    end_wal_index: u64,
     node_id: u128,
 }
 
@@ -80,7 +80,6 @@ struct CatchupCandidate {
     size: u64,
     start_wal_index: u64,
     end_wal_index: u64,
-    node_id: u128,
 }
 
 /// A batch is contiguous when every adjacent pair of items differs by exactly one in wal_index.
@@ -102,6 +101,7 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
     node_id: u128,
     peer_node_id: Option<u128>,
     max_catchup_gap_bytes: Option<u64>,
+    dict_codec: Rc<DictCodec>,
 ) -> Result<S3CatchupResult, S3CatchupError> {
     let mut result = S3CatchupResult {
         batches_applied: 0,
@@ -152,7 +152,6 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
                 size: obj.size,
                 start_wal_index,
                 end_wal_index,
-                node_id: source_node_id,
             });
         }
 
@@ -357,9 +356,9 @@ pub(crate) async fn catchup_from_s3<D: S3Downloader + 'static>(
             }
 
             // Apply the winner to the WAL
-            apply_external_batch(log_segments_cache, shard_mem_cache, items).map_err(S3CatchupError::ApplyFailed)?;
+            apply_external_batch(log_segments_cache, shard_mem_cache, items, &dict_codec).map_err(S3CatchupError::ApplyFailed)?;
 
-            sync_applied_batch(log_segments_cache, shard_mem_cache, fsync_coordinator, watched_aggregates, shard_id)
+            sync_applied_batch(log_segments_cache, shard_mem_cache, fsync_coordinator, watched_aggregates, shard_id, dict_codec.clone())
                 .await
                 .map_err(S3CatchupError::FsyncFailed)?;
 
@@ -409,6 +408,7 @@ pub(crate) fn apply_external_batch(
     log_segments_cache: &Rc<LogSegmentsCache>,
     shard_mem_cache: &Rc<RefCell<MemCache>>,
     items: &[ReplicationBatchItem],
+    dict_codec: &DictCodec,
 ) -> Result<(), ApplyBatchError> {
     let (current_tip_hash, current_wal_index) = {
         let active = log_segments_cache.active();
@@ -445,10 +445,10 @@ pub(crate) fn apply_external_batch(
         });
     }
 
-    queue_replicated_entries(shard_mem_cache, items)
+    queue_replicated_entries(shard_mem_cache, items, dict_codec)
 }
 
-fn queue_replicated_entries(shard_mem_cache: &Rc<RefCell<MemCache>>, items: &[ReplicationBatchItem]) -> Result<(), ApplyBatchError> {
+fn queue_replicated_entries(shard_mem_cache: &Rc<RefCell<MemCache>>, items: &[ReplicationBatchItem], dict_codec: &DictCodec) -> Result<(), ApplyBatchError> {
     for (i, w) in items.windows(2).enumerate() {
         if w[0].metablock.wal_index + 1 != w[1].metablock.wal_index {
             return Err(ApplyBatchError::BatchWalIndexGap {
@@ -466,8 +466,13 @@ fn queue_replicated_entries(shard_mem_cache: &Rc<RefCell<MemCache>>, items: &[Re
             DatablockStorageKind::None | DatablockStorageKind::Inline(_) => (None, None),
             DatablockStorageKind::Block(_) => {
                 if let Some(datablock) = &item.datablock {
-                    let compression_type = CompressionType::from_tuple(item.metablock.datablock_compression_type, None);
-                    let serialized = SerialisedDatablock::new(datablock, compression_type).map_err(ApplyBatchError::SerialiseDatablocks)?;
+                    let compression_type = CompressionType::from_byte(item.metablock.datablock_compression_type)
+                        .map_err(|b| ApplyBatchError::SerialiseDatablocks(
+                            celeriant_wire::codec::codec_error::CodecError::Compression(
+                                format!("unknown compression byte {b}")
+                            )
+                        ))?;
+                    let serialized = SerialisedDatablock::new(datablock, CompressionPolicy::Fixed(compression_type), dict_codec).map_err(ApplyBatchError::SerialiseDatablocks)?;
                     let external_data = serialized.external_data.ok_or(ApplyBatchError::BlockBecameInline)?;
                     (Some(external_data), Some(datablock.clone()))
                 } else {
@@ -489,20 +494,20 @@ async fn sync_applied_batch(
     fsync_coordinator: &Rc<Coordinator<ShardFsyncError>>,
     watched_aggregates: &Rc<AggregateWatchers>,
     shard_id: u32,
+    dict_codec: Rc<DictCodec>,
 ) -> Result<(), ShardFsyncError> {
     let lsc = log_segments_cache.clone();
     let smc = shard_mem_cache.clone();
     let wa = watched_aggregates.clone();
     let mc_capture = smc.clone();
 
-    // We hardcode node status to standalone as we are in offline-catchup mode
-    // and can advance the read position immediately (no follower replication)
+    // Standalone in offline-catchup mode: advance read position immediately (no follower replication).
     fsync_coordinator
         .request_sync_two_phase(
             None,
             ShardFsyncError::WriteLockTimeout,
             move || async move { capture_fsync_snapshot(&mc_capture) },
-            move |captured| commit_fsync_with_rollback(NodeStatus::Standalone, lsc, smc, wa, captured, shard_id),
+            move |captured| commit_fsync_with_rollback(NodeStatus::Standalone, lsc, smc, wa, captured, shard_id, dict_codec),
         )
         .await
 }
@@ -544,11 +549,10 @@ async fn find_divergence_via_s3<D: S3Downloader + 'static>(
     let earlier_batches: Vec<FallbackBatchRef> = objects
         .into_iter()
         .filter_map(|obj| {
-            let (_sid, start, end, nid) = parse_fallback_path(&obj.path)?;
+            let (_sid, start, _end, nid) = parse_fallback_path(&obj.path)?;
             Some(FallbackBatchRef {
                 path: obj.path,
                 start_wal_index: start,
-                end_wal_index: end,
                 node_id: nid,
             })
         })
@@ -961,6 +965,11 @@ mod tests {
         watched_aggregates: Rc<AggregateWatchers>,
     }
 
+    fn test_codec() -> Rc<DictCodec> {
+        use celeriant_wal::builtin_dict::BUILTIN_DICT_BYTES;
+        Rc::new(DictCodec::new(BUILTIN_DICT_BYTES, 3).expect("builtin dict must compile"))
+    }
+
     impl TestComponents {
         async fn new(dir: &std::path::Path) -> Self {
             let log_segments_cache = LogSegmentsCache::ready_up(dir.to_path_buf(), PREALLOCATE, 4, 0).await.unwrap();
@@ -1007,6 +1016,7 @@ mod tests {
                 99,
                 peer_node_id,
                 Some(100), // max_catchup_gap_bytes
+                test_codec(),
             )
             .await
         }
@@ -1062,7 +1072,7 @@ mod tests {
                 metablock: test_metablock(99, GENESIS_HASH),
                 datablock: None,
             };
-            let err = apply_external_batch(&tc.log_segments_cache, &tc.shard_mem_cache, &[item]).unwrap_err();
+            let err = apply_external_batch(&tc.log_segments_cache, &tc.shard_mem_cache, &[item], &test_codec()).unwrap_err();
             assert!(matches!(err, ApplyBatchError::WalIndexMismatch { current: 0, batch_first: 99 }));
 
             tc.close().await;
@@ -1079,7 +1089,7 @@ mod tests {
                 metablock: test_metablock(1, [0xAB; 32]),
                 datablock: None,
             };
-            let err = apply_external_batch(&tc.log_segments_cache, &tc.shard_mem_cache, &[item]).unwrap_err();
+            let err = apply_external_batch(&tc.log_segments_cache, &tc.shard_mem_cache, &[item], &test_codec()).unwrap_err();
             assert!(matches!(err, ApplyBatchError::TipHashMismatch { .. }));
 
             tc.close().await;
@@ -1096,7 +1106,7 @@ mod tests {
                 metablock: test_metablock(1, GENESIS_HASH),
                 datablock: None,
             };
-            apply_external_batch(&tc.log_segments_cache, &tc.shard_mem_cache, &[item]).unwrap();
+            apply_external_batch(&tc.log_segments_cache, &tc.shard_mem_cache, &[item], &test_codec()).unwrap();
             assert!(!tc.shard_mem_cache.borrow().pending_append_queue_is_empty());
 
             tc.close().await;
@@ -1114,7 +1124,7 @@ mod tests {
                 metablock: test_metablock(1, GENESIS_HASH),
                 datablock: None,
             };
-            apply_external_batch(&tc.log_segments_cache, &tc.shard_mem_cache, &[item1]).unwrap();
+            apply_external_batch(&tc.log_segments_cache, &tc.shard_mem_cache, &[item1], &test_codec()).unwrap();
             // Flush the pending queue so WAL index advances
             sync_applied_batch(
                 &tc.log_segments_cache,
@@ -1122,6 +1132,7 @@ mod tests {
                 &tc.fsync_coordinator,
                 &tc.watched_aggregates,
                 0,
+                test_codec(),
             )
             .await
             .unwrap();
@@ -1137,7 +1148,7 @@ mod tests {
                 metablock: test_metablock(2, tip),
                 datablock: None,
             };
-            apply_external_batch(&tc.log_segments_cache, &tc.shard_mem_cache, &[stale, fresh]).unwrap();
+            apply_external_batch(&tc.log_segments_cache, &tc.shard_mem_cache, &[stale, fresh], &test_codec()).unwrap();
 
             tc.close().await;
         });
@@ -1154,20 +1165,21 @@ mod tests {
                 metablock: test_metablock(1, GENESIS_HASH),
                 datablock: None,
             };
-            apply_external_batch(&tc.log_segments_cache, &tc.shard_mem_cache, &[item.clone()]).unwrap();
+            apply_external_batch(&tc.log_segments_cache, &tc.shard_mem_cache, &[item.clone()], &test_codec()).unwrap();
             sync_applied_batch(
                 &tc.log_segments_cache,
                 &tc.shard_mem_cache,
                 &tc.fsync_coordinator,
                 &tc.watched_aggregates,
                 0,
+                test_codec(),
             )
             .await
             .unwrap();
             assert_eq!(tc.wal_index(), 1);
 
             // Re-send same entry - should be a no-op
-            apply_external_batch(&tc.log_segments_cache, &tc.shard_mem_cache, &[item]).unwrap();
+            apply_external_batch(&tc.log_segments_cache, &tc.shard_mem_cache, &[item], &test_codec()).unwrap();
 
             tc.close().await;
         });

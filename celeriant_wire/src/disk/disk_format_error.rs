@@ -6,6 +6,7 @@ pub enum DiskFormatError {
     ExternalDataMissing,
     ChecksumMismatch { expected: u32, actual: u32 },
     UnsupportedVersion(u32),
+    UnknownCompression(u8),
     Codec(CodecError),
     HeaderSizeMismatch { expected: usize, actual: usize },
     JsonSerialize(String),

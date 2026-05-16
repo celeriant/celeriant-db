@@ -7,6 +7,7 @@ use celeriant_disk::files::rwlock_timeout::with_budget;
 use celeriant_distributed::validated_node_status::ValidatedNodeStatus;
 use celeriant_msg::request::requests::ReplicationBatchItem;
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
+use celeriant_wire::codec::compression::DictCodec;
 
 use crate::error::fetch_catchup_entries_error::FetchCatchupEntriesError;
 use crate::error::replication_error::ReplicationError;
@@ -35,10 +36,11 @@ pub(crate) async fn replicate_follower_catchup<R: ReplicationClient + 'static>(
     max_request_size: u64,
     read_max_chunk_size: u64,
     shard_id: u32,
+    dict_codec: &DictCodec,
 ) -> Result<CatchupOutcome, ReplicationError> {
     let entries = match fetch_catchup_entries(
         log_segments_cache, follower_wal_index, leader_wal_index,
-        max_catchup_gap_bytes, read_max_chunk_size,
+        max_catchup_gap_bytes, read_max_chunk_size, dict_codec,
     ).await {
         Ok(entries) => entries,
         Err(FetchCatchupEntriesError::FollowerTooFarBehind) => {

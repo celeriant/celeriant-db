@@ -25,7 +25,6 @@ use crate::{
 use celeriant_msg::process_client_requests::ClientRequest;
 use celeriant_msg::request::requests::{SingleAggregateWrite, WriteRequest};
 use celeriant_wal::aggregate_key::AggregateKey;
-use celeriant_wal::compression_type::CompressionType;
 use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
 use tokio::sync::Barrier;
 use tokio::time::Instant;
@@ -378,8 +377,6 @@ async fn pressure_writer(
                 allow_create: true,
                 expected_event_batch_index: None,
                 enforce_client_idempotency: false,
-                compression_type_id: 0,
-                compression_level: None,
             },
         );
 
@@ -390,7 +387,7 @@ async fn pressure_writer(
             writes,
         });
 
-        match client.send_request(&request, CompressionType::None).await {
+        match client.send_request(&request).await {
             Ok(_) => count += 1,
             Err(_) => break,
         }

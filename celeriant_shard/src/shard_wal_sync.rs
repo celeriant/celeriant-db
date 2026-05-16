@@ -17,6 +17,7 @@ use celeriant_rotating_log::log_segment_file::log_segment_file::{LogSegmentFile,
 use celeriant_rotating_log::log_segment_file::log_segment_file_metadata::LogSegmentFileMetadata;
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
 use celeriant_wal::constants::{self, EntryHashBytes, FIRST_EVENT_BATCH_INDEX, FIXED_BLOCK_SIZE_BYTES, HEADER_BLOCK_SIZE_BYTES, MIN_WRITE_ALIGNMENT, WIRE_VERSION_SEGMENT_SUMMARY_BLOCK, WIRE_VERSION_WAL_METABLOCK};
+use celeriant_wire::codec::compression::DictCodec;
 use celeriant_wal::segment_summary::{SegmentSummaryBlock, SegmentSummaryPayload};
 
 use celeriant_wal::metablocks::metablock::Metablock;
@@ -61,6 +62,7 @@ pub(crate) async fn commit_fsync_with_rollback(
     watched_aggregates: Rc<AggregateWatchers>,
     mut captured: FsyncCapturedData, // Mutable because we set the datablocks_position while writing in metablocks
     shard_id: u32,
+    dict_codec: Rc<DictCodec>,
 ) -> Result<(), ShardFsyncError> {
     let start = std::time::Instant::now();
     let batch_size = captured.sync_positions_snapshot.pending_append_queue.len();
@@ -121,6 +123,7 @@ pub(crate) async fn commit_fsync_with_rollback(
                 captured.sync_positions_snapshot,
                 active_log_segment,
                 updated_log_segment_file_metadata,
+                &dict_codec,
             );
             metrics::histogram!("celeriant_fsync_duration_seconds", &shard_label).record(start.elapsed().as_secs_f64());
             metrics::histogram!("celeriant_fsync_batch_size", &shard_label).record(batch_size as f64);
@@ -143,6 +146,7 @@ fn commit_sync(
     mut sync_positions_snapshot: SyncPositionsSnapshot,
     log_segment_file: Rc<LogSegmentFile>,
     mut new_metadata: LogSegmentFileMetadata,
+    dict_codec: &DictCodec,
 ) {
     if !node_status.is_leader() {
         // Currently single node mode or is follower
@@ -282,6 +286,7 @@ fn commit_sync(
                         queue_item.metablock.datablock_compression_type,
                         &queue_item.metablock.datablock,
                         None,
+                        dict_codec,
                     ) {
                         crate::shard_wal::compile_and_cache_schema(&mut shard_mem_cache, &schema_reg.schema_key, &datablock);
                     }
@@ -545,6 +550,11 @@ mod tests {
         };
     }
 
+    fn test_codec() -> DictCodec {
+        use celeriant_wal::builtin_dict::BUILTIN_DICT_BYTES;
+        DictCodec::new(BUILTIN_DICT_BYTES, 3).expect("builtin dict must compile")
+    }
+
     fn test_dir() -> (tempfile::TempDir, PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("shard");
@@ -656,6 +666,7 @@ mod tests {
             sync_positions_snapshot,
             log_segment_file.clone(),
             new_metadata,
+            &test_codec(),
         );
     }
 
@@ -801,6 +812,7 @@ mod tests {
             sync_positions_snapshot,
             log_segment_file.clone(),
             new_metadata,
+            &test_codec(),
         );
     }
 

@@ -9,6 +9,7 @@ pub enum ReadyUpError {
     UnableToAccessDirectory { directory: String, source: std::io::Error },
     UnableToCreateDirectory { directory: String, source: std::io::Error },
     UnableToDeleteOrphanSegment { path: String, source: std::io::Error },
+    DictCodecBuildFailed(String),
 }
 
 impl fmt::Display for ReadyUpError {
@@ -28,6 +29,9 @@ impl fmt::Display for ReadyUpError {
             }
             Self::UnableToDeleteOrphanSegment { path, source } => {
                 write!(f, "Unable to delete orphan segment: {path}, source={source}")
+            }
+            Self::DictCodecBuildFailed(e) => {
+                write!(f, "Failed to build zstd dict codec at shard boot: {e}")
             }
         }
     }

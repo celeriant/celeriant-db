@@ -16,7 +16,7 @@ use celeriant_msg::{
     request::requests::{SingleAggregateWrite, WriteRequest},
 };
 use celeriant_wal::{
-    aggregate_key::AggregateKey, compression_type::CompressionType,
+    aggregate_key::AggregateKey,
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
 };
 
@@ -116,8 +116,6 @@ async fn test_cross_shard_write_rejection(
             allow_create: true,
             expected_event_batch_index: None,
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
     writes.insert(
@@ -127,8 +125,6 @@ async fn test_cross_shard_write_rejection(
             allow_create: true,
             expected_event_batch_index: None,
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -140,7 +136,7 @@ async fn test_cross_shard_write_rejection(
     });
 
     let response = client
-        .send_request(&write_request, CompressionType::None)
+        .send_request(&write_request)
         .await;
 
     match response {
@@ -192,8 +188,6 @@ async fn test_same_shard_write_success(
             allow_create: true,
             expected_event_batch_index: None,
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
     writes.insert(
@@ -203,8 +197,6 @@ async fn test_same_shard_write_success(
             allow_create: true,
             expected_event_batch_index: None,
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -216,7 +208,7 @@ async fn test_same_shard_write_success(
     });
 
     let response = client
-        .send_request(&write_request, CompressionType::None)
+        .send_request(&write_request)
         .await?;
 
     match response {
@@ -253,7 +245,7 @@ async fn test_no_partial_writes(server_address: &str) -> Result<(), Box<dyn std:
     });
 
     match client
-        .send_request(&exists_req_0, CompressionType::None)
+        .send_request(&exists_req_0)
         .await
     {
         Ok(_) => return Err("Aggregate on shard 0 already exists before test!".into()),
@@ -266,7 +258,7 @@ async fn test_no_partial_writes(server_address: &str) -> Result<(), Box<dyn std:
     }
 
     match client
-        .send_request(&exists_req_1, CompressionType::None)
+        .send_request(&exists_req_1)
         .await
     {
         Ok(resp) => return Err(format!("Aggregate on shard 1 already exists before test! Response: {:?}", resp).into()),
@@ -292,8 +284,6 @@ async fn test_no_partial_writes(server_address: &str) -> Result<(), Box<dyn std:
             allow_create: true,
             expected_event_batch_index: None,
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
     writes.insert(
@@ -303,8 +293,6 @@ async fn test_no_partial_writes(server_address: &str) -> Result<(), Box<dyn std:
             allow_create: true,
             expected_event_batch_index: None,
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -316,14 +304,14 @@ async fn test_no_partial_writes(server_address: &str) -> Result<(), Box<dyn std:
     });
 
     let _ = client
-        .send_request(&write_request, CompressionType::None)
+        .send_request(&write_request)
         .await;
 
     println!("  Cross-shard write rejected (as expected)");
 
     // Verify neither aggregate was created (both should still return error 1001)
     match client
-        .send_request(&exists_req_0, CompressionType::None)
+        .send_request(&exists_req_0)
         .await
     {
         Ok(_) => return Err("Aggregate on shard 0 was created despite rejection!".into()),
@@ -338,7 +326,7 @@ async fn test_no_partial_writes(server_address: &str) -> Result<(), Box<dyn std:
     }
 
     match client
-        .send_request(&exists_req_1, CompressionType::None)
+        .send_request(&exists_req_1)
         .await
     {
         Ok(_) => return Err("Aggregate on shard 1 was created despite rejection!".into()),

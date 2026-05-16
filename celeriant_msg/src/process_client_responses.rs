@@ -1,11 +1,15 @@
 use celeriant_wal::compression_type::CompressionType;
-use celeriant_wire::network::{
-    wire_error::WireError,
-    wire_header::{WireHeader, wire_header_write_fixed_size, wire_header_write_variable_size},
+use celeriant_wire::{
+    codec::compression::DictCodec,
+    network::{
+        wire_error::WireError,
+        wire_header::{WireHeader, wire_header_write_fixed_size},
+    },
 };
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{
+    RESPONSE_COMPRESSION_THRESHOLD_BYTES,
     read_wire_data_error::ReadWireDataError,
     response::responses::{
         AggregateDetailsResponse, ErrorResponse, ListAggregateTypesResponse, ListAggregatesResponse,
@@ -112,11 +116,11 @@ impl ClientResponse {
             };
         }
 
-        macro_rules! variable {
+        macro_rules! variable_uncompressed {
             ($variant:ident) => {
                 ClientResponse::$variant(
                     wire_header
-                        .read_variable_size(reader)
+                        .read_variable_size_uncompressed(reader)
                         .await
                         .map_err(ReadWireDataError::ReadBodyFailure)?,
                 )
@@ -131,36 +135,54 @@ impl ClientResponse {
             ClientResponseType::ProtocolError => fixed!(ProtocolError),
             ClientResponseType::GenericError => fixed!(GenericError),
             ClientResponseType::RegisterSchema => fixed!(RegisterSchema),
-            ClientResponseType::Read => variable!(Read),
-            ClientResponseType::Watch => variable!(Watch),
-            ClientResponseType::ListOrgs => variable!(ListOrgs),
-            ClientResponseType::ListAggregateTypes => variable!(ListAggregateTypes),
-            ClientResponseType::ListAggregates => variable!(ListAggregates),
+            ClientResponseType::Read => variable_uncompressed!(Read),
+            ClientResponseType::Watch => variable_uncompressed!(Watch),
+            ClientResponseType::ListOrgs => variable_uncompressed!(ListOrgs),
+            ClientResponseType::ListAggregateTypes => variable_uncompressed!(ListAggregateTypes),
+            ClientResponseType::ListAggregates => variable_uncompressed!(ListAggregates),
         })
     }
 
     #[inline]
-    pub fn determine_compression_type(response: &ClientResponse, server_compression_algorithm: CompressionType) -> CompressionType {
-        match response {
-            ClientResponse::AggregateDetails(_) => CompressionType::None,
-            ClientResponse::Read(_) => server_compression_algorithm,
-            ClientResponse::Write(_) => CompressionType::None,
-            ClientResponse::TrimStart(_) => CompressionType::None,
-            ClientResponse::Delete(_) => CompressionType::None,
-            ClientResponse::ProtocolError(_) => CompressionType::None,
-            ClientResponse::GenericError(_) => CompressionType::None,
-            ClientResponse::Watch(_) => server_compression_algorithm,
-            ClientResponse::ListOrgs(_) => server_compression_algorithm,
-            ClientResponse::ListAggregateTypes(_) => server_compression_algorithm,
-            ClientResponse::ListAggregates(_) => server_compression_algorithm,
-            ClientResponse::RegisterSchema(_) => CompressionType::None,
-        }
+    pub fn is_fixed_size_variant(response_type_id: u32) -> bool {
+        matches!(
+            ClientResponseType::from_u32(response_type_id),
+            Ok(ClientResponseType::AggregateDetails
+                | ClientResponseType::Write
+                | ClientResponseType::TrimStart
+                | ClientResponseType::Delete
+                | ClientResponseType::ProtocolError
+                | ClientResponseType::GenericError
+                | ClientResponseType::RegisterSchema)
+        )
+    }
+
+    pub fn deserialize_body(response_type_id: u32, body: &[u8], version: u32) -> Result<ClientResponse, ReadWireDataError> {
+        use celeriant_wire::network::wire_header::deserialise_versioned;
+        let response_type = ClientResponseType::from_u32(response_type_id)?;
+        let mb = ReadWireDataError::ReadBodyFailure;
+        let result = match response_type {
+            ClientResponseType::AggregateDetails => ClientResponse::AggregateDetails(deserialise_versioned(body, version).map_err(mb)?),
+            ClientResponseType::Write => ClientResponse::Write(deserialise_versioned(body, version).map_err(mb)?),
+            ClientResponseType::TrimStart => ClientResponse::TrimStart(deserialise_versioned(body, version).map_err(mb)?),
+            ClientResponseType::Delete => ClientResponse::Delete(deserialise_versioned(body, version).map_err(mb)?),
+            ClientResponseType::ProtocolError => ClientResponse::ProtocolError(deserialise_versioned(body, version).map_err(mb)?),
+            ClientResponseType::GenericError => ClientResponse::GenericError(deserialise_versioned(body, version).map_err(mb)?),
+            ClientResponseType::RegisterSchema => ClientResponse::RegisterSchema(deserialise_versioned(body, version).map_err(mb)?),
+            ClientResponseType::Read => ClientResponse::Read(deserialise_versioned(body, version).map_err(mb)?),
+            ClientResponseType::Watch => ClientResponse::Watch(deserialise_versioned(body, version).map_err(mb)?),
+            ClientResponseType::ListOrgs => ClientResponse::ListOrgs(deserialise_versioned(body, version).map_err(mb)?),
+            ClientResponseType::ListAggregateTypes => ClientResponse::ListAggregateTypes(deserialise_versioned(body, version).map_err(mb)?),
+            ClientResponseType::ListAggregates => ClientResponse::ListAggregates(deserialise_versioned(body, version).map_err(mb)?),
+        };
+        Ok(result)
     }
 
     pub async fn write_response<W>(
         writer: &mut W,
         response: &ClientResponse,
-        compression_type: CompressionType,
+        client_has_dict: bool,
+        dict_codec: &DictCodec,
         max_message_size: u64,
         version: u32,
     ) -> Result<(), WireError>
@@ -170,6 +192,7 @@ impl ClientResponse {
         let response_type_id = response.response_type() as u32;
 
         match response {
+            // Fixed-size responses: never compressed.
             ClientResponse::AggregateDetails(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
             ClientResponse::Write(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
             ClientResponse::TrimStart(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
@@ -177,19 +200,124 @@ impl ClientResponse {
             ClientResponse::ProtocolError(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
             ClientResponse::GenericError(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
             ClientResponse::RegisterSchema(res) => wire_header_write_fixed_size(writer, res, response_type_id, version).await,
-            ClientResponse::Read(res) => wire_header_write_variable_size(writer, res, response_type_id, compression_type, max_message_size, version).await,
-            ClientResponse::Watch(res) => wire_header_write_variable_size(writer, res, response_type_id, compression_type, max_message_size, version).await,
-            ClientResponse::ListOrgs(res) => wire_header_write_variable_size(writer, res, response_type_id, compression_type, max_message_size, version).await,
-            ClientResponse::ListAggregateTypes(res) => wire_header_write_variable_size(writer, res, response_type_id, compression_type, max_message_size, version).await,
-            ClientResponse::ListAggregates(res) => wire_header_write_variable_size(writer, res, response_type_id, compression_type, max_message_size, version).await,
+            // Variable-size responses: serialise once, decide compression from payload size, write frame.
+            ClientResponse::Read(res) => write_variable_with_threshold(writer, res, response_type_id, client_has_dict, dict_codec, max_message_size, version).await,
+            ClientResponse::Watch(res) => write_variable_with_threshold(writer, res, response_type_id, client_has_dict, dict_codec, max_message_size, version).await,
+            ClientResponse::ListOrgs(res) => write_variable_with_threshold(writer, res, response_type_id, client_has_dict, dict_codec, max_message_size, version).await,
+            ClientResponse::ListAggregateTypes(res) => write_variable_with_threshold(writer, res, response_type_id, client_has_dict, dict_codec, max_message_size, version).await,
+            ClientResponse::ListAggregates(res) => write_variable_with_threshold(writer, res, response_type_id, client_has_dict, dict_codec, max_message_size, version).await,
         }
     }
+}
+
+pub fn determine_compression_type(
+    response: &ClientResponse,
+    payload_size: usize,
+    client_has_dict: bool,
+) -> CompressionType {
+    match response {
+        ClientResponse::AggregateDetails(_)
+        | ClientResponse::Write(_)
+        | ClientResponse::TrimStart(_)
+        | ClientResponse::Delete(_)
+        | ClientResponse::ProtocolError(_)
+        | ClientResponse::GenericError(_)
+        | ClientResponse::RegisterSchema(_) => return CompressionType::None,
+        // Variable-size responses fall through to the policy below.
+        ClientResponse::Read(_)
+        | ClientResponse::Watch(_)
+        | ClientResponse::ListOrgs(_)
+        | ClientResponse::ListAggregateTypes(_)
+        | ClientResponse::ListAggregates(_) => {}
+    }
+
+    compression_policy(payload_size, client_has_dict)
+}
+
+fn compression_policy(payload_size: usize, client_has_dict: bool) -> CompressionType {
+    if payload_size < RESPONSE_COMPRESSION_THRESHOLD_BYTES {
+        return CompressionType::None;
+    }
+
+    if client_has_dict {
+        CompressionType::ZstdDict
+    } else {
+        CompressionType::None
+    }
+}
+
+async fn write_variable_with_threshold<W, T>(
+    writer: &mut W,
+    message: &T,
+    response_type_id: u32,
+    client_has_dict: bool,
+    dict_codec: &DictCodec,
+    max_message_size: u64,
+    version: u32,
+) -> Result<(), WireError>
+where
+    W: AsyncWriteExt + Unpin,
+    T: bincode::Encode + serde::Serialize,
+{
+    use celeriant_wire::{
+        codec::{bincode as wire_bincode, msgpack as wire_msgpack},
+        network::wire_header::{WIRE_HEADER_SIZE, WIRE_FIXED_BODY_SIZE, PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3},
+    };
+
+    let uncompressed: Vec<u8> = match version {
+        PROTOCOL_VERSION_V2 => wire_bincode::fixed_serialise_heap(message)?,
+        PROTOCOL_VERSION_V3 => wire_msgpack::serialise_heap(message)?,
+        _ => return Err(WireError::UnsupportedProtocol(version)),
+    };
+
+    let payload_size = uncompressed.len();
+
+    let compression_type = compression_policy(payload_size, client_has_dict);
+
+    let data: Vec<u8> = match compression_type {
+        CompressionType::None => uncompressed,
+        CompressionType::ZstdDict => dict_codec.compress(&uncompressed).map_err(WireError::from)?,
+    };
+
+    let compressed_size = data.len() as u32;
+    let uncompressed_size = payload_size as u32;
+    let compression_type_id = compression_type.to_byte();
+
+    if compressed_size as u64 > max_message_size {
+        return Err(WireError::MessageTooLarge {
+            message_length: compressed_size as u64,
+            max_size_bytes: max_message_size,
+        });
+    }
+
+    if compressed_size <= WIRE_FIXED_BODY_SIZE as u32 && compression_type == CompressionType::None {
+        let mut buffer = [0u8; WIRE_HEADER_SIZE + WIRE_FIXED_BODY_SIZE];
+        buffer[0..4].copy_from_slice(&version.to_le_bytes());
+        buffer[4..8].copy_from_slice(&response_type_id.to_le_bytes());
+        buffer[8..12].copy_from_slice(&compressed_size.to_le_bytes());
+        buffer[12..16].copy_from_slice(&uncompressed_size.to_le_bytes());
+        buffer[16] = compression_type_id;
+        buffer[WIRE_HEADER_SIZE..WIRE_HEADER_SIZE + compressed_size as usize].copy_from_slice(&data);
+        writer.write_all(&buffer[..WIRE_HEADER_SIZE + compressed_size as usize]).await?;
+        return Ok(());
+    }
+
+    let mut buffer = Vec::with_capacity(WIRE_HEADER_SIZE + data.len());
+    buffer.extend_from_slice(&version.to_le_bytes());
+    buffer.extend_from_slice(&response_type_id.to_le_bytes());
+    buffer.extend_from_slice(&compressed_size.to_le_bytes());
+    buffer.extend_from_slice(&uncompressed_size.to_le_bytes());
+    buffer.push(compression_type_id);
+    buffer.extend_from_slice(&data);
+    writer.write_all(&buffer).await?;
+
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::response::responses::{AggregateListItem, AggregateTypeListItem, OrgListItem};
+    use crate::response::responses::{AggregateListItem, OrgListItem};
     use celeriant_wire::network::wire_header::{PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3, WIRE_HEADER_SIZE};
     use futures_lite::{future::block_on, io::Cursor};
 
@@ -281,11 +409,18 @@ mod tests {
         )
     }
 
-    async fn write_bytes(res: &ClientResponse, version: u32, compression: CompressionType) -> Vec<u8> {
+    fn test_codec() -> DictCodec {
+        use celeriant_wal::builtin_dict::BUILTIN_DICT_BYTES;
+        DictCodec::new(BUILTIN_DICT_BYTES, 3).expect("builtin dict must compile")
+    }
+
+    /// Write a response with the client_has_dict=false flag (server picks None on the wire).
+    /// The codec is required by signature but never invoked when compression resolves to None.
+    async fn write_bytes(res: &ClientResponse, version: u32) -> Vec<u8> {
         let mut buf = Vec::new();
-        ClientResponse::write_response(&mut buf, res, compression, 64 * 1024 * 1024, version)
+        ClientResponse::write_response(&mut buf, res, false, &test_codec(), 64 * 1024 * 1024, version)
             .await
-            .unwrap();
+            .expect("write_response");
         buf
     }
 
@@ -326,7 +461,7 @@ mod tests {
             for rt in all_types() {
                 for &v in &VERSIONS {
                     let res = make_response(rt);
-                    let bytes = write_bytes(&res, v, CompressionType::None).await;
+                    let bytes = write_bytes(&res, v).await;
                     let parsed = read_back(&bytes).await;
                     assert_eq!(parsed.response_type(), rt, "{:?} v{} type mismatch", rt, v);
                 }
@@ -339,7 +474,7 @@ mod tests {
         block_on(async {
             for rt in all_types() {
                 let res = make_response(rt);
-                let bytes = write_bytes(&res, PROTOCOL_VERSION_V2, CompressionType::None).await;
+                let bytes = write_bytes(&res, PROTOCOL_VERSION_V2).await;
                 let compression_byte = bytes[16];
                 if is_variable_size(rt) {
                     assert!(compression_byte == 0 || compression_byte > 0, "{:?} should use variable path", rt);
@@ -350,43 +485,97 @@ mod tests {
         });
     }
 
+    // --- determine_compression_type unit tests ---
+
     #[test]
-    fn compression_type_determination() {
-        let server_compression = CompressionType::Zstd { level: 6 };
-        for rt in all_types() {
-            let res = make_response(rt);
-            let determined = ClientResponse::determine_compression_type(&res, server_compression);
-            if is_variable_size(rt) {
-                assert_eq!(determined, server_compression, "{:?} should use server compression", rt);
-            } else {
-                assert_eq!(determined, CompressionType::None, "{:?} should not compress", rt);
-            }
+    fn small_payload_always_none() {
+        let small_size = RESPONSE_COMPRESSION_THRESHOLD_BYTES - 1;
+        let res = ClientResponse::Read(ReadResponse { correlation_id: None, event_batches: vec![], next_event_batch_index: None });
+        assert_eq!(
+            determine_compression_type(&res, small_size, true),
+            CompressionType::None,
+            "small payload should be None regardless of client_has_dict"
+        );
+    }
+
+    #[test]
+    fn large_payload_with_dict_returns_zstd_dict() {
+        let res = ClientResponse::Read(ReadResponse { correlation_id: None, event_batches: vec![], next_event_batch_index: None });
+        assert_eq!(
+            determine_compression_type(&res, RESPONSE_COMPRESSION_THRESHOLD_BYTES + 1, true),
+            CompressionType::ZstdDict
+        );
+    }
+
+    #[test]
+    fn large_payload_without_dict_returns_none() {
+        let res = ClientResponse::Read(ReadResponse { correlation_id: None, event_batches: vec![], next_event_batch_index: None });
+        assert_eq!(
+            determine_compression_type(&res, RESPONSE_COMPRESSION_THRESHOLD_BYTES + 1, false),
+            CompressionType::None
+        );
+    }
+
+    #[test]
+    fn write_response_always_none() {
+        // Write, Delete, AggregateDetails, errors, RegisterSchema are never compressed.
+        let large_size = RESPONSE_COMPRESSION_THRESHOLD_BYTES + 1;
+        let none_variants: &[ClientResponse] = &[
+            ClientResponse::Write(SuccessResponse { correlation_id: None }),
+            ClientResponse::Delete(SuccessResponse { correlation_id: None }),
+            ClientResponse::AggregateDetails(AggregateDetailsResponse {
+                correlation_id: None, min_event_batch_index: 0, max_event_batch_index: 0,
+                max_event_index: 0, is_deleted: false, allow_recreate: false,
+                allow_index_continuation: false, last_server_timestamp: 0,
+                last_client_id: 0, last_user_id: None,
+            }),
+            ClientResponse::RegisterSchema(SuccessResponse { correlation_id: None }),
+            ClientResponse::GenericError(ErrorResponse { correlation_id: None, error_code: 0, error_message: String::new() }),
+            ClientResponse::ProtocolError(ProtocolErrorResponse {}),
+        ];
+        for res in none_variants {
+            assert_eq!(
+                determine_compression_type(res, large_size, true),
+                CompressionType::None,
+                "{:?} must always be None", res.response_type()
+            );
         }
     }
 
     #[test]
-    fn compression_round_trip() {
+    fn round_trip_large_payload_no_compression() {
         block_on(async {
-            let compressions = [
-                CompressionType::None,
-                CompressionType::Zstd { level: 6 },
-                CompressionType::Snappy,
-                CompressionType::Brotli { level: 6 },
-                CompressionType::Gzip { level: 6 },
-            ];
+            // Build a payload large enough to exceed the threshold.
+            let res = ClientResponse::ListAggregates(ListAggregatesResponse {
+                correlation_id: Some(1),
+                aggregates: (0u64..100).map(|i| AggregateListItem {
+                    is_deleted: false, org_id: i as u128, aggregate_type_id: i as u128,
+                    aggregate_id: i as u128, event_batch_count: i, min_event_timestamp: i,
+                    max_event_timestamp: i + 1000, min_event_batch_index: i, max_event_batch_index: i + 10,
+                    min_event_index: i, max_event_index: i + 50, min_server_timestamp: i,
+                    max_server_timestamp: i + 2000, compressed_size: i * 100, uncompressed_size: i * 200,
+                }).collect(),
+                next_cursor: None,
+            });
 
-            for rt in all_types().into_iter().filter(|rt| is_variable_size(*rt)) {
-                for &compression in &compressions {
-                    for &v in &VERSIONS {
-                        let res = make_response(rt);
-                        let bytes1 = write_bytes(&res, v, compression).await;
-                        let parsed = read_back(&bytes1).await;
+            for &v in &VERSIONS {
+                let bytes = write_bytes(&res, v).await;
+                assert_eq!(bytes[16], 0, "v{} with None algorithm should have no compression", v);
+                let parsed = read_back(&bytes).await;
+                assert_eq!(parsed.response_type(), ClientResponseType::ListAggregates);
+            }
+        });
+    }
 
-                        assert_eq!(parsed.response_type(), rt);
-
-                        let bytes2 = write_bytes(&parsed, v, compression).await;
-                        assert_eq!(bytes1, bytes2, "{:?} {:?} v{} data not preserved", rt, compression, v);
-                    }
+    #[test]
+    fn round_trip_all_versions_none_algorithm() {
+        block_on(async {
+            for rt in all_types() {
+                for &v in &VERSIONS {
+                    let res = make_response(rt);
+                    let bytes = write_bytes(&res, v).await;
+                    let parsed = read_back(&bytes).await;
+                    assert_eq!(parsed.response_type(), rt, "{:?} v{} type mismatch", rt, v);
                 }
             }
         });
@@ -396,7 +585,7 @@ mod tests {
     fn size_limit_rejects_oversized() {
         block_on(async {
             let res = make_response(ClientResponseType::Read);
-            let bytes = write_bytes(&res, PROTOCOL_VERSION_V2, CompressionType::None).await;
+            let bytes = write_bytes(&res, PROTOCOL_VERSION_V2).await;
             let result = ClientResponse::read_response(&mut Cursor::new(bytes), 1).await;
             assert!(result.is_err(), "should reject when max_size < body size");
         });
@@ -406,7 +595,7 @@ mod tests {
     fn truncated_stream_fails() {
         block_on(async {
             let res = make_response(ClientResponseType::AggregateDetails);
-            let bytes = write_bytes(&res, PROTOCOL_VERSION_V2, CompressionType::None).await;
+            let bytes = write_bytes(&res, PROTOCOL_VERSION_V2).await;
 
             for truncate_at in [0, 10, bytes.len() - 1] {
                 let truncated = &bytes[..truncate_at];
@@ -420,7 +609,7 @@ mod tests {
     fn invalid_message_type_fails() {
         block_on(async {
             let res = make_response(ClientResponseType::AggregateDetails);
-            let mut bytes = write_bytes(&res, PROTOCOL_VERSION_V2, CompressionType::None).await;
+            let mut bytes = write_bytes(&res, PROTOCOL_VERSION_V2).await;
 
             bytes[4..8].copy_from_slice(&(MAX_ID + 1).to_le_bytes());
             let result = ClientResponse::read_response(&mut Cursor::new(bytes), u64::MAX).await;
@@ -455,15 +644,13 @@ mod tests {
                 next_cursor: Some(999),
             });
 
-            let bytes = write_bytes(&res, PROTOCOL_VERSION_V2, CompressionType::None).await;
+            // No compression: cluster algorithm None.
+            let bytes = write_bytes(&res, PROTOCOL_VERSION_V2).await;
             let parsed = read_back(&bytes).await;
             assert_eq!(parsed.response_type(), ClientResponseType::ListAggregates);
 
-            let bytes = write_bytes(&res, PROTOCOL_VERSION_V2, CompressionType::Zstd { level: 6 }).await;
-            let parsed = read_back(&bytes).await;
-            assert_eq!(parsed.response_type(), ClientResponseType::ListAggregates);
-
-            let bytes = write_bytes(&res, PROTOCOL_VERSION_V3, CompressionType::Zstd { level: 6 }).await;
+            // V3 no compression.
+            let bytes = write_bytes(&res, PROTOCOL_VERSION_V3).await;
             let parsed = read_back(&bytes).await;
             assert_eq!(parsed.response_type(), ClientResponseType::ListAggregates);
         });
@@ -472,52 +659,43 @@ mod tests {
     #[test]
     fn variable_size_responses_with_data() {
         block_on(async {
+            // Small payloads (empty lists) — stay below threshold regardless of algorithm.
             let orgs = ClientResponse::ListOrgs(ListOrgsResponse {
                 correlation_id: Some(1),
-                orgs: (0u128..100).map(|i| OrgListItem { org_id: i }).collect(),
-                next_cursor: Some(100),
+                orgs: vec![],
+                next_cursor: None,
             });
 
             let types = ClientResponse::ListAggregateTypes(ListAggregateTypesResponse {
                 correlation_id: Some(2),
-                aggregate_types: (0u128..50)
-                    .map(|i| AggregateTypeListItem { org_id: i, aggregate_type_id: i * 10 })
-                    .collect(),
+                aggregate_types: vec![],
                 next_cursor: None,
             });
 
             let aggregates = ClientResponse::ListAggregates(ListAggregatesResponse {
                 correlation_id: Some(3),
-                aggregates: (0u64..25)
-                    .map(|i| AggregateListItem {
-                        is_deleted: i % 2 == 0,
-                        org_id: i as u128,
-                        aggregate_type_id: (i * 2) as u128,
-                        aggregate_id: (i * 3) as u128,
-                        event_batch_count: i * 10,
-                        min_event_timestamp: 1000 + i,
-                        max_event_timestamp: 2000 + i,
-                        min_event_batch_index: i,
-                        max_event_batch_index: i + 100,
-                        min_event_index: i * 5,
-                        max_event_index: i * 5 + 50,
-                        min_server_timestamp: 3000 + i,
-                        max_server_timestamp: 4000 + i,
-                        compressed_size: i * 100,
-                        uncompressed_size: i * 200,
-                    })
-                    .collect(),
-                next_cursor: Some(999),
+                aggregates: vec![],
+                next_cursor: None,
             });
 
             for res in [orgs, types, aggregates] {
                 for &v in &VERSIONS {
-                    for compression in [CompressionType::None, CompressionType::Zstd { level: 3 }] {
-                        let bytes = write_bytes(&res, v, compression).await;
-                        let parsed = read_back(&bytes).await;
-                        assert_eq!(parsed.response_type(), res.response_type());
-                    }
+                    let bytes = write_bytes(&res, v).await;
+                    let parsed = read_back(&bytes).await;
+                    assert_eq!(parsed.response_type(), res.response_type());
                 }
+            }
+
+            // Large payload — no compression (client has no dict in this test).
+            let large_orgs = ClientResponse::ListOrgs(ListOrgsResponse {
+                correlation_id: Some(4),
+                orgs: (0u128..200).map(|i| OrgListItem { org_id: i }).collect(),
+                next_cursor: Some(200),
+            });
+            for &v in &VERSIONS {
+                let bytes = write_bytes(&large_orgs, v).await;
+                let parsed = read_back(&bytes).await;
+                assert_eq!(parsed.response_type(), ClientResponseType::ListOrgs);
             }
         });
     }

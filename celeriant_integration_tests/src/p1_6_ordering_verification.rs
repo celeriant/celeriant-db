@@ -15,7 +15,6 @@ use celeriant_msg::process_client_responses::ClientResponse;
 use celeriant_msg::request::read_filters::ReadFilters;
 use celeriant_msg::request::requests::{ReadRequest, SingleAggregateWrite, WriteRequest};
 use celeriant_wal::aggregate_key::AggregateKey;
-use celeriant_wal::compression_type::CompressionType;
 use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -99,8 +98,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     allow_create: false,
                     expected_event_batch_index: None,
                     enforce_client_idempotency: false,
-                    compression_type_id: 0,
-                    compression_level: None,
                 },
             );
             let request = ClientRequest::Write(WriteRequest {
@@ -109,7 +106,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 user_id: None,
                 writes,
             });
-            match client.send_request(&request, CompressionType::None).await {
+            match client.send_request(&request).await {
                 Ok(ClientResponse::Write(_)) => {
                     successes.fetch_add(1, Ordering::Relaxed);
                 }
@@ -194,8 +191,6 @@ async fn write_event(
             allow_create,
             expected_event_batch_index: if allow_create { Some(0) } else { None },
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -207,7 +202,7 @@ async fn write_event(
     };
 
     let response = client
-        .send_request(&ClientRequest::Write(write_req), CompressionType::None)
+        .send_request(&ClientRequest::Write(write_req))
         .await?;
 
     match response {
@@ -232,7 +227,7 @@ async fn read_all_batches(
         };
 
         let response = client
-            .send_request(&ClientRequest::Read(read_req), CompressionType::None)
+            .send_request(&ClientRequest::Read(read_req))
             .await;
 
         match response {

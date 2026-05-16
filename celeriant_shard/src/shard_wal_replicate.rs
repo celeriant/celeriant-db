@@ -7,6 +7,7 @@ use celeriant_disk::files::rwlock_timeout::with_budget;
 
 use celeriant_distributed::validated_node_status::{ValidatedNodeStatus, set_node_status_and_metric};
 use celeriant_msg::request::requests::ReplicationBatchItem;
+use celeriant_wire::codec::compression::DictCodec;
 use celeriant_rotating_log::log_segment_file::aggregate_key_bloom::AggregateKeyBloom;
 use celeriant_rotating_log::log_segment_file::log_segment_file::{read_datablocks_carry_over_bytes, write_dual_shard_log_header};
 use celeriant_wal::shard_log_header::ShardLogHeader;
@@ -108,6 +109,7 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient + 'sta
     read_max_chunk_size: u64,
     max_clock_drift_ms: u64,
     shard_id: u32,
+    dict_codec: Rc<DictCodec>,
 ) -> Result<(), ReplicationError> {
     let start = Instant::now();
     let shard_label = [("shard_id", shard_id.to_string())];
@@ -116,8 +118,9 @@ pub(crate) async fn commit_replication_with_rollback<R: ReplicationClient + 'sta
 
     let outcome = replicate_loop(
         &replication_client, &log_segments_cache, &shard_mem_cache, &watched_aggregates, &node_status,
-        &mut replication_snapshot, 
+        &mut replication_snapshot,
         max_catchup_gap_bytes, max_request_size, read_max_chunk_size, max_clock_drift_ms, shard_id,
+        &dict_codec,
     ).await;
 
     // Sweep memcache for any rotated-and-sealed segments whose read cursor has now caught up
@@ -165,6 +168,7 @@ async fn replicate_loop<R: ReplicationClient + 'static>(
     read_max_chunk_size: u64,
     max_clock_drift_ms: u64,
     shard_id: u32,
+    dict_codec: &DictCodec,
 ) -> Result<ReplicationDetails, ReplicationError> {
     if !node_status.get().is_leader() {
         let snapshot_count = snapshot.len();
@@ -187,7 +191,7 @@ async fn replicate_loop<R: ReplicationClient + 'static>(
         return run_probe_send(
             replication_client, log_segments_cache, node_status,
             reachable_at_commit, max_catchup_gap_bytes, max_request_size,
-            read_max_chunk_size, max_clock_drift_ms, shard_id,
+            read_max_chunk_size, max_clock_drift_ms, shard_id, dict_codec,
         ).await;
     }
 
@@ -209,7 +213,7 @@ async fn replicate_loop<R: ReplicationClient + 'static>(
 
     match tcp_send_snapshot(
         replication_client, log_segments_cache, node_status, snapshot,
-        max_request_size, max_catchup_gap_bytes, read_max_chunk_size, max_clock_drift_ms, shard_id,
+        max_request_size, max_catchup_gap_bytes, read_max_chunk_size, max_clock_drift_ms, shard_id, dict_codec,
     ).await? {
         SnapshotSendOutcome::Sent => {
             let pcds = std::mem::take(snapshot);
@@ -238,6 +242,7 @@ async fn run_probe_send<R: ReplicationClient + 'static>(
     read_max_chunk_size: u64,
     max_clock_drift_ms: u64,
     shard_id: u32,
+    dict_codec: &DictCodec,
 ) -> Result<ReplicationDetails, ReplicationError> {
     if !reachable {
         return Ok(ReplicationDetails::ReplicatedToFollower);
@@ -261,6 +266,7 @@ async fn run_probe_send<R: ReplicationClient + 'static>(
         leader_wal_index.saturating_add(1),
         Some(max_request_size),
         read_max_chunk_size,
+        dict_codec,
     ).await {
         Ok(e) => e,
         Err(e) => {
@@ -272,7 +278,7 @@ async fn run_probe_send<R: ReplicationClient + 'static>(
         return Ok(ReplicationDetails::ReplicatedToFollower);
     }
     if let Err(e) = crate::collect_from_disk::fetch_datablocks_for_metablocks(
-        &mut probe_entries, read_max_chunk_size, log_segments_cache,
+        &mut probe_entries, read_max_chunk_size, log_segments_cache, dict_codec,
     ).await {
         debug!(shard_id, error = ?e, "probe: datablock fetch failed, skipping");
         return Ok(ReplicationDetails::ReplicatedToFollower);
@@ -301,7 +307,7 @@ async fn run_probe_send<R: ReplicationClient + 'static>(
             match crate::replicate_follower_catchup::replicate_follower_catchup(
                 replication_client, log_segments_cache, node_status,
                 max_follower_wal_index, leader_wal_index.saturating_add(1),
-                max_catchup_gap_bytes, max_request_size, read_max_chunk_size, shard_id,
+                max_catchup_gap_bytes, max_request_size, read_max_chunk_size, shard_id, dict_codec,
             ).await? {
                 crate::replicate_follower_catchup::CatchupOutcome::Caught => {
                     metrics::counter!("celeriant_probe_gap_send_success_total").increment(1);
@@ -396,6 +402,7 @@ async fn tcp_send_snapshot<R: ReplicationClient + 'static>(
     read_max_chunk_size: u64,
     max_clock_drift_ms: u64,
     shard_id: u32,
+    dict_codec: &DictCodec,
 ) -> Result<SnapshotSendOutcome, ReplicationError> {
     debug_assert!(!snapshot.is_empty());
 
@@ -417,7 +424,7 @@ async fn tcp_send_snapshot<R: ReplicationClient + 'static>(
             match crate::replicate_follower_catchup::replicate_follower_catchup(
                 replication_client, log_segments_cache, node_status,
                 max_follower_wal_index, leader_first_wal,
-                max_catchup_gap_bytes, max_request_size, read_max_chunk_size, shard_id,
+                max_catchup_gap_bytes, max_request_size, read_max_chunk_size, shard_id, dict_codec,
             ).await? {
                 crate::replicate_follower_catchup::CatchupOutcome::Caught => {}
                 crate::replicate_follower_catchup::CatchupOutcome::FallbackToS3 => {
@@ -1006,6 +1013,11 @@ mod tests {
         )
     }
 
+    fn test_codec() -> Rc<DictCodec> {
+        use celeriant_wal::builtin_dict::BUILTIN_DICT_BYTES;
+        Rc::new(DictCodec::new(BUILTIN_DICT_BYTES, 3).expect("builtin dict must compile"))
+    }
+
     fn fresh_memcache() -> MemCache {
         MemCache::new(64 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024, 1024 * 1024, 4 * 1024 * 1024, 64 * 1024 * 1024)
     }
@@ -1261,6 +1273,7 @@ mod tests {
                 64 * 1024,
                 500,
                 0,
+                test_codec(),
             ).await
         }
 

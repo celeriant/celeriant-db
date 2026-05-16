@@ -1,4 +1,3 @@
-use celeriant_wal::compression_type::CompressionType;
 use celeriant_wire::network::{
     wire_error::WireError,
     wire_header::{WireHeader, wire_header_write_fixed_size},
@@ -92,14 +91,9 @@ impl ClusterResponse {
         })
     }
 
-    pub fn determine_compression_type(_response: &ClusterResponse, _server_compression_algorithm: CompressionType) -> CompressionType {
-        CompressionType::None
-    }
-
     pub async fn write_response<W>(
         writer: &mut W,
         response: &ClusterResponse,
-        _compression_type: CompressionType,
         _max_message_size: u64,
         version: u32,
     ) -> Result<(), WireError>
@@ -165,9 +159,9 @@ mod tests {
         }
     }
 
-    async fn write_bytes(res: &ClusterResponse, version: u32, compression: CompressionType) -> Vec<u8> {
+    async fn write_bytes(res: &ClusterResponse, version: u32) -> Vec<u8> {
         let mut buf = Vec::new();
-        ClusterResponse::write_response(&mut buf, res, compression, 64 * 1024 * 1024, version)
+        ClusterResponse::write_response(&mut buf, res, 64 * 1024 * 1024, version)
             .await
             .unwrap();
         buf
@@ -209,7 +203,7 @@ mod tests {
             for rt in all_types() {
                 for &v in &VERSIONS {
                     let res = make_response(rt);
-                    let bytes = write_bytes(&res, v, CompressionType::None).await;
+                    let bytes = write_bytes(&res, v).await;
                     let parsed = read_back(&bytes).await;
                     assert_eq!(parsed.response_type(), rt, "{:?} v{} type mismatch", rt, v);
                 }
@@ -222,21 +216,11 @@ mod tests {
         block_on(async {
             for rt in all_types() {
                 let res = make_response(rt);
-                let bytes = write_bytes(&res, PROTOCOL_VERSION_V2, CompressionType::None).await;
+                let bytes = write_bytes(&res, PROTOCOL_VERSION_V2).await;
                 let compression_byte = bytes[16];
                 assert_eq!(compression_byte, 0, "{:?} should be fixed-size with no compression", rt);
             }
         });
-    }
-
-    #[test]
-    fn compression_type_always_none() {
-        let server_compression = CompressionType::Zstd { level: 6 };
-        for rt in all_types() {
-            let res = make_response(rt);
-            let determined = ClusterResponse::determine_compression_type(&res, server_compression);
-            assert_eq!(determined, CompressionType::None, "{:?} should not compress", rt);
-        }
     }
 
     #[test]
@@ -257,7 +241,7 @@ mod tests {
                 });
 
                 for &v in &VERSIONS {
-                    let bytes = write_bytes(&res, v, CompressionType::None).await;
+                    let bytes = write_bytes(&res, v).await;
                     let parsed = read_back(&bytes).await;
                     assert_eq!(parsed.response_type(), ClusterResponseType::Heartbeat);
                 }
@@ -269,7 +253,7 @@ mod tests {
     fn truncated_stream_fails() {
         block_on(async {
             let res = make_response(ClusterResponseType::Heartbeat);
-            let bytes = write_bytes(&res, PROTOCOL_VERSION_V2, CompressionType::None).await;
+            let bytes = write_bytes(&res, PROTOCOL_VERSION_V2).await;
 
             for truncate_at in [0, 10, bytes.len() - 1] {
                 let truncated = &bytes[..truncate_at];
@@ -289,7 +273,7 @@ mod tests {
     fn invalid_message_type_fails() {
         block_on(async {
             let res = make_response(ClusterResponseType::Heartbeat);
-            let mut bytes = write_bytes(&res, PROTOCOL_VERSION_V2, CompressionType::None).await;
+            let mut bytes = write_bytes(&res, PROTOCOL_VERSION_V2).await;
 
             bytes[4..8].copy_from_slice(&99u32.to_le_bytes());
             let header = WireHeader::from_reader(&mut Cursor::new(bytes.clone()), u64::MAX).await.unwrap();

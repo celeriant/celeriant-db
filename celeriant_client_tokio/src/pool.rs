@@ -138,6 +138,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
+
 use celeriant_msg::process_client_requests::ClientRequest;
 use celeriant_msg::process_client_responses::ClientResponse;
 use celeriant_msg::request::read_filters::ReadFilters;
@@ -152,7 +153,6 @@ use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEven
 use celeriant_msg::response::aggregate_event_batch::AggregateEventBatch;
 use celeriant_msg::response::responses::{AggregateDetailsResponse, ReadResponse, SuccessResponse};
 use celeriant_wal::aggregate_key::AggregateKey;
-use celeriant_wal::compression_type::CompressionType;
 use tokio::time::Duration;
 
 use crate::celeriant_client::{CeleriantClient, ClientIdentityConfig, ClientTlsConfig};
@@ -187,10 +187,6 @@ pub struct PoolOptions {
     pub idle_timeout: Duration,
     /// When true, reads go only to followers (default: false)
     pub route_reads_to_followers: bool,
-    /// Default compression algorithm (default: Zstd level 3)
-    pub compression: CompressionType,
-    /// Payload size threshold above which auto-compression is applied (default: 1024)
-    pub auto_compression_threshold: u64,
     /// Maximum number of seed nodes to try during leader failover (default: 3)
     pub max_leader_retries: usize,
 }
@@ -209,8 +205,6 @@ impl Default for PoolOptions {
             max_response_size: 64 * 1024 * 1024,
             idle_timeout: Duration::from_secs(25),
             route_reads_to_followers: false,
-            compression: CompressionType::Zstd { level: 3 },
-            auto_compression_threshold: 1024,
             max_leader_retries: 3,
         }
     }
@@ -268,16 +262,6 @@ impl PoolOptions {
 
     pub fn with_route_reads_to_followers(mut self, v: bool) -> Self {
         self.route_reads_to_followers = v;
-        self
-    }
-
-    pub fn with_compression(mut self, c: CompressionType) -> Self {
-        self.compression = c;
-        self
-    }
-
-    pub fn with_auto_compression_threshold(mut self, bytes: u64) -> Self {
-        self.auto_compression_threshold = bytes;
         self
     }
 
@@ -341,10 +325,13 @@ struct NodePool {
     /// within `CIRCUIT_BREAKER_COOLDOWN` of this timestamp fail immediately
     /// instead of blocking on TCP connect to a potentially dead host.
     last_connect_failure: Mutex<Option<Instant>>,
+    /// Shared pool-level dict cache. Allows `create_client` to supply a known sha
+    /// and store received bytes without a back-reference to `CeleriantPool`.
+    dict_cache: Arc<Mutex<PoolDictCache>>,
 }
 
 impl NodePool {
-    fn new(address: String, options: Arc<PoolOptions>) -> Self {
+    fn new(address: String, options: Arc<PoolOptions>, dict_cache: Arc<Mutex<PoolDictCache>>) -> Self {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(options.max_connections_per_node));
         Self {
             address,
@@ -353,6 +340,7 @@ impl NodePool {
             options,
             connect_semaphore: tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTS),
             last_connect_failure: Mutex::new(None),
+            dict_cache,
         }
     }
 
@@ -432,7 +420,7 @@ impl NodePool {
             }
         }
 
-        match Self::create_client(&self.address, &self.options).await {
+        match Self::create_client(&self.address, &self.options, &self.dict_cache).await {
             Ok(client) => {
                 *self.last_connect_failure.lock().unwrap() = None;
                 Ok(PooledConnection {
@@ -458,7 +446,11 @@ impl NodePool {
         // If over limit, the connection is simply dropped.
     }
 
-    async fn create_client(address: &str, options: &PoolOptions) -> Result<CeleriantClient, ClientError> {
+    async fn create_client(
+        address: &str,
+        options: &PoolOptions,
+        dict_cache: &Arc<Mutex<PoolDictCache>>,
+    ) -> Result<CeleriantClient, ClientError> {
         let mut client = CeleriantClient::connect_with_timeout(
             address,
             Some(options.connection_timeout),
@@ -469,12 +461,21 @@ impl NodePool {
         client = client
             .with_timeout(options.request_timeout)
             .with_max_request_size(options.max_request_size)
-            .with_max_response_size(options.max_response_size)
-            .with_compression(options.compression)
-            .with_auto_compression_threshold(options.auto_compression_threshold);
+            .with_max_response_size(options.max_response_size);
 
         if let Some(ref identity) = options.identity_config {
-            client.identify(identity).await?;
+            let known_sha = dict_cache.lock().unwrap().last_sha.clone();
+            let dict_cache_ref = Arc::clone(dict_cache);
+            client.identify_with_known_sha(identity, known_sha, move |sha| {
+                dict_cache_ref.lock().unwrap().cache.get(sha).cloned()
+            }).await?;
+
+            // If the client received new dict bytes, store them in the pool cache.
+            if let Some(ref d) = client.current_dict {
+                let mut guard = dict_cache.lock().unwrap();
+                guard.cache.entry(d.sha.clone()).or_insert_with(|| Arc::clone(&d.bytes));
+                guard.last_sha = Some(d.sha.clone());
+            }
         }
 
         Ok(client)
@@ -522,6 +523,25 @@ impl Drop for PooledConnection {
 // CeleriantPool
 // ---------------------------------------------------------------------------
 
+/// Pool-level content-addressed dict cache.
+///
+/// All connections to the same cluster (or distinct clusters sharing a dict)
+/// read from one in-memory copy. `last_sha` is the most-recently-seen cluster
+/// dict sha, sent as `known_dict_sha256` on every new connection so the server
+/// can skip re-shipping the bytes.
+struct PoolDictCache {
+    /// sha256 → bytes. Content-addressed so same dict under different names costs nothing.
+    cache: HashMap<String, Arc<[u8]>>,
+    /// Most recently confirmed dict sha for this pool's cluster.
+    last_sha: Option<String>,
+}
+
+impl PoolDictCache {
+    fn new() -> Self {
+        Self { cache: HashMap::new(), last_sha: None }
+    }
+}
+
 /// Topology-aware connection pool.
 ///
 /// Routes writes to the leader, distributes reads across nodes, handles
@@ -534,6 +554,8 @@ pub struct CeleriantPool {
     nodes: RwLock<HashMap<String, Arc<NodePool>>>,
     leader_address: RwLock<Option<String>>,
     read_counter: AtomicU64,
+    /// Pool-level dict cache shared between all node pools in this pool.
+    dict_cache: Arc<Mutex<PoolDictCache>>,
 }
 
 impl CeleriantPool {
@@ -544,7 +566,20 @@ impl CeleriantPool {
             nodes: RwLock::new(HashMap::new()),
             leader_address: RwLock::new(None),
             read_counter: AtomicU64::new(0),
+            dict_cache: Arc::new(Mutex::new(PoolDictCache::new())),
         }
+    }
+
+    /// Returns the cached dict bytes for `sha`, or `None` if not yet cached.
+    pub fn dict_for_sha(&self, sha: &str) -> Option<Arc<[u8]>> {
+        self.dict_cache.lock().unwrap().cache.get(sha).cloned()
+    }
+
+    /// Insert `bytes` under `sha` and record it as the last-known cluster dict.
+    pub fn cache_dict(&self, sha: String, bytes: Arc<[u8]>) {
+        let mut guard = self.dict_cache.lock().unwrap();
+        guard.cache.insert(sha.clone(), bytes);
+        guard.last_sha = Some(sha);
     }
 
     // --- High-level operations ---
@@ -579,8 +614,6 @@ impl CeleriantPool {
             allow_create: options.allow_create,
             expected_event_batch_index: options.expected_event_batch_index,
             enforce_client_idempotency: options.enforce_client_idempotency,
-            compression_type_id: 0,
-            compression_level: None,
         });
         self.write(WriteRequest {
             correlation_id: None,
@@ -662,7 +695,8 @@ impl CeleriantPool {
     /// Create a dedicated non-pooled WatchConnection.
     ///
     /// The pool's TLS and identity configuration are applied to the watch
-    /// connection, overriding any values set on `options`.
+    /// connection, overriding any values set on `options`. The pool's dict
+    /// cache is threaded in so the watch stream can decompress ZstdDict responses.
     pub async fn watch(
         &self,
         request: WatchRequest,
@@ -671,7 +705,16 @@ impl CeleriantPool {
         let address = self.primary_address();
         options.tls_config = self.options.tls_config.clone();
         options.identity_config = self.options.identity_config.clone();
-        WatchConnection::connect(&address, request, options).await
+
+        let known_sha = self.dict_cache.lock().unwrap().last_sha.clone();
+        let dict_cache = Arc::clone(&self.dict_cache);
+        WatchConnection::connect_with_dict(
+            &address,
+            request,
+            options,
+            known_sha,
+            move |sha| dict_cache.lock().unwrap().cache.get(sha).cloned(),
+        ).await
     }
 
     // --- Low-level access ---
@@ -861,10 +904,15 @@ impl CeleriantPool {
             }
         }
         // Slow path: write lock.
+        let dict_cache = Arc::clone(&self.dict_cache);
         let mut guard = self.nodes.write().unwrap();
         guard
             .entry(address.to_owned())
-            .or_insert_with(|| Arc::new(NodePool::new(address.to_owned(), Arc::clone(&self.options))))
+            .or_insert_with(|| Arc::new(NodePool::new(
+                address.to_owned(),
+                Arc::clone(&self.options),
+                dict_cache,
+            )))
             .clone()
     }
 }
@@ -960,7 +1008,6 @@ fn is_shard_routing_error(error: &ClientError) -> bool {
 /// Streaming list-orgs iterator that holds a pooled connection for its lifetime.
 pub struct PooledListOrgsIterator {
     conn: PooledConnection,
-    compression: celeriant_wal::compression_type::CompressionType,
     shard_cursors: HashMap<u64, Option<u64>>,
     active_shards: VecDeque<u64>,
     max_shard: Option<u64>,
@@ -978,7 +1025,6 @@ impl PooledListOrgsIterator {
         shard_cursors.insert(options.start_shard, None);
         Self {
             conn,
-            compression: options.compression,
             shard_cursors,
             active_shards,
             max_shard: options.max_shard_hint,
@@ -1026,7 +1072,7 @@ impl PooledListOrgsIterator {
             shard_id,
             cursor,
         });
-        match self.conn.client().send_request(&request, self.compression).await {
+        match self.conn.client().send_request(&request).await {
             Ok(ClientResponse::ListOrgs(response)) => {
                 self.buffer.extend(response.orgs);
                 if let Some(next_cursor) = response.next_cursor {
@@ -1085,7 +1131,6 @@ impl PooledListOrgsIterator {
 /// its lifetime.
 pub struct PooledListAggregateTypesIterator {
     conn: PooledConnection,
-    compression: celeriant_wal::compression_type::CompressionType,
     org_id: Option<u128>,
     shard_cursors: HashMap<u64, Option<u64>>,
     active_shards: VecDeque<u64>,
@@ -1108,7 +1153,6 @@ impl PooledListAggregateTypesIterator {
         shard_cursors.insert(options.start_shard, None);
         Self {
             conn,
-            compression: options.compression,
             org_id,
             shard_cursors,
             active_shards,
@@ -1159,7 +1203,7 @@ impl PooledListAggregateTypesIterator {
             org_id: self.org_id,
             cursor,
         });
-        match self.conn.client().send_request(&request, self.compression).await {
+        match self.conn.client().send_request(&request).await {
             Ok(ClientResponse::ListAggregateTypes(response)) => {
                 self.buffer.extend(response.aggregate_types);
                 if let Some(next_cursor) = response.next_cursor {
@@ -1218,7 +1262,6 @@ impl PooledListAggregateTypesIterator {
 /// lifetime. Merges stats across shards/pages and deduplicates by aggregate key.
 pub struct PooledListAggregatesIterator {
     conn: PooledConnection,
-    compression: celeriant_wal::compression_type::CompressionType,
     org_id: Option<u128>,
     aggregate_type_id: Option<u128>,
     include_deleted: bool,
@@ -1247,7 +1290,6 @@ impl PooledListAggregatesIterator {
         shard_cursors.insert(options.start_shard, None);
         Self {
             conn,
-            compression: options.compression,
             org_id,
             aggregate_type_id,
             include_deleted: options.include_deleted,
@@ -1330,7 +1372,7 @@ impl PooledListAggregatesIterator {
             aggregate_type_id: self.aggregate_type_id,
             cursor,
         });
-        match self.conn.client().send_request(&request, self.compression).await {
+        match self.conn.client().send_request(&request).await {
             Ok(ClientResponse::ListAggregates(response)) => {
                 self.buffer.extend(response.aggregates);
                 if let Some(next_cursor) = response.next_cursor {
@@ -1378,5 +1420,49 @@ impl PooledListAggregatesIterator {
             results.push(item?);
         }
         Ok(results)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pool_dict_cache_insert_and_lookup() {
+        let pool = CeleriantPool::new(PoolOptions::new("127.0.0.1:10000"));
+        let bytes: Arc<[u8]> = Arc::from(b"dict bytes" as &[u8]);
+
+        assert!(pool.dict_for_sha("sha1").is_none());
+
+        pool.cache_dict("sha1".to_string(), Arc::clone(&bytes));
+
+        let found = pool.dict_for_sha("sha1").expect("should be cached");
+        assert!(Arc::ptr_eq(&found, &bytes));
+    }
+
+    #[test]
+    fn pool_dict_cache_is_content_addressed() {
+        let pool = CeleriantPool::new(PoolOptions::new("127.0.0.1:10000"));
+        let bytes: Arc<[u8]> = Arc::from(b"same bytes" as &[u8]);
+
+        pool.cache_dict("sha-a".to_string(), Arc::clone(&bytes));
+        pool.cache_dict("sha-b".to_string(), Arc::clone(&bytes));
+
+        // Both shas present.
+        assert!(pool.dict_for_sha("sha-a").is_some());
+        assert!(pool.dict_for_sha("sha-b").is_some());
+    }
+
+    #[test]
+    fn pool_dict_cache_reuse_does_not_overwrite_existing_entry() {
+        let pool = CeleriantPool::new(PoolOptions::new("127.0.0.1:10000"));
+        let bytes: Arc<[u8]> = Arc::from(b"v1 dict" as &[u8]);
+        pool.cache_dict("sha1".to_string(), Arc::clone(&bytes));
+
+        // A second insert for the same sha (e.g. a reconnect) must not overwrite.
+        // The NodePool uses `entry().or_insert_with()`.
+        // Verify the first pointer is still returned.
+        let found = pool.dict_for_sha("sha1").unwrap();
+        assert!(Arc::ptr_eq(&found, &bytes));
     }
 }

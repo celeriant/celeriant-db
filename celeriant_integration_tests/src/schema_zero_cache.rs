@@ -23,7 +23,7 @@ use celeriant_msg::{
     request::requests::{RegisterSchemaRequest, SingleAggregateWrite, WriteRequest},
 };
 use celeriant_wal::{
-    aggregate_key::AggregateKey, compression_type::CompressionType,
+    aggregate_key::AggregateKey,
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
     schema_key::SchemaKey,
 };
@@ -77,8 +77,6 @@ fn write_event(
             allow_create,
             expected_event_batch_index: Some(batch_index),
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -136,40 +134,40 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create aggregate
     let req = write_event(&agg, 1, 0, br#"{"name":"pre","age":0}"#, 0, true);
-    client.send_request(&req, CompressionType::None).await?;
+    client.send_request(&req).await?;
     println!("  Aggregate created");
 
     // Register schema
     let req = register_schema_request(1, 100, 1, 0, schema.to_string());
-    client.send_request(&req, CompressionType::None).await?;
+    client.send_request(&req).await?;
     println!("  Schema registered: PASS");
 
     // Valid write
     let req = write_event(&agg, 1, 0, br#"{"name":"Alice","age":30}"#, 1, false);
-    client.send_request(&req, CompressionType::None).await?;
+    client.send_request(&req).await?;
     println!("  Valid write: PASS");
 
     // Invalid — missing field
     let req = write_event(&agg, 1, 0, br#"{"name":"Bob"}"#, 2, false);
-    let result = client.send_request(&req, CompressionType::None).await;
+    let result = client.send_request(&req).await;
     expect_schema_validation_failed(result);
     println!("  Invalid write (missing field) rejected: PASS");
 
     // Invalid — wrong type
     let req = write_event(&agg, 1, 0, br#"{"name":"Carol","age":"thirty"}"#, 2, false);
-    let result = client.send_request(&req, CompressionType::None).await;
+    let result = client.send_request(&req).await;
     expect_schema_validation_failed(result);
     println!("  Invalid write (wrong type) rejected: PASS");
 
     // Invalid — non-JSON
     let req = write_event(&agg, 1, 0, b"not json", 2, false);
-    let result = client.send_request(&req, CompressionType::None).await;
+    let result = client.send_request(&req).await;
     expect_schema_validation_failed(result);
     println!("  Invalid write (non-JSON) rejected: PASS");
 
     // Duplicate registration
     let req = register_schema_request(1, 100, 1, 0, schema.to_string());
-    let result = client.send_request(&req, CompressionType::None).await;
+    let result = client.send_request(&req).await;
     expect_schema_already_exists(result);
     println!("  Duplicate registration rejected: PASS\n");
 
@@ -185,18 +183,18 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Valid write after restart
     let req = write_event(&agg, 1, 0, br#"{"name":"Dave","age":25}"#, 2, false);
-    client.send_request(&req, CompressionType::None).await?;
+    client.send_request(&req).await?;
     println!("  Valid write after restart: PASS");
 
     // Invalid write after restart
     let req = write_event(&agg, 1, 0, br#"{"name":"Eve"}"#, 3, false);
-    let result = client.send_request(&req, CompressionType::None).await;
+    let result = client.send_request(&req).await;
     expect_schema_validation_failed(result);
     println!("  Invalid write rejected after restart: PASS");
 
     // Duplicate registration after restart
     let req = register_schema_request(1, 100, 1, 0, schema.to_string());
-    let result = client.send_request(&req, CompressionType::None).await;
+    let result = client.send_request(&req).await;
     expect_schema_already_exists(result);
     println!("  Duplicate registration rejected after restart: PASS\n");
 
@@ -209,33 +207,33 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Register a second schema for a different event type
     let schema2 = r#"{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}"#;
     let req = register_schema_request(1, 100, 2, 0, schema2.to_string());
-    client.send_request(&req, CompressionType::None).await?;
+    client.send_request(&req).await?;
     println!("  Second schema registered: PASS");
 
     // Valid write against second schema
     let req = write_event(&agg, 2, 0, br#"{"id":42}"#, 3, false);
-    client.send_request(&req, CompressionType::None).await?;
+    client.send_request(&req).await?;
     println!("  Valid write against second schema: PASS");
 
     // Invalid write against second schema
     let req = write_event(&agg, 2, 0, br#"{"id":"not_int"}"#, 4, false);
-    let result = client.send_request(&req, CompressionType::None).await;
+    let result = client.send_request(&req).await;
     expect_schema_validation_failed(result);
     println!("  Invalid write against second schema rejected: PASS");
 
     // First schema still enforced
     let req = write_event(&agg, 1, 0, br#"{"name":"Frank","age":40}"#, 4, false);
-    client.send_request(&req, CompressionType::None).await?;
+    client.send_request(&req).await?;
     println!("  First schema still enforced (valid): PASS");
 
     let req = write_event(&agg, 1, 0, br#"{"name":"Grace"}"#, 5, false);
-    let result = client.send_request(&req, CompressionType::None).await;
+    let result = client.send_request(&req).await;
     expect_schema_validation_failed(result);
     println!("  First schema still enforced (invalid): PASS");
 
     // Unschema'd event type still passes
     let req = write_event(&agg, 99, 0, b"anything goes", 5, false);
-    client.send_request(&req, CompressionType::None).await?;
+    client.send_request(&req).await?;
     println!("  Unschema'd event type passes: PASS\n");
 
     // ========================================
@@ -250,32 +248,32 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // First schema still enforced
     let req = write_event(&agg, 1, 0, br#"{"name":"Hank","age":50}"#, 6, false);
-    client.send_request(&req, CompressionType::None).await?;
+    client.send_request(&req).await?;
     println!("  First schema valid write: PASS");
 
     let req = write_event(&agg, 1, 0, br#"{"age":50}"#, 7, false);
-    let result = client.send_request(&req, CompressionType::None).await;
+    let result = client.send_request(&req).await;
     expect_schema_validation_failed(result);
     println!("  First schema invalid write rejected: PASS");
 
     // Second schema still enforced
     let req = write_event(&agg, 2, 0, br#"{"id":99}"#, 7, false);
-    client.send_request(&req, CompressionType::None).await?;
+    client.send_request(&req).await?;
     println!("  Second schema valid write: PASS");
 
     let req = write_event(&agg, 2, 0, br#"{"id":"nope"}"#, 8, false);
-    let result = client.send_request(&req, CompressionType::None).await;
+    let result = client.send_request(&req).await;
     expect_schema_validation_failed(result);
     println!("  Second schema invalid write rejected: PASS");
 
     // Both duplicates rejected
     let req = register_schema_request(1, 100, 1, 0, schema.to_string());
-    let result = client.send_request(&req, CompressionType::None).await;
+    let result = client.send_request(&req).await;
     expect_schema_already_exists(result);
     println!("  First schema duplicate rejected: PASS");
 
     let req = register_schema_request(1, 100, 2, 0, schema2.to_string());
-    let result = client.send_request(&req, CompressionType::None).await;
+    let result = client.send_request(&req).await;
     expect_schema_already_exists(result);
     println!("  Second schema duplicate rejected: PASS\n");
 

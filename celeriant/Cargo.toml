@@ -23,6 +23,7 @@ small-metablock = [
 
 [dependencies]
 celeriant_crypto = { path = "../celeriant_crypto" }
+celeriant_wal = { path = "../celeriant_wal" }
 celeriant_distributed = { path = "../celeriant_distributed" }
 celeriant_runtimes = { path = "../celeriant_runtimes" }
 celeriant_sidecar = { path = "../celeriant_sidecar" }
@@ -40,6 +41,8 @@ x509-parser.workspace = true
 toml.workspace = true
 serde.workspace = true
 base64.workspace = true
+sha2.workspace = true
+hex.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

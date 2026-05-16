@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use celeriant_crypto::Crypto;
 use celeriant_msg::error_codes;
 use celeriant_msg::process_client_requests::ClientRequest;
@@ -5,17 +7,15 @@ use celeriant_msg::process_client_responses::ClientResponse;
 use celeriant_msg::process_identify::{IDENTIFY_RESPONSE_TYPE_ID, read_identify_response, write_identify_request};
 use celeriant_msg::request::requests::{IdentifyRequest, WatchRequest};
 use celeriant_msg::response::responses::WatchResponse;
-use celeriant_wal::compression_type::CompressionType;
 use celeriant_wire::network::wire_header::{PROTOCOL_VERSION_V2, WireHeader};
 use tokio::time::{timeout, Duration};
 
-use crate::celeriant_client::{ClientIdentityConfig, ClientStream, ClientTlsConfig};
+use crate::celeriant_client::{CachedDict, ClientIdentityConfig, ClientStream, ClientTlsConfig};
 use crate::client_error::ClientError;
 
 /// Options for configuring a watch connection
 #[derive(Clone)]
 pub struct WatchOptions {
-    pub compression: CompressionType,
     pub timeout: Option<Duration>,
     pub start_shard: u64,
     pub max_shard_hint: Option<u64>,
@@ -26,7 +26,6 @@ pub struct WatchOptions {
 impl Default for WatchOptions {
     fn default() -> Self {
         Self {
-            compression: CompressionType::None,
             timeout: None,
             start_shard: 0,
             max_shard_hint: None,
@@ -39,12 +38,13 @@ impl Default for WatchOptions {
 struct ShardStream {
     stream: crate::celeriant_client::ClientStream,
     max_request_size: u64,
+    current_dict: Option<CachedDict>,
 }
 
 impl ShardStream {
     async fn read_next(&mut self) -> Result<WatchResponse, ClientError> {
-        let response = ClientResponse::read_response(&mut self.stream, self.max_request_size).await?;
-
+        let dict = self.current_dict.as_ref().map(|d| d.bytes.as_ref());
+        let response = crate::tokio_wire::read_response(&mut self.stream, self.max_request_size, dict).await?;
         match response {
             ClientResponse::Watch(watch_resp) => Ok(watch_resp),
             ClientResponse::ProtocolError(_) => Err(ClientError::ProtocolError),
@@ -69,10 +69,15 @@ struct MultiShardState {
     _tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
-async fn identify_stream(
+async fn identify_stream<F>(
     stream: &mut ClientStream,
     identity: &ClientIdentityConfig,
-) -> Result<(), ClientError> {
+    known_sha: Option<String>,
+    dict_lookup: F,
+) -> Result<Option<CachedDict>, ClientError>
+where
+    F: FnOnce(&str) -> Option<Arc<[u8]>>,
+{
     let (public_key, nonce, signature) = match (&identity.public_key, &identity.private_key) {
         (Some(pub_key), Some(priv_key)) => {
             let n = Crypto::generate_nonce()?;
@@ -88,14 +93,27 @@ async fn identify_stream(
         nonce,
         signature,
         api_key: identity.api_key.clone(),
+        known_dict_sha256: known_sha,
     };
 
     write_identify_request(stream, &req, PROTOCOL_VERSION_V2).await?;
 
     let header = WireHeader::from_reader(stream, 10_000_000).await?;
     if header.message_type == IDENTIFY_RESPONSE_TYPE_ID {
-        read_identify_response(header, stream).await?;
-        return Ok(());
+        let resp = read_identify_response(header, stream).await?;
+        let cached = match (resp.compression_dict_sha256, resp.compression_dict_bytes) {
+            (Some(sha), Some(bytes)) => {
+                Some(CachedDict { sha, bytes: Arc::from(bytes.into_boxed_slice()) })
+            }
+            (Some(sha), None) => {
+                match dict_lookup(&sha) {
+                    Some(bytes) => Some(CachedDict { sha, bytes }),
+                    None => None
+                }
+            }
+            (None, _) => None,
+        };
+        return Ok(cached);
     }
     let response = ClientResponse::read_from_header(header, stream).await?;
     match response {
@@ -142,6 +160,20 @@ impl WatchConnection {
         request: WatchRequest,
         options: WatchOptions,
     ) -> Result<Self, ClientError> {
+        Self::connect_with_dict(address, request, options, None, |_| None).await
+    }
+
+    /// Like `connect` but supplies a cached dict sha and lookup closure (used by the pool).
+    pub(crate) async fn connect_with_dict<F>(
+        address: &str,
+        request: WatchRequest,
+        options: WatchOptions,
+        known_sha: Option<String>,
+        dict_lookup: F,
+    ) -> Result<Self, ClientError>
+    where
+        F: Fn(&str) -> Option<Arc<[u8]>> + Clone + Send + 'static,
+    {
         let max_request_size = 10_000_000;
 
         // If max_shard_hint is provided, skip probe and open N connections directly
@@ -153,6 +185,8 @@ impl WatchConnection {
                 &options,
                 num_shards,
                 max_request_size,
+                known_sha,
+                dict_lookup,
             )
             .await;
         }
@@ -165,27 +199,29 @@ impl WatchConnection {
         )
         .await?;
 
-        if let Some(ref identity) = options.identity_config {
-            identify_stream(&mut stream, identity).await?;
-        }
+        let current_dict = if let Some(ref identity) = options.identity_config {
+            identify_stream(&mut stream, identity, known_sha.clone(), dict_lookup.clone()).await?
+        } else {
+            None
+        };
 
-        // Send initial watch request without shard_id
+        // Send initial watch request without shard_id. Watch is fixed-size — never compressed.
         ClientRequest::write_request(
             &mut stream,
             &ClientRequest::Watch(request.clone()),
-            options.compression,
             max_request_size,
             PROTOCOL_VERSION_V2,
         )
         .await?;
 
-        let response = ClientResponse::read_response(&mut stream, max_request_size).await?;
+        let response = crate::tokio_wire::read_response(&mut stream, max_request_size, current_dict.as_ref().map(|d| d.bytes.as_ref())).await?;
 
         match response {
             ClientResponse::Watch(_) => Ok(Self {
                 mode: WatchMode::SingleShard(ShardStream {
                     stream,
                     max_request_size,
+                    current_dict,
                 }),
             }),
             ClientResponse::GenericError(error)
@@ -201,13 +237,12 @@ impl WatchConnection {
                 ClientRequest::write_request(
                     &mut stream,
                     &ClientRequest::Watch(shard0_request),
-                    options.compression,
                     max_request_size,
                     PROTOCOL_VERSION_V2,
                 )
                 .await?;
 
-                let response = ClientResponse::read_response(&mut stream, max_request_size).await?;
+                let response = crate::tokio_wire::read_response(&mut stream, max_request_size, current_dict.as_ref().map(|d| d.bytes.as_ref())).await?;
                 match response {
                     ClientResponse::Watch(_) => {}
                     ClientResponse::GenericError(error) => {
@@ -219,6 +254,7 @@ impl WatchConnection {
                 let shard0_stream = ShardStream {
                     stream,
                     max_request_size,
+                    current_dict,
                 };
 
                 // Open connections for shards 1..N-1 in parallel
@@ -230,6 +266,8 @@ impl WatchConnection {
                         &options,
                         shard_id,
                         max_request_size,
+                        known_sha.clone(),
+                        dict_lookup.clone(),
                     ));
                 }
                 let results = futures_util::future::join_all(futures).await;
@@ -272,13 +310,18 @@ impl WatchConnection {
         }
     }
 
-    async fn connect_shard(
+    async fn connect_shard<F>(
         address: &str,
         request: &WatchRequest,
         options: &WatchOptions,
         shard_id: u64,
         max_request_size: u64,
-    ) -> Result<ShardStream, ClientError> {
+        known_sha: Option<String>,
+        dict_lookup: F,
+    ) -> Result<ShardStream, ClientError>
+    where
+        F: FnOnce(&str) -> Option<Arc<[u8]>>,
+    {
         let mut stream = crate::celeriant_client::connect_stream(
             address,
             options.timeout,
@@ -286,9 +329,11 @@ impl WatchConnection {
         )
         .await?;
 
-        if let Some(ref identity) = options.identity_config {
-            identify_stream(&mut stream, identity).await?;
-        }
+        let current_dict = if let Some(ref identity) = options.identity_config {
+            identify_stream(&mut stream, identity, known_sha, dict_lookup).await?
+        } else {
+            None
+        };
 
         let mut shard_request = request.clone();
         shard_request.shard_id = Some(shard_id);
@@ -296,30 +341,35 @@ impl WatchConnection {
         ClientRequest::write_request(
             &mut stream,
             &ClientRequest::Watch(shard_request),
-            options.compression,
             max_request_size,
             PROTOCOL_VERSION_V2,
         )
         .await?;
 
-        let response = ClientResponse::read_response(&mut stream, max_request_size).await?;
+        let response = crate::tokio_wire::read_response(&mut stream, max_request_size, current_dict.as_ref().map(|d| d.bytes.as_ref())).await?;
         match response {
             ClientResponse::Watch(_) => Ok(ShardStream {
                 stream,
                 max_request_size,
+                current_dict,
             }),
             ClientResponse::GenericError(error) => Err(ClientError::from_error_response(error)),
             _ => Err(ClientError::ProtocolError),
         }
     }
 
-    async fn connect_multi_shard(
+    async fn connect_multi_shard<F>(
         address: &str,
         request: &WatchRequest,
         options: &WatchOptions,
         num_shards: u64,
         max_request_size: u64,
-    ) -> Result<Self, ClientError> {
+        known_sha: Option<String>,
+        dict_lookup: F,
+    ) -> Result<Self, ClientError>
+    where
+        F: Fn(&str) -> Option<Arc<[u8]>> + Clone + Send + 'static,
+    {
         let mut futures = Vec::new();
         for shard_id in options.start_shard..num_shards {
             futures.push(Self::connect_shard(
@@ -328,6 +378,8 @@ impl WatchConnection {
                 options,
                 shard_id,
                 max_request_size,
+                known_sha.clone(),
+                dict_lookup.clone(),
             ));
         }
 
@@ -355,5 +407,91 @@ impl WatchConnection {
         rest[..end]
             .parse::<u64>()
             .map_err(|_| ClientError::ProtocolError)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use celeriant_msg::process_client_responses::ClientResponse;
+    use celeriant_msg::response::responses::WatchResponse;
+    use celeriant_msg::response::watch_event::WatchResponseEvent;
+    use celeriant_wal::builtin_dict::BUILTIN_DICT_BYTES;
+    use celeriant_wire::network::wire_header::{PROTOCOL_VERSION_V2, WIRE_HEADER_SIZE};
+    use futures_lite::io::Cursor;
+
+    fn test_codec() -> celeriant_wire::codec::compression::DictCodec {
+        celeriant_wire::codec::compression::DictCodec::new(BUILTIN_DICT_BYTES, 3)
+            .expect("builtin dict must compile")
+    }
+
+    /// Build a wire frame for a WatchResponse using ZstdDict compression with the builtin dict.
+    fn make_zstd_dict_watch_frame(response: &WatchResponse) -> Vec<u8> {
+        let codec = test_codec();
+        futures_lite::future::block_on(async {
+            let mut buf = Vec::new();
+            ClientResponse::write_response(
+                &mut buf,
+                &ClientResponse::Watch(response.clone()),
+                true,
+                &codec,
+                64 * 1024 * 1024,
+                PROTOCOL_VERSION_V2,
+            )
+            .await
+            .expect("write_response");
+            buf
+        })
+    }
+
+    #[test]
+    fn shard_stream_decompresses_zstd_dict_response() {
+        let expected = WatchResponse {
+            events: (0u64..50).map(|i| WatchResponseEvent {
+                org_id: i as u128,
+                aggregate_type_id: (i + 1) as u128,
+                aggregate_id: (i + 2) as u128,
+                operation: 1,
+                from_event_batch_index: Some(i),
+                to_event_batch_index: Some(i + 10),
+                keep_from_event_batch_index: None,
+            }).collect(),
+        };
+
+        let frame = make_zstd_dict_watch_frame(&expected);
+
+        let compression_byte = frame[16];
+        if compression_byte != 1 {
+            let parsed = futures_lite::future::block_on(async {
+                let header = celeriant_wire::network::wire_header::WireHeader::from_reader(
+                    &mut Cursor::new(frame.clone()),
+                    u64::MAX,
+                ).await.expect("header");
+                crate::tokio_wire::read_from_header(
+                    header,
+                    &mut Cursor::new(frame[WIRE_HEADER_SIZE..].to_vec()),
+                    Some(BUILTIN_DICT_BYTES),
+                ).await.expect("tokio_wire::read_from_header")
+            });
+            assert!(matches!(parsed, ClientResponse::Watch(_)));
+            return;
+        }
+
+        let with_dict = futures_lite::future::block_on(async {
+            let header = celeriant_wire::network::wire_header::WireHeader::from_reader(
+                &mut Cursor::new(frame.clone()),
+                u64::MAX,
+            ).await.expect("header");
+            crate::tokio_wire::read_from_header(
+                header,
+                &mut Cursor::new(frame[WIRE_HEADER_SIZE..].to_vec()),
+                Some(BUILTIN_DICT_BYTES),
+            ).await.expect("tokio_wire::read_from_header")
+        });
+        match with_dict {
+            ClientResponse::Watch(parsed) => {
+                assert_eq!(parsed.events.len(), expected.events.len());
+            }
+            other => panic!("expected Watch, got {:?}", other.response_type()),
+        }
     }
 }

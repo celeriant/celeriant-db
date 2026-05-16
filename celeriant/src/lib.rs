@@ -103,13 +103,45 @@ pub fn startup(args: Vec<String>) -> Result<(), std::io::Error> {
         timestamp_epoch_offset_secs: server_config.timestamp_epoch_offset_secs,
         routing_rule: server_config.routing_rule.to_string(),
         reserve_coordinator_shard: server_config.reserve_coordinator_shard,
+        compression: server_meta::CompressionMeta::default(),
     };
-    if let Err(e) = server_meta::validate_or_create(&server_config.data_root, &current_meta) {
+    let desired_compression = server_config.to_compression_meta();
+    if let Err(e) = server_meta::validate_or_create(
+        &server_config.data_root,
+        &current_meta,
+        &desired_compression,
+        Some(celeriant_wal::resolve_builtin_dict),
+    ) {
         error!("{}", e);
         std::process::exit(1);
     } else {
         info!("No breaking configuration changes detected");
     }
+
+    // Load dict bytes for shard executors. Happens before any port listens (Inv 4).
+    let (dict_bytes, dict_sha256): (std::sync::Arc<[u8]>, std::sync::Arc<str>) = {
+        let dict_path = server_config.data_root.join("dictionary.zstd_dict");
+        match std::fs::read(&dict_path) {
+            Ok(bytes) => {
+                let name = desired_compression.dictionary_name.as_deref().unwrap_or("(unnamed)");
+                let full_sha = {
+                    use hex::ToHex;
+                    use sha2::{Digest, Sha256};
+                    let digest = Sha256::digest(&bytes);
+                    let s: String = digest.encode_hex();
+                    s
+                };
+                info!("loaded dict '{}' (sha {}...)", name, &full_sha[..12]);
+                let arc_bytes = std::sync::Arc::from(bytes.into_boxed_slice());
+                let arc_sha: std::sync::Arc<str> = full_sha.into();
+                (arc_bytes, arc_sha)
+            }
+            Err(e) => {
+                error!("Failed to read dictionary.zstd_dict: {}", e);
+                std::process::exit(1);
+            }
+        }
+    };
 
     // Detect available memory and compute budget
     let (detected_memory, cgroup_limit, total_budget, memory_budget) = {
@@ -266,7 +298,7 @@ pub fn startup(args: Vec<String>) -> Result<(), std::io::Error> {
         info!("API key authentication enabled");
     }
 
-    let shard_config = server_config.to_shard_config(node_id, nbr_shards, tls_config, api_keys, memory_budget);
+    let shard_config = server_config.to_shard_config(node_id, nbr_shards, tls_config, api_keys, memory_budget, dict_bytes, dict_sha256);
     let sidecar_config = server_config.to_sidecar_config(nbr_shards, node_id);
     let sidecar_store_config = server_config.to_sidecar_store_config();
 

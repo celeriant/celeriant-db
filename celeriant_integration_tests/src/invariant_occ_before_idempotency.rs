@@ -13,7 +13,6 @@ use crate::{count_events, write_event, ServerConfig, TestServer};
 use celeriant_msg::process_client_requests::ClientRequest;
 use celeriant_msg::request::requests::{SingleAggregateWrite, WriteRequest};
 use celeriant_wal::aggregate_key::AggregateKey;
-use celeriant_wal::compression_type::CompressionType;
 use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -47,8 +46,6 @@ async fn write_occ(
             allow_create: false,
             expected_event_batch_index,
             enforce_client_idempotency: enforce_idempotency,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -59,8 +56,7 @@ async fn write_occ(
                 client_id: CLIENT_ID,
                 user_id: None,
                 writes,
-            }),
-            CompressionType::None,
+            })
         )
         .await?;
     Ok(())

@@ -413,16 +413,12 @@ impl AccountService {
                         allow_create: true,
                         expected_event_batch_index: Some(from_proj.last_batch_index),
                         enforce_client_idempotency: true,
-                        compression_type_id: 0,
-                        compression_level: None,
                     }),
                     (to_key, SingleAggregateWrite {
                         events: vec![transfer_in],
                         allow_create: true,
                         expected_event_batch_index: Some(to_proj.last_batch_index),
                         enforce_client_idempotency: true,
-                        compression_type_id: 0,
-                        compression_level: None,
                     }),
                 ]),
             };

@@ -18,7 +18,7 @@
 use celeriant_client_tokio::celeriant_client::CeleriantClient;
 use crate::{write_event, ServerConfig, TestServer};
 use celeriant_msg::{process_client_requests::ClientRequest, process_client_responses::ClientResponse, request::requests::ReadRequest};
-use celeriant_wal::{aggregate_key::AggregateKey, compression_type::CompressionType};
+use celeriant_wal::{aggregate_key::AggregateKey};
 use std::time::{Duration, Instant};
 
 const PORT_BASE: u16 = 20900;
@@ -47,7 +47,7 @@ async fn read_aggregate(
         };
 
         let response = client
-            .send_request(&ClientRequest::Read(read_req), CompressionType::None)
+            .send_request(&ClientRequest::Read(read_req))
             .await?;
 
         match response {

@@ -16,7 +16,7 @@ use celeriant_msg::{
     request::requests::{RegisterSchemaRequest, SingleAggregateWrite, WriteRequest},
 };
 use celeriant_wal::{
-    aggregate_key::AggregateKey, compression_type::CompressionType,
+    aggregate_key::AggregateKey,
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
     schema_key::SchemaKey,
 };
@@ -125,8 +125,6 @@ fn write_event(
             allow_create,
             expected_event_batch_index: Some(batch_index),
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -183,27 +181,27 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("Test 1: Write without schema passes through");
     let valid_json = br#"{"name":"Alice","age":30}"#;
     let req = write_event(&agg, 1, 0, valid_json, 0, true);
-    client.send_request(&req, CompressionType::None).await?;
+    client.send_request(&req).await?;
     println!("  PASS\n");
 
     // Test 2: Register a JSON schema
     println!("Test 2: Register JSON schema");
     let schema = json_schema_for_name_age();
     let req = register_schema_request(1, 100, 1, 0, schema.clone());
-    client.send_request(&req, CompressionType::None).await?;
+    client.send_request(&req).await?;
     println!("  PASS\n");
 
     // Test 3: Write valid event against registered schema
     println!("Test 3: Write valid event against schema");
     let req = write_event(&agg, 1, 0, valid_json, 1, false);
-    client.send_request(&req, CompressionType::None).await?;
+    client.send_request(&req).await?;
     println!("  PASS\n");
 
     // Test 4: Write invalid event — missing required field "age"
     println!("Test 4: Write invalid event rejected (error 2022)");
     let invalid_json = br#"{"name":"Bob"}"#;
     let req = write_event(&agg, 1, 0, invalid_json, 2, false);
-    let result = client.send_request(&req, CompressionType::None).await;
+    let result = client.send_request(&req).await;
     expect_schema_validation_failed(result);
     println!("  PASS\n");
 
@@ -211,7 +209,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("Test 5: Write with wrong type rejected (error 2022)");
     let wrong_type = br#"{"name":"Carol","age":"thirty"}"#;
     let req = write_event(&agg, 1, 0, wrong_type, 2, false);
-    let result = client.send_request(&req, CompressionType::None).await;
+    let result = client.send_request(&req).await;
     expect_schema_validation_failed(result);
     println!("  PASS\n");
 
@@ -219,21 +217,21 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("Test 6: Write non-JSON bytes rejected (error 2022)");
     let not_json = b"this is not json";
     let req = write_event(&agg, 1, 0, not_json, 2, false);
-    let result = client.send_request(&req, CompressionType::None).await;
+    let result = client.send_request(&req).await;
     expect_schema_validation_failed(result);
     println!("  PASS\n");
 
     // Test 7: Duplicate schema registration — error 2020
     println!("Test 7: Duplicate schema registration rejected (error 2020)");
     let req = register_schema_request(1, 100, 1, 0, schema.clone());
-    let result = client.send_request(&req, CompressionType::None).await;
+    let result = client.send_request(&req).await;
     expect_schema_already_exists(result);
     println!("  PASS\n");
 
     // Test 8: Invalid schema — malformed JSON
     println!("Test 8: Invalid schema rejected (error 2021)");
     let req = register_schema_request(1, 100, 2, 0, "not valid json schema {{{".to_string());
-    let result = client.send_request(&req, CompressionType::None).await;
+    let result = client.send_request(&req).await;
     expect_schema_invalid(result);
     println!("  PASS\n");
 
@@ -248,7 +246,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         schema_type: 1, // Avro
         schema: avro_schema.clone(),
     });
-    client.send_request(&req, CompressionType::None).await?;
+    client.send_request(&req).await?;
     println!("  PASS\n");
 
     // Test 9a: Write valid Avro-encoded event
@@ -263,13 +261,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     ).unwrap();
     let agg3 = AggregateKey::new(1, 100, 3);
     let req = write_event(&agg3, 3, 0, &valid_avro, 0, true);
-    client.send_request(&req, CompressionType::None).await?;
+    client.send_request(&req).await?;
     println!("  PASS\n");
 
     // Test 9b: Write invalid bytes against Avro schema — should fail
     println!("Test 9b: Write invalid bytes against Avro schema rejected (error 2022)");
     let req = write_event(&agg3, 3, 0, b"not avro data", 1, false);
-    let result = client.send_request(&req, CompressionType::None).await;
+    let result = client.send_request(&req).await;
     expect_schema_validation_failed(result);
     println!("  PASS\n");
 
@@ -284,7 +282,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         schema_type: 2, // Protobuf
         schema: proto_schema_str,
     });
-    client.send_request(&req, CompressionType::None).await?;
+    client.send_request(&req).await?;
     println!("  PASS\n");
 
     // Test 9d: Write valid Protobuf-encoded event
@@ -294,21 +292,21 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     prost::encoding::int32::encode(2, &42, &mut valid_proto);
     let agg4 = AggregateKey::new(1, 100, 4);
     let req = write_event(&agg4, 4, 0, &valid_proto, 0, true);
-    client.send_request(&req, CompressionType::None).await?;
+    client.send_request(&req).await?;
     println!("  PASS\n");
 
     // Test 9e: Write malformed bytes against Protobuf schema — should fail
     println!("Test 9e: Write malformed bytes against Protobuf schema rejected (error 2022)");
     // Truncated length-delimited field: tag says 5 bytes follow but only 2 present
     let req = write_event(&agg4, 4, 0, &[0x0a, 0x05, 0x41, 0x42], 1, false);
-    let result = client.send_request(&req, CompressionType::None).await;
+    let result = client.send_request(&req).await;
     expect_schema_validation_failed(result);
     println!("  PASS\n");
 
     // Test 9f: Write invalid UTF-8 string against Protobuf schema — should fail
     println!("Test 9f: Write invalid UTF-8 against Protobuf schema rejected (error 2022)");
     let req = write_event(&agg4, 4, 0, &[0x0a, 0x02, 0xff, 0xfe], 1, false);
-    let result = client.send_request(&req, CompressionType::None).await;
+    let result = client.send_request(&req).await;
     expect_schema_validation_failed(result);
     println!("  PASS\n");
 
@@ -322,7 +320,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         schema_type: 2,
         schema: "!!!not-base64!!!:test.Msg".to_string(),
     });
-    let result = client.send_request(&req, CompressionType::None).await;
+    let result = client.send_request(&req).await;
     expect_schema_invalid(result);
     println!("  PASS\n");
 
@@ -330,7 +328,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("Test 10: Write to unregistered minor version passes through");
     let agg2 = AggregateKey::new(1, 100, 2);
     let req = write_event(&agg2, 1, 99, b"anything goes", 0, true);
-    client.send_request(&req, CompressionType::None).await?;
+    client.send_request(&req).await?;
     println!("  PASS\n");
 
     // --- Phase 2: WAL recovery after restart (tests bloom filter + reverse scan) ---
@@ -343,20 +341,20 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Test 11: Write valid event after restart — cache is cold, triggers WAL scan
     println!("Test 11: Valid write succeeds after restart (WAL recovery)");
     let req = write_event(&agg, 1, 0, valid_json, 2, false);
-    client.send_request(&req, CompressionType::None).await?;
+    client.send_request(&req).await?;
     println!("  PASS\n");
 
     // Test 12: Invalid write still rejected after restart
     println!("Test 12: Invalid write rejected after restart");
     let req = write_event(&agg, 1, 0, invalid_json, 3, false);
-    let result = client.send_request(&req, CompressionType::None).await;
+    let result = client.send_request(&req).await;
     expect_schema_validation_failed(result);
     println!("  PASS\n");
 
     // Test 13: Duplicate registration still rejected after restart
     println!("Test 13: Duplicate registration rejected after restart");
     let req = register_schema_request(1, 100, 1, 0, schema.clone());
-    let result = client.send_request(&req, CompressionType::None).await;
+    let result = client.send_request(&req).await;
     expect_schema_already_exists(result);
     println!("  PASS\n");
 
@@ -379,25 +377,25 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create aggregate first
     let req = write_event(&agg_ms, 1, 0, b"pre-schema data", 0, true);
-    client.send_request(&req, CompressionType::None).await?;
+    client.send_request(&req).await?;
 
     // Test 14: Register schema on multi-shard server (routes to shard 0, propagates)
     println!("Test 14: Register schema on multi-shard server");
     let ms_schema = r#"{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}"#.to_string();
     let req = register_schema_request(2, 200, 1, 0, ms_schema);
-    client.send_request(&req, CompressionType::None).await?;
+    client.send_request(&req).await?;
     println!("  PASS\n");
 
     // Test 15: Valid write goes through on multi-shard
     println!("Test 15: Valid write on multi-shard server");
     let req = write_event(&agg_ms, 1, 0, br#"{"id":42}"#, 1, false);
-    client.send_request(&req, CompressionType::None).await?;
+    client.send_request(&req).await?;
     println!("  PASS\n");
 
     // Test 16: Invalid write rejected on multi-shard
     println!("Test 16: Invalid write rejected on multi-shard server (error 2022)");
     let req = write_event(&agg_ms, 1, 0, br#"{"id":"not_a_number"}"#, 2, false);
-    let result = client.send_request(&req, CompressionType::None).await;
+    let result = client.send_request(&req).await;
     expect_schema_validation_failed(result);
     println!("  PASS\n");
 

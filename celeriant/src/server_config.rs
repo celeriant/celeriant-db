@@ -5,6 +5,7 @@ use celeriant_runtimes::{TlsConfig, TlsMode};
 use celeriant_runtimes::{ShardConfig, SidecarConfig};
 use celeriant_shard::timestamp_config::{TimestampConfig, TimestampPrecision};
 use celeriant_sidecar::s3_config::S3Config;
+use celeriant_wal::builtin_dict::BUILTIN_DICT_NAME;
 use clap::Parser;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use clap::ValueEnum;
@@ -17,16 +18,6 @@ pub enum ConfigTimestampPrecision {
     Nanoseconds,
 }
 
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, ValueEnum)]
-pub enum ConfigCompressionType {
-    None,
-    Zstd,
-    #[default]
-    Snappy,
-    Brotli,
-    Gzip,
-}
 
 /// TLS mode for the server listeners.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, ValueEnum)]
@@ -263,18 +254,19 @@ pub struct ServerConfig {
 
     #[arg(
         long,
-        default_value = "snappy",
-        env = "CELERIANT_SERVER_COMPRESSION_ALGORITHM",
-        help = "Compression algorithm for server responses: none, zstd, snappy, brotli, gzip"
+        default_value_t = 3,
+        env = "CELERIANT_WAL_COMPRESSION_LEVEL",
+        help = "Compression level for WAL zstd compression (default: 3)"
     )]
-    pub server_compression_algorithm: ConfigCompressionType,
+    pub wal_compression_level: i32,
 
     #[arg(
         long,
-        env = "CELERIANT_SERVER_COMPRESSION_LEVEL",
-        help = "Compression level for zstd, brotli, or gzip (ignored for none/snappy)"
+        default_value = BUILTIN_DICT_NAME,
+        env = "CELERIANT_WAL_DICTIONARY_NAME",
+        help = "Name of the WAL compression dictionary. A name, not a path."
     )]
-    pub server_compression_level: Option<i32>,
+    pub wal_dictionary_name: String,
 
     #[arg(
         long,
@@ -560,6 +552,14 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
+    pub fn to_compression_meta(&self) -> crate::server_meta::CompressionMeta {
+        crate::server_meta::CompressionMeta {
+            level: Some(self.wal_compression_level as u8),
+            dictionary_name: Some(self.wal_dictionary_name.clone()),
+            dictionary_sha256: None,
+        }
+    }
+
     /// Computes memory budget and validates configuration.
     /// Returns ShardMemoryBudget or error message.
     pub fn compute_memory_budget(&self, num_shards: u32) -> Result<crate::memory_budget::ShardMemoryBudget, String> {
@@ -705,8 +705,10 @@ impl ServerConfig {
         tls_config: Option<Arc<TlsConfig>>,
         api_keys: Option<crate::api_keys::ApiKeysConfig>,
         memory_budget: crate::memory_budget::ShardMemoryBudget,
+        dict_bytes: Arc<[u8]>,
+        dict_sha256: Arc<str>,
     ) -> ShardConfig {
-        use celeriant_runtimes::{CompressionType, TlsCertPaths, ApiKeyHashes};
+        use celeriant_runtimes::{TlsCertPaths, ApiKeyHashes};
         use celeriant_crypto::pki::ClientAuthMode;
 
         let replication_config = if self.standalone {
@@ -780,13 +782,6 @@ impl ServerConfig {
             max_promotion_batch_bytes: self.max_promotion_batch_bytes,
             internode_connection_timeout: Some(Duration::from_millis(self.internode_connection_timeout_ms)),
             internode_request_timeout: Duration::from_millis(self.internode_request_timeout_ms),
-            server_compression_algorithm: match self.server_compression_algorithm {
-                ConfigCompressionType::None => CompressionType::None,
-                ConfigCompressionType::Zstd => CompressionType::Zstd { level: self.server_compression_level.unwrap_or(6) },
-                ConfigCompressionType::Snappy => CompressionType::Snappy,
-                ConfigCompressionType::Brotli => CompressionType::Brotli { level: self.server_compression_level.unwrap_or(6) },
-                ConfigCompressionType::Gzip => CompressionType::Gzip { level: self.server_compression_level.unwrap_or(6) },
-            },
             tls_config,
             tls_cert_paths: if self.tls_cert_reload_interval_secs > 0 {
                 if let (Some(ca), Some(cert), Some(key)) = (
@@ -831,6 +826,9 @@ impl ServerConfig {
             s3_max_concurrent_fallback_uploads: self.s3_max_concurrent_fallback_uploads,
             heartbeat_lease_duration: Duration::from_millis(self.heartbeat_lease_duration_ms),
             reserve_coordinator_shard: self.reserve_coordinator_shard,
+            dict_bytes,
+            dict_sha256,
+            wal_compression_level: self.wal_compression_level,
         }
     }
 
@@ -880,8 +878,8 @@ impl ServerConfig {
         check_field!(shard_log_preallocate_bytes);
         check_field!(internode_connection_timeout_ms);
         check_field!(internode_request_timeout_ms);
-        check_field!(server_compression_algorithm);
-        check_field!(server_compression_level);
+        check_field!(wal_compression_level);
+        check_field!(wal_dictionary_name);
         check_field!(fsync_delay_us);
         check_field!(replication_delay_us);
         check_field!(s3_replication_delay_us);
@@ -988,8 +986,8 @@ impl Default for ServerConfig {
             s3_allow_http: false,
             internode_connection_timeout_ms: 1_000,
             internode_request_timeout_ms: 2_000,
-            server_compression_algorithm: ConfigCompressionType::Snappy,
-            server_compression_level: None,
+            wal_compression_level: 3,
+            wal_dictionary_name: BUILTIN_DICT_NAME.to_string(),
             heartbeat_interval_ms: 500,
             heartbeat_timeout_ms: None,
             heartbeat_hard_timeout_multiplier: 4,
@@ -1017,5 +1015,24 @@ impl Default for ServerConfig {
             metrics_enabled: true,
             metrics_port: 9090,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn to_compression_meta() {
+        let cfg = ServerConfig {
+            wal_compression_level: 3,
+            wal_dictionary_name: "json-web-events-v1".to_string(),
+            ..ServerConfig::default()
+        };
+        let meta = cfg.to_compression_meta();
+        assert_eq!(meta.level, Some(3));
+        assert_eq!(meta.dictionary_name.as_deref(), Some("json-web-events-v1"));
+        // sha is None: validate_or_create computes or reads it
+        assert_eq!(meta.dictionary_sha256, None);
     }
 }

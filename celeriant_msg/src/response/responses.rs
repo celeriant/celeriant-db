@@ -225,6 +225,13 @@ pub struct IdentifyResponse {
     pub client_id: Option<u128>,
     /// Access level granted after authentication. None if auth was disabled.
     pub access_level: Option<AccessLevel>,
+    /// SHA-256 hex string of the cluster's current compression dict. None when algorithm != ZstdDict.
+    #[serde(default)]
+    pub compression_dict_sha256: Option<String>,
+    /// Raw dict bytes (~14 KiB). Shipped once per client when client doesn't have this dict yet.
+    /// None when client's known_dict_sha256 matches
+    #[serde(default)]
+    pub compression_dict_bytes: Option<Vec<u8>>,
 }
 
 #[repr(u8)]

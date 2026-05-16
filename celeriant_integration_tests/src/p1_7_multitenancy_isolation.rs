@@ -25,7 +25,7 @@ use celeriant_msg::{
     },
 };
 use celeriant_wal::{
-    aggregate_key::AggregateKey, compression_type::CompressionType,
+    aggregate_key::AggregateKey,
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
 };
 
@@ -59,8 +59,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 allow_create: true,
                 expected_event_batch_index: Some(0),
                 enforce_client_idempotency: true,
-                compression_type_id: 0,
-                compression_level: None,
             },
         );
 
@@ -71,7 +69,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             writes,
         });
         client
-            .send_request(&request, CompressionType::None)
+            .send_request(&request)
             .await?;
         println!("  Written event to aggregate {:?}", agg);
     }
@@ -112,7 +110,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         filters: ReadFilters::new(1),
     });
     let read_result = client
-        .send_request(&read_request, CompressionType::None)
+        .send_request(&read_request)
         .await;
 
     match read_result {
@@ -145,7 +143,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         filters: ReadFilters::new(1),
     });
     let read_result = client
-        .send_request(&read_request, CompressionType::None)
+        .send_request(&read_request)
         .await?;
 
     match read_result {

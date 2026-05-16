@@ -23,7 +23,7 @@ use celeriant_msg::{
     request::requests::ReadRequest,
 };
 use celeriant_wal::{
-    aggregate_key::AggregateKey, compression_type::CompressionType,
+    aggregate_key::AggregateKey,
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
 };
 use std::time::Duration;
@@ -204,7 +204,7 @@ async fn read_event_by_client_index(
         };
 
         let response = client
-            .send_request(&ClientRequest::Read(read_req), CompressionType::None)
+            .send_request(&ClientRequest::Read(read_req))
             .await?;
 
         match response {
@@ -248,7 +248,7 @@ async fn count_events_all(
         };
 
         let response = client
-            .send_request(&ClientRequest::Read(read_req), CompressionType::None)
+            .send_request(&ClientRequest::Read(read_req))
             .await;
 
         match response {

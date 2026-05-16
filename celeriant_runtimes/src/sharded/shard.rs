@@ -76,6 +76,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
         let shutdown_requested = Rc::new(Cell::new(false));
         let shard_wal = Rc::new(shard_wal);
 
+        let dict_codec = shard_wal.dict_codec.clone();
         let ctx = ConnectionContext {
             config: Rc::new(config),
             current_shard_id,
@@ -85,6 +86,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static, S: LeaseStore + 
             catchup_completion_tx: None,
             schema_registration_pending: None,
             lease_manager: lease_manager.map(Rc::new),
+            dict_codec,
         };
 
         Self {
@@ -937,7 +939,6 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
                 accepted_tcp_stream.bind_to_executor(),
                 request,
                 ctx.config.max_response_size,
-                ctx.config.server_compression_algorithm,
                 message_version,
                 ctx.clone(),
                 verified_client_id,
@@ -953,7 +954,6 @@ async fn handle_intrashard_message<R: ReplicationClient + 'static, D: S3Download
                 accepted_tcp_stream.bind_to_executor(),
                 request,
                 ctx.config.max_response_size,
-                ctx.config.server_compression_algorithm,
                 message_version,
                 ctx.clone(),
             );

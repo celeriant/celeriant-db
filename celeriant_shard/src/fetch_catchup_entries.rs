@@ -3,6 +3,7 @@ use std::rc::Rc;
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
 use celeriant_rotating_log::reverse_metablock_scanner::ReverseMetablockScanner;
 use celeriant_wal::constants::FIXED_BLOCK_SIZE_BYTES;
+use celeriant_wire::codec::compression::DictCodec;
 use celeriant_wire::disk::disk_format_error::DiskFormatError;
 use celeriant_wire::disk::metablock_bytes;
 use celeriant_wire::disk::versioned_block::deserialise_metablock;
@@ -17,6 +18,7 @@ pub(crate) async fn fetch_catchup_entries(
     leader_wal_index: u64,
     max_size_bytes: Option<u64>,
     read_max_chunk_size: u64,
+    dict_codec: &DictCodec,
 ) -> Result<Vec<EventBatchFromLogSegmentFile>, FetchCatchupEntriesError> {
     let current_log_id = log_segments_cache.active_log_id();
     let mut scanner = ReverseMetablockScanner::new(log_segments_cache, current_log_id, None, read_max_chunk_size);
@@ -72,7 +74,7 @@ pub(crate) async fn fetch_catchup_entries(
     // Reverse to get chronological order
     replication_items.reverse();
 
-    fetch_datablocks_for_metablocks(&mut replication_items, read_max_chunk_size, log_segments_cache)
+    fetch_datablocks_for_metablocks(&mut replication_items, read_max_chunk_size, log_segments_cache, dict_codec)
         .await
         .map_err(FetchCatchupEntriesError::FetchDatablockError)?;
 
@@ -170,6 +172,11 @@ mod tests {
         metadata.write = cursor;
     }
 
+    fn test_codec() -> DictCodec {
+        use celeriant_wal::builtin_dict::BUILTIN_DICT_BYTES;
+        DictCodec::new(BUILTIN_DICT_BYTES, 3).expect("builtin dict must compile")
+    }
+
     /// Happy path: writes 5 metablocks at wal=1..=5 and asks for the half-open range
     /// (follower=2, leader=5). Result must be wal=3 and wal=4 in chronological order.
     #[test]
@@ -181,7 +188,7 @@ mod tests {
             let blocks: Vec<Metablock> = (1..=5).map(|i| metablock_at(i, 0)).collect();
             write_metablocks_and_set_read_cursor(&lsc, &blocks).await;
 
-            let entries = fetch_catchup_entries(&lsc, 2, 5, Some(1024 * 1024), 64 * 1024).await.unwrap();
+            let entries = fetch_catchup_entries(&lsc, 2, 5, Some(1024 * 1024), 64 * 1024, &test_codec()).await.unwrap();
 
             let wal_indexes: Vec<u64> = entries.iter().map(|e| e.metablock.wal_index).collect();
             assert_eq!(wal_indexes, vec![3, 4], "should return (follower, leader) exclusive on both ends");
@@ -201,7 +208,7 @@ mod tests {
             let blocks: Vec<Metablock> = (1..=3).map(|i| metablock_at(i, 0)).collect();
             write_metablocks_and_set_read_cursor(&lsc, &blocks).await;
 
-            let entries = fetch_catchup_entries(&lsc, 3, 4, Some(1024 * 1024), 64 * 1024).await.unwrap();
+            let entries = fetch_catchup_entries(&lsc, 3, 4, Some(1024 * 1024), 64 * 1024, &test_codec()).await.unwrap();
             assert!(entries.is_empty(), "no entries strictly between follower and leader");
 
             lsc.close().await;
@@ -224,7 +231,7 @@ mod tests {
 
             // Follower is way behind at wal=2, leader claims wal=5. Disk has nothing in
             // (2, 5) — scanner stops at wal=10 and the in-range filter never matches.
-            let entries = fetch_catchup_entries(&lsc, 2, 5, Some(1024 * 1024), 64 * 1024).await.unwrap();
+            let entries = fetch_catchup_entries(&lsc, 2, 5, Some(1024 * 1024), 64 * 1024, &test_codec()).await.unwrap();
             assert!(entries.is_empty());
 
             lsc.close().await;
@@ -242,7 +249,7 @@ mod tests {
             let blocks: Vec<Metablock> = (1..=5).map(|i| metablock_at(i, 64 * 1024)).collect();
             write_metablocks_and_set_read_cursor(&lsc, &blocks).await;
 
-            let result = fetch_catchup_entries(&lsc, 0, 5, Some(100 * 1024), 64 * 1024).await;
+            let result = fetch_catchup_entries(&lsc, 0, 5, Some(100 * 1024), 64 * 1024, &test_codec()).await;
             assert!(matches!(result, Err(FetchCatchupEntriesError::FollowerTooFarBehind)),
                 "expected FollowerTooFarBehind, got {:?}", result.err());
 
@@ -262,7 +269,7 @@ mod tests {
             let blocks: Vec<Metablock> = (1..=5).map(|i| metablock_at(i, 0)).collect();
             write_metablocks_and_set_read_cursor(&lsc, &blocks).await;
 
-            let entries = fetch_catchup_entries(&lsc, 1, 4, Some(1024 * 1024), 64 * 1024).await.unwrap();
+            let entries = fetch_catchup_entries(&lsc, 1, 4, Some(1024 * 1024), 64 * 1024, &test_codec()).await.unwrap();
             let wal_indexes: Vec<u64> = entries.iter().map(|e| e.metablock.wal_index).collect();
             assert_eq!(wal_indexes, vec![2, 3], "wal=1 (follower) and wal=4 (leader) excluded");
 

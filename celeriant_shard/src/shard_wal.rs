@@ -10,9 +10,10 @@ use celeriant_distributed::node_status::NodeStatus;
 use celeriant_distributed::validated_node_status::{self, ValidatedNodeStatus, set_node_status_and_metric};
 use celeriant_rotating_log::errors::ready_up_error::ReadyUpError;
 use celeriant_rotating_log::errors::scan_error::ScanError;
+use celeriant_wire::codec::compression::DictCodec;
 use celeriant_wire::disk::disk_format_error::DiskFormatError;
 use celeriant_wire::disk::metablock_bytes;
-use celeriant_wire::disk::serialised_datablock::SerialisedDatablock;
+use celeriant_wire::disk::serialised_datablock::{CompressionPolicy, SerialisedDatablock};
 use celeriant_wire::disk::versioned_block::{deserialise_metablock, deserialise_segment_summary};
 use crate::shard_wal_sync::summary_path;
 use celeriant_memcache::cache_path::CachePath;
@@ -31,7 +32,6 @@ use celeriant_msg::response::aggregate_event_batch::AggregateEventBatch;
 use celeriant_msg::response::responses::{AggregateListItem, AggregateTypeListItem, AggregateDetailsResponse, FollowerRejection, ListAggregateTypesResponse, ListAggregatesResponse, ListOrgsResponse, OrgListItem, ReadResponse, ReplicationBatchResponse, ReplicationResult, SuccessResponse};
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
 use celeriant_rotating_log::reverse_metablock_scanner::ReverseMetablockScanner;
-use celeriant_wal::compression_type::CompressionType;
 use celeriant_wal::aggregate_client_key::AggregateClientKey;
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::aggregate_type_key::AggregateTypeKey;
@@ -105,6 +105,9 @@ pub(crate) fn compile_and_cache_schema(cache: &mut MemCache, schema_key: &Schema
 ///
 /// Not thread-safe—designed for single-threaded per-core access.
 pub struct ShardWal<R: ReplicationClient + 'static, D: S3Downloader + 'static> {
+    /// Precompiled zstd dict codec built once at shard boot
+    pub dict_codec: Rc<DictCodec>,
+
     /// Trait implementation to download replicated data stored on S3 for catchup
     s3_downloader: Rc<D>,
 
@@ -315,12 +318,18 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let shard_mem_cache = Rc::new(RefCell::new(shard_mem_cache));
         let log_segments_cache = Rc::new(log_segments_cache);
 
-        Self::pre_warm_cache(&log_segments_cache, &shard_mem_cache, &config).await?;
+        let dict_codec = Rc::new(
+            DictCodec::new(&config.dict_bytes, config.wal_compression_level)
+                .map_err(|e| ReadyUpError::DictCodecBuildFailed(e.to_string()))?,
+        );
+
+        Self::pre_warm_cache(&log_segments_cache, &shard_mem_cache, &config, &dict_codec).await?;
 
         let recovered_wal_index = log_segments_cache.active().metadata.borrow().write.wal_index;
         metrics::gauge!("celeriant_wal_index", &metrics_shard_label).set(recovered_wal_index as f64);
 
         Ok(Self {
+            dict_codec,
             s3_downloader: Rc::new(s3_downloader),
             shard_mem_cache,
             log_segments_cache,
@@ -352,6 +361,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         log_segments_cache: &Rc<LogSegmentsCache>,
         shard_mem_cache: &Rc<RefCell<MemCache>>,
         config: &InternalShardConfig,
+        dict_codec: &DictCodec,
     ) -> Result<(), ReadyUpError> {
         let warmup_start = Instant::now();
         let warmup_deadline = config.cache_warmup_max_duration;
@@ -522,7 +532,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                 })
                 .collect();
 
-            crate::collect_from_disk::fetch_datablocks_for_metablocks(&mut batches, config.read_max_chunk_size, log_segments_cache)
+            crate::collect_from_disk::fetch_datablocks_for_metablocks(&mut batches, config.read_max_chunk_size, log_segments_cache, dict_codec)
                 .await
                 .map_err(|e| ReadyUpError::UnableToAccessDirectory {
                     directory: format!("schema datablock fetch: {e:?}"),
@@ -1393,7 +1403,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let mut collection = self.collect_metablocks_bounded(aggregate_key, filters, max_bytes, last_known).await?;
 
         // 4. Fetch datablocks only for kept metablocks
-        fetch_datablocks_for_metablocks(&mut collection.kept_metablocks, self.config.read_max_chunk_size, &self.log_segments_cache).await?;
+        fetch_datablocks_for_metablocks(&mut collection.kept_metablocks, self.config.read_max_chunk_size, &self.log_segments_cache, &self.dict_codec).await?;
 
         // 5. Deserialize and apply event-level filters
         let event_batches = self.build_filtered_response(collection.kept_metablocks, filters);
@@ -1631,7 +1641,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                     datablock: None,
                 }];
 
-                crate::collect_from_disk::fetch_datablocks_for_metablocks(&mut batch, self.config.read_max_chunk_size, &self.log_segments_cache)
+                crate::collect_from_disk::fetch_datablocks_for_metablocks(&mut batch, self.config.read_max_chunk_size, &self.log_segments_cache, &self.dict_codec)
                     .await
                     .map_err(|e| ShardCacheLoadError::DatablockReadError(format!("{e:?}")))?;
 
@@ -1932,6 +1942,9 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             EventTypesKind::Direct(event_type_extraction.event_types)
         };
 
+        // Encryption bailout check must happen before events_in_batch is moved.
+        let has_encrypted_events = events_in_batch.iter().any(|e| e.iv.is_some());
+
         let datablock_aggregate_event_batch = DatablockAggregateEventBatch {
             event_batch_index,
             events: events_in_batch,
@@ -1951,9 +1964,11 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             datablock_kind: DatablockKind::EventBatchItem(datablock_aggregate_event_batch),
         };
 
-        // Serialize datablock - this can fail
-        let serialized_datablock = SerialisedDatablock::new(&datablock, CompressionType::from_tuple(write_request.compression_type_id, write_request.compression_level))
-            .map_err(ShardWriteError::FailedToSerialiseDatablocks)?;
+        let serialized_datablock = SerialisedDatablock::new(
+            &datablock,
+            CompressionPolicy::Auto { compression_allowed: !has_encrypted_events },
+            &self.dict_codec,
+        ).map_err(ShardWriteError::FailedToSerialiseDatablocks)?;
 
         let server_timestamp = self.config.timestamp_config.now();
 
@@ -2011,6 +2026,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let shard_mem_cache = self.shard_mem_cache.clone();
         let watched_aggregates = self.watched_aggregates.clone();
         let shard_id = self.config.shard_id;
+        let dict_codec = self.dict_codec.clone();
 
         // Node status goes into fsync because we need to know if we should advance read position (standalone or follower mode)
         // We already pass lease status checks so can use raw()
@@ -2022,7 +2038,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                 Some(self.config.fsync_delay),
                 ShardFsyncError::WriteLockTimeout,
                 move || async move { capture_fsync_snapshot(&mc_capture) },
-                move |captured| commit_fsync_with_rollback(node_status, rotating_log_cache, shard_mem_cache, watched_aggregates, captured, shard_id),
+                move |captured| commit_fsync_with_rollback(node_status, rotating_log_cache, shard_mem_cache, watched_aggregates, captured, shard_id, dict_codec),
             )
             .await
     }
@@ -2115,12 +2131,13 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let last_rollback_at = self.last_rollback_at.clone();
 
         let mc_capture = shard_mem_cache.clone();
+        let dict_codec = self.dict_codec.clone();
         self.replication_coordinator
             .request_sync_two_phase(
                 delay,
                 ReplicationError::GateTimeout,
                 move || async move { capture_replication_snapshot(&mc_capture, trigger) },
-                move |captured| commit_replication_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates, node_status, last_rollback_at, captured, trigger, max_catchup_gap_bytes, max_request_size, read_max_chunk_size, max_clock_drift_ms, shard_id),
+                move |captured| commit_replication_with_rollback(replication_client, fsync_coordinator, rotating_log_cache, shard_mem_cache, watched_aggregates, node_status, last_rollback_at, captured, trigger, max_catchup_gap_bytes, max_request_size, read_max_chunk_size, max_clock_drift_ms, shard_id, dict_codec),
             )
             .await
     }
@@ -2184,7 +2201,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
         let shard_id = self.config.shard_id;
         match shard_wal_s3_catchup::apply_external_batch(
-            &self.log_segments_cache, &self.shard_mem_cache, &request.batches,
+            &self.log_segments_cache, &self.shard_mem_cache, &request.batches, &self.dict_codec,
         ) {
             Ok(()) => {}
             Err(ApplyBatchError::WalIndexMismatch { current, batch_first }) => {
@@ -2300,7 +2317,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
         items.reverse();
 
-        fetch_datablocks_for_metablocks(&mut items, read_max_chunk_size, &self.log_segments_cache)
+        fetch_datablocks_for_metablocks(&mut items, read_max_chunk_size, &self.log_segments_cache, &self.dict_codec)
             .await
             .map_err(|e| crate::error::replication_to_s3_error::ReplicateToS3Error::SerializationFailed(
                 format!("Failed to fetch datablocks for promotion batch: {e:?}"),
@@ -2649,6 +2666,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             self.config.node_id,
             self.peer_node_id.get(),
             self.config.max_catchup_gap_bytes,
+            self.dict_codec.clone(),
         ).await
 
     }
@@ -2718,12 +2736,15 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             datablock_kind: DatablockKind::SchemaRegistration(datablock_schema_registration),
         };
 
-        // Serialize datablock - schemas use no compression
-        let serialized_datablock = SerialisedDatablock::new(&datablock, celeriant_wal::compression_type::CompressionType::None)
-            .map_err(|e| ShardSchemaError::InvalidSchema {
-                schema_type: request.schema_type,
-                parse_error: format!("Failed to serialize datablock: {:?}", e),
-            })?;
+        let serialized_datablock = SerialisedDatablock::new(
+            &datablock,
+            CompressionPolicy::Auto { compression_allowed: true },
+            &self.dict_codec,
+        )
+        .map_err(|e| ShardSchemaError::InvalidSchema {
+            schema_type: request.schema_type,
+            parse_error: format!("Failed to serialize datablock: {:?}", e),
+        })?;
 
         let metablock = Metablock {
             wal_index: 0,
@@ -2855,6 +2876,8 @@ mod tests {
             max_clock_drift_ms: 500,
             read_max_concurrent: 64,
             cache_warmup_max_duration: Duration::MAX,
+            wal_compression_level: 3,
+            dict_bytes: std::sync::Arc::from(celeriant_wal::builtin_dict::BUILTIN_DICT_BYTES),
         }
     }
 
@@ -2893,8 +2916,6 @@ mod tests {
                 allow_create,
                 expected_event_batch_index: expected_batch,
                 enforce_client_idempotency: enforce_idempotency,
-                compression_type_id: 0,
-                compression_level: None,
             },
         );
         ClientRequest::Write(WriteRequest {
@@ -3023,8 +3044,6 @@ mod tests {
                 allow_create: true,
                 expected_event_batch_index: None,
                 enforce_client_idempotency: false,
-                compression_type_id: 0,
-                compression_level: None,
             },
         );
         ClientRequest::Write(WriteRequest {
@@ -4379,8 +4398,6 @@ mod tests {
                     allow_create: true,
                     expected_event_batch_index: expected,
                     enforce_client_idempotency: false,
-                    compression_type_id: 0,
-                compression_level: None,
                 },
             );
         }
@@ -4945,12 +4962,25 @@ mod tests {
             .unwrap()
     }
 
-    /// Write one event with an 8KB payload to consume ~9KB of segment space.
+    /// Write one event with an 8KB incompressible payload to consume ~9KB of segment space.
+    ///
+    /// Pseudo-random bytes via a splitmix64-style hash on (index, byte_offset) so that the
+    /// payload looks random to zstd's dict-aware compressor and survives compression at roughly
+    /// its uncompressed size. Compaction tests depend on segment byte ratios; a repeated byte
+    /// here would compress to ~0 and invalidate the threshold math.
     fn fat_event(index: u64) -> Vec<DatablockAggregateEvent> {
+        let mut bytes = vec![0u8; 8192];
+        for (offset, slot) in bytes.iter_mut().enumerate() {
+            let mut h = index.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(offset as u64);
+            h ^= h >> 30;
+            h = h.wrapping_mul(0xBF58476D1CE4E5B9);
+            h ^= h >> 27;
+            *slot = h as u8;
+        }
         vec![DatablockAggregateEvent {
             client_event_index: index,
             event_type_major: 1,
-            event_value: Arc::new(vec![index as u8; 8192]),
+            event_value: Arc::new(bytes),
             ..Default::default()
         }]
     }

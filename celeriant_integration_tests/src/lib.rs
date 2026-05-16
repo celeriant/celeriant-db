@@ -110,7 +110,7 @@ use celeriant_msg::{
     response::aggregate_event_batch::AggregateEventBatch,
 };
 use celeriant_wal::{
-    aggregate_key::AggregateKey, compression_type::CompressionType,
+    aggregate_key::AggregateKey,
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
 };
 pub use celeriant_lib::server_config::ServerConfig;
@@ -1126,8 +1126,6 @@ pub async fn write_event(
             allow_create,
             expected_event_batch_index: if event_num == 1 { Some(0) } else { None },
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -1139,7 +1137,7 @@ pub async fn write_event(
     };
 
     let response = client
-        .send_request(&ClientRequest::Write(write_req), CompressionType::None)
+        .send_request(&ClientRequest::Write(write_req))
         .await?;
 
     match response {
@@ -1148,18 +1146,34 @@ pub async fn write_event(
     }
 }
 
+/// SplitMix64-style deterministic non-compressible fill.
+/// Defeats zstd-dict so payloads survive past MINIBATCH_SIZE_BYTES into external Block storage,
+/// which is what tests targeting segment rotation / replication pressure actually want.
+pub fn fill_incompressible(buf: &mut [u8], seed: u64) {
+    let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    for chunk in buf.chunks_mut(8) {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        let bytes = z.to_le_bytes();
+        chunk.copy_from_slice(&bytes[..chunk.len()]);
+    }
+}
+
 /// Write a single event with a large payload to create replication pressure.
 /// The payload_bytes parameter controls how many bytes the event value occupies.
+/// Payload bytes are non-compressible so the datablock is forced out of the inline
+/// minibatch into external Block storage.
 pub async fn write_large_event(
     client: &mut CeleriantClient,
     aggregate_key: &AggregateKey,
     event_num: u64,
     payload_bytes: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut payload = format!("{{\"event\":{},\"pad\":\"", event_num);
-    let pad_len = payload_bytes.saturating_sub(payload.len() + 2); // 2 for closing "}
-    payload.extend(std::iter::repeat('x').take(pad_len));
-    payload.push_str("\"}");
+    let mut payload = vec![0u8; payload_bytes];
+    fill_incompressible(&mut payload, event_num);
 
     let event = DatablockAggregateEvent {
         client_event_index: event_num,
@@ -1168,7 +1182,7 @@ pub async fn write_large_event(
         event_timestamp: 1000 + event_num,
         event_type_major: 100,
         event_type_minor: 0,
-        event_value: Arc::new(payload.into_bytes()),
+        event_value: Arc::new(payload),
         iv: None,
     };
 
@@ -1180,8 +1194,6 @@ pub async fn write_large_event(
             allow_create: false,
             expected_event_batch_index: None,
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -1193,7 +1205,7 @@ pub async fn write_large_event(
     };
 
     let response = client
-        .send_request(&ClientRequest::Write(write_req), CompressionType::None)
+        .send_request(&ClientRequest::Write(write_req))
         .await?;
 
     match response {
@@ -1220,7 +1232,7 @@ pub async fn read_all_batches(
             filters: ReadFilters::new(from_batch),
         };
         let resp = client
-            .send_request(&ClientRequest::Read(req), CompressionType::None)
+            .send_request(&ClientRequest::Read(req))
             .await?;
         match resp {
             ClientResponse::Read(r) => {
@@ -1260,7 +1272,7 @@ pub async fn count_events(
         };
 
         let response = client
-            .send_request(&ClientRequest::Read(read_req), CompressionType::None)
+            .send_request(&ClientRequest::Read(read_req))
             .await;
 
         match response {

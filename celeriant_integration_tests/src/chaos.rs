@@ -18,7 +18,7 @@ use celeriant_msg::{
     },
 };
 use celeriant_wal::{
-    aggregate_key::AggregateKey, compression_type::CompressionType,
+    aggregate_key::AggregateKey,
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
 };
 use rand::{rngs::StdRng, Rng, SeedableRng};
@@ -283,8 +283,6 @@ async fn run_writer_task(
                 allow_create: true,
                 expected_event_batch_index: None,
                 enforce_client_idempotency: false,
-                compression_type_id: 0,
-                compression_level: None,
             },
         );
 
@@ -296,7 +294,7 @@ async fn run_writer_task(
         });
 
         match client
-            .send_request(&request, CompressionType::None)
+            .send_request(&request)
             .await
         {
             Ok(_) => {
@@ -368,7 +366,7 @@ async fn run_reader_task(
         });
 
         match client
-            .send_request(&request, CompressionType::None)
+            .send_request(&request)
             .await
         {
             Ok(_response) => {

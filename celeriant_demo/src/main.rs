@@ -238,16 +238,12 @@ async fn transfer(
                 allow_create: true,
                 expected_event_batch_index: Some(req.expected_from_batch_index),
                 enforce_client_idempotency: false,
-                compression_type_id: 0,
-                compression_level: None,
             }),
             (to_key.clone(), SingleAggregateWrite {
                 events: vec![transfer_in],
                 allow_create: true,
                 expected_event_batch_index: Some(req.expected_to_batch_index),
                 enforce_client_idempotency: false,
-                compression_type_id: 0,
-                compression_level: None,
             }),
         ]),
     };

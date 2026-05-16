@@ -28,7 +28,7 @@ use celeriant_runtimes::RoutingRule;
 use celeriant_msg::request::requests::{RegisterSchemaRequest, WriteRequest};
 use celeriant_msg::{process_client_requests::ClientRequest, request::requests::SingleAggregateWrite};
 use celeriant_wal::{
-    aggregate_key::AggregateKey, compression_type::CompressionType,
+    aggregate_key::AggregateKey,
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
     schema_key::SchemaKey,
 };
@@ -329,7 +329,7 @@ async fn setup_schema_and_accounts(
         schema_type: 0,
         schema: bank_transaction_schema(),
     });
-    client.send_request(&req, CompressionType::None).await?;
+    client.send_request(&req).await?;
     println!("  Schema registered.");
 
     // Pre-create all accounts with valid JSON payloads
@@ -358,8 +358,6 @@ async fn setup_schema_and_accounts(
                 allow_create: true,
                 expected_event_batch_index: None,
                 enforce_client_idempotency: false,
-                compression_type_id: 0,
-                compression_level: None,
             },
         );
 
@@ -369,7 +367,7 @@ async fn setup_schema_and_accounts(
             user_id: None,
             writes,
         });
-        client.send_request(&req, CompressionType::None).await?;
+        client.send_request(&req).await?;
     }
     println!("  {} accounts created.", NUM_ACCOUNTS);
 
@@ -421,8 +419,6 @@ fn build_prebuilt_requests(connection_id: usize, client_id: u128) -> Vec<ClientR
                 allow_create: false,
                 expected_event_batch_index: None,
                 enforce_client_idempotency: false,
-                compression_type_id: 0,
-                compression_level: None,
             },
         );
         writes.insert(
@@ -432,8 +428,6 @@ fn build_prebuilt_requests(connection_id: usize, client_id: u128) -> Vec<ClientR
                 allow_create: false,
                 expected_event_batch_index: None,
                 enforce_client_idempotency: false,
-                compression_type_id: 0,
-                compression_level: None,
             },
         );
 
@@ -1017,7 +1011,7 @@ async fn run_connection_benchmark(
         let req_start = Instant::now();
 
         match client
-            .send_request(&requests[idx], CompressionType::None)
+            .send_request(&requests[idx])
             .await
         {
             Ok(_) => {

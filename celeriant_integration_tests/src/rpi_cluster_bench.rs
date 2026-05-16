@@ -27,7 +27,6 @@ use celeriant_crypto::pki::PkiManager;
 use celeriant_msg::process_client_requests::ClientRequest;
 use celeriant_msg::request::requests::{SingleAggregateWrite, WriteRequest};
 use celeriant_wal::aggregate_key::AggregateKey;
-use celeriant_wal::compression_type::CompressionType;
 use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
 use rustls_pki_types::ServerName;
 use tokio::sync::Barrier;
@@ -124,8 +123,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             allow_create: true,
             expected_event_batch_index: None,
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         });
 
         let request = ClientRequest::Write(WriteRequest {
@@ -135,7 +132,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             writes,
         });
 
-        client.send_request(&request, CompressionType::None).await?;
+        client.send_request(&request).await?;
         println!("  Write OK\n");
     }
 
@@ -330,8 +327,6 @@ async fn run_connection(
                 allow_create: true,
                 expected_event_batch_index: None,
                 enforce_client_idempotency: false,
-                compression_type_id: 0,
-                compression_level: None,
             },
         );
 
@@ -343,7 +338,7 @@ async fn run_connection(
         });
 
         let req_start = Instant::now();
-        match client.send_request(&request, CompressionType::None).await {
+        match client.send_request(&request).await {
             Ok(_) => {
                 latencies.push(req_start.elapsed().as_millis() as u64);
                 request_count += 1;

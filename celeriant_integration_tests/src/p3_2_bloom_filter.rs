@@ -24,7 +24,7 @@ use celeriant_msg::{
     request::requests::{ReadRequest, SingleAggregateWrite, WriteRequest},
 };
 use celeriant_wal::{
-    aggregate_key::AggregateKey, compression_type::CompressionType,
+    aggregate_key::AggregateKey,
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
 };
 use tokio::time::Instant;
@@ -82,8 +82,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 allow_create: true,
                 expected_event_batch_index: Some(0),
                 enforce_client_idempotency: false,
-                compression_type_id: 0,
-                compression_level: None,
             },
         );
 
@@ -95,7 +93,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         });
 
         client
-            .send_request(&request, CompressionType::None)
+            .send_request(&request)
             .await?;
 
         if agg_id % 1000 == 0 {
@@ -120,7 +118,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         let _response = client
-            .send_request(&ClientRequest::Read(read_req), CompressionType::None)
+            .send_request(&ClientRequest::Read(read_req))
             .await;
 
         let elapsed_us = read_start.elapsed().as_micros() as u64;
@@ -157,7 +155,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         let _response = client
-            .send_request(&ClientRequest::Read(read_req), CompressionType::None)
+            .send_request(&ClientRequest::Read(read_req))
             .await?;
 
         let elapsed_us = read_start.elapsed().as_micros() as u64;

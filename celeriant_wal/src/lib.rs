@@ -1,3 +1,4 @@
+pub mod builtin_dict;
 pub mod serde;
 pub mod constants;
 pub mod compression_type;
@@ -14,6 +15,7 @@ pub mod schema_type;
 pub mod segment_summary;
 
 pub use schema_type::SchemaType;
+pub use builtin_dict::resolve_builtin_dict;
 
 /// Formats a u128 as a UUID string (8-4-4-4-12 hex).
 pub fn format_uuid(val: u128) -> String {

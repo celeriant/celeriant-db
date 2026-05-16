@@ -6,10 +6,11 @@ use celeriant_wal::datablocks::datablock_aggregate_event_batch::DatablockAggrega
 use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
 use celeriant_wal::metablocks::metablock_event_batch::{MetablockEventBatch, EventTypesKind};
 use celeriant_wal::compression_type::CompressionType;
+use celeriant_wal::builtin_dict::BUILTIN_DICT_BYTES;
 use celeriant_wire::codec::{
     bincode::{fixed_serialise_heap as bincode_serialise, fixed_deserialise as bincode_deserialise},
     msgpack::{serialise_heap as msgpack_serialise, deserialise as msgpack_deserialise},
-    compression::{compress, decompress},
+    compression::{compress_with_dict, decompress_with_dict},
 };
 use criterion::{
     criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
@@ -63,16 +64,6 @@ fn create_metadata() -> MetablockEventBatch {
     }
 }
 
-fn all_compression_types() -> Vec<(&'static str, CompressionType)> {
-    vec![
-        ("none", CompressionType::None),
-        ("zstd_3", CompressionType::Zstd { level: 3 }),
-        ("snappy", CompressionType::Snappy),
-        ("brotli_4", CompressionType::Brotli { level: 4 }),
-        ("gzip_6", CompressionType::Gzip { level: 6 }),
-    ]
-}
-
 /// Batch configurations: (name, event_count, payload_size_per_event)
 fn batch_configs() -> Vec<(&'static str, usize, usize)> {
     vec![
@@ -89,11 +80,13 @@ fn bench_event_batch_serialization(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(2));
     group.warm_up_time(Duration::from_millis(500));
 
+    let dict = BUILTIN_DICT_BYTES;
+
     for (batch_name, event_count, payload_size) in batch_configs() {
         let batch = create_event_batch(event_count, payload_size);
         let total_bytes = event_count * payload_size;
 
-        for (comp_name, compression) in all_compression_types() {
+        for (comp_name, compression) in [("none", CompressionType::None), ("zstd_dict_3", CompressionType::ZstdDict)] {
             // Bincode serialization
             group.throughput(Throughput::Bytes(total_bytes as u64));
             group.bench_with_input(
@@ -106,9 +99,20 @@ fn bench_event_batch_serialization(c: &mut Criterion) {
                     b.iter(|| {
                         let serialised = bincode_serialise(black_box(*batch)).unwrap();
                         let uncompressed_size = serialised.len();
-                        let compressed = compress(&serialised, *comp).unwrap();
-                        let decompressed = decompress(&compressed, *comp, uncompressed_size).unwrap();
+                        let (compressed, decompressed) = match comp {
+                            CompressionType::None => {
+                                let c = serialised.clone();
+                                let d = c.clone();
+                                (c, d)
+                            }
+                            CompressionType::ZstdDict => {
+                                let c = compress_with_dict(&serialised, 3, dict).unwrap();
+                                let d = decompress_with_dict(&c, uncompressed_size, dict).unwrap();
+                                (c, d)
+                            }
+                        };
                         let _decoded: DatablockAggregateEventBatch = bincode_deserialise(&decompressed).unwrap();
+                        black_box(compressed);
                     });
                 },
             );
@@ -125,9 +129,20 @@ fn bench_event_batch_serialization(c: &mut Criterion) {
                     b.iter(|| {
                         let serialised = msgpack_serialise(black_box(*batch)).unwrap();
                         let uncompressed_size = serialised.len();
-                        let compressed = compress(&serialised, *comp).unwrap();
-                        let decompressed = decompress(&compressed, *comp, uncompressed_size).unwrap();
+                        let (compressed, decompressed) = match comp {
+                            CompressionType::None => {
+                                let c = serialised.clone();
+                                let d = c.clone();
+                                (c, d)
+                            }
+                            CompressionType::ZstdDict => {
+                                let c = compress_with_dict(&serialised, 3, dict).unwrap();
+                                let d = decompress_with_dict(&c, uncompressed_size, dict).unwrap();
+                                (c, d)
+                            }
+                        };
                         let _decoded: DatablockAggregateEventBatch = msgpack_deserialise(&decompressed).unwrap();
+                        black_box(compressed);
                     });
                 },
             );
@@ -142,11 +157,11 @@ fn bench_metadata_serialization(c: &mut Criterion) {
     group.sample_size(50);
     group.measurement_time(Duration::from_secs(2));
     group.warm_up_time(Duration::from_millis(500));
-    
+
     let metadata = create_metadata();
 
-    for (comp_name, compression) in all_compression_types() {
-        // Bincode serialization
+    for (comp_name, compression) in [("none", CompressionType::None), ("zstd_dict_3", CompressionType::ZstdDict)] {
+        let dict = BUILTIN_DICT_BYTES;
         group.bench_with_input(
             BenchmarkId::new("bincode", comp_name),
             &(&metadata, compression),
@@ -154,9 +169,20 @@ fn bench_metadata_serialization(c: &mut Criterion) {
                 b.iter(|| {
                     let serialised = bincode_serialise(black_box(*meta)).unwrap();
                     let uncompressed_size = serialised.len();
-                    let compressed = compress(&serialised, *comp).unwrap();
-                    let decompressed = decompress(&compressed, *comp, uncompressed_size).unwrap();
+                    let (compressed, decompressed) = match comp {
+                        CompressionType::None => {
+                            let c = serialised.clone();
+                            let d = c.clone();
+                            (c, d)
+                        }
+                        CompressionType::ZstdDict => {
+                            let c = compress_with_dict(&serialised, 3, dict).unwrap();
+                            let d = decompress_with_dict(&c, uncompressed_size, dict).unwrap();
+                            (c, d)
+                        }
+                    };
                     let _decoded: MetablockEventBatch = bincode_deserialise(&decompressed).unwrap();
+                    black_box(compressed);
                 });
             },
         );

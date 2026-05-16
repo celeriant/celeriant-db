@@ -14,7 +14,6 @@ use celeriant_msg::{
 };
 use celeriant_wal::{
     aggregate_key::AggregateKey,
-    compression_type::CompressionType,
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
     schema_key::SchemaKey,
 };
@@ -123,6 +122,7 @@ pub async fn execute_command(cli: &Cli, command: Commands) -> Result<()> {
         Commands::ListTypes(args) => list_types(&mut client, args).await,
         Commands::ListAggregates(args) => list_aggregates(&mut client, args).await,
         Commands::RegisterSchema(args) => register_schema(&mut client, args, identity_client_id).await,
+        Commands::Dict(_) => unreachable!("Dict commands are handled before reaching execute_command"),
     }
 }
 
@@ -133,7 +133,7 @@ async fn check_aggregatedetails(client: &mut CeleriantClient, args: AggregateKey
         aggregate_key: key,
     });
 
-    let response = client.send_request(&request, CompressionType::None).await?;
+    let response = client.send_request(&request).await?;
 
     match &response {
         ClientResponse::AggregateDetails(res) => {
@@ -216,7 +216,7 @@ async fn read_events(client: &mut CeleriantClient, args: ReadArgs) -> Result<()>
         filters,
     });
 
-    let response = client.send_request(&request, CompressionType::None).await?;
+    let response = client.send_request(&request).await?;
 
     match &response {
         ClientResponse::Read(res) => {
@@ -278,17 +278,12 @@ async fn write_event(client: &mut CeleriantClient, args: WriteArgs, identity_cli
         iv: None,
     };
 
-    let compression: CompressionType = args.compression.into();
-    let (compression_type_id, compression_level) = compression.to_tuple();
-
     let mut writes = HashMap::new();
     writes.insert(key, SingleAggregateWrite {
         events: vec![event],
         allow_create: args.allow_create,
         expected_event_batch_index: args.expected_index,
         enforce_client_idempotency: args.enforce_idempotency,
-        compression_type_id,
-        compression_level,
     });
 
     let request = ClientRequest::Write(WriteRequest {
@@ -298,7 +293,7 @@ async fn write_event(client: &mut CeleriantClient, args: WriteArgs, identity_cli
         writes,
     });
 
-    let response = client.send_request(&request, compression).await?;
+    let response = client.send_request(&request).await?;
 
     match &response {
         ClientResponse::Write(_res) => {
@@ -327,7 +322,7 @@ async fn trim_start(client: &mut CeleriantClient, args: TrimArgs, identity_clien
         user_id: args.user_id,
     });
 
-    let response = client.send_request(&request, CompressionType::None).await?;
+    let response = client.send_request(&request).await?;
 
     match &response {
         ClientResponse::TrimStart(res) => {
@@ -365,7 +360,7 @@ async fn delete_aggregate(client: &mut CeleriantClient, args: DeleteArgs, identi
         deletes,
     });
 
-    let response = client.send_request(&request, CompressionType::None).await?;
+    let response = client.send_request(&request).await?;
 
     match &response {
         ClientResponse::Delete(res) => {
@@ -494,7 +489,7 @@ async fn register_schema(client: &mut CeleriantClient, args: RegisterSchemaArgs,
         schema,
     });
 
-    let response = client.send_request(&request, CompressionType::None).await?;
+    let response = client.send_request(&request).await?;
 
     match &response {
         ClientResponse::RegisterSchema(_) => {

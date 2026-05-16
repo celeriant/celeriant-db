@@ -2,9 +2,8 @@ use std::{hint::black_box, u64};
 use std::time::Duration;
 
 use bincode::{Decode, Encode};
-use celeriant_wal::compression_type::CompressionType;
 use celeriant_wire::network::wire_header::{
-    WireHeader, wire_header_write_fixed_size, wire_header_write_variable_size,
+    WireHeader, wire_header_write_fixed_size, wire_header_write_variable_size_uncompressed,
 };
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use futures_lite::{future::block_on, io::Cursor};
@@ -49,7 +48,6 @@ fn bench_fixed_vs_variable(c: &mut Criterion) {
 
     let message = create_small_message();
     let request_type = 1u32;
-    let compression = CompressionType::None;
 
     for (version_name, version) in protocol_versions() {
         // === WRITE BENCHMARKS ===
@@ -84,11 +82,10 @@ fn bench_fixed_vs_variable(c: &mut Criterion) {
                 b.iter(|| {
                     block_on(async {
                         let mut buffer = Vec::with_capacity(128);
-                        wire_header_write_variable_size(
+                        wire_header_write_variable_size_uncompressed(
                             &mut buffer,
                             black_box(*msg),
                             request_type,
-                            compression,
                             u64::MAX,
                             *ver,
                         )
@@ -112,11 +109,10 @@ fn bench_fixed_vs_variable(c: &mut Criterion) {
 
         let mut variable_buffer = Vec::new();
         block_on(async {
-            wire_header_write_variable_size(
+            wire_header_write_variable_size_uncompressed(
                 &mut variable_buffer,
                 &message,
                 request_type,
-                compression,
                 u64::MAX,
                 version,
             )
@@ -153,7 +149,7 @@ fn bench_fixed_vs_variable(c: &mut Criterion) {
                         let mut reader = Cursor::new(black_box(data.as_slice()));
                         let header = WireHeader::from_reader(&mut reader, u64::MAX).await.unwrap();
                         let decoded: SmallMessage =
-                            header.read_variable_size(&mut reader).await.unwrap();
+                            header.read_variable_size_uncompressed(&mut reader).await.unwrap();
                         decoded
                     })
                 });
@@ -199,11 +195,10 @@ fn bench_fixed_vs_variable(c: &mut Criterion) {
                 b.iter(|| {
                     block_on(async {
                         let mut buffer = Vec::with_capacity(128);
-                        wire_header_write_variable_size(
+                        wire_header_write_variable_size_uncompressed(
                             &mut buffer,
                             black_box(*msg),
                             request_type,
-                            compression,
                             u64::MAX,
                             *ver,
                         )
@@ -213,7 +208,7 @@ fn bench_fixed_vs_variable(c: &mut Criterion) {
                         let mut reader = Cursor::new(buffer.as_slice());
                         let header = WireHeader::from_reader(&mut reader, u64::MAX).await.unwrap();
                         let decoded: SmallMessage =
-                            header.read_variable_size(&mut reader).await.unwrap();
+                            header.read_variable_size_uncompressed(&mut reader).await.unwrap();
                         decoded
                     })
                 });

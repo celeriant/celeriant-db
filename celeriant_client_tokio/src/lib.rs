@@ -7,9 +7,10 @@ pub mod pool;
 pub mod pool_trait;
 pub mod read_all_iterator;
 pub mod server_error;
+mod tokio_wire;
 pub mod watch_connection;
 
-pub use celeriant_client::{CeleriantClient, ClientIdentityConfig, ClientTlsConfig};
+pub use celeriant_client::{CachedDict, CeleriantClient, ClientIdentityConfig, ClientTlsConfig};
 pub use client_operations::WriteEventsOptions;
 pub use event_helpers::{from_json, json_event};
 pub use client_error::ClientError;

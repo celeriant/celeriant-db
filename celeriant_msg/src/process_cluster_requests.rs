@@ -1,7 +1,10 @@
 use celeriant_wal::compression_type::CompressionType;
-use celeriant_wire::network::{
-    wire_error::WireError,
-    wire_header::{WireHeader, wire_header_write_fixed_size, wire_header_write_variable_size},
+use celeriant_wire::{
+    codec::compression::DictCodec,
+    network::{
+        wire_error::WireError,
+        wire_header::{WireHeader, wire_header_write_fixed_size, wire_header_write_variable_size_with_codec},
+    },
 };
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
 
@@ -53,7 +56,7 @@ impl ClusterRequest {
         }
     }
 
-    pub async fn read_from_header<R>(wire_header: WireHeader, reader: &mut R) -> Result<ClusterRequest, ReadWireDataError>
+    pub async fn read_from_header<R>(wire_header: WireHeader, reader: &mut R, dict_codec: &DictCodec) -> Result<ClusterRequest, ReadWireDataError>
     where
         R: AsyncReadExt + Unpin,
     {
@@ -70,21 +73,15 @@ impl ClusterRequest {
             };
         }
 
-        macro_rules! variable {
-            ($variant:ident) => {
-                ClusterRequest::$variant(
-                    wire_header
-                        .read_variable_size(reader)
-                        .await
-                        .map_err(ReadWireDataError::ReadBodyFailure)?,
-                )
-            };
-        }
-
         Ok(match request_type {
             ClusterRequestType::Heartbeat => fixed!(Heartbeat),
             ClusterRequestType::KickFollower => fixed!(KickFollower),
-            ClusterRequestType::ReplicationBatch => variable!(ReplicationBatch),
+            ClusterRequestType::ReplicationBatch => ClusterRequest::ReplicationBatch(
+                wire_header
+                    .read_variable_size_with_codec(reader, dict_codec)
+                    .await
+                    .map_err(ReadWireDataError::ReadBodyFailure)?,
+            ),
         })
     }
 
@@ -94,6 +91,7 @@ impl ClusterRequest {
         compression_type: CompressionType,
         max_message_size: u64,
         version: u32,
+        dict_codec: &DictCodec,
     ) -> Result<(), WireError>
     where
         W: AsyncWriteExt + Unpin,
@@ -103,7 +101,7 @@ impl ClusterRequest {
         match request {
             ClusterRequest::Heartbeat(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
             ClusterRequest::KickFollower(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
-            ClusterRequest::ReplicationBatch(req) => wire_header_write_variable_size(writer, req, request_type_id, compression_type, max_message_size, version).await,
+            ClusterRequest::ReplicationBatch(req) => wire_header_write_variable_size_with_codec(writer, req, request_type_id, compression_type, max_message_size, version, dict_codec).await,
         }
     }
 }
@@ -151,19 +149,33 @@ mod tests {
         matches!(rt, ClusterRequestType::ReplicationBatch)
     }
 
+    fn test_codec() -> celeriant_wire::codec::compression::DictCodec {
+        use celeriant_wal::builtin_dict::BUILTIN_DICT_BYTES;
+        celeriant_wire::codec::compression::DictCodec::new(BUILTIN_DICT_BYTES, 3)
+            .expect("builtin dict must compile")
+    }
+
     async fn write_bytes(req: &ClusterRequest, version: u32, compression: CompressionType) -> Vec<u8> {
+        write_bytes_with_dict(req, version, compression, &test_codec()).await
+    }
+
+    async fn write_bytes_with_dict(req: &ClusterRequest, version: u32, compression: CompressionType, dict_codec: &celeriant_wire::codec::compression::DictCodec) -> Vec<u8> {
         let mut buf = Vec::new();
-        ClusterRequest::write_request(&mut buf, req, compression, 64 * 1024 * 1024, version)
+        ClusterRequest::write_request(&mut buf, req, compression, 64 * 1024 * 1024, version, dict_codec)
             .await
-            .unwrap();
+            .expect("write_request");
         buf
     }
 
     async fn read_back(bytes: &[u8]) -> ClusterRequest {
-        let header = WireHeader::from_reader(&mut Cursor::new(bytes.to_vec()), u64::MAX).await.unwrap();
-        ClusterRequest::read_from_header(header, &mut Cursor::new(bytes[WIRE_HEADER_SIZE..].to_vec()))
+        read_back_with_dict(bytes, &test_codec()).await
+    }
+
+    async fn read_back_with_dict(bytes: &[u8], dict_codec: &celeriant_wire::codec::compression::DictCodec) -> ClusterRequest {
+        let header = WireHeader::from_reader(&mut Cursor::new(bytes.to_vec()), u64::MAX).await.expect("header");
+        ClusterRequest::read_from_header(header, &mut Cursor::new(bytes[WIRE_HEADER_SIZE..].to_vec()), dict_codec)
             .await
-            .unwrap()
+            .expect("read_from_header")
     }
 
     #[test]
@@ -212,7 +224,7 @@ mod tests {
         block_on(async {
             for rt in all_types() {
                 let req = make_request(rt);
-                let bytes = write_bytes(&req, PROTOCOL_VERSION_V2, CompressionType::Snappy).await;
+                let bytes = write_bytes(&req, PROTOCOL_VERSION_V2, CompressionType::None).await;
                 let compression_byte = bytes[16];
                 if is_variable_size(rt) {
                     assert!(compression_byte == 0 || compression_byte > 0, "{:?} should use variable path", rt);
@@ -228,10 +240,6 @@ mod tests {
         block_on(async {
             let compressions = [
                 CompressionType::None,
-                CompressionType::Zstd { level: 6 },
-                CompressionType::Snappy,
-                CompressionType::Brotli { level: 6 },
-                CompressionType::Gzip { level: 6 },
             ];
 
             for rt in all_types().into_iter().filter(|rt| is_variable_size(*rt)) {
@@ -257,6 +265,7 @@ mod tests {
             let req = make_request(ClusterRequestType::Heartbeat);
             let bytes = write_bytes(&req, PROTOCOL_VERSION_V2, CompressionType::None).await;
 
+            let codec = test_codec();
             for truncate_at in [0, 10, bytes.len() - 1] {
                 let truncated = &bytes[..truncate_at];
                 let header_result = WireHeader::from_reader(&mut Cursor::new(truncated.to_vec()), u64::MAX).await;
@@ -264,10 +273,30 @@ mod tests {
                     let body_result = ClusterRequest::read_from_header(
                         header,
                         &mut Cursor::new(truncated[WIRE_HEADER_SIZE..].to_vec()),
+                        &codec,
                     ).await;
                     assert!(body_result.is_err(), "should fail with {} bytes (full: {})", truncate_at, bytes.len());
                 }
             }
+        });
+    }
+
+    #[test]
+    fn replication_batch_zstd_dict_round_trip() {
+        block_on(async {
+            let req = make_request(ClusterRequestType::ReplicationBatch);
+            let codec = test_codec();
+
+            let bytes = write_bytes_with_dict(&req, PROTOCOL_VERSION_V2, CompressionType::ZstdDict, &codec).await;
+            assert_eq!(bytes[16], 1, "expected ZstdDict compression byte");
+            let parsed = read_back_with_dict(&bytes, &codec).await;
+            assert_eq!(parsed.request_type(), ClusterRequestType::ReplicationBatch);
+            assert_eq!(parsed.correlation_id(), req.correlation_id());
+
+            let bytes_none = write_bytes(&req, PROTOCOL_VERSION_V2, CompressionType::None).await;
+            assert_eq!(bytes_none[16], 0, "expected None compression byte");
+            let parsed_none = read_back(&bytes_none).await;
+            assert_eq!(parsed_none.correlation_id(), req.correlation_id());
         });
     }
 
@@ -277,12 +306,12 @@ mod tests {
             let req = make_request(ClusterRequestType::Heartbeat);
             let mut bytes = write_bytes(&req, PROTOCOL_VERSION_V2, CompressionType::None).await;
 
-            // Set message type to an ID outside cluster range
             bytes[4..8].copy_from_slice(&99u32.to_le_bytes());
-            let header = WireHeader::from_reader(&mut Cursor::new(bytes.clone()), u64::MAX).await.unwrap();
+            let header = WireHeader::from_reader(&mut Cursor::new(bytes.clone()), u64::MAX).await.expect("header");
             let result = ClusterRequest::read_from_header(
                 header,
                 &mut Cursor::new(bytes[WIRE_HEADER_SIZE..].to_vec()),
+                &test_codec(),
             ).await;
             assert!(result.is_err());
         });

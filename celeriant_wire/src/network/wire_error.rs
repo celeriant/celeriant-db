@@ -9,6 +9,7 @@ pub enum WireError {
     },
     UnsupportedProtocol(u32),
     Codec(CodecError),
+    MalformedFrame(String),
 }
 
 impl From<std::io::Error> for WireError {

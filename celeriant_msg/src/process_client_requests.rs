@@ -1,7 +1,9 @@
-use celeriant_wal::compression_type::CompressionType;
+use celeriant_wire::codec::compression::DictCodec;
 use celeriant_wire::network::{
     wire_error::WireError,
-    wire_header::{WireHeader, wire_header_write_fixed_size, wire_header_write_variable_size},
+    wire_header::{
+        WireHeader, wire_header_write_fixed_size, wire_header_write_variable_size_uncompressed,
+    },
 };
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
 
@@ -124,7 +126,11 @@ impl ClientRequest {
         }
     }
 
-    pub async fn read_from_header<R>(wire_header: WireHeader, reader: &mut R) -> Result<ClientRequest, ReadWireDataError>
+    pub async fn read_from_header<R>(
+        wire_header: WireHeader,
+        reader: &mut R,
+        codec: &DictCodec,
+    ) -> Result<ClientRequest, ReadWireDataError>
     where
         R: AsyncReadExt + Unpin,
     {
@@ -145,7 +151,7 @@ impl ClientRequest {
             ($variant:ident) => {
                 ClientRequest::$variant(
                     wire_header
-                        .read_variable_size(reader)
+                        .read_variable_size_with_codec(reader, codec)
                         .await
                         .map_err(ReadWireDataError::ReadBodyFailure)?,
                 )
@@ -169,7 +175,6 @@ impl ClientRequest {
     pub async fn write_request<W>(
         writer: &mut W,
         request: &ClientRequest,
-        compression_type: CompressionType,
         max_message_size: u64,
         version: u32,
     ) -> Result<(), WireError>
@@ -177,7 +182,6 @@ impl ClientRequest {
         W: AsyncWriteExt + Unpin,
     {
         let request_type_id = request.request_type() as u32;
-
         match request {
             ClientRequest::AggregateDetails(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
             ClientRequest::Read(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
@@ -187,8 +191,29 @@ impl ClientRequest {
             ClientRequest::ListOrgs(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
             ClientRequest::ListAggregateTypes(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
             ClientRequest::ListAggregates(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
-            ClientRequest::Write(req) => wire_header_write_variable_size(writer, req, request_type_id, compression_type, max_message_size, version).await,
-            ClientRequest::RegisterSchema(req) => wire_header_write_variable_size(writer, req, request_type_id, compression_type, max_message_size, version).await,
+            ClientRequest::Write(req) => wire_header_write_variable_size_uncompressed(writer, req, request_type_id, max_message_size, version).await,
+            ClientRequest::RegisterSchema(req) => wire_header_write_variable_size_uncompressed(writer, req, request_type_id, max_message_size, version).await,
+        }
+    }
+
+    #[inline]
+    pub fn is_variable_size(&self) -> bool {
+        matches!(self, ClientRequest::Write(_) | ClientRequest::RegisterSchema(_))
+    }
+
+    pub fn serialize_body(&self, version: u32) -> Result<Vec<u8>, WireError> {
+        use celeriant_wire::network::wire_header::serialise_heap_versioned;
+        match self {
+            ClientRequest::AggregateDetails(req) => serialise_heap_versioned(req, version),
+            ClientRequest::Read(req) => serialise_heap_versioned(req, version),
+            ClientRequest::TrimStart(req) => serialise_heap_versioned(req, version),
+            ClientRequest::Delete(req) => serialise_heap_versioned(req, version),
+            ClientRequest::Watch(req) => serialise_heap_versioned(req, version),
+            ClientRequest::ListOrgs(req) => serialise_heap_versioned(req, version),
+            ClientRequest::ListAggregateTypes(req) => serialise_heap_versioned(req, version),
+            ClientRequest::ListAggregates(req) => serialise_heap_versioned(req, version),
+            ClientRequest::Write(req) => serialise_heap_versioned(req, version),
+            ClientRequest::RegisterSchema(req) => serialise_heap_versioned(req, version),
         }
     }
 }
@@ -196,6 +221,7 @@ impl ClientRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use celeriant_wal::compression_type::CompressionType;
     use crate::request::{
         read_filters::ReadFilters,
         requests::{
@@ -276,8 +302,6 @@ mod tests {
                         allow_create: true,
                         expected_event_batch_index: Some(5),
                         enforce_client_idempotency: true,
-                        compression_type_id: 0,
-                        compression_level: None,
                     },
                 )]),
             }),
@@ -343,19 +367,47 @@ mod tests {
         matches!(rt, ClientRequestType::Write | ClientRequestType::RegisterSchema)
     }
 
+    fn test_codec() -> DictCodec {
+        use celeriant_wal::builtin_dict::BUILTIN_DICT_BYTES;
+        DictCodec::new(BUILTIN_DICT_BYTES, 3).expect("builtin dict must compile")
+    }
+
     async fn write_bytes(req: &ClientRequest, version: u32, compression: CompressionType) -> Vec<u8> {
+        use celeriant_wire::network::wire_header::wire_header_write_variable_size_raw;
         let mut buf = Vec::new();
-        ClientRequest::write_request(&mut buf, req, compression, 64 * 1024 * 1024, version)
+        let request_type_id = req.request_type() as u32;
+        if req.is_variable_size() {
+            let body = req.serialize_body(version).expect("serialize_body");
+            let uncompressed_size = body.len() as u32;
+            let frame_body = match compression {
+                CompressionType::None => body,
+                CompressionType::ZstdDict => test_codec().compress(&body).expect("compress"),
+            };
+            wire_header_write_variable_size_raw(
+                &mut buf, &frame_body, request_type_id, compression, uncompressed_size, 64 * 1024 * 1024, version,
+            )
             .await
-            .unwrap();
+            .expect("write_variable_size_raw");
+        } else {
+            ClientRequest::write_request(&mut buf, req, 64 * 1024 * 1024, version)
+                .await
+                .expect("write_request");
+        }
         buf
     }
 
     async fn read_back(bytes: &[u8]) -> ClientRequest {
-        let header = WireHeader::from_reader(&mut Cursor::new(bytes.to_vec()), u64::MAX).await.unwrap();
-        ClientRequest::read_from_header(header, &mut Cursor::new(bytes[celeriant_wire::network::wire_header::WIRE_HEADER_SIZE..].to_vec()))
+        let header = WireHeader::from_reader(&mut Cursor::new(bytes.to_vec()), u64::MAX)
             .await
-            .unwrap()
+            .expect("header");
+        let codec = test_codec();
+        ClientRequest::read_from_header(
+            header,
+            &mut Cursor::new(bytes[celeriant_wire::network::wire_header::WIRE_HEADER_SIZE..].to_vec()),
+            &codec,
+        )
+        .await
+        .expect("read_from_header")
     }
 
     #[test]
@@ -429,7 +481,7 @@ mod tests {
         block_on(async {
             for rt in all_types() {
                 let req = make_request(rt);
-                let bytes = write_bytes(&req, PROTOCOL_VERSION_V2, CompressionType::Snappy).await;
+                let bytes = write_bytes(&req, PROTOCOL_VERSION_V2, CompressionType::None).await;
                 let compression_byte = bytes[16];
                 if is_variable_size(rt) {
                     assert!(compression_byte == 0 || compression_byte > 0, "{:?} should use variable path", rt);
@@ -445,10 +497,6 @@ mod tests {
         block_on(async {
             let compressions = [
                 CompressionType::None,
-                CompressionType::Zstd { level: 6 },
-                CompressionType::Snappy,
-                CompressionType::Brotli { level: 6 },
-                CompressionType::Gzip { level: 6 },
             ];
 
             for rt in all_types().into_iter().filter(|rt| is_variable_size(*rt)) {
@@ -485,6 +533,7 @@ mod tests {
             let req = make_request(ClientRequestType::AggregateDetails);
             let bytes = write_bytes(&req, PROTOCOL_VERSION_V2, CompressionType::None).await;
 
+            let codec = test_codec();
             for truncate_at in [0, 10, bytes.len() - 1] {
                 let truncated = &bytes[..truncate_at];
                 let header_result = WireHeader::from_reader(&mut Cursor::new(truncated.to_vec()), u64::MAX).await;
@@ -492,10 +541,10 @@ mod tests {
                     let body_result = ClientRequest::read_from_header(
                         header,
                         &mut Cursor::new(truncated[celeriant_wire::network::wire_header::WIRE_HEADER_SIZE..].to_vec()),
+                        &codec,
                     ).await;
                     assert!(body_result.is_err(), "should fail with {} bytes (full: {})", truncate_at, bytes.len());
                 }
-                // If header read itself failed, that's also a correct rejection
             }
         });
     }
@@ -507,10 +556,11 @@ mod tests {
             let mut bytes = write_bytes(&req, PROTOCOL_VERSION_V2, CompressionType::None).await;
 
             bytes[4..8].copy_from_slice(&(MAX_ID + 1).to_le_bytes());
-            let header = WireHeader::from_reader(&mut Cursor::new(bytes.clone()), u64::MAX).await.unwrap();
+            let header = WireHeader::from_reader(&mut Cursor::new(bytes.clone()), u64::MAX).await.expect("header");
             let result = ClientRequest::read_from_header(
                 header,
                 &mut Cursor::new(bytes[celeriant_wire::network::wire_header::WIRE_HEADER_SIZE..].to_vec()),
+                &test_codec(),
             ).await;
             assert!(result.is_err());
         });
@@ -535,8 +585,6 @@ mod tests {
                         allow_create: true,
                         expected_event_batch_index: Some(42),
                         enforce_client_idempotency: true,
-                        compression_type_id: 0,
-                        compression_level: None,
                     },
                 )]),
             });
@@ -546,13 +594,13 @@ mod tests {
             let parsed = read_back(&bytes).await;
             assert_eq!(parsed.correlation_id(), req.correlation_id());
 
-            // V2 compressed
-            let bytes = write_bytes(&req, PROTOCOL_VERSION_V2, CompressionType::Zstd { level: 6 }).await;
+            // V2 uncompressed (large)
+            let bytes = write_bytes(&req, PROTOCOL_VERSION_V2, CompressionType::None).await;
             let parsed = read_back(&bytes).await;
             assert_eq!(parsed.correlation_id(), req.correlation_id());
 
-            // V3 compressed
-            let bytes = write_bytes(&req, PROTOCOL_VERSION_V3, CompressionType::Zstd { level: 6 }).await;
+            // V3 uncompressed (large)
+            let bytes = write_bytes(&req, PROTOCOL_VERSION_V3, CompressionType::None).await;
             let parsed = read_back(&bytes).await;
             assert_eq!(parsed.correlation_id(), req.correlation_id());
         });

@@ -23,7 +23,7 @@ use celeriant_msg::{
     request::requests::{AggregateDetailsRequest, ReadRequest, SingleAggregateWrite, WriteRequest},
 };
 use celeriant_wal::{
-    aggregate_key::AggregateKey, compression_type::CompressionType,
+    aggregate_key::AggregateKey,
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
 };
 use rustls_pki_types::ServerName;
@@ -124,8 +124,6 @@ async fn test_mtls_client_server_roundtrip() -> Result<(), Box<dyn std::error::E
             allow_create: true,
             expected_event_batch_index: None,
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -155,7 +153,7 @@ async fn test_mtls_client_server_roundtrip() -> Result<(), Box<dyn std::error::E
             user_id: None,
             writes: writes.clone(),
         });
-        if let Err(e) = client.send_request(&write_req, CompressionType::None).await {
+        if let Err(e) = client.send_request(&write_req).await {
             last_err = format!("write failed (attempt {attempt}): {e}");
             tokio::time::sleep(Duration::from_millis(500)).await;
             continue;
@@ -166,7 +164,7 @@ async fn test_mtls_client_server_roundtrip() -> Result<(), Box<dyn std::error::E
             aggregate_key: aggregate.clone(),
             filters: celeriant_msg::request::read_filters::ReadFilters::new(1),
         });
-        match client.send_request(&read_req, CompressionType::None).await {
+        match client.send_request(&read_req).await {
             Ok(ClientResponse::Read(r)) => {
                 let total_events: usize = r.event_batches.iter().map(|b| b.events.len()).sum();
                 if total_events == 0 {
@@ -223,7 +221,7 @@ async fn test_strict_mode_rejects_plaintext() -> Result<(), Box<dyn std::error::
         filters: celeriant_msg::request::read_filters::ReadFilters::new(1),
     });
 
-    match client.send_request(&request, CompressionType::None).await {
+    match client.send_request(&request).await {
         Err(_) => {
             println!("  Plaintext connection correctly rejected by strict-mode server");
             Ok(())
@@ -281,7 +279,7 @@ async fn test_untrusted_cert_rejected() -> Result<(), Box<dyn std::error::Error>
                 aggregate_key: AggregateKey::new(1, 1, 40005),
                 filters: celeriant_msg::request::read_filters::ReadFilters::new(1),
             });
-            match client.send_request(&request, CompressionType::None).await {
+            match client.send_request(&request).await {
                 Err(_) => {
                     println!("  Rogue client cert rejected on first request");
                     Ok(())
@@ -404,7 +402,7 @@ async fn test_trust_domain_isolation() -> Result<(), Box<dyn std::error::Error>>
                     aggregate_key: AggregateKey::new(1, 1, 60001),
                     filters: celeriant_msg::request::read_filters::ReadFilters::new(1),
                 });
-                match client.send_request(&req, CompressionType::None).await {
+                match client.send_request(&req).await {
                     Ok(_) | Err(celeriant_client_tokio::client_error::ClientError::Server(_)) => {
                         println!("  Client cert accepted on client port (as expected)");
                         client_port_ok = true;
@@ -449,7 +447,7 @@ async fn test_trust_domain_isolation() -> Result<(), Box<dyn std::error::Error>>
                 aggregate_key: AggregateKey::new(1, 1, 60002),
                 filters: celeriant_msg::request::read_filters::ReadFilters::new(1),
             });
-            match client.send_request(&req, CompressionType::None).await {
+            match client.send_request(&req).await {
                 Err(_) => {
                     println!("  Client cert rejected on replication port (post-handshake)");
                     Ok(())
@@ -485,8 +483,6 @@ async fn cross_shard_roundtrip(
                 allow_create: true,
                 expected_event_batch_index: None,
                 enforce_client_idempotency: false,
-                compression_type_id: 0,
-                compression_level: None,
             },
         );
         let write_req = ClientRequest::Write(WriteRequest {
@@ -496,7 +492,7 @@ async fn cross_shard_roundtrip(
             writes,
         });
         client
-            .send_request(&write_req, CompressionType::None)
+            .send_request(&write_req)
             .await?;
 
         let read_req = ClientRequest::Read(ReadRequest {
@@ -505,7 +501,7 @@ async fn cross_shard_roundtrip(
             filters: celeriant_msg::request::read_filters::ReadFilters::new(1),
         });
         let response = client
-            .send_request(&read_req, CompressionType::None)
+            .send_request(&read_req)
             .await?;
 
         match response {
@@ -530,7 +526,7 @@ async fn cross_shard_roundtrip(
             correlation_id: Some(700 + i),
         });
         match client
-            .send_request(&request, CompressionType::None)
+            .send_request(&request)
             .await
         {
             Ok(_) | Err(celeriant_client_tokio::client_error::ClientError::Server(_)) => {}

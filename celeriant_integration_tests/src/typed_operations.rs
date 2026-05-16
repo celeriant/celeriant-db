@@ -73,8 +73,6 @@ async fn test_typed_write(client: &mut CeleriantClient) {
             allow_create: true,
             expected_event_batch_index: Some(0),
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
     let req = WriteRequest { correlation_id: Some(1), client_id: 1, user_id: None, writes };
@@ -98,8 +96,6 @@ async fn test_typed_read(client: &mut CeleriantClient) {
             allow_create: true,
             expected_event_batch_index: Some(0),
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
     let _ = client.write(WriteRequest { correlation_id: None, client_id: 1, user_id: None, writes }).await;
@@ -172,8 +168,6 @@ async fn test_json_event_roundtrip(client: &mut CeleriantClient) {
             allow_create: true,
             expected_event_batch_index: Some(0),
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
     if let Err(e) = client.write(WriteRequest { correlation_id: None, client_id: 1, user_id: None, writes }).await {

@@ -27,7 +27,7 @@ use celeriant_msg::{
     },
 };
 use celeriant_wal::{
-    aggregate_key::AggregateKey, compression_type::CompressionType,
+    aggregate_key::AggregateKey,
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
 };
 
@@ -138,7 +138,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             correlation_id: None,
         });
         match read_client
-            .send_request(&request, CompressionType::None)
+            .send_request(&request)
             .await
         {
             Err(ClientError::Server(celeriant_client_tokio::server_error::ServerError::Details {
@@ -163,8 +163,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 allow_create: true,
                 expected_event_batch_index: Some(0),
                 enforce_client_idempotency: true,
-                compression_type_id: 0,
-                compression_level: None,
             },
         );
 
@@ -175,7 +173,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             writes,
         });
         match write_client
-            .send_request(&request, CompressionType::None)
+            .send_request(&request)
             .await
         {
             Ok(response) => println!("Initial write to aggregate {}: {:?}", i + 1, response),
@@ -196,8 +194,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             allow_create: false,
             expected_event_batch_index: Some(1),
             enforce_client_idempotency: true,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
     writes.insert(
@@ -207,8 +203,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             allow_create: false,
             expected_event_batch_index: Some(1),
             enforce_client_idempotency: true,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -219,7 +213,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         writes,
     });
     match write_client
-        .send_request(&atomic_request, CompressionType::None)
+        .send_request(&atomic_request)
         .await
     {
         Ok(response) => println!("Atomic multi-aggregate write: {:?}", response),
@@ -229,7 +223,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Test idempotency - retry same write
     println!("\n=== Testing idempotency (retry same write) ===");
     match write_client
-        .send_request(&atomic_request, CompressionType::None)
+        .send_request(&atomic_request)
         .await
     {
         Ok(response) => println!("Idempotent retry succeeded: {:?}", response),
@@ -248,7 +242,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             filters: ReadFilters::new(1),
         });
         match read_client
-            .send_request(&request, CompressionType::None)
+            .send_request(&request)
             .await
         {
             Ok(response) => println!("Aggregate {} events: {:?}", i + 1, response),
@@ -342,7 +336,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         deletes,
     });
     match write_client
-        .send_request(&delete_request, CompressionType::None)
+        .send_request(&delete_request)
         .await
     {
         Ok(response) => println!("Delete aggregate 1: {:?}", response),
@@ -417,8 +411,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             allow_create: false,
             expected_event_batch_index: Some(0), // Wrong! Should be 2 now
             enforce_client_idempotency: true,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -429,7 +421,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         writes,
     });
     match write_client
-        .send_request(&request, CompressionType::None)
+        .send_request(&request)
         .await
     {
         Ok(response) => println!("Unexpected success: {:?}", response),

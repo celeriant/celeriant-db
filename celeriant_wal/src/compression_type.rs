@@ -6,39 +6,29 @@ use serde::{Deserialize, Serialize};
 #[repr(u32)]
 pub enum CompressionType {
     None = 0,
-    Zstd { level: i32 } = 1,
-    Snappy = 2,
-    Brotli { level: i32 } = 3,
-    Gzip { level: i32 } = 4,
+    ZstdDict = 1,
 }
 
 impl CompressionType {
     #[inline]
-    pub fn to_tuple(self) -> (u8, Option<i32>) {
+    pub fn is_zstd_dict(self) -> bool {
+        matches!(self, CompressionType::ZstdDict)
+    }
+
+    #[inline]
+    pub fn to_byte(self) -> u8 {
         match self {
-            CompressionType::None => (0, None),
-            CompressionType::Zstd { level } => (1, Some(level)),
-            CompressionType::Snappy => (2, None),
-            CompressionType::Brotli { level } => (3, Some(level)),
-            CompressionType::Gzip { level } => (4, Some(level)),
+            CompressionType::None => 0,
+            CompressionType::ZstdDict => 1,
         }
     }
 
     #[inline]
-    pub fn from_tuple(type_id: u8, level: Option<i32>) -> Self {
+    pub fn from_byte(type_id: u8) -> Result<Self, u8> {
         match type_id {
-            0 => CompressionType::None,
-            1 => CompressionType::Zstd {
-                level: level.unwrap_or(6),
-            },
-            2 => CompressionType::Snappy,
-            3 => CompressionType::Brotli {
-                level: level.unwrap_or(6),
-            },
-            4 => CompressionType::Gzip {
-                level: level.unwrap_or(6),
-            },
-            _ => CompressionType::None,
+            0 => Ok(CompressionType::None),
+            1 => Ok(CompressionType::ZstdDict),
+            _ => Err(type_id),
         }
     }
 }

@@ -8,7 +8,6 @@ use celeriant_msg::request::requests::{
 };
 use celeriant_msg::response::responses::{AggregateDetailsResponse, ReadResponse, SuccessResponse};
 use celeriant_wal::aggregate_key::AggregateKey;
-use celeriant_wal::compression_type::CompressionType;
 use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
 
 use crate::celeriant_client::CeleriantClient;
@@ -34,49 +33,30 @@ impl Default for WriteEventsOptions {
     }
 }
 
-/// Estimate payload size for a `WriteRequest` by summing event value byte lengths.
-fn write_payload_size(req: &WriteRequest) -> u64 {
-    req.writes
-        .values()
-        .flat_map(|w| &w.events)
-        .map(|e| e.event_value.len() as u64)
-        .sum()
-}
-
-/// Estimate payload size for a `RegisterSchemaRequest` from the schema string length.
-fn register_schema_payload_size(req: &RegisterSchemaRequest) -> u64 {
-    req.schema.len() as u64
-}
-
 impl CeleriantClient {
     pub async fn read(&mut self, request: ReadRequest) -> Result<ReadResponse, ClientError> {
-        match self.send_request(&ClientRequest::Read(request), CompressionType::None).await? {
+        match self.send_request(&ClientRequest::Read(request)).await? {
             ClientResponse::Read(r) => Ok(r),
             _ => Err(ClientError::ProtocolError),
         }
     }
 
     pub async fn write(&mut self, request: WriteRequest) -> Result<SuccessResponse, ClientError> {
-        let compression = if write_payload_size(&request) >= self.auto_compression_threshold {
-            self.compression
-        } else {
-            CompressionType::None
-        };
-        match self.send_request(&ClientRequest::Write(request), compression).await? {
+        match self.send_request(&ClientRequest::Write(request)).await? {
             ClientResponse::Write(r) => Ok(r),
             _ => Err(ClientError::ProtocolError),
         }
     }
 
     pub async fn delete(&mut self, request: DeleteRequest) -> Result<SuccessResponse, ClientError> {
-        match self.send_request(&ClientRequest::Delete(request), CompressionType::None).await? {
+        match self.send_request(&ClientRequest::Delete(request)).await? {
             ClientResponse::Delete(r) => Ok(r),
             _ => Err(ClientError::ProtocolError),
         }
     }
 
     pub async fn trim_start(&mut self, request: TrimStartRequest) -> Result<SuccessResponse, ClientError> {
-        match self.send_request(&ClientRequest::TrimStart(request), CompressionType::None).await? {
+        match self.send_request(&ClientRequest::TrimStart(request)).await? {
             ClientResponse::TrimStart(r) => Ok(r),
             _ => Err(ClientError::ProtocolError),
         }
@@ -86,7 +66,7 @@ impl CeleriantClient {
         &mut self,
         request: AggregateDetailsRequest,
     ) -> Result<AggregateDetailsResponse, ClientError> {
-        match self.send_request(&ClientRequest::AggregateDetails(request), CompressionType::None).await? {
+        match self.send_request(&ClientRequest::AggregateDetails(request)).await? {
             ClientResponse::AggregateDetails(r) => Ok(r),
             _ => Err(ClientError::ProtocolError),
         }
@@ -114,8 +94,6 @@ impl CeleriantClient {
             allow_create: options.allow_create,
             expected_event_batch_index: options.expected_event_batch_index,
             enforce_client_idempotency: options.enforce_client_idempotency,
-            compression_type_id: 0,
-            compression_level: None,
         });
         self.write(WriteRequest {
             correlation_id: None,
@@ -130,12 +108,7 @@ impl CeleriantClient {
         &mut self,
         request: RegisterSchemaRequest,
     ) -> Result<SuccessResponse, ClientError> {
-        let compression = if register_schema_payload_size(&request) >= self.auto_compression_threshold {
-            self.compression
-        } else {
-            CompressionType::None
-        };
-        match self.send_request(&ClientRequest::RegisterSchema(request), compression).await? {
+        match self.send_request(&ClientRequest::RegisterSchema(request)).await? {
             ClientResponse::RegisterSchema(r) => Ok(r),
             _ => Err(ClientError::ProtocolError),
         }

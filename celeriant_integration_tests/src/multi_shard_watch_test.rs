@@ -19,7 +19,7 @@ use celeriant_msg::{
     request::requests::{SingleAggregateWrite, WatchRequest, WriteRequest},
 };
 use celeriant_wal::{
-    aggregate_key::AggregateKey, compression_type::CompressionType,
+    aggregate_key::AggregateKey,
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
 };
 use tokio::time::sleep;
@@ -393,7 +393,6 @@ async fn test_max_shard_hint_skips_probe(
     };
 
     let options = WatchOptions {
-        compression: CompressionType::None,
         timeout: None,
         start_shard: 0,
         max_shard_hint: Some(2), // Tell it there are 3 shards (0..2), skip probe
@@ -438,8 +437,6 @@ async fn write_event(
             allow_create: true,
             expected_event_batch_index: None,
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -451,7 +448,7 @@ async fn write_event(
     });
 
     let response = client
-        .send_request(&write_request, CompressionType::None)
+        .send_request(&write_request)
         .await?;
 
     match response {

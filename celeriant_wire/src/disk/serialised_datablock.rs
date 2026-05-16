@@ -1,6 +1,6 @@
 use celeriant_wal::{compression_type::CompressionType, constants::{MINIBATCH_SIZE_BYTES, WIRE_VERSION_WAL_DATABLOCK}, datablocks::datablock::Datablock, metablocks::{datablock_block_ref::DatablockBlockRef, datablock_inline_data::DatablockInlineData, datablock_storage_kind::DatablockStorageKind}};
 
-use crate::{codec::{self, codec_error::CodecError, compression}, disk::disk_format_error::DiskFormatError};
+use crate::{codec::{self, codec_error::CodecError, compression::DictCodec}, disk::disk_format_error::DiskFormatError};
 
 pub struct SerialisedDatablock {
     pub uncompressed_size: u64,
@@ -11,74 +11,149 @@ pub struct SerialisedDatablock {
     pub external_data: Option<Vec<u8>>,
 }
 
+/// Bincode scratch size for the Auto write path. Sized to comfortably hold a typical event
+/// batch without spilling to heap, while staying well below the executor stack limits used
+/// by glommio and tokio.
+pub const DEFAULT_AUTO_STACK_SCRATCH_BYTES: usize = 4096;
+
+/// How the serialiser decides whether to compress a datablock.
+pub enum CompressionPolicy {
+    Auto { compression_allowed: bool },
+    Fixed(CompressionType),
+}
+
 impl SerialisedDatablock {
     pub fn new(
         datablock: &Datablock,
-        compression_type: CompressionType,
+        policy: CompressionPolicy,
+        dict_codec: &DictCodec,
     ) -> Result<Self, CodecError> {
-        let (compression_type_id, _) = compression_type.to_tuple();
+        Self::new_with_stack_scratch::<{ DEFAULT_AUTO_STACK_SCRATCH_BYTES }>(datablock, policy, dict_codec)
+    }
 
-        // Try serialising directly to a stack buffer to avoid a heap allocation.
-        // This covers the common case where uncompressed data fits in a minibatch.
-        let mut stack_buf = [0u8; MINIBATCH_SIZE_BYTES];
-        if let Ok(uncompressed_size) = codec::bincode::fixed_serialise_stack(datablock, &mut stack_buf) {
-            let mut minibatch = [0u8; MINIBATCH_SIZE_BYTES];
-
-            let compressed_size = if compression_type == CompressionType::None {
-                minibatch[..uncompressed_size].copy_from_slice(&stack_buf[..uncompressed_size]);
-                uncompressed_size
-            } else {
-                let compressed = compression::compress(&stack_buf[..uncompressed_size], compression_type)?;
-                minibatch[..compressed.len()].copy_from_slice(&compressed);
-                compressed.len()
-            };
-
-            return Ok(Self {
-                uncompressed_size: uncompressed_size as u64,
-                compressed_size: compressed_size as u64,
-                datablock_version: WIRE_VERSION_WAL_DATABLOCK,
-                compression_type: compression_type_id,
-                storage_kind: DatablockStorageKind::Inline(DatablockInlineData { minibatch }),
-                external_data: None,
-            });
+    pub fn new_with_stack_scratch<const STACK_SCRATCH: usize>(
+        datablock: &Datablock,
+        policy: CompressionPolicy,
+        dict_codec: &DictCodec,
+    ) -> Result<Self, CodecError> {
+        match policy {
+            CompressionPolicy::Auto { compression_allowed } => {
+                serialise_auto::<STACK_SCRATCH>(datablock, compression_allowed, dict_codec)
+            }
+            CompressionPolicy::Fixed(compression_type) => {
+                serialise_fixed(datablock, compression_type, dict_codec)
+            }
         }
-
-        // Uncompressed data exceeds minibatch — heap-serialise, but compression
-        // may still shrink it enough for inline storage
-        let uncompressed = codec::bincode::fixed_serialise_heap(datablock)?;
-        let uncompressed_size = uncompressed.len();
-
-        let compressed = compression::compress(&uncompressed, compression_type)?;
-        let compressed_size = compressed.len();
-
-        if compressed_size <= MINIBATCH_SIZE_BYTES {
-            let mut minibatch = [0u8; MINIBATCH_SIZE_BYTES];
-            minibatch[..compressed_size].copy_from_slice(&compressed);
-
-            return Ok(Self {
-                uncompressed_size: uncompressed_size as u64,
-                compressed_size: compressed_size as u64,
-                datablock_version: WIRE_VERSION_WAL_DATABLOCK,
-                compression_type: compression_type_id,
-                storage_kind: DatablockStorageKind::Inline(DatablockInlineData { minibatch }),
-                external_data: None,
-            });
-        }
-
-        let crc32c = crc32c::crc32c(&compressed);
-        let block_ref = DatablockBlockRef { crc32c };
-
-        Ok(Self {
-            uncompressed_size: uncompressed_size as u64,
-            compressed_size: compressed_size as u64,
-            datablock_version: WIRE_VERSION_WAL_DATABLOCK,
-            compression_type: compression_type_id,
-            storage_kind: DatablockStorageKind::Block(block_ref),
-            external_data: Some(compressed),
-        })
     }
 }
 
+fn serialise_auto<const STACK_SCRATCH: usize>(
+    datablock: &Datablock,
+    compression_allowed: bool,
+    dict_codec: &DictCodec,
+) -> Result<SerialisedDatablock, CodecError> {
+    // Stack-serialise into a scratch buffer big enough to typically avoid the heap.
+    let mut stack_buf = [0u8; STACK_SCRATCH];
+    let stack_result = codec::bincode::fixed_serialise_stack(datablock, &mut stack_buf);
+
+    if let Ok(uncompressed_size) = stack_result {
+        //uncompressed already fits inline. Done, no codec call.
+        if uncompressed_size <= MINIBATCH_SIZE_BYTES {
+            let mut minibatch = [0u8; MINIBATCH_SIZE_BYTES];
+            minibatch[..uncompressed_size].copy_from_slice(&stack_buf[..uncompressed_size]);
+            return Ok(inline(uncompressed_size as u64, uncompressed_size as u64, CompressionType::None.to_byte(), minibatch));
+        }
+
+        // won't fit uncompressed. If encrypted, copy stack→heap for external.
+        if !compression_allowed {
+            return Ok(external_block(
+                uncompressed_size as u64,
+                uncompressed_size as u64,
+                CompressionType::None.to_byte(),
+                stack_buf[..uncompressed_size].to_vec(),
+            ));
+        }
+
+        // try compression to squeeze inline, fall back to external if it doesn't.
+        let compressed = dict_codec.compress(&stack_buf[..uncompressed_size])?;
+        let compressed_size = compressed.len();
+        if compressed_size <= MINIBATCH_SIZE_BYTES {
+            let mut minibatch = [0u8; MINIBATCH_SIZE_BYTES];
+            minibatch[..compressed_size].copy_from_slice(&compressed);
+            return Ok(inline(uncompressed_size as u64, compressed_size as u64, CompressionType::ZstdDict.to_byte(), minibatch));
+        }
+        return Ok(external_block(uncompressed_size as u64, compressed_size as u64, CompressionType::ZstdDict.to_byte(), compressed));
+    }
+
+    // datablock exceeds STACK_SCRATCH. Heap-serialise and run the same decision
+    // tree against the heap-owned bytes.
+    let uncompressed = codec::bincode::fixed_serialise_heap(datablock)?;
+    let uncompressed_size = uncompressed.len();
+
+    if !compression_allowed {
+        return Ok(external_block(uncompressed_size as u64, uncompressed_size as u64, CompressionType::None.to_byte(), uncompressed));
+    }
+
+    let compressed = dict_codec.compress(&uncompressed)?;
+    let compressed_size = compressed.len();
+    if compressed_size <= MINIBATCH_SIZE_BYTES {
+        let mut minibatch = [0u8; MINIBATCH_SIZE_BYTES];
+        minibatch[..compressed_size].copy_from_slice(&compressed);
+        return Ok(inline(uncompressed_size as u64, compressed_size as u64, CompressionType::ZstdDict.to_byte(), minibatch));
+    }
+    Ok(external_block(uncompressed_size as u64, compressed_size as u64, CompressionType::ZstdDict.to_byte(), compressed))
+}
+
+fn serialise_fixed(
+    datablock: &Datablock,
+    compression_type: CompressionType,
+    dict_codec: &DictCodec,
+) -> Result<SerialisedDatablock, CodecError> {
+    let uncompressed = codec::bincode::fixed_serialise_heap(datablock)?;
+    let uncompressed_size = uncompressed.len();
+
+    let body = match compression_type {
+        CompressionType::None => uncompressed,
+        CompressionType::ZstdDict => dict_codec.compress(&uncompressed)?,
+    };
+    let body_size = body.len();
+
+    if body_size <= MINIBATCH_SIZE_BYTES {
+        let mut minibatch = [0u8; MINIBATCH_SIZE_BYTES];
+        minibatch[..body_size].copy_from_slice(&body);
+        return Ok(inline(uncompressed_size as u64, body_size as u64, compression_type.to_byte(), minibatch));
+    }
+
+    Ok(external_block(uncompressed_size as u64, body_size as u64, compression_type.to_byte(), body))
+}
+
+fn inline(uncompressed_size: u64, compressed_size: u64, compression_type: u8, minibatch: [u8; MINIBATCH_SIZE_BYTES]) -> SerialisedDatablock {
+    SerialisedDatablock {
+        uncompressed_size,
+        compressed_size,
+        datablock_version: WIRE_VERSION_WAL_DATABLOCK,
+        compression_type,
+        storage_kind: DatablockStorageKind::Inline(DatablockInlineData { minibatch }),
+        external_data: None,
+    }
+}
+
+fn external_block(uncompressed_size: u64, compressed_size: u64, compression_type: u8, body: Vec<u8>) -> SerialisedDatablock {
+    let crc32c = crc32c::crc32c(&body);
+    SerialisedDatablock {
+        uncompressed_size,
+        compressed_size,
+        datablock_version: WIRE_VERSION_WAL_DATABLOCK,
+        compression_type,
+        storage_kind: DatablockStorageKind::Block(DatablockBlockRef { crc32c }),
+        external_data: Some(body),
+    }
+}
+
+/// Deserialise a datablock from its stored representation.
+///
+/// `dict_codec` is consulted only when the stored `compression_type_id` resolves to `ZstdDict`;
+/// for `None` it is unused.
 pub fn deserialise_datablock(
     uncompressed_size: u64,
     compressed_size: u64,
@@ -86,6 +161,7 @@ pub fn deserialise_datablock(
     compression_type_id: u8,
     storage_kind: &DatablockStorageKind,
     external_data: Option<&[u8]>,
+    dict_codec: &DictCodec,
 ) -> Result<Datablock, DiskFormatError> {
     match storage_kind {
         DatablockStorageKind::None => {
@@ -97,25 +173,21 @@ pub fn deserialise_datablock(
                 return Err(DiskFormatError::UnsupportedVersion(datablock_version));
             }
 
-            let compression_type = CompressionType::from_tuple(compression_type_id, None);
+            let compression_type = CompressionType::from_byte(compression_type_id)
+                .map_err(DiskFormatError::UnknownCompression)?;
             let data = &inline.minibatch[..compressed_size as usize];
 
             if compression_type == CompressionType::None {
                 return Ok(codec::bincode::fixed_deserialise(data)?);
             }
 
-            let decompressed = codec::compression::decompress(
-                data,
-                compression_type,
-                uncompressed_size as usize,
-            )?;
+            let decompressed = dict_codec.decompress(data, uncompressed_size as usize)?;
             Ok(codec::bincode::fixed_deserialise(&decompressed)?)
         }
 
         DatablockStorageKind::Block(block_ref) => {
             let data = external_data.ok_or(DiskFormatError::ExternalDataMissing)?;
 
-            // Verify CRC
             let actual_crc = crc32c::crc32c(data);
             if actual_crc != block_ref.crc32c {
                 return Err(DiskFormatError::ChecksumMismatch {
@@ -124,25 +196,18 @@ pub fn deserialise_datablock(
                 });
             }
 
-            // Check version
             if datablock_version != WIRE_VERSION_WAL_DATABLOCK {
                 return Err(DiskFormatError::UnsupportedVersion(datablock_version));
             }
 
-            let compression_type = CompressionType::from_tuple(compression_type_id, None);
+            let compression_type = CompressionType::from_byte(compression_type_id)
+                .map_err(DiskFormatError::UnknownCompression)?;
 
-            // Save the extra heap allocation if no compression
             if compression_type == CompressionType::None {
-                return Ok(codec::bincode::fixed_deserialise(&data)?);
+                return Ok(codec::bincode::fixed_deserialise(data)?);
             }
 
-            // Decompress and deserialize
-            let decompressed = codec::compression::decompress(
-                data,
-                compression_type,
-                uncompressed_size as usize,
-            )?;
-
+            let decompressed = dict_codec.decompress(data, uncompressed_size as usize)?;
             Ok(codec::bincode::fixed_deserialise(&decompressed)?)
         }
     }
@@ -177,9 +242,10 @@ mod tests {
     }
 
     fn create_large_datablock() -> Datablock {
-        // Create a datablock with enough data to exceed MINIBATCH_SIZE_BYTES (512 bytes)
-        // Need 600+ bytes to ensure serialized size exceeds threshold after bincode overhead
-        let large_payload = vec![0u8; 600];
+        // Bigger than any practical MINIBATCH_SIZE_BYTES so the "won't fit uncompressed
+        // inline" path is exercised. Highly compressible so the dict can shrink it back
+        // under the minibatch ceiling when compression is allowed.
+        let large_payload = vec![0u8; 1500];
         Datablock {
             datablock_kind: DatablockKind::EventBatchItem(DatablockAggregateEventBatch {
                 event_batch_index: 1,
@@ -225,7 +291,16 @@ mod tests {
         }
     }
 
+    fn test_codec() -> DictCodec {
+        use celeriant_wal::builtin_dict::BUILTIN_DICT_BYTES;
+        DictCodec::new(BUILTIN_DICT_BYTES, 3).expect("builtin dict must compile")
+    }
+
     fn roundtrip_deserialise(s: &SerialisedDatablock) -> Result<Datablock, DiskFormatError> {
+        roundtrip_deserialise_with_codec(s, &test_codec())
+    }
+
+    fn roundtrip_deserialise_with_codec(s: &SerialisedDatablock, codec: &DictCodec) -> Result<Datablock, DiskFormatError> {
         deserialise_datablock(
             s.uncompressed_size,
             s.compressed_size,
@@ -233,286 +308,198 @@ mod tests {
             s.compression_type,
             &s.storage_kind,
             s.external_data.as_deref(),
+            codec,
         )
     }
 
-    #[test]
-    fn small_datablock_serializes_inline() {
-        let datablock = create_small_datablock();
-
-        let result = SerialisedDatablock::new(&datablock, CompressionType::None).unwrap();
-
-        assert!(matches!(result.storage_kind, DatablockStorageKind::Inline(_)));
-        assert!(result.external_data.is_none());
+    fn auto() -> CompressionPolicy {
+        CompressionPolicy::Auto { compression_allowed: true }
     }
 
-    #[test]
-    fn large_datablock_serializes_as_block() {
-        let datablock = create_large_datablock();
-
-        let result = SerialisedDatablock::new(&datablock, CompressionType::None).unwrap();
-
-        assert!(matches!(result.storage_kind, DatablockStorageKind::Block(_)));
-        assert!(result.external_data.is_some());
-    }
-
-    #[test]
-    fn inline_with_compression_stores_compressed_data() {
-        let original = create_small_datablock();
-
-        let serialized = SerialisedDatablock::new(&original, CompressionType::Zstd { level: 3 }).unwrap();
-
-        assert!(matches!(serialized.storage_kind, DatablockStorageKind::Inline(_)));
-        assert!(serialized.external_data.is_none());
-        assert_eq!(serialized.compression_type, 1); // Zstd
-        assert!(serialized.compressed_size <= serialized.uncompressed_size);
-    }
-
-    #[test]
-    fn inline_roundtrip_with_zstd_compression() {
-        let original = create_small_datablock();
-
-        let serialized = SerialisedDatablock::new(&original, CompressionType::Zstd { level: 3 }).unwrap();
-
-        let deserialized = roundtrip_deserialise(&serialized).unwrap();
-
-        match (&original.datablock_kind, &deserialized.datablock_kind) {
-            (
-                DatablockKind::EventBatchItem(orig_batch),
-                DatablockKind::EventBatchItem(deser_batch),
-            ) => {
-                assert_eq!(orig_batch.event_batch_index, deser_batch.event_batch_index);
-                assert_eq!(orig_batch.events.len(), deser_batch.events.len());
-                assert_eq!(
-                    orig_batch.events[0].event_index,
-                    deser_batch.events[0].event_index
-                );
+    fn assert_same_batch(a: &Datablock, b: &Datablock) {
+        match (&a.datablock_kind, &b.datablock_kind) {
+            (DatablockKind::EventBatchItem(x), DatablockKind::EventBatchItem(y)) => {
+                assert_eq!(x.event_batch_index, y.event_batch_index);
+                assert_eq!(x.events.len(), y.events.len());
+                if !x.events.is_empty() {
+                    assert_eq!(x.events[0].event_index, y.events[0].event_index);
+                }
             }
             _ => panic!("Unexpected datablock kind"),
         }
     }
 
+    // ==================== Auto policy ====================
+
+    /// Small data that bincodes into ≤ 512 B → inline, uncompressed. The compression byte
+    /// records None even when compression was "allowed" — compression in a fixed slot
+    /// saves nothing.
     #[test]
-    fn inline_roundtrip_with_snappy_compression() {
+    fn auto_small_data_inline_uncompressed() {
         let original = create_small_datablock();
+        let serialised = SerialisedDatablock::new(&original, auto(), &test_codec()).unwrap();
 
-        let serialized = SerialisedDatablock::new(&original, CompressionType::Snappy).unwrap();
-
-        let deserialized = roundtrip_deserialise(&serialized).unwrap();
-
-        match (&original.datablock_kind, &deserialized.datablock_kind) {
-            (
-                DatablockKind::EventBatchItem(orig_batch),
-                DatablockKind::EventBatchItem(deser_batch),
-            ) => {
-                assert_eq!(orig_batch.event_batch_index, deser_batch.event_batch_index);
-            }
-            _ => panic!("Unexpected datablock kind"),
-        }
+        assert!(matches!(serialised.storage_kind, DatablockStorageKind::Inline(_)));
+        assert_eq!(serialised.compression_type, CompressionType::None.to_byte());
+        assert_eq!(serialised.compressed_size, serialised.uncompressed_size);
+        assert!(serialised.external_data.is_none());
     }
 
+    /// Doesn't fit uncompressed, but compresses small enough to inline. The whole point
+    /// of moving the compression decision into the serialiser. `create_large_datablock`
+    /// is 1500 B raw of zeros — compresses to ~30 B with the dict.
     #[test]
-    fn inline_roundtrip() {
-        let original = create_small_datablock();
-
-        let serialized = SerialisedDatablock::new(&original, CompressionType::None).unwrap();
-
-        let deserialized = roundtrip_deserialise(&serialized).unwrap();
-
-        // Compare the event batch contents
-        match (&original.datablock_kind, &deserialized.datablock_kind) {
-            (
-                DatablockKind::EventBatchItem(orig_batch),
-                DatablockKind::EventBatchItem(deser_batch),
-            ) => {
-                assert_eq!(orig_batch.event_batch_index, deser_batch.event_batch_index);
-                assert_eq!(orig_batch.events.len(), deser_batch.events.len());
-                assert_eq!(
-                    orig_batch.events[0].event_index,
-                    deser_batch.events[0].event_index
-                );
-            }
-            _ => panic!("Unexpected datablock kind"),
-        }
-    }
-
-    #[test]
-    fn block_roundtrip_no_compression() {
+    fn auto_large_compressible_inlines_via_compression() {
         let original = create_large_datablock();
+        let serialised = SerialisedDatablock::new(&original, auto(), &test_codec()).unwrap();
 
-        let serialized = SerialisedDatablock::new(&original, CompressionType::None).unwrap();
-
-        // Block variant should exist for large datablocks
-        assert!(matches!(serialized.storage_kind, DatablockStorageKind::Block(_)));
-
-        let deserialized = roundtrip_deserialise(&serialized).unwrap();
-
-        match (&original.datablock_kind, &deserialized.datablock_kind) {
-            (
-                DatablockKind::EventBatchItem(orig_batch),
-                DatablockKind::EventBatchItem(deser_batch),
-            ) => {
-                assert_eq!(orig_batch.event_batch_index, deser_batch.event_batch_index);
-                assert_eq!(orig_batch.events.len(), deser_batch.events.len());
-            }
-            _ => panic!("Unexpected datablock kind"),
-        }
+        assert!(matches!(serialised.storage_kind, DatablockStorageKind::Inline(_)));
+        assert_eq!(serialised.compression_type, CompressionType::ZstdDict.to_byte());
+        assert!(serialised.compressed_size < serialised.uncompressed_size);
+        assert_same_batch(&original, &roundtrip_deserialise(&serialised).unwrap());
     }
 
+    /// Incompressible large data falls through to external block; the compression byte
+    /// still records ZstdDict because the serialiser did attempt compression. Round-trip
+    /// must still recover the original.
     #[test]
-    fn large_datablock_compressed_to_inline_with_zstd() {
-        let original = create_large_datablock();
-
-        let serialized = SerialisedDatablock::new(&original, CompressionType::Zstd { level: 3 }).unwrap();
-
-        // Compressible data that exceeds minibatch uncompressed should inline when compressed
-        assert!(matches!(serialized.storage_kind, DatablockStorageKind::Inline(_)));
-        assert_eq!(serialized.compression_type, 1); // Zstd
-
-        let deserialized = roundtrip_deserialise(&serialized).unwrap();
-
-        match (&original.datablock_kind, &deserialized.datablock_kind) {
-            (
-                DatablockKind::EventBatchItem(orig_batch),
-                DatablockKind::EventBatchItem(deser_batch),
-            ) => {
-                assert_eq!(orig_batch.event_batch_index, deser_batch.event_batch_index);
-            }
-            _ => panic!("Unexpected datablock kind"),
-        }
-    }
-
-    #[test]
-    fn large_datablock_compressed_to_inline_with_snappy() {
-        let original = create_large_datablock();
-
-        let serialized = SerialisedDatablock::new(&original, CompressionType::Snappy).unwrap();
-
-        assert!(matches!(serialized.storage_kind, DatablockStorageKind::Inline(_)));
-
-        let deserialized = roundtrip_deserialise(&serialized).unwrap();
-
-        match (&original.datablock_kind, &deserialized.datablock_kind) {
-            (
-                DatablockKind::EventBatchItem(orig_batch),
-                DatablockKind::EventBatchItem(deser_batch),
-            ) => {
-                assert_eq!(orig_batch.event_batch_index, deser_batch.event_batch_index);
-            }
-            _ => panic!("Unexpected datablock kind"),
-        }
-    }
-
-    #[test]
-    fn incompressible_large_datablock_stays_block() {
+    fn auto_incompressible_data_external_block() {
         let original = create_incompressible_large_datablock();
+        let serialised = SerialisedDatablock::new(&original, auto(), &test_codec()).unwrap();
 
-        let serialized = SerialisedDatablock::new(&original, CompressionType::Zstd { level: 3 }).unwrap();
-
-        assert!(matches!(serialized.storage_kind, DatablockStorageKind::Block(_)));
-
-        let deserialized = roundtrip_deserialise(&serialized).unwrap();
-
-        match (&original.datablock_kind, &deserialized.datablock_kind) {
-            (
-                DatablockKind::EventBatchItem(orig_batch),
-                DatablockKind::EventBatchItem(deser_batch),
-            ) => {
-                assert_eq!(orig_batch.event_batch_index, deser_batch.event_batch_index);
-            }
-            _ => panic!("Unexpected datablock kind"),
-        }
+        assert!(matches!(serialised.storage_kind, DatablockStorageKind::Block(_)));
+        assert_eq!(serialised.compression_type, CompressionType::ZstdDict.to_byte());
+        assert!(serialised.external_data.is_some());
+        assert_same_batch(&original, &roundtrip_deserialise(&serialised).unwrap());
     }
+
+    /// Encrypted payloads (`compression_allowed: false`) skip compression entirely.
+    /// `create_large_datablock` would normally inline-via-compression, but with the
+    /// bailout it goes external as plaintext. Per Inv 11c.
+    #[test]
+    fn auto_encrypted_skips_compression() {
+        let original = create_large_datablock();
+        let serialised = SerialisedDatablock::new(
+            &original,
+            CompressionPolicy::Auto { compression_allowed: false },
+            &test_codec(),
+        ).unwrap();
+
+        assert!(matches!(serialised.storage_kind, DatablockStorageKind::Block(_)));
+        assert_eq!(serialised.compression_type, CompressionType::None.to_byte());
+        assert_eq!(serialised.compressed_size, serialised.uncompressed_size);
+    }
+
+    // ==================== Fixed policy (catchup replay) ====================
+
+    /// Fixed(None) on the large datablock: serialiser honours the explicit byte even
+    /// though Auto would have compressed-to-inline. Used by the S3 catchup replay.
+    #[test]
+    fn fixed_none_preserves_no_compression() {
+        let original = create_large_datablock();
+        let serialised = SerialisedDatablock::new(
+            &original,
+            CompressionPolicy::Fixed(CompressionType::None),
+            &test_codec(),
+        ).unwrap();
+
+        assert!(matches!(serialised.storage_kind, DatablockStorageKind::Block(_)));
+        assert_eq!(serialised.compression_type, CompressionType::None.to_byte());
+    }
+
+    /// Fixed(ZstdDict) forces compression even on data Auto would have left
+    /// uncompressed in the stack buffer. Proves the byte the caller asks for is the byte
+    /// it gets.
+    #[test]
+    fn fixed_zstd_dict_forces_compression() {
+        let original = create_small_datablock();
+        let with_dict = SerialisedDatablock::new(
+            &original,
+            CompressionPolicy::Fixed(CompressionType::ZstdDict),
+            &test_codec(),
+        ).unwrap();
+        let auto = SerialisedDatablock::new(&original, auto(), &test_codec()).unwrap();
+
+        assert_eq!(with_dict.compression_type, CompressionType::ZstdDict.to_byte());
+        assert_eq!(auto.compression_type, CompressionType::None.to_byte());
+        // Compression byte should drive different stored bytes for the same input.
+        let DatablockStorageKind::Inline(d) = &with_dict.storage_kind else { panic!() };
+        let DatablockStorageKind::Inline(p) = &auto.storage_kind else { panic!() };
+        assert_ne!(
+            &d.minibatch[..with_dict.compressed_size as usize],
+            &p.minibatch[..auto.compressed_size as usize],
+            "Fixed(ZstdDict) and Auto(uncompressed) produced identical bytes",
+        );
+        assert_same_batch(&original, &roundtrip_deserialise(&with_dict).unwrap());
+    }
+
+    // ==================== read-side defensive checks ====================
 
     #[test]
     fn crc_mismatch_detected() {
-        let original = create_large_datablock();
-
-        let serialized = SerialisedDatablock::new(&original, CompressionType::None).unwrap();
-
-        // Corrupt the external data
-        let mut corrupted = serialized.external_data.unwrap();
+        let serialised = SerialisedDatablock::new(&create_incompressible_large_datablock(), auto(), &test_codec()).unwrap();
+        let mut corrupted = serialised.external_data.clone().unwrap();
         corrupted[10] ^= 0xFF;
-
         let result = deserialise_datablock(
-            serialized.uncompressed_size,
-            serialized.compressed_size,
-            serialized.datablock_version,
-            serialized.compression_type,
-            &serialized.storage_kind,
+            serialised.uncompressed_size,
+            serialised.compressed_size,
+            serialised.datablock_version,
+            serialised.compression_type,
+            &serialised.storage_kind,
             Some(&corrupted),
+            &test_codec(),
         );
-
         assert!(matches!(result, Err(DiskFormatError::ChecksumMismatch { .. })));
     }
 
     #[test]
     fn block_missing_external_data_fails() {
-        let original = create_large_datablock();
-
-        let serialized = SerialisedDatablock::new(&original, CompressionType::None).unwrap();
-
-        // Try to deserialize block without external data
+        let serialised = SerialisedDatablock::new(&create_incompressible_large_datablock(), auto(), &test_codec()).unwrap();
         let result = deserialise_datablock(
-            serialized.uncompressed_size,
-            serialized.compressed_size,
-            serialized.datablock_version,
-            serialized.compression_type,
-            &serialized.storage_kind,
+            serialised.uncompressed_size,
+            serialised.compressed_size,
+            serialised.datablock_version,
+            serialised.compression_type,
+            &serialised.storage_kind,
             None,
+            &test_codec(),
         );
-
         assert!(matches!(result, Err(DiskFormatError::ExternalDataMissing)));
     }
 
     #[test]
     fn none_storage_fails() {
-        let result = deserialise_datablock(0, 0, 0, 0, &DatablockStorageKind::None, None);
-
+        let result = deserialise_datablock(0, 0, 0, 0, &DatablockStorageKind::None, None, &test_codec());
         assert!(matches!(result, Err(DiskFormatError::DatablockExpected)));
     }
 
     #[test]
     fn unsupported_version_detected() {
-        let original = create_large_datablock();
-
-        let mut serialized = SerialisedDatablock::new(&original, CompressionType::None).unwrap();
-
-        // Modify the version
-        serialized.datablock_version = 9999;
-
-        let result = roundtrip_deserialise(&serialized);
-
+        let mut serialised = SerialisedDatablock::new(&create_incompressible_large_datablock(), auto(), &test_codec()).unwrap();
+        serialised.datablock_version = 9999;
+        let result = roundtrip_deserialise(&serialised);
         assert!(matches!(result, Err(DiskFormatError::UnsupportedVersion(9999))));
     }
 
     #[test]
-    fn block_ref_contains_correct_sizes() {
-        let original = create_incompressible_large_datablock();
-
-        let serialized = SerialisedDatablock::new(&original, CompressionType::Zstd { level: 3 }).unwrap();
-
-        if let DatablockStorageKind::Block(ref _block_ref) = serialized.storage_kind {
-            assert!(serialized.uncompressed_size > 0);
-            assert!(serialized.external_data.as_ref().unwrap().len() <= serialized.uncompressed_size as usize);
-        } else {
-            panic!("Expected Block storage");
-        }
+    fn crc_is_calculated_over_stored_bytes() {
+        let serialised = SerialisedDatablock::new(&create_incompressible_large_datablock(), auto(), &test_codec()).unwrap();
+        let DatablockStorageKind::Block(block_ref) = &serialised.storage_kind else { panic!() };
+        assert_eq!(block_ref.crc32c, crc32c::crc32c(serialised.external_data.as_ref().unwrap()));
     }
 
+    /// A tiny stack scratch must transparently fall through to the heap path and still
+    /// produce a correct roundtripping result. Exercises Case D.
     #[test]
-    fn crc_is_calculated_over_compressed_data() {
-        let original = create_incompressible_large_datablock();
-
-        let serialized = SerialisedDatablock::new(&original, CompressionType::None).unwrap();
-
-        if let DatablockStorageKind::Block(ref block_ref) = serialized.storage_kind {
-            let external = serialized.external_data.as_ref().unwrap();
-            let expected_crc = crc32c::crc32c(external);
-
-            assert_eq!(block_ref.crc32c, expected_crc);
-        } else {
-            panic!("Expected Block storage");
-        }
+    fn auto_stack_scratch_too_small_falls_to_heap_path() {
+        let original = create_large_datablock();
+        let serialised = SerialisedDatablock::new_with_stack_scratch::<64>(
+            &original,
+            auto(),
+            &test_codec(),
+        ).unwrap();
+        // 64-byte scratch can't hold 650 B of payload; heap branch must take over and the
+        // resulting block must still roundtrip cleanly.
+        assert_same_batch(&original, &roundtrip_deserialise(&serialised).unwrap());
     }
 }

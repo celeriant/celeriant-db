@@ -36,7 +36,6 @@ use celeriant_msg::process_client_responses::ClientResponse;
 use celeriant_msg::request::requests::ListAggregatesRequest;
 use celeriant_runtimes::RoutingRule;
 use celeriant_wal::aggregate_key::AggregateKey;
-use celeriant_wal::compression_type::CompressionType;
 use std::collections::HashSet;
 
 
@@ -143,7 +142,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             cursor,
         });
 
-        let response = client.send_request(&req, CompressionType::None).await?;
+        let response = client.send_request(&req).await?;
         let list_resp = match response {
             ClientResponse::ListAggregates(r) => r,
             other => {

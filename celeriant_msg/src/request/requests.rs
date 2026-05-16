@@ -67,8 +67,6 @@ pub struct SingleAggregateWrite {
     pub allow_create: bool,
     pub expected_event_batch_index: Option<u64>,
     pub enforce_client_idempotency: bool,
-    pub compression_type_id: u8,
-    pub compression_level: Option<i32>,
 }
 
 
@@ -172,4 +170,7 @@ pub struct IdentifyRequest {
     pub signature: Option<String>,
     /// Base64-encoded 32-byte API key. None when authentication is disabled.
     pub api_key: Option<String>,
+    /// SHA-256 hex string of the dict the client already has cached. None if no dict cached
+    #[serde(default)]
+    pub known_dict_sha256: Option<String>,
 }

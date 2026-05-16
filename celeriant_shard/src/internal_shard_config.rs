@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use crate::timestamp_config::TimestampConfig;
 
@@ -36,4 +36,6 @@ pub struct InternalShardConfig {
     pub cache_warmup_max_duration: Duration,
     pub replication_rollback_cooldown: Duration,
     pub heartbeat_starve_threshold: Duration,
+    pub wal_compression_level: i32,
+    pub dict_bytes: Arc<[u8]>,
 }

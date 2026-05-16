@@ -1,11 +1,11 @@
+use std::rc::Rc;
 use std::sync::Arc;
 
 use celeriant_ktls::ktls_connect;
-use celeriant_msg::process_client_requests::ClientRequest;
-use celeriant_msg::process_client_responses::ClientResponse;
 use celeriant_msg::process_cluster_requests::ClusterRequest;
 use celeriant_msg::process_cluster_responses::ClusterResponse;
 use celeriant_wal::compression_type::CompressionType;
+use celeriant_wire::codec::compression::DictCodec;
 use celeriant_wire::network::wire_header::PROTOCOL_VERSION_V2;
 use futures_lite::future::or;
 use glommio::net::TcpStream;
@@ -50,7 +50,7 @@ impl GlommioTlsConfig {
 ///
 /// IPv6 bracket notation `"[::1]:12000"` → `"::1"`
 /// IPv4 / hostname `"10.0.0.1:12000"` → `"10.0.0.1"`
-pub(crate) fn extract_host(address: &str) -> Result<&str, String> {
+fn extract_host(address: &str) -> Result<&str, String> {
     if address.starts_with('[') {
         address
             .get(1..)
@@ -87,31 +87,15 @@ mod tests {
     }
 }
 
-/// Minimal, high-performance Celeriant TCP client for Glommio
-///
-/// Establishes a single TCP connection for multiple request/response pairs.
-/// Connection lifetime is tied to the struct (RAII). No retries, no heartbeat.
-/// Developers need to handle connection timeouts and reconnection logic.
-/// TCP connections are a limited resource, only hold one open as long as you need it.
-///
-/// Note: This client must be used within a Glommio LocalExecutor context.
 pub struct CeleriantClient {
     stream: TcpStream,
     max_request_size: u64,
     max_response_size: u64,
     timeout_duration: Option<Duration>,
+    dict_codec: Rc<DictCodec>,
 }
 
 impl CeleriantClient {
-    pub async fn connect_with_timeout(
-        address: &str,
-        connection_timeout: Option<Duration>,
-        max_request_size: u64,
-        max_response_size: u64,
-    ) -> Result<Self, ClientError> {
-        Self::connect_with_timeout_tls(address, connection_timeout, max_request_size, max_response_size, None, None).await
-    }
-
     pub async fn connect_with_timeout_tls(
         address: &str,
         connection_timeout: Option<Duration>,
@@ -119,6 +103,7 @@ impl CeleriantClient {
         max_response_size: u64,
         tls_config: Option<GlommioTlsConfig>,
         tcp_user_timeout: Option<Duration>,
+        dict_codec: Rc<DictCodec>,
     ) -> Result<Self, ClientError> {
         let stream = if let Some(duration) = connection_timeout {
             TcpStream::connect_timeout(address, duration)
@@ -175,13 +160,8 @@ impl CeleriantClient {
             max_request_size,
             max_response_size,
             timeout_duration: None,
+            dict_codec,
         })
-    }
-
-    /// Set maximum request size in bytes (default: 10MB)
-    pub fn with_max_request_size(mut self, max_request_size: u64) -> Self {
-        self.max_request_size = max_request_size;
-        self
     }
 
     /// Set request timeout (default: none)
@@ -190,67 +170,12 @@ impl CeleriantClient {
         self
     }
 
-    /// Send a request and await the response
-    ///
-    /// Compression is specified per-request. Returns the response or an error.
-    /// CeleriantError from the response is surfaced as ClientError::CeleriantError.
-    ///
-    /// This is a blocking operation on the connection. For concurrent requests,
-    /// create multiple client instances (one per connection).
-    pub async fn send_request(
-        &mut self,
-        request: &ClientRequest,
-        compression_type: CompressionType,
-    ) -> Result<ClientResponse, ClientError> {
-        if let Some(duration) = self.timeout_duration {
-            let request_future = self.send_request_inner(request, compression_type);
-
-            let result = or(
-                async { Some(request_future.await) },
-                async { Timer::new(duration).await; None }
-            ).await;
-
-            match result {
-                Some(response) => response,
-                None => Err(ClientError::RequestTimeout),
-            }
-        } else {
-            self.send_request_inner(request, compression_type).await
-        }
-    }
-
-    async fn send_request_inner(
-        &mut self,
-        request: &ClientRequest,
-        compression_type: CompressionType,
-    ) -> Result<ClientResponse, ClientError> {
-        ClientRequest::write_request(
-            &mut self.stream,
-            request,
-            compression_type,
-            self.max_request_size,
-            PROTOCOL_VERSION_V2,
-        )
-        .await
-        .map_err(ClientError::WriteRequestError)?;
-
-        let response = ClientResponse::read_response(&mut self.stream, self.max_response_size).await
-            .map_err(ClientError::ReadResponseError)?;
-
-        match response {
-            ClientResponse::ProtocolError(_) => Err(ClientError::RequestProtocolError),
-            ClientResponse::GenericError(error) => Err(ClientError::from_error_response(error)),
-            _ => Ok(response),
-        }
-    }
-
     pub async fn send_cluster_request(
         &mut self,
         request: &ClusterRequest,
-        compression_type: CompressionType,
     ) -> Result<ClusterResponse, ClientError> {
         if let Some(duration) = self.timeout_duration {
-            let request_future = self.send_cluster_request_inner(request, compression_type);
+            let request_future = self.send_cluster_request_inner(request);
             let result = or(
                 async { Some(request_future.await) },
                 async { Timer::new(duration).await; None }
@@ -260,21 +185,27 @@ impl CeleriantClient {
                 None => Err(ClientError::RequestTimeout),
             }
         } else {
-            self.send_cluster_request_inner(request, compression_type).await
+            self.send_cluster_request_inner(request).await
         }
     }
 
     async fn send_cluster_request_inner(
         &mut self,
         request: &ClusterRequest,
-        compression_type: CompressionType,
     ) -> Result<ClusterResponse, ClientError> {
+        // Only variable-size variants (ReplicationBatch) can be compressed.
+        // Fixed-size variants (Heartbeat, KickFollower) always use None.
+        let compression = match request {
+            ClusterRequest::ReplicationBatch(_) => CompressionType::ZstdDict,
+            _ => CompressionType::None,
+        };
         ClusterRequest::write_request(
             &mut self.stream,
             request,
-            compression_type,
+            compression,
             self.max_request_size,
             PROTOCOL_VERSION_V2,
+            &self.dict_codec,
         )
         .await
         .map_err(ClientError::WriteRequestError)?;

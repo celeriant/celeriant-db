@@ -24,7 +24,7 @@ use celeriant_msg::{
     request::requests::{RegisterSchemaRequest, SingleAggregateWrite, WriteRequest},
 };
 use celeriant_wal::{
-    aggregate_key::AggregateKey, compression_type::CompressionType,
+    aggregate_key::AggregateKey,
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
     schema_key::SchemaKey,
 };
@@ -60,8 +60,6 @@ async fn write_with_payload(
             allow_create: false,
             expected_event_batch_index: None,
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -72,8 +70,7 @@ async fn write_with_payload(
                 client_id: CLIENT_ID,
                 user_id: None,
                 writes,
-            }),
-            CompressionType::None,
+            })
         )
         .await?;
 
@@ -146,7 +143,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     node_a_client
-        .send_request(&register_req, CompressionType::None)
+        .send_request(&register_req)
         .await?;
     println!("  Schema registered");
 
@@ -260,7 +257,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Invalid write (wrong type) rejected: PASS");
 
     let result = node_a_client
-        .send_request(&register_req, CompressionType::None)
+        .send_request(&register_req)
         .await;
     match &result {
         Err(ClientError::Server(celeriant_client_tokio::server_error::ServerError::Schema {

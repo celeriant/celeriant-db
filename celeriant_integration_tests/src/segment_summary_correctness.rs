@@ -17,7 +17,6 @@ use celeriant_msg::request::requests::{
     DeleteRequest, SingleAggregateDelete, TrimStartRequest,
 };
 use celeriant_wal::aggregate_key::AggregateKey;
-use celeriant_wal::compression_type::CompressionType;
 
 async fn force_rotation(
     client: &mut CeleriantClient,
@@ -137,7 +136,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         deletes,
     });
     client
-        .send_request(&req, CompressionType::None)
+        .send_request(&req)
         .await?;
 
     // Verify aggregate 200 is excluded from default listing
@@ -204,7 +203,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         user_id: Some(888),
     };
     client
-        .send_request(&ClientRequest::TrimStart(req), CompressionType::None)
+        .send_request(&ClientRequest::TrimStart(req))
         .await?;
 
     let aggs = ListAggregatesIterator::new(&mut client, Some(1), Some(10), options.clone())
@@ -248,7 +247,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         deletes,
     });
     client
-        .send_request(&req, CompressionType::None)
+        .send_request(&req)
         .await?;
 
     // Force rotation before recreate

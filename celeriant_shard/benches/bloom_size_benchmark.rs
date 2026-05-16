@@ -88,6 +88,8 @@ fn create_config(shard_dir: PathBuf) -> InternalShardConfig {
         compaction_min_reclaimable_ratio: 0.20,
         compaction_temp_dir: std::path::PathBuf::from("/tmp/test_compaction"),
         cache_warmup_max_duration: Duration::MAX,
+        wal_compression_level: 3,
+        dict_bytes: std::sync::Arc::from(celeriant_wal::builtin_dict::BUILTIN_DICT_BYTES),
     }
 }
 
@@ -119,8 +121,6 @@ fn create_write_request(
             allow_create: true,
             expected_event_batch_index: None,
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 

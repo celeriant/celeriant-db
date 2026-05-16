@@ -33,7 +33,7 @@ use celeriant_msg::request::requests::{
     ReadRequest, SingleAggregateWrite, WriteRequest,
 };
 use celeriant_wal::{
-    aggregate_key::AggregateKey, compression_type::CompressionType,
+    aggregate_key::AggregateKey,
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
 };
 use std::fs;
@@ -249,11 +249,13 @@ fn index_to_key(flat_index: usize) -> (u128, u128, u128) {
 }
 
 fn make_event(payload_size: usize) -> DatablockAggregateEvent {
+    // Unique seed per event so events in the same datablock don't deduplicate under zstd-dict,
+    // otherwise 10 identical large events would compress to one and let the WAL fill too slowly
+    // to force segment rotation.
+    static EVENT_SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seed = EVENT_SEED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut payload = vec![0u8; payload_size];
-    // Fill with non-compressible data to ensure large payloads stay above miniblock threshold
-    for (i, byte) in payload.iter_mut().enumerate() {
-        *byte = (i % 251) as u8;
-    }
+    crate::fill_incompressible(&mut payload, seed);
     DatablockAggregateEvent {
         client_event_index: 0,
         event_index: 0,
@@ -282,8 +284,6 @@ fn make_create_request(flat_index: usize, client_id: u128) -> ClientRequest {
             allow_create: true,
             expected_event_batch_index: None,
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -305,8 +305,6 @@ fn make_single_write_request(org_id: u128, type_id: u128, aggregate_id: u128, cl
             allow_create: true,
             expected_event_batch_index: None,
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -386,7 +384,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             for i in 0..count {
                 let flat = offset + i;
                 let req = make_create_request(flat, verified_client_id);
-                if let Err(e) = client.send_request(&req, CompressionType::None).await {
+                if let Err(e) = client.send_request(&req).await {
                     if i == 0 {
                         eprintln!("  Setup write error (offset={}, i={}): {}", offset, i, e);
                     }
@@ -610,7 +608,7 @@ async fn read_worker(
         });
 
         let t = Instant::now();
-        match client.send_request(&req, CompressionType::None).await {
+        match client.send_request(&req).await {
             Ok(ClientResponse::Read(_)) => {
                 latencies.push(t.elapsed().as_millis() as u64);
                 count += 1;
@@ -686,7 +684,7 @@ async fn list_aggregates_worker(
             });
 
             let t = Instant::now();
-            match client.send_request(&req, CompressionType::None).await {
+            match client.send_request(&req).await {
                 Ok(ClientResponse::ListAggregates(r)) => {
                     latencies.push(t.elapsed().as_millis() as u64);
                     count += 1;
@@ -760,7 +758,7 @@ async fn list_orgs_worker(
             });
 
             let t = Instant::now();
-            match client.send_request(&req, CompressionType::None).await {
+            match client.send_request(&req).await {
                 Ok(ClientResponse::ListOrgs(r)) => {
                     latencies.push(t.elapsed().as_millis() as u64);
                     count += 1;
@@ -838,7 +836,7 @@ async fn list_types_worker(
             });
 
             let t = Instant::now();
-            match client.send_request(&req, CompressionType::None).await {
+            match client.send_request(&req).await {
                 Ok(ClientResponse::ListAggregateTypes(r)) => {
                     latencies.push(t.elapsed().as_millis() as u64);
                     count += 1;
@@ -922,7 +920,7 @@ async fn write_worker(
         let req = make_single_write_request(org_id, type_id, agg_id, verified_client_id);
 
         let t = Instant::now();
-        match client.send_request(&req, CompressionType::None).await {
+        match client.send_request(&req).await {
             Ok(_) => {
                 latencies.push(t.elapsed().as_millis() as u64);
                 count += 1;

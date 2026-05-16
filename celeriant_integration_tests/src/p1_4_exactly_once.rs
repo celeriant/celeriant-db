@@ -25,7 +25,7 @@ use celeriant_msg::{
     },
 };
 use celeriant_wal::{
-    aggregate_key::AggregateKey, compression_type::CompressionType,
+    aggregate_key::AggregateKey,
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
 };
 
@@ -75,8 +75,6 @@ async fn test_basic_idempotency(
             allow_create: true,
             expected_event_batch_index: None, // Don't use OCC for this test
             enforce_client_idempotency: true,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -89,7 +87,7 @@ async fn test_basic_idempotency(
 
     // First write should succeed
     println!("  Sending first write...");
-    let response = client.send_request(&request, CompressionType::None).await?;
+    let response = client.send_request(&request).await?;
     match response {
         ClientResponse::Write(_) => println!("  First write: SUCCESS"),
         other => panic!("Expected Write response, got {:?}", other),
@@ -106,7 +104,7 @@ async fn test_basic_idempotency(
     });
 
     println!("  Retrying same write (should fail with error 2002)...");
-    match client.send_request(&retry_request, CompressionType::None).await {
+    match client.send_request(&retry_request).await {
         Err(ClientError::Server(celeriant_client_tokio::server_error::ServerError::Write {
             kind: celeriant_client_tokio::server_error::WriteError::ClientIdempotencyViolation {
                 last_client_event_index,
@@ -143,8 +141,6 @@ async fn test_uncertain_ack(
             allow_create: false,
             expected_event_batch_index: None, // Don't use OCC - rely on idempotency
             enforce_client_idempotency: true,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -156,7 +152,7 @@ async fn test_uncertain_ack(
     });
 
     println!("  Sending write on first connection...");
-    let response = client1.send_request(&request, CompressionType::None).await?;
+    let response = client1.send_request(&request).await?;
     match response {
         ClientResponse::Write(_) => println!("  Write sent successfully"),
         other => panic!("Expected Write response, got {:?}", other),
@@ -178,7 +174,7 @@ async fn test_uncertain_ack(
         writes: writes.clone(),
     });
 
-    match client2.send_request(&retry_request, CompressionType::None).await {
+    match client2.send_request(&retry_request).await {
         Err(ClientError::Server(celeriant_client_tokio::server_error::ServerError::Write {
             kind: celeriant_client_tokio::server_error::WriteError::ClientIdempotencyViolation {
                 last_client_event_index,
@@ -218,7 +214,7 @@ async fn verify_event_count(
         filters: ReadFilters::new(1),
     });
 
-    let response = client.send_request(&request, CompressionType::None).await?;
+    let response = client.send_request(&request).await?;
     match response {
         ClientResponse::Read(r) => {
             let batch_count = r.event_batches.len();
@@ -254,7 +250,7 @@ async fn verify_client_event_indices(
         filters: ReadFilters::new(1),
     });
 
-    let response = client.send_request(&request, CompressionType::None).await?;
+    let response = client.send_request(&request).await?;
     match response {
         ClientResponse::Read(r) => {
             let mut client_event_indices = Vec::new();

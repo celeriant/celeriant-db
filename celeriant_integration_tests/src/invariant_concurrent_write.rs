@@ -10,7 +10,6 @@ use celeriant_msg::process_client_requests::ClientRequest;
 use celeriant_msg::process_client_responses::ClientResponse;
 use celeriant_msg::request::requests::{SingleAggregateWrite, WriteRequest};
 use celeriant_wal::aggregate_key::AggregateKey;
-use celeriant_wal::compression_type::CompressionType;
 use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -98,8 +97,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         allow_create: false,
                         expected_event_batch_index: None,
                         enforce_client_idempotency: false,
-                        compression_type_id: 0,
-                        compression_level: None,
                     },
                 );
                 let request = ClientRequest::Write(WriteRequest {
@@ -108,7 +105,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     user_id: None,
                     writes,
                 });
-                match client.send_request(&request, CompressionType::None).await {
+                match client.send_request(&request).await {
                     Ok(ClientResponse::Write(_)) => {
                         successes.fetch_add(1, Ordering::Relaxed);
                     }

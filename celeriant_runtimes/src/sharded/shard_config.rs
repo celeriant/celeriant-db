@@ -4,8 +4,6 @@ use celeriant_crypto::pki::ClientAuthMode;
 use celeriant_msg::response::responses::AccessLevel;
 use celeriant_shard::timestamp_config::TimestampConfig;
 use celeriant_distributed::s3_lease_config::S3LeaseConfig;
-use celeriant_wal::compression_type::CompressionType;
-
 use crate::sharded::routing_rule::RoutingRule;
 use crate::sharded::tls_config::TlsConfig;
 
@@ -73,7 +71,6 @@ pub struct ShardConfig {
     pub max_response_size: u64,
     pub internode_connection_timeout: Option<Duration>,
     pub internode_request_timeout: Duration,
-    pub server_compression_algorithm: CompressionType,
     pub slow_client_timeout: Duration,
     pub max_requested_latency: Duration,
     pub shard_log_preallocate_bytes: u64,
@@ -109,4 +106,7 @@ pub struct ShardConfig {
     pub compaction_temp_dir: Option<std::path::PathBuf>,
     pub s3_retry_max_duration: Option<Duration>,
     pub cache_warmup_max_duration: Option<Duration>,
+    pub dict_bytes: Arc<[u8]>,
+    pub dict_sha256: Arc<str>,
+    pub wal_compression_level: i32,
 }

@@ -24,7 +24,7 @@ use celeriant_msg::{
     request::requests::{SingleAggregateWrite, WriteRequest},
 };
 use celeriant_wal::{
-    aggregate_key::AggregateKey, compression_type::CompressionType,
+    aggregate_key::AggregateKey,
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
 };
 
@@ -79,8 +79,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             allow_create: true,
             expected_event_batch_index: Some(0),
             enforce_client_idempotency: true,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
     writes.insert(
@@ -90,8 +88,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             allow_create: true,
             expected_event_batch_index: Some(0),
             enforce_client_idempotency: true,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -103,7 +99,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let response = client
-        .send_request(&request, CompressionType::None)
+        .send_request(&request)
         .await?;
 
     match response {
@@ -131,8 +127,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             allow_create: false,
             expected_event_batch_index: Some(1),
             enforce_client_idempotency: true,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -144,7 +138,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let response = client
-        .send_request(&request, CompressionType::None)
+        .send_request(&request)
         .await?;
 
     match response {
@@ -173,8 +167,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             allow_create: false,
             expected_event_batch_index: Some(1), // Expects version 1
             enforce_client_idempotency: true,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
     writes.insert(
@@ -184,8 +176,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             allow_create: false,
             expected_event_batch_index: Some(1), // Stale! B is actually at version 2
             enforce_client_idempotency: true,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -197,7 +187,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let result = client
-        .send_request(&request, CompressionType::None)
+        .send_request(&request)
         .await;
 
     match result {

@@ -13,7 +13,6 @@ use celeriant_msg::request::{
 };
 use celeriant_wal::{
     aggregate_key::AggregateKey,
-    compression_type::CompressionType,
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
     schema_key::SchemaKey,
 };
@@ -382,16 +381,13 @@ impl App {
             // Routing section
             InputField::with_value("[Routing] Route Reads to Followers (true/false)", if s.routing.route_reads_to_followers { "true" } else { "false" }),
             InputField::with_value("[Routing] Max Leader Retries", &s.routing.max_leader_retries.to_string()),
-            // Compression section
-            InputField::with_value("[Compression] Enabled (true/false)", if s.compression.enabled { "true" } else { "false" }),
-            InputField::with_value("[Compression] Auto Threshold (bytes)", &s.compression.auto_threshold_bytes.to_string()),
         ];
         self.input_field_index = 0;
         self.settings_scroll = 0;
     }
 
     pub fn sync_settings_from_fields(&mut self) {
-        if self.input_fields.len() < 18 {
+        if self.input_fields.len() < 16 {
             return;
         }
         let s = &mut self.settings;
@@ -425,9 +421,6 @@ impl App {
 
         s.routing.route_reads_to_followers = self.input_fields[14].value.trim().eq_ignore_ascii_case("true");
         s.routing.max_leader_retries = self.input_fields[15].value.trim().parse().unwrap_or(s.routing.max_leader_retries);
-
-        s.compression.enabled = self.input_fields[16].value.trim().eq_ignore_ascii_case("true");
-        s.compression.auto_threshold_bytes = self.input_fields[17].value.trim().parse().unwrap_or(s.compression.auto_threshold_bytes);
 
         // Keep server_address in sync
         self.server_address = self.settings.connection.server.clone();
@@ -645,15 +638,6 @@ impl App {
         opts = opts
             .with_route_reads_to_followers(s.routing.route_reads_to_followers)
             .with_max_leader_retries(s.routing.max_leader_retries as usize);
-
-        // Compression
-        if s.compression.enabled {
-            opts = opts
-                .with_compression(CompressionType::Zstd { level: 3 })
-                .with_auto_compression_threshold(s.compression.auto_threshold_bytes);
-        } else {
-            opts = opts.with_compression(CompressionType::None);
-        }
 
         Ok(opts)
     }

@@ -16,7 +16,7 @@ use celeriant_msg::{
     request::requests::{AggregateDetailsRequest, ReadRequest, SingleAggregateWrite, WriteRequest},
 };
 use celeriant_wal::{
-    aggregate_key::AggregateKey, compression_type::CompressionType,
+    aggregate_key::AggregateKey,
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
 };
 use tokio::time::Duration;
@@ -31,7 +31,7 @@ async fn send_probe(
     client: &mut CeleriantClient,
     request: &ClientRequest,
 ) -> Result<(), ClientError> {
-    match client.send_request(request, CompressionType::None).await {
+    match client.send_request(request).await {
         Ok(_) | Err(ClientError::Server(_)) => Ok(()),
         Err(e) => Err(e),
     }
@@ -251,8 +251,6 @@ async fn test_mixed_operations(server_address: &str) -> Result<(), Box<dyn std::
             allow_create: true,
             expected_event_batch_index: None, // Don't enforce version
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -264,7 +262,7 @@ async fn test_mixed_operations(server_address: &str) -> Result<(), Box<dyn std::
     });
 
     let write_response = client
-        .send_request(&write_request, CompressionType::None)
+        .send_request(&write_request)
         .await?;
     println!("  Write response: {:?}", write_response);
 
@@ -275,7 +273,7 @@ async fn test_mixed_operations(server_address: &str) -> Result<(), Box<dyn std::
     });
 
     let exists_response = client
-        .send_request(&exists_request, CompressionType::None)
+        .send_request(&exists_request)
         .await?;
     println!("  Exists response: {:?}", exists_response);
 
@@ -287,7 +285,7 @@ async fn test_mixed_operations(server_address: &str) -> Result<(), Box<dyn std::
     });
 
     let read_response = client
-        .send_request(&read_request, CompressionType::None)
+        .send_request(&read_request)
         .await?;
     println!("  Read response: {:?}", read_response);
 
@@ -375,8 +373,6 @@ async fn test_shard_affinity(server_address: &str) -> Result<(), Box<dyn std::er
                 allow_create: true,
                 expected_event_batch_index: None,
                 enforce_client_idempotency: false,
-                compression_type_id: 0,
-                compression_level: None,
             },
         );
 
@@ -388,7 +384,7 @@ async fn test_shard_affinity(server_address: &str) -> Result<(), Box<dyn std::er
         });
 
         write_client
-            .send_request(&write_request, CompressionType::None)
+            .send_request(&write_request)
             .await?;
 
         // Read back using second connection
@@ -399,7 +395,7 @@ async fn test_shard_affinity(server_address: &str) -> Result<(), Box<dyn std::er
         });
 
         let response = read_client
-            .send_request(&read_request, CompressionType::None)
+            .send_request(&read_request)
             .await?;
         println!(
             "  Shard {} write/read cycle successful: {:?}",

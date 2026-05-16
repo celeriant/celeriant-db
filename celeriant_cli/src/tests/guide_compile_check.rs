@@ -21,7 +21,6 @@ const _: () = {
     use celeriant_msg::request::read_filters::ReadFilters;
     use celeriant_msg::request::requests::*;
     use celeriant_wal::aggregate_key::AggregateKey;
-    use celeriant_wal::compression_type::CompressionType;
     use celeriant_wal::schema_key::SchemaKey;
     use celeriant_wal::schema_type::SchemaType;
     use serde::{Deserialize, Serialize};
@@ -208,8 +207,6 @@ const _: () = {
                     allow_create: true,
                     expected_event_batch_index: Some(from_batch_index),
                     enforce_client_idempotency: true,
-                    compression_type_id: 0,
-                    compression_level: None,
                 },
             ),
             (
@@ -219,8 +216,6 @@ const _: () = {
                     allow_create: true,
                     expected_event_batch_index: Some(to_batch_index),
                     enforce_client_idempotency: true,
-                    compression_type_id: 0,
-                    compression_level: None,
                 },
             ),
         ]);
@@ -442,14 +437,6 @@ const _: () = {
         Ok(())
     }
 
-    // --- Compression ---
-
-    fn compression() {
-        PoolOptions::new("localhost:10000")
-            .with_compression(CompressionType::Zstd { level: 3 })
-            .with_auto_compression_threshold(2048);
-    }
-
     // --- Error handling ---
 
     async fn error_handling(pool: &CeleriantPool) -> Result<(), Box<dyn std::error::Error>> {
@@ -467,8 +454,6 @@ const _: () = {
                     allow_create: true,
                     expected_event_batch_index: None,
                     enforce_client_idempotency: false,
-                    compression_type_id: 0,
-                    compression_level: None,
                 },
             )]),
         };

@@ -62,8 +62,6 @@ async fn test_pool_write(pool: &CeleriantPool) {
             allow_create: true,
             expected_event_batch_index: Some(0),
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
     let req = WriteRequest { correlation_id: Some(1), client_id: 1, user_id: None, writes };
@@ -251,8 +249,6 @@ async fn test_get_leader_connection(pool: &CeleriantPool) {
                     allow_create: true,
                     expected_event_batch_index: Some(0),
                     enforce_client_idempotency: false,
-                    compression_type_id: 0,
-                    compression_level: None,
                 },
             );
             let req = WriteRequest { correlation_id: None, client_id: 1, user_id: None, writes };

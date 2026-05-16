@@ -23,7 +23,7 @@ use celeriant_msg::{
     request::requests::{SingleAggregateWrite, WriteRequest},
 };
 use celeriant_wal::{
-    aggregate_key::AggregateKey, compression_type::CompressionType,
+    aggregate_key::AggregateKey,
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
 };
 
@@ -121,8 +121,6 @@ async fn test_successful_identity_verification(
             allow_create: true,
             expected_event_batch_index: Some(0),
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -134,7 +132,7 @@ async fn test_successful_identity_verification(
     };
 
     let response = client
-        .send_request(&ClientRequest::Write(write_req), CompressionType::None)
+        .send_request(&ClientRequest::Write(write_req))
         .await?;
 
     match response {
@@ -185,8 +183,6 @@ async fn test_identity_mismatch_rejection(
             allow_create: true,
             expected_event_batch_index: Some(0),
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -198,7 +194,7 @@ async fn test_identity_mismatch_rejection(
     };
 
     let result = client
-        .send_request(&ClientRequest::Write(write_req), CompressionType::None)
+        .send_request(&ClientRequest::Write(write_req))
         .await;
 
     match result {
@@ -252,8 +248,6 @@ async fn test_backward_compatibility_no_identity(
             allow_create: true,
             expected_event_batch_index: Some(0),
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -265,7 +259,7 @@ async fn test_backward_compatibility_no_identity(
     };
 
     let response = client
-        .send_request(&ClientRequest::Write(write_req), CompressionType::None)
+        .send_request(&ClientRequest::Write(write_req))
         .await?;
 
     match response {
@@ -302,8 +296,6 @@ async fn test_enforcement_rejects_unidentified(
             allow_create: true,
             expected_event_batch_index: Some(0),
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -315,7 +307,7 @@ async fn test_enforcement_rejects_unidentified(
     };
 
     let result = client
-        .send_request(&ClientRequest::Write(write_req), CompressionType::None)
+        .send_request(&ClientRequest::Write(write_req))
         .await;
 
     match result {
@@ -367,8 +359,6 @@ async fn test_enforcement_allows_identified(
             allow_create: true,
             expected_event_batch_index: Some(0),
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -380,7 +370,7 @@ async fn test_enforcement_allows_identified(
     };
 
     let response = client
-        .send_request(&ClientRequest::Write(write_req), CompressionType::None)
+        .send_request(&ClientRequest::Write(write_req))
         .await?;
 
     match response {

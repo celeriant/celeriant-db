@@ -29,12 +29,6 @@ impl From<rmp_serde::decode::Error> for CodecError {
     }
 }
 
-impl From<snap::Error> for CodecError {
-    fn from(value: snap::Error) -> Self {
-        CodecError::Compression(value.to_string())
-    }
-}
-
 impl From<std::io::Error> for CodecError {
     fn from(value: std::io::Error) -> Self {
         CodecError::Compression(value.to_string())

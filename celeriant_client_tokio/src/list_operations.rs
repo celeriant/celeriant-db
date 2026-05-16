@@ -8,7 +8,6 @@ use celeriant_msg::request::requests::{
 use celeriant_msg::response::responses::{AggregateListItem, AggregateTypeListItem, OrgListItem};
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::aggregate_type_key::AggregateTypeKey;
-use celeriant_wal::compression_type::CompressionType;
 
 use crate::celeriant_client::CeleriantClient;
 use crate::client_error::ClientError;
@@ -16,8 +15,6 @@ use crate::client_error::ClientError;
 /// Options for list operations
 #[derive(Debug, Clone)]
 pub struct ListOptions {
-    /// Compression type for requests (default: None)
-    pub compression: CompressionType,
     /// Include deleted aggregates in results (default: false, only for list_aggregates)
     pub include_deleted: bool,
     /// Starting shard hint - useful if you know your shard range (default: 0)
@@ -34,7 +31,6 @@ fn is_shard_routing_error(error: &ClientError) -> bool {
 impl Default for ListOptions {
     fn default() -> Self {
         Self {
-            compression: CompressionType::None,
             include_deleted: false,
             start_shard: 0,
             max_shard_hint: None,
@@ -43,22 +39,16 @@ impl Default for ListOptions {
 }
 
 /// Streaming iterator for listing organizations across all shards
-/// 
+///
 /// Automatically handles pagination, shard discovery, and deduplication.
 /// Drop the iterator to cancel the operation.
 pub struct ListOrgsIterator<'a> {
     client: &'a mut CeleriantClient,
-    compression: CompressionType,
-    // Shard state: maps shard_id -> cursor (None means start from beginning)
     shard_cursors: HashMap<u64, Option<u64>>,
-    // Shards still being processed (round-robin order)
     active_shards: VecDeque<u64>,
-    // Track max discovered shard (None = still discovering)
     max_shard: Option<u64>,
     next_shard_to_try: u64,
-    // Deduplication
     seen: HashSet<u128>,
-    // Buffered results from current page
     buffer: VecDeque<OrgListItem>,
     exhausted: bool,
 }
@@ -67,14 +57,12 @@ impl<'a> ListOrgsIterator<'a> {
     pub fn new(client: &'a mut CeleriantClient, options: ListOptions) -> Self {
         let mut active_shards = VecDeque::new();
         let mut shard_cursors = HashMap::new();
-        
-        // Initialize with start shard
+
         active_shards.push_back(options.start_shard);
         shard_cursors.insert(options.start_shard, None);
-        
+
         Self {
             client,
-            compression: options.compression,
             shard_cursors,
             active_shards,
             max_shard: options.max_shard_hint,
@@ -88,21 +76,18 @@ impl<'a> ListOrgsIterator<'a> {
     /// Get the next organization, or None if exhausted
     pub async fn next(&mut self) -> Option<Result<OrgListItem, ClientError>> {
         loop {
-            // Return buffered items first (with deduplication)
             while let Some(item) = self.buffer.pop_front() {
                 if self.seen.insert(item.org_id) {
                     return Some(Ok(item));
                 }
-                // Skip duplicates, continue loop
             }
 
             if self.exhausted {
                 return None;
             }
 
-            // Try to fetch more data
             match self.fetch_next_page().await {
-                Ok(true) => continue,  // Got data, loop to return it
+                Ok(true) => continue,
                 Ok(false) => {
                     self.exhausted = true;
                     return None;
@@ -113,14 +98,12 @@ impl<'a> ListOrgsIterator<'a> {
     }
 
     async fn fetch_next_page(&mut self) -> Result<bool, ClientError> {
-        // If no active shards, try to discover more
         if self.active_shards.is_empty() {
             if !self.try_add_next_shard() {
-                return Ok(false); // No more shards to try
+                return Ok(false);
             }
         }
 
-        // Round-robin: take front shard, will push back if not exhausted
         let shard_id = match self.active_shards.pop_front() {
             Some(s) => s,
             None => return Ok(false),
@@ -134,31 +117,26 @@ impl<'a> ListOrgsIterator<'a> {
             cursor,
         });
 
-        match self.client.send_request(&request, self.compression).await {
+        match self.client.send_request(&request).await {
             Ok(ClientResponse::ListOrgs(response)) => {
                 self.buffer.extend(response.orgs);
 
                 if let Some(next_cursor) = response.next_cursor {
-                    // More pages on this shard
                     self.shard_cursors.insert(shard_id, Some(next_cursor));
                     self.active_shards.push_back(shard_id);
                 } else {
-                    // Shard exhausted, remove from rotation
                     self.shard_cursors.remove(&shard_id);
                 }
 
-                // Try to add next shard for parallelism in round-robin
                 self.try_add_next_shard();
 
                 Ok(true)
             }
             Ok(_) => Err(ClientError::ProtocolError),
             Err(e) => {
-                // Check if this is a shard routing error on a new shard
                 if cursor.is_none() && self.max_shard.is_none() && is_shard_routing_error(&e) {
                     self.max_shard = Some(shard_id.saturating_sub(1));
                     self.shard_cursors.remove(&shard_id);
-                    // Continue with remaining active shards
                     if self.active_shards.is_empty() && self.buffer.is_empty() {
                         return Ok(false);
                     }
@@ -170,7 +148,6 @@ impl<'a> ListOrgsIterator<'a> {
     }
 
     fn try_add_next_shard(&mut self) -> bool {
-        // Check if we should try adding a new shard
         if let Some(max) = self.max_shard {
             if self.next_shard_to_try > max {
                 return false;
@@ -200,13 +177,12 @@ impl<'a> ListOrgsIterator<'a> {
 /// Streaming iterator for listing aggregate types across all shards
 pub struct ListAggregateTypesIterator<'a> {
     client: &'a mut CeleriantClient,
-    compression: CompressionType,
     org_id: Option<u128>,
     shard_cursors: HashMap<u64, Option<u64>>,
     active_shards: VecDeque<u64>,
     max_shard: Option<u64>,
     next_shard_to_try: u64,
-    seen: HashSet<AggregateTypeKey>, // (org_id, aggregate_type_id)
+    seen: HashSet<AggregateTypeKey>,
     buffer: VecDeque<AggregateTypeListItem>,
     exhausted: bool,
 }
@@ -224,7 +200,6 @@ impl<'a> ListAggregateTypesIterator<'a> {
 
         Self {
             client,
-            compression: options.compression,
             org_id,
             shard_cursors,
             active_shards,
@@ -281,7 +256,7 @@ impl<'a> ListAggregateTypesIterator<'a> {
             cursor,
         });
 
-        match self.client.send_request(&request, self.compression).await {
+        match self.client.send_request(&request).await {
             Ok(ClientResponse::ListAggregateTypes(response)) => {
                 self.buffer.extend(response.aggregate_types);
 
@@ -355,7 +330,6 @@ pub struct AggregateStats {
 }
 
 impl AggregateStats {
-    /// Create from a single list item
     pub(crate) fn from_item(item: &AggregateListItem) -> Self {
         Self {
             org_id: item.org_id,
@@ -376,13 +350,9 @@ impl AggregateStats {
         }
     }
 
-    /// Merge another item's stats into this one
     pub(crate) fn merge(&mut self, item: &AggregateListItem) {
-        // is_deleted: true if ANY shard reports deleted
         self.is_deleted = self.is_deleted || item.is_deleted;
-        // Sums
         self.event_batch_count += item.event_batch_count;
-        // Mins (0 means "no data", skip in min calculation)
         if item.min_event_timestamp > 0 {
             self.min_event_timestamp = if self.min_event_timestamp == 0 {
                 item.min_event_timestamp
@@ -411,13 +381,10 @@ impl AggregateStats {
                 self.min_event_index.min(item.min_event_index)
             };
         }
-        // Maxes
         self.max_event_timestamp = self.max_event_timestamp.max(item.max_event_timestamp);
         self.max_server_timestamp = self.max_server_timestamp.max(item.max_server_timestamp);
         self.max_event_batch_index = self.max_event_batch_index.max(item.max_event_batch_index);
         self.max_event_index = self.max_event_index.max(item.max_event_index);
-        
-        // Sums for sizes
         self.compressed_size += item.compressed_size;
         self.uncompressed_size += item.uncompressed_size;
     }
@@ -426,7 +393,6 @@ impl AggregateStats {
 /// Streaming iterator for listing aggregates across all shards
 pub struct ListAggregatesIterator<'a> {
     client: &'a mut CeleriantClient,
-    compression: CompressionType,
     org_id: Option<u128>,
     aggregate_type_id: Option<u128>,
     include_deleted: bool,
@@ -434,13 +400,9 @@ pub struct ListAggregatesIterator<'a> {
     active_shards: VecDeque<u64>,
     max_shard: Option<u64>,
     next_shard_to_try: u64,
-    /// Accumulated stats per aggregate (merged across pages/shards)
     stats: HashMap<AggregateKey, AggregateStats>,
-    /// Track aggregates marked as deleted
     deleted: HashSet<AggregateKey>,
-    /// Keys in order of first observation (for iteration order)
     order: Vec<AggregateKey>,
-    /// Position in order vec for next() iteration
     order_pos: usize,
     buffer: VecDeque<AggregateListItem>,
     exhausted: bool,
@@ -460,7 +422,6 @@ impl<'a> ListAggregatesIterator<'a> {
 
         Self {
             client,
-            compression: options.compression,
             org_id,
             aggregate_type_id,
             include_deleted: options.include_deleted,
@@ -480,24 +441,19 @@ impl<'a> ListAggregatesIterator<'a> {
     /// Get the next aggregate with accumulated stats, or None if exhausted
     pub async fn next(&mut self) -> Option<Result<AggregateStats, ClientError>> {
         loop {
-            // Process buffered items into stats map
             while let Some(item) = self.buffer.pop_front() {
                 let key = AggregateKey::new(item.org_id, item.aggregate_type_id, item.aggregate_id);
-                
-                // Track deleted status
+
                 if item.is_deleted {
                     self.deleted.insert(key.clone());
                 }
 
                 if let Some(existing) = self.stats.get_mut(&key) {
-                    // Merge stats from this page/shard
                     existing.merge(&item);
-                    // Update deleted status if newly discovered
                     if self.deleted.contains(&key) {
                         existing.is_deleted = true;
                     }
                 } else {
-                    // First time seeing this aggregate
                     let mut stats = AggregateStats::from_item(&item);
                     if self.deleted.contains(&key) {
                         stats.is_deleted = true;
@@ -507,13 +463,11 @@ impl<'a> ListAggregatesIterator<'a> {
                 }
             }
 
-            // Try to return next item from accumulated stats
             while self.order_pos < self.order.len() {
                 let key = &self.order[self.order_pos];
                 self.order_pos += 1;
 
                 if let Some(stats) = self.stats.get(key) {
-                    // Apply deleted filter
                     if !self.include_deleted && stats.is_deleted {
                         continue;
                     }
@@ -525,12 +479,10 @@ impl<'a> ListAggregatesIterator<'a> {
                 return None;
             }
 
-            // Fetch more data
             match self.fetch_next_page().await {
                 Ok(true) => continue,
                 Ok(false) => {
                     self.exhausted = true;
-                    // Final pass: return any remaining items we haven't yielded
                     continue;
                 }
                 Err(e) => return Some(Err(e)),
@@ -560,7 +512,7 @@ impl<'a> ListAggregatesIterator<'a> {
             cursor,
         });
 
-        match self.client.send_request(&request, self.compression).await {
+        match self.client.send_request(&request).await {
             Ok(ClientResponse::ListAggregates(response)) => {
                 self.buffer.extend(response.aggregates);
 

@@ -18,7 +18,7 @@ use celeriant_msg::{
     request::requests::{SingleAggregateWrite, WatchRequest, WriteRequest},
 };
 use celeriant_wal::{
-    aggregate_key::AggregateKey, compression_type::CompressionType,
+    aggregate_key::AggregateKey,
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
 };
 use celeriant_wire::network::wire_header::PROTOCOL_VERSION_V2;
@@ -142,7 +142,6 @@ impl WatchConnection {
         ClientRequest::write_request(
             &mut self.stream,
             &req,
-            CompressionType::None,
             10_000_000,
             PROTOCOL_VERSION_V2,
         )
@@ -159,7 +158,6 @@ impl WatchConnection {
         ClientRequest::write_request(
             &mut self.stream,
             &req,
-            CompressionType::None,
             10_000_000,
             PROTOCOL_VERSION_V2,
         )
@@ -270,8 +268,6 @@ async fn test_watch_receives_writes(
             allow_create: true,
             expected_event_batch_index: None,
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -283,7 +279,7 @@ async fn test_watch_receives_writes(
     });
 
     let write_response = write_client
-        .send_request(&write_request, CompressionType::None)
+        .send_request(&write_request)
         .await?;
     println!("  Write completed: {:?}", write_response);
 
@@ -355,8 +351,6 @@ async fn test_watch_with_aggregate_filter(
             allow_create: true,
             expected_event_batch_index: None,
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -367,8 +361,7 @@ async fn test_watch_with_aggregate_filter(
                 client_id: CLIENT_ID,
                 user_id: None,
                 writes,
-            }),
-            CompressionType::None,
+            })
         )
         .await?;
 
@@ -382,8 +375,6 @@ async fn test_watch_with_aggregate_filter(
             allow_create: true,
             expected_event_batch_index: None,
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -394,8 +385,7 @@ async fn test_watch_with_aggregate_filter(
                 client_id: CLIENT_ID,
                 user_id: None,
                 writes,
-            }),
-            CompressionType::None,
+            })
         )
         .await?;
 
@@ -527,8 +517,6 @@ async fn test_multiple_watchers(
             allow_create: true,
             expected_event_batch_index: None,
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -539,8 +527,7 @@ async fn test_multiple_watchers(
                 client_id: CLIENT_ID,
                 user_id: None,
                 writes,
-            }),
-            CompressionType::None,
+            })
         )
         .await?;
 
@@ -612,8 +599,6 @@ async fn test_write_then_watch_same_connection(
             allow_create: true,
             expected_event_batch_index: None,
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -670,8 +655,6 @@ async fn test_write_then_watch_same_connection(
             allow_create: false, // Aggregate already exists
             expected_event_batch_index: None,
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -683,7 +666,7 @@ async fn test_write_then_watch_same_connection(
     });
 
     let write_response2 = write_client
-        .send_request(&write_request2, CompressionType::None)
+        .send_request(&write_request2)
         .await?;
     println!("  Second write completed from separate connection: {:?}", write_response2);
 

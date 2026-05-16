@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -12,10 +13,11 @@ use celeriant_msg::{
     request::requests::{HeartbeatRequest, KickFollowerRequest, ReplicationBatchItem, ReplicationBatchRequest},
     response::responses::{HeartbeatResult, ReplicationResult},
 };
-use celeriant_wal::{compression_type::CompressionType, s3::fallback_batch::{FallbackBatch, FallbackItem}};
+use celeriant_wal::s3::fallback_batch::{FallbackBatch, FallbackItem};
 use glommio::sync::RwLock;
 use tracing::debug;
 
+use celeriant_wire::codec::compression::DictCodec;
 use crate::error::{replication_to_follower_error::ReplicateToFollowerError, replication_to_s3_error::ReplicateToS3Error, send_heartbeat_error::SendHeartbeatError};
 use crate::s3_uploader::S3Uploader;
 
@@ -63,8 +65,6 @@ impl ReplicationClient for StubReplicationClient {
     async fn send_kick(&self) -> Result<bool, SendHeartbeatError> { Ok(true) }
 }
 
-/// Managed TCP connection state. Tracks which address the connection was
-/// established to so that address changes are detected lazily.
 struct ConnState {
     client: Option<CeleriantClient>,
     connected_to: Option<String>,
@@ -75,8 +75,6 @@ impl ConnState {
         Self { client: None, connected_to: None }
     }
 
-    /// Ensure the TCP connection is established to `address`.
-    /// Drops and reconnects if the address changed or `reset` is true.
     async fn ensure_connected(
         &mut self,
         address: &Option<String>,
@@ -87,6 +85,7 @@ impl ConnState {
         max_response_size: u64,
         replication_client_config: Option<&Arc<rustls::ClientConfig>>,
         tcp_user_timeout: Option<Duration>,
+        dict_codec: Rc<DictCodec>,
     ) -> Result<(), ClientError> {
         if self.connected_to.as_ref() != address.as_ref() {
             self.client = None;
@@ -115,6 +114,7 @@ impl ConnState {
                 max_response_size,
                 tls_config,
                 tcp_user_timeout,
+                dict_codec,
             )
             .await?;
             debug!(addr, "internode: connected");
@@ -128,7 +128,6 @@ impl ConnState {
     }
 }
 
-/// Manage follower communication with split internal locks
 pub struct FollowerConnection<S: S3Uploader> {
     follower_address: RefCell<Option<String>>,
     follower_reachable: Cell<bool>,
@@ -144,6 +143,7 @@ pub struct FollowerConnection<S: S3Uploader> {
     max_request_size: u64,
     max_response_size: u64,
     replication_client_config: Option<Arc<rustls::ClientConfig>>,
+    dict_codec: Rc<DictCodec>,
     s3_uploader: Option<S>,
     s3_upload_sequence: Cell<u64>,
     heartbeat_in_flight_since_unix_ms: Cell<Option<u64>>,
@@ -161,6 +161,7 @@ impl<S: S3Uploader> FollowerConnection<S> {
         shard_id: u64,
         node_id: u128,
         replication_client_config: Option<Arc<rustls::ClientConfig>>,
+        dict_codec: Rc<DictCodec>,
         s3_uploader: Option<S>,
     ) -> Self {
         assert!(shard_id <= u32::MAX as u64, "shard_id {} exceeds u32::MAX", shard_id);
@@ -179,6 +180,7 @@ impl<S: S3Uploader> FollowerConnection<S> {
             max_request_size,
             max_response_size,
             replication_client_config,
+            dict_codec,
             s3_uploader,
             s3_upload_sequence: Cell::new(0),
             heartbeat_in_flight_since_unix_ms: Cell::new(None),
@@ -235,7 +237,7 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
         let address = self.follower_address.borrow().clone();
         let shard_id = self.shard_id;
 
-        guard.ensure_connected(&address, false, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref(), self.tcp_user_timeout).await?;
+        guard.ensure_connected(&address, false, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref(), self.tcp_user_timeout, self.dict_codec.clone()).await?;
 
         let mut request = ClusterRequest::ReplicationBatch(ReplicationBatchRequest {
             correlation_id: None,
@@ -245,14 +247,14 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
             batches,
         });
 
-        let response = match guard.client.as_mut().unwrap().send_cluster_request(&request, CompressionType::Snappy).await {
+        let response = match guard.client.as_mut().unwrap().send_cluster_request(&request).await {
             Ok(r) => r,
             Err(_) => {
-                guard.ensure_connected(&address, true, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref(), self.tcp_user_timeout).await?;
+                guard.ensure_connected(&address, true, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref(), self.tcp_user_timeout, self.dict_codec.clone()).await?;
                 if let ClusterRequest::ReplicationBatch(ref mut req) = request {
                     req.leader_timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
                 }
-                guard.client.as_mut().unwrap().send_cluster_request(&request, CompressionType::Snappy).await?
+                guard.client.as_mut().unwrap().send_cluster_request(&request).await?
             }
         };
 
@@ -341,7 +343,7 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
         // Always reset: forces a fresh TCP connection on each heartbeat attempt.
         // This avoids stale connections hanging for the full internode_request_timeout
         // (10s) when the peer is unreachable, which would prevent timely self-fencing.
-        guard.ensure_connected(&address, true, hb_timeout, hb_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref(), self.tcp_user_timeout).await?;
+        guard.ensure_connected(&address, true, hb_timeout, hb_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref(), self.tcp_user_timeout, self.dict_codec.clone()).await?;
 
         let request = ClusterRequest::Heartbeat(HeartbeatRequest {
             correlation_id: None,
@@ -350,7 +352,7 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
             lease_index,
         });
 
-        let response = guard.client.as_mut().unwrap().send_cluster_request(&request, CompressionType::None).await?;
+        let response = guard.client.as_mut().unwrap().send_cluster_request(&request).await?;
 
         match response {
             ClusterResponse::Heartbeat(resp) => Ok(resp.result),
@@ -364,17 +366,17 @@ impl<S: S3Uploader> ReplicationClient for FollowerConnection<S> {
 
         let address = self.follower_address.borrow().clone();
 
-        guard.ensure_connected(&address, false, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref(), self.tcp_user_timeout).await?;
+        guard.ensure_connected(&address, false, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref(), self.tcp_user_timeout, self.dict_codec.clone()).await?;
 
         let request = ClusterRequest::KickFollower(KickFollowerRequest {
             correlation_id: None,
         });
 
-        let response = match guard.client.as_mut().unwrap().send_cluster_request(&request, CompressionType::None).await {
+        let response = match guard.client.as_mut().unwrap().send_cluster_request(&request).await {
             Ok(r) => r,
             Err(_) => {
-                guard.ensure_connected(&address, true, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref(), self.tcp_user_timeout).await?;
-                guard.client.as_mut().unwrap().send_cluster_request(&request, CompressionType::None).await?
+                guard.ensure_connected(&address, true, self.connection_timeout, self.request_timeout, self.max_request_size, self.max_response_size, self.replication_client_config.as_ref(), self.tcp_user_timeout, self.dict_codec.clone()).await?;
+                guard.client.as_mut().unwrap().send_cluster_request(&request).await?
             }
         };
 
@@ -396,8 +398,13 @@ mod tests {
     use celeriant_wal::datablocks::datablock::Datablock;
     use celeriant_wal::datablocks::datablock_kind::DatablockKind;
     use celeriant_wal::datablocks::datablock_aggregate_event_batch::DatablockAggregateEventBatch;
+    use celeriant_wire::codec::compression::DictCodec;
     use glommio::LocalExecutor;
     use std::rc::Rc;
+
+    fn test_dict_codec() -> Rc<DictCodec> {
+        Rc::new(DictCodec::new(celeriant_wal::builtin_dict::BUILTIN_DICT_BYTES, 3).unwrap())
+    }
 
     type MockCalls = Rc<RefCell<Vec<(String, Bytes)>>>;
 
@@ -483,6 +490,7 @@ mod tests {
                 7,
                 1,
                 None,
+                test_dict_codec(),
                 Some(mock_uploader),
             );
 
@@ -507,6 +515,7 @@ mod tests {
                 7,
                 1,
                 None,
+                test_dict_codec(),
                 None,
             );
 
@@ -537,6 +546,7 @@ mod tests {
                 7,
                 42,
                 None,
+                test_dict_codec(),
                 Some(mock_uploader),
             );
 
@@ -587,6 +597,7 @@ mod tests {
                 5,
                 1,
                 None,
+                test_dict_codec(),
                 Some(mock_uploader),
             );
 
@@ -639,6 +650,7 @@ mod tests {
                 1024, 1024,
                 7, 1,
                 None,
+                test_dict_codec(),
                 Some(mock_uploader),
             );
 
@@ -683,6 +695,7 @@ mod tests {
                 7,
                 1,
                 None,
+                test_dict_codec(),
                 Some(mock_uploader),
             );
 
@@ -705,7 +718,7 @@ mod tests {
             None,
             1024, 1024,
             7, 1,
-            None, None,
+            None, test_dict_codec(), None,
         )
     }
 

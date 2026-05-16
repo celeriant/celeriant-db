@@ -14,7 +14,6 @@ use celeriant_msg::process_client_requests::ClientRequest;
 use celeriant_msg::process_client_responses::ClientResponse;
 use celeriant_msg::request::requests::{DeleteRequest, SingleAggregateDelete, TrimStartRequest};
 use celeriant_wal::aggregate_key::AggregateKey;
-use celeriant_wal::compression_type::CompressionType;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -41,7 +40,7 @@ async fn delete_aggregate(
     };
 
     let response = client
-        .send_request(&ClientRequest::Delete(req), CompressionType::None)
+        .send_request(&ClientRequest::Delete(req))
         .await?;
 
     match response {
@@ -64,7 +63,7 @@ async fn trim_aggregate(
     };
 
     let response = client
-        .send_request(&ClientRequest::TrimStart(req), CompressionType::None)
+        .send_request(&ClientRequest::TrimStart(req))
         .await?;
 
     match response {

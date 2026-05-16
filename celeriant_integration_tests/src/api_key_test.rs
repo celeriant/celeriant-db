@@ -26,7 +26,7 @@ use celeriant_msg::{
     request::requests::{ReadRequest, SingleAggregateWrite, WriteRequest},
 };
 use celeriant_wal::{
-    aggregate_key::AggregateKey, compression_type::CompressionType,
+    aggregate_key::AggregateKey,
     datablocks::datablock_aggregate_event::DatablockAggregateEvent,
 };
 
@@ -170,8 +170,6 @@ async fn test_read_write_key_allows_writes(
             allow_create: true,
             expected_event_batch_index: Some(0),
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -183,7 +181,7 @@ async fn test_read_write_key_allows_writes(
     };
 
     let response = client
-        .send_request(&ClientRequest::Write(write_req), CompressionType::None)
+        .send_request(&ClientRequest::Write(write_req))
         .await?;
 
     match response {
@@ -227,7 +225,7 @@ async fn test_read_only_key_blocks_writes(
     };
 
     let read_response = client
-        .send_request(&ClientRequest::Read(read_req), CompressionType::None)
+        .send_request(&ClientRequest::Read(read_req))
         .await?;
 
     match read_response {
@@ -249,8 +247,6 @@ async fn test_read_only_key_blocks_writes(
             allow_create: false,
             expected_event_batch_index: None,
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -262,7 +258,7 @@ async fn test_read_only_key_blocks_writes(
     };
 
     let result = client
-        .send_request(&ClientRequest::Write(write_req), CompressionType::None)
+        .send_request(&ClientRequest::Write(write_req))
         .await;
 
     match result {
@@ -398,8 +394,6 @@ async fn test_secondary_key_works(
             allow_create: true,
             expected_event_batch_index: Some(0),
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -411,7 +405,7 @@ async fn test_secondary_key_works(
     };
 
     let response = client
-        .send_request(&ClientRequest::Write(write_req), CompressionType::None)
+        .send_request(&ClientRequest::Write(write_req))
         .await?;
 
     match response {
@@ -448,8 +442,6 @@ async fn test_no_api_keys_allows_all(
             allow_create: true,
             expected_event_batch_index: Some(0),
             enforce_client_idempotency: false,
-            compression_type_id: 0,
-            compression_level: None,
         },
     );
 
@@ -461,7 +453,7 @@ async fn test_no_api_keys_allows_all(
     };
 
     let response = client
-        .send_request(&ClientRequest::Write(write_req), CompressionType::None)
+        .send_request(&ClientRequest::Write(write_req))
         .await?;
 
     match response {

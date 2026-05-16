@@ -1,9 +1,11 @@
+use std::rc::Rc;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::Duration;
 
 use celeriant_distributed::s3_lease_manager::S3LeaseManager;
 use celeriant_distributed::validated_node_status::ValidatedNodeStatus;
 use celeriant_shard::{internal_shard_config::InternalShardConfig, replication_client::FollowerConnection, shard_wal::ShardWal, shard_wal_compact::cleanup_orphaned_compacting_files};
+use celeriant_wire::codec::compression::DictCodec;
 use celeriant_sidecar::store::SidecarStoreTrait;
 use glommio::{
     CpuSet, LocalExecutorPoolBuilder, PoolPlacement,
@@ -17,7 +19,7 @@ use crate::{sharded::{intrashard_messages::IntrashardMessages, shard::Shard}, si
 mod sharded;
 mod sidecar;
 
-pub use {sharded::shard_config::{ApiKeyHashes, ShardConfig, TlsCertPaths}, sidecar::sidecar_config::SidecarConfig, sharded::routing_rule::RoutingRule, celeriant_wal::compression_type::CompressionType, sharded::tls_config::{TlsConfig, TlsMode}};
+pub use {sharded::shard_config::{ApiKeyHashes, ShardConfig, TlsCertPaths}, sidecar::sidecar_config::SidecarConfig, sharded::routing_rule::RoutingRule, sharded::tls_config::{TlsConfig, TlsMode}};
 
 const MAX_SHARD_RESTARTS: u32 = 3;
 const SHARD_RESTART_DELAY: Duration = Duration::from_secs(5);
@@ -120,10 +122,16 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                     compaction_temp_dir,
                     max_clock_drift_ms: shard_config.max_clock_drift_ms,
                     cache_warmup_max_duration: shard_config.cache_warmup_max_duration.unwrap_or(Duration::MAX),
+                    wal_compression_level: shard_config.wal_compression_level,
+                    dict_bytes: shard_config.dict_bytes.clone(),
                 };
                 let s3_uploader = SidecarS3Uploader::new(sidecar_senders.clone(), s3_upload_inflight.clone(), shard_config.s3_max_concurrent_fallback_uploads);
                 let replication_client_config = shard_config.tls_config.as_ref()
                     .map(|t| t.replication_client_config.clone());
+                let replication_dict_codec = Rc::new(
+                    DictCodec::new(&shard_config.dict_bytes, shard_config.wal_compression_level)
+                        .expect("DictCodec build failed at executor start")
+                );
                 let replication_client = FollowerConnection::new(
                     None,
                     shard_config.internode_connection_timeout,
@@ -135,6 +143,7 @@ pub fn run_executors_and_sidecar<S: SidecarStoreTrait>(shard_config: ShardConfig
                     current_shard_id as u64,
                     shard_config.node_id,
                     replication_client_config,
+                    replication_dict_codec.clone(),
                     Some(s3_uploader),
                 );
                 let s3_downloader = SidecarS3Downloader::new(sidecar_senders.clone());

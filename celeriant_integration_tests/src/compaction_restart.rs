@@ -19,7 +19,7 @@ use crate::{
 };
 use celeriant_msg::process_client_requests::ClientRequest;
 use celeriant_msg::request::requests::{DeleteRequest, SingleAggregateDelete};
-use celeriant_wal::{aggregate_key::AggregateKey, compression_type::CompressionType};
+use celeriant_wal::{aggregate_key::AggregateKey};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -48,7 +48,7 @@ async fn delete_aggregate(
         user_id: None,
     });
     client
-        .send_request(&request, CompressionType::None)
+        .send_request(&request)
         .await?;
     Ok(())
 }
